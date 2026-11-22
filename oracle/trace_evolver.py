@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import string
 from collections import Counter
 from dataclasses import dataclass, field, asdict
@@ -36,6 +37,11 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.model_evolver import (
+    SHADOW_TAG,
+    _canonical_families,
+    _tag_shadow_description,
+)
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
 
@@ -51,6 +57,55 @@ CONVERGENCE_BONUS = 0.15           # bonus weight for multi-source convergent si
 MIN_SIGNAL_SOURCES = 2
 MAX_SIGNAL_SOURCES = 15
 REGIME_AWARE = True                # adjust mutations per market regime
+MIN_PATTERN1_FAIL_MENTIONS = 2
+MIN_MISSED_TOKEN_LENGTH = 5
+
+_PROSE_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+(?:[:-][A-Za-z0-9_]+)*")
+_MISSED_PROSE_STOPWORDS: frozenset[str] = frozenset({
+    "about", "above", "after", "again", "against", "already", "always",
+    "awareness", "because", "before", "being", "below", "between", "blocked",
+    "calendar", "capture", "catalysts", "check", "checked", "consider",
+    "could", "direction", "during", "earnings", "ensemble", "event", "every",
+    "expiry", "first", "flagged", "found", "freshness", "gating", "going",
+    "great", "having", "horizons", "however", "ignored", "included", "logic",
+    "longer", "market", "meetings", "might", "missed", "model", "moved",
+    "needed", "never", "other", "points", "position", "prediction", "present",
+    "price", "recommendation", "rolled", "sanity", "short", "should", "signal",
+    "signals", "since", "stale", "still", "their", "there", "these", "thing",
+    "think", "those", "three", "through", "timing", "trade", "trailing",
+    "under", "until", "using", "where", "which", "while", "would", "wrong",
+})
+
+
+def _extract_prose_tokens(prose: str) -> list[str]:
+    """Extract whole tokens (including colon/underscore/hyphen registry names)."""
+    return _PROSE_TOKEN_RE.findall(prose)
+
+
+def _extract_prediction_signal_names(signals_raw: Any) -> set[str]:
+    """Extract distinct signal names from an oracle_predictions.signals JSONB payload."""
+    payload = signals_raw
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return set()
+    if isinstance(payload, dict):
+        items = payload.get("items", [])
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return set()
+    names: set[str] = set()
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                name = item.get("name")
+                if isinstance(name, str) and name.strip():
+                    names.add(name.strip())
+            elif isinstance(item, str) and item.strip():
+                names.add(item.strip())
+    return names
 
 
 def _rand(n: int = 6) -> str:
@@ -123,6 +178,8 @@ class TraceAnalyzer:
         postmortems = self._load_postmortems(cutoff)
         scoring = self._load_scoring_data(cutoff)
         signal_accuracy = self._load_signal_accuracy(cutoff)
+        overall_fires, winning_outcomes, total_outcomes = self._load_signal_fire_counts(cutoff)
+        registry_names = set(self._available_sources())
         regime = self._get_current_regime()
 
         if len(postmortems) < MIN_POSTMORTEMS_FOR_ANALYSIS:
@@ -132,31 +189,55 @@ class TraceAnalyzer:
 
         patterns = []
 
-        # Pattern 1: Failure category clustering
-        cat_counts = Counter(pm["failure_category"] for pm in postmortems)
-        total = len(postmortems)
-        for cat, count in cat_counts.most_common():
-            if count < 2:
-                continue
-            cat_pms = [pm for pm in postmortems if pm["failure_category"] == cat]
-            wrong_signals = self._aggregate_signals(cat_pms, "signals_wrong")
-            right_signals = self._aggregate_signals(cat_pms, "signals_right")
-            missed_signals = self._aggregate_missed(cat_pms)
-            affected = list({pm.get("model_name", "unknown") for pm in cat_pms})
+        # Pattern 1: Rate-based failure category clustering (requires overall fire
+        # counts across BOTH winning and losing outcomes; trade_postmortems alone
+        # only records failures, so disable Pattern 1 when no winning+losing
+        # denominator is available).
+        if winning_outcomes <= 0 or total_outcomes <= 0 or not overall_fires:
+            log.warning(
+                "TraceAnalyzer: Pattern 1 disabled — trade_postmortems contains "
+                "failures only and no winning+losing signal fire denominator is "
+                "available (winning_outcomes={w}, total_outcomes={t}, signals={s})",
+                w=winning_outcomes, t=total_outcomes, s=len(overall_fires),
+            )
+        else:
+            cat_counts = Counter(pm["failure_category"] for pm in postmortems)
+            for cat, count in cat_counts.most_common():
+                if count < 2:
+                    continue
+                cat_pms = [pm for pm in postmortems if pm["failure_category"] == cat]
+                wrong_signals = self._aggregate_signals(
+                    cat_pms, "signals_wrong",
+                    overall_fires=overall_fires,
+                    min_rate=SIGNAL_WRONG_THRESHOLD,
+                )
+                right_signals = self._aggregate_signals(
+                    cat_pms, "signals_right",
+                    overall_fires=overall_fires,
+                    min_rate=0.0,
+                )
+                missed_signals = self._aggregate_missed(
+                    cat_pms, registry_names=registry_names,
+                )
+                if cat == "wrong_signal" and not wrong_signals and not missed_signals:
+                    continue
+                affected = sorted(
+                    {pm["model_name"] for pm in cat_pms if pm.get("model_name")}
+                ) or ["unknown"]
 
-            action = self._recommend_action(cat, wrong_signals, right_signals, missed_signals)
+                action = self._recommend_action(cat, wrong_signals, right_signals, missed_signals)
 
-            patterns.append(FailurePattern(
-                category=cat,
-                frequency=count,
-                fraction=round(count / total, 3),
-                signals_commonly_wrong=wrong_signals[:5],
-                signals_commonly_right=right_signals[:5],
-                signals_commonly_missed=missed_signals[:3],
-                affected_models=affected,
-                regime_context=regime,
-                recommended_action=action,
-            ))
+                patterns.append(FailurePattern(
+                    category=cat,
+                    frequency=count,
+                    fraction=round(min(1.0, count / total_outcomes), 3),
+                    signals_commonly_wrong=wrong_signals[:5],
+                    signals_commonly_right=right_signals[:5],
+                    signals_commonly_missed=missed_signals[:3],
+                    affected_models=affected,
+                    regime_context=regime,
+                    recommended_action=action,
+                ))
 
         # Pattern 2: Signal-level accuracy from trust_scorer data
         for sig_name, accuracy in signal_accuracy.items():
@@ -306,25 +387,112 @@ class TraceAnalyzer:
         except Exception:
             return None
 
-    def _aggregate_signals(self, postmortems: list[dict], key: str) -> list[str]:
-        """Count signal mentions across postmortems, return sorted by frequency."""
-        counter: Counter = Counter()
+    def _load_signal_fire_counts(self, cutoff: datetime) -> tuple[dict[str, int], int, int]:
+        """Load per-signal overall fire counts across winning AND losing scored predictions."""
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT verdict, signals
+                    FROM oracle_predictions
+                    WHERE scored_at >= :cutoff
+                      AND verdict IN ('hit', 'miss', 'partial')
+                      AND dedup_keep = TRUE
+                      AND id NOT LIKE 'astrogrid:%'
+                """), {"cutoff": cutoff}).fetchall()
+        except Exception as e:
+            log.warning("TraceAnalyzer: signal fire counts query failed: {e}", e=str(e))
+            return {}, 0, 0
+
+        fire_counts: Counter[str] = Counter()
+        winning = 0
+        total = 0
+        for verdict, signals_raw in rows:
+            if verdict not in ("hit", "miss", "partial"):
+                continue
+            total += 1
+            if verdict in ("hit", "partial"):
+                winning += 1
+            fire_counts.update(_extract_prediction_signal_names(signals_raw))
+        return dict(fire_counts), winning, total
+
+    def _available_sources(self) -> list[str]:
+        try:
+            with self.engine.connect() as conn:
+                return [
+                    r[0] for r in conn.execute(text(
+                        "SELECT DISTINCT source_module FROM signal_registry ORDER BY source_module"
+                    )).fetchall()
+                    if r and r[0]
+                ]
+        except Exception as e:
+            log.warning("TraceAnalyzer: available sources query failed: {e}", e=str(e))
+            return []
+
+    def _aggregate_signals(
+        self,
+        postmortems: list[dict],
+        key: str,
+        *,
+        overall_fires: dict[str, int] | None = None,
+        min_rate: float = SIGNAL_WRONG_THRESHOLD,
+        min_mentions: int = MIN_PATTERN1_FAIL_MENTIONS,
+    ) -> list[str]:
+        """Rank signals by failure rate (mentions in failures / overall fires).
+
+        Requires overall fire counts from BOTH winning and losing outcomes.
+        Fails closed (returns []) when no denominator is supplied.
+        """
+        if not overall_fires:
+            log.warning(
+                "TraceAnalyzer._aggregate_signals: disabled — no winning+losing overall fire denominator"
+            )
+            return []
+        mentions: Counter[str] = Counter()
         for pm in postmortems:
             signals = pm.get(key, [])
             if isinstance(signals, list):
-                counter.update(s for s in signals if isinstance(s, str))
-        return [sig for sig, _ in counter.most_common()]
+                mentions.update({s for s in signals if isinstance(s, str) and s})
+        scored_signals: list[tuple[float, int, str]] = []
+        for sig, fail_count in mentions.items():
+            if fail_count < min_mentions:
+                continue
+            total_fires = int(overall_fires.get(sig, 0))
+            if total_fires <= 0 or fail_count > total_fires:
+                continue
+            rate = fail_count / total_fires
+            if rate > min_rate:
+                scored_signals.append((rate, fail_count, sig))
+        scored_signals.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        return [sig for _, _, sig in scored_signals]
 
-    def _aggregate_missed(self, postmortems: list[dict]) -> list[str]:
-        counter: Counter = Counter()
+    def _aggregate_missed(
+        self,
+        postmortems: list[dict],
+        registry_names: set[str] | list[str] | None = None,
+    ) -> list[str]:
+        """Extract missed signals by exact whole-token match against signal_registry."""
+        names = self._available_sources() if registry_names is None else list(registry_names)
+        canonical_by_lower = {
+            n.strip().lower(): n.strip()
+            for n in names
+            if isinstance(n, str) and n.strip()
+        }
+        if not canonical_by_lower:
+            return []
+        counter: Counter[str] = Counter()
         for pm in postmortems:
             missed = pm.get("what_we_missed", "")
-            if missed and isinstance(missed, str):
-                # Extract signal-like keywords from the narrative
-                for word in missed.split():
-                    cleaned = word.strip(".,;:()[]\"'").lower()
-                    if len(cleaned) > 3 and cleaned.isalpha():
-                        counter[cleaned] += 1
+            if not missed or not isinstance(missed, str):
+                continue
+            matched_in_pm: set[str] = set()
+            for token in _extract_prose_tokens(missed):
+                lower = token.lower()
+                if len(lower) < MIN_MISSED_TOKEN_LENGTH or lower in _MISSED_PROSE_STOPWORDS:
+                    continue
+                canonical = canonical_by_lower.get(lower)
+                if canonical is not None:
+                    matched_in_pm.add(canonical)
+            counter.update(matched_in_pm)
         return [w for w, c in counter.most_common(10) if c >= 2]
 
     def _recommend_action(self, category: str, wrong: list[str],
@@ -443,12 +611,18 @@ class TargetedMutator:
                         params={"donor_model": top_model, "take_ratio": 0.5},
                     ))
 
-        # Add missed signal proposals
+        # Add missed signal proposals (exact case-insensitive whole-name match only)
         if pattern.signals_commonly_missed:
             available = self._available_sources()
+            missed_exact = {
+                m.strip().lower()
+                for m in pattern.signals_commonly_missed
+                if isinstance(m, str)
+                and len(m.strip()) >= MIN_MISSED_TOKEN_LENGTH
+                and m.strip().lower() not in _MISSED_PROSE_STOPWORDS
+            }
             for model in pattern.affected_models:
-                addable = [s for s in available
-                           if any(missed in s.lower() for missed in pattern.signals_commonly_missed)]
+                addable = [s for s in available if s.lower() in missed_exact]
                 if addable:
                     model_sources = self._get_model_sources(model)
                     new_signals = [s for s in addable if s not in model_sources][:2]
@@ -465,14 +639,15 @@ class TargetedMutator:
         return proposals
 
     def apply(self, proposal: MutationProposal) -> str | None:
-        """Apply a mutation proposal, creating a new model variant. Returns model name or None."""
+        """Apply a mutation proposal, creating a new shadow model variant. Returns model name or None."""
         parent = self._load_model(proposal.parent_model)
         if not parent:
             log.warning("TargetedMutator: parent model '{m}' not found", m=proposal.parent_model)
             return None
 
         sources = _parse_json(parent.get("signal_sources"))
-        families = _parse_json(parent.get("signal_families"))
+        parent_families = _parse_json(parent.get("signal_families"))
+        families = list(parent_families)
         horizon = parent.get("target_horizon_days", 7)
 
         if proposal.mutation_type == "remove_signal":
@@ -504,35 +679,90 @@ class TargetedMutator:
             sources = list(dict.fromkeys(sources + donor_picks))
             if len(sources) > MAX_SIGNAL_SOURCES:
                 sources = sources[:MAX_SIGNAL_SOURCES]
-            families = list(set(families) | set(_parse_json(donor.get("signal_families"))))
+            families = sorted(set(families) | set(_parse_json(donor.get("signal_families"))))
 
         else:
             log.warning("TargetedMutator: unknown mutation type '{t}'", t=proposal.mutation_type)
             return None
 
+        # Refuse functional clones: OracleEngine._load_models reads signal_families
+        # (not signal_sources or target_horizon_days). The comparison uses
+        # signal_families only because GRID_SIGNAL_REGISTRY defaults off
+        # (oracle/engine.py ~L44); if registry mode is enabled, signal_sources
+        # becomes vote-relevant.
+        parent_fam_sig = _canonical_families(parent_families)
+        new_fam_sig = _canonical_families(families)
+        if not new_fam_sig:
+            log.info(
+                "TargetedMutator: refusing {t} on '{p}' — empty vote-determining signal_families",
+                t=proposal.mutation_type, p=proposal.parent_model,
+            )
+            return None
+        if new_fam_sig == parent_fam_sig:
+            log.info(
+                "TargetedMutator: refusing {t} on '{p}' — vote-determining "
+                "signal_families {f} unchanged (mutation only modified unread fields)",
+                t=proposal.mutation_type, p=proposal.parent_model, f=list(new_fam_sig),
+            )
+            return None
+        existing_sigs = self._active_or_shadow_family_signatures()
+        if existing_sigs is None:
+            log.warning(
+                "TargetedMutator: refusing {t} on '{p}' — unable to verify active/shadow signal_families (fail closed)",
+                t=proposal.mutation_type, p=proposal.parent_model,
+            )
+            return None
+        if new_fam_sig in existing_sigs:
+            log.info(
+                "TargetedMutator: refusing {t} on '{p}' — vote-determining "
+                "signal_families {f} matches an existing active or shadow model",
+                t=proposal.mutation_type, p=proposal.parent_model, f=list(new_fam_sig),
+            )
+            return None
+
         name = f"trace_{proposal.mutation_type[:8]}_{_rand()}"
-        desc = f"{proposal.description} | {proposal.rationale[:100]}"
+        desc = _tag_shadow_description(f"{proposal.description} | {proposal.rationale[:100]}")[:500]
 
         try:
             with self.engine.begin() as conn:
-                conn.execute(text("""
+                res = conn.execute(text("""
                     INSERT INTO oracle_models
                     (name, version, description, signal_families, signal_sources,
                      weight, active, parent_model, created_by, target_horizon_days, last_updated)
                     VALUES (:name, '1.0', :desc, :fam, :src,
-                            1.0, TRUE, :parent, :cb, :horizon, NOW())
+                            0.0, FALSE, :parent, :cb, :horizon, NOW())
                     ON CONFLICT (name) DO NOTHING
                 """), {
-                    "name": name, "desc": desc[:500],
-                    "fam": json.dumps(families), "src": json.dumps(sources),
+                    "name": name, "desc": desc,
+                    "fam": json.dumps(list(new_fam_sig)), "src": json.dumps(sources),
                     "parent": proposal.parent_model, "cb": "trace_evolver:" + proposal.mutation_type,
                     "horizon": horizon,
                 })
-            log.info("TargetedMutator: created '{name}' from {parent} ({type})",
+            if getattr(res, "rowcount", 1) == 0:
+                return None
+            log.info("TargetedMutator: staged shadow model '{name}' from {parent} ({type})",
                      name=name, parent=proposal.parent_model, type=proposal.mutation_type)
             return name
         except Exception as e:
             log.error("TargetedMutator: failed to create model: {e}", e=str(e))
+            return None
+
+    def _active_or_shadow_family_signatures(self) -> set[tuple[str, ...]] | None:
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT signal_families FROM oracle_models "
+                        "WHERE active = TRUE OR description LIKE :shadow_prefix"
+                    ),
+                    {"shadow_prefix": f"{SHADOW_TAG}%"},
+                ).fetchall()
+            return {_canonical_families(r[0]) for r in rows}
+        except Exception as e:
+            log.warning(
+                "TargetedMutator: active/shadow signal_families query failed: {e}",
+                e=str(e),
+            )
             return None
 
     def _get_model_sources(self, model_name: str) -> list[str]:
@@ -615,7 +845,7 @@ class EvolutionGate:
         try:
             with self.engine.connect() as conn:
                 parent = conn.execute(text(
-                    "SELECT active FROM oracle_models WHERE name = :n"
+                    "SELECT active, signal_families FROM oracle_models WHERE name = :n"
                 ), {"n": proposal.parent_model}).fetchone()
         except Exception as e:
             return False, f"gate db error checking parent: {e}"
@@ -623,6 +853,7 @@ class EvolutionGate:
             return False, f"Parent model '{proposal.parent_model}' not found"
         if not parent[0]:
             return False, f"Parent model '{proposal.parent_model}' is inactive"
+        parent_fam_sig = _canonical_families(parent[1])
 
         # Gate 2: Signal count bounds
         if proposal.mutation_type == "remove_signal":
@@ -637,16 +868,44 @@ class EvolutionGate:
             if projected > MAX_SIGNAL_SOURCES:
                 return False, f"Would create {projected} signals (max {MAX_SIGNAL_SOURCES})"
 
-        # Gate 3: No exact duplicate model configurations
-        if proposal.mutation_type in ("remove_signal", "add_signal"):
-            new_sources = set(parent_sources)
-            if proposal.mutation_type == "remove_signal":
-                new_sources -= set(proposal.params.get("signals_to_remove", []))
-            else:
-                new_sources |= set(proposal.params.get("signals_to_add", []))
+        # Gate 3: No functional clones on vote-determining fields (signal_families,
+        # the only model-definition field OracleEngine._load_models reads because
+        # GRID_SIGNAL_REGISTRY defaults off in oracle/engine.py ~L44; if registry
+        # mode is enabled, signal_sources becomes vote-relevant). Applies to ALL
+        # mutation types including adjust_horizon, remove_signal, add_signal.
+        if proposal.mutation_type == "crossover_targeted":
+            donor_name = proposal.params.get("donor_model")
+            if not donor_name:
+                return False, "Missing donor_model for crossover_targeted"
+            try:
+                with self.engine.connect() as conn:
+                    donor_row = conn.execute(text(
+                        "SELECT signal_families FROM oracle_models WHERE name = :n"
+                    ), {"n": donor_name}).fetchone()
+            except Exception as e:
+                return False, f"gate db error checking donor: {e}"
+            if not donor_row:
+                return False, f"Donor model '{donor_name}' not found"
+            new_fam_sig = _canonical_families(
+                list(parent_fam_sig) + list(_canonical_families(donor_row[0]))
+            )
+        else:
+            new_fam_sig = parent_fam_sig
 
-            if self._config_exists(sorted(new_sources)):
-                return False, "Identical signal configuration already exists"
+        if not new_fam_sig:
+            return False, "Candidate has no vote-determining signal_families"
+        if new_fam_sig == parent_fam_sig:
+            return (
+                False,
+                f"Functional clone: mutation '{proposal.mutation_type}' does not change "
+                f"vote-determining signal_families {list(new_fam_sig)}",
+            )
+
+        exists_clone, err = self._families_config_exists(new_fam_sig)
+        if err is not None:
+            return False, f"gate db error checking active/shadow signal_families: {err}"
+        if exists_clone:
+            return False, "Functional clone: identical vote-determining signal_families already exists on an active or shadow model"
 
         # Gate 4: Population cap
         try:
@@ -661,21 +920,27 @@ class EvolutionGate:
 
         return True, "passed"
 
-    def _config_exists(self, sorted_sources: list[str]) -> bool:
-        target_json = json.dumps(sorted_sources)
+    def _families_config_exists(self, target_sig: tuple[str, ...]) -> tuple[bool, str | None]:
+        """Check whether any active or [shadow] model has identical vote-determining signal_families."""
         try:
             with self.engine.connect() as conn:
-                # Check if any active model has identical sorted sources
-                rows = conn.execute(text(
-                    "SELECT signal_sources FROM oracle_models WHERE active = TRUE"
-                )).fetchall()
-            for (src_raw,) in rows:
-                existing = sorted(_parse_json(src_raw))
-                if json.dumps(existing) == target_json:
-                    return True
-        except Exception:
-            pass
-        return False
+                rows = conn.execute(
+                    text(
+                        "SELECT signal_families FROM oracle_models "
+                        "WHERE active = TRUE OR description LIKE :shadow_prefix"
+                    ),
+                    {"shadow_prefix": f"{SHADOW_TAG}%"},
+                ).fetchall()
+            for (fam_raw,) in rows:
+                if _canonical_families(fam_raw) == target_sig:
+                    return True, None
+            return False, None
+        except Exception as e:
+            log.warning(
+                "EvolutionGate: active/shadow signal_families check failed (failing closed): {e}",
+                e=str(e),
+            )
+            return True, str(e)
 
 
 # ── 4. Trace Evolver (Orchestrator) ──────────────────────────────────────

@@ -4,6 +4,10 @@ GRID Oracle — Model Evolver.
 Autonomous lifecycle manager: create, mutate, crossover, score, kill models.
 Run every 6h via Hermes. Reads stats from oracle_predictions, kills losers,
 spawns mutations/crossovers of top performers, seeds from hypothesis discoveries.
+
+Shadow promotion needs a harness that records shadow predictions without voting;
+until it exists, shadow models stay inactive and are promoted only by an operator
+after review.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ KILL_THRESHOLD_HIT_RATE = 0.20
 KILL_THRESHOLD_PREDICTIONS = 20
 LEADERBOARD_BAND = 5
 MIN_SIGNAL_SOURCES = 2
+SHADOW_TAG = "[shadow]"
 
 def _rand(n=6): return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 def _trunc(s, n=20): return s[:n]
@@ -36,6 +41,18 @@ def _parse_json_list(v):
             log.debug("_parse_sources JSON parse failed: {e}", e=str(e))
             return []
     return []
+
+
+def _canonical_families(v) -> tuple[str, ...]:
+    """Canonical vote-determining signature read by OracleEngine._load_models."""
+    return tuple(sorted({s.strip() for s in _parse_json_list(v) if s and s.strip()}))
+
+
+def _tag_shadow_description(desc: str) -> str:
+    clean = (desc or "").strip()
+    if clean.startswith(SHADOW_TAG):
+        return clean
+    return f"{SHADOW_TAG} {clean}".strip()
 
 @dataclass
 class EvolveResult:
@@ -72,9 +89,9 @@ class ModelEvolver:
                     r.killed.append(s["name"])
                 except Exception as e: r.errors.append(f"kill {s['name']}: {e}")
 
-        # Cap enforcement
+        # Cap enforcement (new shadow models start inactive, so only trim active surplus)
         current = self._count_active()
-        surplus = (current + 4) - MAX_ACTIVE_MODELS
+        surplus = current - MAX_ACTIVE_MODELS
         if surplus > 0:
             killed_set = set(r.killed)
             killable = [s for s in reversed(scored) if s["name"] not in killed_set]
@@ -141,6 +158,7 @@ class ModelEvolver:
         row = self._load(parent_name)
         if not row: return None
         sources = _parse_json_list(row.get("signal_sources"))
+        parent_families = _parse_json_list(row.get("signal_families"))
         available = self._available_sources()
         can_add = bool(set(available) - set(sources))
         can_rm = len(sources) > MIN_SIGNAL_SOURCES
@@ -155,24 +173,38 @@ class ModelEvolver:
             new.remove(rm)
             note = f"removed {rm}"
         name = f"{_trunc(parent_name)}_mut_{_rand()}"
-        self._insert(name=name, desc=f"Mutation of {parent_name}: {note}", sources=new,
-                     families=_parse_json_list(row.get("signal_families")),
-                     parent=parent_name, created_by="evolver:mutation")
-        return name
+        inserted = self._insert(
+            name=name, desc=f"Mutation of {parent_name}: {note}", sources=new,
+            families=parent_families, parent=parent_name,
+            created_by="evolver:mutation", parent_families=parent_families,
+        )
+        return name if inserted else None
 
     def _crossover(self, a: str, b: str) -> str | None:
         ra, rb = self._load(a), self._load(b)
         if not ra or not rb: return None
         sa = set(_parse_json_list(ra.get("signal_sources")))
         sb = set(_parse_json_list(rb.get("signal_sources")))
-        if sa == sb: return None
+        fa = _canonical_families(ra.get("signal_families"))
+        fb = _canonical_families(rb.get("signal_families"))
+        new_families = sorted(set(fa) | set(fb))
+        new_sig = _canonical_families(new_families)
+        if not new_sig or new_sig in (fa, fb):
+            log.info(
+                "ModelEvolver: refusing crossover {a} x {b} — vote-determining "
+                "signal_families {f} does not differ from parents",
+                a=a, b=b, f=list(new_sig),
+            )
+            return None
         name = f"cross_{_trunc(a,10)}_{_trunc(b,10)}_{_rand(4)}"
-        self._insert(name=name, desc=f"Crossover {a} x {b}", sources=sorted(sa | sb),
-                     families=sorted(set(_parse_json_list(ra.get("signal_families"))) | set(_parse_json_list(rb.get("signal_families")))),
-                     parent=a, created_by="evolver:crossover")
-        return name
+        inserted = self._insert(
+            name=name, desc=f"Crossover {a} x {b}", sources=sorted(sa | sb),
+            families=new_families, parent=a, created_by="evolver:crossover",
+        )
+        return name if inserted else None
 
     def _from_hypothesis(self) -> str | None:
+        # Fails closed (families=[] is refused as empty, creating nothing); the 301 existing evolver:hypothesis models are untouched.
         try:
             with self.engine.connect() as conn:
                 rows = conn.execute(text("""
@@ -196,9 +228,12 @@ class ModelEvolver:
                         v = item.get(k)
                         if v and isinstance(v, str) and v not in sources: sources.append(v)
             if not sources: sources = self._available_sources()[:3]
-            self._insert(name=name, desc=f"Hypothesis {str(hid)[:12]}: {str(thesis)[:100]}",
-                         sources=sources, families=[], parent=None, created_by="evolver:hypothesis")
-            return name
+            inserted = self._insert(
+                name=name, desc=f"Hypothesis {str(hid)[:12]}: {str(thesis)[:100]}",
+                sources=sources, families=[], parent=None, created_by="evolver:hypothesis",
+            )
+            if inserted:
+                return name
         return None
 
     def _kill(self, name, reason=""):
@@ -227,12 +262,62 @@ class ModelEvolver:
             r = conn.execute(text("SELECT name, signal_sources, signal_families, description, parent_model FROM oracle_models WHERE name=:n"), {"n": name}).fetchone()
         return {"name": r[0], "signal_sources": r[1], "signal_families": r[2], "description": r[3], "parent_model": r[4]} if r else None
 
-    def _insert(self, *, name, desc, sources, families, parent, created_by):
+    def _active_or_shadow_family_signatures(self) -> set[tuple[str, ...]] | None:
+        """Return canonical signal_families sets for all active or [shadow] models, or None on DB error."""
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT signal_families FROM oracle_models "
+                        "WHERE active = TRUE OR description LIKE :shadow_prefix"
+                    ),
+                    {"shadow_prefix": f"{SHADOW_TAG}%"},
+                ).fetchall()
+            return {_canonical_families(r[0]) for r in rows}
+        except Exception as e:
+            log.warning(
+                "ModelEvolver: active/shadow signal_families query failed (failing closed): {e}",
+                e=str(e),
+            )
+            return None
+
+    def _is_functional_clone(
+        self,
+        families: list[str],
+        parent_families: list[str] | None = None,
+    ) -> tuple[bool, str]:
+        """Refuse models whose vote-determining fields (signal_families) clone an active or shadow model."""
+        # The comparison uses signal_families only because GRID_SIGNAL_REGISTRY
+        # defaults off (oracle/engine.py ~L44); if registry mode is enabled,
+        # signal_sources becomes vote-relevant.
+        cand_sig = _canonical_families(families)
+        if not cand_sig:
+            return True, "empty vote-determining signal_families (OracleEngine._load_models reads only signal_families)"
+        if parent_families is not None and cand_sig == _canonical_families(parent_families):
+            return True, f"unchanged vote-determining signal_families {list(cand_sig)} (mutation only modified unread fields)"
+        existing_sigs = self._active_or_shadow_family_signatures()
+        if existing_sigs is None:
+            return True, "unable to verify active/shadow model signal_families (fail closed)"
+        if cand_sig in existing_sigs:
+            return True, f"vote-determining signal_families {list(cand_sig)} equals an existing active or shadow model"
+        return False, ""
+
+    def _insert(self, *, name, desc, sources, families, parent, created_by, parent_families=None) -> bool:
+        is_clone, reason = self._is_functional_clone(families, parent_families=parent_families)
+        if is_clone:
+            log.info("ModelEvolver: refusing to create '{n}' — {r}", n=name, r=reason)
+            return False
+        shadow_desc = _tag_shadow_description(desc)
+        canon_families = list(_canonical_families(families))
         with self.engine.begin() as conn:
-            conn.execute(text("""
+            res = conn.execute(text("""
                 INSERT INTO oracle_models (name, version, description, signal_families, signal_sources, weight, active, parent_model, created_by, last_updated)
-                VALUES (:name, '1.0', :desc, :fam, :src, 1.0, TRUE, :parent, :cb, NOW()) ON CONFLICT (name) DO NOTHING
-            """), {"name": name, "desc": desc, "fam": json.dumps(families), "src": json.dumps(sources), "parent": parent, "cb": created_by})
+                VALUES (:name, '1.0', :desc, :fam, :src, 0.0, FALSE, :parent, :cb, NOW()) ON CONFLICT (name) DO NOTHING
+            """), {"name": name, "desc": shadow_desc, "fam": json.dumps(canon_families), "src": json.dumps(sources), "parent": parent, "cb": created_by})
+        if getattr(res, "rowcount", 1) == 0:
+            return False
+        log.info("ModelEvolver: staged shadow model '{n}' (active=FALSE, weight=0.0)", n=name)
+        return True
 
     def _log_iteration(self, r, best, worst):
         try:
