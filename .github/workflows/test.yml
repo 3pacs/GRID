@@ -232,6 +232,27 @@ jobs:
             exit 1
           fi
 
+      # model_eligible dry-run audit (#1301): the health half reads
+      # resolved_series point-in-time (obs/release/vintage <= as_of,
+      # retractions by the end of as_of removed before the latest-vintage
+      # pick, equal to PITStore.get_pit on resolver-shaped rows); future-dated
+      # rows appear only in the separate contamination report; NaN/inf/overflow
+      # values fail variance without aborting the scan. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Eligibility audit point-in-time PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_eligibility_audit_pg.py -q -rA | tee /tmp/grid-eligibility-audit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-eligibility-audit-pg.txt; then
+            echo "::error::Eligibility audit point-in-time PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Each database fixture uses a private schema. Run the competing
       # writers, scorers and hourly advisory-lock tests serially.
       - name: Oracle forward measurement PostgreSQL contracts

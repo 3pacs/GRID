@@ -4,9 +4,10 @@ Retired 2026-11-21: Hardcoding ``WHERE id BETWEEN 1 AND 25`` disabled
 ``vix_spot`` (id 11) and ``yld_curve_2s10s`` (id 1), blinding ``auto_regime.py``
 during live volatility shocks.
 
-Use ``normalization.eligibility_audit`` (a dry-run report: observation count, freshness,
-no future dates, non-zero variance) to see what should change, and ship any change as a
-reviewed Alembic migration that records the pre-image of every row it touches.
+Use ``normalization.eligibility_audit`` (a dry-run report: point-in-time observation
+count, freshness and finite non-zero variance, plus a separate report of future-dated
+rows) to see what should change, and ship any change as a reviewed Alembic migration
+that records the pre-image of every row it touches.
 """
 
 from __future__ import annotations
