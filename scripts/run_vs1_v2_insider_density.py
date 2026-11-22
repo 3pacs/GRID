@@ -419,7 +419,17 @@ def cmd_open_holdout(args) -> None:
     probe = None
     if getattr(args, "holdout_probe_report", None):
         path = Path(args.holdout_probe_report)
-        probe = {"sha256": v1.data_sha256(path), "report": json.loads(path.read_text(encoding="utf-8"))}
+        report = json.loads(path.read_text(encoding="utf-8"))
+        manifest = _manifest(args)
+        named = (
+            set(report.get("tickers") or ())
+            | set(report.get("admitted") or ())
+            | set(report.get("abstaining") or ())
+        )
+        extra = sorted(named - set(manifest.admitted))
+        if extra:
+            raise SystemExit(f"holdout basis report names tickers outside the admitted manifest: {extra[:10]}")
+        probe = {"sha256": v1.data_sha256(path), "report": report}
     opened = h.open_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
                             log_dir=Path(args.log_dir), now=_now(), observed=observed, witness=witness,
                             repo_root=REPO, holdout_probe=probe)
@@ -434,7 +444,8 @@ def cmd_holdout(args) -> None:
     key = h.resume_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
                             log_dir=Path(args.log_dir), observed=observed, witness=witness, repo_root=REPO)
     _, admitted, _, prices = _prices(args, universe, "holdout", key)
-    panels = h.build_trial_panels(events, admission, admitted, prices, "holdout")
+    abstain = v2.holdout_abstaining(key.holdout_probe, admitted["ticker"])
+    panels = h.build_trial_panels(events, admission, admitted, prices, "holdout", abstain_tickers=abstain)
     result = h.evaluate_panel_holdout(frozen, panels, key, power=power)
     result["price_receipt_sha256"] = prices.receipt_sha
     h.write_frozen(run_dir, "holdout-result.json", result)
