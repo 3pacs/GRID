@@ -592,6 +592,56 @@ def _binding_summary(bindings: dict[str, dict[str, Any]]) -> dict[str, str]:
     return {concept: b["feature"] for concept, b in bindings.items()}
 
 
+_STORED_SNAPSHOT_PAYLOAD_SQL = text(
+    "SELECT payload FROM analytical_snapshots WHERE id = :sid AND category = :category"
+)
+
+
+def _stored_snapshot_binding(engine, snapshot_id: int | None) -> dict[str, Any]:
+    """``{snapshot_id, snapshot_hash}`` for a saved regime_detection snapshot.
+
+    The hash is taken over the payload as read back from the database, not
+    the in-memory dict: JSONB normalizes numbers (``-0.0`` becomes ``0.0``,
+    ``1e20`` becomes an integer), and readers hash what they read back. So
+    both sides hash the identical post-JSONB object. Returns ``{}`` (no
+    binding, so readers withhold the regime) when the row can't be read back.
+    """
+    from store.snapshots import canonical_payload_sha256
+
+    if snapshot_id is None:
+        return {}
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                _STORED_SNAPSHOT_PAYLOAD_SQL,
+                {"sid": int(snapshot_id), "category": "regime_detection"},
+            ).fetchone()
+        stored = row[0] if row else None
+        if isinstance(stored, str):
+            stored = json.loads(stored)
+        if not isinstance(stored, dict):
+            log.warning("Snapshot {sid} could not be read back; journal entry carries no snapshot binding", sid=snapshot_id)
+            return {}
+        return {"snapshot_id": int(snapshot_id), "snapshot_hash": canonical_payload_sha256(stored)}
+    except Exception as exc:
+        log.warning("Snapshot {sid} read-back failed: {e}; journal entry carries no snapshot binding", sid=snapshot_id, e=str(exc))
+        return {}
+
+
+def _journal_will_accept(confidence: float, transition_probability: float) -> bool:
+    """Mirror DecisionJournal.log_decision's numeric checks (finite, in [0, 1]).
+
+    The snapshot is saved before the journal entry so the entry can name it;
+    when the journal would reject the values anyway, skip the save, as the
+    journal-first order did, so no unbound snapshot is left behind.
+    """
+    return all(
+        isinstance(v, (int, float, np.floating)) and not isinstance(v, bool)
+        and bool(np.isfinite(v)) and 0.0 <= float(v) <= 1.0
+        for v in (confidence, transition_probability)
+    )
+
+
 def compute_regime_at(
     engine,
     as_of: date,
@@ -1155,6 +1205,62 @@ def run() -> dict[str, Any]:
                 f"{biggest_calm[0]} z={biggest_calm[1]['z']:.1f} is calm despite {regime} regime"
             )
 
+    # One run tag joins this run's analytical_snapshots row, its
+    # decision_journal entry and any regime_history revision it causes.
+    run_tag = f"auto_regime.run:{uuid4().hex}"
+
+    # Persist the snapshot FIRST so the journal entry can name it. The
+    # briefing and publication guards publish a regime only when its journal
+    # row binds the exact producer snapshot (id + hash of the stored payload).
+    # A failed save must not block the journal or regime_history writes: the
+    # journal then carries no snapshot binding and readers withhold the regime.
+    binding: dict[str, Any] = {"regime_run_tag": run_tag}
+    try:
+        if not _journal_will_accept(confidence, trans_prob):
+            raise ValueError(
+                f"journal would reject confidence={confidence} / transition_probability={trans_prob}; "
+                "not saving an unbound snapshot"
+            )
+        from store.snapshots import AnalyticalSnapshotStore
+
+        snapshot_payload = {
+            "regime": regime,
+            "confidence": confidence,
+            "posture": posture,
+            "stress_index": round(s_current, 4),
+            "stress_derivative": round(ds, 4),
+            "transition_probability": trans_prob,
+            "distribution": dist,
+            "contradictions": contradictions,
+            "contributions": {k: v for k, v in sorted_contribs[:10]},
+            "n_features": len(fid_to_name),
+            "n_observations": len(df),
+            "features_used": _binding_summary(bindings),
+            "features_missing": missing,
+            "data_as_of": data_as_of.isoformat() if data_as_of else None,
+            "data_staleness_days": data_staleness_days,
+            "stale_features": stale_features,
+            "regime_run_tag": run_tag,
+        }
+        snap_store = AnalyticalSnapshotStore(db_engine=engine)
+        snapshot_id = snap_store.save_snapshot(
+            category="regime_detection",
+            payload=snapshot_payload,
+            as_of_date=today,
+            metrics={
+                "regime": regime,
+                "confidence": round(confidence, 4),
+                "stress_index": round(s_current, 4),
+                "stress_derivative": round(ds, 4),
+            },
+        )
+        if snapshot_id is None:
+            log.warning("Snapshot persistence returned no id; the regime journal entry carries no snapshot binding")
+        binding.update(_stored_snapshot_binding(engine, snapshot_id))
+    except Exception as exc:
+        binding = {"regime_run_tag": run_tag}
+        log.warning("Snapshot persistence failed: {e}", e=str(exc))
+
     # Insert into decision_journal via DecisionJournal class
     # (ensures validation: NaN/Inf rejection, confidence range, etc.)
     from journal.log import DecisionJournal
@@ -1165,7 +1271,7 @@ def run() -> dict[str, Any]:
         inferred_state=regime,
         state_confidence=confidence,
         transition_probability=trans_prob,
-        contradiction_flags=contradictions,
+        contradiction_flags={**contradictions, **binding},
         grid_recommendation=posture,
         baseline_recommendation="NEUTRAL",
         action_taken=f"AUTO_{posture}",
@@ -1184,7 +1290,7 @@ def run() -> dict[str, Any]:
         # Only today's row: earlier dates are never replaced by the scheduled run.
         regime_history_written = persist_regime_history(
             engine, today, regime, confidence, data_as_of=data_as_of,
-            replace=RegimeReplacement(SAME_DAY_REFRESH_REASON, f"auto_regime.run:{uuid4().hex}"),
+            replace=RegimeReplacement(SAME_DAY_REFRESH_REASON, run_tag),
         )
         log.info(
             "regime_history {w} — {d} = {l} (data_as_of {da}, {n} days old)",
@@ -1196,42 +1302,6 @@ def run() -> dict[str, Any]:
     except Exception as exc:
         regime_history_error = str(exc)
         log.warning("regime_history persistence failed: {e}", e=regime_history_error)
-
-    # Persist snapshot
-    try:
-        from store.snapshots import AnalyticalSnapshotStore
-
-        snap_store = AnalyticalSnapshotStore(db_engine=engine)
-        snap_store.save_snapshot(
-            category="regime_detection",
-            payload={
-                "regime": regime,
-                "confidence": confidence,
-                "posture": posture,
-                "stress_index": round(s_current, 4),
-                "stress_derivative": round(ds, 4),
-                "transition_probability": trans_prob,
-                "distribution": dist,
-                "contradictions": contradictions,
-                "contributions": {k: v for k, v in sorted_contribs[:10]},
-                "n_features": len(fid_to_name),
-                "n_observations": len(df),
-                "features_used": _binding_summary(bindings),
-                "features_missing": missing,
-                "data_as_of": data_as_of.isoformat() if data_as_of else None,
-                "data_staleness_days": data_staleness_days,
-                "stale_features": stale_features,
-            },
-            as_of_date=today,
-            metrics={
-                "regime": regime,
-                "confidence": round(confidence, 4),
-                "stress_index": round(s_current, 4),
-                "stress_derivative": round(ds, 4),
-            },
-        )
-    except Exception as exc:
-        log.warning("Snapshot persistence failed: {e}", e=str(exc))
 
     result = {
         "regime": regime,

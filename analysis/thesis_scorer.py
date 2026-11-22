@@ -41,6 +41,7 @@ Each model in the breakdown:
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import time as _time
 from datetime import date, datetime, timedelta, timezone
@@ -63,14 +64,47 @@ EVALUATION_WINDOW_DAYS = 5
 STALE_HOURS = 72  # data older than this gets downweighted
 DEFAULT_ACCURACY = 0.50  # start at coin-flip until we have history
 
+# Regime changepoints (_score_regime_changepoints). The detector
+# (discovery/changepoint_detector.py) stamps its version in
+# signal_registry.provenance and writes a break only while it is fresh; these
+# two values are its CHANGEPOINT_DETECTOR_VERSION and FRESH_BREAK_DAYS (a test
+# pins them together). Rows from the earlier detector (provenance NULL; about
+# 1.08M rows, and 59% of all registry rows written 2026-11-08..22) are ignored
+# by version, not deleted.
+CHANGEPOINT_DETECTOR_VERSION = "changepoint_detector/2"
+CHANGEPOINT_FRESH_DAYS = 5
+# Each feature with a fresh break moves the score by this times the average
+# confidence; the tally is capped so it can never dominate the thesis.
+CHANGEPOINT_POINTS_PER_FEATURE = 10.0
+CHANGEPOINT_SCORE_CAP = 30.0
+CHANGEPOINT_CONFIDENCE_CAP = 60.0
+
 # Fed Net Liquidity 30-day change bands (millions USD; WALCL/WTREGEN are millions,
 # RRPONTSYD is converted from billions via RRPONTSYD_TO_MILLIONS).
 FED_LIQ_MODERATE_MILLIONS = 50_000.0   # $50B
 FED_LIQ_STRONG_MILLIONS = 100_000.0    # $100B
 FED_LIQ_BAND_STEP_MILLIONS = 50_000.0  # $50B linear ramp width
 
-# Options-derived models (dealer_gamma, vanna_charm) freshness gate
+# Options-derived models (dealer_gamma, vanna_charm) freshness gate and proxy labels.
+# Model keys stay "dealer_gamma" and "vanna_charm" for downstream accuracy table stability;
+# names and measurement tags distinguish these proxies from directly observed dealer Greeks.
 OPTIONS_MAX_AGE_TRADING_DAYS = 2
+_DEALER_GAMMA_NAME = "Options Sentiment (PCR Proxy)"
+_DEALER_GAMMA_MEASUREMENT = "proxy:put_call_ratio"
+_VANNA_CHARM_NAME = "Vanna/Charm (Max-Pain Proxy)"
+_VANNA_CHARM_MEASUREMENT = "proxy:max_pain_distance"
+_UNSET = object()
+
+# The two options scorers are live-only. options_daily_signals keeps one mutable
+# row per (ticker, signal_date): no immutable revision history, and no commit-time
+# availability clock (created_at is a write-time lower bound; PostgreSQL NOW() is
+# the writing transaction's start, before its commit). A live read sees only
+# committed rows, so it is sound; the value as of a past decision clock cannot be
+# reproduced. So a replay request, or a session row last written after the
+# decision clock, is reported unavailable and never replaced by an earlier session.
+# A live score's decision clock is the instant just before its read.
+OPTIONS_REPLAY_UNAVAILABLE = "historical_replay_unavailable"
+OPTIONS_WRITTEN_AFTER_CLOCK = "unavailable_written_after_decision_clock"
 
 # News sentiment scoring thresholds
 NEWS_MIN_DIRECTIONAL_ARTICLES = 5
@@ -102,10 +136,217 @@ TOP_RISK_FACTORS_LIMIT = 3
 
 
 def _trading_days_age(sig_date: date, as_of: date) -> int:
-    """Count US equity trading days elapsed strictly after ``sig_date`` through ``as_of``."""
-    if sig_date >= as_of:
+    """Count US equity trading days elapsed strictly after ``sig_date`` through ``as_of``.
+
+    Raises ``ValueError`` when ``sig_date > as_of`` so a future-dated row can
+    never be misread as age 0.
+    """
+    if sig_date > as_of:
+        raise ValueError(
+            f"signal_date {sig_date.isoformat()} is after decision date {as_of.isoformat()}"
+        )
+    if sig_date == as_of:
         return 0
     return len(trading_days_between(sig_date + timedelta(days=1), as_of))
+
+
+def _coerce_utc_timestamp(value: Any) -> datetime | None:
+    """Normalize a timestamp value to timezone-aware UTC, or None if invalid."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = _dt.datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, _dt.datetime):
+        return None
+    return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _coerce_signal_date(value: Any) -> date | None:
+    """Normalize a DB date value to ``date``, or None if missing/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    if isinstance(value, str):
+        try:
+            return _dt.date.fromisoformat(value)
+        except ValueError:
+            try:
+                return _dt.datetime.fromisoformat(value).date()
+            except ValueError:
+                return None
+    return None
+
+
+def _options_decision_clock(as_of_ts: datetime | None) -> tuple[datetime, bool]:
+    """``(decision_clock, is_replay)``. None means live: now, UTC.
+
+    Any explicit clock is a replay, even one a moment ago: a row committed
+    between that clock and the read is visible to the read but carries a
+    created_at from before its commit, so only a live read is sound.
+    """
+    if as_of_ts is None:
+        now = datetime.now(timezone.utc)
+        return (now if now.tzinfo else now.replace(tzinfo=timezone.utc)), False
+    clock = as_of_ts if as_of_ts.tzinfo else as_of_ts.replace(tzinfo=timezone.utc)
+    return clock.astimezone(timezone.utc), True
+
+
+def _options_unavailable(
+    model_key: str,
+    model_name: str,
+    measurement: str,
+    accuracy: float,
+    availability: str,
+    threshold: str,
+    reasoning: str,
+) -> dict[str, Any]:
+    """A fail-closed ``no_data`` verdict that says why the evidence is unavailable."""
+    verdict = _verdict(
+        model_key, model_name,
+        0, 0, "historical value unavailable", threshold, reasoning,
+        data_age_hours=None, historical_accuracy=accuracy, status="no_data",
+        measurement=measurement,
+    )
+    verdict["evidence_availability"] = availability
+    return verdict
+
+
+def _options_replay_refusal(
+    model_key: str, model_name: str, measurement: str, accuracy: float, as_of_ts: datetime,
+) -> dict[str, Any]:
+    return _options_unavailable(
+        model_key, model_name, measurement, accuracy, OPTIONS_REPLAY_UNAVAILABLE,
+        "live decision clock only",
+        f"SPY options values as of {as_of_ts.isoformat()} cannot be reproduced: "
+        "options_daily_signals keeps one mutable row per session, with no revision "
+        "history or commit-time availability clock. Not scored; no other session substituted.",
+    )
+
+
+def _label_options_session(verdict: dict[str, Any], sig_date_raw: Any, as_of_date: date) -> dict[str, Any]:
+    """Name the session a live score used; say so when it is an earlier session."""
+    sig_date = _coerce_signal_date(sig_date_raw)
+    if sig_date is None:
+        return verdict
+    verdict["evidence_session"] = sig_date.isoformat()
+    if sig_date == as_of_date:
+        verdict["evidence_basis"] = "same_session"
+    else:
+        verdict["evidence_basis"] = "prior_session"
+        verdict["reasoning"] = (
+            f"Uses an earlier session's row ({sig_date.isoformat()}): no {as_of_date.isoformat()} "
+            "row was written by the decision clock. " + verdict["reasoning"]
+        )
+    return verdict
+
+
+def _validate_options_clock(
+    *,
+    model_key: str,
+    model_name: str,
+    measurement: str,
+    metric_summary: str,
+    sig_date_raw: Any,
+    created_at_raw: Any,
+    as_of_ts: datetime,
+    accuracy: float,
+) -> tuple[float | None, dict[str, Any] | None]:
+    """Defend options-derived scores against future dates, late captures, and staleness.
+
+    Returns ``(age_hours, None)`` when eligible and fresh, or ``(None, verdict)``
+    with a fail-closed ``no_data`` / ``stale`` verdict otherwise.
+    """
+    as_of_date = as_of_ts.date()
+    sig_date = _coerce_signal_date(sig_date_raw)
+    if sig_date is None:
+        log.warning(
+            "{m}: missing signal_date — marking stale and excluding from score",
+            m=model_name,
+        )
+        return None, _verdict(
+            model_key, model_name,
+            0, 0, f"stale {metric_summary} (unknown date)",
+            f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+            "SPY options signal_date is missing; excluded from score.",
+            data_age_hours=None, historical_accuracy=accuracy, status="stale",
+            measurement=measurement,
+        )
+
+    date_age_hours = (as_of_date - sig_date).days * 24.0
+    if sig_date > as_of_date or date_age_hours < 0:
+        log.warning(
+            "{m}: lookahead guard rejected signal_date={sd} > as_of={as_of} "
+            "(age_hours={ah:.1f}) — failing closed",
+            m=model_name, sd=sig_date, as_of=as_of_date, ah=date_age_hours,
+        )
+        return None, _verdict(
+            model_key, model_name,
+            0, 0, "no eligible data",
+            f"signal_date <= {as_of_date.isoformat()}",
+            f"SPY options signal_date {sig_date} is after decision date {as_of_date}; "
+            "excluded from score (lookahead guard).",
+            data_age_hours=None, historical_accuracy=accuracy, status="no_data",
+            measurement=measurement,
+        )
+
+    age_hours = date_age_hours
+    if created_at_raw is not _UNSET:
+        created_ts = _coerce_utc_timestamp(created_at_raw)
+        if created_ts is None:
+            log.warning(
+                "{m}: missing/invalid created_at for signal_date={sd} — failing closed",
+                m=model_name, sd=sig_date,
+            )
+            return None, _verdict(
+                model_key, model_name,
+                0, 0, "no eligible data",
+                f"created_at <= {as_of_ts.isoformat()}",
+                "SPY options created_at timestamp is missing or unverifiable; excluded from score.",
+                data_age_hours=None, historical_accuracy=accuracy, status="no_data",
+                measurement=measurement,
+            )
+        capture_age_hours = (as_of_ts - created_ts).total_seconds() / 3600.0
+        if capture_age_hours < 0:
+            log.warning(
+                "{m}: lookahead guard rejected created_at={ca} > as_of={as_of} "
+                "(age_hours={ah:.2f}) — failing closed",
+                m=model_name, ca=created_ts.isoformat(), as_of=as_of_ts.isoformat(),
+                ah=capture_age_hours,
+            )
+            return None, _options_unavailable(
+                model_key, model_name, measurement, accuracy, OPTIONS_WRITTEN_AFTER_CLOCK,
+                f"created_at <= {as_of_ts.isoformat()}",
+                f"SPY options row for {sig_date.isoformat()} was last written at "
+                f"{created_ts.isoformat()}, after decision clock {as_of_ts.isoformat()} "
+                "(late capture or in-place revision). Its value as of the decision clock "
+                "cannot be reproduced; not scored, and no earlier session substituted "
+                "(lookahead guard).",
+            )
+        age_hours = max(date_age_hours, capture_age_hours)
+
+    trading_age = _trading_days_age(sig_date, as_of_date)
+    if trading_age > OPTIONS_MAX_AGE_TRADING_DAYS:
+        log.warning(
+            "{m} stale: signal_date={sd}, trading_days_old={td} > {lim}",
+            m=model_name, sd=sig_date, td=trading_age, lim=OPTIONS_MAX_AGE_TRADING_DAYS,
+        )
+        return None, _verdict(
+            model_key, model_name,
+            0, 0, f"stale {metric_summary} (as of {sig_date})",
+            f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+            f"SPY options data is {trading_age} trading days old (last signal {sig_date}, "
+            f"max {OPTIONS_MAX_AGE_TRADING_DAYS}); excluded from score.",
+            data_age_hours=age_hours, historical_accuracy=accuracy, status="stale",
+            measurement=measurement,
+        )
+
+    return age_hours, None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -123,6 +364,7 @@ def _verdict(
     data_age_hours: float | None = None,
     historical_accuracy: float = DEFAULT_ACCURACY,
     status: str = "active",
+    measurement: str | None = None,
 ) -> dict[str, Any]:
     """Build an immutable model verdict dict.
 
@@ -138,7 +380,7 @@ def _verdict(
     else:
         direction = "neutral"
 
-    return {
+    verdict: dict[str, Any] = {
         "key": key,
         "name": name,
         "score": round(clamped_score, 1),
@@ -151,6 +393,9 @@ def _verdict(
         "historical_accuracy": round(historical_accuracy, 3),
         "status": status,
     }
+    if measurement is not None:
+        verdict["measurement"] = measurement
+    return verdict
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -292,8 +537,10 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
             status="broken", historical_accuracy=accuracy)
 
 
-def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
-    """Dealer gamma via SPY put/call ratio.
+def _score_dealer_gamma(engine: Engine, accuracy: float, as_of_ts: datetime | None = None) -> dict:
+    """Put/call ratio proxy for dealer gamma (not directly observed dealer gamma).
+
+    Model key remains ``dealer_gamma`` for downstream accuracy table stability.
 
     Logic: PCR is the ratio of put volume to call volume.
     - PCR < 0.6  → extreme complacency, contrarian bearish (-30)
@@ -305,49 +552,52 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
     Note: PCR is CONTRARIAN.  High put buying = bullish setup.
     """
     try:
+        as_of_ts, is_replay = _options_decision_clock(as_of_ts)
+        if is_replay:
+            return _options_replay_refusal(
+                "dealer_gamma", _DEALER_GAMMA_NAME, _DEALER_GAMMA_MEASUREMENT, accuracy, as_of_ts,
+            )
+        as_of_date = as_of_ts.date()
+
+        # The newest session at or before the decision date, whatever its write
+        # time: if it was written after the clock, the guard below reports it
+        # unavailable rather than letting SQL fall through to an earlier session.
         with engine.connect() as conn:
-            row = conn.execute(visible_sql(
-                "SELECT put_call_ratio, spot_price, signal_date "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE ticker = 'SPY' AND put_call_ratio IS NOT NULL "
-                "ORDER BY signal_date DESC LIMIT 1"
-            )).fetchone()
+            row = conn.execute(
+                visible_sql(
+                    "SELECT put_call_ratio, spot_price, signal_date, created_at "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                    "WHERE ticker = 'SPY' AND put_call_ratio IS NOT NULL "
+                    "AND signal_date <= :as_of_date "
+                    "ORDER BY signal_date DESC, created_at DESC LIMIT 1"
+                ),
+                {"as_of_date": as_of_date},
+            ).fetchone()
 
             if not row or not row[0]:
-                return _verdict("dealer_gamma", "Options Sentiment (PCR)",
+                return _verdict(
+                    "dealer_gamma", _DEALER_GAMMA_NAME,
                     0, 0, "no data", "", "No SPY options data available.",
-                    status="no_data", historical_accuracy=accuracy)
+                    status="no_data", historical_accuracy=accuracy,
+                    measurement=_DEALER_GAMMA_MEASUREMENT,
+                )
 
             pcr = float(row[0])
             spot = float(row[1]) if row[1] else None
-            sig_date = row[2]
-            if isinstance(sig_date, datetime):
-                sig_date = sig_date.date()
-            today = datetime.now(timezone.utc).date()
-            if sig_date is None:
-                log.warning("Dealer gamma: missing signal_date — marking stale and excluding from score")
-                return _verdict(
-                    "dealer_gamma", "Options Sentiment (PCR)",
-                    0, 0, f"stale SPY PCR = {pcr:.2f} (unknown date)",
-                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
-                    "SPY options signal_date is missing; excluded from score.",
-                    data_age_hours=None, historical_accuracy=accuracy, status="stale",
-                )
-            age_hours = (today - sig_date).days * 24
-            trading_age = _trading_days_age(sig_date, today)
-            if trading_age > OPTIONS_MAX_AGE_TRADING_DAYS:
-                log.warning(
-                    "Dealer gamma stale: signal_date={sd}, trading_days_old={td} > {m}",
-                    sd=sig_date, td=trading_age, m=OPTIONS_MAX_AGE_TRADING_DAYS,
-                )
-                return _verdict(
-                    "dealer_gamma", "Options Sentiment (PCR)",
-                    0, 0, f"stale SPY PCR = {pcr:.2f} (as of {sig_date})",
-                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
-                    f"SPY options data is {trading_age} trading days old (last signal {sig_date}, "
-                    f"max {OPTIONS_MAX_AGE_TRADING_DAYS}); excluded from score.",
-                    data_age_hours=age_hours, historical_accuracy=accuracy, status="stale",
-                )
+            sig_date_raw = row[2]
+            created_at_raw = row[3] if len(row) > 3 else _UNSET
+            age_hours, rejected = _validate_options_clock(
+                model_key="dealer_gamma",
+                model_name=_DEALER_GAMMA_NAME,
+                measurement=_DEALER_GAMMA_MEASUREMENT,
+                metric_summary=f"SPY PCR = {pcr:.2f}",
+                sig_date_raw=sig_date_raw,
+                created_at_raw=created_at_raw,
+                as_of_ts=as_of_ts,
+                accuracy=accuracy,
+            )
+            if rejected is not None:
+                return rejected
 
             # Contrarian scoring
             if pcr < 0.6:
@@ -370,77 +620,90 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
             if age_hours and age_hours > 48:
                 confidence *= 0.7
 
-            return _verdict(
-                "dealer_gamma", "Options Sentiment (PCR)",
+            return _label_options_session(_verdict(
+                "dealer_gamma", _DEALER_GAMMA_NAME,
                 score, confidence,
                 data_point=f"SPY PCR = {pcr:.2f}" + (f", spot ${spot:.0f}" if spot else ""),
                 threshold="<0.6 contrarian bear, 0.6-0.8 bull, 1.0-1.3 contrarian bull, >1.3 strong contrarian bull",
-                reasoning=f"SPY put/call ratio is {pcr:.2f} ({label}). "
-                    f"{'High put buying historically precedes reversals upward.' if pcr > 1.0 else 'Low put buying signals complacency risk.' if pcr < 0.7 else 'Sentiment in neutral range.'}",
+                reasoning=(
+                    f"Put/call ratio proxy (not directly observed dealer gamma): "
+                    f"SPY put/call ratio is {pcr:.2f} ({label}). "
+                    f"{'High put buying historically precedes reversals upward.' if pcr > 1.0 else 'Low put buying signals complacency risk.' if pcr < 0.7 else 'Sentiment in neutral range.'}"
+                ),
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
-            )
+                measurement=_DEALER_GAMMA_MEASUREMENT,
+            ), sig_date_raw, as_of_date)
     except Exception as exc:
         log.debug("Dealer gamma scorer error: {e}", e=str(exc))
-        return _verdict("dealer_gamma", "Options Sentiment (PCR)",
+        return _verdict(
+            "dealer_gamma", _DEALER_GAMMA_NAME,
             0, 0, "error", "", f"Scorer error: {exc}",
-            status="broken", historical_accuracy=accuracy)
+            status="broken", historical_accuracy=accuracy,
+            measurement=_DEALER_GAMMA_MEASUREMENT,
+        )
 
 
-def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
-    """Vanna/charm: spot distance from max pain.
+def _score_vanna_charm(engine: Engine, accuracy: float, as_of_ts: datetime | None = None) -> dict:
+    """Max-pain distance proxy for vanna/charm (not directly observed dealer vanna/charm).
 
-    Logic: Options market makers hedge toward max pain as expiry approaches.
-    - Spot > max pain by 2%+ → charm pulls DOWN (bearish -30 to -50)
+    Model key remains ``vanna_charm`` for downstream accuracy table stability.
+
+    Logic: Uses spot distance from max pain as a pin-pressure proxy.
+    - Spot > max pain by 2%+ → pull DOWN (bearish -30 to -50)
     - Spot > max pain by 1-2% → mild bearish (-10 to -30)
     - Spot within 1% of max pain → pinned/neutral
     - Spot < max pain by 1-2% → mild bullish (+10 to +30)
-    - Spot < max pain by 2%+ → charm pulls UP (bullish +30 to +50)
+    - Spot < max pain by 2%+ → pull UP (bullish +30 to +50)
 
     Confidence increases closer to OpEx (Friday).
     """
     try:
+        as_of_ts, is_replay = _options_decision_clock(as_of_ts)
+        if is_replay:
+            return _options_replay_refusal(
+                "vanna_charm", _VANNA_CHARM_NAME, _VANNA_CHARM_MEASUREMENT, accuracy, as_of_ts,
+            )
+        as_of_date = as_of_ts.date()
+
+        # The newest session at or before the decision date, whatever its write
+        # time: if it was written after the clock, the guard below reports it
+        # unavailable rather than letting SQL fall through to an earlier session.
         with engine.connect() as conn:
-            row = conn.execute(visible_sql(
-                "SELECT max_pain, spot_price, signal_date "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0 "
-                "ORDER BY signal_date DESC LIMIT 1"
-            )).fetchone()
+            row = conn.execute(
+                visible_sql(
+                    "SELECT max_pain, spot_price, signal_date, created_at "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                    "WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0 "
+                    "AND signal_date <= :as_of_date "
+                    "ORDER BY signal_date DESC, created_at DESC LIMIT 1"
+                ),
+                {"as_of_date": as_of_date},
+            ).fetchone()
 
             if not row:
-                return _verdict("vanna_charm", "Vanna/Charm (Max Pain)",
+                return _verdict(
+                    "vanna_charm", _VANNA_CHARM_NAME,
                     0, 0, "no data", "", "No max pain data available.",
-                    status="no_data", historical_accuracy=accuracy)
+                    status="no_data", historical_accuracy=accuracy,
+                    measurement=_VANNA_CHARM_MEASUREMENT,
+                )
 
-            mp, spot, sig_date = float(row[0]), float(row[1]), row[2]
-            if isinstance(sig_date, datetime):
-                sig_date = sig_date.date()
-            today = datetime.now(timezone.utc).date()
-            if sig_date is None:
-                log.warning("Vanna/charm: missing signal_date — marking stale and excluding from score")
-                return _verdict(
-                    "vanna_charm", "Vanna/Charm (Max Pain)",
-                    0, 0, f"stale max pain ${mp:.0f} (unknown date)",
-                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
-                    "SPY options signal_date is missing; excluded from score.",
-                    data_age_hours=None, historical_accuracy=accuracy, status="stale",
-                )
-            age_hours = (today - sig_date).days * 24
-            trading_age = _trading_days_age(sig_date, today)
-            if trading_age > OPTIONS_MAX_AGE_TRADING_DAYS:
-                log.warning(
-                    "Vanna/charm stale: signal_date={sd}, trading_days_old={td} > {m}",
-                    sd=sig_date, td=trading_age, m=OPTIONS_MAX_AGE_TRADING_DAYS,
-                )
-                return _verdict(
-                    "vanna_charm", "Vanna/Charm (Max Pain)",
-                    0, 0, f"stale max pain ${mp:.0f} (as of {sig_date})",
-                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
-                    f"SPY options data is {trading_age} trading days old (last signal {sig_date}, "
-                    f"max {OPTIONS_MAX_AGE_TRADING_DAYS}); excluded from score.",
-                    data_age_hours=age_hours, historical_accuracy=accuracy, status="stale",
-                )
+            mp, spot, sig_date_raw = float(row[0]), float(row[1]), row[2]
+            created_at_raw = row[3] if len(row) > 3 else _UNSET
+            age_hours, rejected = _validate_options_clock(
+                model_key="vanna_charm",
+                model_name=_VANNA_CHARM_NAME,
+                measurement=_VANNA_CHARM_MEASUREMENT,
+                metric_summary=f"max pain ${mp:.0f}",
+                sig_date_raw=sig_date_raw,
+                created_at_raw=created_at_raw,
+                as_of_ts=as_of_ts,
+                accuracy=accuracy,
+            )
+            if rejected is not None:
+                return rejected
+
             gap_pct = (spot - mp) / spot * 100
 
             # Score: linear in gap
@@ -456,31 +719,36 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
                 score = 30 + min(20, (abs(gap_pct) - 2) * 10)
 
             # Confidence: higher closer to Friday (OpEx)
-            days_to_friday = (4 - today.weekday()) % 7
+            days_to_friday = (4 - as_of_date.weekday()) % 7
             opex_boost = max(0, 15 - days_to_friday * 3)
             confidence = 40 + opex_boost + (accuracy * 15)
             if age_hours and age_hours > 48:
                 confidence *= 0.6
 
-            return _verdict(
-                "vanna_charm", "Vanna/Charm (Max Pain)",
+            return _label_options_session(_verdict(
+                "vanna_charm", _VANNA_CHARM_NAME,
                 score, confidence,
                 data_point=f"Spot ${spot:.0f} vs max pain ${mp:.0f} (gap {gap_pct:+.1f}%)",
                 threshold="bearish if spot >1% above max pain, bullish if >1% below",
                 reasoning=(
+                    f"Max-pain distance proxy (not directly observed vanna/charm): "
                     f"SPY spot is {abs(gap_pct):.1f}% {'above' if gap_pct > 0 else 'below'} "
                     f"max pain (${mp:.0f}). "
-                    f"{'Charm and dealer hedging should pull price down toward max pain.' if gap_pct > 1 else 'Charm should pull price up toward max pain.' if gap_pct < -1 else 'Spot near max pain — dealers are balanced, expect low volatility.'}"
+                    f"{'Distance above max pain implies downward pin pressure toward max pain.' if gap_pct > 1 else 'Distance below max pain implies upward pin pressure toward max pain.' if gap_pct < -1 else 'Spot near max pain — limited implied pin pressure.'}"
                     + (f" OpEx in {days_to_friday} day{'s' if days_to_friday != 1 else ''} — gravitational pull strengthening." if days_to_friday <= 3 else "")
                 ),
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
-            )
+                measurement=_VANNA_CHARM_MEASUREMENT,
+            ), sig_date_raw, as_of_date)
     except Exception as exc:
         log.debug("Vanna/charm scorer error: {e}", e=str(exc))
-        return _verdict("vanna_charm", "Vanna/Charm (Max Pain)",
+        return _verdict(
+            "vanna_charm", _VANNA_CHARM_NAME,
             0, 0, "error", "", f"Scorer error: {exc}",
-            status="broken", historical_accuracy=accuracy)
+            status="broken", historical_accuracy=accuracy,
+            measurement=_VANNA_CHARM_MEASUREMENT,
+        )
 
 
 def _score_congressional(engine: Engine, accuracy: float) -> dict:
@@ -906,17 +1174,62 @@ def _score_trust_convergence(engine: Engine, accuracy: float) -> dict:
             status="broken", historical_accuracy=accuracy)
 
 
-def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
-    """Regime changepoint signals from the discovery pipeline.
+def _score_regime_changepoints(engine: Engine, accuracy: float, as_of: datetime | None = None) -> dict:
+    """Regime changepoints: which declared regime features broke recently, as of ``as_of``.
 
-    Logic: The changepoint detector publishes regime change signals
-    (rising/falling/stable) to signal_registry every 12h.  Count
-    bullish vs bearish regime transitions in the last 48 hours.
+    Logic: discovery/changepoint_detector.py writes one signal_registry row
+    per point-in-time drift break on a declared regime feature (VIX, credit
+    spreads, curve, 10y, S&P 500, net liquidity, dollar, claims, breakevens),
+    stamped with its version in ``provenance``. ``direction`` is already the
+    risk reading: bullish = toward risk-on, bearish = toward risk-off.
 
-    Score scales with the net direction and average confidence of
-    the detected changepoints.
+    ``as_of`` is an explicit instant (default: now, UTC; a naive value is
+    UTC). A row is visible at ``as_of`` only if both fences hold, each on the
+    row itself, in SQL and before any reconciliation:
+
+    * ``valid_from <= as_of``: its availability;
+    * ``metadata.published_at <= as_of``: the scan that actually wrote it.
+      A break's first row written by a late scan has valid_from = its
+      effective known-at, earlier than the scan; without this fence a replay
+      between the two would see a break GRID did not hold yet, and a
+      withdrawal or revision published after ``as_of`` could change what was
+      live then.
+
+    A row with no ``published_at`` (none is written by detector version 2)
+    is not visible and is counted as ``unpublished``.
+
+    Counts *features*, not visible rows, in three steps:
+
+    1. Each break (``signal_id``) is reduced to its latest availability row
+       (``valid_from``). A break re-evaluated on a later vintage has a later
+       row of the same signal_id; one no longer detected has a row with
+       metadata status ``withdrawn``.
+    2. Breaks whose latest row is a withdrawal are dropped, and so are breaks
+       whose effective known-at is older than CHANGEPOINT_FRESH_DAYS
+       before ``as_of``.
+    3. Each feature counts once, by its surviving break with the latest
+       break date, so withdrawing one break never hides another on the same
+       feature.
+
+    Two times are kept apart. ``metadata.effective_known_at`` is when the
+    break became knowable from its inputs (release, vintage and retraction
+    dates); the freshness window is measured on it. ``metadata.
+    first_published_at`` is when the detector first wrote the break; it is
+    informational and never extends freshness. ``valid_from`` is the row's
+    availability: the effective known-at for a break's first row, and never
+    before the scan that saw a revision or withdrawal.
+
+    Only rows of CHANGEPOINT_DETECTOR_VERSION count; the earlier detector's
+    rows (about 1.08M, one per feature per index per 12 h scan) are ignored.
+    Score = net (risk-on minus risk-off features) x
+    CHANGEPOINT_POINTS_PER_FEATURE x average confidence, capped at
+    +/-CHANGEPOINT_SCORE_CAP; confidence is capped at
+    CHANGEPOINT_CONFIDENCE_CAP.
     """
     try:
+        as_of = as_of or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
         with engine.connect() as conn:
             # Guard: table might not exist yet
             try:
@@ -929,88 +1242,154 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy,
                 )
 
+            # Both fences on every row, before reconciliation. valid_from >=
+            # effective known-at on every row, so the window holds every row
+            # whose break can still be fresh at as_of. Rows without
+            # published_at come back flagged and are dropped below.
             rows = conn.execute(text(
-                "SELECT direction, confidence, value, valid_from "
+                "SELECT signal_id, ticker, direction, confidence, valid_from, "
+                "metadata->>'status', metadata->>'break_date', "
+                "COALESCE(CAST(metadata->>'effective_known_at' AS timestamptz), valid_from), "
+                "metadata->>'published_at' IS NULL "
                 "FROM signal_registry "
                 "WHERE source_module = :src "
                 "AND signal_type = :stype "
-                "AND valid_from >= NOW() - INTERVAL '48 hours' "
-                "ORDER BY valid_from DESC"
+                "AND provenance = :version "
+                "AND valid_from <= :as_of "
+                "AND valid_from > :window_start "
+                "AND (metadata->>'published_at' IS NULL "
+                "OR CAST(metadata->>'published_at' AS timestamptz) <= :as_of) "
+                "ORDER BY valid_from DESC "
+                "LIMIT :row_limit"
             ).bindparams(
                 src="discovery.changepoint_detector",
                 stype="regime_change",
+                version=CHANGEPOINT_DETECTOR_VERSION,
+                as_of=as_of,
+                window_start=as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS),
+                row_limit=1000,
             )).fetchall()
 
+        window = f"{CHANGEPOINT_FRESH_DAYS}d"
+        unpublished_count = sum(1 for r in rows if r[8])
+        rows = [r for r in rows if not r[8]]
         if not rows:
             return _verdict(
                 "regime_changepoints", "Regime Changepoints",
-                0, 0, "no recent signals", "",
-                "No regime change signals in last 48 hours.",
+                0, 0, "no fresh breaks", "",
+                f"No declared regime feature has a break known in the last {window} "
+                f"as of {as_of.isoformat()} (detector {CHANGEPOINT_DETECTOR_VERSION}"
+                + (f"; {unpublished_count} row{'s' if unpublished_count != 1 else ''} without "
+                   "published_at not visible" if unpublished_count else "")
+                + ").",
                 status="no_data", historical_accuracy=accuracy,
             )
 
-        bullish = [r for r in rows if r[0] == "bullish"]
-        bearish = [r for r in rows if r[0] == "bearish"]
-        total = len(rows)
+        # rows: (signal_id, ticker, direction, confidence, valid_from, status,
+        # break_date, effective_known_at, unpublished), newest valid_from first.
+        def _utc(ts: Any) -> Any:
+            return ts if ts is None or ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+        # 1. Latest availability per break (by valid_from, whatever the row order).
+        latest_by_break: dict[Any, Any] = {}
+        for i, r in enumerate(rows):
+            key = r[0] if r[0] is not None else ("row", i)
+            current = latest_by_break.get(key)
+            if current is None or _utc(r[4]) > _utc(current[4]):
+                latest_by_break[key] = r
+        # 2. Drop withdrawn breaks, then breaks no longer fresh by effective known-at.
+        live = [r for r in latest_by_break.values() if r[5] != "withdrawn"]
+        withdrawn_count = len(latest_by_break) - len(live)
+        fresh_after = as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS)
+        fresh = [r for r in live if _utc(r[7]) is not None and _utc(r[7]) > fresh_after]
+        aged_count = len(live) - len(fresh)
+        # 3. One break per feature: the latest break date, then the latest availability.
+        by_feature: dict[Any, Any] = {}
+        for r in fresh:
+            current = by_feature.get(r[1])
+            if current is None or (str(r[6] or ""), _utc(r[4])) > (str(current[6] or ""), _utc(current[4])):
+                by_feature[r[1]] = r
+        features = [(r[1], r[2], r[3], r[7]) for r in by_feature.values()]
+        if not features:
+            return _verdict(
+                "regime_changepoints", "Regime Changepoints",
+                0, 0, "no fresh breaks", "",
+                f"No live regime break known in the last {window}: {withdrawn_count} "
+                f"withdrawn on later data, {aged_count} older than the window "
+                f"(as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}).",
+                status="no_data", historical_accuracy=accuracy,
+            )
+        total = len(features)
+        bullish = sorted(str(r[0]) for r in features if r[1] == "bullish")
+        bearish = sorted(str(r[0]) for r in features if r[1] == "bearish")
         bull_count = len(bullish)
         bear_count = len(bearish)
-        neutral_count = sum(r[0] == "neutral" for r in rows)
+        neutral_count = sum(r[1] == "neutral" for r in features)
         other_count = total - bull_count - bear_count - neutral_count
 
-        # Average confidence across all signals (0-1 scale)
-        avg_conf = sum(float(r[1]) for r in rows) / total
-        # Average magnitude
-        avg_mag = sum(abs(float(r[2])) for r in rows) / total
+        # Average confidence over every counted feature, unknown ones included
+        avg_conf = sum(float(r[2] or 0) for r in features) / total
 
-        # Net direction: each signal ~ 12 points, scaled by avg confidence
         net = bull_count - bear_count
-        score = net * 12 * avg_conf
-        score = max(-80, min(80, score))
+        score = net * CHANGEPOINT_POINTS_PER_FEATURE * avg_conf
+        score = max(-CHANGEPOINT_SCORE_CAP, min(CHANGEPOINT_SCORE_CAP, score))
 
-        # Confidence: base from signal count and their confidence values
-        conf_base = 25
-        conf_volume = min(25, total * 5)
-        conf_quality = avg_conf * 25  # 0-25 from signal confidence
-        conf_accuracy = accuracy * 15
-        confidence = min(90, conf_base + conf_volume + conf_quality + conf_accuracy)
+        conf_base = 20
+        conf_volume = min(20, total * 4)
+        conf_quality = avg_conf * 20  # 0-20 from break confidence
+        conf_accuracy = accuracy * 10
+        confidence = min(CHANGEPOINT_CONFIDENCE_CAP,
+                         conf_base + conf_volume + conf_quality + conf_accuracy)
 
-        # Data age from most recent signal
-        most_recent = rows[0][3]  # valid_from of most recent
+        # Data age from the most recently knowable counted break
+        most_recent = max(_utc(r[3]) for r in features)
         age_hours = None
         if most_recent:
             try:
                 ts = most_recent if most_recent.tzinfo else most_recent.replace(tzinfo=timezone.utc)
-                age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                age_hours = (as_of - ts).total_seconds() / 3600
             except Exception as exc:
                 log.warning("Failed to compute regime changepoints age: {e}", e=exc)
+
+        def _named(names: list[str]) -> str:
+            return f" ({', '.join(names)})" if names else ""
 
         result = _verdict(
             "regime_changepoints", "Regime Changepoints",
             score, confidence,
             data_point=(
+                f"{total} feature{'s' if total != 1 else ''} with a fresh break: "
                 f"{bull_count} bullish, {bear_count} bearish, "
                 f"{neutral_count} neutral, {other_count} other/unknown "
-                f"(48h, avg conf {avg_conf:.0%})"
+                f"({window}, avg conf {avg_conf:.0%})"
             ),
-            threshold="each changepoint ~ +/-12 pts scaled by confidence; net direction determines signal",
+            threshold=(
+                f"each feature ~ +/-{CHANGEPOINT_POINTS_PER_FEATURE:g} pts scaled by confidence, "
+                f"capped at +/-{CHANGEPOINT_SCORE_CAP:g}; latest break per feature in {window}"
+            ),
             reasoning=(
-                f"{total} regime changepoints in 48h: "
-                f"{bull_count} bullish, {bear_count} bearish. "
-                f"{neutral_count} explicitly neutral; {other_count} other/unknown. "
-                f"Average confidence {avg_conf:.0%}, magnitude {avg_mag:.2f}. "
-                + ("Net bullish regime shifts suggest improving conditions. "
+                f"{total} declared regime feature{'s' if total != 1 else ''} broke in the last {window}: "
+                f"{bull_count} toward risk-on{_named(bullish)}, "
+                f"{bear_count} toward risk-off{_named(bearish)}. "
+                f"{neutral_count} neutral; {other_count} other/unknown. "
+                + (f"{withdrawn_count} break{'s' if withdrawn_count != 1 else ''} withdrawn on later data, "
+                   "not counted. " if withdrawn_count else "")
+                + f"Average confidence {avg_conf:.0%}. "
+                + ("Net risk-on regime shifts suggest improving conditions. "
                    if net > 0
-                   else "Net bearish regime shifts suggest deteriorating conditions. "
+                   else "Net risk-off regime shifts suggest deteriorating conditions. "
                    if net < 0
                    else "Balanced regime shifts — no clear directional signal. ")
-                + "Changepoints detect structural breaks in feature time series."
+                + f"Point-in-time drift breaks as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}."
             ),
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
         )
         result["category_counts"] = {
+            "unit": "features", "rows_read": len(rows), "breaks_read": len(latest_by_break),
             "total": total, "bullish": bull_count, "bearish": bear_count,
             "neutral": neutral_count, "other_unknown": other_count,
+            "withdrawn": withdrawn_count, "aged_out": aged_count, "unpublished": unpublished_count,
             "known_categories_exhaustive": other_count == 0,
         }
         return result
@@ -2686,6 +3065,17 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
                 "supply_chain": 0.7,
                 "crucix_osint": 1.5, "gdelt_geopolitical": 1.4,
             }
+        elif regime == "FRAGILE":
+            # scripts/auto_regime.py's elevated-stress state (stress index
+            # above 0.6 or rising fast; posture DEFENSIVE): the CRISIS tilts
+            # at half strength.
+            adjustments = {
+                "dealer_gamma": 1.2, "vanna_charm": 1.2,
+                "capital_flows": 1.1, "trust_convergence": 1.15,
+                "regime_changepoints": 1.15,
+                "supply_chain": 0.85,
+                "crucix_osint": 1.25, "gdelt_geopolitical": 1.2,
+            }
         elif regime in ("EXPANSION", "RISK_ON", "GROWTH"):
             adjustments = {
                 "capital_flows": 1.3, "insider_cluster": 1.2,
@@ -2965,8 +3355,8 @@ _MODEL_PLAIN_NAMES: dict[str, str] = {
     "insider_clusters": "Corporate Insider Trading",
     "insider_cluster": "Corporate Insider Trading",
     "options_flow": "Options Market Bets",
-    "dealer_gamma": "Dealer Positioning",
-    "vanna_charm": "Options Decay & Flows",
+    "dealer_gamma": _DEALER_GAMMA_NAME,
+    "vanna_charm": _VANNA_CHARM_NAME,
     "gex": "Dealer Positioning",
     "news_sentiment": "News Mood",
     "social_sentiment": "Social Media Mood",
