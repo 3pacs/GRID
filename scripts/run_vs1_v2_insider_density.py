@@ -104,6 +104,14 @@ V8_CODE_FILES = V7_CODE_FILES + (
     "evals/e0/structure.py",
     "evals/e0/MANIFEST.sha256",
 )
+# v9 additionally pins its harness/CLI, probe-to-manifest builder and pinned XNYS calendar manifest.
+V9_CODE_FILES = V8_CODE_FILES + (
+    "analysis/panel_insider_density_v9.py",
+    "scripts/run_vs1_v9_insider_density.py",
+    "scripts/run_vs1_v9_manifest_from_v8_probe.py",
+    "scripts/build_vs1_calendar_manifest.py",
+    "docs/reference/calendar-manifests/vs1-xnys-2007-11-01-2026-06-30.json",
+)
 
 
 def _now() -> datetime:
@@ -128,7 +136,11 @@ def _events(args, universe):
 
 
 def _code_files(h=v2) -> dict:
-    files = {"vs1-v7": V7_CODE_FILES, "vs1-v8": V8_CODE_FILES}.get(h.VERSION, CODE_FILES)
+    files = {
+        "vs1-v7": V7_CODE_FILES,
+        "vs1-v8": V8_CODE_FILES,
+        "vs1-v9": V9_CODE_FILES,
+    }.get(h.VERSION, CODE_FILES)
     return {f: v1.file_sha256(REPO / f) for f in files}
 
 
