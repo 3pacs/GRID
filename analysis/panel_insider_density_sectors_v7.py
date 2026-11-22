@@ -45,7 +45,7 @@ REGISTRY_ID = v9.SECTORS_V7  # "sectors-v7"
 PREREG_PATH = Path("docs/paper_log/vs1-sectors-v7-preregistration.md")
 #: SHA-256 of the UTF-8 LF body strictly between <!-- PREREG-BODY-START --> and <!-- PREREG-BODY-END -->.
 #: Recompute and re-pin after filling operator placeholder tokens once v8 STOP, sectors-v6 STOP and v9 registration exist.
-PREREG_BODY_SHA256: str | None = "5eeaa010f7fcb97a18c076bf89a517bb9127fb6ea381e775ab2aed790c2b00b0"
+PREREG_BODY_SHA256: str | None = "79d9b9ccaeced29ed3df36e3ffe632605a6240c12abcb9d1320cc0530e466563"
 #: The exact witnessed two-record v9 registration head; placeholder (None) until v9 is registered and witnessed.
 V9_REGISTRATION_HEAD_SHA256: str | None = None
 #: sha256 of GD10b GateSpec v1 (analysis.generalization_gate.GATE_SPEC_V1_SHA256).
