@@ -345,6 +345,36 @@ def _gather_active_actors(engine: Engine, target_date: date) -> dict[str, Any]:
 
 
 _PRE_OPEN_CUTOFF_UTC = time(13, 30)  # roughly US market open
+_NEUTRAL_MISSED_MOVE_PCT = 1.5
+
+
+def _grade_thesis_verdict(
+    morning_thesis: str,
+    actual_outcome: str,
+    sp500_return_pct: float | None = None,
+) -> tuple[str, str | None]:
+    """Grade the pre-open thesis against the actual S&P 500 direction.
+
+    A NEUTRAL pre-open call on a day with |SPX| >= 1.5% is graded ``missed``
+    rather than ``partial`` because sitting neutral missed a large directional
+    move. ``thesis_accuracy`` is an unconstrained JSONB dict whose ``verdict``
+    field accepts free text.
+    """
+    if morning_thesis == actual_outcome:
+        return "correct", None
+    if (
+        morning_thesis == "NEUTRAL"
+        and sp500_return_pct is not None
+        and abs(sp500_return_pct) >= _NEUTRAL_MISSED_MOVE_PCT
+    ):
+        return (
+            "missed",
+            f"NEUTRAL thesis on a {sp500_return_pct:+.2f}% S&P 500 move "
+            f"(|SPX| >= {_NEUTRAL_MISSED_MOVE_PCT:.1f}%)",
+        )
+    if morning_thesis == "NEUTRAL" or actual_outcome == "NEUTRAL":
+        return "partial", None
+    return "wrong", None
 
 
 def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]:
@@ -360,7 +390,7 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
         "morning_thesis": None,
         "morning_conviction": None,
         "actual_outcome": None,
-        "verdict": None,  # correct / wrong / partial / None (no basis to grade)
+        "verdict": None,  # correct / wrong / partial / missed / None (no basis to grade)
         "reason": None,
         "details": [],
     }
@@ -391,6 +421,7 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
 
         # Determine actual market direction from S&P close — gated by the
         # same price-freshness rule as _gather_market_moves (§4.1 fix #2).
+        daily_return: float | None = None
         if PRICES_ENABLED:
             with engine.connect() as conn:
                 pair = _fresh_pair(conn, "YF:^GSPC:close", target_date)
@@ -410,12 +441,14 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
 
         # Compare — only when both sides of the comparison are honest.
         if accuracy["morning_thesis"] and accuracy["actual_outcome"]:
-            if accuracy["morning_thesis"] == accuracy["actual_outcome"]:
-                accuracy["verdict"] = "correct"
-            elif accuracy["morning_thesis"] == "NEUTRAL" or accuracy["actual_outcome"] == "NEUTRAL":
-                accuracy["verdict"] = "partial"
-            else:
-                accuracy["verdict"] = "wrong"
+            verdict, verdict_reason = _grade_thesis_verdict(
+                accuracy["morning_thesis"],
+                accuracy["actual_outcome"],
+                daily_return,
+            )
+            accuracy["verdict"] = verdict
+            if verdict_reason is not None:
+                accuracy["reason"] = verdict_reason
         elif accuracy["reason"] is None:
             accuracy["reason"] = "morning thesis or actual outcome unavailable"
 
@@ -425,14 +458,23 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
         # consumer (api/routers/chat.py, api/routers/intel.py,
         # intelligence/regime/state_vector.py, etc.) reads for the same
         # "anomalies detected today" purpose. See §4.1 fix #4.
+        # Deduplicate by check name (keeping the latest row per name) so
+        # repeated intra-day runs do not fill all 5 slots with identical rows.
         try:
             with engine.connect() as conn:
                 cr_rows = conn.execute(
                     text(
                         "SELECT name, category, assessment, implication "
-                        "FROM cross_reference_checks "
-                        "WHERE DATE(checked_at) = :dt "
-                        "AND assessment IS NOT NULL AND assessment != 'consistent' "
+                        "FROM ("
+                        "  SELECT name, category, assessment, implication, checked_at, "
+                        "         ROW_NUMBER() OVER ("
+                        "           PARTITION BY name ORDER BY checked_at DESC, id DESC"
+                        "         ) AS rn "
+                        "  FROM cross_reference_checks "
+                        "  WHERE DATE(checked_at) = :dt "
+                        "  AND assessment IS NOT NULL AND assessment != 'consistent'"
+                        ") deduped "
+                        "WHERE rn = 1 "
                         "ORDER BY checked_at DESC LIMIT 5"
                     ),
                     {"dt": target_date},
@@ -1174,7 +1216,7 @@ if __name__ == "__main__":
     if args.list:
         result = list_diary_entries(eng)
         for e in result["entries"]:
-            badge = {"correct": "+", "wrong": "X", "partial": "~"}.get(e["verdict"], "?")
+            badge = {"correct": "+", "wrong": "X", "partial": "~", "missed": "!"}.get(e["verdict"], "?")
             print(f"[{badge}] {e['date']}  SP500: {e.get('sp500_return_pct', '?')}%  thesis: {e.get('morning_thesis', '?')}")
     elif args.search:
         results = search_diary(eng, args.search)

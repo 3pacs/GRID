@@ -616,6 +616,10 @@ def _publication_guard(role: str, content: str | None, verdict: dict[str, Any] |
 
 _YF_SNAPSHOT_LOOKBACK_DAYS = 14
 
+# Raw series whose snapshot label differs from their raw_series id. The live
+# 10-year yield is stored as "yc_10y"; briefings and grounding call it DGS10.
+_RAW_SERIES_LABEL_ALIASES: dict[str, str] = {"yc_10y": "DGS10"}
+
 
 def _read_yf_snapshot_value(conn: Any, sid: str, now: datetime) -> dict[str, Any] | None:
     """Latest Yahoo daily value for ``sid`` without serving an in-progress capture.
@@ -764,9 +768,14 @@ class MarketBriefingEngine:
                     ],
                     # FRED series are stored bare in raw_series (fred.py
                     # writes the FRED id as series_id), never "FRED:<id>".
-                    # DGS10 is not in FRED_SERIES_LIST, so DGS5 stands in.
+                    # The 10-year yield is read from raw "yc_10y" (written
+                    # by ingestion/altdata/yield_curve_full.py from FRED
+                    # DGS10; entity_map maps it to treasury_10y) and shown
+                    # under the "DGS10" label grounding uses. Bare raw
+                    # "DGS10" has had no pull since 2026-04, so it is never
+                    # read here (it would publish a stale 10-year).
                     "rates": [
-                        "DFF", "T10Y2Y", "T10Y3M", "DGS2", "DGS5",
+                        "DFF", "T10Y2Y", "T10Y3M", "DGS2", "DGS5", "yc_10y",
                     ],
                     "credit": [
                         "YF:HYG:close", "YF:LQD:close", "YF:JNK:close",
@@ -797,6 +806,7 @@ class MarketBriefingEngine:
                         # Extract a clean label
                         parts = sid.split(":")
                         label = parts[1] if len(parts) > 1 else sid
+                        label = _RAW_SERIES_LABEL_ALIASES.get(sid, label)
                         if sid.startswith("YF:"):
                             entry = _read_yf_snapshot_value(conn, sid, now_utc)
                             if entry:
@@ -902,7 +912,7 @@ class MarketBriefingEngine:
                 ).fetchone()
 
                 if regime_row:
-                    snapshot["latest_regime"] = {
+                    latest_regime: dict[str, Any] = {
                         "state": regime_row[0],
                         "confidence": round(regime_row[1], 4),
                         "transition_prob": round(regime_row[2], 4),
@@ -910,6 +920,46 @@ class MarketBriefingEngine:
                         "recommendation": regime_row[4],
                         "timestamp": str(regime_row[5]),
                     }
+                    bound_count: int | None = None
+                    raw_flags = regime_row[3]
+                    if isinstance(raw_flags, str):
+                        try:
+                            raw_flags = json.loads(raw_flags)
+                        except ValueError:
+                            raw_flags = None
+                    if isinstance(raw_flags, dict):
+                        fu = raw_flags.get("features_used")
+                        if isinstance(fu, (dict, list, tuple, set)):
+                            bound_count = len(fu)
+                    if bound_count is None:
+                        try:
+                            snap_row = conn.execute(
+                                text(
+                                    "SELECT payload FROM analytical_snapshots "
+                                    "WHERE category = :category "
+                                    "ORDER BY snapshot_date DESC, created_at DESC LIMIT 1"
+                                ),
+                                {"category": "regime_detection"},
+                            ).fetchone()
+                            if snap_row and snap_row[0] is not None:
+                                payload = snap_row[0]
+                                if isinstance(payload, str):
+                                    payload = json.loads(payload)
+                                if isinstance(payload, dict):
+                                    snap_regime = payload.get("regime")
+                                    same_regime = (
+                                        not isinstance(snap_regime, str)
+                                        or not snap_regime.strip()
+                                        or snap_regime.strip().upper() == str(regime_row[0]).strip().upper()
+                                    )
+                                    fu = payload.get("features_used") if same_regime else None
+                                    if isinstance(fu, (dict, list, tuple, set)):
+                                        bound_count = len(fu)
+                        except Exception:
+                            pass
+                    if bound_count is not None:
+                        latest_regime["bound_inputs"] = bound_count
+                    snapshot["latest_regime"] = latest_regime
 
                 # Convergence signals from trust scorer
                 try:
@@ -1161,36 +1211,18 @@ class MarketBriefingEngine:
                          + json.dumps(declared, sort_keys=True, ensure_ascii=True))
         lines.append("")
 
-        # Feature values — select most informative via orthogonality
+        # Feature values — select most informative via orthogonality (shared with fallback)
         features = snapshot.get("features", {})
         if features:
-            try:
-                from analysis.prompt_optimizer import select_prompt_features
-
-                # Preserve the existing selector inputs/ordering. Its z field is
-                # a raw-value ranking proxy here, never displayed as measured z.
-                feat_list = [
-                    {"name": name, "z": info["value"], "value": info["value"]}
-                    for name, info in features.items()
-                    if info.get("value") is not None
-                ]
-                selected = select_prompt_features(feat_list, max_count=20, corr_threshold=0.7)
-                lines.append(f"### GRID FEATURES ({len(features)} total, {len(selected)} selected by orthogonality)")
+            selected_names, used_selector = self._select_display_features(features, max_count=20)
+            if used_selector:
+                lines.append(f"### GRID FEATURES ({len(features)} total, {len(selected_names)} selected by orthogonality)")
                 lines.append("Selection uses absolute raw-value ranking proxies, not measured z-scores.")
-                for feature in selected:
-                    name = feature["name"]
-                    lines.append(self._format_evidence_value("features", name, features[name]))
-                lines.append("")
-            except Exception:
-                # Fallback to simple truncation
+            else:
                 lines.append(f"### GRID FEATURES ({len(features)} total, showing top 20)")
-                shown = 0
-                for name, info in features.items():
-                    if shown >= 20:
-                        break
-                    lines.append(self._format_evidence_value("features", name, info))
-                    shown += 1
-                lines.append("")
+            for name in selected_names:
+                lines.append(self._format_evidence_value("features", name, features[name]))
+            lines.append("")
 
         # SPY put/call ratio — explicit, clearly-labeled section so the
         # model has a real number to cite instead of inventing one (see
@@ -1479,6 +1511,17 @@ class MarketBriefingEngine:
 
         from ollama.number_grounding import annotate_publication_context, check_publication_claims
 
+        # ── Truncation guard (raw model output, before context annotation) ──
+        # Inspect the backend stop reason (primary signal) or fallback text
+        # heuristic on the raw candidate BEFORE annotate_publication_context can
+        # replace or append clauses. On non-receipted calls retry once with a
+        # larger token budget; if still truncated, withhold and emit summary.
+        raw_truncation = (
+            self._detect_truncation(candidate, self.ollama)
+            if candidate is not None
+            else None
+        )
+
         claim_guard = check_publication_claims(content, actor_evidence=snapshot.get("actor_evidence"))
         rejected = content if not claim_guard["passed"] else None
         if receipt_callback is not None:
@@ -1487,8 +1530,51 @@ class MarketBriefingEngine:
             else:
                 candidate_guard = _publication_guard("CANDIDATE", candidate, claim_guard)
         snapshot["publication_claim_guard"] = claim_guard
+
+        truncation = (
+            raw_truncation
+            if candidate is not None and claim_guard["passed"]
+            else None
+        )
+        if truncation is not None and receipt_callback is None:
+            log.warning(
+                "Briefing response appeared truncated ({r}); retrying once with num_predict=1600",
+                r=truncation["reason"],
+            )
+            retry_content = self.ollama.chat(
+                messages=messages,
+                temperature=0.4,
+                num_predict=1600,
+            )
+            if retry_content is not None:
+                retry_truncation = self._detect_truncation(retry_content, self.ollama)
+                retry_claim_guard = check_publication_claims(
+                    retry_content, actor_evidence=snapshot.get("actor_evidence"),
+                )
+                if retry_claim_guard["passed"] and retry_truncation is None:
+                    candidate = retry_content
+                    content = retry_content
+                    claim_guard = retry_claim_guard
+                    snapshot["publication_claim_guard"] = claim_guard
+                    snapshot["truncation_guard"] = {
+                        "passed": True,
+                        "retried": True,
+                        "initial_reason": truncation["reason"],
+                    }
+                    truncation = None
+                elif not retry_claim_guard["passed"]:
+                    candidate = retry_content
+                    content = retry_content
+                    rejected = retry_content
+                    claim_guard = retry_claim_guard
+                    snapshot["publication_claim_guard"] = claim_guard
+                    truncation = None
+                else:
+                    truncation = retry_truncation
+
         content, context_guard = annotate_publication_context(content, snapshot)
         snapshot["publication_context_guard"] = context_guard
+
         if not claim_guard["passed"]:
             # Replace the whole candidate instead of leaving its causal story
             # intact with a numeric footnote. Only future generations change.
@@ -1517,22 +1603,44 @@ class MarketBriefingEngine:
             )
             # Existing PR844 internal retention; never input to the summary.
             claim_guard["rejected_candidate"] = rejected
+        elif truncation is not None:
+            log.warning(
+                "Briefing truncation guard withheld {t} narrative: reason={r}",
+                t=briefing_type, r=truncation["reason"],
+            )
+            snapshot["truncation_guard"] = {"passed": False, **truncation}
+            publication_status.update(content_kind="data_summary", reason="truncated_response")
+            summary = self._generate_fallback_briefing(snapshot, reason="truncated_response")
+            fallback_source_text = summary
+            summary_guard = check_publication_claims(summary, actor_evidence=snapshot.get("actor_evidence"))
+            if receipt_callback is not None:
+                fallback_guards.append(_publication_guard("DATA_SUMMARY", summary, summary_guard))
+            claim_guard["fallback"] = summary_guard
+            summary, fallback_context_guard = annotate_publication_context(summary, snapshot)
+            context_guard["fallback"] = fallback_context_guard
+            if not summary_guard["passed"]:
+                emit_receipt(None, "guard_withheld")
+                raise ValueError("Data summary withheld: unsupported source interpretation.")
+            content = (
+                "**AI narrative withheld: response truncated before completion. Data summary only.**\n\n"
+                + summary
+            )
+        elif "truncation_guard" not in snapshot:
+            snapshot["truncation_guard"] = {"passed": True, "reason": None}
 
         snapshot["publication_status"] = publication_status
 
         # ── Number-grounding gate ──
         # Runs on every generated briefing before it is written: numeric
         # claims (decimals, percents, $ amounts, ratios) must be backed by
-        # a number actually present in `data_context` — the same text
-        # handed to the LLM above. Catches invented figures with no basis
-        # at all (the 2026-09-23 "P/C ratio of 8.96" incident) that a
-        # prompt instruction alone did not stop. See ollama/number_grounding.py.
+        # a matching (instrument, value) pair in `data_context` when an
+        # instrument is named, or by a value in `data_context` otherwise.
         from ollama.number_grounding import (
-            check_numbers_grounded, _annotate_inline, _BANNER_TEMPLATE, _FOOTER_TEMPLATE,
+            _annotate_inline, _BANNER_TEMPLATE, _FOOTER_TEMPLATE,
         )
 
         grounding_input = content
-        grounding = check_numbers_grounded(content, data_context)
+        grounding = self._check_numbers_grounded_by_instrument(content, data_context)
         content = grounding.annotated_text
         grounding_stats = grounding.to_dict()
         ungrounded_count = grounding_stats.get("ungrounded_count")
@@ -1787,6 +1895,581 @@ class MarketBriefingEngine:
         )
 
     @staticmethod
+    def _select_display_features(
+        features: dict[str, Any], max_count: int = 20,
+    ) -> tuple[list[str], bool]:
+        """Select the same feature names for both data_context and fallback summary."""
+        if not features:
+            return [], False
+        try:
+            from analysis.prompt_optimizer import select_prompt_features
+
+            # Preserve the existing selector inputs/ordering. Its z field is
+            # a raw-value ranking proxy here, never displayed as measured z.
+            feat_list = [
+                {"name": name, "z": info["value"], "value": info["value"]}
+                for name, info in features.items()
+                if isinstance(info, dict) and info.get("value") is not None
+            ]
+            selected = select_prompt_features(feat_list, max_count=max_count, corr_threshold=0.7)
+            return [feature["name"] for feature in selected], True
+        except Exception:
+            return list(features.keys())[:max_count], False
+
+    @staticmethod
+    def _detect_truncation(text: str | None, client: Any = None) -> dict[str, Any] | None:
+        """Detect LLM output truncation via client stop reason (primary) or mid-sentence fallback.
+
+        When the client exposes a non-empty stop reason (Ollama ``done_reason`` or
+        OpenAI/llama.cpp ``finish_reason``), that signal is authoritative: ``'length'``
+        (or ``'max_tokens'`` / ``'max_output_tokens'``) flags truncation regardless of
+        text, while any other stop reason (e.g. ``'stop'``) passes without invoking
+        the text heuristic.
+
+        Only when no stop reason is available does the fallback text heuristic run,
+        flagging unclosed code fences/bold or a last line that ends mid-sentence
+        (lowercase word or trailing comma/connector with no terminal punctuation)
+        while allowing numbers/%, parentheticals, bold/italic footers, ``---``,
+        list items, headings, and table rows.
+        """
+        import re
+
+        for attr in ("last_finish_reason", "last_done_reason", "finish_reason", "done_reason"):
+            raw_reason = getattr(client, attr, None)
+            if isinstance(raw_reason, str) and raw_reason.strip():
+                normalized = raw_reason.strip().lower()
+                if normalized in {"length", "max_tokens", "max_output_tokens"}:
+                    return {"reason": "finish_reason_length", "finish_reason": normalized}
+                return None
+
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        stripped = text.rstrip()
+        if stripped.count("```") % 2 == 1:
+            return {"reason": "unclosed_code_fence", "finish_reason": None}
+        last_line = stripped.splitlines()[-1].strip()
+        if last_line.count("**") % 2 == 1:
+            return {"reason": "unclosed_markdown", "finish_reason": None}
+
+        # Legitimate non-sentence endings: headings, horizontal rules, list items,
+        # table rows, code fences, terminal punctuation, digits, %, ), ], *, _, `.
+        if (
+            last_line.startswith("#")
+            or re.fullmatch(r"[-*_]{3,}", last_line)
+            or re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)", last_line)
+            or last_line.endswith("|")
+            or last_line.endswith("```")
+            or re.search(r'[.!?…]["\'”’)\]*_`]*$', last_line)
+            or re.search(r'[\d%)\]*_`]$', last_line)
+        ):
+            return None
+
+        # Only flag mid-sentence truncation: trailing comma/connector or lowercase word.
+        if (
+            re.search(r"[,;:—–/&]$", last_line)
+            or re.search(r"(?:\s+-|--)$", last_line)
+            or re.search(r"(?:^|[\s(\[/—–-])([a-z][a-z'-]*)$", last_line)
+        ):
+            return {"reason": "mid_sentence_truncation", "finish_reason": None}
+        return None
+
+    @staticmethod
+    def _instrument_patterns() -> tuple[tuple[str, str], ...]:
+        """Ordered (canonical_instrument, regex) table — specific spans before broad ones."""
+        bare_tenor_ahead = (
+            r"(?="
+            r"(?:\s*(?:[:,=(]\s*|\s+))"
+            r"(?:(?:is|was|are|were|at|near|around|about|roughly|currently|now|still|"
+            r"stands?|standing|sits?|sitting|holds?|holding|remains?|remaining|"
+            r"trades?|trading|prints?|printed|closed?|closing|settled?|settling|"
+            r"hovers?|hovering|yields?|yielding|of|to|in|above|below|"
+            r"rose|fell|dropped|climbed|edged|ticked|moved)\s+){0,3}"
+            r"\(?\s*(?!\d{4}(?:-\d{2}|\b))[+\-\u2212]?\d+(?:\.\d+)?"
+            r")"
+        )
+        return (
+            (
+                "T10Y2Y",
+                r"\b(?:T10Y2Y|"
+                r"(?:10Y[\s/-]*2Y|2Y[\s/-]*10Y)(?:\s+(?:yield\s+curve\s+|Treasury\s+)?spread)?|"
+                r"2s10s|10s2s|"
+                r"10[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s*(?:minus|/|-|and|vs\.?|versus|to)\s*2[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s+(?:yield\s+curve\s+|Treasury\s+)?spread|"
+                r"2[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s*(?:minus|/|-|and|vs\.?|versus|to)\s*10[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s+(?:yield\s+curve\s+|Treasury\s+)?spread|"
+                r"10[- ]?(?:year|yr)\s*(?:minus|/|-)\s*2[- ]?(?:year|yr)(?:\s+spread)?)\b",
+            ),
+            (
+                "T10Y3M",
+                r"\b(?:T10Y3M|"
+                r"(?:10Y[\s/-]*3M|3M[\s/-]*10Y)(?:\s+(?:yield\s+curve\s+|Treasury\s+)?spread)?|"
+                r"3m10y|"
+                r"10[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s*(?:minus|/|-|and|vs\.?|versus|to)\s*3[- ]?(?:month|mo)(?:\s+(?:Treasury\s+)?yields?)?\s+(?:yield\s+curve\s+|Treasury\s+)?spread|"
+                r"10[- ]?(?:year|yr)\s*(?:minus|/|-)\s*3[- ]?(?:month|mo)(?:\s+spread)?)\b",
+            ),
+            ("T5YIE", r"\b(?:T5YIE|5[- ]?(?:year|yr)\s+breakevens?(?:\s+inflation)?|5Y\s+breakevens?)\b"),
+            ("T10YIE", r"\b(?:T10YIE|10[- ]?(?:year|yr)\s+breakevens?(?:\s+inflation)?|10Y\s+breakevens?)\b"),
+            ("DFII10", r"\b(?:DFII10|10[- ]?(?:year|yr)\s+TIPS(?:\s+yields?)?|10Y\s+TIPS(?:\s+yields?)?)\b"),
+            (
+                "DGS10",
+                r"\b(?:DGS10|"
+                r"10[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|notes?|bonds?|Treasur(?:y|ies)|rates?)|"
+                r"10Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|notes?|bonds?|rates?)|"
+                r"UST\s*10Y|US10Y|"
+                r"(?:10[- ]?(?:year|yr)|10Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS2",
+                r"\b(?:DGS2|"
+                r"2[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|notes?|Treasur(?:y|ies)|rates?)|"
+                r"2Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|notes?|rates?)|"
+                r"UST\s*2Y|US2Y|"
+                r"(?:2[- ]?(?:year|yr)|2Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS5",
+                r"\b(?:DGS5|"
+                r"5[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|notes?|Treasur(?:y|ies)|rates?)|"
+                r"5Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|notes?|rates?)|"
+                r"UST\s*5Y|US5Y|"
+                r"(?:5[- ]?(?:year|yr)|5Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS30",
+                r"\b(?:DGS30|"
+                r"30[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|bonds?|Treasur(?:y|ies)|rates?)|"
+                r"30Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|bonds?|rates?)|"
+                r"UST\s*30Y|US30Y|"
+                r"(?:30[- ]?(?:year|yr)|30Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS1",
+                r"\b(?:DGS1|"
+                r"1[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|bills?|Treasur(?:y|ies)|rates?)|"
+                r"1Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|bills?|rates?)|"
+                r"UST\s*1Y|US1Y|"
+                r"(?:1[- ]?(?:year|yr)|1Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            ("DFF", r"\b(?:DFF|(?:effective\s+)?fed(?:eral)?\s+funds(?:\s+rates?)?)\b"),
+            ("SPY_PCR", r"\b(?:spy_put_call|spy_pcr|SPY\s+(?:put/call|P/C|PCR)(?:\s+(?:open[- ]interest\s+)?ratio)?|(?:aggregate\s+)?(?:put/call|P/C)\s+(?:open[- ]interest\s+)?ratio|(?:put/call|P/C|PCR))\b"),
+            ("HYG/LQD", r"\bHYG\s*/\s*LQD\b"),
+            ("^VIX9D", r"(?<!\w)(?:\^VIX9D|VIX9D|9[- ]?day\s+VIX|VIX\s+9[- ]?day|9D\s+VIX)\b"),
+            ("^VIX3M", r"(?<!\w)(?:\^VIX3M|VIX3M|3[- ]?month\s+VIX|VIX\s+3[- ]?month|3M\s+VIX)\b"),
+            ("^VIX", r"(?<!\w)(?:\^VIX|VIX)(?![ -]?(?:9D|3M|9[- ]?day|3[- ]?month))\b"),
+            ("^GSPC", r"(?<!\w)(?:\^GSPC|S\s*(?:[&＆]|&amp;)\s*P\s+500|SPX|GSPC)\b"),
+            ("SPY", r"\bSPY\b"),
+            ("^DJI", r"(?<!\w)(?:\^DJI|Dow\s+Jones|DJIA|Dow)\b"),
+            ("^IXIC", r"(?<!\w)(?:\^IXIC|Nasdaq(?:\s+Composite)?|IXIC)\b"),
+            ("^RUT", r"(?<!\w)(?:\^RUT|Russell\s+2000|RUT)\b"),
+            ("HYG", r"\bHYG\b"),
+            ("LQD", r"\bLQD\b"),
+            ("JNK", r"\bJNK\b"),
+            ("EMB", r"\bEMB\b"),
+            ("GC=F", r"(?<!\w)(?:GC=F|gold\s+futures)\b"),
+            ("GLD", r"\bGLD\b"),
+            ("SI=F", r"(?<!\w)(?:SI=F|silver\s+futures)\b"),
+            ("CL=F", r"(?<!\w)(?:CL=F|WTI|crude\s+oil)\b"),
+            ("HG=F", r"(?<!\w)(?:HG=F|copper\s+futures)\b"),
+            ("UUP", r"\bUUP\b"),
+            ("FXE", r"\bFXE\b"),
+            ("FXY", r"\bFXY\b"),
+            ("EEM", r"\bEEM\b"),
+            ("CPIAUCSL", r"\b(?:CPIAUCSL|CPI)\b"),
+            ("PCEPILFE", r"\b(?:PCEPILFE|core\s+PCE)\b"),
+            ("UNRATE", r"\b(?:UNRATE|unemployment(?:\s+rate)?)\b"),
+            ("RSAFS", r"\b(?:RSAFS|retail\s+sales)\b"),
+            ("UMCSENT", r"\b(?:UMCSENT|consumer\s+sentiment|UMich)\b"),
+        )
+
+    @staticmethod
+    def _canonical_instrument_label(label: str) -> str:
+        upper = label.strip().upper()
+        if upper in {"VIX", "^VIX"}:
+            return "^VIX"
+        if upper in {"VIX3M", "^VIX3M"}:
+            return "^VIX3M"
+        if upper in {"VIX9D", "^VIX9D"}:
+            return "^VIX9D"
+        if upper in {"GSPC", "^GSPC", "SPX"}:
+            return "^GSPC"
+        if upper in {"DJI", "^DJI"}:
+            return "^DJI"
+        if upper in {"IXIC", "^IXIC"}:
+            return "^IXIC"
+        if upper in {"RUT", "^RUT"}:
+            return "^RUT"
+        return upper
+
+    @staticmethod
+    def _extract_instrument_spans(
+        text: str,
+        compiled_patterns: list[tuple[str, Any]],
+        feature_patterns: list[tuple[str, Any]] | None = None,
+    ) -> list[tuple[int, int, str]]:
+        """Non-overlapping (start, end, instrument_id) spans in priority order."""
+        claimed: list[tuple[int, int]] = []
+        spans: list[tuple[int, int, str]] = []
+        for inst, pat in compiled_patterns:
+            for match in pat.finditer(text):
+                s, e = match.start(), match.end()
+                if any(s < ce and cs < e for cs, ce in claimed):
+                    continue
+                claimed.append((s, e))
+                spans.append((s, e, inst))
+        for inst, pat in (feature_patterns or ()):
+            for match in pat.finditer(text):
+                s, e = match.start(), match.end()
+                if any(s < ce and cs < e for cs, ce in claimed):
+                    continue
+                claimed.append((s, e))
+                spans.append((s, e, inst))
+        spans.sort(key=lambda item: item[0])
+        return spans
+
+    @classmethod
+    def _check_numbers_grounded_by_instrument(
+        cls,
+        text: str,
+        data_context: str,
+        *,
+        threshold: float | None = None,
+    ) -> Any:
+        """Verify numeric claims against (instrument, value) pairs in data_context.
+
+        When a numeric claim is attributed to a recognized instrument (e.g.
+        '10-year Treasury yield at 4.80%' -> DGS10), it must match a value
+        bound to that same instrument in data_context rather than any bare
+        number anywhere in the prompt (such as DGS2=4.80). Claims without a
+        named instrument retain standard context-pool numeric grounding.
+        """
+        import re
+        from ollama.number_grounding import (
+            DEFAULT_BANNER_THRESHOLD,
+            GroundingResult,
+            NumericMention,
+            _BANNER_TEMPLATE,
+            _FOOTER_TEMPLATE,
+            _annotate_inline,
+            _is_grounded,
+            extract_numeric_mentions,
+        )
+
+        if threshold is None:
+            threshold = DEFAULT_BANNER_THRESHOLD
+
+        if not text or not text.strip():
+            return GroundingResult(
+                annotated_text=text or "",
+                total_numbers=0,
+                grounded_count=0,
+                ungrounded=(),
+                ungrounded_ratio=0.0,
+                banner_triggered=False,
+                threshold=threshold,
+            )
+
+        compiled = [(inst, re.compile(pat, re.IGNORECASE)) for inst, pat in cls._instrument_patterns()]
+        structured_re = re.compile(r"^\s*-\s+([A-Za-z0-9_]+):([^:\s]+):\s*raw value=([^|\n]+)")
+        structured_claim_re = re.compile(r"^\s*-\s+([A-Za-z0-9_]+):([^:\s]+):")
+        z_reported_re = re.compile(r"source-reported z=([+-]?\d+(?:\.\d+)?)")
+
+        # 1. Build instrument -> [NumericMention] bindings from data_context
+        context_by_instrument: dict[str, list[Any]] = {}
+        in_pcr_section = False
+        in_limits_section = False
+        for line in (data_context or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("### "):
+                upper_hdr = stripped.upper()
+                in_pcr_section = "SPY PUT/CALL" in upper_hdr
+                in_limits_section = "PUBLICATION CONTEXT LIMITS" in upper_hdr
+                continue
+            if in_limits_section or stripped.startswith("DECLARED ACTION CALENDAR"):
+                continue
+
+            m = structured_re.match(line)
+            if m:
+                cat, label, raw_val = m.group(1), m.group(2), m.group(3)
+                if cat == "features":
+                    inst = f"feature:{label}"
+                elif cat == "options" and label == "spy_put_call":
+                    inst = "SPY_PCR"
+                else:
+                    inst = cls._canonical_instrument_label(label)
+                val_mentions = extract_numeric_mentions(raw_val, include_small_integers=True)
+                z_match = z_reported_re.search(line)
+                if z_match:
+                    val_mentions.extend(extract_numeric_mentions(z_match.group(1), include_small_integers=True))
+                context_by_instrument.setdefault(inst, []).extend(val_mentions)
+                continue
+
+            if in_pcr_section and stripped.startswith("- Value:"):
+                val_part = stripped.split("(", 1)[0]
+                context_by_instrument.setdefault("SPY_PCR", []).extend(
+                    extract_numeric_mentions(val_part, include_small_integers=True)
+                )
+                continue
+
+            line_mentions = extract_numeric_mentions(line)
+            if not line_mentions:
+                continue
+            line_spans = cls._extract_instrument_spans(line, compiled)
+            if not line_spans:
+                continue
+            for idx, lm in enumerate(line_mentions):
+                prev_spans = [sp for sp in line_spans if sp[1] <= lm.start]
+                if prev_spans:
+                    bound_inst = prev_spans[-1][2]
+                else:
+                    next_limit = line_mentions[idx + 1].start if idx + 1 < len(line_mentions) else len(line)
+                    next_spans = [sp for sp in line_spans if lm.end <= sp[0] < next_limit]
+                    bound_inst = next_spans[0][2] if next_spans else None
+                if bound_inst is not None:
+                    context_by_instrument.setdefault(bound_inst, []).append(lm)
+
+        feature_patterns = [
+            (k, re.compile(r"(?<!\w)" + re.escape(k[len("feature:"):]) + r"(?!\w)"))
+            for k in sorted(
+                (key for key in context_by_instrument if key.startswith("feature:") and len(key) >= len("feature:") + 3),
+                key=len,
+                reverse=True,
+            )
+        ]
+
+        pool = extract_numeric_mentions(data_context or "")
+        claims = extract_numeric_mentions(text)
+
+        # Pre-compute line spans and clause spans for claim attribution
+        line_ranges: list[tuple[int, int]] = []
+        pos = 0
+        for raw_line in text.splitlines(keepends=True):
+            line_ranges.append((pos, pos + len(raw_line)))
+            pos += len(raw_line)
+        if not line_ranges:
+            line_ranges.append((0, len(text)))
+
+        clause_split_re = re.compile(r"\n+|;\s*|\s*\|\s*|(?<=[.!?])(?<!vs\.)\s+")
+        clause_ranges: list[tuple[int, int]] = []
+        cpos = 0
+        for sep in clause_split_re.finditer(text):
+            clause_ranges.append((cpos, sep.start()))
+            cpos = sep.end()
+        clause_ranges.append((cpos, len(text)))
+
+        def _range_for(offset: int, ranges: list[tuple[int, int]]) -> tuple[int, int]:
+            for rs, re_ in ranges:
+                if rs <= offset < re_:
+                    return rs, re_
+            return 0, len(text)
+
+        spread_clause_re = re.compile(
+            r"\b(?:spread|inversion|inverted|gap|diff(?:erence)?|steepen\w*|flatten\w*|"
+            r"percentage\s+points?|bps|basis\s+points?|wide(?:r|ned|ning)?|narrow(?:er|ed|ing)?|"
+            r"above|below|premium|discount)\b",
+            re.IGNORECASE,
+        )
+        post_sep_re = re.compile(
+            r",|\b(?:versus|vs\.?|above|below|while|whereas|and|but|relative\s+to)\b",
+            re.IGNORECASE,
+        )
+        spread_leg_pairs = (
+            ("T10Y2Y", ("DGS10", "DGS2")),
+            ("T10Y3M", ("DGS10", "DGS3MO")),
+        )
+
+        def _derived_spread_pool(
+            clause_insts: set[str], target_inst: str | None,
+        ) -> list[NumericMention]:
+            """Derived spread/difference values (signed and unsigned magnitudes)."""
+            derived: list[NumericMention] = []
+            # 1. Unsigned magnitudes of spread instruments (e.g. T10Y2Y=-0.45 -> 0.45)
+            for spread_key, legs in spread_leg_pairs:
+                for m in context_by_instrument.get(spread_key, []):
+                    if m.value < 0:
+                        derived.append(NumericMention(
+                            raw=m.raw, value=abs(m.value), kind=m.kind,
+                            decimals=m.decimals, start=0, end=0,
+                        ))
+                if target_inst == spread_key or (legs[0] in context_by_instrument and legs[1] in context_by_instrument):
+                    for a in context_by_instrument.get(legs[0], []):
+                        for b in context_by_instrument.get(legs[1], []):
+                            dp = max(a.decimals, b.decimals)
+                            diff = round(a.value - b.value, dp)
+                            for val in (diff, abs(diff)):
+                                derived.append(NumericMention(
+                                    raw=f"{val:.{dp}f}", value=val, kind="decimal",
+                                    decimals=dp, start=0, end=0,
+                                ))
+            # 2. Pairwise differences among instruments co-mentioned in this clause
+            mentioned = sorted(i for i in clause_insts if i in context_by_instrument)
+            for i in range(len(mentioned)):
+                for j in range(i + 1, len(mentioned)):
+                    for a in context_by_instrument[mentioned[i]]:
+                        for b in context_by_instrument[mentioned[j]]:
+                            dp = max(a.decimals, b.decimals)
+                            diff = round(a.value - b.value, dp)
+                            for val in (diff, -diff, abs(diff)):
+                                derived.append(NumericMention(
+                                    raw=f"{val:.{dp}f}", value=val, kind="decimal",
+                                    decimals=dp, start=0, end=0,
+                                ))
+            return derived
+
+        ungrounded: list[Any] = []
+        for idx, claim in enumerate(claims):
+            # Preserve Unicode minus sign (U+2212) immediately before an extracted mention.
+            effective_claim = claim
+            if (
+                claim.start > 0
+                and text[claim.start - 1] == "\u2212"
+                and not claim.raw.startswith(("+", "-"))
+                and claim.value > 0
+            ):
+                effective_claim = NumericMention(
+                    raw=claim.raw, value=-claim.value, kind=claim.kind,
+                    decimals=claim.decimals, start=claim.start, end=claim.end,
+                )
+
+            ls, le = _range_for(claim.start, line_ranges)
+            line_text = text[ls:le]
+            sm = structured_claim_re.match(line_text)
+            if sm:
+                cat, label = sm.group(1), sm.group(2)
+                if cat == "features":
+                    inst: str | None = f"feature:{label}"
+                elif cat == "options" and label == "spy_put_call":
+                    inst = "SPY_PCR"
+                else:
+                    inst = cls._canonical_instrument_label(label)
+                if not _is_grounded(effective_claim, context_by_instrument.get(inst, [])):
+                    ungrounded.append(claim)
+                continue
+
+            cs, ce = _range_for(claim.start, clause_ranges)
+            clause = text[cs:ce]
+            c_start = claim.start - cs
+            c_end = claim.end - cs
+            c_spans = cls._extract_instrument_spans(clause, compiled, feature_patterns)
+
+            prev_claim_rel = (
+                claims[idx - 1].end - cs
+                if idx > 0 and claims[idx - 1].end > cs
+                else 0
+            )
+            next_claim_rel = (
+                claims[idx + 1].start - cs
+                if idx + 1 < len(claims) and claims[idx + 1].start < ce
+                else len(clause)
+            )
+
+            inst = None
+            prev_spans = [sp for sp in c_spans if prev_claim_rel <= sp[0] and sp[1] <= c_start]
+            if prev_spans:
+                inst = prev_spans[-1][2]
+            else:
+                post_limit = min(c_end + 40, next_claim_rel)
+                post_spans = [sp for sp in c_spans if c_end <= sp[0] <= post_limit]
+                if post_spans:
+                    cand = post_spans[0]
+                    # Do not steal a span that directly introduces the next claim or
+                    # lies across a comparative/clause separator.
+                    has_next_claim = idx + 1 < len(claims) and claims[idx + 1].start < ce
+                    introduces_next = has_next_claim and not any(
+                        sp[0] >= cand[1] and sp[1] <= next_claim_rel for sp in c_spans
+                    )
+                    if not introduces_next and not post_sep_re.search(clause[c_end:cand[0]]):
+                        inst = cand[2]
+
+            clause_insts = {sp[2] for sp in c_spans}
+            is_spread_ctx = bool(
+                inst in {"T10Y2Y", "T10Y3M"} or spread_clause_re.search(clause)
+            )
+            explicit_plus = effective_claim.raw.startswith("+")
+
+            if inst is not None:
+                if inst == "SPY" and "SPY" not in context_by_instrument and "^GSPC" in context_by_instrument:
+                    inst = "^GSPC"
+                own_vals = list(context_by_instrument.get(inst, []))
+                if not inst.startswith("feature:"):
+                    feat_alias = f"feature:{inst.lower()}"
+                    if feat_alias in context_by_instrument:
+                        own_vals.extend(context_by_instrument[feat_alias])
+                if _is_grounded(effective_claim, own_vals):
+                    continue
+                if is_spread_ctx and not explicit_plus:
+                    if _is_grounded(effective_claim, _derived_spread_pool(clause_insts, inst)):
+                        continue
+                # Fail an instrument-bound claim ONLY when its value matches a
+                # DIFFERENT instrument's value in data_context and not its own
+                # bound instrument's (the DGS2-as-10Y / swapped-instrument defect).
+                if inst.startswith("feature:"):
+                    other_vals = [
+                        m for k, vals in context_by_instrument.items()
+                        if k != inst for m in vals
+                    ]
+                else:
+                    other_vals = [
+                        m for k, vals in context_by_instrument.items()
+                        if k != inst and not k.startswith("feature:") for m in vals
+                    ]
+                if _is_grounded(effective_claim, other_vals):
+                    ungrounded.append(claim)
+                    continue
+                # Otherwise fall back to the context pool check (plus derived spread values).
+                if _is_grounded(effective_claim, pool):
+                    continue
+                if is_spread_ctx and not explicit_plus and _is_grounded(
+                    effective_claim, _derived_spread_pool(clause_insts, inst),
+                ):
+                    continue
+                ungrounded.append(claim)
+            else:
+                if _is_grounded(effective_claim, pool):
+                    continue
+                if is_spread_ctx and not explicit_plus and _is_grounded(
+                    effective_claim, _derived_spread_pool(clause_insts, None),
+                ):
+                    continue
+                ungrounded.append(claim)
+
+        total = len(claims)
+        ungrounded_count = len(ungrounded)
+        ratio = (ungrounded_count / total) if total else 0.0
+
+        annotated = _annotate_inline(text, ungrounded)
+        if ungrounded:
+            unique_raw = list(dict.fromkeys(m.raw for m in ungrounded))
+            annotated += _FOOTER_TEMPLATE.format(values=", ".join(unique_raw))
+
+        banner_triggered = total > 0 and ratio > threshold
+        if banner_triggered:
+            annotated = _BANNER_TEMPLATE.format(
+                ungrounded=ungrounded_count, total=total, ratio=ratio,
+            ) + annotated
+
+        if ungrounded_count:
+            log.warning(
+                "Briefing number grounding: {u}/{t} numeric claims ungrounded "
+                "({r:.0%}): {vals}",
+                u=ungrounded_count, t=total, r=ratio,
+                vals=", ".join(dict.fromkeys(m.raw for m in ungrounded)),
+            )
+        else:
+            log.debug(
+                "Briefing number grounding: {t} numeric claims, all grounded",
+                t=total,
+            )
+
+        return GroundingResult(
+            annotated_text=annotated,
+            total_numbers=total,
+            grounded_count=total - ungrounded_count,
+            ungrounded=tuple(ungrounded),
+            ungrounded_ratio=ratio,
+            banner_triggered=banner_triggered,
+            threshold=threshold,
+        )
+
+    @staticmethod
     def _publication_display_categories(snapshot: dict[str, Any]) -> list[tuple[str, Any]]:
         """Display legacy fx.EEM as equity, retaining original input custody."""
         rows = []
@@ -1818,6 +2501,7 @@ class MarketBriefingEngine:
         notes = {
             "model_unavailable": "Model response unavailable. Data summary only.",
             "claim_guard_withheld": "AI narrative withheld by publication claim guard. Data summary only.",
+            "truncated_response": "AI narrative withheld due to truncated model response. Data summary only.",
             "source_evidence_unknown": "Source evidence unavailable or unknown. Data summary only.",
         }
         note = notes.get(reason, notes["source_evidence_unknown"])
@@ -1843,9 +2527,13 @@ class MarketBriefingEngine:
 
         features = snapshot.get("features", {})
         if features:
-            lines.append("## Retained Feature Evidence (first 20; freshness unknown)")
-            for name, info in list(features.items())[:20]:
-                lines.append(self._format_evidence_value("features", name, info))
+            selected_names, used_selector = self._select_display_features(features, max_count=20)
+            if used_selector:
+                lines.append(f"## Retained Feature Evidence ({len(selected_names)} selected; freshness unknown)")
+            else:
+                lines.append("## Retained Feature Evidence (first 20; freshness unknown)")
+            for name in selected_names:
+                lines.append(self._format_evidence_value("features", name, features[name]))
             lines.append("")
 
         regime = snapshot.get("latest_regime")
