@@ -863,22 +863,24 @@ def _typed_id_keys(raw: Any) -> set[tuple[str, Any]] | None:
 def producer_eligible_feature_ids(payload: dict[str, Any], *, as_of: datetime | None = None) -> list[str | int] | None:
     """Distinct eligible feature ids a producer payload actually lists, or None.
 
-    Only ``features_used`` entries count, filtered by ``eligible_feature_ids``
-    (else ``eligible_features``) and by ``ineligible_features`` (else
-    ``excluded_features``): the same rule the briefing applies to the same
-    payload (``MarketBriefingEngine._gather_market_snapshot``). A scalar such
+    Only ``features_used`` entries count, filtered through
+    ``store.snapshots.producer_feature_filters``: the rule the briefing
+    applies to the same payload (``MarketBriefingEngine._gather_market_snapshot``).
+    A present empty eligibility list means nothing is eligible. A scalar such
     as ``bound_inputs``, ``n_features`` or ``feature_count`` is never a count,
-    so a payload without feature entries proves nothing.
+    so a payload without feature entries proves nothing. Raises
+    ``InvalidFeatureFilter`` for a malformed or self-contradictory filter.
     """
+    from store.snapshots import producer_feature_filters
+
     raw = payload.get("features_used")
     if not isinstance(raw, (dict, list, tuple)):
         return None
-    excl_raw = payload.get("ineligible_features") or payload.get("excluded_features")
-    elig_raw = payload.get("eligible_feature_ids") or payload.get("eligible_features")
+    eligible, excluded = producer_feature_filters(payload)
     return _extract_distinct_eligible_feature_ids(
         raw,
-        eligible_ids=_typed_id_keys(elig_raw) if isinstance(elig_raw, (list, tuple, set)) else None,
-        excluded_ids=_typed_id_keys(excl_raw),
+        eligible_ids=None if eligible is None else _typed_id_keys(eligible),
+        excluded_ids=_typed_id_keys(excluded) or None,
         as_of=as_of,
     )
 
@@ -891,7 +893,7 @@ def describe_producer_snapshot(row: Any) -> dict[str, Any]:
     payload itself names (``producer_eligible_feature_ids``); the count is their
     number. The payload is not carried.
     """
-    from store.snapshots import canonical_payload_sha256
+    from store.snapshots import InvalidFeatureFilter, canonical_payload_sha256
 
     if row is None:
         return {"found": False}
@@ -915,7 +917,11 @@ def describe_producer_snapshot(row: Any) -> dict[str, Any]:
         "payload_sha256": digest,
         "regime": _extract_regime_label(payload),
     })
-    ids = producer_eligible_feature_ids(payload, as_of=created)
+    try:
+        ids = producer_eligible_feature_ids(payload, as_of=created)
+    except InvalidFeatureFilter:
+        ids = None
+        entry["feature_filter_invalid"] = True
     entry["eligible_feature_ids"] = ids
     entry["bound_inputs"] = len(ids) if ids is not None else None
     return entry
@@ -974,14 +980,40 @@ def _verified_producer_count(
         return ("unverified", "missing_publication_clock"), None
     if available > as_of:
         return ("mismatch", "producer_snapshot_future_clock"), None
+    if entry.get("feature_filter_invalid") is True:
+        return ("mismatch", "producer_snapshot_invalid_feature_filter"), None
     producer_ids = entry.get("eligible_feature_ids")
     if not isinstance(producer_ids, list):
         return ("unverified", "producer_snapshot_missing_bound_inputs"), None
-    inline_ids = mapping.get("eligible_feature_ids")
-    if inline_ids is not None and _typed_id_keys(inline_ids) != _typed_id_keys(producer_ids):
-        # Same count is not enough: the carried ids must be the producer's ids.
-        return ("mismatch", "inline_feature_ids_disagree_with_producer"), None
+    problem = _inline_claims_disagree(mapping, producer_ids)
+    if problem is not None:
+        return ("mismatch", problem), None
     return None, len(producer_ids)
+
+
+def _inline_claims_disagree(mapping: dict[str, Any], producer_ids: list[Any]) -> str | None:
+    """Check every inline feature claim on its own against the producer's ids.
+
+    ``features_used``, ``eligible_feature_ids`` and ``bound_inputs`` are each
+    validated independently (not through ``_extract_bound_input_count``'s
+    first-key-wins order), so ids that match cannot mask a wrong scalar count.
+    Returns a mismatch reason, or None when every present claim agrees.
+    """
+    producer_keys = _typed_id_keys(producer_ids)
+    for key in ("features_used", "eligible_feature_ids", "bound_inputs"):
+        if key not in mapping or mapping[key] is None:
+            continue
+        value = mapping[key]
+        if key == "bound_inputs" and type(value) is int:
+            if value != len(producer_ids):
+                return f"inline_bound_inputs_disagree_with_producer:{value}!={len(producer_ids)}"
+            continue
+        if not isinstance(value, (dict, list, tuple)):
+            return f"invalid_inline_{key}"
+        inline_ids = _extract_distinct_eligible_feature_ids(value)
+        if inline_ids is None or _typed_id_keys(inline_ids) != producer_keys:
+            return "inline_feature_ids_disagree_with_producer"
+    return None
 
 
 def inspect_regime_binding(

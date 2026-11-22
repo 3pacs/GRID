@@ -1241,3 +1241,107 @@ def test_auto_regime_payload_shape_counts_its_concept_feature_names():
     )
     assert entry["bound_inputs"] == 9
     assert sorted(entry["eligible_feature_ids"]) == sorted(f"feature_{i}" for i in range(9))
+
+
+# ── Codex HOLD on #1387 head 328f7979 ────────────────────────────────────────
+# (1) `eligible_feature_ids or eligible_features` read a present empty list as
+# absent; malformed present filters must be rejected, in the briefing too.
+# (2) matching inline ids could mask a contradictory scalar bound_inputs.
+
+_FEATURES_8 = {f"c{i}": f"feat_{i}" for i in range(8)}
+
+
+def _briefing_on(tmp_path, payload: dict) -> dict:
+    regime_row = ("FRAGILE", 0.72, 0.15, {"snapshot_id": 42, "snapshot_hash": _canonical_sha256(payload)},
+                  "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(regime_row, snap_rows=[(42, payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))])
+    return _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+
+
+@pytest.mark.parametrize("filter_key", ["eligible_feature_ids", "eligible_features"])
+def test_a_present_empty_eligibility_filter_means_nothing_is_eligible(tmp_path, filter_key):
+    payload = {"regime": "FRAGILE", "features_used": _FEATURES_8, filter_key: []}
+    snap = _briefing_on(tmp_path, payload)
+    assert snap["latest_regime"]["bound_inputs"] == 0
+    assert snap["latest_regime"]["eligible_feature_ids"] == []
+
+    job = _load_packet_module()
+    captured = _captured_producer(job, 42, payload)
+    assert captured["42"]["eligible_feature_ids"] == [] and captured["42"]["bound_inputs"] == 0
+    packet, exclusions = job.build_packet(_packet_bundle([_briefing_record(8500, snap)], producer_snapshots=captured))
+    assert packet["publications"] == []
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [
+        ("REFUSED_INSUFFICIENT_REGIME_INPUTS", ["regime_bound_inputs_below_minimum:0<8"]),
+    ]
+
+
+@pytest.mark.parametrize("filters", [
+    {"eligible_feature_ids": [], "eligible_features": [f"feat_{i}" for i in range(8)]},
+    {"eligible_feature_ids": ["feat_0"], "eligible_features": ["feat_1"]},
+    {"eligible_feature_ids": None},
+    {"eligible_feature_ids": "feat_0"},
+    {"eligible_features": {"feat_0": True}},
+    {"ineligible_features": "feat_0"},
+    {"excluded_features": None},
+], ids=["empty_vs_alias", "conflicting_aliases", "null", "string", "dict", "excluded_string", "excluded_null"])
+def test_malformed_or_conflicting_filters_fail_closed_on_both_sides(tmp_path, filters):
+    payload = {"regime": "FRAGILE", "features_used": _FEATURES_8, **filters}
+    snap = _briefing_on(tmp_path, payload)
+    assert "latest_regime" not in snap
+    assert snap["latest_regime_withheld"]["reason"] == "producer_snapshot_invalid_feature_filter"
+
+    job = _load_packet_module()
+    entry = _captured_producer(job, 42, payload)["42"]
+    assert entry["feature_filter_invalid"] is True and entry["eligible_feature_ids"] is None
+    record = _briefing_record(8501, {"latest_regime": _bound_regime(payload)})
+    _, exclusions = job.build_packet(_packet_bundle([record], producer_snapshots={"42": entry}))
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [
+        ("REFUSED_REGIME_BINDING_MISMATCH", ["producer_snapshot_invalid_feature_filter"]),
+    ]
+
+
+def test_agreeing_aliases_and_empty_exclusions_are_accepted(tmp_path):
+    ids = [f"feat_{i}" for i in range(8)]
+    payload = {"regime": "FRAGILE", "features_used": _FEATURES_8, "eligible_feature_ids": ids,
+               "eligible_features": list(reversed(ids)), "ineligible_features": [], "excluded_features": {}}
+    snap = _briefing_on(tmp_path, payload)
+    assert snap["latest_regime"]["bound_inputs"] == 8
+    job = _load_packet_module()
+    packet, exclusions = job.build_packet(_packet_bundle(
+        [_briefing_record(8502, snap)], producer_snapshots=_captured_producer(job, 42, payload),
+    ))
+    assert exclusions == [] and [p["id"] for p in packet["publications"]] == ["market_briefings:8502"]
+
+
+@pytest.mark.parametrize("extra,reason", [
+    ({"eligible_feature_ids": [f"feat_{i}" for i in range(8)], "bound_inputs": 12},
+     "inline_bound_inputs_disagree_with_producer:12!=8"),
+    ({"features_used": _FEATURES_8, "bound_inputs": 7},
+     "inline_bound_inputs_disagree_with_producer:7!=8"),
+    ({"features_used": {"c0": "feat_0"}, "eligible_feature_ids": [f"feat_{i}" for i in range(8)]},
+     "inline_feature_ids_disagree_with_producer"),
+    ({"eligible_feature_ids": "feat_0"}, "invalid_inline_eligible_feature_ids"),
+], ids=["ids_match_count_wrong", "features_match_count_wrong", "one_claim_of_two_wrong", "ids_not_a_list"])
+def test_every_inline_claim_is_checked_on_its_own(extra, reason):
+    job = _load_packet_module()
+    record = _briefing_record(8503, {"latest_regime": _bound_regime(_PAYLOAD_8, **extra)})
+    _, exclusions = job.build_packet(_packet_bundle(
+        [record], producer_snapshots=_captured_producer(job, 42, _PAYLOAD_8),
+    ))
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [
+        ("REFUSED_REGIME_BINDING_MISMATCH", [reason]),
+    ]
+
+
+def test_producer_feature_filters_rule():
+    from store.snapshots import InvalidFeatureFilter, producer_feature_filters
+
+    assert producer_feature_filters({}) == (None, [])
+    assert producer_feature_filters({"eligible_feature_ids": []}) == ([], [])
+    assert producer_feature_filters({"eligible_features": ["a"], "ineligible_features": ["b"],
+                                     "excluded_features": {"c": 1}}) == (["a"], ["b", "c"])
+    assert producer_feature_filters({"eligible_feature_ids": ["a", "b"], "eligible_features": ["b", "a", "a"]})[0] == ["b", "a", "a"]
+    for bad in ({"eligible_feature_ids": None}, {"eligible_features": 3}, {"excluded_features": "x"},
+                {"eligible_feature_ids": [], "eligible_features": ["a"]}):
+        with pytest.raises(InvalidFeatureFilter):
+            producer_feature_filters(bad)
