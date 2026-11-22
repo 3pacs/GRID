@@ -666,9 +666,9 @@ def test_defect5_diary_grading_neutral_on_large_spx_move_is_missed(
 # ── Defect 6: Daily publication packet guards (regime inputs + staleness) ───
 
 
-def _packet_bundle(records):
+def _packet_bundle(records, producer_snapshots=None):
     day = "2026-11-18"
-    return {
+    bundle = {
         "version": "publication-capture-v1",
         "producer": "scripts/daily_publication_packet.py",
         "publication_day": day,
@@ -681,6 +681,15 @@ def _packet_bundle(records):
         "existing_diary_context": [],
         "records": records,
     }
+    if producer_snapshots is not None:
+        bundle["producer_snapshots"] = producer_snapshots
+    return bundle
+
+
+def _captured_producer(job, snapshot_id, payload, created_at="2026-11-18T09:59:00Z"):
+    """The packet's capture of one analytical_snapshots row, keyed by id."""
+    row = {"id": snapshot_id, "category": "regime_detection", "payload": payload, "created_at": created_at}
+    return {str(snapshot_id): job.describe_producer_snapshot(row)}
 
 
 @pytest.mark.parametrize("regime_meta", [
@@ -715,7 +724,10 @@ def test_defect6_packet_refuses_regime_label_under_8_bound_inputs(regime_meta):
     assert "market_briefings:7001" in packet["capture_receipt"]["quarantined_publication_ids"]
 
 
-def test_defect6_packet_allows_regime_with_8_inputs_and_notices_unavailable_count():
+def test_defect6_packet_refuses_regime_labels_without_producer_proof():
+    """Codex HOLD on #1386 (032cd9ae): an inline count of eight, no count, or a
+    registry size never stands in for the producer snapshot. Each label is
+    refused as unverified, not carried with a notice."""
     job = _load_packet_module()
     bundle = _packet_bundle([
         {
@@ -724,7 +736,7 @@ def test_defect6_packet_allows_regime_with_8_inputs_and_notices_unavailable_coun
                 "id": 7002,
                 "briefing_type": "hourly",
                 "briefing_date": "2026-11-18",
-                "content": "Eight bound inputs briefing.",
+                "content": "Eight inline bound inputs briefing.",
                 "created_at": "2026-11-18T12:00:00Z",
                 "snapshot_bytes": 500,
                 "snapshot_data": {"latest_regime": {"state": "FRAGILE", "bound_inputs": 8, "timestamp": "2026-11-18T10:00:00Z"}},
@@ -758,30 +770,52 @@ def test_defect6_packet_allows_regime_with_8_inputs_and_notices_unavailable_coun
 
     packet, exclusions = job.build_packet(bundle)
 
-    assert [p["id"] for p in packet["publications"]] == [
-        "market_briefings:7002", "market_briefings:7003", "market_briefings:7005",
+    assert packet["publications"] == []
+    assert [(e["publication_id"], e["disposition"], e["reasons"]) for e in exclusions] == [
+        (f"market_briefings:{i}", "REFUSED_UNVERIFIED_REGIME_BINDING", ["missing_producer_snapshot_binding"])
+        for i in (7002, 7003, 7005)
     ]
+    for i in (7002, 7003, 7005):
+        assert any(f"market_briefings:{i}" in b and "not verified" in b for b in packet["blockers"])
+
+
+def test_defect6_packet_carries_a_regime_verified_against_its_producer():
+    job = _load_packet_module()
+    payload = {"regime": "FRAGILE", "features_used": {f"c{i}": f"feat_{i}" for i in range(8)}}
+    digest = job.sha256(job.canonical(payload))
+    record = {
+        "id": 7006,
+        "briefing_type": "hourly",
+        "briefing_date": "2026-11-18",
+        "content": "Producer-bound briefing.",
+        "created_at": "2026-11-18T12:00:00Z",
+        "snapshot_bytes": 500,
+        "snapshot_data": {"latest_regime": {
+            "state": "FRAGILE", "snapshot_id": 61, "snapshot_hash": digest,
+            "bound_inputs": 8, "timestamp": "2026-11-18T10:00:00Z",
+        }},
+    }
+    packet, exclusions = job.build_packet(_packet_bundle(
+        [{"channel": "market_briefings", "record": record}],
+        producer_snapshots=_captured_producer(job, 61, payload),
+    ))
     assert exclusions == []
-    assert not any("bound inputs" in b or "regime bound-input" in b for b in packet["blockers"])
-    pub_by_id = {p["id"]: p for p in packet["publications"]}
-    assert "notices" not in pub_by_id["market_briefings:7002"]
-    assert "regime bound-input count unavailable" in pub_by_id["market_briefings:7003"]["notices"]
-    assert "regime bound-input count unavailable" in pub_by_id["market_briefings:7005"]["notices"]
-    assert any("market_briefings:7003" in n and "regime bound-input count unavailable" in n for n in packet["notices"])
-    assert any("market_briefings:7005" in n and "regime bound-input count unavailable" in n for n in packet["notices"])
-    assert not any("market_briefings:7002" in n for n in packet["notices"])
+    assert [p["id"] for p in packet["publications"]] == ["market_briefings:7006"]
+    assert "notices" not in packet["publications"][0]
 
 
 def test_defect6_market_briefing_carries_bound_inputs_into_latest_regime_snapshot(tmp_path):
-    """G1: MarketBriefingEngine._gather_market_snapshot carries len(features_used) into
-    snapshot['latest_regime']['bound_inputs'] when the regime record has features_used,
-    making the packet guard live instead of inert."""
+    """G1: MarketBriefingEngine._gather_market_snapshot carries distinct eligible
+    feature count into snapshot['latest_regime']['bound_inputs'] when the regime
+    record is bound to its exact producer analytical snapshot, making the packet
+    guard live instead of inert."""
     from tests.test_market_briefing_number_grounding import _FakeResult
 
     class _RegimeConn(_FakeConnection):
-        def __init__(self, regime_row, snap_payload):
+        def __init__(self, regime_row, snap_id, snap_payload):
             super().__init__()
             self._regime_row = regime_row
+            self._snap_id = snap_id
             self._snap_payload = snap_payload
 
         def execute(self, stmt, params=None):
@@ -789,13 +823,26 @@ def test_defect6_market_briefing_carries_bound_inputs_into_latest_regime_snapsho
             if "FROM decision_journal" in sql:
                 return _FakeResult(one=self._regime_row)
             if "FROM analytical_snapshots" in sql:
-                return _FakeResult(one=(self._snap_payload,) if self._snap_payload is not None else None)
+                row = (
+                    (self._snap_id, self._snap_payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))
+                    if self._snap_payload is not None
+                    else None
+                )
+                return _FakeResult(one=row, many=[row] if row is not None else [])
             return super().execute(stmt, params)
 
-    regime_row = ("FRAGILE", 0.72, 0.15, {}, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    def _payload_hash(payload: dict) -> str:
+        raw = json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, allow_nan=False,
+            separators=(",", ":"), default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
     low_payload = {"regime": "FRAGILE", "n_features": 12, "features_used": {f"f{i}": f"s{i}" for i in range(5)}}
+    low_flags = {"snapshot_id": 101, "snapshot_hash": _payload_hash(low_payload)}
+    regime_row_low = ("FRAGILE", 0.72, 0.15, low_flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
     snap_low = _make_engine(
-        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row, low_payload)), tmp_path,
+        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row_low, 101, low_payload)), tmp_path,
     )._gather_market_snapshot()
     assert snap_low["latest_regime"]["bound_inputs"] == 5
 
@@ -812,13 +859,16 @@ def test_defect6_market_briefing_carries_bound_inputs_into_latest_regime_snapsho
             "snapshot_bytes": 500,
             "snapshot_data": snap_low,
         },
-    }]))
+    }], producer_snapshots=_captured_producer(job, 101, low_payload)))
     assert packet_low["publications"] == []
     assert exclusions_low[0]["disposition"] == "REFUSED_INSUFFICIENT_REGIME_INPUTS"
 
-    # When no features_used is available on the regime record, omit count (do not fabricate)
+    # When no features_used is available on the bound producer snapshot, omit count (do not fabricate)
+    none_payload = {"regime": "FRAGILE", "n_features": 12}
+    none_flags = {"snapshot_id": 102, "snapshot_hash": _payload_hash(none_payload)}
+    regime_row_none = ("FRAGILE", 0.72, 0.15, none_flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
     snap_none = _make_engine(
-        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row, {"regime": "FRAGILE", "n_features": 12})), tmp_path,
+        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row_none, 102, none_payload)), tmp_path,
     )._gather_market_snapshot()
     assert "bound_inputs" not in snap_none["latest_regime"]
     packet_none, exclusions_none = job.build_packet(_packet_bundle([{
@@ -832,10 +882,12 @@ def test_defect6_market_briefing_carries_bound_inputs_into_latest_regime_snapsho
             "snapshot_bytes": 500,
             "snapshot_data": snap_none,
         },
-    }]))
-    assert [p["id"] for p in packet_none["publications"]] == ["market_briefings:7011"]
-    assert exclusions_none == []
-    assert any("regime bound-input count unavailable" in n for n in packet_none["notices"])
+    }], producer_snapshots=_captured_producer(job, 102, none_payload)))
+    # No producer-derived count: the label is unverified and refused, not carried with a notice.
+    assert packet_none["publications"] == []
+    assert [(e["disposition"], e["reasons"]) for e in exclusions_none] == [
+        ("REFUSED_UNVERIFIED_REGIME_BINDING", ["producer_snapshot_missing_bound_inputs"]),
+    ]
 
 
 def test_defect6_packet_marks_stale_inputs_and_models_without_mutating_inputs():

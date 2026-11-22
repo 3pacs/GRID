@@ -54,6 +54,38 @@ def _safe_json(data: Any) -> str:
     return json.dumps(data, cls=_NumpyEncoder, default=str)
 
 
+# Keys a producer adds to its decision_journal ``contradiction_flags`` to name
+# the analytical_snapshots row behind the decision. They are provenance, not
+# contradictions: display paths strip them with ``strip_binding_flags``.
+REGIME_BINDING_FLAG_KEYS: frozenset[str] = frozenset(
+    {"snapshot_id", "snapshot_hash", "regime_run_tag"}
+)
+
+
+def canonical_payload_sha256(payload: dict[str, Any]) -> str:
+    """SHA-256 of a snapshot payload in canonical JSON (sorted keys, compact).
+
+    The one hash both sides of a producer→reader snapshot binding use. Both
+    hash the payload as read back from the database (JSONB normalizes
+    numbers, e.g. -0.0 -> 0.0), never the producer's in-memory dict. Raises
+    ``ValueError`` on NaN/inf.
+    """
+    import hashlib
+
+    raw = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False,
+        separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def strip_binding_flags(flags: Any) -> Any:
+    """Return journal flags without producer-binding keys (for display)."""
+    if not isinstance(flags, dict):
+        return flags
+    return {k: v for k, v in flags.items() if k not in REGIME_BINDING_FLAG_KEYS}
+
+
 # ---------------------------------------------------------------------------
 # Canonical schema
 # ---------------------------------------------------------------------------

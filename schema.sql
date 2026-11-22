@@ -2143,3 +2143,17 @@ CREATE INDEX IF NOT EXISTS ix_insider_trades_value
 CREATE INDEX IF NOT EXISTS ix_insider_trades_cluster_buy
     ON insider_trades (is_cluster_buy)
     WHERE is_cluster_buy = TRUE;
+
+-- ---------------------------------------------------------------------------
+-- market_state_provisional (#1312, migrations/versions/market_state_prov_20261122.py): the display-only
+-- market-state record computed at a session's close, from the inputs GRID held at the close. Never read by a
+-- decision path; the decision record stays in market_state_daily. A non-provisional row cannot exist (CHECK).
+-- DDL identical to the revision; idempotent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_state_provisional (
+    as_of_date   DATE PRIMARY KEY,
+    rule         TEXT NOT NULL,
+    record       JSONB NOT NULL,
+    computed_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    provisional  BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional)
+);

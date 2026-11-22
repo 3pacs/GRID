@@ -89,6 +89,11 @@ class RunFileError(ValueError):
     """A run file the factory refuses."""
 
 
+class PriceFileError(RunFileError):
+    """A price file that is not a Tiingo daily file: a column missing, a row that does not parse, or a cell that is
+    neither a number nor a blank where a price or a volume belongs."""
+
+
 @dataclass(frozen=True)
 class RunFile:
     run_id: str
@@ -301,7 +306,7 @@ class Panel:
     on: np.ndarray            # overnight return ending at each session's open
     intra: np.ndarray         # open to close of each session
     cc: np.ndarray            # close to close ending at each session
-    adj: np.ndarray           # adjusted close
+    adj: np.ndarray           # adjusted close of a valid bar; NaN on a session whose bar is missing or invalid
     base: np.ndarray          # member, valid bar, price and liquidity floors (signal presence is added per signal)
     member: np.ndarray
     sector: np.ndarray        # sector index per column, -1 = none
@@ -314,8 +319,8 @@ class Panel:
 class Universe:
     sessions: list
     cols: list
-    frames: dict              # one frame per bar field, indexed by session, one column per price file
-    ok: pd.DataFrame          # a valid bar: positive unadjusted and adjusted prices, open and close inside the day's range
+    frames: dict              # one frame per bar field, by session and price file; a number that is not finite is blank
+    ok: pd.DataFrame          # a valid bar: all eight prices finite and positive, open and close inside the day's range
     member: np.ndarray
     base: np.ndarray          # member, valid bar, price and liquidity floors
     dollar: pd.DataFrame | None = None   # the median dollar volume the liquidity floor reads
@@ -335,6 +340,35 @@ def _read(data_dir: Path, name: str, files: dict | None) -> bytes:
     return raw
 
 
+def _price_rows(raw: bytes, name: str, fields: tuple) -> pd.DataFrame:
+    """One price file's rows, checked: every row has the header's number of cells, ``date`` holds text, and each of
+    ``fields`` holds numbers and blanks only. A file that fails is refused by name. Nothing is coerced or realigned: a
+    cell such as ``not_available`` is never turned into a blank, and a row with a cell too many is never read with
+    its values one column along (which pandas does, silently, when columns are picked by name)."""
+    lines = raw.split(b"\n")
+    cells = lines[0].count(b",")
+    ragged = next((n for n, line in enumerate(lines[1:], 2) if line.count(b",") != cells and line.strip()), None)
+    if ragged is not None:
+        raise PriceFileError(f"{name}: line {ragged} does not have the header's {cells + 1} cells; the file is refused, "
+                             "not repaired")
+    try:
+        df = pd.read_csv(io.BytesIO(raw), usecols=["date", *fields])
+    except ValueError as exc:   # a column missing, no header, a row with the wrong number of cells
+        raise PriceFileError(f"{name} cannot be read as a Tiingo daily file: {exc}") from exc
+    if df.empty:
+        return df
+    if not pd.api.types.is_string_dtype(df["date"]):
+        raise PriceFileError(f"{name}: the date column does not hold days as text (YYYY-MM-DD)")
+    bad = []
+    for k in fields:
+        if df[k].dtype.kind not in "fiu":
+            first = df.loc[df[k].notna() & pd.to_numeric(df[k], errors="coerce").isna(), "date"]
+            bad.append(f"{k} (first on {str(first.iloc[0])[:10]})" if len(first) else k)
+    if bad:
+        raise PriceFileError(f"{name}: a cell that is not a number in {', '.join(bad)}; the file is refused, not repaired")
+    return df
+
+
 def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dollar_volume: float,
              files: dict | None = None) -> Universe:
     """Which stock may be ranked on which session. This is the one definition: ``load_panel`` builds on it, and a
@@ -344,15 +378,20 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
     d when it is a member, has a valid bar on d, closed at ``min_price`` or more on the session before, and its median
     dollar volume over the ``DOLLAR_VOLUME_WINDOW`` sessions ending the session before is at least
     ``min_dollar_volume``. "The session before" is the store's previous session, not the stock's previous bar: a
-    stock with no bar on it has no prior close and is out. Bars after ``DEV_LAST_BAR`` are dropped."""
+    stock with no bar on it has no prior close and is out. A valid bar has all eight prices of the row (open, high,
+    low, close and their adjusted values) finite and positive. A number that is not finite (``inf``) is read as a
+    blank, in the prices and in the volume. A cell that is not a number at all is not a Tiingo row: the file is
+    refused by name (``PriceFileError``) and nothing is computed from the store. Bars after ``DEV_LAST_BAR`` are
+    dropped."""
     data_dir = Path(data_dir)
     on_disk = sorted(str(p.relative_to(data_dir)) for p in sorted((data_dir / "prices").glob("*.csv")))
     names = on_disk if files is None else sorted(n for n in files if n.startswith("prices/"))
     if names != on_disk:
         raise RunFileError("the price files changed between the run's declaration and its read; read a fixed copy")
-    cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "volume")}
+    cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "adjHigh",
+                                                  "adjLow", "volume")}
     for name in names:
-        df = pd.read_csv(io.BytesIO(_read(data_dir, name, files)), usecols=["date", *cols_data])
+        df = _price_rows(_read(data_dir, name, files), name, tuple(cols_data))
         if df.empty:
             continue
         df["date"] = df["date"].str[:10]
@@ -360,13 +399,16 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
         for k, store in cols_data.items():
             store[Path(name).stem] = df[k]
     f = {k: pd.DataFrame(v).sort_index() for k, v in cols_data.items()}
+    f = {k: v.where(np.isfinite(v)) for k, v in f.items()}   # inf is not a price or a volume: read it as a blank
     counts = f["close"].notna().sum(axis=1)
     sessions = [d for d, n in counts.items() if n >= min_session_bars]
     if not sessions or sessions[-1] > DEV_LAST_BAR:
         raise RunFileError("no development sessions in the data")
     f = {k: v.reindex(sessions) for k, v in f.items()}
     lo, hi = f["low"] * (1 - BAR_TOL), f["high"] * (1 + BAR_TOL)
+    # all eight prices of the row: a blank in any one of them, adjHigh and adjLow included, is not a valid bar
     ok = ((f["open"] > 0) & (f["close"] > 0) & (f["high"] > 0) & (f["low"] > 0) & (f["adjOpen"] > 0) & (f["adjClose"] > 0)
+          & (f["adjHigh"] > 0) & (f["adjLow"] > 0)
           & (f["open"] >= lo) & (f["open"] <= hi) & (f["close"] >= lo) & (f["close"] <= hi))
     cols = list(ok.columns)
 
@@ -395,7 +437,11 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
 
 def load_panel(data_dir: Path, run: RunFile, files: dict | None = None) -> Panel:
     """The bars a run evaluates. ``files`` is the declared manifest's file table; ``run`` always passes it, so every
-    file parsed is the one that was hashed before the declaration."""
+    file parsed is the one that was hashed before the declaration.
+
+    Every price a signal or an outcome reads comes from a valid bar. The returns are masked by the bar and the one
+    before it, and the adjusted close is blank on an invalid bar, so the momentum, reversal, 52-week-high and
+    sector-momentum signals never read a close the valid-bar rule turned away."""
     u = universe(data_dir, min_session_bars=run.min_session_bars, min_price=run.min_price,
                  min_dollar_volume=run.min_dollar_volume, files=files)
     f, ok, cols, member = u.frames, u.ok, u.cols, u.member
@@ -417,7 +463,8 @@ def load_panel(data_dir: Path, run: RunFile, files: dict | None = None) -> Panel
         code = np.full(len(cols), -1)
         how = {"labels": "none", "labelled_checked": 0, "leave_one_out_accuracy": None, "placed_by_correlation": 0,
                "unplaced": int(member.any(axis=0).sum())}
-    return Panel(u.sessions, cols, on.values, intra.values, cc.values, f["adjClose"].values, u.base, member, code, sectors, how,
+    adj = f["adjClose"].where(ok)   # an invalid bar's adjusted close reaches no signal
+    return Panel(u.sessions, cols, on.values, intra.values, cc.values, adj.values, u.base, member, code, sectors, how,
                  u.dollar.values.astype(np.float32))
 
 
@@ -590,6 +637,7 @@ class Book:
     k_sector: np.ndarray | None = None
     traded: bool = True
     parts: list = field(default_factory=list)   # (bottom picks, top picks, share of the spread) of each pair in it
+    sector_picks: dict = field(default_factory=dict)   # within sector: sector -> (bottom picks, top picks), every filled one
 
 
 def _night_index(panel: Panel, run: RunFile, states: States, eligible_r: np.ndarray, gate: dict, r: int) -> np.ndarray | None:
@@ -624,6 +672,7 @@ def _book(sig_r: np.ndarray, tick: np.ndarray, idx: np.ndarray, m: dict, y: np.n
     per, ks = np.full(n_s, np.nan), np.zeros(n_s)
     num = den = 0.0
     los, his, pairs = [], [], []
+    picked: dict = {}
     dropped = 0
     for s, sidx in enumerate(by_sector):
         if len(sidx) < floor:
@@ -631,6 +680,7 @@ def _book(sig_r: np.ndarray, tick: np.ndarray, idx: np.ndarray, m: dict, y: np.n
         k = max(1, math.floor(q * len(sidx)))
         sv, lo_s, hi_s, d_s = _spread(sig_r, tick, sidx, k, y)
         per[s], ks[s] = sv, k
+        picked[s] = (lo_s, hi_s)
         los.append(lo_s)
         his.append(hi_s)
         dropped += d_s
@@ -639,9 +689,9 @@ def _book(sig_r: np.ndarray, tick: np.ndarray, idx: np.ndarray, m: dict, y: np.n
             pairs.append((lo_s, hi_s, k))
     if not den:
         empty = np.zeros(0, dtype=int)
-        return Book(float("nan"), 0, empty, empty, dropped, per, ks, traded=False)
+        return Book(float("nan"), 0, empty, empty, dropped, per, ks, traded=False, sector_picks=picked)
     return Book(num / den, den, np.concatenate(los), np.concatenate(his), dropped, per, ks,
-                parts=[(lo_s, hi_s, k / den) for lo_s, hi_s, k in pairs])
+                parts=[(lo_s, hi_s, k / den) for lo_s, hi_s, k in pairs], sector_picks=picked)
 
 
 def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
@@ -661,12 +711,14 @@ def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
         mods = [m for m in run.modules() if m["signal"] == name]
         ys = {h: outcome(panel, h) for h in spec["horizons"]}
         prev: dict = {}
+        prev_sector: dict = {}     # trial -> (night, {sector: (bottom picks, top picks)}) of its last traded night
         for m in mods:
             within = m["ranking"] == "within_sector"
             out[m["trial_id"]] = {"gross": np.full(n_d, np.nan), "names": np.zeros(n_d), "turnover": np.full(n_d, np.nan),
                                   "picks": np.zeros(n_d), "dropped": np.zeros(n_d),
                                   "per_sector": np.full((n_d, n_s), np.nan) if within else None,
-                                  "k_sector": np.zeros((n_d, n_s)) if within else None}
+                                  "k_sector": np.zeros((n_d, n_s)) if within else None,
+                                  "turnover_sector": np.full((n_d, n_s), np.nan) if within else None}
         for r in rows:
             idx = _night_index(panel, run, states, eligible[r], gate, r)
             if idx is None:
@@ -688,6 +740,15 @@ def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
                 adjacent = last is not None and last[0] == r - 1
                 res["turnover"][r] = _turnover(last[1] if adjacent else None, lo, hi) if m["horizon"] == "close_1d" else 1.0
                 prev[m["trial_id"]] = (r, (lo, hi))
+                if m["ranking"] != "pooled":
+                    # each filled sector's replaced-name share against its own picks the night before. Over every
+                    # filled sector their k-weighted mean is the module's turnover (a name stays in its sector); the
+                    # card's cuts weight only the sectors with outcomes, so they match the module on complete nights
+                    before = prev_sector[m["trial_id"]][1] if adjacent else {}
+                    for s, (lo_s, hi_s) in book.sector_picks.items():
+                        res["turnover_sector"][r, s] = (_turnover(before.get(s), lo_s, hi_s)
+                                                        if m["horizon"] == "close_1d" else 1.0)
+                    prev_sector[m["trial_id"]] = (r, book.sector_picks)
     return out
 
 
@@ -760,9 +821,15 @@ def _cut(gross: np.ndarray, cost: np.ndarray) -> dict:
             "sd_bp": round(sd * 1e4, 2), "t_gross": round(mean / (sd / math.sqrt(len(v))), 3) if sd else None}
 
 
-def card(panel: Panel, res: dict, states: States, cost: np.ndarray) -> dict:
-    """Where the module paid: by year and by the states recorded the evening before each decision day."""
+def card(panel: Panel, res: dict, states: States, rate: float) -> dict:
+    """Where the module paid: by year and by the states recorded the evening before each decision day.
+
+    ``rate`` is the cost of a turnover of 1 (sides x cost per side). A cut of whole nights pays the module's turnover.
+    A sector pays its own replaced-name share, and a cut of several sectors pays their shares weighted like its
+    spread. That is a cost proxy conditional on the cut, not an independently traded book. It counts entries only (an
+    exit or a shrinking book costs nothing), and its sectors are only those with outcomes that night."""
     gross = res["gross"]
+    cost = rate * res["turnover"]
     traded = ~np.isnan(gross)
 
     def where(mask: np.ndarray) -> dict:
@@ -776,15 +843,18 @@ def card(panel: Panel, res: dict, states: States, cost: np.ndarray) -> dict:
         out[name] = {str(v): where(arr == v) for v in sorted({x for x, t in zip(states.night[name], traded) if t and x is not None})}
     if res["per_sector"] is not None:
         ps, ks = res["per_sector"], res["k_sector"]
+        sector_cost = rate * res["turnover_sector"]
 
         def pooled(pick: np.ndarray) -> dict:
             use = pick & ~np.isnan(ps) & (ks > 0)
             w = np.where(use, ks, 0.0)
             tot = w.sum(axis=1)
-            return _cut(np.where(tot > 0, (np.where(use, ps, 0.0) * w).sum(axis=1) / np.where(tot > 0, tot, 1), np.nan), cost)
+            den = np.where(tot > 0, tot, 1)
+            spread = np.where(tot > 0, (np.where(use, ps, 0.0) * w).sum(axis=1) / den, np.nan)
+            return _cut(spread, np.where(tot > 0, (np.where(use, sector_cost, 0.0) * w).sum(axis=1) / den, np.nan))
 
         every = np.ones_like(ps, dtype=bool)
-        out["sector"] = {s: _cut(ps[:, j], cost) for j, s in enumerate(panel.sectors)}
+        out["sector"] = {s: _cut(ps[:, j], sector_cost[:, j]) for j, s in enumerate(panel.sectors)}
         out["group"] = {g: pooled(every & np.array([GROUP_OF[s] == g for s in panel.sectors])[None, :]) for g in GROUPS}
         seen = sorted({x for x in states.sector_phase[traded].ravel() if x})
         out["sector_phase"] = {str(p): pooled(states.sector_phase == p) for p in seen}
@@ -1136,7 +1206,8 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
         modules = spec.modules()
         gates = {s["name"]: s.get("gate", {}) for s in spec.signal_specs()}
         per_side = spec.cost_bp_per_side * 1e-4
-        costs = {m["trial_id"]: SIDES[m["horizon"]] * per_side * results[m["trial_id"]]["turnover"] for m in modules}
+        rates = {m["trial_id"]: SIDES[m["horizon"]] * per_side for m in modules}
+        costs = {tid: rates[tid] * results[tid]["turnover"] for tid in rates}
         net = np.column_stack([results[m["trial_id"]]["gross"] - costs[m["trial_id"]] for m in modules])
         bar = sign_flip_max_t(net, spec.perms, spec.seed, spec.alpha, spec.null_block_sessions)
         counts_as_cleared = not spec.hypothesis_only
@@ -1205,7 +1276,7 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
             "ranking": [{k: t[k] for k in ("trial_id", "family", "feature", "n", "r", "net_dollars", "gross_bp", "turnover",
                                            "share_of_nights", "gate", "t", "p", "adjusted_p", "passed_step_down",
                                            "dropped_pick_share", "selected")} for t in tested_rows],
-            "cards": {tid: card(panel, results[tid], states, costs[tid]) for tid in carded},
+            "cards": {tid: card(panel, results[tid], states, rates[tid]) for tid in carded},
             "residual": residual_cards(panel, spec, states, results, costs, carded),
             "hypothesis_only": spec.hypothesis_only,
             "note": ("development ranking only; a selected module is a candidate for one confirmation look, not a finding"
@@ -1218,7 +1289,11 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
                              sector_limit,
                              "cost is sides x cost x turnover at a flat rate per side, with no borrow fee on the short side",
                              ("the residual card knows five factors and the sector; whatever else the spread holds, a "
-                              "known effect the set lacks included, stays in its residual")],
+                              "known effect the set lacks included, stays in its residual"),
+                             ("a card's sector cuts pay a replaced-name cost proxy, not an independently traded book: "
+                              "the share of each sector's current picks that are new, weighted like the cut's spread over "
+                              "the sectors with outcomes that night; exits and a shrinking book cost nothing, and a cut "
+                              "matches the module's cost only on nights every filled sector has outcomes")],
         }
         write_once(out / "report.json", rep)
         with (out / "report.md").open("x", encoding="utf-8") as stream:
