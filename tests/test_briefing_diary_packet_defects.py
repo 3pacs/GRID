@@ -773,15 +773,17 @@ def test_defect6_packet_allows_regime_with_8_inputs_and_notices_unavailable_coun
 
 
 def test_defect6_market_briefing_carries_bound_inputs_into_latest_regime_snapshot(tmp_path):
-    """G1: MarketBriefingEngine._gather_market_snapshot carries len(features_used) into
-    snapshot['latest_regime']['bound_inputs'] when the regime record has features_used,
-    making the packet guard live instead of inert."""
+    """G1: MarketBriefingEngine._gather_market_snapshot carries distinct eligible
+    feature count into snapshot['latest_regime']['bound_inputs'] when the regime
+    record is bound to its exact producer analytical snapshot, making the packet
+    guard live instead of inert."""
     from tests.test_market_briefing_number_grounding import _FakeResult
 
     class _RegimeConn(_FakeConnection):
-        def __init__(self, regime_row, snap_payload):
+        def __init__(self, regime_row, snap_id, snap_payload):
             super().__init__()
             self._regime_row = regime_row
+            self._snap_id = snap_id
             self._snap_payload = snap_payload
 
         def execute(self, stmt, params=None):
@@ -789,13 +791,26 @@ def test_defect6_market_briefing_carries_bound_inputs_into_latest_regime_snapsho
             if "FROM decision_journal" in sql:
                 return _FakeResult(one=self._regime_row)
             if "FROM analytical_snapshots" in sql:
-                return _FakeResult(one=(self._snap_payload,) if self._snap_payload is not None else None)
+                row = (
+                    (self._snap_id, self._snap_payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))
+                    if self._snap_payload is not None
+                    else None
+                )
+                return _FakeResult(one=row, many=[row] if row is not None else [])
             return super().execute(stmt, params)
 
-    regime_row = ("FRAGILE", 0.72, 0.15, {}, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    def _payload_hash(payload: dict) -> str:
+        raw = json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, allow_nan=False,
+            separators=(",", ":"), default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
     low_payload = {"regime": "FRAGILE", "n_features": 12, "features_used": {f"f{i}": f"s{i}" for i in range(5)}}
+    low_flags = {"snapshot_id": 101, "snapshot_hash": _payload_hash(low_payload)}
+    regime_row_low = ("FRAGILE", 0.72, 0.15, low_flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
     snap_low = _make_engine(
-        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row, low_payload)), tmp_path,
+        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row_low, 101, low_payload)), tmp_path,
     )._gather_market_snapshot()
     assert snap_low["latest_regime"]["bound_inputs"] == 5
 
@@ -816,9 +831,12 @@ def test_defect6_market_briefing_carries_bound_inputs_into_latest_regime_snapsho
     assert packet_low["publications"] == []
     assert exclusions_low[0]["disposition"] == "REFUSED_INSUFFICIENT_REGIME_INPUTS"
 
-    # When no features_used is available on the regime record, omit count (do not fabricate)
+    # When no features_used is available on the bound producer snapshot, omit count (do not fabricate)
+    none_payload = {"regime": "FRAGILE", "n_features": 12}
+    none_flags = {"snapshot_id": 102, "snapshot_hash": _payload_hash(none_payload)}
+    regime_row_none = ("FRAGILE", 0.72, 0.15, none_flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
     snap_none = _make_engine(
-        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row, {"regime": "FRAGILE", "n_features": 12})), tmp_path,
+        _FakeOllamaClient(None), _FakeEngine(_RegimeConn(regime_row_none, 102, none_payload)), tmp_path,
     )._gather_market_snapshot()
     assert "bound_inputs" not in snap_none["latest_regime"]
     packet_none, exclusions_none = job.build_packet(_packet_bundle([{

@@ -1,0 +1,690 @@
+"""Regression tests closing Codex review HOLD on PR #1373 (head 6b6ecbf5).
+
+Covers:
+1. Snapshot binding: regime labels cite only features from the exact producer
+   analytical snapshot (bound by snapshot id/hash and availability clock <=
+   decision clock); unrelated snapshots and missing labels are withheld.
+2. Distinct eligible feature IDs: duplicates, nulls, blanks, non-typed, and
+   ineligible entries do not count toward MIN_REGIME_BOUND_INPUTS.
+3. Positive instrument binding: named instruments (e.g. 10-year Treasury yield
+   -> DGS10 from raw yc_10y) must bind to their own source series and never
+   fall back to unrelated unit-compatible numbers (DGS2, DGS5, T10Y2Y, features).
+4. Clock sanity: future timestamps and negative ages are rejected rather than
+   trusted as fresh (including when a claimed age/freshness says fresh).
+
+All tests are offline: synthetic dicts, fake connections, mocked LLM — no DB,
+no network, no live or protected outputs read.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib.util
+import json
+import os
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+os.environ.setdefault("DB_PASSWORD", "test-password")
+
+from ollama.market_briefing import MarketBriefingEngine
+from tests.test_market_briefing_number_grounding import (
+    _FakeConnection,
+    _FakeEngine,
+    _FakeOllamaClient,
+    _FakeResult,
+    _empty_snapshot,
+    _make_engine,
+    _no_network,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_packet_module():
+    spec = importlib.util.spec_from_file_location(
+        "daily_publication_packet_binding_under_test",
+        ROOT / "scripts" / "daily_publication_packet.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _canonical_sha256(payload: dict) -> str:
+    raw = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False,
+        separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _packet_bundle(records: list[dict]) -> dict:
+    day = "2026-11-18"
+    return {
+        "version": "publication-capture-v1",
+        "producer": "scripts/daily_publication_packet.py",
+        "publication_day": day,
+        "session_start": f"{day}T00:00:00Z",
+        "session_end": "2026-11-19T00:00:00Z",
+        "captured_at": "2026-11-19T06:00:00Z",
+        "database_receipt": {"transaction_read_only": "on"},
+        "channels": {
+            "market_briefings": {
+                "count": len(records),
+                "truncated": False,
+                "complete": True,
+                "state": "ROWS_RETURNED",
+            },
+        },
+        "failures": [],
+        "existing_diary_context": [],
+        "records": records,
+    }
+
+
+def _briefing_record(row_id: int, snapshot_data: dict, *, created_at: str = "2026-11-18T14:00:00Z") -> dict:
+    return {
+        "channel": "market_briefings",
+        "record": {
+            "id": row_id,
+            "briefing_type": "hourly",
+            "briefing_date": "2026-11-18",
+            "content": f"Synthetic briefing {row_id}.",
+            "created_at": created_at,
+            "snapshot_bytes": 600,
+            "snapshot_data": snapshot_data,
+        },
+    }
+
+
+class _BoundRegimeConn(_FakeConnection):
+    """Fake DB connection serving decision_journal and analytical_snapshots rows."""
+
+    def __init__(self, regime_row, snap_rows=None, *, row_by_sid=None):
+        super().__init__(row_by_sid=row_by_sid)
+        self._regime_row = regime_row
+        self._snap_rows = list(snap_rows) if snap_rows is not None else []
+        self.snap_queries: list[tuple[str, dict]] = []
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        params = dict(params or {})
+        if "FROM decision_journal" in sql:
+            return _FakeResult(one=self._regime_row)
+        if "FROM analytical_snapshots" in sql:
+            self.snap_queries.append((sql, params))
+            rows = list(self._snap_rows)
+            if "snapshot_id" in params:
+                rows = [r for r in rows if len(r) >= 2 and r[0] == params["snapshot_id"]]
+            return _FakeResult(one=(rows[0] if rows else None), many=rows)
+        return super().execute(stmt, params)
+
+
+# ── HOLD 1: Snapshot binding & missing regime label ──────────────────────────
+
+
+def test_briefing_unrelated_analytical_snapshot_cannot_lend_feature_count_and_withholds_regime(tmp_path):
+    """Unbound decision_journal row (no snapshot_id/hash) must NOT borrow
+    features_used from an unrelated latest analytical_snapshots row."""
+    unrelated_payload = {
+        "regime": "FRAGILE",
+        "n_features": 12,
+        "features_used": {f"c{i}": f"feat_{i}" for i in range(10)},
+    }
+    regime_row = ("FRAGILE", 0.72, 0.15, {}, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(
+        regime_row,
+        snap_rows=[(99, unrelated_payload, "2026-11-18T09:55:00Z", date(2026, 11, 18))],
+    )
+
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+
+    assert "latest_regime" not in snap
+    assert snap.get("latest_regime_withheld", {}).get("reason")
+    assert conn.snap_queries == []
+
+
+@pytest.mark.parametrize("case", [
+    "wrong_snapshot_id",
+    "wrong_snapshot_hash",
+    "regime_label_mismatch",
+    "missing_snapshot_label",
+    "blank_snapshot_label",
+    "snapshot_not_found",
+])
+def test_briefing_snapshot_binding_mismatch_or_missing_label_withholds_regime(tmp_path, case):
+    """Any producer snapshot mismatch (id, hash, regime label, missing label, or absent row)
+    must withhold latest_regime with a logged reason."""
+    valid_payload = {
+        "regime": "FRAGILE",
+        "features_used": {f"c{i}": f"feat_{i}" for i in range(8)},
+    }
+    expected_hash = _canonical_sha256(valid_payload)
+    flags = {"snapshot_id": 42, "snapshot_hash": expected_hash}
+    regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+
+    if case == "wrong_snapshot_id":
+        snap_rows = [(99, valid_payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))]
+    elif case == "wrong_snapshot_hash":
+        tampered = {**valid_payload, "features_used": {f"c{i}": f"other_{i}" for i in range(9)}}
+        snap_rows = [(42, tampered, "2026-11-18T09:59:00Z", date(2026, 11, 18))]
+    elif case == "regime_label_mismatch":
+        other_regime = {"regime": "GROWTH", "features_used": valid_payload["features_used"]}
+        flags = {"snapshot_id": 42, "snapshot_hash": _canonical_sha256(other_regime)}
+        regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+        snap_rows = [(42, other_regime, "2026-11-18T09:59:00Z", date(2026, 11, 18))]
+    elif case == "missing_snapshot_label":
+        no_label = {"features_used": valid_payload["features_used"]}
+        flags = {"snapshot_id": 42, "snapshot_hash": _canonical_sha256(no_label)}
+        regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+        snap_rows = [(42, no_label, "2026-11-18T09:59:00Z", date(2026, 11, 18))]
+    elif case == "blank_snapshot_label":
+        blank_label = {"regime": "   ", "features_used": valid_payload["features_used"]}
+        flags = {"snapshot_id": 42, "snapshot_hash": _canonical_sha256(blank_label)}
+        regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+        snap_rows = [(42, blank_label, "2026-11-18T09:59:00Z", date(2026, 11, 18))]
+    else:
+        snap_rows = []
+
+    conn = _BoundRegimeConn(regime_row, snap_rows=snap_rows)
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+
+    assert "latest_regime" not in snap, f"{case}: latest_regime should be withheld"
+    assert snap.get("latest_regime_withheld", {}).get("reason")
+
+
+@pytest.mark.parametrize("bad_state", [None, "", "   ", "UNKNOWN", "NONE", "N/A"])
+def test_briefing_missing_or_unasserted_journal_regime_label_is_withheld(tmp_path, bad_state):
+    payload = {"regime": "FRAGILE", "features_used": {f"c{i}": f"feat_{i}" for i in range(8)}}
+    flags = {"snapshot_id": 42, "snapshot_hash": _canonical_sha256(payload)}
+    regime_row = (bad_state, 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(
+        regime_row,
+        snap_rows=[(42, payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))],
+    )
+
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+
+    assert "latest_regime" not in snap
+    assert snap.get("latest_regime_withheld", {}).get("reason") == "missing_regime_label"
+
+
+def test_briefing_bound_producer_snapshot_passes_and_carries_binding_metadata(tmp_path):
+    payload = {
+        "regime": "FRAGILE",
+        "features_used": {f"c{i}": f"feat_{i}" for i in range(8)},
+    }
+    expected_hash = _canonical_sha256(payload)
+    flags = {"snapshot_id": 42, "snapshot_hash": expected_hash}
+    regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(
+        regime_row,
+        snap_rows=[(42, payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))],
+    )
+
+    engine = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)
+    snap = engine._gather_market_snapshot()
+
+    lr = snap["latest_regime"]
+    assert lr["state"] == "FRAGILE"
+    assert lr["bound_inputs"] == 8
+    assert lr["snapshot_id"] == 42
+    assert lr["snapshot_hash"] == expected_hash
+    assert len(lr["eligible_feature_ids"]) == 8
+
+    # End-to-end: verified bound regime renders into data_context and fallback
+    ctx = engine._build_data_context(snap)
+    assert "### LATEST REGIME INFERENCE" in ctx
+    assert "- State: FRAGILE" in ctx
+    fallback = engine._generate_fallback_briefing(snap)
+    assert "## Latest Regime" in fallback
+    assert "FRAGILE" in fallback
+
+    # And passes daily_publication_packet cleanly
+    job = _load_packet_module()
+    packet, exclusions = job.build_packet(_packet_bundle([_briefing_record(8002, snap)]))
+    assert exclusions == []
+    assert [p["id"] for p in packet["publications"]] == ["market_briefings:8002"]
+
+
+@pytest.mark.parametrize("snapshot_data,case_id", [
+    (
+        {
+            "latest_regime": {"state": "FRAGILE", "snapshot_id": 10, "timestamp": "2026-11-18T10:00:00Z"},
+            "features_used": {f"c{i}": f"feat_{i}" for i in range(10)},
+            "snapshot_id": 99,
+        },
+        "parent_unrelated_snapshot",
+    ),
+    (
+        {
+            "latest_regime": {
+                "state": "FRAGILE",
+                "snapshot_id": 10,
+                "snapshot_hash": "a" * 64,
+                "timestamp": "2026-11-18T10:00:00Z",
+                "bound_inputs": 9,
+                "producer_snapshot": {
+                    "snapshot_id": 99,
+                    "regime": "FRAGILE",
+                    "available_at": "2026-11-18T09:55:00Z",
+                    "features_used": {f"c{i}": f"feat_{i}" for i in range(9)},
+                },
+            },
+        },
+        "producer_snapshot_id_mismatch",
+    ),
+    (
+        {
+            "latest_regime": {
+                "state": "FRAGILE",
+                "snapshot_id": 10,
+                "timestamp": "2026-11-18T10:00:00Z",
+                "bound_inputs": 9,
+                "producer_snapshot": {
+                    "snapshot_id": 10,
+                    "regime": "GROWTH",
+                    "available_at": "2026-11-18T09:55:00Z",
+                    "features_used": {f"c{i}": f"feat_{i}" for i in range(9)},
+                },
+            },
+        },
+        "producer_snapshot_regime_mismatch",
+    ),
+    (
+        {
+            "latest_regime": {
+                "state": "FRAGILE",
+                "snapshot_id": 10,
+                "timestamp": "2026-11-18T10:00:00Z",
+                "bound_inputs": 9,
+                "producer_snapshot": {
+                    "snapshot_id": 10,
+                    "available_at": "2026-11-18T09:55:00Z",
+                    "features_used": {f"c{i}": f"feat_{i}" for i in range(9)},
+                },
+            },
+        },
+        "producer_snapshot_missing_label",
+    ),
+    (
+        {
+            "latest_regime": {
+                "state": "",
+                "bound_inputs": 10,
+                "timestamp": "2026-11-18T10:00:00Z",
+            },
+        },
+        "missing_regime_label_blank",
+    ),
+    (
+        {
+            "latest_regime": {
+                "bound_inputs": 10,
+                "timestamp": "2026-11-18T10:00:00Z",
+            },
+        },
+        "missing_regime_label_absent",
+    ),
+])
+def test_packet_refuses_unrelated_snapshot_and_missing_regime_label(snapshot_data, case_id):
+    job = _load_packet_module()
+    bundle = _packet_bundle([_briefing_record(8001, snapshot_data)])
+
+    packet, exclusions = job.build_packet(bundle)
+
+    assert packet["publications"] == [], f"{case_id}: should be withheld/refused"
+    assert len(exclusions) == 1
+    assert "market_briefings:8001" in packet["capture_receipt"]["quarantined_publication_ids"]
+    assert any("market_briefings:8001" in b for b in packet["blockers"])
+
+
+# ── HOLD 2: Distinct non-null typed eligible feature IDs ─────────────────────
+
+
+def test_briefing_duplicate_null_blank_and_ineligible_features_counted_distinctly(tmp_path):
+    """Duplicates, nulls, blanks, booleans, and ineligible dicts must not pad bound_inputs."""
+    payload = {
+        "regime": "FRAGILE",
+        "features_used": [
+            "vix_close",
+            "vix_close",
+            " VIX_CLOSE ",
+            None,
+            "",
+            "   ",
+            "null",
+            True,
+            False,
+            {"feature_id": "hy_oas", "eligible": True},
+            {"feature_id": "hy_oas", "eligible": True},
+            {"feature_id": "bad_feat", "eligible": False},
+            {"feature_id": "stale_feat", "stale": True},
+            {"feature_id": None, "eligible": True},
+            "dgs10",
+            42,
+            42,
+        ],
+    }
+    flags = {"snapshot_id": 55, "snapshot_hash": _canonical_sha256(payload)}
+    regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(
+        regime_row,
+        snap_rows=[(55, payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))],
+    )
+
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+
+    # Only 4 distinct valid eligible IDs: "vix_close", "hy_oas", "dgs10", 42
+    assert snap["latest_regime"]["bound_inputs"] == 4
+
+    job = _load_packet_module()
+    packet, exclusions = job.build_packet(_packet_bundle([_briefing_record(8010, snap)]))
+    assert packet["publications"] == []
+    assert exclusions[0]["disposition"] == "REFUSED_INSUFFICIENT_REGIME_INPUTS"
+
+
+@pytest.mark.parametrize("regime_meta", [
+    {
+        "state": "FRAGILE",
+        "timestamp": "2026-11-18T10:00:00Z",
+        "features_used": ["f1", "f1", "f2", "f2", None, "", "   ", "null", "f3", "f3"],
+    },
+    {
+        "state": "GROWTH",
+        "timestamp": "2026-11-18T10:00:00Z",
+        # 10 dict keys mapping to only 3 distinct non-null target feature IDs
+        "features_used": {
+            "c0": "vix", "c1": "vix", "c2": "vix", "c3": None, "c4": "",
+            "c5": "   ", "c6": "hy_oas", "c7": "hy_oas", "c8": "dgs10", "c9": False,
+        },
+    },
+    {
+        "state": "CRISIS",
+        "timestamp": "2026-11-18T10:00:00Z",
+        # Claimed bound_inputs=10 cannot override features_used having only 4 eligible IDs
+        "bound_inputs": 10,
+        "features_used": [
+            {"feature_id": 1, "eligible": True},
+            {"feature_id": 1, "eligible": True},
+            {"feature_id": 2, "eligible": False},
+            {"feature_id": 3, "model_eligible": False},
+            {"feature_id": 4, "eligible": True},
+            {"feature_id": 5, "eligible": True},
+            {"feature_id": 6, "eligible": True},
+            {"feature_id": None, "eligible": True},
+        ],
+    },
+])
+def test_packet_duplicate_null_and_ineligible_feature_ids_do_not_reach_threshold(regime_meta):
+    job = _load_packet_module()
+    bundle = _packet_bundle([_briefing_record(8011, {"latest_regime": regime_meta})])
+
+    packet, exclusions = job.build_packet(bundle)
+
+    assert packet["publications"] == []
+    assert len(exclusions) == 1
+    assert exclusions[0]["disposition"] == "REFUSED_INSUFFICIENT_REGIME_INPUTS"
+
+
+# ── HOLD 3: Positive instrument binding (Treasury yield wrong-source) ────────
+
+
+@pytest.mark.parametrize("claim_text,expected_unverified", [
+    ("The 10-year Treasury yield stands at 4.80% today.", "4.80%"),
+    ("The 10-year Treasury yield stands at 4.50% today.", "4.50%"),
+    ("The 10-year Treasury yield stands at -0.45% today.", "-0.45%"),
+    ("With the curve inverted, the 10-year Treasury yield is 0.45% today.", "0.45%"),
+    ("The 10-year Treasury yield stands at 4.33% today.", "4.33%"),
+    ("The 10-year Treasury yield stands at 4.15% today.", "4.15%"),
+    ("The ten-year Treasury yield stands at 4.50% today.", "4.50%"),
+])
+def test_grounding_named_10y_treasury_yield_rejects_wrong_source_values(
+    tmp_path, monkeypatch, claim_text, expected_unverified,
+):
+    """When yc_10y / DGS10 is absent, a named 10-year Treasury yield claim must
+    FAIL grounding even when DGS2, DGS5, T10Y2Y, DFF, macro, or features contain
+    the exact same numeric value (no fallback to global context pool)."""
+    monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
+    monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
+    monkeypatch.setattr("intelligence.sentiment_scorer.compute_sentiment", _no_network)
+    monkeypatch.setattr("intelligence.sentiment_scorer.log_prediction", _no_network)
+    monkeypatch.setattr("intelligence.context_provider.build_full_context", lambda *_a, **_k: "")
+
+    snapshot = _empty_snapshot()
+    snapshot["timestamp"] = "2026-11-18T14:00:00+00:00"
+    snapshot["date"] = "2026-11-18"
+    snapshot["rates"] = {
+        "DGS2": {"value": 4.80, "date": "2026-11-18"},
+        "DGS5": {"value": 4.50, "date": "2026-11-18"},
+        "T10Y2Y": {"value": -0.45, "date": "2026-11-18"},
+        "DFF": {"value": 4.33, "date": "2026-11-18"},
+    }
+    # Unit-compatible feature & macro entries that used to slip through pool fallback
+    snapshot["features"] = {
+        "custom_rate_proxy": {"value": 4.15, "date": "2026-11-18"},
+        "alt_5y_proxy": {"value": 4.50, "date": "2026-11-18"},
+    }
+    snapshot["macro"] = {
+        "UNRATE": {"value": 4.50, "date": "2026-11-01"},
+    }
+
+    engine = _make_engine(_FakeOllamaClient(f"## What's Happening Now\n{claim_text}\n"), None, tmp_path)
+    monkeypatch.setattr(engine, "_gather_market_snapshot", lambda: copy.deepcopy(snapshot))
+
+    result = engine.generate_briefing(briefing_type="hourly", save=False)
+
+    assert result["grounding"]["ungrounded_count"] == 1, (
+        f"Expected ungrounded on {claim_text!r}, got {result['grounding']}"
+    )
+    assert result["grounding"]["ungrounded_values"] == [expected_unverified]
+    assert f"{expected_unverified} [unverified]" in result["content"]
+
+
+def test_grounding_10y_treasury_binds_positively_to_yc_10y_dgs10_only(tmp_path, monkeypatch):
+    """When yc_10y populates rates.DGS10=4.22, 4.22% passes for 10Y while
+    4.50% (present in DGS5 and features) still fails for 10Y."""
+    monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
+    monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
+    monkeypatch.setattr("intelligence.sentiment_scorer.compute_sentiment", _no_network)
+    monkeypatch.setattr("intelligence.sentiment_scorer.log_prediction", _no_network)
+    monkeypatch.setattr("intelligence.context_provider.build_full_context", lambda *_a, **_k: "")
+
+    rows = {
+        "yc_10y": (4.22, date(2026, 11, 18)),
+        "DGS2": (4.80, date(2026, 11, 18)),
+        "DGS5": (4.50, date(2026, 11, 18)),
+        "T10Y2Y": (-0.58, date(2026, 11, 18)),
+    }
+
+    good_engine = _make_engine(
+        _FakeOllamaClient("## What's Happening Now\nThe 10-year Treasury yield is 4.22%.\n"),
+        _FakeEngine(_FakeConnection(row_by_sid=rows)),
+        tmp_path,
+    )
+    good = good_engine.generate_briefing(briefing_type="hourly", save=False)
+    assert good["grounding"]["ungrounded_count"] == 0
+
+    bad_engine = _make_engine(
+        _FakeOllamaClient("## What's Happening Now\nThe 10-year Treasury yield is 4.50%.\n"),
+        _FakeEngine(_FakeConnection(row_by_sid=rows)),
+        tmp_path,
+    )
+    bad = bad_engine.generate_briefing(briefing_type="hourly", save=False)
+    assert bad["grounding"]["ungrounded_count"] == 1
+    assert bad["grounding"]["ungrounded_values"] == ["4.50%"]
+
+
+# ── HOLD 4: Clock sanity — reject future timestamps & negative ages ──────────
+
+
+@pytest.mark.parametrize("snapshot_data,case_id", [
+    (
+        {"rates": {"DGS10": {"value": 4.35, "date": "2026-11-25"}}},
+        "future_obs_date",
+    ),
+    (
+        {"rates": {"DGS10": {"value": 4.35, "date": "2026-11-25", "age_days": 0}}},
+        "future_obs_date_with_claimed_fresh_age",
+    ),
+    (
+        {
+            "rates": {
+                "DGS10": {
+                    "value": 4.35,
+                    "date": "2026-11-25",
+                    "freshness": {"status": "fresh", "age": 0, "limit": 5, "unit": "days"},
+                },
+            },
+        },
+        "future_obs_date_with_claimed_fresh_block",
+    ),
+    (
+        {"models": {"regime_hmm": {"trained_at": "2026-11-18T18:00:00Z", "max_age_days": 30}}},
+        "future_same_day_timestamp",
+    ),
+    (
+        {"rates": {"DGS2": {"value": 4.80, "date": "2026-11-18", "age_days": -1}}},
+        "negative_age_days",
+    ),
+    (
+        {"rates": {"DGS2": {"value": 4.80, "date": "2026-11-18", "data_staleness_days": -3}}},
+        "negative_data_staleness_days",
+    ),
+    (
+        {"rates": {"DGS2": {"value": 4.80, "date": "2026-11-18", "age_hours": -0.5}}},
+        "negative_age_hours",
+    ),
+    (
+        {
+            "rates": {
+                "DGS2": {
+                    "value": 4.80,
+                    "date": "2026-11-18",
+                    "freshness": {"status": "fresh", "age": -2, "limit": 5, "unit": "days"},
+                },
+            },
+        },
+        "negative_freshness_age",
+    ),
+    (
+        {
+            "latest_regime": {
+                "state": "FRAGILE",
+                "bound_inputs": 8,
+                "timestamp": "2026-11-18T18:00:00Z",
+            },
+        },
+        "future_regime_timestamp",
+    ),
+])
+def test_packet_rejects_future_timestamps_and_negative_ages(snapshot_data, case_id):
+    """Future timestamps and negative ages must be rejected, never trusted as fresh."""
+    job = _load_packet_module()
+    bundle = _packet_bundle([_briefing_record(8020, snapshot_data, created_at="2026-11-18T14:00:00Z")])
+
+    packet, exclusions = job.build_packet(bundle)
+
+    assert packet["publications"] == [], f"{case_id}: should be rejected"
+    assert len(exclusions) == 1
+    assert "market_briefings:8020" in packet["capture_receipt"]["quarantined_publication_ids"]
+    assert any("market_briefings:8020" in b for b in packet["blockers"])
+
+
+def test_packet_does_not_trust_claimed_fresh_age_over_stale_timestamp():
+    """A stale observation date must still be flagged stale even if age_days=0 or
+    freshness={'status': 'fresh', 'age': 0} claims otherwise."""
+    job = _load_packet_module()
+    bundle = _packet_bundle([_briefing_record(
+        8021,
+        {
+            "rates": {
+                "DGS2": {"value": 4.80, "date": "2026-10-01", "age_days": 0},
+                "DGS10": {
+                    "value": 4.35,
+                    "date": "2026-10-01",
+                    "freshness": {"status": "fresh", "age": 1, "limit": 5, "unit": "days"},
+                },
+            },
+        },
+        created_at="2026-11-18T14:00:00Z",
+    )])
+
+    packet, exclusions = job.build_packet(bundle)
+
+    assert exclusions == []
+    assert len(packet["publications"]) == 1
+    pub = packet["publications"][0]
+    assert pub["stale"] is True
+    stale_paths = {item["path"] for item in pub["stale_items"]}
+    assert "snapshot_data.rates.DGS2" in stale_paths
+    assert "snapshot_data.rates.DGS10" in stale_paths
+
+
+def test_briefing_rejects_future_db_rows_and_future_or_negative_age_snapshot_items(tmp_path, monkeypatch):
+    """MarketBriefingEngine rejects future timestamps and negative ages both at
+    DB gather time and during context rendering / grounding."""
+    monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
+    monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
+    monkeypatch.setattr("intelligence.sentiment_scorer.compute_sentiment", _no_network)
+    monkeypatch.setattr("intelligence.sentiment_scorer.log_prediction", _no_network)
+    monkeypatch.setattr("intelligence.context_provider.build_full_context", lambda *_a, **_k: "")
+
+    future_day = date.today() + timedelta(days=5)
+    future_ts = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
+    payload = {"regime": "FRAGILE", "features_used": {f"c{i}": f"feat_{i}" for i in range(8)}}
+    flags = {"snapshot_id": 77, "snapshot_hash": _canonical_sha256(payload)}
+
+    # (a) Future raw_series observation and future analytical_snapshots clock rejected at gather
+    conn = _BoundRegimeConn(
+        regime_row=("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z"),
+        snap_rows=[(77, payload, future_ts, future_day)],
+        row_by_sid={"yc_10y": (4.35, future_day), "DGS2": (4.80, date(2026, 11, 18))},
+    )
+    gathered = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+    assert "DGS10" not in gathered["rates"]
+    assert gathered["rates"]["DGS2"]["value"] == 4.80
+    assert "latest_regime" not in gathered
+    assert gathered.get("latest_regime_withheld", {}).get("reason")
+
+    # (b) Future-dated or negative-age snapshot entries are withheld from data_context
+    #     and fail grounding if claimed in LLM text.
+    snapshot = _empty_snapshot()
+    snapshot["timestamp"] = "2026-11-18T14:00:00+00:00"
+    snapshot["date"] = "2026-11-18"
+    snapshot["rates"] = {
+        "DGS10": {"value": 4.35, "date": "2026-11-25", "age_days": 0},
+        "DGS2": {"value": 4.80, "date": "2026-11-18", "age_days": -2},
+    }
+    engine = _make_engine(
+        _FakeOllamaClient(
+            "## What's Happening Now\n"
+            "The 10-year Treasury yield is 4.35% and the 2-year Treasury yield is 4.80%.\n"
+        ),
+        None,
+        tmp_path,
+    )
+    monkeypatch.setattr(engine, "_gather_market_snapshot", lambda: copy.deepcopy(snapshot))
+    result = engine.generate_briefing(briefing_type="hourly", save=False)
+
+    assert result["grounding"]["ungrounded_count"] == 2
+    assert result["grounding"]["ungrounded_values"] == ["4.35%", "4.80%"]
+    assert "4.35% [unverified]" in result["content"]
+    assert "4.80% [unverified]" in result["content"]
+
+    # (c) Direct grounding call also rejects a future asof date against snapshot header
+    direct_ctx = (
+        "## Market Data Snapshot — 2026-11-18T14:00:00+00:00 (assembly time, not an evidence clock)\n"
+        "### RATES\n"
+        "- rates:DGS10: raw value=4.35 | asof=2026-11-25 | source=unknown\n"
+    )
+    direct = MarketBriefingEngine._check_numbers_grounded_by_instrument(
+        "The 10-year Treasury yield is 4.35%.", direct_ctx,
+    )
+    assert len(direct.ungrounded) == 1
+    assert direct.ungrounded[0].raw == "4.35%"

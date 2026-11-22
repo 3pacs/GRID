@@ -485,10 +485,32 @@ def diary_run_evidence(bundle: dict[str, Any], day: date, unit_evidence: dict[st
 MIN_REGIME_BOUND_INPUTS = 8
 REGIME_BOUND_INPUT_UNAVAILABLE_NOTICE = "regime bound-input count unavailable"
 _UNASSERTED_REGIME_LABELS = frozenset({"", "UNKNOWN", "UNCALIBRATED", "NONE", "N/A"})
+_INVALID_FEATURE_ID_STRINGS = frozenset({
+    "", "null", "none", "n/a", "na", "unknown", "missing", "unavailable", "-",
+})
+_INELIGIBLE_FEATURE_STATUSES = frozenset({
+    "ineligible", "stale", "missing", "unavailable", "rejected",
+    "invalid", "unverified", "future", "withheld", "excluded",
+})
+_SNAPSHOT_ID_KEYS = ("snapshot_id", "producer_snapshot_id", "analytical_snapshot_id")
+_SNAPSHOT_HASH_KEYS = ("snapshot_hash", "producer_snapshot_hash", "snapshot_sha256", "payload_sha256")
+_OBSERVED_TIMESTAMP_KEYS = (
+    "data_as_of", "obs_date", "date", "as_of_date", "as_of",
+    "available_at", "snapshot_available_at", "created_at",
+    "trained_at", "model_updated_at", "updated_at", "timestamp",
+    "collected_at", "checked_at",
+)
+_NUMERIC_AGE_KEYS = (
+    ("age_seconds", "seconds"),
+    ("age_hours", "hours"),
+    ("age_days", "days"),
+    ("data_staleness_days", "days"),
+)
 # Only actual bound-input fields; n_features / feature_count / n_features_used
 # reflect registry or matrix sizes rather than bound inputs and are ignored.
 _BOUND_INPUT_KEYS = (
     "features_used",
+    "eligible_feature_ids",
     "bound_inputs",
 )
 # Cadence-aware max-age defaults (days), matching auto_regime.py (5d) and
@@ -519,25 +541,197 @@ MONTHLY_MACRO_SERIES = frozenset({
 })
 
 
-def _extract_bound_input_count(mapping: dict[str, Any]) -> int | None:
-    """Return an integer bound-input count from *mapping* if available, else None.
+def _normalize_typed_feature_id(val: Any) -> tuple[tuple[str, Any], str | int] | None:
+    """Normalize a typed feature identifier (non-bool int >= 0 or non-blank str)."""
+    if val is None or isinstance(val, bool):
+        return None
+    if type(val) is int:
+        if val < 0:
+            return None
+        return ("int", val), val
+    if type(val) is str:
+        cleaned = val.strip()
+        if cleaned.lower() in _INVALID_FEATURE_ID_STRINGS:
+            return None
+        return ("str", cleaned.casefold()), cleaned
+    return None
 
-    Reads ``features_used`` (collection length) before ``bound_inputs`` (int or
-    collection length). Registry-size fields (``n_features``, ``feature_count``,
+
+def _extract_distinct_eligible_feature_ids(
+    raw_features: Any,
+    *,
+    eligible_ids: set[tuple[str, Any]] | None = None,
+    excluded_ids: set[tuple[str, Any]] | None = None,
+    as_of: datetime | None = None,
+) -> list[str | int] | None:
+    """Return sorted distinct, non-null, typed, eligible feature IDs from *raw_features*."""
+    if not isinstance(raw_features, (dict, list, tuple, set)):
+        return None
+
+    def _entry_eligible(entry: dict[str, Any]) -> bool:
+        if "eligible" in entry and entry["eligible"] is not True:
+            return False
+        if "model_eligible" in entry and entry["model_eligible"] is not True:
+            return False
+        if entry.get("stale") is True:
+            return False
+        if "status" in entry:
+            st = entry["status"]
+            if type(st) is not str or st.strip().lower() in _INELIGIBLE_FEATURE_STATUSES:
+                return False
+        if as_of is not None and _check_entry_clock_sanity(entry, "feature", "input", as_of):
+            return False
+        return True
+
+    def _dict_entry_id(entry: dict[str, Any], fallback_key: Any = None) -> tuple[tuple[str, Any], str | int] | None:
+        for id_key in ("feature_id", "id", "feature", "series_id", "name"):
+            if id_key in entry:
+                return _normalize_typed_feature_id(entry[id_key])
+        if fallback_key is not None:
+            return _normalize_typed_feature_id(fallback_key)
+        return None
+
+    seen: dict[tuple[str, Any], str | int] = {}
+
+    def _consider(pair: tuple[tuple[str, Any], str | int] | None, alias_key: tuple[str, Any] | None = None) -> None:
+        if pair is None:
+            return
+        norm_key, display_val = pair
+        if excluded_ids and (norm_key in excluded_ids or (alias_key is not None and alias_key in excluded_ids)):
+            return
+        if eligible_ids is not None and norm_key not in eligible_ids and (alias_key is None or alias_key not in eligible_ids):
+            return
+        seen.setdefault(norm_key, display_val)
+
+    if isinstance(raw_features, dict):
+        for k, v in raw_features.items():
+            key_pair = _normalize_typed_feature_id(k)
+            if key_pair is None:
+                continue
+            if isinstance(v, dict):
+                if not _entry_eligible(v):
+                    continue
+                _consider(_dict_entry_id(v, fallback_key=k), alias_key=key_pair[0])
+            else:
+                _consider(_normalize_typed_feature_id(v), alias_key=key_pair[0])
+    else:
+        for item in raw_features:
+            if isinstance(item, dict):
+                if not _entry_eligible(item):
+                    continue
+                _consider(_dict_entry_id(item))
+            else:
+                _consider(_normalize_typed_feature_id(item))
+
+    return [val for _, val in sorted(seen.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))]
+
+
+def _snapshot_hash_matches(payload: dict[str, Any], expected_hash: Any) -> bool:
+    """Verify *expected_hash* against *payload* canonical sha256 or declared hash."""
+    if type(expected_hash) is not str or not expected_hash.strip():
+        return False
+    exp = expected_hash.strip().lower()
+    if exp.startswith("sha256:"):
+        exp = exp[7:]
+    if not exp:
+        return False
+
+    declared: list[str] = []
+    for hkey in _SNAPSHOT_HASH_KEYS:
+        val = payload.get(hkey)
+        if type(val) is str and val.strip():
+            norm = val.strip().lower()
+            if norm.startswith("sha256:"):
+                norm = norm[7:]
+            if norm != exp:
+                return False
+            declared.append(norm)
+
+    is_sha256_hex = len(exp) == 64 and all(c in "0123456789abcdef" for c in exp)
+    if is_sha256_hex:
+        if sha256(canonical(payload)) == exp:
+            return True
+        stripped = {k: v for k, v in payload.items() if k not in _SNAPSHOT_HASH_KEYS}
+        if len(stripped) != len(payload) and sha256(canonical(stripped)) == exp:
+            return True
+        if declared and all(h == exp for h in declared) and set(payload.keys()) <= {
+            "snapshot_id", "snapshot_hash", "available_at", "regime", "state",
+            "producer_snapshot_id", "producer_snapshot_hash", "snapshot_sha256",
+        }:
+            return True
+        return False
+    return bool(declared) and all(h == exp for h in declared)
+
+
+def _extract_snapshot_id(mapping: dict[str, Any], *, allow_bare_id: bool = False) -> int | str | None:
+    keys = ("id", *_SNAPSHOT_ID_KEYS) if allow_bare_id else _SNAPSHOT_ID_KEYS
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            val = mapping[key]
+            if type(val) is int and val >= 0:
+                return val
+            if type(val) is str and val.strip():
+                return val.strip()
+    return None
+
+
+def _extract_snapshot_hash(mapping: dict[str, Any]) -> str | None:
+    for key in _SNAPSHOT_HASH_KEYS:
+        val = mapping.get(key)
+        if type(val) is str and val.strip():
+            return val.strip()
+    return None
+
+
+def _extract_bound_input_count(mapping: dict[str, Any], *, as_of: datetime | None = None) -> int | None:
+    """Return an integer distinct eligible bound-input count from *mapping*, else None.
+
+    Reads ``features_used`` (distinct non-null typed eligible feature IDs) before
+    ``eligible_feature_ids`` and ``bound_inputs`` (collection distinct count or
+    non-negative int). Registry-size fields (``n_features``, ``feature_count``,
     ``n_features_used``) are never treated as bound-input counts.
     """
+    excl_raw = mapping.get("ineligible_features") or mapping.get("excluded_features")
+    excluded_set: set[tuple[str, Any]] | None = None
+    if isinstance(excl_raw, (list, tuple, set, dict)):
+        excl_items = excl_raw.keys() if isinstance(excl_raw, dict) else excl_raw
+        excluded_set = {
+            pair[0]
+            for item in excl_items
+            if (pair := _normalize_typed_feature_id(item)) is not None
+        }
+    elig_raw = mapping.get("eligible_features")
+    eligible_set: set[tuple[str, Any]] | None = None
+    if isinstance(elig_raw, (list, tuple, set)):
+        eligible_set = {
+            pair[0]
+            for item in elig_raw
+            if (pair := _normalize_typed_feature_id(item)) is not None
+        }
+
     for key in _BOUND_INPUT_KEYS:
         if key not in mapping:
             continue
         raw = mapping[key]
-        if key == "features_used":
-            if isinstance(raw, (list, tuple, dict, set)):
-                return len(raw)
+        if key in ("features_used", "eligible_feature_ids"):
+            distinct = _extract_distinct_eligible_feature_ids(
+                raw,
+                eligible_ids=eligible_set if key == "features_used" else None,
+                excluded_ids=excluded_set,
+                as_of=as_of,
+            )
+            if distinct is not None:
+                return len(distinct)
+            continue
+        if isinstance(raw, (list, tuple, dict, set)):
+            distinct = _extract_distinct_eligible_feature_ids(
+                raw, eligible_ids=eligible_set, excluded_ids=excluded_set, as_of=as_of,
+            )
+            if distinct is not None:
+                return len(distinct)
             continue
         if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
             return raw
-        if isinstance(raw, (list, tuple, dict, set)):
-            return len(raw)
     return None
 
 
@@ -550,76 +744,264 @@ def _extract_regime_label(mapping: dict[str, Any]) -> str | None:
     return None
 
 
-def inspect_regime_bound_inputs(row: dict[str, Any]) -> tuple[str, str | None, int | None]:
+def _resolve_row_as_of(row: dict[str, Any], as_of: datetime | None) -> datetime | None:
+    if as_of is not None:
+        return clock(as_of)
+    for key in ("created_at", "generated_at", "timestamp"):
+        val = row.get(key)
+        if val is not None:
+            _, dt, _, _ = _parse_observed_clock(val)
+            if dt is not None:
+                return dt
+    return None
+
+
+def _verify_producer_snapshot_binding(
+    regime_mapping: dict[str, Any],
+    regime_label: str,
+    producer_snap: Any,
+    as_of: datetime | None,
+) -> tuple[bool, str | None, int | None]:
+    """Verify that *producer_snap* matches *regime_mapping* by id/hash, label, and clock."""
+    if not isinstance(producer_snap, dict):
+        return False, "invalid_producer_snapshot", None
+
+    if as_of is not None:
+        clock_errs = _check_entry_clock_sanity(producer_snap, "producer_snapshot", "model", as_of)
+        if clock_errs:
+            return False, f"producer_snapshot_{clock_errs[0]['reason']}", None
+
+    snap_label = _extract_regime_label(producer_snap)
+    if snap_label is None:
+        return False, "producer_snapshot_missing_regime_label", None
+    if snap_label.upper() != regime_label.upper():
+        return False, "producer_snapshot_regime_mismatch", None
+
+    expected_id = _extract_snapshot_id(regime_mapping)
+    actual_id = _extract_snapshot_id(producer_snap, allow_bare_id=True)
+    if expected_id is not None:
+        if actual_id is None or actual_id != expected_id:
+            return False, "producer_snapshot_id_mismatch", None
+
+    expected_hash = _extract_snapshot_hash(regime_mapping)
+    if expected_hash is not None:
+        if not _snapshot_hash_matches(producer_snap, expected_hash):
+            return False, "producer_snapshot_hash_mismatch", None
+
+    snap_count = _extract_bound_input_count(producer_snap, as_of=as_of)
+    return True, None, snap_count
+
+
+def inspect_regime_binding(row: dict[str, Any], as_of: datetime | None = None) -> dict[str, Any]:
+    """Read-only inspection of regime label binding, snapshot match, clock sanity,
+    and distinct eligible bound-input count."""
+    if not isinstance(row, dict):
+        return {"status": "ok", "label": None, "count": None, "reason": None}
+
+    resolved_as_of = _resolve_row_as_of(row, as_of)
+    roots: list[dict[str, Any]] = [row]
+    snap = row.get("snapshot_data")
+    if isinstance(snap, dict):
+        roots.append(snap)
+
+    # Explicit regime sub-containers carry regime declarations and must have a valid label.
+    explicit_containers: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for root in roots:
+        for key in ("latest_regime", "regime", "regime_detection"):
+            sub = root.get(key)
+            if isinstance(sub, dict) and sub:
+                explicit_containers.append((key, sub, root))
+
+    # Cross-check sibling regime containers within the same root (e.g. latest_regime vs regime_detection)
+    for root in roots:
+        siblings = [
+            (k, root[k])
+            for k in ("latest_regime", "regime", "regime_detection")
+            if isinstance(root.get(k), dict) and root[k]
+        ]
+        if len(siblings) >= 2:
+            labels = {_extract_regime_label(m).upper() for _, m in siblings if _extract_regime_label(m)}
+            if len(labels) > 1:
+                return {
+                    "status": "mismatch",
+                    "label": _extract_regime_label(siblings[0][1]),
+                    "count": None,
+                    "reason": "conflicting_regime_snapshots",
+                }
+            sids = {_extract_snapshot_id(m) for _, m in siblings if _extract_snapshot_id(m) is not None}
+            if len(sids) > 1:
+                return {
+                    "status": "mismatch",
+                    "label": _extract_regime_label(siblings[0][1]),
+                    "count": None,
+                    "reason": "conflicting_regime_snapshot_ids",
+                }
+
+    unavailable_label: str | None = None
+
+    def _inspect_one(
+        mapping: dict[str, Any],
+        parent: dict[str, Any] | None,
+        *,
+        explicit_regime_container: bool,
+    ) -> dict[str, Any] | None:
+        nonlocal unavailable_label
+        label = _extract_regime_label(mapping)
+        if label is None:
+            if explicit_regime_container:
+                return {
+                    "status": "mismatch",
+                    "label": None,
+                    "count": None,
+                    "reason": "missing_regime_label",
+                }
+            return None
+
+        if resolved_as_of is not None:
+            clock_errs = _check_entry_clock_sanity(mapping, "regime", "model", resolved_as_of)
+            if clock_errs:
+                return {
+                    "status": "mismatch",
+                    "label": label,
+                    "count": None,
+                    "reason": f"regime_{clock_errs[0]['reason']}",
+                }
+
+        raw_bi = mapping.get("bound_inputs")
+        if "bound_inputs" in mapping and raw_bi is not None and (
+            isinstance(raw_bi, bool)
+            or (isinstance(raw_bi, int) and raw_bi < 0)
+        ):
+            return {
+                "status": "mismatch",
+                "label": label,
+                "count": None,
+                "reason": "invalid_bound_inputs",
+            }
+
+        snap_count_from_producer: int | None = None
+        for snap_key in ("producer_snapshot", "analytical_snapshot"):
+            if snap_key in mapping and mapping[snap_key] is not None:
+                ok, reason, scount = _verify_producer_snapshot_binding(
+                    mapping, label, mapping[snap_key], resolved_as_of,
+                )
+                if not ok:
+                    return {"status": "mismatch", "label": label, "count": None, "reason": reason}
+                if scount is not None:
+                    snap_count_from_producer = scount
+
+        has_own_collection = any(
+            k in mapping and isinstance(mapping[k], (dict, list, tuple, set))
+            for k in ("features_used", "eligible_feature_ids", "bound_inputs")
+        )
+        count = _extract_bound_input_count(mapping, as_of=resolved_as_of)
+        if snap_count_from_producer is not None:
+            if count is None or (not has_own_collection and snap_count_from_producer < count):
+                count = snap_count_from_producer
+
+        if count is None and isinstance(parent, dict):
+            parent_count = _extract_bound_input_count(parent, as_of=resolved_as_of)
+            if parent_count is not None:
+                # Never borrow a feature count from an unrelated/unbound parent snapshot.
+                map_sid = _extract_snapshot_id(mapping)
+                parent_sid = _extract_snapshot_id(parent, allow_bare_id=False)
+                map_hash = _extract_snapshot_hash(mapping)
+                parent_label = _extract_regime_label(parent)
+                if (
+                    map_sid is not None
+                    and parent_sid is not None
+                    and map_sid == parent_sid
+                    and (map_hash is None or _snapshot_hash_matches(parent, map_hash))
+                    and parent_label is not None
+                    and parent_label.upper() == label.upper()
+                    and (resolved_as_of is None or not _check_entry_clock_sanity(parent, "parent_snapshot", "model", resolved_as_of))
+                ):
+                    count = parent_count
+                else:
+                    return {
+                        "status": "mismatch",
+                        "label": label,
+                        "count": None,
+                        "reason": "unrelated_parent_snapshot",
+                    }
+
+        if count is not None and count < MIN_REGIME_BOUND_INPUTS:
+            return {
+                "status": "insufficient",
+                "label": label,
+                "count": count,
+                "reason": f"regime_bound_inputs_below_minimum:{count}<{MIN_REGIME_BOUND_INPUTS}",
+            }
+        if count is None and unavailable_label is None:
+            unavailable_label = label
+        return None
+
+    for _, mapping, parent in explicit_containers:
+        verdict = _inspect_one(mapping, parent, explicit_regime_container=True)
+        if verdict is not None:
+            return verdict
+
+    for root in roots:
+        verdict = _inspect_one(root, None, explicit_regime_container=False)
+        if verdict is not None:
+            return verdict
+
+    if unavailable_label is not None:
+        return {"status": "unavailable", "label": unavailable_label, "count": None, "reason": None}
+    return {"status": "ok", "label": None, "count": None, "reason": None}
+
+
+def inspect_regime_bound_inputs(row: dict[str, Any], as_of: datetime | None = None) -> tuple[str, str | None, int | None]:
     """Read-only inspection of any carried regime label's bound-input count.
 
     Returns:
         (``"insufficient"``, label, count) when a carried regime label has a
-            bound-input count < MIN_REGIME_BOUND_INPUTS;
+            distinct eligible bound-input count < MIN_REGIME_BOUND_INPUTS;
+        (``"mismatch"``, label, None) when a carried regime container has a
+            missing label, unrelated/mismatched producer snapshot, or invalid clock;
         (``"unavailable"``, label, None) when a carried regime label has no
             available bound-input count;
         (``"ok"``, None, None) when no regime label is asserted or every
             asserted regime label meets MIN_REGIME_BOUND_INPUTS.
     """
-    if not isinstance(row, dict):
-        return "ok", None, None
-    containers: list[tuple[dict[str, Any], dict[str, Any] | None]] = [(row, None)]
-    snap = row.get("snapshot_data")
-    if isinstance(snap, dict):
-        containers.append((snap, row))
-    for container, parent in list(containers):
-        for key in ("latest_regime", "regime", "regime_detection"):
-            sub = container.get(key)
-            if isinstance(sub, dict):
-                containers.append((sub, container))
-    unavailable_label: str | None = None
-    for mapping, parent in containers:
-        label = _extract_regime_label(mapping)
-        if label is None:
-            continue
-        count = _extract_bound_input_count(mapping)
-        if count is None and isinstance(parent, dict):
-            count = _extract_bound_input_count(parent)
-        if count is not None and count < MIN_REGIME_BOUND_INPUTS:
-            return "insufficient", label, count
-        if count is None and unavailable_label is None:
-            unavailable_label = label
-    if unavailable_label is not None:
-        return "unavailable", unavailable_label, None
-    return "ok", None, None
+    info = inspect_regime_binding(row, as_of=as_of)
+    return info["status"], info["label"], info["count"]
 
 
-def check_regime_bound_inputs(row: dict[str, Any]) -> tuple[str, int] | None:
+def check_regime_bound_inputs(row: dict[str, Any], as_of: datetime | None = None) -> tuple[str, int] | None:
     """Read-only check: return (label, bound_count) if a carried regime label was
     computed from fewer than MIN_REGIME_BOUND_INPUTS bound inputs and that count
     is available in *row*; otherwise None."""
-    status, label, count = inspect_regime_bound_inputs(row)
+    status, label, count = inspect_regime_bound_inputs(row, as_of=as_of)
     if status == "insufficient" and label is not None and count is not None:
         return label, count
     return None
 
 
-def _parse_observed_clock(value: Any) -> tuple[date | None, datetime | None, str | None]:
-    """Parse an ISO date or timestamp without mutating input. Returns (date, utc_dt, raw_str)."""
+def _parse_observed_clock(value: Any) -> tuple[date | None, datetime | None, str | None, bool]:
+    """Parse an ISO date or timestamp without mutating input.
+
+    Returns ``(date, utc_dt, raw_str, is_date_only)``.
+    """
     if isinstance(value, datetime):
         dt = clock(value)
-        return dt.date(), dt, iso(dt)
+        return dt.date(), dt, iso(dt), False
     if isinstance(value, date):
-        return value, datetime.combine(value, time(), timezone.utc), value.isoformat()
+        return value, datetime.combine(value, time(), timezone.utc), value.isoformat(), True
     if not isinstance(value, str) or not value.strip():
-        return None, None, None
+        return None, None, None, False
     raw = value.strip()
     if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
         try:
             d = date.fromisoformat(raw)
-            return d, datetime.combine(d, time(), timezone.utc), d.isoformat()
+            return d, datetime.combine(d, time(), timezone.utc), d.isoformat(), True
         except ValueError:
-            return None, None, None
+            return None, None, None, False
     try:
         dt = clock(raw)
-        return dt.date(), dt, iso(dt)
+        return dt.date(), dt, iso(dt), False
     except ValueError:
-        return None, None, None
+        return None, None, None, False
 
 
 def _resolve_item_max_age(item: dict[str, Any], category: str, name: str | None) -> tuple[float, str] | None:
@@ -650,6 +1032,167 @@ def _resolve_item_max_age(item: dict[str, Any], category: str, name: str | None)
     return None
 
 
+def _check_entry_clock_sanity(
+    item: dict[str, Any],
+    path: str,
+    kind: str,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    """Reject future timestamps (later than *as_of*) or negative/non-finite ages.
+
+    Never trusts a claimed ``age_days`` or ``freshness.status == 'fresh'`` over
+    an actual timestamp.
+    """
+    violations: list[dict[str, Any]] = []
+    as_of_utc = clock(as_of)
+    as_of_iso = iso(as_of_utc)
+    as_of_date = as_of_utc.date()
+
+    # 1. Check freshness block age
+    fresh = item.get("freshness")
+    if isinstance(fresh, dict) and "age" in fresh and fresh["age"] is not None:
+        f_age = fresh["age"]
+        if (
+            isinstance(f_age, bool)
+            or not isinstance(f_age, (int, float))
+            or not math.isfinite(f_age)
+            or f_age < 0
+        ):
+            violations.append({
+                "path": path, "kind": kind, "status": "rejected", "reason": "negative_age",
+                "field": "freshness.age", "observed_at": str(item.get("obs_date") or item.get("date") or "unknown"),
+                "as_of": as_of_iso, "age": f_age, "unit": fresh.get("unit") or "days",
+            })
+
+    # 2. Check explicit numeric age fields
+    for age_key, age_unit in _NUMERIC_AGE_KEYS:
+        if age_key in item and item[age_key] is not None:
+            raw_age = item[age_key]
+            if (
+                isinstance(raw_age, bool)
+                or not isinstance(raw_age, (int, float))
+                or not math.isfinite(raw_age)
+                or raw_age < 0
+            ):
+                violations.append({
+                    "path": path, "kind": kind, "status": "rejected", "reason": "negative_age",
+                    "field": age_key, "observed_at": str(item.get("obs_date") or item.get("date") or "unknown"),
+                    "as_of": as_of_iso, "age": raw_age, "unit": age_unit,
+                })
+
+    # 3. Check stale_features map for negative ages
+    stale_feat_map = item.get("stale_features")
+    if isinstance(stale_feat_map, dict):
+        for fname, age_d in sorted(stale_feat_map.items()):
+            if age_d is not None and (
+                isinstance(age_d, bool)
+                or not isinstance(age_d, (int, float))
+                or not math.isfinite(age_d)
+                or age_d < 0
+            ):
+                violations.append({
+                    "path": f"{path}.stale_features.{fname}", "kind": "input",
+                    "status": "rejected", "reason": "negative_age",
+                    "field": f"stale_features.{fname}", "observed_at": "unknown",
+                    "as_of": as_of_iso, "age": age_d, "unit": "days",
+                })
+
+    # 4. Check ALL observed/availability timestamps against the decision clock
+    for ts_key in _OBSERVED_TIMESTAMP_KEYS:
+        if ts_key not in item or item[ts_key] is None:
+            continue
+        raw_ts = item[ts_key]
+        if isinstance(raw_ts, str) and raw_ts.strip().lower() in _INVALID_FEATURE_ID_STRINGS:
+            continue
+        obs_date, obs_dt, obs_str, is_date_only = _parse_observed_clock(raw_ts)
+        if obs_date is None or obs_dt is None:
+            continue
+        if is_date_only:
+            if obs_date > as_of_date:
+                violations.append({
+                    "path": path, "kind": kind, "status": "rejected", "reason": "future_timestamp",
+                    "field": ts_key, "observed_at": obs_str, "as_of": as_of_iso,
+                    "age": (as_of_date - obs_date).days, "unit": "days",
+                })
+        elif obs_dt > as_of_utc:
+            violations.append({
+                "path": path, "kind": kind, "status": "rejected", "reason": "future_timestamp",
+                "field": ts_key, "observed_at": obs_str, "as_of": as_of_iso,
+                "age": round((as_of_utc - obs_dt).total_seconds(), 3), "unit": "seconds",
+            })
+
+    return violations
+
+
+def find_invalid_clock_items(row: dict[str, Any], as_of: datetime) -> list[dict[str, Any]]:
+    """Read-only scan for any carried input, model, or regime with a future timestamp or negative age."""
+    if not isinstance(row, dict):
+        return []
+    violations: list[dict[str, Any]] = []
+    input_categories = (
+        "equities", "equity_volume", "rates", "credit", "volatility",
+        "commodities", "fx", "equity_etf_proxies", "macro", "features",
+        "options", "inputs",
+    )
+    model_categories = ("models", "model_states")
+    regime_categories = ("latest_regime", "regime", "regime_detection")
+
+    def _scan_container(container: dict[str, Any], prefix: str) -> None:
+        for cat in input_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        violations.extend(_check_entry_clock_sanity(
+                            entry, f"{prefix}{cat}.{name}", "input", as_of,
+                        ))
+        for cat in model_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        violations.extend(_check_entry_clock_sanity(
+                            entry, f"{prefix}{cat}.{name}", "model", as_of,
+                        ))
+        for cat in regime_categories:
+            entry = container.get(cat)
+            if isinstance(entry, dict):
+                violations.extend(_check_entry_clock_sanity(
+                    entry, f"{prefix}{cat}", "model", as_of,
+                ))
+                for snap_key in ("producer_snapshot", "analytical_snapshot"):
+                    psnap = entry.get(snap_key)
+                    if isinstance(psnap, dict):
+                        violations.extend(_check_entry_clock_sanity(
+                            psnap, f"{prefix}{cat}.{snap_key}", "model", as_of,
+                        ))
+
+    snap = row.get("snapshot_data")
+    if isinstance(snap, dict):
+        _scan_container(snap, "snapshot_data.")
+    _scan_container(row, "")
+
+    moves = row.get("market_moves")
+    if isinstance(moves, dict):
+        indices = moves.get("indices")
+        if isinstance(indices, dict):
+            for name, entry in indices.items():
+                if isinstance(entry, dict):
+                    violations.extend(_check_entry_clock_sanity(
+                        entry, f"market_moves.indices.{name}", "input", as_of,
+                    ))
+        for list_key in ("notable", "sector_leaders", "sector_laggards"):
+            items = moves.get(list_key)
+            if isinstance(items, list):
+                for idx, entry in enumerate(items):
+                    if isinstance(entry, dict):
+                        label = str(entry.get("asset") or entry.get("etf") or entry.get("sector") or idx)
+                        violations.extend(_check_entry_clock_sanity(
+                            entry, f"market_moves.{list_key}.{label}", "input", as_of,
+                        ))
+    return violations
+
+
 def _check_entry_staleness(
     item: dict[str, Any],
     path: str,
@@ -658,12 +1201,18 @@ def _check_entry_staleness(
     as_of: datetime,
     name: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Read-only staleness check for one carried input or model dict."""
-    findings: list[dict[str, Any]] = []
-    as_of_iso = iso(as_of)
-    as_of_date = as_of.date()
+    """Read-only staleness check for one carried input or model dict.
 
-    # 1. Explicit freshness block (e.g. market_state.py shape)
+    Always verifies observed timestamps against *as_of* rather than trusting a
+    claimed ``age_days`` or ``freshness.status == 'fresh'`` to hide stale data.
+    """
+    findings: list[dict[str, Any]] = []
+    as_of_utc = clock(as_of)
+    as_of_iso = iso(as_of_utc)
+    as_of_date = as_of_utc.date()
+
+    # 1. Explicit freshness block (e.g. market_state.py shape) — can mark stale,
+    #    never short-circuits past timestamp verification when claiming fresh.
     fresh = item.get("freshness")
     if isinstance(fresh, dict):
         f_status = fresh.get("status")
@@ -671,8 +1220,8 @@ def _check_entry_staleness(
         f_limit = fresh.get("limit")
         f_unit = fresh.get("unit") or "days"
         over_limit = (
-            isinstance(f_age, (int, float)) and not isinstance(f_age, bool)
-            and isinstance(f_limit, (int, float)) and not isinstance(f_limit, bool)
+            isinstance(f_age, (int, float)) and not isinstance(f_age, bool) and math.isfinite(f_age)
+            and isinstance(f_limit, (int, float)) and not isinstance(f_limit, bool) and math.isfinite(f_limit)
             and f_age > f_limit
         )
         if f_status == "stale" or over_limit:
@@ -708,14 +1257,11 @@ def _check_entry_staleness(
         return findings
     limit, unit = max_spec
 
-    # 3. Direct numeric age fields (age_days / data_staleness_days / age_hours / age_seconds)
+    # 3. Direct non-negative numeric age fields (never trusted over an older timestamp)
     explicit_age: float | None = None
-    for age_key, age_unit in (
-        ("age_seconds", "seconds"), ("age_hours", "hours"),
-        ("age_days", "days"), ("data_staleness_days", "days"),
-    ):
+    for age_key, age_unit in _NUMERIC_AGE_KEYS:
         raw_age = item.get(age_key)
-        if isinstance(raw_age, (int, float)) and not isinstance(raw_age, bool) and math.isfinite(raw_age):
+        if isinstance(raw_age, (int, float)) and not isinstance(raw_age, bool) and math.isfinite(raw_age) and raw_age >= 0:
             if age_unit == unit:
                 explicit_age = float(raw_age)
                 break
@@ -735,24 +1281,27 @@ def _check_entry_staleness(
     obs_date: date | None = None
     obs_dt: datetime | None = None
     obs_str: str | None = None
-    for ts_key in (
-        "data_as_of", "obs_date", "date", "as_of_date", "as_of",
-        "trained_at", "model_updated_at", "updated_at", "timestamp",
-        "collected_at", "checked_at",
-    ):
+    for ts_key in _OBSERVED_TIMESTAMP_KEYS:
         if ts_key in item and item[ts_key] is not None:
-            obs_date, obs_dt, obs_str = _parse_observed_clock(item[ts_key])
+            obs_date, obs_dt, obs_str, _ = _parse_observed_clock(item[ts_key])
             if obs_date is not None:
                 break
 
-    computed_age: float | None = explicit_age
-    if computed_age is None and obs_date is not None and obs_dt is not None:
+    timestamp_age: float | None = None
+    if obs_date is not None and obs_dt is not None:
         if unit == "days":
-            computed_age = float((as_of_date - obs_date).days)
+            timestamp_age = float((as_of_date - obs_date).days)
         elif unit == "hours":
-            computed_age = round((as_of - obs_dt).total_seconds() / 3600.0, 3)
+            timestamp_age = round((as_of_utc - obs_dt).total_seconds() / 3600.0, 3)
         elif unit == "seconds":
-            computed_age = round((as_of - obs_dt).total_seconds(), 3)
+            timestamp_age = round((as_of_utc - obs_dt).total_seconds(), 3)
+
+    if timestamp_age is not None and explicit_age is not None:
+        computed_age: float | None = max(timestamp_age, explicit_age)
+    elif timestamp_age is not None:
+        computed_age = timestamp_age
+    else:
+        computed_age = explicit_age
 
     if computed_age is not None and computed_age > limit:
         age_out: int | float = int(computed_age) if unit == "days" and computed_age.is_integer() else computed_age
@@ -898,7 +1447,11 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         # Screen the WHOLE canonical row: source_record (snapshot_data, grounding, etc.) enters packet.json too.
         reasons = screen_row(row)
         disposition = None
-        regime_status, regime_label, bound_count = inspect_regime_bound_inputs(row)
+        regime_info = inspect_regime_binding(row, as_of=published)
+        regime_status = regime_info["status"]
+        regime_label = regime_info["label"]
+        bound_count = regime_info["count"]
+        clock_violations = find_invalid_clock_items(row, published)
         if reasons:
             disposition = "QUARANTINED_SCREEN_HIT"
         elif len(text_bytes) > TEXT_FIELD_CAP_BYTES:
@@ -911,6 +1464,21 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
             packet["blockers"].append(
                 f"{identity}: refused to carry regime label {regime_label!r} computed from "
                 f"{bound_count} bound inputs (minimum {MIN_REGIME_BOUND_INPUTS})"
+            )
+        elif regime_status == "mismatch":
+            disposition = "REFUSED_REGIME_BINDING_MISMATCH"
+            mismatch_reason = regime_info["reason"] or "regime_binding_mismatch"
+            reasons = [mismatch_reason]
+            log.warning("publication-packet: refused {} due to regime binding mismatch: {}", identity, mismatch_reason)
+            packet["blockers"].append(
+                f"{identity}: refused carried regime ({mismatch_reason})"
+            )
+        elif clock_violations:
+            disposition = "REFUSED_INVALID_SOURCE_CLOCK"
+            reasons = [f"{v['reason']}:{v['path']}" for v in clock_violations]
+            log.warning("publication-packet: refused {} due to invalid source clock/age: {}", identity, reasons)
+            packet["blockers"].append(
+                f"{identity}: refused due to invalid source clock/age ({', '.join(reasons)})"
             )
         if disposition:
             exclusions.append({"publication_id": identity, "channel": channel, "disposition": disposition,
