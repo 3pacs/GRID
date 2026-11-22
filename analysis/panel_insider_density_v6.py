@@ -125,10 +125,10 @@ def interval_close_mask(admission: Admission):
     return mask
 
 
-def build_trial_panels(events, admission, universe, prices, window):
+def build_trial_panels(events, admission, universe, prices, window, *, abstain_tickers=None):
     """v2's trial panels with closes outside the C1 interval, or before Tiingo startDate, blanked first (v6 §2.3)."""
     return v2.build_trial_panels(events, admission, universe, prices, window, blank_before_listing=True,
-                                 close_mask=interval_close_mask(admission))
+                                 close_mask=interval_close_mask(admission), abstain_tickers=abstain_tickers)
 
 
 # --- pins ---------------------------------------------------------------------------------
