@@ -53,12 +53,29 @@ weeks.
 - `POST /api/v1/ollama/ask` adds the read reports of the last 30 days that match the question to the system
   context, beside the knowledge tree and the research findings.
 
+## Asks to the owner, carried until settled
+
+An ask is the line of a report that is addressed to the owner. The reader picks the first open item that names him
+or an approval, then the first open item, then the title. The same ask written twice, even reworded, keys the
+same: its words, sorted. Asks are carried across days until they are settled.
+
+Each hourly run checks the open asks of the last 14 days, records each check as one insert-only row in
+`agent_report_ask_checks`, and rechecks an ask only when new matching reports have arrived. A check settles an
+ask in one of two ways:
+
+- **On GitHub.** The ask asks only for a merge, and every GRID PR it names is merged or closed. This uses the
+  public API, and 3pacs/GRID only, so no model is needed.
+- **By the local model.** It reads the ask beside up to six later reports that share at least two words with it,
+  plus the GitHub state of any PR named. It settles the ask only when a later report says the thing was done,
+  approved, declined, superseded or no longer needed.
+
 ## Nothing falls through
 
 The digest is the safety net. It is texted each morning and lists:
 
-- the counts;
-- every report that needs the owner, with its first open item;
+- the counts for the previous day;
+- every ask from the last 14 days still waiting on the owner, once each and newest first;
+- how many asks later reports have settled;
 - any unreadable report.
 
 A day whose `unread` is not zero after the runs is visible in `coverage`.
