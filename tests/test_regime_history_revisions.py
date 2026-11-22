@@ -316,3 +316,81 @@ def test_versions_from_before_the_migration_have_an_unknown_start(scratch):
     legacy, known = _revisions(scratch)
     assert legacy.regime == "NEUTRAL" and legacy.created_at is None
     assert known.regime == "FRAGILE" and known.created_at == legacy.superseded_at
+
+
+def test_the_write_lock_is_taken_before_the_epoch_is_stamped():
+    """Codex (6011125969): stamping the epoch before blocking writers let a legacy row written in between pass as
+    trigger-managed. The lock must come first and last until the triggers exist (same transaction)."""
+    m = importlib.import_module(_MIGRATION)
+    calls: list[str] = []
+
+    class _Op:
+        def execute(self, statement):
+            calls.append(str(statement).strip())
+
+    real_op = m.op
+    m.op = _Op()
+    try:
+        m.upgrade()
+    finally:
+        m.op = real_op
+    assert calls[0] == m.WRITE_LOCK == "LOCK TABLE regime_history IN SHARE ROW EXCLUSIVE MODE"
+    first_trigger = next(i for i, c in enumerate(calls) if c.startswith("CREATE TRIGGER regime_history_keep_revisions"))
+    assert calls.index(m.EPOCH_ROW.strip()) < first_trigger
+
+
+def test_the_migration_boundary_with_concurrent_legacy_writers(scratch):
+    """Two sessions at the boundary Codex named (6011125969). The migration is paused right after it stamps the
+    epoch, before any trigger exists. A legacy writer that tries to commit a row in that window must be blocked:
+    otherwise its created_at, later than the epoch, would pass as trigger-managed. Once the migration commits, the
+    same write goes through with the trigger's clock."""
+    import threading
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    m = importlib.import_module(_MIGRATION)
+    paused, release = threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+
+    def _upgrade_pausing_after_the_epoch():
+        try:
+            with scratch.connect() as conn:
+                trans = conn.begin()
+                ops = Operations(MigrationContext.configure(conn))
+
+                class _Pausing:
+                    def execute(self, statement, *args, **kwargs):
+                        ops.execute(statement, *args, **kwargs)
+                        if str(statement).strip() == m.EPOCH_ROW.strip():
+                            paused.set()
+                            release.wait(20)
+
+                real_op = m.op
+                m.op = _Pausing()
+                try:
+                    m.upgrade()
+                finally:
+                    m.op = real_op
+                trans.commit()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    migration = threading.Thread(target=_upgrade_pausing_after_the_epoch)
+    migration.start()
+    try:
+        assert paused.wait(20)                                 # epoch stamped, no trigger yet
+        with pytest.raises(DBAPIError, match="lock timeout"):
+            with scratch.begin() as conn:
+                conn.execute(text("SET LOCAL lock_timeout = '300ms'"))
+                conn.execute(text("INSERT INTO regime_history (obs_date, regime, confidence, source) "
+                                  "VALUES (:d, 'NEUTRAL', 0.5, 'auto_regime')"), {"d": DAY})
+    finally:
+        release.set()
+        migration.join(timeout=30)
+    assert not migration.is_alive() and errors == []
+    with scratch.begin() as conn:
+        conn.execute(text("INSERT INTO regime_history (obs_date, regime, confidence, source, created_at) "
+                          "VALUES (:d, 'NEUTRAL', 0.5, 'auto_regime', '2000-01-01')"), {"d": DAY})
+        epoch = conn.execute(text("SELECT revisions_from FROM regime_history_revision_epoch")).scalar_one()
+    assert _row(scratch)[4] > epoch                             # the trigger's clock, never the writer's

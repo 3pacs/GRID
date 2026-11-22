@@ -46,6 +46,10 @@ After this migration:
 * obs_date cannot change. TRUNCATE of either table is refused, and revisions
   refuse UPDATE and DELETE.
 
+The upgrade takes a writer-conflicting lock on ``regime_history`` before it
+stamps the epoch and holds it until the triggers are installed, so no row can
+be written after the epoch without the trigger's clock.
+
 Existing rows are not touched. ``schema.sql`` declares the same objects (the
 migration replay applies schema.sql first, so every statement is idempotent).
 Downgrade refuses while any revision exists: dropping the table would destroy
@@ -63,6 +67,10 @@ down_revision: Union[str, Sequence[str], None] = "agent_report_ask_owner_2026112
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+
+# SHARE ROW EXCLUSIVE conflicts with every INSERT, UPDATE and DELETE (ROW EXCLUSIVE) but not with SELECT.
+# Not in schema.sql: a fresh database has no concurrent writers.
+WRITE_LOCK = "LOCK TABLE regime_history IN SHARE ROW EXCLUSIVE MODE"
 
 # Each statement also appears verbatim in schema.sql (tests/test_regime_history_revisions.py).
 REVISIONS_TABLE = """
@@ -202,6 +210,11 @@ $$
 
 
 def upgrade() -> None:
+    # Block every regime_history writer before the epoch is stamped, and keep blocking them until the triggers are
+    # installed (the lock lasts to the end of the migration's transaction). Without it, a legacy writer could commit
+    # a row after the epoch but before the trigger existed, and its created_at would then pass the epoch check as if
+    # the trigger had stamped it. Readers are not blocked.
+    op.execute(WRITE_LOCK)
     op.execute(EPOCH_TABLE)
     op.execute(EPOCH_ROW)
     op.execute(REVISIONS_TABLE)
