@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from .types import FlowLayer, FlowNode
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -193,8 +194,8 @@ def _build_options_positioning(engine: Engine, as_of: date) -> FlowNode:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("""
-                    SELECT AVG(put_call_ratio) FROM options_daily_signals
+                visible_sql("""
+                    SELECT AVG(put_call_ratio) FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker IN ('SPY', 'QQQ', 'IWM')
                       AND signal_date >= :d7
                 """),

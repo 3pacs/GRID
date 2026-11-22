@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger as log
 from pydantic import BaseModel, Field
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ---------------------------------------------------------------------------
@@ -786,14 +787,13 @@ def _gen_deep_forensics(
     """Deep forensic price move analysis for top tickers."""
     tasks: list[tuple[str, str, dict]] = []
     try:
-        from sqlalchemy import text as sa_text
         tickers = ["AAPL", "NVDA", "MSFT", "TSLA", "GOOGL", "META", "AMZN",
                     "SPY", "QQQ", "BTC-USD", "ETH-USD"]
         for ticker in tickers[:10]:
             with engine.connect() as conn:
-                rows = conn.execute(sa_text(
+                rows = conn.execute(visible_sql(
                     "SELECT signal_date, spot_price, put_call_ratio, iv_atm "
-                    "FROM options_daily_signals WHERE ticker = :t "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods WHERE ticker = :t "
                     "ORDER BY signal_date DESC LIMIT 5"
                 ), {"t": ticker}).fetchall()
 
@@ -1016,16 +1016,15 @@ def _gen_earnings_preview(
     """Pre-analyze upcoming earnings for major tickers."""
     tasks: list[tuple[str, str, dict]] = []
     try:
-        from sqlalchemy import text as sa_text
         tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
         import random
         random.shuffle(tickers)
 
         for ticker in tickers[:7]:
             with engine.connect() as conn:
-                opts = conn.execute(sa_text(
+                opts = conn.execute(visible_sql(
                     "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :t ORDER BY signal_date DESC LIMIT 1"
                 ), {"t": ticker}).fetchone()
 

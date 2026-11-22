@@ -51,6 +51,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ── Global Central Banks Registry ─────────────────────────────────────
@@ -465,8 +466,8 @@ def _get_put_call_ratio(engine: Engine, ticker: str) -> str | None:
     """Get the current GEX regime for a ticker from options_daily_signals."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT put_call_ratio FROM options_daily_signals
+            row = conn.execute(visible_sql("""
+                SELECT put_call_ratio FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()
@@ -554,17 +555,23 @@ def _get_congressional_signal(engine: Engine, ticker: str) -> str | None:
     return None
 
 
-def _get_whale_flow(engine: Engine, ticker: str) -> str | None:
-    """Infer whale flow from options daily signals (put/call ratio)."""
+def _get_whale_flow(engine: Engine, ticker: str, as_of: date | None = None) -> str | None:
+    """Infer whale flow from options daily signals (put/call ratio).
+
+    Reads ``put_call_ratio`` (the column is not ``pcr``; until 2026-11-21 this
+    read failed on PostgreSQL and the layer never showed a whale flow) on the
+    latest signal day at or before ``as_of`` (today when not given), never a
+    Schwab-captured day: the money-flow map is served to every viewer.
+    """
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT pcr, total_volume FROM options_daily_signals
-                WHERE ticker = :t AND signal_date <= CURRENT_DATE
+            row = conn.execute(visible_sql("""
+                SELECT put_call_ratio, total_volume FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
+                WHERE ticker = :t AND signal_date <= :as_of
                 ORDER BY signal_date DESC LIMIT 1
-            """), {"t": ticker}).fetchone()
+            """), {"t": ticker, "as_of": as_of or date.today()}).fetchone()
             if row:
-                pcr = float(row[0]) if row[0] else None
+                pcr = float(row[0]) if row[0] is not None else None
                 if pcr is not None:
                     if pcr < 0.5:
                         return "call_heavy"
@@ -902,7 +909,7 @@ def _build_sectors_layer(engine: Engine, as_of: date) -> dict:
         insider = _get_insider_signal(engine, etf)
         congress = _get_congressional_signal(engine, etf)
         dp = _get_dark_pool_signal(engine, etf)
-        whale = _get_whale_flow(engine, etf)
+        whale = _get_whale_flow(engine, etf, as_of)
 
         # Short sector id
         sector_id = sector_name.lower().replace(" ", "_")

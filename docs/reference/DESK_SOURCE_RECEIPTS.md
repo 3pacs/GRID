@@ -289,7 +289,11 @@ journalctl --user -u grid-desk-receipts -n 40
 
 ## Not done
 
-- No job commits and pushes the witness file. The hub post above stands in for it.
+- The witness file is committed and pushed by `scripts/desk_receipts_witness_sync.sh` (2026-11-21), run as
+  `ExecStopPost` of `grid-desk-receipts.service` from the dedicated clone `/home/grid/dev/obsidian-vault-deskwitness`
+  (export-anchors, append-only check, commit only `05-GRID/Paper-Log/desk-receipts/`, push; loud on any refusal or
+  an unpushed head). It takes effect when the owner clones that vault copy and moves the unit to a pinned checkout
+  that has the script; until then the hub post stands in for it.
 - The running copy is the first pinned commit and does not have the review fixes (pinned
   calendar, one-version reads, interrupted-write recovery, retryable delivery). They reach
   grid-svr when the owner applies a new pinned checkout. The fixes add optional fields and

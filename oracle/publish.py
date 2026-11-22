@@ -12,6 +12,7 @@ from sqlalchemy.engine import Engine
 
 from oracle.dedup_index import EXTERNAL_RECORDING_POLICY, ensure_dedup_index, forecast_identity
 from oracle.entry_price_policy import NULL_WRITE_POLICY
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from oracle.prediction_context import (
     build_prediction_context,
     enrich_signals_payload,
@@ -85,10 +86,10 @@ def _measured_entry_price(
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text(
+                visible_sql(
                     """
                     SELECT spot_price, signal_date
-                    FROM options_daily_signals
+                    FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker = :t
                       AND signal_date <= :d
                       AND spot_price > 0
@@ -96,6 +97,8 @@ def _measured_entry_price(
                     LIMIT 1
                     """
                 ),
+                # AstroGrid predictions are published: a Schwab-captured day
+                # never supplies the entry price; the latest non-Schwab day does.
                 {"t": ticker, "d": as_of},
             ).fetchone()
     except Exception as exc:  # pragma: no cover - defensive; never block a publish

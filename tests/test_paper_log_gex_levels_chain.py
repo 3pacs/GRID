@@ -32,6 +32,12 @@ def sqlite_engine():
         sa.Column("snap_date", sa.Date),
         sa.Column("created_at", sa.DateTime(timezone=True)),
     )
+    # The provenance filter's batch registry (store/options_provenance.py); empty = no Schwab day.
+    sa.Table(
+        "options_capture_batches", meta,
+        sa.Column("ticker", sa.Text), sa.Column("snap_date", sa.Date),
+        sa.Column("spot_provider", sa.Text), sa.Column("clock_metadata", sa.Text),
+    )
     meta.create_all(engine)
     try:
         yield engine

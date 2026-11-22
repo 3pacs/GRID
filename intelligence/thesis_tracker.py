@@ -37,6 +37,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from intelligence.thesis_schema import require_thesis_connection
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # Owner-approved hold (Wave 3 triage report, item #16, 2026-09-27/28).
@@ -309,8 +310,8 @@ def _get_spy_price_near(conn, target_ts) -> float | None:
     target_date = target_ts.date() if hasattr(target_ts, "date") else target_ts
 
     # Try options_daily_signals (most common SPY source)
-    row = conn.execute(text("""
-        SELECT spot_price FROM options_daily_signals
+    row = conn.execute(visible_sql("""
+        SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
         WHERE ticker = 'SPY'
           AND signal_date <= :d
           AND spot_price > 0

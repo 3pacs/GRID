@@ -27,6 +27,12 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.options_provenance import (
+    VISIBLE_DAILY_SIGNALS,
+    include_schwab_rows,
+    visible_sql,
+)
+
 
 def _nullable_float(value: Any) -> float | None:
     """Coerce to a native float, preserving a missing value as SQL NULL.
@@ -121,9 +127,14 @@ class OptionsScanner:
     # a per-ticker thin-chain gap and starts being a data-source problem.
     SYSTEMATIC_GAP_SHARE = 0.5
 
-    def __init__(self, db_engine: Engine, lookback_days: int = 252) -> None:
+    def __init__(self, db_engine: Engine, lookback_days: int = 252, *,
+                 include_schwab: bool = False) -> None:
         self.engine = db_engine
         self.lookback_days = lookback_days
+        # Schwab-captured days are read only for an admin request; the digest,
+        # the stored scans and the precomputed /options/100x never see them
+        # (store/options_provenance.py).
+        self.include_schwab = include_schwab_rows(include_schwab)
         log.info(
             "OptionsScanner initialised — lookback={d}d", d=lookback_days
         )
@@ -198,10 +209,11 @@ class OptionsScanner:
         """Get tickers that have options_daily_signals data."""
         with self.engine.connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT DISTINCT ticker FROM options_daily_signals "
-                    "ORDER BY ticker"
-                )
+                visible_sql(
+                    "SELECT DISTINCT ticker FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                    "ORDER BY ticker",
+                    self.include_schwab,
+                ),
             ).fetchall()
         return [r[0] for r in rows]
 
@@ -647,7 +659,7 @@ class OptionsScanner:
         try:
             from analysis.vol_surface import VolSurfaceEngine
 
-            engine = VolSurfaceEngine(self.engine)
+            engine = VolSurfaceEngine(self.engine, include_schwab=self.include_schwab)
             surface = engine.build_surface(ticker, as_of_date=scan_date)
             if not surface or "error" in surface:
                 return (0.0, "", meta)
@@ -734,7 +746,7 @@ class OptionsScanner:
         try:
             from physics.dealer_gamma import DealerGammaEngine
 
-            dg = DealerGammaEngine(self.engine)
+            dg = DealerGammaEngine(self.engine, include_schwab=self.include_schwab)
             profile = dg.compute_gex_profile(ticker, snap_date=scan_date)
         except Exception as exc:  # pragma: no cover — defensive
             log.debug("dealer_gamma extras failed for {t}: {e}", t=ticker, e=str(exc))
@@ -917,17 +929,18 @@ class OptionsScanner:
         """
         with self.engine.connect() as conn:
             row = conn.execute(
-                text(
+                visible_sql(
                     "SELECT put_call_ratio, max_pain, iv_skew, total_oi, "
                     "total_volume, near_expiry, spot_price, iv_atm, "
                     "iv_25d_put, iv_25d_call, term_structure_slope, "
                     "oi_concentration, signal_date, created_at "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :ticker AND signal_date <= :sd "
                     "AND signal_date >= :oldest "
                     "AND total_oi >= 1000 "
                     "AND (iv_atm IS NULL OR iv_atm >= 0.03) "
-                    "ORDER BY signal_date DESC LIMIT 1"
+                    "ORDER BY signal_date DESC LIMIT 1",
+                    self.include_schwab,
                 ),
                 {
                     "ticker": ticker, "sd": scan_date,
@@ -960,14 +973,15 @@ class OptionsScanner:
         start = scan_date - timedelta(days=self.lookback_days)
         with self.engine.connect() as conn:
             rows = conn.execute(
-                text(
+                visible_sql(
                     "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
                     "total_oi, iv_atm, iv_25d_put, iv_25d_call, "
                     "term_structure_slope, oi_concentration "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :ticker "
                     "AND signal_date >= :start AND signal_date < :end "
-                    "ORDER BY signal_date"
+                    "ORDER BY signal_date",
+                    self.include_schwab,
                 ),
                 {"ticker": ticker, "start": start, "end": scan_date},
             ).fetchall()

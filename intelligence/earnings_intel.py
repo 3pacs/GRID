@@ -27,6 +27,7 @@ import numpy as np
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ── Data Classes ─────────────────────────────────────────────────────────
@@ -639,9 +640,9 @@ def run_earnings_cycle(engine: Engine) -> dict[str, Any]:
 def _get_iv_data(conn, ticker: str) -> dict | None:
     """Get latest IV data from options_daily_signals."""
     try:
-        row = conn.execute(text("""
+        row = conn.execute(visible_sql("""
             SELECT iv_atm, iv_skew, term_structure_slope, spot_price
-            FROM options_daily_signals
+            FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = :t AND iv_atm IS NOT NULL AND iv_atm >= 0.03
             ORDER BY signal_date DESC LIMIT 1
         """), {"t": ticker}).fetchone()
@@ -653,8 +654,8 @@ def _get_iv_data(conn, ticker: str) -> dict | None:
         # IV rank: compare current IV to 52-week range
         iv_rank = None
         if iv_atm:
-            hist = conn.execute(text("""
-                SELECT iv_atm FROM options_daily_signals
+            hist = conn.execute(visible_sql("""
+                SELECT iv_atm FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND iv_atm IS NOT NULL
                 AND signal_date >= CURRENT_DATE - 252
                 ORDER BY signal_date DESC
@@ -757,8 +758,8 @@ def _get_congressional_signal(conn, ticker: str) -> str:
 
 def _get_price_near(conn, ticker: str, target_date: date) -> float | None:
     """Get price at or near a specific date."""
-    row = conn.execute(text("""
-        SELECT spot_price FROM options_daily_signals
+    row = conn.execute(visible_sql("""
+        SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
         WHERE ticker = :t AND signal_date <= :d AND spot_price > 0
         ORDER BY signal_date DESC LIMIT 1
     """), {"t": ticker, "d": target_date}).fetchone()

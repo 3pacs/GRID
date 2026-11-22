@@ -41,6 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.observations import read_latest
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 # ── Crowdedness component configuration ──────────────────────────────────
 
@@ -382,10 +383,10 @@ def _read_options_pcr(engine: Engine, ticker: str) -> float | None:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text(
+                visible_sql(
                     """
                     SELECT put_call_ratio
-                    FROM options_daily_signals
+                    FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker = :t
                       AND put_call_ratio IS NOT NULL
                     ORDER BY signal_date DESC

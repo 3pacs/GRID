@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
 from store.options_iv import public_wing_fields
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine, get_pit_store
@@ -394,15 +395,16 @@ def get_ticker_analysis(
         # ── Options signals ──
         try:
             opts = conn.execute(
-                text(
+                visible_sql(
                     "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
                     "total_oi, total_volume, spot_price, iv_atm, "
                     "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration, "
                     "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :ticker "
                     "ORDER BY signal_date DESC LIMIT 5"
                 ),
+                # The analysis is cached per ticker for every viewer: never a Schwab day.
                 {"ticker": ticker_upper},
             ).fetchall()
             analysis["options"] = [

@@ -22,15 +22,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from itertools import pairwise
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.observations import adjust_history_for_splits, read_splits, read_window
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -40,6 +43,14 @@ EXTENDED_UNIVERSE = MAG7_TICKERS + [
     "SPY", "QQQ", "LLY", "V", "MA", "UNH", "RTX", "PG", "TMO",
     "AVGO", "JPM", "BRK-B", "XOM", "JNJ", "WMT", "HD",
 ]
+
+# A fractional return times this is basis points (0.03 -> 300 bps).
+BPS_PER_UNIT = 10_000
+# Stored deep-dive payloads (news_impact_reports.payload) carry this. Version 2
+# (2026-11-21): move, macro and sector bps are real basis points; version 1
+# payloads (no field) multiplied fractional returns by 100, and their moves
+# were always empty because the price read named columns that do not exist.
+REPORT_VERSION = 2
 
 # Time horizon thresholds
 SHORT_TERM_DAYS = 5          # < 1 week
@@ -346,14 +357,17 @@ class PriceDecomposer:
             4. Estimate each catalyst's bps contribution
             5. Compute unexplained residual
         """
-        move_bps = abs(move_pct) * 100
+        # move_pct is a fraction (0.03 = 3%); 1 bp = 0.0001, so 3% = 300 bps,
+        # the scale of CATALYST_TYPES' typical_bps. Before report version 2
+        # this multiplied by 100 (percent labelled as bps).
+        move_bps = abs(move_pct) * BPS_PER_UNIT
         move_dir = "up" if move_pct > 0 else "down"
 
         # 1. Market and sector decomposition
         spy_ret = self._get_return(
             "SPY" if ticker != "SPY" else "QQQ", move_date
         )
-        macro_bps = abs(spy_ret * 100) if spy_ret else 0.0
+        macro_bps = abs(spy_ret * BPS_PER_UNIT) if spy_ret else 0.0
 
         # Sector beta (rough: tech stocks move ~1.2x SPY)
         sector_beta = 1.2 if ticker in MAG7_TICKERS else 1.0
@@ -478,68 +492,62 @@ class PriceDecomposer:
 
         return catalysts
 
+    def _daily_closes(self, conn: Any, ticker: str, start: date,
+                      end: date) -> list[tuple[date, float]]:
+        """Daily closes of ``ticker`` labelled in ``[start, end]``, oldest first, on one share basis.
+
+        Read through ``store.observations.read_window`` (SUCCESS rows, one
+        vintage per day, no FAILED zero markers), from the first source that
+        has at least two closes: TIINGO's ``YF:{T}:adj_close`` (split and
+        dividend adjusted), then yfinance's ``YF:{T}:close`` (split adjusted
+        as of the pull). A recorded split is applied only where the stored
+        history shows its jump (``adjust_history_for_splits``), so an
+        adjusted series is never divided twice. Nothing labelled after
+        ``end`` is read.
+
+        Until 2026-11-21 these reads selected ``obs_date, close_price`` from
+        ``options_daily_signals`` (neither column exists) and fell back to a
+        ``YFINANCE:{T}_close`` series id that no puller writes, so every move
+        scan and return came back empty.
+        """
+        sym = ticker.upper()
+        for series_id, source in ((f"YF:{sym}:adj_close", "TIINGO"), (f"YF:{sym}:close", "yfinance")):
+            obs = read_window(conn, series_id, source=source, start=start, as_of=end)
+            points = [(o.obs_date, o.value) for o in obs if math.isfinite(o.value) and o.value > 0]
+            if len(points) >= 2:
+                splits = read_splits(conn, sym, start=start, end=end)
+                adjusted, _ = adjust_history_for_splits(points, splits, verify=True)
+                return adjusted
+        return []
+
     def _find_significant_moves(self, ticker: str, days: int,
                                 threshold: float) -> list[tuple[date, float]]:
-        """Find daily moves exceeding threshold %."""
+        """Find daily moves exceeding threshold % (fractional close-to-close return)."""
         try:
+            today = date.today()
             with self.engine.connect() as conn:
-                # Try options_daily_signals first
-                rows = conn.execute(
-                    text(
-                        "SELECT obs_date, close_price FROM options_daily_signals "
-                        "WHERE ticker = :t AND obs_date > CURRENT_DATE - :d "
-                        "ORDER BY obs_date ASC"
-                    ),
-                    {"t": ticker, "d": days},
-                ).fetchall()
-                if not rows:
-                    # Fall back to raw_series
-                    rows = conn.execute(
-                        text(
-                            "SELECT obs_date, value FROM raw_series "
-                            "WHERE series_id LIKE :pat "
-                            "AND pull_status = 'SUCCESS' "
-                            "AND obs_date > CURRENT_DATE - :d "
-                            "ORDER BY obs_date ASC"
-                        ),
-                        {"pat": f"YFINANCE:{ticker}_close", "d": days},
-                    ).fetchall()
-
-            if len(rows) < 2:
-                return []
-
+                closes = self._daily_closes(conn, ticker, today - timedelta(days=days), today)
             moves = []
-            for i in range(1, len(rows)):
-                prev_price = float(rows[i - 1][1])
-                curr_price = float(rows[i][1])
-                if prev_price == 0:
-                    continue
+            for (_, prev_price), (curr_date, curr_price) in pairwise(closes):
                 pct = (curr_price - prev_price) / prev_price
                 if abs(pct) >= threshold:
-                    moves.append((rows[i][0], round(pct, 5)))
+                    moves.append((curr_date, round(pct, 5)))
             return moves
         except Exception as exc:
             log.warning("Significant moves scan failed for {t}: {e}", t=ticker, e=str(exc))
             return []
 
     def _get_return(self, ticker: str, on_date: date) -> float | None:
-        """Get single-day return for a ticker."""
+        """Close-to-close return of ``ticker`` on ``on_date``; ``None`` without a close that day."""
         try:
             with self.engine.connect() as conn:
-                rows = conn.execute(
-                    text(
-                        "SELECT obs_date, close_price FROM options_daily_signals "
-                        "WHERE ticker = :t AND obs_date BETWEEN :s AND :d "
-                        "ORDER BY obs_date ASC"
-                    ),
-                    {"t": ticker, "s": on_date - timedelta(days=5), "d": on_date},
-                ).fetchall()
-                if len(rows) < 2:
-                    return None
-                prev = float(rows[-2][1])
-                curr = float(rows[-1][1])
-                return (curr - prev) / prev if prev else None
-        except Exception:
+                closes = self._daily_closes(conn, ticker, on_date - timedelta(days=7), on_date)
+            if len(closes) < 2 or closes[-1][0] != on_date:
+                return None
+            prev = closes[-2][1]
+            return (closes[-1][1] - prev) / prev
+        except Exception as exc:
+            log.debug("Return read failed for {t} on {d}: {e}", t=ticker, d=on_date, e=str(exc))
             return None
 
 
@@ -727,7 +735,7 @@ class DeepDiveEngine:
 
         # Avg explanation rate
         explained_rates = [
-            a.total_explained_bps / max(abs(a.move_pct) * 100, 1)
+            a.total_explained_bps / max(abs(a.move_pct) * BPS_PER_UNIT, 1)
             for a in attributions
         ]
         avg_explained = (
@@ -838,6 +846,8 @@ Be specific with numbers. Use short/medium/long-term framing."""
         """Store deep dive report to DB."""
         try:
             payload = {
+                "report_version": REPORT_VERSION,
+                "bps_scale": "basis_points",
                 "ticker": report.ticker,
                 "name": report.name,
                 "total_moves_analyzed": report.total_moves_analyzed,
@@ -917,6 +927,7 @@ def run_deep_dive_task(engine: Engine, context: dict) -> str:
     dive = DeepDiveEngine(engine)
     report = dive.generate_deep_dive(ticker, days)
     return json.dumps({
+        "report_version": REPORT_VERSION,
         "ticker": report.ticker,
         "moves_analyzed": report.total_moves_analyzed,
         "avg_explained_pct": report.avg_explained_pct,

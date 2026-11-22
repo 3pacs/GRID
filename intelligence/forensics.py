@@ -28,6 +28,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────
@@ -153,9 +154,9 @@ def _get_price_moves(
 
         if not rows:
             # Fallback: options_daily_signals spot_price
-            rows = conn.execute(text("""
+            rows = conn.execute(visible_sql("""
                 SELECT signal_date, spot_price
-                FROM options_daily_signals
+                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND signal_date >= :c AND spot_price > 0
                 ORDER BY signal_date
             """), {"t": ticker.upper(), "c": cutoff}).fetchall()
