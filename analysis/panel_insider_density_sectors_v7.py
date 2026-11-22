@@ -67,6 +67,9 @@ measure_trial = v9.measure_trial
 REGISTRY_LOG = "granular_panel_prereg_sectors_v7.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_sectors_v7.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_sectors_v7.lock"
+#: Global lock order whenever both registries are held concurrently: parent (``vs1-v9``) first,
+#: then child (``sectors-v7``). Releasing happens in reverse order (child, then parent).
+LOCK_ORDER: tuple[str, str] = (v9.REGISTRY_ID, REGISTRY_ID)
 WITNESS_PATH = v1.canonical_witness_path(REGISTRY_ID)
 #: Populated only after the one witnessed sectors-v7 registration.
 REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
@@ -317,20 +320,28 @@ def registry(log_dir: Path) -> ForwardLog:
     )
 
 
-def verify_v9_registration(log_dir: Path, vault_repo: Path, tip: str) -> dict:
-    """Exactly two local v9 records and exactly their off-host registration anchor at ``tip``."""
-    _, head, _, _ = _bound()
+def _v9_witness_anchor_bytes(vault_repo: Path, tip: str) -> bytes:
+    """Return v9's exact two-record anchor bytes at ``tip``, refusing any other witness content."""
     content = v1._git(Path(vault_repo), "show", f"{tip}:{v9.WITNESS_PATH}", binary=True)
     if content != v9.REGISTERED_ANCHOR_LINE + b"\n":
         raise PermissionError("v9 is not exactly at its witnessed two-record registration")
-    log = v9.registry(log_dir)
+    return content
+
+
+def _verify_v9_registration_locked(
+    log: ForwardLog,
+    *,
+    head: str,
+    tip: str,
+    witness_content: bytes,
+) -> tuple[dict, list[dict]]:
+    """Verify v9's exact two-record local chain against ``witness_content`` while holding ``log.locked()``."""
     with tempfile.TemporaryDirectory() as scratch:
         external = Path(scratch) / "v9.anchors.jsonl"
-        external.write_bytes(content)
-        with log.locked():
-            check = log.verify_chain(external_anchors=external)
-            records = log.read_all()
-            heads = v1._line_sha256(log)
+        external.write_bytes(witness_content)
+        check = log.verify_chain(external_anchors=external)
+        records = log.read_all()
+        heads = v1._line_sha256(log)
     if (
         not check["ok"]
         or len(records) != 2
@@ -339,12 +350,26 @@ def verify_v9_registration(log_dir: Path, vault_repo: Path, tip: str) -> dict:
         or records[-1].get("kind") != "preregistration"
     ):
         raise PermissionError("v9 two-record registration differs from its witness")
-    return {"records": 2, "head_sha256": head, "tip": tip}
+    return {"records": 2, "head_sha256": head, "tip": tip}, records
 
 
-def check_registration_census(census: Mapping[str, Any], *, v9_log_dir: Path, witness_repo: Path) -> None:
-    """Registration is allowed only while v9 sits at exactly its two registration records."""
-    _, _, v8_stop, s6_stop = _bound()
+def verify_v9_registration(log_dir: Path, vault_repo: Path, tip: str) -> dict:
+    """Exactly two local v9 records and exactly their off-host registration anchor at ``tip``."""
+    _, head, _, _ = _bound()
+    content = _v9_witness_anchor_bytes(vault_repo, tip)
+    log = v9.registry(log_dir)
+    with log.locked():
+        proof, _ = _verify_v9_registration_locked(
+            log, head=head, tip=tip, witness_content=content
+        )
+    return proof
+
+
+def _check_registration_census_offhost(
+    census: Mapping[str, Any], *, witness_repo: Path
+) -> tuple[str, str, bytes]:
+    """Validate off-host census baseline and exact v9 registration anchor bytes at ``census['tip']``."""
+    _, head, v8_stop, s6_stop = _bound()
     v9.check_census(
         census,
         v8_stop_head_sha256=v8_stop,
@@ -356,7 +381,17 @@ def check_registration_census(census: Mapping[str, Any], *, v9_log_dir: Path, wi
         raise PermissionError("sectors-v7 registration needs the exact pre-sectors-v7 baseline")
     if (census.get("records") or {}).get(v9.REGISTRY_ID) != 2:
         raise PermissionError("sectors-v7 must register before any v9 opening (v9 at exactly two records)")
-    verify_v9_registration(v9_log_dir, witness_repo, census["tip"])
+    tip = census["tip"]
+    content = _v9_witness_anchor_bytes(witness_repo, tip)
+    return head, tip, content
+
+
+def check_registration_census(census: Mapping[str, Any], *, v9_log_dir: Path, witness_repo: Path) -> None:
+    """Registration is allowed only while v9 sits at exactly its two registration records."""
+    head, tip, content = _check_registration_census_offhost(census, witness_repo=witness_repo)
+    log = v9.registry(v9_log_dir)
+    with log.locked():
+        _verify_v9_registration_locked(log, head=head, tip=tip, witness_content=content)
 
 
 def registration_records(now: datetime, code_sha: str, *, repo_root: Path = s4.REPO) -> list[dict]:
@@ -459,28 +494,58 @@ def register(
 
     ``witness`` must be the fresh v9 ``OffhostWitness`` issued by ``v9.check_offhost`` (a raw
     census from an older tip is refused by type).
+
+    Lock order (:data:`LOCK_ORDER`): acquires the parent ``vs1-v9`` registry lock before
+    verifying v9's exact two-record registration and holds it through acquiring the child
+    ``sectors-v7`` lock, re-verifying ``vs1-v9``, appending the registration records, and
+    validating the written ``sectors-v7`` chain.
     """
     _bound()
     if not isinstance(witness, v2.OffhostWitness) or witness.path != v9.WITNESS_PATH:
         raise PermissionError("sectors-v7 registration needs a fresh v9 off-host witness (v9.check_offhost)")
-    check_registration_census(witness.census, v9_log_dir=v9_log_dir, witness_repo=witness.repo)
+    head, tip, witness_content = _check_registration_census_offhost(
+        witness.census, witness_repo=witness.repo
+    )
+    if witness.tip != tip or witness.content != witness_content:
+        raise PermissionError("v9 is not exactly at its witnessed two-record registration")
     log9 = v9.registry(v9_log_dir)
     with log9.locked():
-        registered_at = datetime.fromisoformat(log9.read_all()[1]["run_at"])  # verified two-record chain
-    if now.tzinfo is None or now < registered_at:
-        raise ValueError("sectors-v7 registration time must follow v9's registration")
-    records = registration_records(now, code_sha, repo_root=repo_root)
-    heads = v1.chained_sha256(records)
-    if REGISTERED_RECORD_SHA256 is not None and tuple(heads) != REGISTERED_RECORD_SHA256:
-        raise PermissionError("sectors-v7 registration would fork its pinned chain")
-    if dry_run:
-        return {"dry_run": True, "would_register_sha256": heads}
-    log = registry(log_dir)
-    with log.locked():
-        check = log.verify_chain()
-        if not check["ok"] or log.read_all():
-            raise PermissionError("sectors-v7 registry is broken or already registered")
-        appended = log.append_locked(records)
+        _, v9_records = _verify_v9_registration_locked(
+            log9, head=head, tip=tip, witness_content=witness_content
+        )
+        registered_at = datetime.fromisoformat(v9_records[1]["run_at"])  # verified two-record chain
+        if now.tzinfo is None or now < registered_at:
+            raise ValueError("sectors-v7 registration time must follow v9's registration")
+        records = registration_records(now, code_sha, repo_root=repo_root)
+        heads = v1.chained_sha256(records)
+        if REGISTERED_RECORD_SHA256 is not None and tuple(heads) != REGISTERED_RECORD_SHA256:
+            raise PermissionError("sectors-v7 registration would fork its pinned chain")
+        if dry_run:
+            return {"dry_run": True, "would_register_sha256": heads}
+        log = registry(log_dir)
+        if log9.lock_path.resolve() == log.lock_path.resolve():
+            raise RuntimeError("vs1-v9 and sectors-v7 registries must use distinct lock files")
+        with log.locked():
+            # Defense-in-depth: re-verify v9 under both locks immediately before writing sectors-v7.
+            _verify_v9_registration_locked(
+                log9, head=head, tip=tip, witness_content=witness_content
+            )
+            check = log.verify_chain()
+            if not check["ok"] or log.read_all():
+                raise PermissionError("sectors-v7 registry is broken or already registered")
+            appended = log.append_locked(records)
+            post_check = log.verify_chain()
+            written_heads = v1._line_sha256(log)
+            if (
+                not post_check["ok"]
+                or post_check["records"] != len(records)
+                or post_check["anchored_records"] != len(records)
+                or post_check["head_sha256"] != heads[-1]
+                or tuple(written_heads) != tuple(heads)
+            ):
+                raise RuntimeError(
+                    f"sectors-v7 registry validation failed after append: {post_check['detail']}"
+                )
     return {"appended": [r["kind"] for r in appended], "head_sha256": heads[-1]}
 
 

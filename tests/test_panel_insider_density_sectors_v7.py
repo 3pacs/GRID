@@ -5,8 +5,10 @@ No database, network, or /data access.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -28,7 +30,7 @@ from analysis import panel_insider_density_v6 as v6
 from analysis import panel_insider_density_v7 as v7
 from analysis import panel_insider_density_v8 as v8
 from analysis import panel_insider_density_v9 as v9
-from analysis.research_forward_log import canonical
+from analysis.research_forward_log import ForwardLog, canonical
 from scripts import run_vs1_sectors_v7_registration as s7_cli
 from tests.test_panel_insider_density_sectors_v6_stop import (
     S6_DECISION_REF,
@@ -722,3 +724,281 @@ def test_sectors_v7_cli_dry_run_default_and_execute_head_check(monkeypatch, tmp_
     for bad in ("2026-11-22T00:00:00", "2026-11-22T00:00:00+02:00", "2999-01-01T00:00:00+00:00", "nope"):
         with pytest.raises(SystemExit):
             s7_cli.main([*base[:-1], bad])
+
+
+# --- 8. Concurrent v9 advance regressions, parent->child lock order & post-append validation ---
+
+
+def test_sectors_v7_register_serializes_concurrent_v9_thread_under_parent_lock(monkeypatch, tmp_path):
+    """A concurrent v9 writer landing between check and append cannot advance v9 before sectors-v7 validates."""
+    ctx = _bind_v9_and_s7(monkeypatch, tmp_path)
+    vault, v9_reg = ctx["vault"], ctx["v9_reg"]
+    s7_reg = tmp_path / "s7_reg"
+    witness = v9.check_offhost(vault.cache, remote_url=str(vault.remote))
+
+    between_check_and_append = threading.Event()
+    v9_writer_started = threading.Event()
+    v9_appended = threading.Event()
+    writer_errors: list[BaseException] = []
+    observed: dict[str, object] = {}
+
+    def v9_writer() -> None:
+        try:
+            between_check_and_append.wait(timeout=5.0)
+            v9_writer_started.set()
+            v9.registry(v9_reg).append([{
+                "kind": "inputs_frozen",
+                "prereg_sha256": ctx["v9_body_sha"],
+                "run_at": S7_REG_AT.isoformat(),
+            }])
+            v9_appended.set()
+        except BaseException as exc:  # pragma: no cover - surfaced on main thread
+            writer_errors.append(exc)
+
+    orig_registration_records = s7.registration_records
+
+    def hooked_registration_records(*args, **kwargs):
+        recs = orig_registration_records(*args, **kwargs)
+        between_check_and_append.set()
+        assert v9_writer_started.wait(timeout=2.0)
+        # Give the concurrent v9 thread ample time to acquire v9's lock if it was released early.
+        v9_appended.wait(timeout=0.4)
+        return recs
+
+    orig_append_locked = ForwardLog.append_locked
+
+    def spied_append_locked(self, records):
+        if self.path == s7_reg / s7.REGISTRY_LOG:
+            v9_lines = [
+                line for line in (v9_reg / v9.REGISTRY_LOG).read_bytes().splitlines() if line
+            ]
+            observed["v9_lines_at_s7_append"] = len(v9_lines)
+            observed["v9_lock_held_at_s7_append"] = (v9_reg / v9.REGISTRY_LOCK).exists()
+            observed["s7_lock_held_at_s7_append"] = (s7_reg / s7.REGISTRY_LOCK).exists()
+            observed["v9_appended_before_s7_write"] = v9_appended.is_set()
+        return orig_append_locked(self, records)
+
+    monkeypatch.setattr(s7, "registration_records", hooked_registration_records)
+    monkeypatch.setattr(ForwardLog, "append_locked", spied_append_locked)
+
+    t = threading.Thread(target=v9_writer, daemon=True)
+    t.start()
+    try:
+        out = s7.register(
+            s7_reg,
+            S7_REG_AT,
+            "c" * 40,
+            v9_log_dir=v9_reg,
+            witness=witness,
+            dry_run=False,
+        )
+    finally:
+        between_check_and_append.set()
+        t.join(timeout=5.0)
+
+    assert not t.is_alive()
+    assert not writer_errors, f"concurrent v9 writer raised: {writer_errors}"
+    assert v9_appended.is_set()
+    assert observed["v9_lock_held_at_s7_append"] is True
+    assert observed["s7_lock_held_at_s7_append"] is True
+    assert observed["v9_lines_at_s7_append"] == 2
+    assert observed["v9_appended_before_s7_write"] is False
+    assert out["appended"] == ["header", "preregistration"]
+    assert s7.registry(s7_reg).verify_chain()["records"] == 2
+    assert len(v9.registry(v9_reg).read_all()) == 3
+    assert not (v9_reg / v9.REGISTRY_LOCK).exists()
+    assert not (s7_reg / s7.REGISTRY_LOCK).exists()
+
+
+def test_sectors_v7_register_refuses_injected_v9_advance_between_check_and_append(monkeypatch, tmp_path):
+    """If v9 advances out-of-band between check and append, sectors-v7 refuses and writes nothing."""
+    ctx = _bind_v9_and_s7(monkeypatch, tmp_path)
+    vault, v9_reg = ctx["vault"], ctx["v9_reg"]
+    s7_reg = tmp_path / "s7_reg"
+    witness = v9.check_offhost(vault.cache, remote_url=str(vault.remote))
+
+    orig_registration_records = s7.registration_records
+
+    def inject_v9_advance(*args, **kwargs):
+        recs = orig_registration_records(*args, **kwargs)
+        # Bypass lock acquisition to simulate an out-of-band v9 write landing right before sectors-v7 append.
+        v9.registry(v9_reg).append_locked([{
+            "kind": "inputs_frozen",
+            "prereg_sha256": ctx["v9_body_sha"],
+            "run_at": S7_REG_AT.isoformat(),
+        }])
+        return recs
+
+    monkeypatch.setattr(s7, "registration_records", inject_v9_advance)
+
+    with pytest.raises(PermissionError, match="differs from its witness"):
+        s7.register(
+            s7_reg,
+            S7_REG_AT,
+            "c" * 40,
+            v9_log_dir=v9_reg,
+            witness=witness,
+            dry_run=False,
+        )
+
+    assert not (s7_reg / s7.REGISTRY_LOG).exists()
+    assert not (s7_reg / s7.REGISTRY_ANCHORS).exists()
+    assert not (v9_reg / v9.REGISTRY_LOCK).exists()
+    assert not (s7_reg / s7.REGISTRY_LOCK).exists()
+
+
+def test_sectors_v7_register_lock_order_parent_then_child_and_same_dir_safe(monkeypatch, tmp_path):
+    """Locks follow strict parent (v9) -> child (sectors-v7) order through validated append, even in one dir."""
+    ctx = _bind_v9_and_s7(monkeypatch, tmp_path)
+    vault, v9_reg = ctx["vault"], ctx["v9_reg"]
+    # Use the SAME directory for v9 and sectors-v7 to confirm distinct lock files never self-deadlock.
+    shared_dir = v9_reg
+    witness = v9.check_offhost(vault.cache, remote_url=str(vault.remote))
+
+    assert s7.LOCK_ORDER == (v9.REGISTRY_ID, s7.REGISTRY_ID)
+
+    events: list[tuple[str, str]] = []
+    orig_locked = ForwardLog.locked
+    orig_append_locked = ForwardLog.append_locked
+    orig_verify_chain = ForwardLog.verify_chain
+    s7_appended = False
+
+    @contextlib.contextmanager
+    def tracked_locked(self):
+        with orig_locked(self):
+            events.append(("acquire", self.lock_path.name))
+            try:
+                yield
+            finally:
+                events.append(("release", self.lock_path.name))
+
+    def tracked_append_locked(self, records):
+        nonlocal s7_appended
+        if self.lock_path.name == s7.REGISTRY_LOCK:
+            events.append(("append", self.lock_path.name))
+        res = orig_append_locked(self, records)
+        if self.lock_path.name == s7.REGISTRY_LOCK:
+            s7_appended = True
+        return res
+
+    def tracked_verify_chain(self, external_anchors=None):
+        res = orig_verify_chain(self, external_anchors=external_anchors)
+        if self.lock_path.name == s7.REGISTRY_LOCK and s7_appended:
+            events.append(("post_verify", self.lock_path.name))
+        return res
+
+    monkeypatch.setattr(ForwardLog, "locked", tracked_locked)
+    monkeypatch.setattr(ForwardLog, "append_locked", tracked_append_locked)
+    monkeypatch.setattr(ForwardLog, "verify_chain", tracked_verify_chain)
+
+    out = s7.register(
+        shared_dir,
+        S7_REG_AT,
+        "c" * 40,
+        v9_log_dir=shared_dir,
+        witness=witness,
+        dry_run=False,
+    )
+    assert out["appended"] == ["header", "preregistration"]
+    assert events == [
+        ("acquire", v9.REGISTRY_LOCK),
+        ("acquire", s7.REGISTRY_LOCK),
+        ("append", s7.REGISTRY_LOCK),
+        ("post_verify", s7.REGISTRY_LOCK),
+        ("release", s7.REGISTRY_LOCK),
+        ("release", v9.REGISTRY_LOCK),
+    ]
+    assert not (shared_dir / v9.REGISTRY_LOCK).exists()
+    assert not (shared_dir / s7.REGISTRY_LOCK).exists()
+
+
+def test_sectors_v7_register_refuses_when_post_append_validation_fails_and_releases_locks(monkeypatch, tmp_path):
+    """Post-append chain validation runs under both locks and fails closed while releasing locks cleanly."""
+    ctx = _bind_v9_and_s7(monkeypatch, tmp_path)
+    vault, v9_reg = ctx["vault"], ctx["v9_reg"]
+    s7_reg = tmp_path / "s7_reg"
+    witness = v9.check_offhost(vault.cache, remote_url=str(vault.remote))
+
+    orig_verify_chain = ForwardLog.verify_chain
+    s7_verify_calls = 0
+    locks_during_post_verify: dict[str, bool] = {}
+
+    def failing_post_verify(self, external_anchors=None):
+        nonlocal s7_verify_calls
+        res = orig_verify_chain(self, external_anchors=external_anchors)
+        if self.path == s7_reg / s7.REGISTRY_LOG:
+            s7_verify_calls += 1
+            # Call 1: pre-append check in register(); Call 2: internal check in append_locked();
+            # Call 3: post-append validation in register().
+            if s7_verify_calls == 3:
+                locks_during_post_verify["v9"] = (v9_reg / v9.REGISTRY_LOCK).exists()
+                locks_during_post_verify["s7"] = (s7_reg / s7.REGISTRY_LOCK).exists()
+                return {**res, "ok": False, "detail": "synthetic post-append tamper"}
+        return res
+
+    monkeypatch.setattr(ForwardLog, "verify_chain", failing_post_verify)
+
+    with pytest.raises(RuntimeError, match="validation failed after append"):
+        s7.register(
+            s7_reg,
+            S7_REG_AT,
+            "c" * 40,
+            v9_log_dir=v9_reg,
+            witness=witness,
+            dry_run=False,
+        )
+
+    assert locks_during_post_verify == {"v9": True, "s7": True}
+    assert not (v9_reg / v9.REGISTRY_LOCK).exists()
+    assert not (s7_reg / s7.REGISTRY_LOCK).exists()
+
+
+def test_sectors_v7_register_refuses_when_concurrent_v9_writer_wins_lock_first(tmp_path, monkeypatch):
+    """If a concurrent v9 writer holds the parent lock and advances v9 first, sectors-v7 refuses."""
+    ctx = _bind_v9_and_s7(monkeypatch, tmp_path)
+    vault, v9_reg = ctx["vault"], ctx["v9_reg"]
+    s7_reg = tmp_path / "s7_reg"
+    witness = v9.check_offhost(vault.cache, remote_url=str(vault.remote))
+
+    s7_errors: list[BaseException] = []
+    v9_locked_event = threading.Event()
+    s7_started_event = threading.Event()
+
+    def s7_caller() -> None:
+        try:
+            v9_locked_event.wait(timeout=5.0)
+            s7_started_event.set()
+            s7.register(
+                s7_reg,
+                S7_REG_AT,
+                "c" * 40,
+                v9_log_dir=v9_reg,
+                witness=witness,
+                dry_run=False,
+            )
+        except BaseException as exc:
+            s7_errors.append(exc)
+
+    t = threading.Thread(target=s7_caller, daemon=True)
+    t.start()
+    log9 = v9.registry(v9_reg)
+    try:
+        with log9.locked():
+            v9_locked_event.set()
+            assert s7_started_event.wait(timeout=2.0)
+            log9.append_locked([{
+                "kind": "inputs_frozen",
+                "prereg_sha256": ctx["v9_body_sha"],
+                "run_at": S7_REG_AT.isoformat(),
+            }])
+    finally:
+        v9_locked_event.set()
+        t.join(timeout=5.0)
+
+    assert not t.is_alive()
+    assert len(s7_errors) == 1
+    assert isinstance(s7_errors[0], PermissionError)
+    assert "differs from its witness" in str(s7_errors[0])
+    assert not (s7_reg / s7.REGISTRY_LOG).exists()
+    assert not (v9_reg / v9.REGISTRY_LOCK).exists()
+    assert not (s7_reg / s7.REGISTRY_LOCK).exists()
