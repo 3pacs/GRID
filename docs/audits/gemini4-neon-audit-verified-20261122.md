@@ -24,23 +24,37 @@ Reach labels:
 
 **Slice** is the fix branch (`claude/fp-<slice>-20261122`), or the owner if the fix lives elsewhere. Regime and state items go to the regime and state work (#1301).
 
-**Status as of 2026-11-22 ~11:00Z.**
-- **Merged and deployed** (owner's instruction):
-  - #1350 oracle-polarity
-  - #1349 options-recommender
-  - #1373 briefing-diary
-  - #1370 ingest-integrity
-  - #1366 thesis-models
-- **Codex HOLDs on three of those**, closed forward in follow-up draft PRs:
-  - #1373 → #1386. It includes the `auto_regime.py` producer binding that the guard depends on.
-  - #1370 → #1384.
-  - #1366 → #1382.
-- **Codex HOLDs on unmerged drafts**, fixed on their own branches:
-  - #1369 (13F share-based flows, VIX/VIX3M same date);
-  - #1375 (mandatory probe pins);
-  - #1378 (v9 lock held through the append);
-  - #1358 (this ledger's wording).
-- **Still draft:** every other slice.
+**Status as of 2026-11-22 ~12:30Z.**
+
+**Merged, on the owner's instruction in the Claude session.** Each was merged at the head CI passed, with `--match-head-commit`:
+- #1350 oracle-polarity: merge commit `9d777445`
+- #1349 options-recommender: merge commit `808b5150`
+- #1373 briefing-diary: merge commit `451d4428`
+- #1370 ingest-integrity: merge commit `acc4177f`
+- #1366 thesis-models: merge commit `2157fe94`
+
+**Deploy evidence** (GitHub Actions `deploy.yml` on 3pacs/GRID):
+- Run 45012118413 (push, `451d4428`, which contains #1350, #1349 and #1373): success, 10:30Z.
+- Run 45013982186 (push, `2157fe94`, which adds #1370 and #1366): success.
+- Run 45014889134 (workflow_dispatch on `e55e95ab`, with `activate_scheduler` and `activate_intelligence` plus their acknowledgements): success, 11:06Z. Its "Verify grid-scheduler runs the deployed tree", "Verify grid-intelligence runs the deployed tree" and "Refresh runtime preservation record" steps all succeeded.
+
+**Running units**, read on grid-svr at ~11:07Z from each unit's `/proc/<pid>/cwd`:
+- On release `e55e95ab`, which contains all five merges: grid-api, grid-hermes, grid-coordinator, grid-scheduler, grid-intelligence.
+- Still on `2316256c`, which runs none of these five fixes: grid-realtime and grid-fleet-heartbeat.
+- Timer units with their working directory on the `grid_release` symlink (grid-market-diary, grid-publication-packet) pick up the current release at each run.
+
+**Codex HOLDs on three of the merged PRs.** These are corrective heads pending Codex's exact-head review. They are not yet merged or deployed, so the HOLDs are not closed:
+- #1373 → #1386. It includes the `auto_regime.py` producer binding that the guard depends on.
+- #1370 → #1384.
+- #1366 → #1382.
+
+**Codex HOLDs on unmerged drafts.** Corrective heads were pushed on their own branches, pending Codex's exact-head review:
+- #1369 (13F share-based flows, VIX/VIX3M same date);
+- #1375 (mandatory probe pins);
+- #1378 (v9 lock held through the append);
+- #1358 (this ledger's wording).
+
+**Still draft:** every other slice.
 
 ## Scoreboard context
 
