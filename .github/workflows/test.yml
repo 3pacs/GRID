@@ -305,6 +305,30 @@ jobs:
             exit 1
           fi
 
+      # Eligibility apply tool (scripts/apply_eligibility_change.py, #1301, a
+      # DRAFT stacked on the change log migration): proves on real PostgreSQL
+      # that --apply refuses without the Oracle polarity and auto_regime
+      # hysteresis prerequisites, without an owner-approved evidence receipt
+      # that still matches every running unit's process and tree, or without
+      # migration authority, that a rollback restores only its own change set
+      # and refuses any divergence (rolling back set 2 leaves set 1's vix_spot
+      # enabled), and that blockers and lock waits refuse before any write.
+      # A skip must fail.
+      - name: Eligibility apply tool PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_apply_eligibility_change_pg.py tests/test_apply_eligibility_change.py \
+            -q -rA | tee /tmp/grid-eligibility-apply-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-eligibility-apply-pg.txt; then
+            echo "::error::Eligibility apply tool PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Each database fixture uses a private schema. Run the competing
       # writers, scorers and hourly advisory-lock tests serially.
       - name: Oracle forward measurement PostgreSQL contracts
