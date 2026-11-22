@@ -251,34 +251,21 @@ def _append_jsonl(path: Path, row: dict) -> None:
         os.fsync(fh.fileno())
 
 
-#: ``reads.jsonl`` in the data dir: one line, fsynced, *before* any of a registration's window
-#: data is read. ``progress`` = a forward registration's presence count; ``look`` = its look.
-READS_FILE = "reads.jsonl"
-
-
-def _mark_read(data_dir: Path, reg_sha: str, kind: str, now: datetime) -> None:
-    _append_jsonl(data_dir / READS_FILE, {"registration_sha256": reg_sha, "kind": kind, "at": now.isoformat()})
-
-
-def read_evidence(data_dir: Path, reg_sha: str) -> dict:
-    """What the data dir shows of a registration's window having been read or evaluated.
-
-    Recorded whole in a code-change abandonment; the ledger frees nothing without it."""
-    reads = [r for r in _jsonl(data_dir / READS_FILE) if r["registration_sha256"] == reg_sha]
-    looks = data_dir / "looks"
-    return {
-        "reads_file": READS_FILE,
-        "progress_reads": sum(1 for r in reads if r["kind"] == "progress"),
-        "look_reads": sum(1 for r in reads if r["kind"] == "look"),
-        "failed_attempts": sum(1 for a in _jsonl(data_dir / "attempts.jsonl") if a["registration_sha256"] == reg_sha),
-        "report_staged": any((looks / f"{reg_sha[:16]}{ext}").exists() for ext in (".json", ".tmp")),
-    }
-
-
 def _jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     return [json.loads(x) for x in path.read_bytes().splitlines() if x.strip()]
+
+
+def read_evidence(ledger: Ledger, data_dir: Path, reg_sha: str) -> dict:
+    """What a code-change abandonment records: the ``edge_read`` kinds already in the ledger, and
+    the data dir's failed attempts and staged report (any sign of a look keeps the window)."""
+    looks = data_dir / "looks"
+    return {
+        "ledger_reads": sorted(L.load_state(ledger).reads.get(reg_sha, ())),
+        "failed_attempts": sum(1 for a in _jsonl(data_dir / "attempts.jsonl") if a["registration_sha256"] == reg_sha),
+        "report_staged": any((looks / f"{reg_sha[:16]}{ext}").exists() for ext in (".json", ".tmp")),
+    }
 
 
 def _attempt_failed(ledger: Ledger, data_dir: Path, reg_sha: str, reg: dict, err: Exception, now: datetime,
@@ -369,22 +356,22 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
                 # before any data: a registration whose family code changed is abandoned now,
                 # unread, on every lane (a forward one would otherwise collect to its look first)
                 _check_code(reg)
-                if dry_run:  # a dry run reads no open registration's window (it could not mark the read)
+                if dry_run:  # a dry run reads no open registration's window (it records no edge_read)
                     summary["forward" if reg["lane"] == "forward" else "looks"].append(
                         {"registration": reg_sha[:16], "dry_run": "window not read"})
                     continue
                 if reg["lane"] == "forward":
-                    _mark_read(data_dir, reg_sha, "progress", now)
+                    L.append_read(ledger, reg_sha, "progress", now.isoformat())
                     prog = forward_progress(reg, source, today, extras)
                     summary["forward"].append({"registration": reg_sha[:16], **prog})
                     if not prog["ready"]:
                         continue
-                _mark_read(data_dir, reg_sha, "look", now)
+                L.append_read(ledger, reg_sha, "look", now.isoformat())
                 look, body = compute_look(reg_sha, reg, source, today, extras)
             except CodeChanged as exc:
                 if not dry_run:
                     L.append_abandoned(ledger, reg_sha, str(exc), now.isoformat(), cause=L.CODE_CHANGED,
-                                       read_evidence=read_evidence(data_dir, reg_sha))
+                                       read_evidence=read_evidence(ledger, data_dir, reg_sha))
                 summary["abandoned"].append({"registration": reg_sha[:16], "reason": str(exc)})
                 continue
             except NotReady:

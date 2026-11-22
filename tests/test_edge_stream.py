@@ -692,7 +692,7 @@ def test_code_change_abandons_a_forward_registration_at_once(tmp_path, monkeypat
     assert s["abandoned"][0]["registration"] == sha[:16]
     state = L.load_state(led)
     rec = state.abandoned[sha]
-    assert rec["cause"] == L.CODE_CHANGED and rec["read_evidence"]["progress_reads"] == 0
+    assert rec["cause"] == L.CODE_CHANGED and rec["read_evidence"]["ledger_reads"] == []
     assert not state.unread_abandoned(sha) and state.reregistrable(sha)  # forward: never frees its window
 
 
@@ -712,7 +712,8 @@ def test_forward_progress_then_code_change_keeps_the_window(tmp_path, monkeypatc
         R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=5), register=False)
     state = L.load_state(led)
     ev = state.abandoned[sha]["read_evidence"]
-    assert ev["progress_reads"] == 2 and ev["look_reads"] == 0 and ev["report_staged"] is False
+    assert ev["ledger_reads"] == ["progress"] and state.reads[sha] == {"progress"} and ev["report_staged"] is False
+    assert sum(1 for r in led.records if r.get("kind") == L.READ_KIND) == 1  # first read of a kind only
     assert not state.unread_abandoned(sha)
     assert any(c["source"] == sha for c in state.consumption())
     assert state.abandoned[sha]["alpha_spent"] == alpha and state.stage1_count(2026) == 1
@@ -735,11 +736,11 @@ def test_any_trace_of_a_look_keeps_the_window_and_the_group(tmp_path, monkeypatc
         (tmp_path / "looks").mkdir()
         (tmp_path / "looks" / f"{sha[:16]}.json").write_bytes(b"{}")
     elif trace == "aborted_attempt":
-        R._mark_read(tmp_path, sha, "look", NOW)
+        L.append_read(led, sha, "look", NOW.isoformat())
         R._append_jsonl(tmp_path / "attempts.jsonl", {"registration_sha256": sha, "at": NOW.isoformat(),
                                                      "error": "SourceError: x"})
     else:
-        R._mark_read(tmp_path, sha, "look", NOW)
+        L.append_read(led, sha, "look", NOW.isoformat())
     with monkeypatch.context() as m:
         m.setattr(R, "code_sha256", lambda fam: "f" * 64)
         R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=3), register=False)
@@ -759,13 +760,12 @@ def test_a_look_read_is_marked_before_the_data_is_read(tmp_path):
 
     class Watch(StaticSource):
         def sessions(self, *a, **k):
-            seen.append([r["kind"] for r in R._jsonl(tmp_path / R.READS_FILE)])
+            seen.append(set(L.load_state(led).reads.get(sha, ())))
             return super().sessions(*a, **k)
 
     src = Watch(synthetic_bars(("GLD", "SLV"), date(2024, 11, 1), TODAY, 0.002), today=TODAY)
     R.run_cycle(led, src, tmp_path, now=NOW + timedelta(days=3), register=False)
-    assert seen and all(k == ["look"] for k in seen)
-    assert R.read_evidence(tmp_path, sha)["look_reads"] == 1
+    assert seen and all(k == {"look"} for k in seen)
 
 
 def test_a_dry_run_reads_no_open_window_and_writes_nothing(tmp_path):
@@ -776,7 +776,7 @@ def test_a_dry_run_reads_no_open_window_and_writes_nothing(tmp_path):
     s = R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=3), dry_run=True,
                     register=False)
     assert all(x.get("dry_run") == "window not read" for x in s["looks"] + s["forward"])
-    assert len(led.records) == n and not (tmp_path / R.READS_FILE).exists()
+    assert len(led.records) == n and not L.load_state(led).reads
 
 
 def test_unread_abandonment_frees_its_window_under_policy_4(tmp_path, monkeypatch):
@@ -828,30 +828,53 @@ def test_other_abandonments_keep_their_window(tmp_path, monkeypatch):
     assert not any(r["proposal_id"].startswith("IM1-v1:metals") for r in s["registered"])
 
 
-def test_the_live_abandonment_is_unread_only_by_attestation():
-    """The 2026-11-20 single-stocks abandonment has no cause or evidence fields; only policy 4's
-    attestation by name frees it. The same reason text on any other record frees nothing."""
-    live = P.UNREAD_ABANDONMENT["attested"][0]["registration_sha256"]
-    reg = {"lane": "history", "stage": 1}
+def test_no_window_is_freed_for_a_registration_sealed_before_policy_4():
+    """Codex 6010864065: the 2026-11-20 single-stocks abandonment (no cause, no evidence) is not
+    freed by anything in policy 4; only the live forward registration is named, for a new window."""
+    live = "cfa2537678d7af7153e767810fda3d87a9316c45687d9cc2747e54a1fd0b224b"
+    assert all(a["registration_sha256"] != live and a["frees_window"] is False
+               for a in P.UNREAD_ABANDONMENT["attested"])
     state = L.StreamState(policy=P.policy_payload(), policy_sha256=P.policy_sha256())
-    for sha in (live, "b" * 64):
-        state.registrations[sha] = reg
-        state.abandoned[sha] = {"reason": "family IM1 code differs from the registered sha"}
-    assert state.unread_abandoned(live) and state.reregistrable(live)
-    assert not state.unread_abandoned("b" * 64) and not state.reregistrable("b" * 64)
-    state.looks[live] = {"verdict": "FAIL"}
-    assert not state.unread_abandoned(live)
-    fwd = P.UNREAD_ABANDONMENT["attested"][1]["registration_sha256"]
-    clean = {"reads_file": R.READS_FILE, "progress_reads": 3, "look_reads": 0, "failed_attempts": 0,
-             "report_staged": False}
+    state.registrations[live] = {"lane": "history", "stage": 1}
+    state.abandoned[live] = {"reason": "family IM1 code differs from the registered sha"}
+    assert not state.unread_abandoned(live) and not state.reregistrable(live)
+    fwd = P.UNREAD_ABANDONMENT["attested"][0]["registration_sha256"]
+    clean = {"ledger_reads": [], "failed_attempts": 0, "report_staged": False}
     state.registrations[fwd] = {"lane": "forward", "stage": 1}
     state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": clean}
     assert state.reregistrable(fwd) and not state.unread_abandoned(fwd)  # new window only
-    state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": {**clean, "failed_attempts": 1}}
+    # an attestation never overrides contrary evidence
+    for bad in ({**clean, "failed_attempts": 1}, {**clean, "report_staged": True}, {**clean, "ledger_reads": ["look"]}):
+        state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": bad}
+        assert not state.reregistrable(fwd), bad
+    state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": clean}
+    state.reads[fwd] = {"look"}  # the ledger disputes the recorded evidence
     assert not state.reregistrable(fwd)
-    old = L.StreamState(policy=_v3_payload(), policy_sha256="x")  # policy 3 attests nothing
-    old.registrations[live], old.abandoned[live] = reg, {"reason": "x"}
-    assert not old.unread_abandoned(live)
+
+
+def test_a_lost_sidecar_cannot_free_a_read_window(tmp_path, monkeypatch):
+    """The read record is in the hash-chained ledger: deleting or restoring the data dir changes
+    nothing, and a cut-out record makes the ledger refuse to load."""
+    led = L.memory()
+    sha = register(led, metals_proposal())
+    L.append_read(led, sha, "look", NOW.isoformat())
+    assert L.append_read(led, sha, "look", NOW.isoformat()) is None  # one record per kind
+    with monkeypatch.context() as m:
+        m.setattr(R, "code_sha256", lambda fam: "f" * 64)
+        R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=3), register=False)
+    for f in tmp_path.iterdir():
+        if f.is_file():
+            f.unlink()
+    state = L.load_state(led)
+    assert state.reads[sha] == {"look"} and not state.unread_abandoned(sha) and not state.reregistrable(sha)
+    with pytest.raises(L.StreamRefused, match="already closed"):  # no read is recorded after a close
+        L.append_read(led, sha, "progress", NOW.isoformat())
+    other = L.memory()
+    osha = register(other, metals_proposal())
+    L.append_read(other, osha, "look", NOW.isoformat())
+    L._append(other, {"kind": L.READ_KIND, "registration_sha256": osha, "read": "look", "recorded_at": "x"})
+    with pytest.raises(L.StreamRefused, match="recorded twice"):  # a forged duplicate is refused on load
+        L.load_state(other)
 
 
 def test_abandonment_evidence_is_complete_or_refused():

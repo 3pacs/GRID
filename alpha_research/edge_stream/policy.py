@@ -9,12 +9,12 @@ owner decision (:data:`OWNER_DECISIONS`), which may change the few fields in
 :data:`OWNER_WAIVABLE` and nothing else. Nothing here is read from the
 environment.
 
-Version 4 (2026-11-21) adds one owner decision (:data:`UNREAD_ABANDONMENT`): a
-registration abandoned because its family's code changed before its look, with recorded
-evidence that none of its window was read, has that window freed, and its (family,
-group, lane) may register again on a new window. A forward window whose presence was
-counted stays consumed. Its alpha stays spent and it still counts toward the yearly
-maximum. Every other abandonment keeps its window consumed.
+Version 4 (2026-11-21) adds one owner decision (:data:`UNREAD_ABANDONMENT`): a history
+registration sealed under it, abandoned because its family's code changed, whose ledger
+holds no read of its window, has that window freed, and its (family, group, lane) may
+register again on a new window. A forward window whose presence was counted stays
+consumed. Its alpha stays spent and it still counts toward the yearly maximum. Every
+other abandonment, and every registration sealed before it, keeps its window consumed.
 
 Version 3 (2026-11-16) carries the owner's two-stage evidence bar (GRID issue 1213):
 
@@ -123,44 +123,27 @@ OWNER_DECISIONS: tuple[dict, ...] = (
 UNREAD_ABANDONMENT: dict = {
     "decision": OWNER_DECISIONS[1]["id"],
     "cause": "code_changed",
-    "rule": "unread status is evidenced, never inferred from when the code check ran. Before any of a "
-            "registration's window data is read the runner appends an fsynced line to reads.jsonl (progress for "
-            "a forward presence count, look for a look); a dry run reads no open registration's window. An "
-            "abandonment at the code-hash check records what the data dir showed at that moment: progress and "
-            "look reads, failed attempts, and whether a report was staged. Only a history registration with no "
-            "read, no failed attempt and no staged report (or one attested by name below, from the cycles that "
-            "touched it) has its window freed and may register again on a new window. A forward registration "
-            "whose presence was counted keeps its window consumed; when it had no look read, failed attempt or "
-            "staged report it may register again on a new window, which starts after the new registration and "
-            "was never read. Every other abandonment, and any with missing or partial evidence, keeps its window "
-            "and its (family, group, lane) closed. The alpha of an abandoned registration stays spent and it "
-            "counts toward max_registrations",
-    "evidence_trusted_for": "registrations sealed under this policy or a later one (every cycle of their life "
-                            "marks reads); a registration sealed before it counts only when attested below",
+    "rule": "unread status is a positive receipt in the ledger, never inferred. Before the first read of each "
+            "kind of an open registration's window (progress: a forward presence count; look: a look) the runner "
+            "appends an edge_read record to this hash-chained, anchored ledger; a dry run reads no open window. "
+            "A history registration sealed under this policy or a later one, with no edge_read record, abandoned "
+            "at the code-hash check with no failed attempt and no staged report in the data dir, has its window "
+            "freed and its (family, group, lane) may register again on a new window. A forward window stays "
+            "consumed; with no look read, failed attempt or staged report a new forward window may register, "
+            "starting after the new registration. Any registration sealed before this policy, and any whose "
+            "evidence is missing, partial or disputed, keeps its window and its (family, group, lane) closed. "
+            "The alpha of an abandoned registration stays spent and it counts toward max_registrations",
     "attested": [
-        {
-            "registration_sha256": "cfa2537678d7af7153e767810fda3d87a9316c45687d9cc2747e54a1fd0b224b",
-            "lane": "history",
-            "frees_window": True,
-            "proposal_id": "IM1-v1:us_single_stocks:history:2024-12-19",
-            "evidence": "abandoned 2026-11-20 before reads.jsonl existed. cycle.log: registered 2026-11-19 11:15:11Z, "
-                        "no cycle between, abandoned in the next cycle (2026-11-20 11:05:50Z) with looks []. The "
-                        "release then running (15975857) raises CodeChanged in compute_look before _read. No "
-                        "attempts.jsonl line and no looks/cfa25376* file. The bar cache holds these seven tickers "
-                        "only for 2024-11-25..2024-12-18 (18 sessions each, fetched 2026-11-19 11:12-11:15Z by the "
-                        "G11 pre-window check at registration) and no session on or after the window start "
-                        "2024-12-19 (checked 2026-11-22)",
-        },
         {
             "registration_sha256": "69a8482023b8306323ac5d18d5e70e5af2451fa2846912f24a1990656660218d",
             "lane": "forward",
             "frees_window": False,
             "proposal_id": "IM1-v1:us_equity_index:forward:2026-11-23",
-            "evidence": "sealed 2026-11-20 under policy 3, before read marking. Its presence is counted every cycle, "
-                        "so its window stays consumed. It may register again on a new window only if its abandonment "
-                        "records no failed attempt and no staged report. No look read is possible before it: the code "
-                        "it runs under (15975857, 586ba09b) calls compute_look for a forward registration only when "
-                        "forward_progress is ready, which needs 100 sessions from 2026-11-23 or 250 weekdays",
+            "evidence": "sealed 2026-11-20 under policy 3, before edge_read records. Its window stays consumed; it "
+                        "may register again on a new window only when its abandonment records no failed attempt and "
+                        "no staged report. The code it ran under (15975857, 586ba09b) calls compute_look for a "
+                        "forward registration only once forward_progress is ready (100 sessions from 2026-11-23 or "
+                        "250 weekdays), so no look of it can precede its abandonment",
         },
     ],
 }
