@@ -6,28 +6,43 @@ alone. This module computes real cross-sectional breadth over constituent
 prices, counting on each session ``d`` only the tickers that were index
 members on ``d``:
 
-  - ``pct_above_50ma``   fraction of members with close > 50-session SMA
-  - ``pct_above_200ma``  fraction of members with close > 200-session SMA
-  - ``net_adv_ratio``    (advancers - decliners) / members with a 1-day return
+  - ``pct_above_50ma``   fraction of observed members with close > 50-session SMA
+  - ``pct_above_200ma``  fraction of observed members with close > 200-session SMA
+  - ``net_adv_ratio``    (advancers - decliners) / observed members with a 1-day return
   - ``mcclellan_osc``    19-row EMA minus 39-row EMA of 1000 * net_adv_ratio
   - ``sector_iqr_5d``    interquartile range of 5-session sector-ETF returns
 
-Point in time:
+Coverage, and UNKNOWN. Every row reports ``members`` (index members on ``d``)
+and, per statistic, how many of them were observed (a price on ``d`` plus the
+history the statistic needs) and the ratio. A statistic whose coverage is
+below ``min_coverage`` (default :data:`MIN_MEMBER_COVERAGE` = 0.95) is UNKNOWN
+(NaN), so a panel holding 50 names never stands in for a 500-name index. 0.95
+bounds the error of a fraction statistic: with ``k`` of ``N`` members
+unobserved, the full-index value lies within ``k / N`` (at most 5 percentage
+points) of the observed one. ``status`` is ``ok`` (all three base statistics
+known), ``partial`` or ``unknown``, and ``reason`` says why. ``mcclellan_osc``
+is NaN until 39 consecutive rows have a known ``net_adv_ratio`` and restarts
+after any UNKNOWN row.
 
-* Membership is required, never defaulted: ``members_on(d)`` must return the
-  members *as of* ``d``. :func:`sp500_members_on` builds it from the dated
-  membership file ``config/sp500_membership.json`` (base set + dated changes,
-  via ``ingestion.altdata.finra_dix.Membership``). Dates after the file's
-  ``covers_to`` get the last known set: stale, not future. Passing today's
-  list for history would re-introduce survivorship bias, which is why there is
-  no "all columns" fallback.
-* Every statistic is trailing: rolling means, one-day returns and EMAs use
-  rows at or before ``d`` only.
-* Prices should be split/dividend-adjusted closes (``adj_close``, the
-  ``{ticker}_full`` basis). Above/below-MA and return signs are ratios within
-  one series, so a later back-adjustment rescales a whole window together and
-  cannot change them; raw closes would turn a split inside the window into a
-  false cross.
+Membership is required, never defaulted: ``members_on(d)`` returns the members
+*as of* ``d``, or :class:`UnknownMembership` with a reason. :func:`sp500_members_on`
+builds it from the dated file ``config/sp500_membership.json`` (base set +
+dated changes, via ``ingestion.altdata.finra_dix.Membership``) and returns
+UNKNOWN before the file's ``base_date`` and after its ``covers_to`` (the last
+change date the file records): the last member set is not carried forward.
+
+Exact availability. The price panel is plain (no vintages), so the caller must
+pass a known-at-aligned panel: row ``d`` holds only values known by the end of
+``d`` (for example closes read with ``store.observations.read_window_known_at``
+at ``as_of = d``, or a PIT store read). Every statistic is trailing (rolling
+means, one-day returns and EMAs use rows at or before ``d``), so rows after
+``d`` cannot change row ``d``; ``as_of`` drops them explicitly. A breadth value
+for ``d`` is available after ``d``'s close. Split/dividend-adjusted closes
+(``adj_close``, the ``{ticker}_full`` basis) are fine here even though the
+adjustment is a later vintage: a later corporate action rescales every price in
+a trailing window by the same factor, which cannot change an above/below-MA
+comparison or a return's sign. Raw closes would turn a split inside the window
+into a false cross.
 
 No writer: nothing stores these series in this change.
 """
@@ -35,97 +50,161 @@ No writer: nothing stores these series in this change.
 from __future__ import annotations
 
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-MIN_CONSTITUENTS_FOR_BREADTH = 50
+MIN_MEMBER_COVERAGE: float = 0.95
 MIN_SECTORS_FOR_IQR = 6
+_EMA_FAST, _EMA_SLOW = 19, 39
 
-_BREADTH_COLUMNS = ["pct_above_50ma", "pct_above_200ma", "net_adv_ratio", "mcclellan_osc"]
+STATUS_OK = "ok"
+STATUS_PARTIAL = "partial"
+STATUS_UNKNOWN = "unknown"
+
+_STATS: tuple[tuple[str, str], ...] = (
+    ("pct_above_50ma", "50ma"),
+    ("pct_above_200ma", "200ma"),
+    ("net_adv_ratio", "ret1"),
+)
+
+BREADTH_COLUMNS: list[str] = [
+    "members",
+    "observed_50ma", "observed_200ma", "observed_ret1",
+    "coverage_50ma", "coverage_200ma", "coverage_ret1",
+    "pct_above_50ma", "pct_above_200ma", "net_adv_ratio", "mcclellan_osc",
+    "status", "reason",
+]
 
 
-def sp500_members_on(path: Path | None = None) -> Callable[[date], frozenset[str]]:
-    """``members_on`` callable over the dated S&P 500 membership file.
+@dataclass(frozen=True)
+class UnknownMembership:
+    """``members_on`` result for a date whose membership is not known."""
 
-    Tickers are as the membership file spells them (``BRK.B``); the price
-    frame's columns must use the same spelling.
+    reason: str
+
+
+MembersOn = Callable[[date], Collection[str] | UnknownMembership]
+
+
+def sp500_members_on(path: Path | None = None) -> Callable[[date], frozenset[str] | UnknownMembership]:
+    """``members_on`` over the dated S&P 500 membership file.
+
+    Known on ``[base_date, covers_to]``; UNKNOWN (with the reason) outside it.
+    Tickers are as the file spells them (``BRK.B``); the price frame's columns
+    must use the same spelling.
     """
     from ingestion.altdata.finra_dix import MEMBERSHIP_PATH, Membership
 
     membership = Membership.load(path or MEMBERSHIP_PATH)
-    return membership.on
+    base = date.fromisoformat(str(membership.base_date))
+    covers_to = date.fromisoformat(str(membership.covers_to))
+
+    def members_on(d: date) -> frozenset[str] | UnknownMembership:
+        if d < base:
+            return UnknownMembership(f"before membership base_date {base.isoformat()}")
+        if d > covers_to:
+            return UnknownMembership(f"after membership covers_to {covers_to.isoformat()}")
+        return membership.on(d)
+
+    return members_on
+
+
+def _mcclellan(net_adv: pd.Series) -> pd.Series:
+    """19/39 EMA spread of ``1000 * net_adv`` over runs of known values only."""
+    out = pd.Series(np.nan, index=net_adv.index, dtype=float)
+    known = net_adv.notna()
+    run_id = (~known).cumsum()
+    for _, run in net_adv[known].groupby(run_id[known]):
+        scaled = run * 1000.0
+        fast = scaled.ewm(span=_EMA_FAST, adjust=False, min_periods=_EMA_FAST).mean()
+        slow = scaled.ewm(span=_EMA_SLOW, adjust=False, min_periods=_EMA_SLOW).mean()
+        out.loc[run.index] = (fast - slow).to_numpy()
+    return out
 
 
 def compute_true_breadth_panel(
     prices: pd.DataFrame,
     *,
-    members_on: Callable[[date], Collection[str]],
-    min_constituents: int = MIN_CONSTITUENTS_FOR_BREADTH,
+    members_on: MembersOn,
+    as_of: date | None = None,
+    min_coverage: float = MIN_MEMBER_COVERAGE,
 ) -> pd.DataFrame:
-    """Breadth metrics from a daily close frame (index = dates, columns = tickers).
+    """Breadth with coverage from a known-at-aligned daily close frame.
 
-    Row ``d`` counts only the columns in ``members_on(d)``; a date with fewer
-    than ``min_constituents`` members in the frame is left out.
+    ``prices``: index = session dates, columns = tickers. One output row per
+    session at or before ``as_of`` (all sessions when ``as_of`` is None);
+    columns :data:`BREADTH_COLUMNS`. A statistic is NaN when it is UNKNOWN.
     """
     if prices is None or prices.empty:
-        return pd.DataFrame(columns=_BREADTH_COLUMNS)
+        return pd.DataFrame(columns=BREADTH_COLUMNS)
 
+    if prices.index.has_duplicates:
+        raise ValueError("prices has duplicate session dates; pass one known-at row per session")
     px = prices.sort_index().astype(float)
+    if as_of is not None:
+        px = px.loc[[(i.date() if hasattr(i, "date") else i) <= as_of for i in px.index]]
+        if px.empty:
+            return pd.DataFrame(columns=BREADTH_COLUMNS)
+
     ma50 = px.rolling(50, min_periods=50).mean()
     ma200 = px.rolling(200, min_periods=200).mean()
     ret1 = px.pct_change(1, fill_method=None)
+    valid = {
+        "50ma": px.notna() & ma50.notna(),
+        "200ma": px.notna() & ma200.notna(),
+        "ret1": ret1.notna(),
+    }
+    up = {"50ma": px > ma50, "200ma": px > ma200, "ret1": ret1 > 0}
+    down_ret1 = ret1 < 0
+    columns = set(px.columns)
 
-    rows: list[dict[str, float]] = []
+    rows: list[dict[str, object]] = []
     out_dates: list[date] = []
-    all_cols = list(px.columns)
-
     for idx_val in px.index:
         d = idx_val.date() if hasattr(idx_val, "date") else idx_val
-        allowed = members_on(d)
-        cols = [c for c in all_cols if c in allowed]
-        if len(cols) < min_constituents:
-            continue
-
-        cur = px.loc[idx_val, cols]
-        m50 = ma50.loc[idx_val, cols]
-        m200 = ma200.loc[idx_val, cols]
-        r1 = ret1.loc[idx_val, cols]
-
-        valid50 = cur.notna() & m50.notna()
-        valid200 = cur.notna() & m200.notna()
-        valid_r1 = r1.notna()
-
-        pct50 = (
-            float((cur[valid50] > m50[valid50]).mean())
-            if int(valid50.sum()) >= min_constituents
-            else float("nan")
-        )
-        pct200 = (
-            float((cur[valid200] > m200[valid200]).mean())
-            if int(valid200.sum()) >= min_constituents
-            else float("nan")
-        )
-        if int(valid_r1.sum()) >= min_constituents:
-            adv = int((r1[valid_r1] > 0).sum())
-            dec = int((r1[valid_r1] < 0).sum())
-            net_adv = (adv - dec) / float(valid_r1.sum())
-        else:
-            net_adv = float("nan")
-
         out_dates.append(d)
-        rows.append({"pct_above_50ma": pct50, "pct_above_200ma": pct200, "net_adv_ratio": net_adv})
+        row: dict[str, object] = {c: np.nan for c in BREADTH_COLUMNS}
+        members = members_on(d)
+        if isinstance(members, UnknownMembership):
+            row.update(members=0, status=STATUS_UNKNOWN, reason=members.reason)
+            rows.append(row)
+            continue
+        n_members = len(members)
+        if n_members == 0:
+            row.update(members=0, status=STATUS_UNKNOWN, reason="no members on this date")
+            rows.append(row)
+            continue
+        cols = [c for c in members if c in columns]
+        row["members"] = n_members
+        reasons: list[str] = []
+        known = 0
+        for stat, key in _STATS:
+            ok = valid[key].loc[idx_val, cols] if cols else pd.Series(dtype=bool)
+            n_obs = int(ok.sum())
+            coverage = n_obs / n_members
+            row[f"observed_{key}"] = n_obs
+            row[f"coverage_{key}"] = coverage
+            if coverage < min_coverage or n_obs == 0:
+                reasons.append(f"{stat} coverage {coverage:.3f} below {min_coverage:.2f}")
+                continue
+            ok_cols = ok[ok].index
+            n_up = int(up[key].loc[idx_val, ok_cols].sum())
+            if key == "ret1":
+                n_down = int(down_ret1.loc[idx_val, ok_cols].sum())
+                row[stat] = (n_up - n_down) / n_obs
+            else:
+                row[stat] = n_up / n_obs
+            known += 1
+        row["status"] = STATUS_OK if known == len(_STATS) else (STATUS_PARTIAL if known else STATUS_UNKNOWN)
+        row["reason"] = "; ".join(reasons) or None
+        rows.append(row)
 
-    if not rows:
-        return pd.DataFrame(columns=_BREADTH_COLUMNS)
-
-    df = pd.DataFrame(rows, index=out_dates)
-    scaled = df["net_adv_ratio"] * 1000.0
-    ema19 = scaled.ewm(span=19, adjust=False, min_periods=19).mean()
-    ema39 = scaled.ewm(span=39, adjust=False, min_periods=39).mean()
-    df["mcclellan_osc"] = ema19 - ema39
+    df = pd.DataFrame(rows, index=out_dates, columns=BREADTH_COLUMNS)
+    df["mcclellan_osc"] = _mcclellan(df["net_adv_ratio"].astype(float))
     return df
 
 
@@ -135,7 +214,12 @@ def compute_sector_dispersion_iqr(
     horizon_days: int = 5,
     min_sectors: int = MIN_SECTORS_FOR_IQR,
 ) -> pd.Series:
-    """Cross-sectional IQR of trailing ``horizon_days`` returns across sector ETFs (XLK..XLU)."""
+    """Cross-sectional IQR of trailing ``horizon_days`` returns across the sector ETFs given.
+
+    Computed over the columns present (XLK..XLU); a date with fewer than
+    ``min_sectors`` finite returns is left out. Same known-at contract as
+    :func:`compute_true_breadth_panel`.
+    """
     if sector_prices is None or sector_prices.empty:
         return pd.Series(dtype=float, name="sector_iqr_5d")
 

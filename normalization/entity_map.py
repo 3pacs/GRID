@@ -1154,7 +1154,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "ofr_fsi_funding": "ofr_fsi_funding",
     "ofr_fsi_safe_assets": "ofr_fsi_safe_assets",
     "ofr_fsi_volatility": "ofr_fsi_volatility",
-    # ingestion/fred.py FRED_SERIES_LIST (CFNAI already pulled; the rest added 2026-11-21)
+    # FRED ids: CFNAI is in ingestion/fred.py FRED_SERIES_LIST today; the other
+    # nine are not pulled until the separate FRED-pull change lands, so for now
+    # nothing writes them.
     "CFNAI": "chicago_fed_cfnai",
     "IORB": "fed_iorb_rate",
     "WRESBAL": "fed_reserve_balances_weekly",
