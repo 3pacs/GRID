@@ -6,7 +6,8 @@ Quarterly data with intra-quarter estimates from ETF flow proxies.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+import math
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -38,37 +39,75 @@ _SWF_TOTAL_USD = sum(s["aum_usd"] for s in _SWF_ESTIMATES)
 
 # ── Node Builders ────────────────────────────────────────────────────────
 
+_13F_ROWS_SQL = text(
+    "SELECT amount_usd, direction, confidence, evidence, created_at "
+    "FROM dollar_flows "
+    "WHERE source_type = '13f' "
+    "AND flow_date >= :start AND flow_date <= :end "
+    "AND (created_at IS NULL OR created_at < :known_before)"
+)
+
+
 def _build_13f_aggregate(engine: Engine, as_of: date) -> FlowNode:
-    """Sum net dollar flows from 13F filings over the trailing 90 days."""
+    """Net estimated 13F holdings-position change over the trailing 90 days.
+
+    A 13F row is a share delta valued at a quarter-end implied price: an
+    estimated holdings-position change at reference prices, never observed
+    cash or transaction flow. Only rows that pass
+    ``intelligence.dollar_flows.is_qualified_13f_dollar_flow_row`` count, and
+    only rows written before the end of ``as_of`` (``created_at``); inflows add
+    and outflows subtract. With no qualified row the value is unknown (None),
+    never zero.
+    """
+    from intelligence.dollar_flows import is_qualified_13f_dollar_flow_row
+
     lookback = as_of - timedelta(days=90)
+    known_before = datetime.combine(as_of + timedelta(days=1), time.min, tzinfo=timezone.utc)
     value: float | None = None
+    counts = {"qualified": 0, "unqualified": 0, "rows_read": 0}
 
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT SUM(amount_usd) AS net_flow
-                    FROM dollar_flows
-                    WHERE source_type = '13f'
-                      AND flow_date >= :start
-                      AND flow_date <= :end
-                """),
-                {"start": lookback, "end": as_of},
-            ).fetchone()
-            if row and row[0] is not None:
-                value = float(row[0])
+            rows = conn.execute(
+                _13F_ROWS_SQL,
+                {"start": lookback, "end": as_of, "known_before": known_before},
+            ).fetchall()
+        net = 0.0
+        for amount, direction, confidence, evidence, _created in rows:
+            counts["rows_read"] += 1
+            if direction not in ("inflow", "outflow") or not is_qualified_13f_dollar_flow_row(confidence, evidence):
+                counts["unqualified"] += 1
+                continue
+            try:
+                amt = float(amount)
+            except (TypeError, ValueError):
+                counts["unqualified"] += 1
+                continue
+            if not math.isfinite(amt) or amt < 0:
+                counts["unqualified"] += 1
+                continue
+            counts["qualified"] += 1
+            net += amt if direction == "inflow" else -amt
+        if counts["qualified"]:
+            value = round(net, 2)
     except Exception as exc:
         log.warning("13f_aggregate query failed: {}", exc)
 
     return FlowNode(
         id="13f_aggregate",
-        label="13F Aggregate Net Flows",
+        label="13F Estimated Holdings-Position Change",
         layer=LAYER_ID,
         value=value,
         change_1m=value,  # trailing 90d is the best proxy we have
-        confidence="derived",
+        confidence="estimated",
         source="SEC:13F-HR",
-        metadata={"lookback_days": 90},
+        metadata={
+            "lookback_days": 90,
+            "measure": "estimated_holdings_position_change_at_reference_prices",
+            "not_observed_cash_flow": True,
+            "coverage": "qualified" if counts["qualified"] else "no_qualified_13f_rows",
+            **counts,
+        },
     )
 
 

@@ -108,6 +108,35 @@ _EDGAR_RATE_DELAY: float = 0.15
 # Minimum position change threshold to flag as INCREASED/DECREASED (20%)
 _POSITION_CHANGE_THRESHOLD: float = 0.20
 
+# A same-CUSIP split or reverse split between two quarter-ends changes the
+# reported share count with no trade (100 x $100 -> 200 x $50). 13F rows carry
+# CUSIPs, not tickers, so no trustworthy split adjustment is available here.
+# A continuing position whose implied per-share price (value / shares) moved by
+# more than this factor either way between the two quarter-ends is quarantined
+# as a possible split or corporate action instead of being read as a trade.
+# Known limit: a split ratio below this factor (e.g. 5-for-4) offset by a
+# market move can still pass; a ticker-level split source would close that.
+MAX_QUARTER_IMPLIED_PRICE_RATIO: float = 1.25
+
+
+def implied_price_suggests_corporate_action(
+    prev_value: float, prev_shares: float, curr_value: float, curr_shares: float,
+) -> bool:
+    """True when the implied per-share price moved too far for a no-action quarter.
+
+    Also True for any non-finite or non-positive input: the transition cannot
+    be shown to be free of a split, so it is not read as a trade.
+    """
+    try:
+        prev_price = float(prev_value) / float(prev_shares)
+        curr_price = float(curr_value) / float(curr_shares)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return True
+    if not (math.isfinite(prev_price) and math.isfinite(curr_price)) or prev_price <= 0 or curr_price <= 0:
+        return True
+    ratio = curr_price / prev_price
+    return ratio > MAX_QUARTER_IMPLIED_PRICE_RATIO or ratio < 1.0 / MAX_QUARTER_IMPLIED_PRICE_RATIO
+
 # SEC Form 13F XML <value> switched from thousands of dollars to whole dollars
 # for filings made on or after 2023-01-03 (SEC Final Rule, Release No. 34-95148).
 _13F_DOLLAR_CUTOVER_DATE: date = date(2023, 1, 3)
@@ -832,6 +861,11 @@ class InstitutionalFlowsPuller(BasePuller):
                 continue
             if prev_st != curr_st:
                 _quarantine("mixed_share_types")
+                continue
+            # Checked before the zero-delta skip: a split with an offsetting
+            # trade can leave the share count flat, which is not "no change".
+            if implied_price_suggests_corporate_action(prev_val, prev_shares, curr_val, curr_shares):
+                _quarantine("possible_split_or_corporate_action")
                 continue
 
             delta_shares = curr_shares - prev_shares

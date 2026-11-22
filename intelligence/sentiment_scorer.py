@@ -311,13 +311,25 @@ def _score_flows(engine: Engine, days: int = 7) -> SentimentComponent:
 
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text(
+            rows = list(conn.execute(text(
                 "SELECT direction, SUM(amount_usd) "
                 "FROM dollar_flows "
                 "WHERE flow_date >= :cutoff AND flow_date <= :today "
-                "AND NOT (source_type = '13f' AND COALESCE(confidence, '') != 'derived') "
+                "AND source_type <> '13f' "
                 "GROUP BY direction"
-            ), {"cutoff": cutoff, "today": today}).fetchall()
+            ), {"cutoff": cutoff, "today": today}).fetchall())
+            # 13F rows count only with documented share-based evidence; legacy
+            # rows tagged 'derived' without it do not.
+            from intelligence.dollar_flows import is_qualified_13f_dollar_flow_row
+
+            for direction, amount, confidence, evidence in conn.execute(text(
+                "SELECT direction, amount_usd, confidence, evidence "
+                "FROM dollar_flows "
+                "WHERE flow_date >= :cutoff AND flow_date <= :today "
+                "AND source_type = '13f'"
+            ), {"cutoff": cutoff, "today": today}).fetchall():
+                if is_qualified_13f_dollar_flow_row(confidence, evidence):
+                    rows.append((direction, amount))
 
             for direction, amount in rows:
                 amt = float(amount or 0)

@@ -33,6 +33,13 @@ from sqlalchemy.engine import Engine
 from analysis.sector_map import SECTOR_MAP, get_all_sectors
 
 
+def is_qualified_13f_dollar_flow_row(confidence: Any, evidence: Any) -> bool:
+    """The one 13F qualification rule (``intelligence.dollar_flows``), imported lazily."""
+    from intelligence.dollar_flows import is_qualified_13f_dollar_flow_row as _qualified
+
+    return _qualified(confidence, evidence)
+
+
 # ── Actor tier classification ────────────────────────────────────────────
 
 # Source types map to actor tiers.  Congressional and insider are
@@ -161,7 +168,8 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
             rows = conn.execute(
                 text(
                     "SELECT source_type, actor_name, ticker, amount_usd, "
-                    "direction, confidence, flow_date "
+                    "direction, confidence, flow_date, "
+                    "CASE WHEN source_type = '13f' THEN evidence ELSE NULL END "
                     "FROM dollar_flows "
                     "WHERE flow_date >= :cutoff AND flow_date <= CURRENT_DATE "
                     "ORDER BY flow_date DESC"
@@ -178,9 +186,9 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
         source_type = r[0]
         direction = r[4]
         confidence = r[5] or "estimated"
-        # Quarantine legacy pre-fix 13F rows (written as 'confirmed' marked-value
-        # deltas / whole positions before share-based flow estimation).
-        if source_type == "13f" and confidence != "derived":
+        # A 13F row counts only with documented share-based evidence (legacy
+        # marked-value / whole-position rows, even ones tagged 'derived', do not).
+        if source_type == "13f" and not is_qualified_13f_dollar_flow_row(confidence, r[7]):
             quarantined_13f += 1
             continue
         if direction == "quarantined":
@@ -601,17 +609,21 @@ def compute_flow_momentum(engine: Engine, ticker: str, days: int = 30) -> dict[s
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT amount_usd, direction, flow_date "
+                    "SELECT amount_usd, direction, flow_date, source_type, confidence, "
+                    "CASE WHEN source_type = '13f' THEN evidence ELSE NULL END "
                     "FROM dollar_flows "
                     "WHERE UPPER(ticker) = :ticker "
                     "AND flow_date >= :cutoff "
                     "AND flow_date <= CURRENT_DATE "
-                    "AND NOT (source_type = '13f' AND COALESCE(confidence, '') != 'derived') "
                     "AND direction != 'quarantined' "
                     "ORDER BY flow_date DESC"
                 ),
                 {"ticker": ticker.upper(), "cutoff": cutoff},
             ).fetchall()
+        rows = [
+            r for r in rows
+            if r[3] != "13f" or is_qualified_13f_dollar_flow_row(r[4], r[5])
+        ]
     except Exception as exc:
         log.warning("Flow momentum query failed: {e}", e=str(exc))
         return {

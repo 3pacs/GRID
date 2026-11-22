@@ -1200,6 +1200,15 @@ def _qualify_and_estimate_13f_flow(
         if (action == "INCREASED" and delta_shares < 0) or (action == "DECREASED" and delta_shares > 0):
             return None, "quarantine:action_share_direction_mismatch"
 
+        # A split or reverse split changes shares with no trade; without both
+        # quarter-end values the transition cannot be shown free of one.
+        if prev_val is None or curr_val is None:
+            return None, "quarantine:unverifiable_corporate_action"
+        from ingestion.altdata.institutional_flows import implied_price_suggests_corporate_action
+
+        if implied_price_suggests_corporate_action(prev_val, prev_shares, curr_val, curr_shares):
+            return None, "quarantine:possible_split_or_corporate_action"
+
         if curr_val is not None:
             price = curr_val / curr_shares
             if stated_price is not None and abs(price - stated_price) / price > 0.01:
@@ -1304,6 +1313,16 @@ def _qualify_and_estimate_13f_flow(
         }, None
 
     return None, "quarantine:unknown_action"
+
+
+def is_qualified_13f_dollar_flow_row(confidence: str | None, raw_evidence: Any) -> bool:
+    """Public qualification test for every served reader of 13F ``dollar_flows`` rows.
+
+    A 13F row is an *estimated holdings-position change at reference prices*
+    (share delta x quarter-end implied price), never observed cash or
+    transaction flow, and counts only with documented share-based evidence.
+    """
+    return _is_qualified_13f_dollar_flow_row(confidence, raw_evidence)
 
 
 def _is_qualified_13f_dollar_flow_row(confidence: str | None, raw_evidence: Any) -> bool:

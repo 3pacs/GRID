@@ -280,8 +280,8 @@ def test_13f_share_based_estimate_separates_share_delta_from_price_move():
         institutional_flows.InstitutionalFlowsPuller
     )
     prev = {
-        # Bought +150k shares (+30%), price jumped $200 -> $300:
-        # Marked value delta = +$95M, share-based flow = 150k * $300 = $45M.
+        # Bought +150k shares (+30%), price rose $200 -> $240:
+        # Marked value delta = +$56M, share-based flow = 150k * $240 = $36M.
         "037833100": {
             "name": "APPLE INC",
             "value_usd": 100_000_000,
@@ -289,8 +289,8 @@ def test_13f_share_based_estimate_separates_share_delta_from_price_move():
             "share_type": "SH",
             "value_units": "usd",
         },
-        # Sold -200k shares (-40%), price doubled $200 -> $400:
-        # Marked value ROSE $100M -> $120M, but share-based flow is $80M OUTFLOW.
+        # Sold -200k shares (-40%), price rose $200 -> $240:
+        # Marked value fell only $28M ($100M -> $72M); share-based flow is $48M OUTFLOW.
         "594918104": {
             "name": "MICROSOFT CORP",
             "value_usd": 100_000_000,
@@ -302,14 +302,14 @@ def test_13f_share_based_estimate_separates_share_delta_from_price_move():
     curr = {
         "037833100": {
             "name": "APPLE INC",
-            "value_usd": 195_000_000,
+            "value_usd": 156_000_000,
             "shares": "650000",
             "share_type": "SH",
             "value_units": "usd",
         },
         "594918104": {
             "name": "MICROSOFT CORP",
-            "value_usd": 120_000_000,
+            "value_usd": 72_000_000,
             "shares": "300000",
             "share_type": "SH",
             "value_units": "usd",
@@ -324,20 +324,20 @@ def test_13f_share_based_estimate_separates_share_delta_from_price_move():
     aapl = by_cusip["037833100"]
     assert aapl["action"] == "INCREASED"
     assert aapl["delta_shares"] == 150_000
-    assert aapl["valuation_price_usd"] == pytest.approx(300.0)
+    assert aapl["valuation_price_usd"] == pytest.approx(240.0)
     assert aapl["valuation_price_basis"] == "curr_quarter_end_implied"
     assert aapl["flow_estimation_method"] == "delta_shares_x_curr_quarter_end_price"
-    assert aapl["value_usd"] == pytest.approx(45_000_000.0)
-    assert aapl["estimated_flow_usd"] == pytest.approx(45_000_000.0)
-    assert aapl["holdings_value_delta_usd"] == pytest.approx(95_000_000.0)
+    assert aapl["value_usd"] == pytest.approx(36_000_000.0)
+    assert aapl["estimated_flow_usd"] == pytest.approx(36_000_000.0)
+    assert aapl["holdings_value_delta_usd"] == pytest.approx(56_000_000.0)
     assert aapl["qualified_for_directional_flow"] is True
 
     msft = by_cusip["594918104"]
     assert msft["action"] == "DECREASED"
     assert msft["delta_shares"] == -200_000
-    assert msft["valuation_price_usd"] == pytest.approx(400.0)
-    assert msft["value_usd"] == pytest.approx(80_000_000.0)
-    assert msft["holdings_value_delta_usd"] == pytest.approx(20_000_000.0)
+    assert msft["valuation_price_usd"] == pytest.approx(240.0)
+    assert msft["value_usd"] == pytest.approx(48_000_000.0)
+    assert msft["holdings_value_delta_usd"] == pytest.approx(-28_000_000.0)
 
 
 def test_dollar_flows_13f_unchanged_shares_with_price_change_emits_zero_flow():
@@ -479,7 +479,7 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
             prev_shares=500_000,
             curr_shares=600_000,
             prev_value_usd=100_000_000.0,
-            curr_value_usd=180_000_000.0,  # $300/sh -> 100k * $300 = $30M
+            curr_value_usd=144_000_000.0,  # $200 -> $240/sh -> 100k * $240 = $24M
             filing_date=filing_day.isoformat(),
         ),
     )
@@ -494,7 +494,7 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
     assert len(summary) == 1
     assert summary[0]["ticker"] == "AAPL"
     assert summary[0]["direction"] == "inflow"
-    assert summary[0]["amount_usd"] == pytest.approx(30_000_000.0)
+    assert summary[0]["amount_usd"] == pytest.approx(24_000_000.0)
     assert summary[0]["confidence"] == "derived"
     assert summary.quarantined_13f == 6
     assert sum(summary.quarantined_13f_reasons.values()) == 6
@@ -895,3 +895,127 @@ def test_vol_term_structure_scores_matched_dates_with_spot_slope_wording(monkeyp
     src = pathlib.Path("intelligence/sentiment_scorer.py").read_text()
     assert "contango" not in src.lower()
     assert "backwardation" not in src.lower()
+
+
+# ── Codex HOLD on #1369 head 4b66f327 ──────────────────────────────────────
+# (1) a same-CUSIP split must not read as a trade; (2) every served reader of
+# 13F dollar_flows rows qualifies them, honours the as-of cutoff and keeps no
+# qualified coverage unknown.
+
+
+def _holding(value_usd: float, shares: int) -> dict:
+    return {"name": "SPLITCO", "value_usd": value_usd, "shares": str(shares),
+            "share_type": "SH", "value_units": "usd"}
+
+
+@pytest.mark.parametrize("prev,curr", [
+    ((10_000, 100), (10_000, 200)),     # 2-for-1 split, no trade: 100 x $100 -> 200 x $50
+    ((5_000, 1_000), (5_000, 100)),     # 1-for-10 reverse split: 1000 x $5 -> 100 x $50
+    ((10_000, 100), (12_500, 250)),     # split plus a buy, no adjustment available
+    ((10_000, 100), (5_000, 100)),      # split plus a sale leaving the share count flat
+], ids=["split_2_for_1", "reverse_1_for_10", "split_plus_buy", "split_flat_shares"])
+def test_13f_split_like_transition_is_quarantined_not_read_as_a_trade(prev, curr):
+    puller = institutional_flows.InstitutionalFlowsPuller.__new__(institutional_flows.InstitutionalFlowsPuller)
+    counts: dict[str, int] = {}
+    changes = puller._compare_holdings({"C1": _holding(*prev)}, {"C1": _holding(*curr)}, quarantine_counts=counts)
+    assert changes == []
+    assert counts == {"possible_split_or_corporate_action": 1}
+
+
+def test_13f_real_trade_at_a_normal_price_move_still_reads():
+    puller = institutional_flows.InstitutionalFlowsPuller.__new__(institutional_flows.InstitutionalFlowsPuller)
+    changes = puller._compare_holdings({"C1": _holding(10_000, 100)}, {"C1": _holding(16_500, 150)})
+    assert [(c["action"], c["delta_shares"], c["estimated_flow_usd"]) for c in changes] == [("INCREASED", 50, 5_500.0)]
+    assert institutional_flows.implied_price_suggests_corporate_action(10_000, 100, 12_400, 100) is False
+    for bad in ((0, 100, 1, 1), (1, 0, 1, 1), (float("nan"), 1, 1, 1), ("x", 1, 1, 1)):
+        assert institutional_flows.implied_price_suggests_corporate_action(*bad) is True
+
+
+@pytest.mark.parametrize("prev_value,curr_value,reason", [
+    (10_000.0, 10_000.0, "quarantine:possible_split_or_corporate_action"),
+    (None, 10_000.0, "quarantine:unverifiable_corporate_action"),
+], ids=["split_shaped", "missing_prev_value"])
+def test_dollar_flows_estimate_refuses_split_shaped_and_unverifiable_rows(prev_value, curr_value, reason):
+    payload = _qualified_13f_payload(
+        ticker="SPLT", cusip="999999999", prev_shares=100, curr_shares=200,
+        prev_value_usd=prev_value, curr_value_usd=curr_value, filing_date=YESTERDAY.isoformat(),
+    )
+    meta = dollar_flows._extract_13f_vintage_meta(payload, YESTERDAY)
+    estimate, why = dollar_flows._qualify_and_estimate_13f_flow("INCREASED", 5_000.0, payload, YESTERDAY, meta)
+    assert estimate is None and why == reason
+
+
+_QUALIFIED_EV = {
+    "value_units": "usd", "delta_shares": 1_000, "qualified_for_directional_flow": True,
+    "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+}
+
+
+def _insert_flow_at(engine, amount, direction, *, confidence, evidence, created_at, flow_date=YESTERDAY):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO dollar_flows (source_type, actor_name, ticker, amount_usd, direction, "
+                "confidence, evidence, flow_date, created_at) "
+                "VALUES ('13f', 'F', 'AAPL', :amt, :dir, :conf, :ev, :fd, :ca)"
+            ),
+            {"amt": amount, "dir": direction, "conf": confidence,
+             "ev": json.dumps(evidence) if evidence is not None else None, "fd": flow_date, "ca": created_at},
+        )
+
+
+def test_institutional_layer_counts_only_qualified_13f_rows_known_by_as_of():
+    from analysis.money_flow_engine import layer_institutional
+
+    engine = _make_engine()
+    known = datetime.combine(YESTERDAY, datetime.min.time(), timezone.utc) + timedelta(hours=12)
+    later = known + timedelta(days=3)
+    _insert_flow_at(engine, 10_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
+    _insert_flow_at(engine, 4_000_000.0, "outflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
+    # legacy rows: 'derived' without qualification evidence, and 'confirmed'
+    _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"}, created_at=known)
+    _insert_flow_at(engine, 800_000_000.0, "inflow", confidence="confirmed", evidence=_QUALIFIED_EV, created_at=known)
+    # qualified, but written after the as-of date
+    _insert_flow_at(engine, 50_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=later)
+
+    node = layer_institutional._build_13f_aggregate(engine, YESTERDAY)
+    assert node.value == pytest.approx(6_000_000.0)
+    assert node.metadata["qualified"] == 2 and node.metadata["unqualified"] == 2
+    assert node.metadata["measure"] == "estimated_holdings_position_change_at_reference_prices"
+    assert node.metadata["not_observed_cash_flow"] is True
+    assert "Estimated Holdings-Position Change" in node.label and "Net Flows" not in node.label
+
+    later_node = layer_institutional._build_13f_aggregate(engine, (later + timedelta(days=1)).date())
+    assert later_node.value == pytest.approx(56_000_000.0)
+
+
+def test_institutional_layer_without_qualified_rows_is_unknown_not_zero():
+    from analysis.money_flow_engine import layer_institutional
+
+    engine = _make_engine()
+    known = datetime.combine(YESTERDAY, datetime.min.time(), timezone.utc)
+    _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"}, created_at=known)
+    node = layer_institutional._build_13f_aggregate(engine, YESTERDAY)
+    assert node.value is None
+    assert node.metadata["coverage"] == "no_qualified_13f_rows"
+    empty = layer_institutional._build_13f_aggregate(_make_engine(), YESTERDAY)
+    assert empty.value is None and empty.metadata["rows_read"] == 0
+
+
+def test_sentiment_and_momentum_readers_drop_derived_rows_without_evidence():
+    """flow_aggregator (both readers) and sentiment_scorer used to keep any
+    13F row tagged 'derived'; a legacy row without share-based evidence is
+    now dropped from each, and the qualified row is kept."""
+    engine = _make_engine()
+    _insert_flow(engine, "13f", "Q", "AAPL", 10_000_000.0, "inflow", YESTERDAY, confidence="derived", evidence=_QUALIFIED_EV)
+    _insert_flow(engine, "13f", "L", "AAPL", 900_000_000.0, "outflow", YESTERDAY, confidence="derived", evidence={"cusip": "x"})
+
+    momentum = flow_aggregator.compute_flow_momentum(engine, "AAPL")
+    assert momentum["flow_count"] == 1
+
+    flows = flow_aggregator._fetch_flows(engine, 30)
+    assert [f["amount_usd"] for f in flows if f["source_type"] == "13f"] == [10_000_000.0]
+
+    component = sentiment_scorer._score_flows(engine, days=7)
+    assert component.raw_value == pytest.approx(1.0)  # only the qualified inflow counts
+    assert "$0.0B out" in component.detail
