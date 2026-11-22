@@ -25,8 +25,16 @@ def rank_ic(
 
     RankIC = Spearman correlation between signal ranks and forward returns
     across all tickers, computed per date.
+
+    Contract: ``forward_returns`` must already be aligned to the decision row
+    (i.e. ``forward_returns.loc[t]`` is the forward return realized after the
+    signal at date ``t`` is known, such as ``prices.pct_change(h).shift(-h)``).
+    At default ``horizon=1`` no extra shift is applied; ``horizon > 1`` shifts
+    by ``-(horizon - 1)`` to measure decay at further lead steps.
     """
-    fwd = forward_returns.shift(-horizon)
+    if int(horizon) != horizon or horizon < 1:
+        raise ValueError("horizon must be a positive integer")
+    fwd = forward_returns if horizon == 1 else forward_returns.shift(-(horizon - 1))
 
     common_dates = signal.index.intersection(fwd.dropna(how="all").index)
     ics = []
@@ -67,8 +75,13 @@ def long_short_returns(
 
     Top N tickers by signal → long. Bottom N → short.
     Average long return minus average short return, net of costs.
+
+    Contract: ``forward_returns`` must already be aligned to the decision row
+    (i.e. ``forward_returns.loc[t]`` is the forward return realized after the
+    signal at date ``t`` is known, such as ``prices.pct_change(h).shift(-h)``).
+    This function does NOT shift ``forward_returns``.
     """
-    fwd = forward_returns.shift(-1)
+    fwd = forward_returns
     common_dates = signal.index.intersection(fwd.dropna(how="all").index)
 
     ls_returns = []

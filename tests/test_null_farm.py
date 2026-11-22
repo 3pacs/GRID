@@ -66,16 +66,43 @@ def test_s09_world_builds_exactly_n_discovery_rows(params):
 
 
 def test_panel_world_plants_the_specified_ic_and_nothing_under_the_null():
-    def mean_ic(effect):
-        cell = nf.make_cell("gauntlet_perm", "persistent_feature", 400, reps=1, effect=effect)
+    def mean_ic(effect, world="persistent_feature"):
+        cell = nf.make_cell("gauntlet_perm", world, 400, reps=1, effect=effect)
         signal, fwd, depth = nf.panel_world(cell, np.random.default_rng(3))
-        s, f = signal.to_numpy()[:-1], fwd.to_numpy()[1:]
+        s, f = signal.to_numpy(), fwd.to_numpy()
         ics = [np.corrcoef(a, b)[0, 1] for a, b in zip(s, f)]
         assert depth == 0
         return float(np.mean(ics))
 
     assert abs(mean_ic(0.0)) < 0.03
     assert mean_ic(0.3) > 0.2
+    assert abs(mean_ic(0.0, world="iid")) < 0.03
+    assert mean_ic(0.3, world="iid") > 0.2
+
+
+def test_panel_world_plants_effect_at_intended_row_not_t_plus_1():
+    """With long_short_returns pairing signal[t] with fwd[t], an iid planted
+    effect must show up on row t (and be detected by the gauntlet), not on t+1,
+    while null-size cells (effect=0) remain unchanged."""
+    cell = nf.make_cell("gauntlet_perm", "iid", 250, reps=1, effect=0.3, perms=49)
+    signal, fwd, _ = nf.panel_world(cell, np.random.default_rng(11))
+    s, f = signal.to_numpy(), fwd.to_numpy()
+
+    same_row_ic = float(np.mean([np.corrcoef(a, b)[0, 1] for a, b in zip(s, f)]))
+    shifted_ic = float(np.mean([np.corrcoef(a, b)[0, 1] for a, b in zip(s[:-1], f[1:])]))
+    assert same_row_ic > 0.2
+    assert abs(shifted_ic) < 0.05
+
+    rec = nf.replicate(cell, rep=0, base_seed=11)
+    assert rec["observed_sharpe"] > 1.5
+    assert rec["reject"] is True
+
+    # Null cell (effect=0) leaves signal and fwd independent of any planting step.
+    null_cell = nf.make_cell("gauntlet_perm", "iid", 250, reps=1, effect=0.0)
+    sig_null, fwd_null, _ = nf.panel_world(null_cell, np.random.default_rng(11))
+    np.testing.assert_array_equal(sig_null.to_numpy(), s)
+    null_ic = float(np.mean([np.corrcoef(a, b)[0, 1] for a, b in zip(sig_null.to_numpy(), fwd_null.to_numpy())]))
+    assert abs(null_ic) < 0.05
 
 
 def test_overlap_depth_follows_the_declaration():

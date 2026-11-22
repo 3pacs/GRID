@@ -77,15 +77,33 @@ def train_ensemble(
     lgb_params: dict[str, Any] | None = None,
     n_rounds: int = 200,
     early_stopping: int = 20,
+    label_horizon: int = 5,
+    embargo_days: int | None = None,
+    inner_val_frac: float = 0.2,
 ) -> EnsembleResult:
     """
     Train LightGBM ensemble on stacked factor signals.
 
-    Uses expanding-window split: first train_frac for training, rest for validation.
-    Returns predictions on the full dataset (in-sample + OOS).
+    Uses an expanding-window split with an embargo gap of ``embargo_days``
+    (defaulting to ``label_horizon`` and required to be ``>= label_horizon``)
+    between training and validation so overlapping forward labels never span
+    the split boundary. Early stopping monitors an inner holdout carved from
+    the END of the training window (separated from the inner fit set by the
+    same embargo), never the outer validation set.
     """
     if not _HAS_LGB:
         raise ImportError("lightgbm not installed. Run: pip install lightgbm")
+    if int(label_horizon) != label_horizon or label_horizon < 1:
+        raise ValueError(f"label_horizon must be a positive integer, got {label_horizon}")
+    embargo = int(label_horizon) if embargo_days is None else int(embargo_days)
+    if embargo < label_horizon:
+        raise ValueError(
+            f"embargo_days ({embargo}) must be >= label_horizon ({label_horizon})"
+        )
+    if not 0.0 < train_frac < 1.0:
+        raise ValueError(f"train_frac must be in (0, 1), got {train_frac}")
+    if not 0.0 < inner_val_frac < 1.0:
+        raise ValueError(f"inner_val_frac must be in (0, 1), got {inner_val_frac}")
 
     features, target = _build_feature_matrix(signal_panels, forward_returns)
     if len(features) < 100:
@@ -94,32 +112,56 @@ def train_ensemble(
     params = {**_DEFAULT_LGB_PARAMS, **(lgb_params or {})}
     feature_names = list(features.columns)
 
-    # Expanding window split by date
+    # Expanding-window split by date with outer embargo >= label_horizon.
+    # Outer train: dates[:split_idx]; dropped embargo: dates[split_idx : split_idx + embargo];
+    # outer validation: dates[split_idx + embargo :].
     dates = features.index.get_level_values(0).unique().sort_values()
     split_idx = int(len(dates) * train_frac)
     train_dates = dates[:split_idx]
-    val_dates = dates[split_idx:]
+    val_dates = dates[split_idx + embargo :]
 
-    train_mask = features.index.get_level_values(0).isin(train_dates)
-    val_mask = features.index.get_level_values(0).isin(val_dates)
+    # Carve inner early-stopping holdout from the END of train_dates with the
+    # same embargo gap between fit_dates and es_dates.
+    n_train_dates = len(train_dates)
+    es_len = max(1, int(n_train_dates * inner_val_frac))
+    es_start_idx = n_train_dates - es_len
+    fit_end_idx = es_start_idx - embargo
+    if fit_end_idx <= 0 or es_len <= 0 or len(val_dates) == 0:
+        raise ValueError(
+            f"Insufficient dates ({len(dates)}) for train/inner-holdout/val split "
+            f"with embargo={embargo} and train_frac={train_frac}"
+        )
 
-    X_train, y_train = features[train_mask], target[train_mask]
-    X_val, y_val = features[val_mask], target[val_mask]
+    fit_dates = train_dates[:fit_end_idx]
+    es_dates = train_dates[es_start_idx:]
+
+    date_level = features.index.get_level_values(0)
+    fit_mask = date_level.isin(fit_dates)
+    es_mask = date_level.isin(es_dates)
+    val_mask = date_level.isin(val_dates)
+
+    X_fit, y_fit = features[fit_mask], target[fit_mask]
+    X_es, y_es = features[es_mask], target[es_mask]
+    X_val = features[val_mask]
+    if X_fit.empty or X_es.empty or X_val.empty:
+        raise ValueError("Empty split after applying embargo between train, early-stop, and val")
 
     log.info(
-        "Training LightGBM ensemble: {nf} features, {nt} train / {nv} val samples",
-        nf=len(feature_names), nt=len(X_train), nv=len(X_val),
+        "Training LightGBM ensemble: {nf} features, {nt} fit / {ne} early-stop / "
+        "{nv} val samples (embargo={eb} dates)",
+        nf=len(feature_names), nt=len(X_fit), ne=len(X_es), nv=len(X_val), eb=embargo,
     )
 
-    dtrain = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
-    dval = lgb.Dataset(X_val, label=y_val, reference=dtrain, feature_name=feature_names)
+    dfit = lgb.Dataset(X_fit, label=y_fit, feature_name=feature_names)
+    des = lgb.Dataset(X_es, label=y_es, reference=dfit, feature_name=feature_names)
 
     callbacks = [lgb.early_stopping(early_stopping), lgb.log_evaluation(50)]
     model = lgb.train(
-        params, dtrain,
+        params,
+        dfit,
         num_boost_round=n_rounds,
-        valid_sets=[dtrain, dval],
-        valid_names=["train", "val"],
+        valid_sets=[dfit, des],
+        valid_names=["train", "early_stop"],
         callbacks=callbacks,
     )
 
@@ -136,10 +178,10 @@ def train_ensemble(
     pred_panel = pred_series.unstack()
     ranked = pred_panel.rank(axis=1, pct=True)
 
-    # Compute train/val Sharpe from long-short
+    # Compute train/val Sharpe from long-short (val_dates untouched during training/ES)
     from alpha_research.validation.metrics import long_short_returns, sharpe_ratio
 
-    train_pred = ranked.loc[ranked.index.isin(train_dates)]
+    train_pred = ranked.loc[ranked.index.isin(fit_dates)]
     val_pred = ranked.loc[ranked.index.isin(val_dates)]
     train_fwd = forward_returns.unstack() if isinstance(forward_returns, pd.Series) else forward_returns
     train_fwd_aligned = train_fwd.reindex(index=ranked.index, columns=ranked.columns)
@@ -159,5 +201,5 @@ def train_ensemble(
         train_sharpe=train_sr,
         val_sharpe=val_sr,
         n_features=len(feature_names),
-        n_train_samples=len(X_train),
+        n_train_samples=len(X_fit),
     )

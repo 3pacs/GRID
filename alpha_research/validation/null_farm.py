@@ -215,11 +215,13 @@ def panel_world(
 ) -> tuple[pd.DataFrame, pd.DataFrame, int]:
     """(signal, forward_returns, overlap_depth) on ``n`` dates for the gauntlet.
 
-    The gauntlet pairs ``signal[t]`` with ``forward_returns[t + 1]``. With
-    ``horizon`` h > 1, ``forward_returns[t]`` is the overlapping h-day sum of
-    daily returns ``t .. t + h - 1``; ``overlap_depth`` is ``h - 1`` when the
-    cell declares it (``declare_overlap``), else 0. ``effect`` plants a
-    cross-sectional IC: ``daily[t + 1] = effect * z(signal[t]) + sqrt(1 - effect^2) * noise``.
+    The gauntlet pairs ``signal[t]`` with ``forward_returns[t]`` (already
+    aligned to decision row ``t``). With ``horizon`` h > 1,
+    ``forward_returns[t]`` is the overlapping h-day sum of daily forward
+    returns ``t .. t + h - 1``; ``overlap_depth`` is ``h - 1`` when the cell
+    declares it (``declare_overlap``), else 0. ``effect`` plants a
+    cross-sectional IC on the intended row:
+    ``daily[t] = effect * z(signal[t]) + sqrt(1 - effect^2) * noise[t]``.
     """
     params = cell.get("params", {})
     n, n_assets = cell["n"], int(params.get("n_assets", 20))
@@ -233,7 +235,7 @@ def panel_world(
     daily = noise.copy()
     if effect:
         z = _zscore_rows(feature)
-        daily[1:] = effect * z[:-1] + math.sqrt(1 - effect**2) * noise[1:]
+        daily = effect * z + math.sqrt(1 - effect**2) * noise
     daily *= DAILY_SCALE
     if horizon > 1:
         csum = np.vstack([np.zeros((1, n_assets)), np.cumsum(daily, axis=0)])

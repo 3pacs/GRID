@@ -2,26 +2,30 @@
 False Discovery Gauntlet — 5 statistical tests to prevent self-deception.
 
 From QuantaAlpha v2 research:
-  - ROBUST: CV >= 75%, permutation p < 0.05, subsample > 50%, val net Sharpe > 0.3
-  - MARGINAL: CV >= 50%, permutation p < 0.10
+  - ROBUST: CV >= 75%, permutation p < 0.05, subsample > 50%, val net Sharpe > 0.3,
+    AND deflated_sharpe_passed is True
+  - MARGINAL: CV >= 50%, permutation p < 0.10 (or ROBUST downgraded when DSR fails
+    or cannot be computed)
   - UNSTABLE: everything else
 
 Key finding: 0/7 runs achieved ROBUST in 2024 OOS. CV consistency is the real blocker.
 
-S6 (2026-11-06) corrections:
+S6 / S7 calibrations (``docs/research/null-calibration-farm-v1.md``):
 
 * Deflated Sharpe ratio follows Bailey & López de Prado (2014): per-period
   Sharpe, skewness/kurtosis-adjusted PSR, and a threshold ``SR0`` built from
   the *cross-trial* variance of the trials' Sharpe ratios and the caller's
-  trial count. The old code compared an annualized Sharpe against a threshold
-  built from per-period standard errors (about sqrt(252) ~ 16x too lenient).
-* The permutation null reorders contiguous *blocks* of signal dates
-  (:func:`analysis.offline_research_proof.block_permutations`), so the
-  signal's serial correlation survives in the null. The block is declared or
-  sized from the lag-1 autocorrelation of the real long-short returns
-  (:func:`analysis.offline_research_proof.autocorrelation_block`), never
-  below overlap depth + 1. The old per-date shuffle was anti-conservative
-  (30% rejections at nominal 5% on a persistent null panel).
+  trial count. ROBUST requires ``deflated_sharpe_passed`` to be True; when DSR
+  is unavailable (multi-trial with no ``trial_sharpes``), the verdict caps at
+  MARGINAL and records why in ``details``.
+* Recommendation 1 (null-calibration-farm-v1): the permutation null runs on
+  gross returns (``cost_bps=0``) so null draws do not pay artificially inflated
+  turnover cost relative to a persistent real signal. Transaction costs remain
+  in the net-Sharpe threshold, CV consistency, and DSR.
+* Recommendation 2 (null-calibration-farm-v1): the data-driven permutation block
+  length takes ``max(returns acf1 block, ceil(signal rank half-life))`` from the
+  mean lag-1 cross-sectional rank autocorrelation of ``signal``, keeping the
+  overlap floor (``overlap_depth + 1``) and ``MIN_BLOCKS`` cap.
 * p-values are ``(1 + #null >= observed) / (perms + 1)`` (never 0), the
   default permutation count is derived from the smallest threshold the
   verdict uses (:func:`analysis.ledger_steered_exploration.perms_for_threshold`),
@@ -50,7 +54,12 @@ from analysis.ledger_steered_exploration import (
     min_attainable_p,
     perms_for_threshold,
 )
-from analysis.offline_research_proof import autocorrelation_block, block_permutations
+from analysis.offline_research_proof import (
+    MIN_BLOCKS,
+    autocorrelation_block,
+    block_permutations,
+    lag1_autocorrelation,
+)
 
 EULER_GAMMA = 0.5772156649015329
 # The smallest p threshold the verdict uses (ROBUST needs permutation p < 0.05).
@@ -107,17 +116,44 @@ class DeflatedSharpe:
     confidence: float
 
 
+def _signal_rank_persistence(signal: pd.DataFrame) -> tuple[float | None, float | None]:
+    """Mean lag-1 cross-sectional rank autocorrelation across assets and its half-life.
+
+    Per Recommendation 2 of ``docs/research/null-calibration-farm-v1.md``, sizing
+    the block from the signal's own persistence prevents persistent null signals
+    against white returns from collapsing to block length 1.
+    """
+    if signal.empty or len(signal) < 3 or signal.shape[1] == 0:
+        return None, None
+    ranks = signal.rank(axis=1, pct=True)
+    acfs: list[float] = []
+    for col in ranks.columns:
+        vals = ranks[col].dropna().to_numpy(dtype=float)
+        phi = lag1_autocorrelation(vals)
+        if phi is not None and math.isfinite(phi):
+            acfs.append(float(phi))
+    if not acfs:
+        return None, None
+    mean_phi = float(np.mean(acfs))
+    if mean_phi <= 0.0:
+        return mean_phi, None
+    clamped = min(mean_phi, 0.99)
+    half_life = -math.log(2.0) / math.log(clamped)
+    return mean_phi, half_life
+
+
 def permutation_block_length(
     ls_returns: pd.Series | np.ndarray,
     block: int = 0,
     overlap_depth: int = 0,
+    signal: pd.DataFrame | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Permutation block (in dates) for the gauntlet's null.
 
     A declared ``block`` is used as is, but never below ``overlap_depth + 1``
-    (refused). ``block=0`` sizes it from the lag-1 autocorrelation of the real
-    long-short returns with :func:`autocorrelation_block` (floor
-    ``overlap_depth + 1``, at least ``MIN_BLOCKS`` blocks).
+    (refused). ``block=0`` takes ``max(returns acf1 block, ceil(signal rank
+    half-life))`` (Recommendation 2 of ``docs/research/null-calibration-farm-v1.md``),
+    keeping the overlap floor ``overlap_depth + 1`` and the ``MIN_BLOCKS`` cap.
     """
     if overlap_depth < 0 or block < 0:
         raise ValueError("block and overlap_depth must be >= 0")
@@ -128,7 +164,39 @@ def permutation_block_length(
                 f"permutation block {block} is shorter than overlap depth + 1 = {floor}"
             )
         return int(block), {"rule": "declared", "overlap_floor": floor}
-    size, basis = autocorrelation_block(np.asarray(ls_returns, dtype=float), overlap_depth)
+    ret_size, basis = autocorrelation_block(np.asarray(ls_returns, dtype=float), overlap_depth)
+    size = int(ret_size)
+    basis = dict(basis)
+    basis["returns_block"] = int(ret_size)
+
+    if signal is not None and len(signal) >= 3:
+        n_dates = len(signal)
+        sig_phi, sig_hl = _signal_rank_persistence(signal)
+        sig_band = 2.0 / math.sqrt(n_dates)
+        sig_cap = max(1, n_dates // MIN_BLOCKS)
+        sig_block = floor
+        if sig_phi is not None and sig_phi > sig_band and sig_hl is not None:
+            # Cover two rank half-lives (decay to <= 25% correlation across block
+            # boundaries, compensating for finite-sample rank-acf downward bias so
+            # AR(1) phi=0.95 lands in the doc's calibrated ~14-20 block range).
+            sig_wanted = math.ceil(2.0 * sig_hl)
+            sig_block = max(floor, min(sig_wanted, sig_cap))
+        else:
+            sig_wanted = floor
+        basis["signal_rank_acf1"] = sig_phi
+        basis["signal_rank_half_life"] = sig_hl
+        basis["signal_block"] = int(sig_block)
+        if sig_block > size:
+            size = int(sig_block)
+            basis["rule"] = (
+                f"max(returns_block={ret_size}, ceil(2*signal_rank_half_life)={sig_wanted} "
+                f"capped at n//{MIN_BLOCKS}={sig_cap}, floor {floor})"
+            )
+            if sig_block < sig_wanted:
+                basis["caveat"] = (
+                    f"signal persistence block capped at {sig_block} < {sig_wanted} "
+                    f"(n={n_dates}, >= {MIN_BLOCKS} blocks)"
+                )
     return int(size), basis
 
 
@@ -146,24 +214,37 @@ def permutation_test(
     perms_cap: int = PERMS_CAP,
 ) -> PermutationResult:
     """
-    Block-permute the signal's dates, recompute Sharpe. If the real model's
-    Sharpe is not in the extreme upper tail of that null, the signal is noise.
+    Block-permute the signal's dates, recompute gross Sharpe. If the real
+    signal's gross Sharpe is not in the extreme upper tail of that null, the
+    signal is noise.
+
+    Per Recommendation 1 of ``docs/research/null-calibration-farm-v1.md``,
+    both the observed statistic and every null draw inside the permutation test
+    run on gross returns (``cost_bps=0.0``) so the null does not suffer
+    artificially inflated turnover drag when a persistent signal is shuffled.
+    Transaction costs remain enforced in ``run_gauntlet``'s net Sharpe, CV
+    consistency, and DSR. ``cost_bps`` is retained in the signature for API
+    compatibility.
 
     Contiguous blocks of dates keep their internal order (the signal's serial
-    correlation is kept); see :func:`permutation_block_length` for the block.
+    correlation is kept); see :func:`permutation_block_length` for the block
+    sizing (Recommendation 2: signal rank persistence + returns autocorrelation).
     ``n_shuffles=None`` derives the count so the minimum attainable p is at
     least ``PERMS_MARGIN`` x below ``alpha`` (floor 999); it raises
     ``PermutationBudgetError`` if ``perms_cap`` cannot reach that.
 
     Returns a :class:`PermutationResult` (one-sided upper-tail p).
     """
+    del cost_bps  # Permutation null runs on gross returns (null-calibration-farm-v1 rec 1)
     if n_shuffles is None:
         n_shuffles = perms_for_threshold(alpha, floor=PERMUTATION_FLOOR, cap=perms_cap)
     if n_shuffles < 1:
         raise ValueError("n_shuffles must be >= 1")
-    real_ls = long_short_returns(signal, forward_returns, top_n, cost_bps)
+    real_ls = long_short_returns(signal, forward_returns, top_n, 0.0)
     observed = sharpe_ratio(real_ls)
-    size, basis = permutation_block_length(real_ls.dropna(), block, overlap_depth)
+    size, basis = permutation_block_length(
+        real_ls.dropna(), block, overlap_depth, signal=signal
+    )
 
     dates = signal.index
     null_sharpes = np.empty(n_shuffles)
@@ -171,7 +252,7 @@ def permutation_test(
         shuffled_signal = signal.iloc[order]
         shuffled_signal.index = dates
         shuffled_ls = long_short_returns(
-            shuffled_signal, forward_returns, top_n, cost_bps
+            shuffled_signal, forward_returns, top_n, 0.0
         )
         null_sharpes[i] = sharpe_ratio(shuffled_ls)
 
@@ -464,17 +545,37 @@ def run_gauntlet(
 
     # Compute net Sharpe for threshold check
     net_sharpe = sharpe_ratio(ls_ret)
+    dsr_passed = bool(dsr is not None and dsr.passed)
 
-    # Verdict
-    if (cv_con >= 0.75 and perm_p < 0.05 and sub_stab > 0.50 and net_sharpe > 0.3):
+    # Verdict: ROBUST requires deflated_sharpe_passed is True; if DSR fails or
+    # cannot be computed (e.g. multi-trial without trial_sharpes), cap at the
+    # next-lower verdict (MARGINAL) and record why.
+    base_robust_ok = (
+        cv_con >= 0.75 and perm_p < 0.05 and sub_stab > 0.50 and net_sharpe > 0.3
+    )
+    verdict_downgrade_reason: str | None = None
+    if base_robust_ok and dsr_passed:
         verdict = "ROBUST"
     elif cv_con >= 0.50 and perm_p < 0.10:
         verdict = "MARGINAL"
+        if base_robust_ok and not dsr_passed:
+            if dsr is None:
+                verdict_downgrade_reason = (
+                    f"Downgraded from ROBUST to MARGINAL: deflated Sharpe ratio "
+                    f"unavailable ({dsr_note})"
+                )
+            else:
+                verdict_downgrade_reason = (
+                    f"Downgraded from ROBUST to MARGINAL: deflated Sharpe ratio "
+                    f"failed (dsr={dsr.dsr:.4f} <= {dsr.confidence:.2f}, "
+                    f"sr0_per_period={dsr.sr0:.4f})"
+                )
     else:
         verdict = "UNSTABLE"
 
     details: dict[str, Any] = {
         "net_sharpe": net_sharpe,
+        "permutation_gross_sharpe": observed_sr,
         "decay_ics": decay_ics,
         "n_days": len(ls_ret),
         "passes_net_sharpe_threshold": net_sharpe > 1.4,
@@ -495,13 +596,15 @@ def run_gauntlet(
         }
     else:
         details["deflated_sharpe_unavailable"] = dsr_note
+    if verdict_downgrade_reason is not None:
+        details["verdict_downgrade_reason"] = verdict_downgrade_reason
 
     return GauntletResult(
         verdict=verdict,
         permutation_p=perm_p,
         permutation_passed=perm_p < 0.05,
-        deflated_sharpe_passed=bool(dsr is not None and dsr.passed),
-        observed_sharpe=observed_sr,
+        deflated_sharpe_passed=dsr_passed,
+        observed_sharpe=net_sharpe,
         # SR0 annualized, in the same units as observed_sharpe
         deflated_threshold=(
             dsr.sr0 * math.sqrt(periods_per_year) if dsr is not None else math.nan

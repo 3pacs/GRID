@@ -46,6 +46,22 @@ def _make_count_result(n):
     return _make_result(_make_row(n))
 
 
+def _ok_drift_checker(_model_id: int) -> dict:
+    """Stub drift check returning evaluated non-critical drift."""
+    return {
+        "overall_drift_score": 0.05,
+        "recommended_action": "OK",
+        "data_distribution_drift": {"1": {"drifted": False}},
+    }
+
+
+def _passing_oos_result():
+    """Passing out-of-sample validation_results row (n=40, hit_rate=0.75 -> Wilson lo > 0.5)."""
+    return _make_result(
+        _make_row("PASS", {"n_scored": 40, "hit_rate": 0.75}, {}, {})
+    )
+
+
 # ---------------------------------------------------------------------------
 # GateChecker init
 # ---------------------------------------------------------------------------
@@ -250,7 +266,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(1)
 
         assert result["passed"] is True
@@ -275,7 +291,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is False
@@ -301,7 +317,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is True
@@ -320,7 +336,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(3)
 
         assert result["passed"] is True
@@ -343,7 +359,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is False
@@ -367,7 +383,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is False
@@ -390,7 +406,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is True
@@ -400,7 +416,7 @@ class TestShadowToStaging:
         conn = _get_mock_conn(mock_engine)
         conn.execute.side_effect = [_make_result(None)]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(999)
 
         assert result["passed"] is False
@@ -417,7 +433,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(1)
 
         assert any("operator" in d.lower() for d in result["details"])
@@ -434,10 +450,10 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(1)
 
-        # Should pass (rule_based soft gates)
+        # Should pass (rule_based soft gates + OK drift check)
         assert result["passed"] is True
 
 
@@ -467,7 +483,9 @@ class TestStagingToProduction:
         result_no_prod = MagicMock()
         result_no_prod.fetchone.return_value = None
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -491,7 +509,9 @@ class TestStagingToProduction:
         result_no_prod = MagicMock()
         result_no_prod.fetchone.return_value = None
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -518,7 +538,9 @@ class TestStagingToProduction:
         result_existing = MagicMock()
         result_existing.fetchone.return_value = existing_row
 
-        conn.execute.side_effect = [result_model, result_count, result_existing]
+        conn.execute.side_effect = [
+            result_model, result_count, result_existing, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -536,7 +558,9 @@ class TestStagingToProduction:
         result_count = _make_count_result(20)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -552,7 +576,9 @@ class TestStagingToProduction:
         result_count = _make_count_result(0)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -580,7 +606,9 @@ class TestStagingToProduction:
         result_count = _make_count_result(25)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         gc.check_staging_to_production(10)
@@ -608,7 +636,7 @@ class TestStagingToProduction:
 class TestCheckAllGates:
 
     def test_check_all_gates_dispatches_correctly(self, mock_engine):
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
 
         # SHADOW dispatches to check_candidate_to_shadow
         # Set up conn to return model not found so we get a quick result
@@ -656,7 +684,9 @@ class TestCheckAllGates:
         result_count = _make_count_result(25)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_all_gates(10, "PRODUCTION")

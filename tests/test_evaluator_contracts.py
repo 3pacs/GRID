@@ -75,16 +75,13 @@ def test_predict_fn_actually_drives_the_return():
     assert len({long_result["return"], short_result["return"], zero_result["return"]}) == 3
 
 
-def test_predict_fn_none_falls_back_to_fully_invested_baseline():
+def test_predict_fn_none_raises_value_error():
     bt = _bt()
     dates = pd.DatetimeIndex([date(2024, 1, 1), date(2024, 1, 2)], name="obs_date")
     matrix = pd.DataFrame({1: [100.0, 110.0]}, index=dates)
 
-    baseline_result = bt._compute_era_metrics(matrix, None, cost_bps=0.0)
-    long_result = bt._compute_era_metrics(
-        matrix, lambda m: pd.Series(1.0, index=m.index), cost_bps=0.0
-    )
-    assert baseline_result["return"] == pytest.approx(long_result["return"])
+    with pytest.raises(ValueError, match="predict_fn"):
+        bt._compute_era_metrics(matrix, None, cost_bps=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +98,10 @@ def test_column_order_does_not_change_target_or_result():
 
     ordered = pd.DataFrame(data, index=dates)[[10, 20, 30]]
     permuted = pd.DataFrame(data, index=dates)[[30, 10, 20]]
+    const_long = lambda m: pd.Series(1.0, index=m.index)
 
-    result_ordered = bt._compute_era_metrics(ordered, None, cost_bps=10.0)
-    result_permuted = bt._compute_era_metrics(permuted, None, cost_bps=10.0)
+    result_ordered = bt._compute_era_metrics(ordered, const_long, cost_bps=10.0)
+    result_permuted = bt._compute_era_metrics(permuted, const_long, cost_bps=10.0)
 
     assert result_ordered == result_permuted
 
@@ -251,8 +249,9 @@ def test_duplicate_rows_do_not_inflate_sample_count():
         ),
     )
 
-    dup_result = bt._compute_era_metrics(matrix, None, cost_bps=0.0)
-    clean_result = bt._compute_era_metrics(deduped, None, cost_bps=0.0)
+    const_long = lambda m: pd.Series(1.0, index=m.index)
+    dup_result = bt._compute_era_metrics(matrix, const_long, cost_bps=0.0)
+    clean_result = bt._compute_era_metrics(deduped, const_long, cost_bps=0.0)
 
     assert dup_result["n_total"] == clean_result["n_total"] == 3
     assert dup_result == clean_result
@@ -358,9 +357,9 @@ def test_warmup_rows_are_counted_separately_not_silently_zeroed():
     assert result["n_total"] == 4
     assert result["n_missing"] == 1  # row 0: pct_change() has no prior value
     assert result["n_warmup"] == 2  # rows 1, 2: shifted signal still undefined
-    assert result["n_days"] == 3  # rows 1, 2, 3 all have a defined target return
+    assert result["n_days"] == 1  # leading warmup rows trimmed; only active row 3 scored
     # Only row 3 (signal shifted from row 2's defined 1.0) actually traded;
-    # rows 1 and 2 contributed a flat (zero-position) day, not a guess.
+    # leading warmup rows 1 and 2 are trimmed rather than zero-padded.
     r3 = (110.0 - 95.0) / 95.0
     assert result["return"] == pytest.approx(r3, abs=1e-5)
 
@@ -379,7 +378,9 @@ def test_no_move_and_missing_rows_are_counted_explicitly():
     )
     matrix = pd.DataFrame({1: [100.0, 100.0, np.nan, 100.0, 105.0]}, index=dates)
 
-    result = bt._compute_era_metrics(matrix, None, cost_bps=0.0)
+    result = bt._compute_era_metrics(
+        matrix, lambda m: pd.Series(1.0, index=m.index), cost_bps=0.0
+    )
 
     assert result["n_total"] == 5
     # Row 0 has no prior value (structural), rows 2 and 3 are missing data.
@@ -424,16 +425,17 @@ def test_target_feature_id_result_is_column_order_invariant():
     ordered = pd.DataFrame(data, index=dates)[[10, 20, 30]]
     permuted = pd.DataFrame(data, index=dates)[[30, 10, 20]]
 
+    const_long = lambda m: pd.Series(1.0, index=m.index)
     result_ordered = bt._compute_era_metrics(
-        ordered, None, cost_bps=10.0, target_feature_id=20
+        ordered, const_long, cost_bps=10.0, target_feature_id=20
     )
     result_permuted = bt._compute_era_metrics(
-        permuted, None, cost_bps=10.0, target_feature_id=20
+        permuted, const_long, cost_bps=10.0, target_feature_id=20
     )
 
     assert result_ordered == result_permuted
     # And it must actually be trading column 20, not the sorted-first (10).
-    default_result = bt._compute_era_metrics(ordered, None, cost_bps=10.0)
+    default_result = bt._compute_era_metrics(ordered, const_long, cost_bps=10.0)
     assert result_ordered != default_result
 
 
@@ -442,7 +444,9 @@ def test_target_feature_id_missing_from_matrix_is_handled_explicitly():
     dates = pd.DatetimeIndex([date(2024, 1, 1), date(2024, 1, 2)], name="obs_date")
     matrix = pd.DataFrame({1: [100.0, 110.0]}, index=dates)
 
-    result = bt._compute_era_metrics(matrix, None, cost_bps=0.0, target_feature_id=999)
+    result = bt._compute_era_metrics(
+        matrix, lambda m: pd.Series(1.0, index=m.index), cost_bps=0.0, target_feature_id=999
+    )
     assert result["return"] == 0.0
     assert result["n_days"] == 0
 
@@ -670,7 +674,9 @@ def test_stateless_predict_fn_path_unaffected_by_fit_fn_addition():
     bt = _bt()
     dates = pd.DatetimeIndex([date(2024, 1, i) for i in range(1, 6)], name="obs_date")
     matrix = pd.DataFrame({1: [100.0, 110.0, 99.0, 108.0, 97.0]}, index=dates)
-    result = bt._compute_era_metrics(matrix, None, cost_bps=0.0)
+    result = bt._compute_era_metrics(
+        matrix, lambda m: pd.Series(1.0, index=m.index), cost_bps=0.0
+    )
     assert "train_start" not in result
 
 
