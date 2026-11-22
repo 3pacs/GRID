@@ -21,6 +21,7 @@ from api.schemas.regime import (
     RegimeTransitionsResponse,
 )
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
+from store.snapshots import strip_binding_flags
 
 router = APIRouter(prefix="/api/v1/regime", tags=["regime"])
 
@@ -228,7 +229,9 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
         )
 
     model_label = f"{prod[1]} v{prod[2]}" if prod else "auto"
-    flags = latest[3] if isinstance(latest[3], dict) else {}
+    # Producer-binding keys (snapshot id/hash, run tag) are provenance, not
+    # contradictions, so they never reach the displayed list.
+    flags = strip_binding_flags(latest[3]) if isinstance(latest[3], dict) else {}
     contradiction_list = [f"{k}: {v}" for k, v in flags.items()] if flags else []
 
     # Carry the reading's own date alongside the timestamp so a surface can show
@@ -296,7 +299,7 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
                 "state": row[0],
                 "confidence": float(row[1]) if row[1] else 0.0,
                 "transition_probability": float(row[2]) if row[2] else 0.0,
-                "contradiction_flags": row[3] if isinstance(row[3], dict) else {},
+                "contradiction_flags": strip_binding_flags(row[3]) if isinstance(row[3], dict) else {},
                 "recommendation": row[4] or "",
                 "as_of": row[5].isoformat() if row[5] else "",
             }

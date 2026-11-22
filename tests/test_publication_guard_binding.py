@@ -688,3 +688,91 @@ def test_briefing_rejects_future_db_rows_and_future_or_negative_age_snapshot_ite
     )
     assert len(direct.ungrounded) == 1
     assert direct.ungrounded[0].raw == "4.35%"
+
+
+# ── Producer half: scripts/auto_regime.py binds its journal row to its snapshot ──
+
+
+def test_auto_regime_saves_snapshot_before_journal_and_shares_one_run_tag():
+    """The journal entry can name the snapshot only if the snapshot is saved
+    first; regime_history keeps its place after the journal and reuses the
+    same run tag, so the three rows join on one key."""
+    import inspect
+
+    import scripts.auto_regime as auto
+
+    src = inspect.getsource(auto.run)
+    i_tag = src.index('run_tag = f"auto_regime.run:{uuid4().hex}"')
+    i_snap = src.index("snap_store.save_snapshot(")
+    i_hash = src.index("stored_payload_sha256(snapshot_payload)")
+    i_journal = src.index("journal.log_decision(")
+    i_history = src.index("persist_regime_history(")
+    assert i_tag < i_snap < i_hash < i_journal < i_history
+    assert "contradiction_flags={**contradictions, **binding}" in src
+    assert "RegimeReplacement(SAME_DAY_REFRESH_REASON, run_tag)" in src
+    assert src.count("uuid4()") == 1
+    assert src.count("save_snapshot(") == 1
+
+
+def test_producer_binding_round_trips_through_the_briefing_guard(tmp_path):
+    """What auto_regime writes (payload stored via _safe_json, flags with the
+    stored-payload hash) is exactly what the briefing guard accepts. The
+    binding keys never show up as contradictions."""
+    import numpy as np
+
+    from store.snapshots import _safe_json, stored_payload_sha256
+
+    payload = {
+        "regime": "FRAGILE",
+        "confidence": np.float64(0.7134),
+        "stress_index": 1.2345,
+        "n_features": np.int64(9),
+        "features_used": {f"concept_{i}": f"feature_{i}" for i in range(9)},
+        "data_as_of": date(2026, 11, 18),
+        "regime_run_tag": "auto_regime.run:abc123",
+    }
+    stored = json.loads(_safe_json(payload))  # what JSONB hands back
+    flags = {
+        "calm_in_stress": "vix z=-1.2 is calm despite FRAGILE regime",
+        "snapshot_id": 42,
+        "snapshot_hash": stored_payload_sha256(payload),
+        "regime_run_tag": "auto_regime.run:abc123",
+    }
+    regime_row = ("FRAGILE", 0.7134, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(
+        regime_row, snap_rows=[(42, stored, "2026-11-18T09:59:00Z", date(2026, 11, 18))],
+    )
+
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+
+    lr = snap["latest_regime"]
+    assert lr["state"] == "FRAGILE"
+    assert lr["snapshot_id"] == 42
+    assert lr["bound_inputs"] == 9
+    assert lr["contradictions"] == {"calm_in_stress": flags["calm_in_stress"]}
+
+
+def test_regime_current_lists_contradictions_without_binding_keys():
+    from unittest.mock import MagicMock, patch
+
+    from api.routers import regime as regime_router
+
+    engine, conn = MagicMock(), MagicMock()
+    conn.__enter__.return_value = conn
+    conn.__exit__.return_value = False
+    prod = MagicMock()
+    prod.fetchone.return_value = (7, "stress_index", "1.0")
+    latest = MagicMock()
+    latest.fetchone.return_value = (
+        "FRAGILE", 0.72, 0.1,
+        {"calm_in_stress": "x", "snapshot_id": 42, "snapshot_hash": "a" * 64,
+         "regime_run_tag": "auto_regime.run:abc"},
+        "DEFENSIVE", "NEUTRAL", datetime(2026, 11, 18, 10, tzinfo=timezone.utc),
+    )
+    history = MagicMock()
+    history.fetchone.return_value = (None,)
+    conn.execute.side_effect = [prod, latest, history]
+    engine.connect.return_value = conn
+    with patch.object(regime_router, "get_db_engine", return_value=engine):
+        resp = regime_router.get_current(_token="t")
+    assert resp.contradiction_flags == ["calm_in_stress: x"]

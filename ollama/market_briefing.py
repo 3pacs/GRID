@@ -24,6 +24,7 @@ from typing import Any, Callable
 import schedule
 from loguru import logger as log
 from outputs.path_utils import ensure_output_dir
+from store.snapshots import canonical_payload_sha256, strip_binding_flags
 
 # Output directory for saved briefings
 _BRIEFING_DIR = Path(__file__).parent.parent / "outputs" / "market_briefings"
@@ -881,11 +882,8 @@ class MarketBriefingEngine:
 
     @staticmethod
     def _canonical_snapshot_hash(payload: dict[str, Any]) -> str:
-        raw = json.dumps(
-            payload, sort_keys=True, ensure_ascii=False, allow_nan=False,
-            separators=(",", ":"), default=str,
-        ).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
+        # One helper for producer and reader, so the binding hash can't drift.
+        return canonical_payload_sha256(payload)
 
     @classmethod
     def _snapshot_hash_matches(cls, payload: dict[str, Any], expected_hash: Any) -> bool:
@@ -1470,7 +1468,7 @@ class MarketBriefingEngine:
                                         "state": state_label,
                                         "confidence": round(regime_row[1], 4),
                                         "transition_prob": round(regime_row[2], 4),
-                                        "contradictions": regime_row[3],
+                                        "contradictions": strip_binding_flags(regime_row[3]),
                                         "recommendation": regime_row[4],
                                         "timestamp": str(regime_row[5]),
                                         "snapshot_id": s_id,
@@ -1507,7 +1505,7 @@ class MarketBriefingEngine:
                                             "state": state_label,
                                             "confidence": round(regime_row[1], 4),
                                             "transition_prob": round(regime_row[2], 4),
-                                            "contradictions": regime_row[3],
+                                            "contradictions": strip_binding_flags(regime_row[3]),
                                             "recommendation": regime_row[4],
                                             "timestamp": str(regime_row[5]),
                                             "snapshot_hash": inline_hash,
