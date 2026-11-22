@@ -8,8 +8,10 @@ from __future__ import annotations
 import itertools
 import math
 import socket
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 
+import pandas as pd
 import pytest
 
 from features.buyback_blackout import (
@@ -173,3 +175,82 @@ def test_no_positive_weight_is_unknown() -> None:
     assert r.share is None and r.reason == "no_positive_weight"
     ser = compute_blackout_series([AS_OF], [], lambda _d: {"AAPL": 0.0})
     assert math.isnan(ser.loc[AS_OF, "share"]) and ser.loc[AS_OF, "status"] == STATUS_UNKNOWN
+
+
+# ── Non-finite and out-of-range inputs (Codex 6011729288) ──────────────────
+# Invalid input raises ValueError at the boundary (see the module docstring);
+# valid input always yields finite shares, bounds and coverage in [0, 1].
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -0.1, True, None, "0.4",
+                                 10**400, Decimal("0.4")], ids=repr)
+def test_an_invalid_weight_raises_naming_the_ticker(bad) -> None:
+    with pytest.raises(ValueError, match="MSFT"):
+        compute_blackout_reading(AS_OF, _full_schedule(), {**WEIGHTS, "MSFT": bad})
+
+
+def test_weights_whose_total_overflows_raise() -> None:
+    with pytest.raises(ValueError, match="overflow"):
+        compute_blackout_reading(AS_OF, _full_schedule(), {"AAPL": 1e308, "MSFT": 1e308})
+
+
+@pytest.mark.parametrize("key", ["", "  ", None, 5])
+def test_an_invalid_ticker_key_raises(key) -> None:
+    with pytest.raises(ValueError):
+        compute_blackout_reading(AS_OF, _full_schedule(), {key: 1.0})
+
+
+@pytest.mark.parametrize("as_of", [datetime(2026, 11, 20, 16, 0), pd.NaT, "2026-11-20", None,
+                                   date(1800, 1, 1), date(2300, 1, 1)], ids=repr)
+def test_an_invalid_as_of_raises(as_of) -> None:
+    with pytest.raises(ValueError):
+        compute_blackout_reading(as_of, _full_schedule(), WEIGHTS)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("known_at", datetime(2026, 10, 1, 9)), ("known_at", pd.NaT), ("known_at", None),
+    ("earnings_date", "2026-11-25"), ("earnings_date", date(1066, 10, 14)),
+    ("ticker", ""), ("ticker", None), ("fiscal_period", ""), ("fiscal_period", 3),
+])
+def test_invalid_schedule_fields_raise_at_construction(field: str, value) -> None:
+    args = {"ticker": "AAPL", "earnings_date": date(2026, 11, 25), "known_at": KNOWN, "fiscal_period": None}
+    args[field] = value
+    with pytest.raises(ValueError):
+        ScheduledEarnings(**args)
+
+
+def test_non_schedule_entries_raise() -> None:
+    with pytest.raises(ValueError):
+        compute_blackout_reading(AS_OF, [("AAPL", date(2026, 11, 25), KNOWN)], WEIGHTS)  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize("kwargs", [{"pre_days": -1}, {"post_days": True}, {"max_lookahead_days": 1.5},
+                                    {"min_coverage": 0.0}, {"min_coverage": 1.5},
+                                    {"min_coverage": float("nan")}], ids=repr)
+def test_invalid_parameters_raise(kwargs) -> None:
+    with pytest.raises(ValueError):
+        compute_blackout_reading(AS_OF, _full_schedule(), WEIGHTS, **kwargs)
+
+
+def test_series_names_the_date_of_an_invalid_weight() -> None:
+    bad_day = date(2026, 11, 21)
+
+    def weights_on(d: date):
+        return {**WEIGHTS, "NVDA": float("nan")} if d == bad_day else WEIGHTS
+
+    with pytest.raises(ValueError, match="2026-11-21"):
+        compute_blackout_series([AS_OF, bad_day], _full_schedule(), weights_on)
+    with pytest.raises(ValueError):
+        compute_blackout_series([AS_OF, "2026-11-21"], _full_schedule(), lambda _d: WEIGHTS)  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize("weights", [
+    {"AAPL": 1e-300, "MSFT": 1e-300, "NVDA": 1e-300},
+    {"AAPL": 1e300, "MSFT": 1e300, "NVDA": 1e300},
+    {"AAPL": 0.0, "MSFT": 1.0, "NVDA": 3.0, "ZZZ": 0.0},
+    {"AAPL": 2, "MSFT": 1, "NVDA": 1},
+], ids=["tiny", "huge", "zeros", "ints"])
+def test_valid_extreme_weights_give_finite_unit_values(weights) -> None:
+    r = compute_blackout_reading(AS_OF, _full_schedule(), weights, min_coverage=0.5)
+    for v in (r.share, r.share_lower, r.share_upper, r.coverage):
+        assert v is not None and math.isfinite(v) and 0.0 <= v <= 1.0
+    assert r.share_lower <= r.share_upper

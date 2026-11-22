@@ -23,10 +23,21 @@ Not scheduled anywhere yet: nothing calls :meth:`CFTCTFFPuller.pull_all`
 except tests. The Socrata field names below follow the TFF dataset's column
 names; they have not been re-checked against the live dataset in this change,
 so the parser fails closed (skips the row) on any missing field.
+
+Input validation (before anything is derived or written): every raw position
+must be a finite number (``math.isfinite`` runs before any comparison, so a
+NaN can never slip past one), every long/short count must be ``>= 0`` and no
+larger than open interest (each category's contracts are part of it), and open
+interest must be finite and ``> 0``. Booleans, ``"nan"``, ``"inf"`` and
+overflowing strings such as ``"1e400"`` are rejected. A report date must parse
+to a real date (an empty string parses to ``NaT`` in pandas and is refused).
+A rejected row is skipped with its reason, like every other skip, and no metric
+derived from it is stored; the derived metrics are re-checked for finiteness.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -111,23 +122,45 @@ class TFFParseOutcome:
     skipped: list[dict[str, Any]] = field(default_factory=list)
 
 
+_POSITION_KEYS: tuple[str, ...] = tuple(k for k in TFF_RAW_FIELDS if k != "open_interest")
+
+
+def _finite_number(val: Any) -> float | None:
+    """``val`` as a finite float, or None (bools, NaN, inf and non-numbers are refused)."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, str) and val.strip() == "":
+        return None
+    try:
+        out = float(val)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _parse_tff_metrics(rec: dict[str, Any]) -> tuple[dict[str, float] | None, str | None]:
+    """Validated raw positions to derived metrics, or ``(None, reason)``."""
     raw: dict[str, float] = {}
     for k, fld in TFF_RAW_FIELDS.items():
         val = rec.get(fld)
-        if val is None or str(val).strip() == "":
+        if val is None or (isinstance(val, str) and val.strip() == ""):
             return None, f"missing field {fld}"
-        try:
-            raw[k] = float(val)
-        except (TypeError, ValueError):
-            return None, f"unparseable field {fld}"
+        num = _finite_number(val)
+        if num is None:
+            return None, f"non_finite_or_non_numeric field {fld}"
+        raw[k] = num
 
     oi = raw["open_interest"]
-    if oi <= 0:
+    if not oi > 0.0:  # finite by construction; "not >" also refuses anything unordered
         return None, "non_positive_open_interest"
+    for k in _POSITION_KEYS:
+        if raw[k] < 0.0:
+            return None, f"negative_position {TFF_RAW_FIELDS[k]}"
+        if raw[k] > oi:
+            return None, f"position_exceeds_open_interest {TFF_RAW_FIELDS[k]}"
 
     lev_net = raw["lev_money_long"] - raw["lev_money_short"]
-    return {
+    metrics = {
         "lev_money_long": raw["lev_money_long"],
         "lev_money_short": raw["lev_money_short"],
         "lev_money_net": lev_net,
@@ -135,15 +168,38 @@ def _parse_tff_metrics(rec: dict[str, Any]) -> tuple[dict[str, float] | None, st
         "dealer_net": raw["dealer_long"] - raw["dealer_short"],
         "lev_money_pct_oi": 100.0 * lev_net / oi,
         "open_interest": oi,
-    }, None
+    }
+    bad = sorted(m for m, v in metrics.items() if not math.isfinite(v))
+    if bad:
+        return None, f"non_finite_derived {','.join(bad)}"
+    return metrics, None
+
+
+def _report_date(raw_rd: Any) -> date | None:
+    """The report date as a real ``date``; None for missing, unparseable, NaT or non-text.
+
+    Only a string or a date is accepted: pandas would read a bare number such
+    as ``20261117`` as nanoseconds since 1970.
+    """
+    if not isinstance(raw_rd, (str, date)):
+        return None
+    try:
+        ts = pd.Timestamp(raw_rd)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.date()
 
 
 def parse_tff_records(code: str, records: Iterable[dict[str, Any]]) -> TFFParseOutcome:
     """Fail-closed parser from Socrata TFF rows to ``ParsedTFFReport`` records.
 
     A row whose market code differs from ``code``, whose report date does not
-    parse, or that lacks any raw field is skipped with a reason. Two rows for
-    one report date with different numbers drop that date entirely.
+    parse to a real date, or whose positions are missing, non-finite,
+    non-numeric or out of bounds (see :func:`_parse_tff_metrics`) is skipped
+    with a reason. Two rows for one report date with different numbers drop
+    that date entirely.
     """
     outcome = TFFParseOutcome()
     by_date: dict[date, list[ParsedTFFReport]] = {}
@@ -153,13 +209,9 @@ def parse_tff_records(code: str, records: Iterable[dict[str, Any]]) -> TFFParseO
             outcome.skipped.append({"reason": "market_code_mismatch", "expected": code, "got": rec_code or None})
             continue
         raw_rd = rec.get("report_date_as_yyyy_mm_dd")
-        if raw_rd is None:
-            outcome.skipped.append({"reason": "bad_report_date", "raw": None})
-            continue
-        try:
-            rd = pd.Timestamp(raw_rd).date()
-        except (TypeError, ValueError):
-            outcome.skipped.append({"reason": "bad_report_date", "raw": raw_rd})
+        rd = _report_date(raw_rd)
+        if rd is None:
+            outcome.skipped.append({"reason": "bad_report_date", "raw": None if raw_rd is None else str(raw_rd)})
             continue
         metrics, why = _parse_tff_metrics(rec)
         if metrics is None:
@@ -328,6 +380,9 @@ class CFTCTFFPuller(BasePuller):
                     for rep in outcome.reports:
                         if rep.report_date in existing or rep.report_date > date.today():
                             continue
+                        value = rep.metrics[metric]
+                        if not math.isfinite(value):  # parse already refuses these; never write one
+                            raise ValueError(f"non-finite {metric} for {rep.report_date}")
                         payload = build_tff_payload(code, rep, metric)
                         if payload["release_at"] is None:
                             no_release += 1
@@ -336,7 +391,7 @@ class CFTCTFFPuller(BasePuller):
                             conn=conn,
                             series_id=sid,
                             obs_date=rep.report_date,
-                            value=rep.metrics[metric],
+                            value=value,
                             raw_payload=payload,
                         )
                         existing.add(rep.report_date)

@@ -44,14 +44,27 @@ a trailing window by the same factor, which cannot change an above/below-MA
 comparison or a return's sign. Raw closes would turn a split inside the window
 into a false cross.
 
+Bad input. A price that is present but not usable -- ``inf``, ``-inf``, zero
+or negative -- is treated as unobserved (so it lowers coverage) and counted in
+``invalid_prices``; a zero previous close can therefore never produce an
+infinite return. Every emitted statistic is finite or UNKNOWN (NaN with status
+``unknown``/``partial`` and a reason); a non-finite value is never returned.
+Invalid arguments raise ``ValueError`` at the boundary: a non-numeric price
+panel, session labels that are not dates (or ``NaT``), duplicate sessions,
+``as_of`` that is not a ``datetime.date``, ``min_coverage`` outside ``(0, 1]``,
+and a ``members_on`` that returns something other than a collection of
+tickers or :class:`UnknownMembership`.
+
 No writer: nothing stores these series in this change.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from numbers import Real
 from pathlib import Path
 
 import numpy as np
@@ -72,7 +85,7 @@ _STATS: tuple[tuple[str, str], ...] = (
 )
 
 BREADTH_COLUMNS: list[str] = [
-    "members",
+    "members", "invalid_prices",
     "observed_50ma", "observed_200ma", "observed_ret1",
     "coverage_50ma", "coverage_200ma", "coverage_ret1",
     "pct_above_50ma", "pct_above_200ma", "net_adv_ratio", "mcclellan_osc",
@@ -126,6 +139,37 @@ def _mcclellan(net_adv: pd.Series) -> pd.Series:
     return out
 
 
+def _session_frame(prices: pd.DataFrame, what: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(clean float frame, invalid-price mask) on a sorted, de-duplicated date index.
+
+    Raises ``ValueError`` for non-numeric values, non-date or NaT labels and
+    duplicate sessions. Present-but-unusable prices (non-finite or ``<= 0``)
+    become NaN in the clean frame and True in the mask.
+    """
+    try:
+        raw = prices.astype(float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what} must be numeric: {exc}") from exc
+    try:
+        with warnings.catch_warnings():  # garbage labels fall back to dateutil; the ValueError below is the answer
+            warnings.simplefilter("ignore", UserWarning)
+            idx = pd.DatetimeIndex(pd.to_datetime(raw.index))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what} index must be session dates: {exc}") from exc
+    if idx.hasnans:
+        raise ValueError(f"{what} index has NaT session labels")
+    idx = idx.normalize()
+    if idx.has_duplicates:
+        raise ValueError(f"{what} has duplicate session dates; pass one known-at row per session")
+    raw.index = idx
+    raw = raw.sort_index()
+    values = raw.to_numpy(dtype=float)
+    invalid = ~np.isnan(values) & (~np.isfinite(values) | (values <= 0.0))
+    invalid_mask = pd.DataFrame(invalid, index=raw.index, columns=raw.columns)
+    clean = raw.mask(invalid_mask)
+    return clean, invalid_mask
+
+
 def compute_true_breadth_panel(
     prices: pd.DataFrame,
     *,
@@ -139,14 +183,18 @@ def compute_true_breadth_panel(
     session at or before ``as_of`` (all sessions when ``as_of`` is None);
     columns :data:`BREADTH_COLUMNS`. A statistic is NaN when it is UNKNOWN.
     """
+    if as_of is not None and (not isinstance(as_of, date) or isinstance(as_of, datetime)):
+        raise ValueError(f"as_of must be a datetime.date, got {as_of!r}")
+    if (not isinstance(min_coverage, Real) or isinstance(min_coverage, bool)
+            or not np.isfinite(float(min_coverage)) or not 0.0 < float(min_coverage) <= 1.0):
+        raise ValueError(f"min_coverage must be in (0, 1], got {min_coverage!r}")
     if prices is None or prices.empty:
         return pd.DataFrame(columns=BREADTH_COLUMNS)
 
-    if prices.index.has_duplicates:
-        raise ValueError("prices has duplicate session dates; pass one known-at row per session")
-    px = prices.sort_index().astype(float)
+    px, invalid = _session_frame(prices, "prices")
     if as_of is not None:
-        px = px.loc[[(i.date() if hasattr(i, "date") else i) <= as_of for i in px.index]]
+        keep = px.index <= pd.Timestamp(as_of)
+        px, invalid = px.loc[keep], invalid.loc[keep]
         if px.empty:
             return pd.DataFrame(columns=BREADTH_COLUMNS)
 
@@ -156,7 +204,7 @@ def compute_true_breadth_panel(
     valid = {
         "50ma": px.notna() & ma50.notna(),
         "200ma": px.notna() & ma200.notna(),
-        "ret1": ret1.notna(),
+        "ret1": ret1.notna() & np.isfinite(ret1),
     }
     up = {"50ma": px > ma50, "200ma": px > ma200, "ret1": ret1 > 0}
     down_ret1 = ret1 < 0
@@ -165,21 +213,25 @@ def compute_true_breadth_panel(
     rows: list[dict[str, object]] = []
     out_dates: list[date] = []
     for idx_val in px.index:
-        d = idx_val.date() if hasattr(idx_val, "date") else idx_val
+        d = idx_val.date()
         out_dates.append(d)
         row: dict[str, object] = {c: np.nan for c in BREADTH_COLUMNS}
         members = members_on(d)
         if isinstance(members, UnknownMembership):
-            row.update(members=0, status=STATUS_UNKNOWN, reason=members.reason)
+            row.update(members=0, invalid_prices=0, status=STATUS_UNKNOWN, reason=members.reason)
             rows.append(row)
             continue
+        if isinstance(members, (str, bytes)) or not isinstance(members, Collection):
+            raise ValueError(f"members_on({d}) must return a collection of tickers or UnknownMembership, "
+                             f"got {type(members).__name__}")
         n_members = len(members)
         if n_members == 0:
-            row.update(members=0, status=STATUS_UNKNOWN, reason="no members on this date")
+            row.update(members=0, invalid_prices=0, status=STATUS_UNKNOWN, reason="no members on this date")
             rows.append(row)
             continue
         cols = [c for c in members if c in columns]
         row["members"] = n_members
+        row["invalid_prices"] = int(invalid.loc[idx_val, cols].sum()) if cols else 0
         reasons: list[str] = []
         known = 0
         for stat, key in _STATS:
@@ -195,16 +247,23 @@ def compute_true_breadth_panel(
             n_up = int(up[key].loc[idx_val, ok_cols].sum())
             if key == "ret1":
                 n_down = int(down_ret1.loc[idx_val, ok_cols].sum())
-                row[stat] = (n_up - n_down) / n_obs
+                value = (n_up - n_down) / n_obs
             else:
-                row[stat] = n_up / n_obs
+                value = n_up / n_obs
+            if not np.isfinite(value):  # counts over a positive n_obs; kept as a hard guard
+                reasons.append(f"{stat} not finite")
+                continue
+            row[stat] = value
             known += 1
+        if row["invalid_prices"]:
+            reasons.append(f"{row['invalid_prices']} member price(s) non-finite or <= 0, treated as unobserved")
         row["status"] = STATUS_OK if known == len(_STATS) else (STATUS_PARTIAL if known else STATUS_UNKNOWN)
         row["reason"] = "; ".join(reasons) or None
         rows.append(row)
 
     df = pd.DataFrame(rows, index=out_dates, columns=BREADTH_COLUMNS)
-    df["mcclellan_osc"] = _mcclellan(df["net_adv_ratio"].astype(float))
+    osc = _mcclellan(df["net_adv_ratio"].astype(float))
+    df["mcclellan_osc"] = osc.where(np.isfinite(osc))
     return df
 
 
@@ -217,13 +276,19 @@ def compute_sector_dispersion_iqr(
     """Cross-sectional IQR of trailing ``horizon_days`` returns across the sector ETFs given.
 
     Computed over the columns present (XLK..XLU); a date with fewer than
-    ``min_sectors`` finite returns is left out. Same known-at contract as
-    :func:`compute_true_breadth_panel`.
+    ``min_sectors`` finite returns is left out, never emitted as a value.
+    Non-finite or ``<= 0`` prices are unobserved; invalid arguments raise
+    ``ValueError``. Same known-at contract as :func:`compute_true_breadth_panel`.
     """
+    if not isinstance(horizon_days, int) or isinstance(horizon_days, bool) or horizon_days < 1:
+        raise ValueError(f"horizon_days must be an integer >= 1, got {horizon_days!r}")
+    if not isinstance(min_sectors, int) or isinstance(min_sectors, bool) or min_sectors < 2:
+        raise ValueError(f"min_sectors must be an integer >= 2, got {min_sectors!r}")
     if sector_prices is None or sector_prices.empty:
         return pd.Series(dtype=float, name="sector_iqr_5d")
 
-    rets = sector_prices.sort_index().astype(float).pct_change(horizon_days, fill_method=None)
+    clean, _invalid = _session_frame(sector_prices, "sector_prices")
+    rets = clean.pct_change(horizon_days, fill_method=None)
     out: dict[date, float] = {}
     for idx_val, row in rets.iterrows():
         vals = row.dropna().to_numpy(dtype=float)
@@ -231,6 +296,7 @@ def compute_sector_dispersion_iqr(
         if len(vals) < min_sectors:
             continue
         q75, q25 = np.percentile(vals, [75.0, 25.0])
-        d = idx_val.date() if hasattr(idx_val, "date") else idx_val
-        out[d] = float(q75 - q25)
+        iqr = float(q75 - q25)
+        if np.isfinite(iqr):
+            out[idx_val.date()] = iqr
     return pd.Series(out, dtype=float, name="sector_iqr_5d").sort_index()

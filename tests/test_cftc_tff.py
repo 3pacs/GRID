@@ -6,6 +6,7 @@ so no test reaches the network. The engine is a MagicMock; no database.
 
 from __future__ import annotations
 
+import math
 import socket
 from datetime import date, datetime, timezone
 from typing import Any
@@ -202,3 +203,71 @@ def test_every_failure_names_its_market_and_stage(monkeypatch) -> None:
     puller._insert_raw = _flaky_insert
     result = puller.pull_all(codes=["043602", "044601"])
     assert result["errors"] == {"043602": "write: RuntimeError: synthetic database failure"}
+
+
+# ── Non-finite and out-of-range inputs (Codex 6011729288) ──────────────────
+
+_BAD_NUMBERS = ["nan", "NaN", "inf", "-inf", "Infinity", "1e400", float("nan"), float("inf"),
+                float("-inf"), True, False, "abc", "0x10", [1], {"v": 1}]
+
+
+@pytest.mark.parametrize("field", list(cftc_tff.TFF_RAW_FIELDS.values()))
+@pytest.mark.parametrize("bad", _BAD_NUMBERS, ids=repr)
+def test_non_finite_or_non_numeric_fields_skip_the_row(field: str, bad: Any) -> None:
+    out = parse_tff_records("043602", [_row(**{field: bad})])
+    assert out.reports == []
+    assert len(out.skipped) == 1
+    assert out.skipped[0]["reason"] == "incomplete_metrics"
+    assert out.skipped[0]["detail"] == f"non_finite_or_non_numeric field {field}"
+
+
+def test_nan_open_interest_no_longer_slips_past_the_positive_check() -> None:
+    # Before: float("nan") <= 0 is False, so a NaN OI reached lev_money_pct_oi.
+    for oi in ("nan", float("nan")):
+        out = parse_tff_records("043602", [_row(open_interest_all=oi)])
+        assert out.reports == [] and "non_finite" in out.skipped[0]["detail"]
+    for oi in ("0", "-1", 0, -6000000):
+        out = parse_tff_records("043602", [_row(open_interest_all=oi)])
+        assert out.reports == [] and out.skipped[0]["detail"] == "non_positive_open_interest"
+
+
+@pytest.mark.parametrize("field,value,detail", [
+    ("lev_money_positions_long", "-1", "negative_position lev_money_positions_long"),
+    ("dealer_positions_short_all", "-0.5", "negative_position dealer_positions_short_all"),
+    ("asset_mgr_positions_long", "6000001", "position_exceeds_open_interest asset_mgr_positions_long"),
+])
+def test_out_of_range_positions_skip_the_row(field: str, value: str, detail: str) -> None:
+    out = parse_tff_records("043602", [_row(**{field: value})])
+    assert out.reports == [] and out.skipped[0]["detail"] == detail
+
+
+@pytest.mark.parametrize("raw_rd", ["", "NaT", "nat", "garbage", "2026-13-01", True, float("nan"), 20261117],
+                         ids=repr)
+def test_bad_report_dates_skip_the_row(raw_rd: Any) -> None:
+    # pandas parses "" and "NaT" to NaT; that is not a date and must not reach a write.
+    out = parse_tff_records("043602", [_row(report_date=raw_rd)])
+    assert out.reports == [] and out.skipped[0]["reason"] == "bad_report_date"
+
+
+def test_every_accepted_metric_is_finite() -> None:
+    out = parse_tff_records("043602", [_row(open_interest_all="1e-300", lev_money_positions_long="0",
+                                            lev_money_positions_short="0", dealer_positions_long_all="0",
+                                            dealer_positions_short_all="0", asset_mgr_positions_long="0",
+                                            asset_mgr_positions_short="0")])
+    assert len(out.reports) == 1
+    assert all(math.isfinite(v) for v in out.reports[0].metrics.values())
+
+
+def test_rejected_rows_never_reach_a_write(monkeypatch) -> None:
+    page = [
+        _row(report_date="2026-11-10T00:00:00.000", open_interest_all="nan", id="bad-oi"),
+        _row(report_date="2026-11-03T00:00:00.000", lev_money_positions_long="inf", id="bad-inf"),
+        _row(report_date="", id="bad-date"),
+        _row(id="good"),  # 2026-11-17
+    ]
+    puller, inserted, _ = _offline_puller(monkeypatch, [page])
+    result = puller.pull_all(codes=["043602"])
+    assert result["skipped_rows"] == 3 and result["status"] == "PARTIAL"
+    assert {r["obs_date"] for r in inserted} == {date(2026, 11, 17)}
+    assert len(inserted) == len(TFF_METRICS)
+    assert all(math.isfinite(r["value"]) for r in inserted)

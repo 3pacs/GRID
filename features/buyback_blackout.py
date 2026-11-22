@@ -33,14 +33,30 @@ against the total. ``share`` is the blackout share of the *covered* weight;
 None. 0.90 keeps the bound interval at most 10 percentage points wide: its
 width is exactly the unknown share of weight.
 
+Invalid input raises ``ValueError`` at the boundary; it is never coerced. A
+weight must be a real, finite number ``>= 0`` (NaN, inf, negative, boolean,
+``None`` and non-numeric weights raise, naming the ticker); zero weights are
+ignored, and a date whose weights sum to zero is UNKNOWN (``no_positive_weight``).
+A weight total that overflows raises. Every date (``as_of``, ``earnings_date``,
+``known_at``) must be a real ``datetime.date`` (not a ``datetime``, ``NaT`` or
+string) between :data:`MIN_DATE` and :data:`MAX_DATE`; tickers must be
+non-empty strings; ``pre_days``, ``post_days`` and ``max_lookahead_days`` must
+be non-negative integers and ``min_coverage`` in ``(0, 1]``. Raising (rather
+than marking the name UNKNOWN) is deliberate: a weight that is not a number
+leaves the index total itself unknown, so no coverage could be stated. With
+valid input every returned share, bound and coverage is finite and in
+``[0, 1]``.
+
 No writer: nothing stores this series in this change.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from numbers import Real
 
 import pandas as pd
 
@@ -48,6 +64,9 @@ DEFAULT_PRE_EARNINGS_BLACKOUT_DAYS: int = 35
 DEFAULT_POST_EARNINGS_BLACKOUT_DAYS: int = 2
 DEFAULT_MAX_LOOKAHEAD_DAYS: int = 100
 MIN_WEIGHT_COVERAGE: float = 0.90
+#: Plausible date range for every input date (keeps window arithmetic in range).
+MIN_DATE: date = date(1900, 1, 1)
+MAX_DATE: date = date(2200, 12, 31)
 
 STATUS_OK = "ok"
 STATUS_UNKNOWN = "unknown"
@@ -72,6 +91,56 @@ class ScheduledEarnings:
     earnings_date: date
     known_at: date
     fiscal_period: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ticker, str) or not self.ticker.strip():
+            raise ValueError(f"ScheduledEarnings.ticker must be a non-empty string, got {self.ticker!r}")
+        _check_date("earnings_date", self.earnings_date)
+        _check_date("known_at", self.known_at)
+        if self.fiscal_period is not None and (
+                not isinstance(self.fiscal_period, str) or not self.fiscal_period.strip()):
+            raise ValueError(f"ScheduledEarnings.fiscal_period must be None or a non-empty string, "
+                             f"got {self.fiscal_period!r}")
+
+
+def _check_date(name: str, value: object) -> None:
+    """A real ``date`` (not a ``datetime``/``NaT``/string) inside [MIN_DATE, MAX_DATE]."""
+    if not isinstance(value, date) or isinstance(value, datetime):
+        raise ValueError(f"{name} must be a datetime.date, got {value!r}")
+    if not MIN_DATE <= value <= MAX_DATE:
+        raise ValueError(f"{name} {value} is outside {MIN_DATE}..{MAX_DATE}")
+
+
+def _check_params(pre_days: int, post_days: int, max_lookahead_days: int, min_coverage: float) -> None:
+    for name, v in (("pre_days", pre_days), ("post_days", post_days),
+                    ("max_lookahead_days", max_lookahead_days)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {v!r}")
+    if (not isinstance(min_coverage, Real) or isinstance(min_coverage, bool)
+            or not math.isfinite(min_coverage) or not 0.0 < min_coverage <= 1.0):
+        raise ValueError(f"min_coverage must be in (0, 1], got {min_coverage!r}")
+
+
+def _clean_weights(market_cap_weights: Mapping[str, float]) -> dict[str, float]:
+    """Validated weights by upper-cased ticker (duplicates after normalising are summed)."""
+    if not isinstance(market_cap_weights, Mapping):
+        raise ValueError("market_cap_weights must be a mapping of ticker -> weight")
+    weights: dict[str, float] = {}
+    for tk, w in market_cap_weights.items():
+        if not isinstance(tk, str) or not tk.strip():
+            raise ValueError(f"weight key must be a non-empty ticker string, got {tk!r}")
+        try:
+            fw = float(w) if isinstance(w, Real) and not isinstance(w, bool) else math.nan
+        except OverflowError:
+            fw = math.inf
+        if not math.isfinite(fw) or fw < 0.0:
+            raise ValueError(f"weight for {tk!r} must be a finite number >= 0, got {w!r}")
+        if fw > 0.0:
+            key = tk.strip().upper()
+            weights[key] = weights.get(key, 0.0) + fw
+    if not math.isfinite(sum(weights.values())):
+        raise ValueError("weights overflow: their total is not finite")
+    return weights
 
 
 @dataclass(frozen=True)
@@ -101,6 +170,8 @@ def _reports_known_at(as_of: date, earnings: Iterable[ScheduledEarnings]) -> dic
     periods: dict[tuple[str, str], tuple[date, set[date]]] = {}
     standalone: dict[str, set[date]] = {}
     for ev in earnings:
+        if not isinstance(ev, ScheduledEarnings):
+            raise ValueError(f"earnings entries must be ScheduledEarnings, got {type(ev).__name__}")
         if ev.known_at > as_of:
             continue
         tk = ev.ticker.strip().upper()
@@ -158,18 +229,14 @@ def compute_blackout_reading(
     """Blackout share of index market cap on ``as_of``, with coverage.
 
     ``market_cap_weights`` must be the weights as of ``as_of`` (the index
-    universe on that date); non-positive weights are ignored.
+    universe on that date); zero weights are ignored and invalid ones raise
+    ``ValueError`` (see the module docstring).
     """
-    weights: dict[str, float] = {}
-    for tk, w in market_cap_weights.items():
-        if w is None:
-            continue
-        fw = float(w)
-        if fw > 0.0:
-            key = tk.strip().upper()
-            weights[key] = weights.get(key, 0.0) + fw
+    _check_date("as_of", as_of)
+    _check_params(pre_days, post_days, max_lookahead_days, min_coverage)
+    weights = _clean_weights(market_cap_weights)
     total = sum(weights.values())
-    if total <= 0.0:
+    if not total > 0.0:
         return BlackoutReading(as_of, STATUS_UNKNOWN, "no_positive_weight", None, None, None,
                                0.0, 0.0, 0.0, 0.0, (), ())
 
@@ -189,9 +256,12 @@ def compute_blackout_reading(
             if status == "blackout":
                 blackout += weights[tk]
 
-    coverage = covered / total
-    lower = blackout / total
-    upper = (blackout + (total - covered)) / total
+    def _unit(x: float) -> float:  # finite by construction; clamp float rounding into [0, 1]
+        return min(1.0, max(0.0, x))
+
+    coverage = _unit(covered / total)
+    lower = _unit(blackout / total)
+    upper = _unit((blackout + (total - covered)) / total)
     if covered <= 0.0 or coverage < min_coverage:
         return BlackoutReading(
             as_of, STATUS_UNKNOWN, f"coverage {coverage:.3f} below {min_coverage:.2f}",
@@ -235,13 +305,19 @@ def compute_blackout_series(
     ``weights_on(d)`` gives the weights as of ``d``.
     """
     ev_list = list(earnings)
+    day_list = list(dates)
+    for d in day_list:
+        _check_date("dates entry", d)
     rows: list[dict[str, object]] = []
     index: list[date] = []
-    for d in sorted(set(dates)):
-        r = compute_blackout_reading(
-            d, ev_list, weights_on(d), pre_days=pre_days, post_days=post_days,
-            max_lookahead_days=max_lookahead_days, min_coverage=min_coverage,
-        )
+    for d in sorted(set(day_list)):
+        try:
+            r = compute_blackout_reading(
+                d, ev_list, weights_on(d), pre_days=pre_days, post_days=post_days,
+                max_lookahead_days=max_lookahead_days, min_coverage=min_coverage,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{d.isoformat()}: {exc}") from exc
         index.append(d)
         rows.append({
             "share": float("nan") if r.share is None else r.share,
