@@ -146,7 +146,7 @@ def test_a_delayed_same_day_input_does_not_change_the_provisional_record(engine,
     assert at_close["minutes_after_close"] == 15.0
     lineage = late["source_lineage"]["availability_cutoff"]
     assert lineage["at"] == "2026-11-20T21:00:00+00:00" and set(lineage["reads"]) == {
-        "raw_series", "fred_vintages", "dealer_gex_daily", "resolved_series"}
+        "raw_series", "fred_vintages", "dealer_gex_daily", "resolved_series", "kxfed"}
 
 
 def test_the_decision_record_still_reads_to_the_end_of_its_day(engine):

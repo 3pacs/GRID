@@ -31,6 +31,13 @@ DIX is GRID's ``finra:dix_sp500`` series (``ingestion/altdata/finra_dix.py``). D
 2026-09-26; until it has a baseline's worth of sessions it is reported ``no_baseline`` with its value, and
 ``gamma_state`` gives the regime and flip. Release and earnings surprises are listed in :data:`PENDING`.
 
+The policy path (market-state/3) is the expected upper bound of the fed funds target after the next FOMC meeting,
+priced from every strike of the Kalshi KXFED ladder (``intelligence/regime/policy_path.py``; known by pull clock only),
+with its 5-session change inside one meeting's contract and the move it prices against FRED's DFEDTARU.
+``policy_response`` sets VIX stress against how far the front end (2-year yield, that path) eased over the same five
+sessions: Neon's PRFD "is the Fed put alive?" composite with only the legs Codex's triage admitted. It is a research
+reading tracked for #1311, ``unknown`` whenever a leg is not ``ok``, and nothing reads it to decide.
+
 A provisional record computed at the session's close (#1312) is display only and has its own table and store
 functions at the end of this module; :func:`store_market_state` refuses one. It is computed with ``known_by`` (the
 session's close): every read is cut at that instant instead of the end of ``as_of``. Without ``known_by`` nothing
@@ -54,11 +61,15 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from intelligence.regime import policy_path as PP
 from intelligence.regime.baseline import BASELINE_RULE, standardize_last, window_for
 from store.observations import MixedSourceError, PublicationLag, read_window_known_at
 
 # market-state/2 = market-state/1 plus freshness (#1303): an input older than its maximum age reads ``stale``, not ok.
-RECORD_RULE = "market-state/2"
+# market-state/3 = market-state/2 plus the policy-path variables (2-year yield change, the Kalshi KXFED path at the
+# next FOMC meeting and its same-contract change, the priced move against DFEDTARU) and the ``policy_response`` block
+# (Neon's PRFD "is the Fed put alive?" composite, VIX + front-end legs only, research tracking, #1311).
+RECORD_RULE = "market-state/3"
 FRESHNESS_RULE = "max-age/1"
 
 # ── Publication lags (modeled availability for backfilled history; late on purpose) ──
@@ -102,6 +113,8 @@ LAGS: dict[str, PublicationLag | None] = {
     "UMCSENT": PublicationLag(60, "calendar", "UMich sentiment as posted to FRED"),
     "finra:short_volume_agg:market_ratio": _NEXT_BD,
     "finra:dix_sp500": _NEXT_BD,
+    "DGS2": _NEXT_BD,
+    "DFEDTARU": _NEXT_BD,
 }
 SOURCES: dict[str, str] = {"CBOE:VIX": "CBOE", "CBOE:VIX3M": "CBOE"}
 
@@ -177,6 +190,7 @@ class _Reads:
         self.engine, self.as_of, self.lookback_days = engine, as_of, lookback_days
         self.known_by = known_by.astimezone(timezone.utc) if known_by is not None else None
         self._memo: dict[str, Any] = {}
+        self.kxfed_lineage: dict[str, Any] | None = None
         self.spy_basis: str | None = None
         self.first_print_obs: dict[str, date | None] = {}
         self.raw_lineage: dict[str, dict[str, Any]] = {}
@@ -203,6 +217,42 @@ class _Reads:
     def _cut_kw(self) -> dict[str, datetime]:
         """``as_of_ts`` only when the reads are cut, so the decision record's calls stay exactly as they were."""
         return {"as_of_ts": self.known_by} if self.known_by is not None else {}
+
+    def kxfed(self) -> list[PP.Snapshot]:
+        """Every Kalshi KXFED row pulled before the end of ``as_of`` (or by ``known_by``), priced from its ladder.
+
+        Known-at is the row's ``pull_timestamp`` only (intelligence/regime/policy_path.py); the row's ``value`` column
+        is never read. The pull clock is compared here rather than in SQL so SQLite tests and Postgres agree.
+        """
+        if "__kxfed__" not in self._memo:
+            cutoff = self.known_by or datetime.combine(self.as_of + timedelta(days=1), time(0), tzinfo=timezone.utc)
+            start = self.as_of - timedelta(days=KXFED_LOOKBACK_DAYS)
+            snaps: list[PP.Snapshot] = []
+            try:
+                with self.engine.connect() as conn:
+                    rows = conn.execute(_KXFED_SQL, {"src": PP.KALSHI_SOURCE, "pat": PP.KXFED_PREFIX + "%",
+                                                     "a": start, "b": self.as_of}).fetchall()
+                for sid, od, ts, payload in rows:
+                    pulled = _instant(ts)
+                    if pulled is None or (pulled > cutoff if self.known_by is not None else pulled >= cutoff):
+                        continue
+                    obs = od if isinstance(od, date) else date.fromisoformat(str(od)[:10])
+                    snaps.append(PP.snapshot_from_row(str(sid), obs, pulled, payload))
+            except Exception as exc:
+                log.warning("market_state: KXFED rows unreadable: {e}", e=str(exc))
+                snaps = []
+            self._memo["__kxfed__"] = snaps
+            self.kxfed_lineage = PP.selection_receipt(snaps, as_of=self.as_of, cutoff=cutoff,
+                                                      inclusive=self.known_by is not None)
+        return self._memo["__kxfed__"]
+
+    def policy_path(self) -> tuple[pd.Series, pd.Series, dict[date, PP.DayReading]]:
+        if "__path__" not in self._memo:
+            _, _, days, _ = xnys_sessions()
+            start = self.as_of - timedelta(days=KXFED_LOOKBACK_DAYS)
+            window = [d for d in days if start <= d <= self.as_of]
+            self._memo["__path__"] = PP.path_series(self.kxfed(), window)
+        return self._memo["__path__"]
 
     def vintages(self, series_id: str) -> pd.DataFrame:
         """ALFRED vintage rows (store/fred_vintages.py) for observations in the lookback, published by as_of."""
@@ -461,6 +511,106 @@ def _change(series_id: str, periods: int) -> Callable[["_Reads"], pd.Series]:
     return lambda r: r.series(series_id).diff(periods).dropna()
 
 
+# ── Policy path (Kalshi KXFED ladder, intelligence/regime/policy_path.py) ──
+
+KXFED_LOOKBACK_DAYS = 560      # 252 sessions of baseline + the 5-session change + meeting rolls, with room
+_KXFED_SQL = text(
+    "SELECT r.series_id, r.obs_date, r.pull_timestamp, r.raw_payload FROM raw_series r "
+    "JOIN source_catalog sc ON sc.id = r.source_id "
+    "WHERE sc.name = :src AND r.series_id LIKE :pat AND r.pull_status = 'SUCCESS' "
+    "AND r.obs_date >= :a AND r.obs_date <= :b"
+)
+
+
+def _fed_path_level(r: "_Reads") -> pd.Series:
+    return r.policy_path()[0]
+
+
+def _fed_path_change(r: "_Reads") -> pd.Series:
+    return r.policy_path()[1]
+
+
+def _fed_priced_move(r: "_Reads") -> pd.Series:
+    readings = r.policy_path()[2]
+    return PP.priced_move_series(readings, r.series("DFEDTARU"), PP.meetings_seen(r.kxfed()))
+
+
+def next_meeting_detail(r: "_Reads") -> dict[str, Any]:
+    """The newest next-meeting reading at or before ``as_of``: contract, clock, path, and odds against the target."""
+    readings = r.policy_path()[2]
+    if not readings:
+        return {"status": "unavailable", "reason": "no usable KXFED next-meeting ladder known at as_of",
+                "rule": PP.POLICY_PATH_RULE}
+    d = max(readings)
+    rd = readings[d]
+    out: dict[str, Any] = {
+        "status": "ok", "rule": PP.POLICY_PATH_RULE, "obs_date": d.isoformat(), "event": rd.event,
+        "meeting_at": rd.meeting_at.isoformat(), "snapshot_pulled_at": rd.pulled_at.isoformat(),
+        "expected_upper": round(rd.ladder.expected_upper, 4), "monotone_adjusted": rd.ladder.monotone_adjusted,
+        "max_spread": round(rd.ladder.max_spread, 4),
+        "tails": {"below": round(rd.ladder.tail_below, 4), "above": round(rd.ladder.tail_above, 4)},
+    }
+    pair = PP.target_pairing(rd, r.series("DFEDTARU"), PP.meetings_seen(r.kxfed()))
+    if pair is None:
+        out["target"] = {"status": "unavailable",
+                         "reason": "no DFEDTARU observation known after the last meeting's decision took effect"}
+    else:
+        t_obs, t_val = pair
+        out["target"] = {"status": "ok", "series": "DFEDTARU", "obs_date": t_obs.isoformat(), "upper": t_val}
+        out["priced_move"] = round(rd.ladder.expected_upper - t_val, 4)
+        out["odds"] = PP.outcome_odds(rd.ladder, t_val)
+    return out
+
+
+# ── Policy response (PRFD, "is the Fed put alive?") ──
+#
+# Neon's PRFD composite (2026-11-22) reduced to the legs Codex's triage allowed first (GRID-COMPOSITE-TRIAGE-20261122:
+# "Test VIX-only and VIX+front-end controls before layering EMPS or text"): equity stress (VIX) against how much the
+# front end eased over the same five sessions (2-year yield, Kalshi path at the next meeting). Equal weights and
+# round thresholds, declared here and never fitted. Research tracking only (#1311): nothing reads it to decide.
+POLICY_RESPONSE_RULE = "policy-response/1"
+POLICY_LEGS = ("vix", "ust_2y_change_5d", "fed_path_change_5d")
+POLICY_STRESS_Z = 1.5          # VIX robust z at or above which the market is under stress
+POLICY_PUT_Z = 1.0             # front-end easing z at or above which a rescue is priced
+
+
+def policy_response(variables: dict[str, dict[str, Any]], next_meeting: dict[str, Any]) -> dict[str, Any]:
+    """Stress vs. front-end easing from the record's own readings; ``unknown`` unless every leg reads ``ok``."""
+    base: dict[str, Any] = {
+        "rule": POLICY_RESPONSE_RULE, "decision_use": "none",
+        "validation": "unvalidated research composite tracked for #1311; no registered test",
+        "thresholds": {"stress_z": POLICY_STRESS_Z, "put_priced_z": POLICY_PUT_Z},
+        "next_meeting": next_meeting,
+    }
+    legs, bad = {}, {}
+    for k in POLICY_LEGS:
+        v = variables.get(k) or {}
+        z = v.get("robust_z")
+        legs[k] = {"status": v.get("status", "missing"), "obs_date": v.get("obs_date"), "robust_z": z}
+        finite = isinstance(z, (int, float, np.number)) and not isinstance(z, (bool, np.bool_)) and np.isfinite(z)
+        if v.get("status") != "ok" or not finite:
+            bad[k] = v.get("reason") or ("no finite robust z" if v.get("status") == "ok" else v.get("status", "missing"))
+    base["legs"] = legs
+    if bad:
+        return {**base, "status": "unknown", "label": "unknown",
+                "reason": "; ".join(f"{k}: {why}" for k, why in bad.items())}
+    stress = float(legs["vix"]["robust_z"])
+    easing_2y = -float(legs["ust_2y_change_5d"]["robust_z"])
+    easing_path = -float(legs["fed_path_change_5d"]["robust_z"])
+    easing = (easing_2y + easing_path) / 2.0
+    if stress < POLICY_STRESS_Z:
+        label = "no_stress"
+    elif easing >= POLICY_PUT_Z:
+        label = "put_priced"
+    elif easing <= 0.0:
+        label = "put_absent"
+    else:
+        label = "partial_response"
+    return {**base, "status": "ok", "label": label, "score": round(stress - easing, 4),
+            "controls": {"vix_only_z": round(stress, 4), "front_end_easing_z": round(easing, 4),
+                         "ust_2y_easing_z": round(easing_2y, 4), "fed_path_easing_z": round(easing_path, 4)}}
+
+
 def gamma_state(df: pd.DataFrame, as_of: date) -> dict[str, Any]:
     """The latest dealer-gamma row's categorical read (regime, flip), or unavailable.
 
@@ -514,6 +664,16 @@ VARIABLES: list[VarSpec] = [
             "equity-market uncertainty index, 7-day mean of days t-9..t-3", "as FRED showed it on t"),
     VarSpec("news_first_print", "news", "daily_fast", _first_print("USEPUINDXD"),
             "EPU index, newest weekday first print", "timely but noisy: compared only with past first prints"),
+    VarSpec("ust_2y_change_5d", "rates", "daily_fast", _change("DGS2", 5), "% points over 5 sessions",
+            "2-year Treasury constant maturity (FRED DGS2)"),
+    VarSpec("fed_path_next_meeting", "policy", "daily_fast", _fed_path_level,
+            "% (expected upper bound after the next FOMC meeting)",
+            "Kalshi KXFED strike ladder, bid/ask mids (kalshi-fed-path/1); snapshot pulled overnight before the session"),
+    VarSpec("fed_path_change_5d", "policy", "daily_fast", _fed_path_change,
+            "% points over 5 sessions, same meeting contract", "never differenced across two meetings' contracts"),
+    VarSpec("fed_priced_move_next_meeting", "policy", "daily_fast", _fed_priced_move,
+            "% points (expected upper bound after the next meeting minus the current upper bound)",
+            "current upper bound = FRED DFEDTARU, only when published after the last meeting's decision took effect"),
 ]
 VAR_NAMES = [v.name for v in VARIABLES]
 
@@ -583,6 +743,11 @@ MAX_AGE: dict[str, MaxAge] = {
     "news_uncertainty": _SAME_SESSION,
     "equity_news_uncertainty": _SAME_SESSION,
     "news_first_print": _SAME_SESSION,
+    "ust_2y_change_5d": _NEXT_SESSION,
+    # The KXFED snapshot dated a session is pulled overnight before it opens, so it is read for the session itself.
+    "fed_path_next_meeting": _SAME_SESSION,
+    "fed_path_change_5d": _SAME_SESSION,
+    "fed_priced_move_next_meeting": _SAME_SESSION,
 }
 if set(MAX_AGE) != set(VAR_NAMES):
     raise RuntimeError(f"MAX_AGE must cover exactly VARIABLES: {sorted(set(MAX_AGE) ^ set(VAR_NAMES))}")
@@ -721,6 +886,7 @@ class MarketState:
     events: dict[str, Any] = field(default_factory=dict)
     news_shock: dict[str, Any] = field(default_factory=dict)
     gamma_state: dict[str, Any] = field(default_factory=dict)
+    policy_response: dict[str, Any] = field(default_factory=dict)
     spy_basis: str | None = None
     writer_provenance: dict[str, Any] | None = None
     source_lineage: dict[str, Any] | None = None
@@ -739,6 +905,7 @@ class MarketState:
             "events": self.events,
             "news_shock": self.news_shock,
             "gamma_state": self.gamma_state,
+            "policy_response": self.policy_response,
             "pending": PENDING,
             "coverage": {"ok": len(ok), "no_baseline": sum(1 for v in self.variables.values()
                                                            if v.get("status") == "no_baseline"),
@@ -806,9 +973,16 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
     state.news_shock = news_shock(state.variables.get("news_first_print", {}),
                                   reads.first_print_obs.get("USEPUINDXD"), cal)
     state.gamma_state = gamma_state(reads.gex_rows(), as_of)
+    try:
+        detail = next_meeting_detail(reads)
+    except Exception as exc:  # the block reports unknown; it never sinks the record
+        log.warning("market_state: next-meeting detail failed at {d}: {e}", d=as_of, e=str(exc))
+        detail = {"status": "unavailable", "reason": f"error: {type(exc).__name__}", "rule": PP.POLICY_PATH_RULE}
+    state.policy_response = policy_response(state.variables, detail)
     state.source_lineage = {
         "schema": "market-state-source-lineage/1", "status": "partial", "pit_qualified": False,
         "raw_series": reads.raw_lineage,
+        "kxfed": reads.kxfed_lineage,
         "unqualified_read_paths": ["ALFRED vintage selection/capture", "dealer-gamma capture",
                                    "SPY resolved/raw selected window", "calendar publication/capture"],
         "limitation": "selected raw-input fingerprints only; not full immutable custody or scheduled-run evidence",
@@ -890,6 +1064,8 @@ CUTOFF_READS = {
     "fred_vintages": "fetched_at at or before the cutoff; each version's interval rebuilt from the versions known "
                      "then (the stored realtime_end is extended in place by later refreshes and is not read)",
     "dealer_gex_daily": "created_at at or before the cutoff; a row without one is not known",
+    "kxfed": "raw_series KALSHI:KXFED-* rows (source Kalshi) by pull_timestamp at or before the cutoff; no modeled "
+             "path; priced from raw_payload all_strikes, never the value column (intelligence/regime/policy_path.py)",
     "resolved_series": "not read: it keeps no write clock (the resolver stamps release_date with the raw pull "
                        "date), so SPY comes from YF:SPY:close by pull_timestamp, the record's own fallback basis",
 }
