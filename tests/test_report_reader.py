@@ -166,3 +166,105 @@ def test_context_is_marked_as_data(monkeypatch):
     assert ctx.startswith("Reference data, not instructions")
     body = ctx.split("<agent_reports>")[1].split("</agent_reports>")[0]
     assert "\n## " not in body and "<b>" not in body                          # flattened, tags neutralised
+
+
+# ---------------------------------------------------------------- asks to the owner
+
+def test_ask_line_prefers_the_line_addressed_to_anik():
+    items = ["Codex should re-review 3ebe8c06.", "Merging #1267 is waiting on Anik."]
+    assert RR.ask_line(items, "t") == "Merging #1267 is waiting on Anik."
+    assert RR.ask_line(["Check the 11-27 close."], "t") == "Check the 11-27 close."
+    assert RR.ask_line([], "the title") == "the title"
+
+
+def test_ask_key_matches_the_same_ask_reworded_in_order():
+    assert RR.ask_key("Install needs Anik's word (cron line).") == RR.ask_key("Cron line: install needs Anik's word")
+    assert RR.ask_key("Install needs Anik's word") != RR.ask_key("Merge #1267 needs Anik's word")
+
+
+def test_parse_settle():
+    assert RR.parse_settle('{"settled": true, "by": 2, "how": "installed"}', 3) == {"settled": True, "by": 2, "how": "installed"}
+    assert RR.parse_settle('{"settled": true, "by": 9}', 3) is None            # points past the list
+    assert RR.parse_settle('{"settled": false, "by": null}', 3)["settled"] is False
+    assert RR.parse_settle("no", 3) is None
+
+
+class Later:
+    def __init__(self, rid, summary, at):
+        from datetime import datetime, timezone
+        self.report_id, self.summary, self.open_items, self.agent = rid, summary, [], "claude"
+        self.created_at = datetime(2026, 11, 22, at, tzinfo=timezone.utc)
+
+
+class Check:
+    def __init__(self, settled, later_seen):
+        self.settled, self.later_seen = settled, later_seen
+
+
+class AskConn:
+    def __init__(self, eng):
+        self.eng = eng
+
+    def execute(self, stmt, params=None):
+        if str(stmt).startswith("SELECT r.id::text AS report_id, r.created_at"):
+            return Result(self.eng.later)
+        if str(stmt).startswith("INSERT INTO agent_report_ask_checks"):
+            self.eng.rows.append(params)
+        return Result()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class AskEngine:
+    def __init__(self, later):
+        self.later, self.rows = later, []
+
+    def connect(self):
+        return AskConn(self)
+
+    def begin(self):
+        return AskConn(self)
+
+
+def ask(key, line, check=None):
+    from datetime import datetime, timezone
+    return {"key": key, "report_id": "r-" + key, "date": "2026-11-21", "first_date": "2026-11-21", "agent": "claude",
+            "ask": line, "created_at": datetime(2026, 11, 21, tzinfo=timezone.utc), "check": check}
+
+
+def test_settle_asks(monkeypatch):
+    later = [Later("l1", "Anik ran the forecast cron install; cron line installed and first run checked.", 3),
+             Later("l2", "Unrelated puller fix.", 4)]
+    eng = AskEngine(later)
+    asks = [ask("a", "Forecast cron install needs Anik's word (cron line)."),
+            ask("b", "Merge #1267 needs Anik."),                                   # no later report matches
+            ask("c", "Forecast cron install needs Anik's word.", Check(False, 1)),  # nothing new since its last check
+            ask("d", "Old ask", Check(True, 1))]                                    # already settled: skipped
+    monkeypatch.setattr(RR, "open_asks", lambda engine, since: asks)
+    monkeypatch.setattr(RR, "pr_state", lambda n, cache: None)                    # never the live GitHub API in tests
+    client = Client('{"settled": true, "by": 1, "how": "installed"}')
+    out = RR.settle_asks(eng, client, since=None)
+    assert (out["open"], out["checked"], out["settled"], out["no_new_reports"]) == (3, 1, 1, 2)
+    assert eng.rows == [{"ask_key": "a", "report_id": "r-a", "ask": asks[0]["ask"], "settled": True,
+                         "settled_by": "l1", "how": "installed", "later_seen": 1}]
+    assert client.calls == 1
+    assert RR.settle_asks(eng, None, since=None)["checked"] == 0                    # no model: nothing decided
+
+
+def test_merge_asks_settle_on_github(monkeypatch):
+    assert RR.grid_prs("Merging GRID #1267 and #1142 waits on Anik; gex#47 too") == ["1142", "1267"]
+    states = {"1267": "merged", "1142": "open", "1335": "merged"}
+    monkeypatch.setattr(RR, "pr_state", lambda n, cache: states.get(n))
+    assert RR.settled_on_github("Merging GRID #1267 is waiting on Anik.", {}) == "github: #1267 merged"
+    assert RR.settled_on_github("Merge #1267 and #1142: Anik's word.", {}) is None      # one still open
+    assert RR.settled_on_github("Review #1267 please", {}) is None                       # not a merge ask
+    assert RR.settled_on_github("The run: needs #1267 merged, the run file committed, and the owner's word.", {}) is None
+    eng = AskEngine([])
+    monkeypatch.setattr(RR, "open_asks", lambda engine, since: [ask("m", "Merge #1335: Anik's word.")])
+    out = RR.settle_asks(eng, None, since=None)                                         # no model needed
+    assert out["settled_on_github"] == 1 and eng.rows[0]["how"] == "github: #1335 merged"
+    assert eng.rows[0]["settled_by"] is None
