@@ -280,8 +280,9 @@ ingest enforces; the grader constructs rows so they pass by construction):
   re-extracts instead of inheriting a weaker one's answer.
 - `market_briefings` narratives are mostly descriptive ("The VIX stands at 28.18"): every
   current-state figure on a series the generator reads (`ollama/market_briefing.py` key_series:
-  VIX, VIX9D, VIX3M, S&P 500, Nasdaq, Dow, Russell 2000, HYG/LQD/JNK/EMB, GLD, UUP, T10Y2Y,
-  T10Y3M, DFF, DGS2, DGS5) becomes a `data_quality` row judged on whether the number was real
+  VIX, VIX9D, VIX3M, S&P 500, Nasdaq, Dow, Russell 2000, HYG/LQD/JNK/EMB, EEM, FXE, FXY, GLD, UUP,
+  T10Y2Y, T10Y3M, DFF, DGS2, DGS5, DGS10 (read from `yc_10y` while the bare FRED pull is stale), T5YIE,
+  UNRATE with a 100-day label window) becomes a `data_quality` row judged on whether the number was real
   at the instant it was stated, from every capture GRID holds around it
   (`store.observations.read_vintages`: intraday pulls, the completed close, the session's
   high/low, later revisions). During a session: nearby captures (within 90 minutes) and
@@ -302,7 +303,30 @@ ingest enforces; the grader constructs rows so they pass by construction):
   older known closes are stale/partial. These retain the prior limitation that release
   timing/revisions and explicit "current" versus "close" wording require further work.
   Grader confidence remains a heuristic, not a calibrated accuracy probability.
-  Derived quantities (z-scores, momentum, ratios, moves in %) are skipped.
+  Derived quantities (z-scores, momentum, ratios, moves in %) are skipped; so is a name on either
+  side of "/" ("VIX/VIX3M=0.90"), and a stated level outside 0.2x-5x of what GRID holds for the
+  series (spreads exempt) is `unscorable`, never refuted.
+- Realized moves (grader `v4`): the diary's WHAT HAPPENED section and a briefing's `## What Changed`
+  restate one session ("the S&P 500 fell 1.92% to 7416.59"). Each such sentence on the diary's
+  instruments (indices, VIX, SPY, sector ETFs, UUP, TLT; Gold/Crude only in the diary) is a
+  `data_quality` row graded on the diary's basis, yfinance `YF:<ticker>:close` raw closes:
+  close(session)/close(previous session) - 1 and the stated close, at the printed precision.
+  `confirmed` only when both completed closes were captured at or before `stated_at`; a match on
+  later captures is `partially_confirmed` with `knowable_at_stated_at=false`; a mismatch on later
+  captures is `unscorable`. Multi-day windows ("over 5 days", "this week", "year-to-date"),
+  hedged numbers ("approximately", "respectively") and briefings stated during the session are not
+  graded.
+- LLM `level` claims are graded only when the span carries a forecast verb or horizon and the
+  number is within 0.2x-5x of the instrument's last close; otherwise `unscorable` ("describes a
+  return/score, not a close level"). An LLM row whose span contains a deterministically graded
+  figure or move is dropped. Unpriced GRID-internal quantities get their own reasons ("GRID-internal
+  signal; no external truth", "GRID-internal derived statistic").
+- Every unscorable row carries a cause key, counted per day as `unscorable_by_cause` (with
+  `records_withheld`) in the grader receipt and in the header's free-form `grader` object; the
+  withheld placeholder row stays, so `claims_unscorable` still equals the unscorable rows. A
+  `--dry-run --json` receipt lists `verdict_changes` (each row whose verdict would change against
+  the file on disk) without writing or ingesting anything.
+- Grader `v4-causes-moves` (after `v3-range-pairing`) rewrites each day in the lookback once.
 - Grader `v3-range-pairing` (after `v2-corroboration`) changes verdict semantics only; the version
   bump changes every review header, so the next run rewrites each day in the lookback window.
 - Grader `v2-corroboration` changes verdict semantics only. Regrading follows the existing

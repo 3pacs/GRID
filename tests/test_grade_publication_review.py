@@ -44,7 +44,7 @@ THESIS_TEXT = ("Markets look flat — nobody's confident either way.\nHere's why
 WITHHELD_TEXT = ("**AI narrative withheld: unsupported source interpretation. Data summary only.**\n\n"
                  "# GRID Market Briefing — 2026-11-07T00:17:36 (assembly time)\n\n## Equities\n- equities:^GSPC: raw value=7353.73\n")
 NARRATIVE_TEXT = ("SPY should close higher today as dealers are short gamma into the open. "
-                  "We expect QQQ to finish above 600 by the close. "
+                  "We expect QQQ to finish above 7000 by the close. "
                   "The move is caused by the Fed's balance sheet runoff.\n\n## Equities\n- data\n")
 CLOSES = {date(2026, 11, 4): 7260.0, date(2026, 11, 5): 7300.0, date(2026, 11, 6): 7320.0,
           date(2026, 11, 9): 7400.0, date(2026, 11, 10): 7380.0, date(2026, 11, 11): 7390.0}
@@ -295,8 +295,8 @@ def test_narrative_briefing_claims_are_extracted_validated_and_graded(tmp_path, 
     reply = json.dumps([
         {"span": "SPY should close higher today as dealers are short gamma into the open.", "claim_type": "direction",
          "instrument": "SPY", "direction": "bullish", "horizon": "close"},
-        {"span": "We expect QQQ to finish above 600 by the close.", "claim_type": "level", "instrument": "QQQ",
-         "comparator": ">", "level": 600, "horizon": "close"},
+        {"span": "We expect QQQ to finish above 7000 by the close.", "claim_type": "level", "instrument": "QQQ",
+         "comparator": ">", "level": 7000, "horizon": "close"},
         {"span": "The move is caused by the Fed's balance sheet runoff.", "claim_type": "causal", "instrument": None},
         {"span": "not in the text at all, a paraphrase", "claim_type": "direction", "instrument": "SPY", "direction": "bullish"},
         {"span": "Bitcoin will rip higher into the weekend close.", "claim_type": "direction", "instrument": "BTC", "direction": "bullish"},
@@ -314,7 +314,7 @@ def test_narrative_briefing_claims_are_extracted_validated_and_graded(tmp_path, 
     assert spy["verdict"] == "partially_confirmed" and spy["thesis_direction"] == "bullish" and spy["actual_direction"] == "neutral"
     assert spy["horizon_end"] == grader.iso(grader.session_close_utc(date(2026, 11, 6)))
     qqq = next(r for r in rows if r["instrument"] == "QQQ")
-    assert qqq["verdict"] == "confirmed" and qqq["claim_type"] == "level"     # 7320 > 600 (stub closes are shared)
+    assert qqq["verdict"] == "confirmed" and qqq["claim_type"] == "level"     # 7320 > 7000 (stub closes are shared)
     causal = next(r for r in rows if r["claim_type"] == "causal")
     assert causal["verdict"] == "unresolved" and causal["evidence"] == []
     btc = next(r for r in rows if "Bitcoin" in r["claim_span"])
@@ -384,12 +384,12 @@ def test_week_horizon_resolves_inside_the_default_lookback():
 
 def test_level_claim_unresolved_before_its_horizon(closes):
     p = grader.Publication("market_briefings:7", "market_briefings", T_FRI_PRE_CLOSE, NARRATIVE_TEXT, sha(NARRATIVE_TEXT), {})
-    row = grader.grade_level(object(), p, "We expect QQQ to finish above 600 by the close.", "QQQ", ">", 600.0,
+    row = grader.grade_level(object(), p, "We expect QQQ to finish above 7000 by the close.", "QQQ", ">", 7000.0,
                              date(2026, 11, 6), datetime(2026, 11, 6, 19, 0, tzinfo=timezone.utc))
     assert row["verdict"] == "unresolved" and row["horizon_end"] == grader.iso(grader.session_close_utc(date(2026, 11, 6)))
-    refuted = grader.grade_level(object(), p, "We expect QQQ to finish above 600 by the close.", "QQQ", "<", 600.0,
+    refuted = grader.grade_level(object(), p, "We expect QQQ to finish above 7000 by the close.", "QQQ", "<", 7000.0,
                                  date(2026, 11, 6), GRADED_LATE)
-    assert refuted["verdict"] == "refuted" and "needed < 600" in refuted["root_cause"]
+    assert refuted["verdict"] == "refuted" and "needed < 7000" in refuted["root_cause"]
 
 
 @pytest.mark.parametrize("reply, reason", [
@@ -1135,5 +1135,310 @@ def test_read_vintages_carries_the_pull_run_id_only_as_a_string():
     assert [o.pull_run_id for o in out] == ["abc123", None, None, None]
 
 
-def test_grader_version_moved_with_the_pairing_rule():
-    assert grader.GRADER_VERSION == "grid/grade_publication_review-v3-range-pairing"
+def test_grader_version_moved_with_the_unscorable_fixes():
+    # v4: return/score levels refused, figure set widened, realized moves graded, unscorable causes counted.
+    # A new version rewrites every day in the lookback once (the header's grader.model changes).
+    assert grader.GRADER_VERSION == "grid/grade_publication_review-v4-causes-moves"
+
+
+# ── v4: no return/score level refuted against a close ─────────────────────────────────────
+
+TEXT_5116 = ("## What Changed\n*   **Momentum:** SPY 5-day return is -0.63% and 20-day return is -3.65%, driving a "
+             "negative momentum score of -0.37.\n*   **Breadth:** 55% of sector ETFs are positive, a mildly positive "
+             "breadth score (+0.09).\n*   **Credit:** HYG/LQD ratio change is -1.17%, scored as risk-off (-0.23).\n"
+             "*   **Insider Activity:** 264 buys vs. 875 sells (ratio 23%), resulting in a negative insider score of -0.54.\n"
+             "*   **Social:** NVDA has high social mentions (1314) but neutral sentiment (0.542 bull ratio).\n\n"
+             "## Equities\n- data\n")
+SPAN_5116 = "SPY 5-day return is -0.63% and 20-day return is -3.65%, driving a negative momentum score of -0.37."
+
+
+def _pub(text: str, at: datetime, pid: str = "market_briefings:5116", **record) -> "grader.Publication":
+    return grader.Publication(pid, pid.split(":")[0], at, text, sha(text), record)
+
+
+def test_market_briefings_5116_return_is_not_graded_as_a_close_level(tmp_path, closes):
+    """The false refutation of 2026-11-11: the model read "SPY 5-day return is -0.63%" as "SPY < 0"
+    (horizon week) and grade_level refuted it against SPY's close."""
+    reply = json.dumps([{"span": SPAN_5116, "claim_type": "level", "instrument": "SPY", "comparator": "<", "level": 0.0,
+                         "horizon": "week", "direction": "bearish"}])
+    p = _pub(TEXT_5116, datetime(2026, 11, 6, 11, 2, tzinfo=timezone.utc))
+    rows, _ = grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: FakeClient(reply))
+    [row] = [r for r in rows if r["claim_span"] == SPAN_5116]
+    assert row["verdict"] == "unscorable" and row["evidence"] == []
+    assert row["root_cause"].startswith("describes a return/score, not a close level")
+    assert row[grader.CAUSE_KEY] == "not_a_close_level"
+
+
+def test_level_claim_needs_a_forecast_and_the_price_scale(closes):
+    p = _pub("x" * 20, T_FRI_PRE_CLOSE, "market_briefings:9")
+    session = date(2026, 11, 6)
+    no_forecast = grader.grade_level(object(), p, "QQQ is above 7000 today.", "QQQ", ">", 7000.0, session, GRADED_LATE)
+    assert no_forecast["verdict"] == "unscorable" and "no forecast verb or horizon" in no_forecast["root_cause"]
+    off_scale = grader.grade_level(object(), p, "QQQ will close above 0.5 by the close.", "QQQ", ">", 0.5, session,
+                                   GRADED_LATE)
+    assert off_scale["verdict"] == "unscorable" and "outside 0.2x-5x" in off_scale["root_cause"]
+    assert grader.grade_level(object(), p, "QQQ will close above 7000.", "QQQ", ">", 7000.0, session,
+                              GRADED_LATE)["verdict"] == "confirmed"
+
+
+def test_level_claim_without_a_baseline_close_is_unscorable_not_wrong(closes):
+    closes.clear()
+    p = _pub("x" * 20, T_FRI_PRE_CLOSE, "market_briefings:9")
+    row = grader.grade_level(object(), p, "QQQ will close above 7000.", "QQQ", ">", 7000.0, date(2026, 11, 6), GRADED_LATE)
+    assert row["verdict"] == "unscorable" and "to check its scale" in row["root_cause"]
+
+
+def test_internal_signals_and_statistics_get_their_own_reason(tmp_path, closes):
+    reply = json.dumps([
+        {"span": "HYG/LQD ratio change is -1.17%, scored as risk-off (-0.23).", "claim_type": "direction",
+         "instrument": "HYG/LQD", "direction": "bearish"},
+        {"span": "264 buys vs. 875 sells (ratio 23%), resulting in a negative insider score of -0.54.",
+         "claim_type": "direction", "instrument": "insider activity", "direction": "bearish"},
+        {"span": "55% of sector ETFs are positive, a mildly positive breadth score (+0.09).", "claim_type": "level",
+         "instrument": "sector ETFs", "comparator": ">", "level": 50},
+        {"span": "NVDA has high social mentions (1314) but neutral sentiment (0.542 bull ratio).", "claim_type": "level",
+         "instrument": "NVDA", "level": 0.542},
+    ])
+    rows, _ = grader.grade_briefing(object(), _pub(TEXT_5116, T_FRI_PRE_CLOSE), GRADED_LATE, tmp_path,
+                                    lambda: FakeClient(reply))
+    reasons = {r["claim_span"][:12]: (r["verdict"], r["root_cause"]) for r in rows}
+    assert reasons["HYG/LQD rati"] == ("unscorable", "GRID-internal signal; no external truth")
+    assert reasons["264 buys vs."] == ("unscorable", "GRID-internal signal; no external truth")
+    assert reasons["55% of secto"] == ("unscorable", "GRID-internal derived statistic")
+    assert reasons["NVDA has hig"] == ("unscorable", "GRID-internal derived statistic")
+    # an unpriced instrument without such wording keeps the old reason
+    rows, _ = grader.grade_briefing(object(), _pub(NARRATIVE_TEXT.replace("\n\n## Equities", " Bitcoin will rip higher.\n\n## Equities"),
+                                                   T_FRI_PRE_CLOSE, "market_briefings:10"), GRADED_LATE, tmp_path,
+                                    lambda: FakeClient(json.dumps([{"span": "Bitcoin will rip higher.", "claim_type": "direction",
+                                                                    "instrument": "BTC", "direction": "bullish"}])))
+    assert any("no price series for instrument 'BTC'" in (r["root_cause"] or "") for r in rows)
+
+
+# ── v4: widened figures ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("text, series_id, span, stated", [
+    ("Implied volatility (VIX) stands at 28.44, a fear regime.", "YF:^VIX:close", "(VIX) stands at 28.44", 28.44),
+    ("while the 9-day VIX (29.26) exceeds", "YF:^VIX9D:close", "9-day VIX (29.26)", 29.26),
+    ("VIX is 19.46 with a 3-month tenor of 20.64, indicating", "YF:^VIX3M:close", "3-month tenor of 20.64", 20.64),
+    ("The 10Y-2Y yield curve spread is positive (+0.28%), normal.", "T10Y2Y", "10Y-2Y yield curve spread is positive (+0.28%)", 0.28),
+    ("The 10Y-2Y spread is -0.12% today.", "T10Y2Y", "10Y-2Y spread is -0.12%", -0.12),
+    ("The 10-year/2-year yield spread is positive at 0.25%, normal.", "T10Y2Y", "10-year/2-year yield spread is positive at 0.25%", 0.25),
+    ("While the 10-year to 2-year yield spread is positive at 0.30%, the", "T10Y2Y", "10-year to 2-year yield spread is positive at 0.30%", 0.30),
+    ("The 10-year Treasury yield is 4.95% (as of 2026-11-12).", "DGS10", "10-year Treasury yield is 4.95%", 4.95),
+    ("The 5-year inflation expectation (T5YIE) is 2.3%, anchored.", "T5YIE", "5-year inflation expectation (T5YIE) is 2.3%", 2.3),
+    ("The unemployment rate is 4.1% (as of 2026-10-01).", "UNRATE", "unemployment rate is 4.1%", 4.1),
+    ("The Fed funds rate (DFF) is 3.88%, neutral.", "DFF", "Fed funds rate (DFF) is 3.88%", 3.88),
+    ("Emerging market equity exposure (EEM) is at 60.92.", "YF:EEM:close", "(EEM) is at 60.92", 60.92),
+    ("The Euro (FXE) is at 101.71, and", "YF:FXE:close", "(FXE) is at 101.71", 101.71),
+    ("and the Yen (FXY) is at 57.38.", "YF:FXY:close", "(FXY) is at 57.38", 57.38),
+    ("contango (VIX 19.46 vs. VIX3M 20.64), no panic", "YF:^VIX:close", "VIX 19.46", 19.46),
+    ("Credit ETF prices (HYG 76.63, LQD 102.74) are observed", "YF:HYG:close", "HYG 76.63", 76.63),
+])
+def test_extract_figures_v4_forms(text, series_id, span, stated):
+    figs = grader.extract_figures(text)
+    hit = next(f for f in figs if f.figure.series_id == series_id)
+    assert (hit.span, hit.stated) == (span, stated) and hit.span in text
+
+
+@pytest.mark.parametrize("text", [
+    "Monitor the VIX tenor structure (currently in contango, VIX/VIX3M=0.90) for a shift.",   # a ratio
+    "The VIX term structure is in backwardation (VIX/VIX3M ratio 1.05).",
+    "the VIX tenor structure (9-day above 3-month) is inverted",                             # "(9-day" is a name
+    "VIX 30 days ago was calm",                                                             # bare, not a boundary
+    "Tech led: the Nasdaq 100, the Dow 30 and small caps.",                                 # index names, no level
+    "The 10Y-2Y spread moved by +0.04% this week.",                                         # a change
+    "The S&P 500 is at +1.2% on the day.",                                                  # signed price = move
+])
+def test_extract_figures_v4_refuses_ratios_tenors_and_moves(text):
+    assert [f.span for f in grader.extract_figures(text)] == []
+
+
+def test_dgs10_falls_back_to_yc_10y_and_monthly_unrate_reaches_back(vintages):
+    at = _z(date(2026, 11, 16), 7)
+    vintages["DGS10"] = [_o("DGS10", date(2026, 4, 2), 4.30, _z(date(2026, 4, 3), 12), "FRED")]   # stale bare pull
+    vintages["yc_10y"] = [_o("yc_10y", date(2026, 11, 12), 5.13, _z(date(2026, 11, 13), 22), "FRED")]
+    row = _judge("The 10-year Treasury yield is 4.95% today.", at)
+    assert row["verdict"] == "refuted" and row["instrument"] == "DGS10"
+    assert all("yc_10y" in e["source"] for e in row["evidence"])
+    vintages["UNRATE"] = [_o("UNRATE", date(2026, 10, 1), 4.1, _z(date(2026, 11, 7), 13), "FRED")]
+    assert _judge("The unemployment rate is 4.1% now.", at)["verdict"] == "confirmed"
+
+
+def test_figure_far_off_the_series_scale_is_unscorable_not_refuted(vintages):
+    vintages["YF:^VIX3M:close"] = [_o("YF:^VIX3M:close", THU, 20.64, _z(FRI, 4))]
+    row = _judge("The VIX3M at 0.90 is calm.", _z(FRI, 13))
+    assert row["verdict"] == "unscorable" and row[grader.CAUSE_KEY] == "off_scale"
+    assert "not the level" in row["root_cause"]
+    # a spread crosses zero: no scale guard
+    vintages["T10Y2Y"] = [_o("T10Y2Y", THU, 0.38, _z(FRI, 12), "FRED")]
+    assert _judge("The 10Y-2Y spread is at 0.02% today.", _z(date(2026, 11, 7), 1))["verdict"] == "refuted"
+
+
+def test_llm_row_containing_a_graded_figure_is_dropped(tmp_path, closes, vintages):
+    _vix(vintages, (THU, 19.46, _z(FRI, 4)))
+    vintages["YF:^VIX3M:close"] = [_o("YF:^VIX3M:close", THU, 20.64, _z(FRI, 4))]
+    text = ("## What's Happening Now\nVIX is 19.46 with a 3-month tenor of 20.64, indicating a contango term "
+            "structure (ratio 0.94).\n\n## Equities\n- data\n")
+    reply = json.dumps([{"span": "VIX is 19.46 with a 3-month tenor of 20.64, indicating a contango term structure (ratio 0.94).",
+                         "claim_type": "level", "instrument": "VIX", "level": 19.46}])
+    rows, _ = grader.grade_briefing(object(), _pub(text, _z(FRI, 13), "market_briefings:11"), GRADED_LATE, tmp_path,
+                                    lambda: FakeClient(reply))
+    assert sorted((r["claim_span"], r["verdict"]) for r in rows) == [("3-month tenor of 20.64", "confirmed"),
+                                                                    ("VIX is 19.46", "confirmed")]
+
+
+# ── v4: realized moves ("the S&P 500 fell 1.92% to 7416.59") ────────────────────────────
+
+DIARY_TEXT = ("### WHAT HAPPENED\nThe S&P 500 fell 1.92% to 7416.59, leading a broad risk-off session. Technology (XLK) "
+              "was the worst-performing sector, down 3.24%. Energy (XLE) and Industrials (XLI) showed resilience, "
+              "declining only 0.52% and 0.55% respectively. Materials (XLB) and Health Care (XLV) both fell approximately "
+              "2.05%. Crude Oil surged +2.55% to 88.74, while Gold slipped 0.86% to $3,853.00. The VIX rising 18.70% to "
+              "22.91.\n\n### WHY\nThe S&P 500 returning -1.92% was a surprise.\n\n---\n\n## Data Appendix\n"
+              "| S&P 500 | 7416.59 | -1.92% |\n")
+MON, TUE_DIARY = date(2026, 11, 16), datetime(2026, 11, 17, 5, 34, tzinfo=timezone.utc)
+FRI13 = date(2026, 11, 13)
+GRADED_V4 = datetime(2026, 11, 21, 11, 35, tzinfo=timezone.utc)
+
+
+def _closes_for(table, sid, prev_value, value, prev_at=None, at=None):
+    table[sid] = [_o(sid, FRI13, prev_value, prev_at or _z(date(2026, 11, 14), 5, 15)),
+                  _o(sid, MON, value, at or _z(date(2026, 11, 17), 5, 15))]
+
+
+def test_extract_moves_reads_the_diary_section_only_and_skips_hedged_numbers():
+    p = _pub(DIARY_TEXT, TUE_DIARY, "market_diary:38", date="2026-11-16")
+    got = [(m.instrument.label, m.pct, m.level, m.span) for m in grader.extract_moves(p, grader.narrative_window(DIARY_TEXT))]
+    assert got == [("S&P 500", -1.92, 7416.59, "S&P 500 fell 1.92% to 7416.59"),
+                   ("XLK", -3.24, None, "(XLK) was the worst-performing sector, down 3.24%"),
+                   ("Crude Oil", 2.55, 88.74, "Crude Oil surged +2.55% to 88.74"),
+                   ("Gold", -0.86, 3853.0, "Gold slipped 0.86% to $3,853.00"),
+                   ("VIX", 18.70, 22.91, "VIX rising 18.70% to 22.91")]
+    # "declining only 0.52% and 0.55% respectively", "both fell approximately", the WHY section and the
+    # appendix table are not read.
+
+
+@pytest.mark.parametrize("text", [
+    "## What Changed\nMomentum is negative, with SPY down 2.40% over 5 days and 4.82% over 20 days.\n",
+    "## What Changed\nThe S&P 500 is down 3.1% year-to-date.\n",
+    "## What Changed\nThe S&P 500 fell 1.2% this week.\n",
+    "## What Changed\nGold fell 1.2% overnight.\n",            # diary-only name in a briefing, and overnight
+    "## What Changed\nThe S&P 500 rose -0.4% on the day.\n",   # verb and sign disagree
+    "## What's Happening Now\nThe S&P 500 fell 1.2%.\n",       # not the restating section
+])
+def test_extract_moves_refuses_other_windows(text):
+    p = _pub(text, datetime(2026, 11, 17, 6, 2, tzinfo=timezone.utc), "market_briefings:5285")
+    assert grader.extract_moves(p, grader.narrative_window(text)) == []
+
+
+def _move_rows(vintages, closes_table=None):
+    p = _pub(DIARY_TEXT, TUE_DIARY, "market_diary:38", date="2026-11-16")
+    return {r["claim_span"].split(" ")[0]: r for r in
+            (grader.grade_move(object(), p, m) for m in grader.extract_moves(p, grader.narrative_window(DIARY_TEXT)))}
+
+
+def test_realized_move_confirmed_only_on_closes_captured_before_the_statement(vintages):
+    _closes_for(vintages, "YF:^GSPC:close", 7561.67, 7416.59)                       # -1.919 % -> "1.92%" at 2 dp
+    _closes_for(vintages, "YF:XLK:close", 100.0, 96.76)                              # -3.24 %
+    _closes_for(vintages, "YF:CL=F:close", 86.53, 88.74, at=_z(date(2026, 11, 17), 6))  # after the 05:34 diary
+    rows = _move_rows(vintages)
+    spx = rows["S&P"]
+    assert spx["verdict"] == "confirmed" and spx["knowable_at_stated_at"] is True and spx["claim_type"] == "data_quality"
+    assert [e["observed"].split(" ")[0] for e in spx["evidence"][:2]] == ["7561.67", "7416.59"]
+    assert rows["(XLK)"]["verdict"] == "confirmed"
+    crude = rows["Crude"]
+    assert crude["verdict"] == "partially_confirmed" and crude["knowable_at_stated_at"] is False
+    assert all(e["as_of"] <= grader.iso(GRADED_V4) for r in rows.values() for e in r["evidence"])
+
+
+def test_realized_move_refuted_on_known_closes_and_never_on_later_ones(vintages):
+    _closes_for(vintages, "YF:^GSPC:close", 7400.0, 7416.59)                       # +0.22 %, the diary said -1.92 %
+    _closes_for(vintages, "YF:^VIX:close", 19.3, 22.91)                            # +18.70 %, but the close says 22.91 vs 22.91
+    _closes_for(vintages, "YF:GC=F:close", 3880.0, 3700.0, at=_z(date(2026, 11, 17), 9))   # later capture, mismatch
+    rows = _move_rows(vintages)
+    assert rows["S&P"]["verdict"] == "refuted" and rows["S&P"]["root_cause"].endswith("the move differs")
+    assert rows["S&P"]["knowable_at_stated_at"] is True
+    assert rows["VIX"]["verdict"] == "confirmed"
+    gold = rows["Gold"]
+    assert gold["verdict"] == "unscorable" and gold[grader.CAUSE_KEY] == "move_unknowable"
+    assert rows["(XLK)"]["verdict"] == "unscorable" and rows["(XLK)"][grader.CAUSE_KEY] == "no_capture"
+
+
+def test_realized_move_level_and_rounding(vintages):
+    _closes_for(vintages, "YF:^GSPC:close", 7561.67, 7300.0)          # -3.46 %: move and close both wrong
+    _closes_for(vintages, "YF:XLK:close", 100.0, 96.75)               # -3.25 % vs "3.24%": within rounding distance
+    rows = _move_rows(vintages)
+    assert rows["S&P"]["verdict"] == "refuted" and "the move and close differ" in rows["S&P"]["root_cause"]
+    assert rows["(XLK)"]["verdict"] == "partially_confirmed" and "within rounding" in rows["(XLK)"]["root_cause"]
+
+
+def test_realized_move_needs_the_right_session(vintages):
+    _closes_for(vintages, "YF:^GSPC:close", 7561.67, 7416.59)
+    bad = _pub(DIARY_TEXT, TUE_DIARY, "market_diary:38", date="2026-11-17")          # not completed by 05:34Z
+    [row, *_] = [grader.grade_move(object(), bad, m) for m in grader.extract_moves(bad, DIARY_TEXT)]
+    assert row["verdict"] == "unscorable" and row[grader.CAUSE_KEY] == "no_session"
+    text = "## What Changed\nThe S&P 500 fell 1.92% to 7416.59 into the afternoon.\n\n## Equities\n- data\n"
+    live = _pub(text, _z(date(2026, 11, 17), 18), "market_briefings:5260")             # 13:00 ET, session open
+    [row] = [grader.grade_move(object(), live, m) for m in grader.extract_moves(live, text)]
+    assert row["verdict"] == "unscorable" and "intraday" in row["root_cause"]
+    after = _pub(text, _z(date(2026, 11, 17), 6), "market_briefings:5261")             # before the open: Monday's move
+    [row] = [grader.grade_move(object(), after, m) for m in grader.extract_moves(after, text)]
+    assert row["verdict"] == "confirmed"
+
+
+def test_diary_with_moves_has_no_nothing_extracted_row_and_drops_the_overlapping_figure(tmp_path, closes, vintages):
+    _closes_for(vintages, "YF:^GSPC:close", 7561.67, 7416.59)
+    text = "### WHAT HAPPENED\nThe S&P 500 closed at 7416.59, down 1.92%, a broad risk-off session.\n\n### WHY\nnone\n"
+    rows, _ = grader.grade_briefing(object(), _pub(text, TUE_DIARY, "market_diary:38", date="2026-11-16"), GRADED_V4,
+                                    tmp_path, lambda: FakeClient("[]"))
+    assert [(r["claim_span"], r["verdict"]) for r in rows] == [("S&P 500 closed at 7416.59, down 1.92%", "confirmed")]
+
+
+# ── v4: unscorable causes in the receipt and header.grader, accepted by the ingest ─────────
+
+def test_unscorable_causes_and_withheld_records_reach_header_and_receipt(tmp_path, closes, vintages):
+    _closes_for(vintages, "YF:^GSPC:close", 7561.67, 7416.59)
+    day = date(2026, 11, 17)
+    packet_root, review_root = tmp_path / "packets", tmp_path / "reviews"
+    diary = "### WHAT HAPPENED\nThe S&P 500 fell 1.92% to 7416.59 and Technology (XLK) dropped 3.24%.\n\n### WHY\nx\n"
+    write_packet(packet_root, day, [
+        pub("market_briefings:1", WITHHELD_TEXT, _z(day, 1), briefing_type="hourly"),
+        pub("market_briefings:2", WITHHELD_TEXT.replace("2026-11-07T00:17", "2026-11-07T01:17"), _z(day, 2)),
+        pub("market_diary:38", diary, TUE_DIARY, date="2026-11-16"),
+        pub("market_briefings:3", TEXT_5116, _z(day, 6)),
+    ])
+    reply = json.dumps([{"span": SPAN_5116, "claim_type": "level", "instrument": "SPY", "comparator": "<", "level": 0.0,
+                         "horizon": "week"}])
+    receipt = grader.grade_day(FakeEngine(), day, packet_root=packet_root, review_root=review_root, now=GRADED_V4,
+                               client_factory=lambda: FakeClient(reply), ingest=False)
+    assert receipt["state"] == "WRITTEN"
+    assert receipt["records_withheld"] == 2 and receipt["records_withheld_by_channel"] == {"market_briefings": 2}
+    assert receipt["unscorable_by_cause"]["withheld_narrative"] == 2
+    assert receipt["unscorable_by_cause"]["not_a_close_level"] == 1
+    assert receipt["rows_by_kind"]["realized_move"] == 2
+    lines = (review_root / day.isoformat() / "review.jsonl").read_text().splitlines()
+    header, rows = json.loads(lines[0]), [json.loads(line) for line in lines[1:]]
+    assert header["grader"]["unscorable_by_cause"] == receipt["unscorable_by_cause"]
+    assert header["grader"]["records_withheld"] == 2
+    assert sum(header["grader"]["unscorable_by_cause"].values()) == header["claims_unscorable"] == \
+        sum(1 for r in rows if r["verdict"] == "unscorable")
+    assert not any(k.startswith("_") for r in rows for k in r)            # private keys never reach the file
+    validation = validate_with_ingest(review_root, packet_root, day, GRADED_V4)   # no schema change needed
+    assert len(validation.accepted) == len(rows)
+    stored = json.loads(validation.header.grader_json)
+    assert stored["unscorable_by_cause"] == receipt["unscorable_by_cause"] and stored["records_withheld"] == 2
+
+
+def test_dry_run_reports_each_row_whose_verdict_would_change(tmp_path, closes, vintages):
+    day = date(2026, 11, 17)
+    packet_root, review_root = tmp_path / "packets", tmp_path / "reviews"
+    diary = "### WHAT HAPPENED\nThe S&P 500 fell 1.92% to 7416.59 today.\n\n### WHY\nx\n"
+    write_packet(packet_root, day, [pub("market_diary:38", diary, TUE_DIARY, date="2026-11-16")])
+    first = grader.grade_day(FakeEngine(), day, packet_root=packet_root, review_root=review_root, now=GRADED_V4,
+                             client_factory=lambda: FakeClient("[]"), ingest=False)
+    assert first["state"] == "WRITTEN"
+    _closes_for(vintages, "YF:^GSPC:close", 7561.67, 7416.59)
+    dry = grader.grade_day(FakeEngine(), day, packet_root=packet_root, review_root=review_root, now=GRADED_V4,
+                           client_factory=lambda: FakeClient("[]"), ingest=False, dry_run=True)
+    assert dry["state"] == "DRY_RUN" and dry["would_write"] is True
+    assert dry["verdict_changes"] == [{"publication_id": "market_diary:38", "claim_span": "S&P 500 fell 1.92% to 7416.59",
+                                       "before": "unscorable", "after": "confirmed", "root_cause": None}]
