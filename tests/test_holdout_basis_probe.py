@@ -244,13 +244,17 @@ def _make_sealed_registry(
     tmp_path: Path,
     *,
     study: str = "vs1-v9",
-    prereg_sha256: str = "9" * 64,
+    prereg_sha256: str | None = None,
     manifest_digest: str = "e" * 64,
     seal_discovery: bool = True,
     witness_discovery_frozen: bool = True,
     frozen_at: datetime = DISC_FROZEN_AT,
 ) -> tuple[Path, _LocalVault, str, str]:
     """Create a synthetic registry chain + off-host witness up to discovery_frozen (or earlier)."""
+    if prereg_sha256 is None:
+        from analysis import panel_insider_density_v9 as v9
+
+        prereg_sha256 = v9.PREREG_BODY_SHA256 if study == "vs1-v9" else "9" * 64
     log_dir = tmp_path / "registry"
     num = study.split("-v")[1]
     stem = f"granular_panel_prereg_v{num}"
@@ -418,7 +422,9 @@ def test_refuses_missing_allow_holdout(tmp_path):
         cli.main([
             "--manifest", str(manifest), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
             "--twelvedata-dir", str(tmp_path / "td"), "--tiingo-meta-dir", str(tmp_path / "meta"),
-            "--calendar-manifest", str(cal), "--as-of-ts", SNAPSHOT.isoformat(),
+            "--calendar-manifest", str(cal), "--submissions", str(tmp_path / "subs.csv"),
+            "--issuers", str(tmp_path / "issuers.json"), "--sic-map", str(tmp_path / "sic.jsonl"),
+            "--as-of-ts", SNAPSHOT.isoformat(),
             "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out"),
         ])
     assert "allow-holdout" in str(exc.value).lower() or "allow_holdout" in str(exc.value).lower()
@@ -455,7 +461,9 @@ def test_refuses_existing_out_directory(tmp_path, monkeypatch):
         cli.main([
             "--manifest", str(manifest), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
             "--twelvedata-dir", str(tmp_path / "td"), "--tiingo-meta-dir", str(tmp_path / "meta"),
-            "--calendar-manifest", str(cal), "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--calendar-manifest", str(cal), "--submissions", str(tmp_path / "subs.csv"),
+            "--issuers", str(tmp_path / "issuers.json"), "--sic-map", str(tmp_path / "sic.jsonl"),
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
             "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(existing),
         ])
     with pytest.raises(hb.HoldoutProbeRefused, match="exists|write-once"):
@@ -527,7 +535,9 @@ def test_refuses_read_outside_holdout_window(tmp_path):
             cli.main([
                 "--manifest", str(manifest), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
                 "--twelvedata-dir", str(tmp_path / "td"), "--tiingo-meta-dir", str(tmp_path / "meta"),
-                "--calendar-manifest", str(cal), "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+                "--calendar-manifest", str(cal), "--submissions", str(tmp_path / "subs.csv"),
+                "--issuers", str(tmp_path / "issuers.json"), "--sic-map", str(tmp_path / "sic.jsonl"),
+                "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
                 "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / f"o_{val}"),
                 flag, val,
             ])
@@ -683,15 +693,34 @@ def test_end_to_end_cli_outputs_window_holdout_tickers_subset_and_xlk_magnitudes
     )
     log_dir, vault, prereg, frozen_sha = _make_sealed_registry(tmp_path, manifest_digest=m_digest)
 
+    # Synthetic C1 submissions, issuers JSON, and SIC map (required by v6 §2.3, §8 — HOLD-N2).
+    issuers_path = tmp_path / "issuers.json"
+    sic_map_path = tmp_path / "sic_map.jsonl"
+    subs_path = tmp_path / "subs.csv"
+    issuers_meta = [{"ticker": t, "cik": 1000 + i, "current_tickers": [t]} for i, t in enumerate(admitted_in)]
+    issuers_path.write_text(json.dumps({"issuers": issuers_meta}), encoding="utf-8")
+    sic_map_path.write_text(
+        "".join(json.dumps({"cik": m["cik"], "sic": 7372, "name": f"{m['ticker']} Systems Inc"}) + "\n" for m in issuers_meta),
+        encoding="utf-8",
+    )
+    subs_path.write_text(
+        "accession_number,filing_date,issuer_cik,document_type,issuer_ticker\n"
+        + "".join(f"{m['cik']}-1,2019-06-01,{m['cik']},4,{m['ticker']}\n" for m in issuers_meta),
+        encoding="utf-8",
+    )
+
     monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
     monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: engine)
     monkeypatch.setattr(engine, "dispose", lambda: None)
+    monkeypatch.setattr(cli, "resolve_code_sha", lambda repo_root=cli.REPO: CODE_SHA)
 
     out = tmp_path / "holdout_probe_out"
     cli.main([
         "--manifest", str(manifest_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
         "--twelvedata-dir", str(td_dir), "--tiingo-meta-dir", str(meta_dir),
-        "--calendar-manifest", str(cal_path), "--as-of-ts", SNAPSHOT.isoformat(),
+        "--calendar-manifest", str(cal_path), "--submissions", str(subs_path),
+        "--issuers", str(issuers_path), "--sic-map", str(sic_map_path), "--unpinned-sic-map",
+        "--as-of-ts", SNAPSHOT.isoformat(),
         "--allow-holdout", "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(out),
     ])
 
@@ -997,3 +1026,132 @@ def test_discovery_probe_still_refuses_2020_and_later_reads(tmp_path):
                 conn, ["AAA"], benchmark="XLK", source="TIINGO",
                 lo=date(2011, 11, 2), hi=date(2020, 1, 1), as_of_ts=SNAPSHOT, vendors=vendors,
             )
+
+
+# --- 6. Follow-up guards: HOLD-N1, HOLD-N2, HOLD-N3, HOLD-N5 ---------------------------------------
+
+
+def test_calendar_regex_and_schema_imported_from_market_calendar():
+    from analysis import holdout_basis_probe as hb
+    from ingestion import market_calendar as mc
+
+    assert hb.CALENDAR_SCHEMA == mc.SCHEMA
+    assert hb.CALENDAR_VERSION_RE is mc.VERSION
+    assert hb.SESSION_KEY_RE is mc.KEY
+
+
+def test_cli_refuses_missing_submissions_issuers_or_sic_map_and_empty_sec_names_fails_closed(tmp_path, monkeypatch):
+    from analysis import holdout_basis_probe as hb
+    from scripts import run_holdout_basis_probe as cli
+
+    base = [
+        "--manifest", str(tmp_path / "m.json"),
+        "--log-dir", str(tmp_path / "reg"),
+        "--vault-repo", str(tmp_path / "vault"),
+        "--twelvedata-dir", str(tmp_path / "td"),
+        "--tiingo-meta-dir", str(tmp_path / "meta"),
+        "--calendar-manifest", str(tmp_path / "cal.json"),
+        "--submissions", str(tmp_path / "subs.csv"),
+        "--issuers", str(tmp_path / "issuers.json"),
+        "--sic-map", str(tmp_path / "sic.jsonl"),
+        "--as-of-ts", SNAPSHOT.isoformat(),
+        "--allow-holdout",
+        "--prereg-sha256", "9" * 64,
+        "--out", str(tmp_path / "out"),
+    ]
+    for omit in ("--submissions", "--issuers", "--sic-map"):
+        idx = base.index(omit)
+        trimmed = base[:idx] + base[idx + 2 :]
+        with pytest.raises(SystemExit) as exc:
+            cli.main(trimmed)
+        assert exc.value.code != 0
+
+    # Passing sec_names={} to run_holdout_probe must fail closed as entity_mismatch (never silently skip!).
+    series = {"AAA": _series(HO_SESSIONS, base=40.0), "XLK": _series(HO_SESSIONS, base=90.0)}
+    engine = _build_holdout_db(series)
+    td_dir = _write_td_dir(tmp_path / "td", series)
+    meta_dir = _write_tiingo_meta_dir(tmp_path / "meta", list(series))
+    cal = hb.load_calendar_manifest(_write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS))
+    m_path, _ = _write_manifest(tmp_path / "m.json", ["AAA"], {"AAA": "2010-01-04"})
+    manifest = hb.load_price_manifest(m_path)
+    vendors = hb.HoldoutVendorFiles(td_dir, meta_dir, lo=HO_LO, hi=HO_HI, boundary_anchor=cal.boundary_anchor)
+    with engine.connect() as conn:
+        probe = hb.run_holdout_probe(
+            conn, manifest=manifest, calendar=cal, lo=HO_LO, hi=HO_HI,
+            as_of_ts=SNAPSHOT, vendors=vendors, sec_names={},
+        )
+    assert probe["records"]["AAA"]["abstains"] is True
+    assert "entity_mismatch" in probe["records"]["AAA"]["reasons"]
+
+
+def test_cli_computes_code_sha_from_clean_git_tree_and_asserts_flag(tmp_path, monkeypatch):
+    from scripts import run_holdout_basis_probe as cli
+    import scripts.run_real_panel_scan as rps
+
+    # Create a real clean git repository in tmp_path.
+    repo = tmp_path / "clean_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--initial-branch=main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@grid.local"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "GRID Test"], check=True, capture_output=True)
+    (repo / "tracked.txt").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+    real_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    series = {"AAA": _series(HO_SESSIONS, base=41.0), "XLK": _series(HO_SESSIONS, base=95.0)}
+    engine = _build_holdout_db(series)
+    td_dir = _write_td_dir(tmp_path / "td", series)
+    meta_dir = _write_tiingo_meta_dir(tmp_path / "meta", list(series))
+    cal_path = _write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS)
+    manifest_path, m_digest = _write_manifest(tmp_path / "m.json", ["AAA"], {"AAA": "2010-01-04"})
+    log_dir, vault, prereg, _ = _make_sealed_registry(tmp_path, manifest_digest=m_digest)
+
+    issuers_path = tmp_path / "issuers.json"
+    sic_map_path = tmp_path / "sic_map.jsonl"
+    subs_path = tmp_path / "subs.csv"
+    issuers_path.write_text(json.dumps({"issuers": [{"ticker": "AAA", "cik": 1000, "current_tickers": ["AAA"]}]}), encoding="utf-8")
+    sic_map_path.write_text(json.dumps({"cik": 1000, "sic": 7372, "name": "AAA Systems Inc"}) + "\n", encoding="utf-8")
+    subs_path.write_text(
+        "accession_number,filing_date,issuer_cik,document_type,issuer_ticker\n1000-1,2019-06-01,1000,4,AAA\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cli, "REPO", repo)
+    monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+
+    base_args = [
+        "--manifest", str(manifest_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+        "--twelvedata-dir", str(td_dir), "--tiingo-meta-dir", str(meta_dir),
+        "--calendar-manifest", str(cal_path), "--submissions", str(subs_path),
+        "--issuers", str(issuers_path), "--sic-map", str(sic_map_path), "--unpinned-sic-map",
+        "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout", "--prereg-sha256", prereg,
+    ]
+
+    # (a) Omitting --code-sha computes HEAD automatically!
+    out_auto = tmp_path / "out_auto"
+    cli.main([*base_args, "--out", str(out_auto)])
+    rep_auto = json.loads((out_auto / "holdout_basis_report.json").read_text(encoding="utf-8"))
+    assert rep_auto["code_sha"] == real_head
+
+    # (b) Supplying matching --code-sha succeeds!
+    out_match = tmp_path / "out_match"
+    cli.main([*base_args, "--code-sha", real_head, "--out", str(out_match)])
+    rep_match = json.loads((out_match / "holdout_basis_report.json").read_text(encoding="utf-8"))
+    assert rep_match["code_sha"] == real_head
+
+    # (c) Supplying a free/mismatched --code-sha refuses!
+    wrong_sha = ("0" if real_head[0] != "0" else "1") + real_head[1:]
+    with pytest.raises(SystemExit, match="code.?sha|match"):
+        cli.main([*base_args, "--code-sha", wrong_sha, "--out", str(tmp_path / "out_bad_sha")])
+    assert not (tmp_path / "out_bad_sha").exists()
+
+    # (d) Dirty tracked file refuses!
+    (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="modified|dirty|code_sha"):
+        cli.main([*base_args, "--out", str(tmp_path / "out_dirty")])
+    assert not (tmp_path / "out_dirty").exists()

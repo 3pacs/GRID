@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dc_replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -476,6 +476,70 @@ def holdout_abstaining(holdout_probe: Mapping[str, Any] | None, entities: Iterab
     return sorted({str(t) for t in entities if str(t) in explicit or str(t) not in admitted})
 
 
+def apply_close_masks(
+    closes: pd.DataFrame,
+    universe: pd.DataFrame,
+    *,
+    benchmark: str,
+    window: str,
+    listed_from: Mapping[str, str] | None = None,
+    blank_before_listing: bool = False,
+    close_mask: Any = None,
+    abstain_tickers: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Apply pre-listing, C1 interval, and holdout-only abstention masks to closes."""
+    abstain = {str(t) for t in (abstain_tickers or ())}
+    if abstain and window != "holdout":
+        raise ValueError("abstain_tickers applies only to the holdout window")
+    out = closes
+    if blank_before_listing and listed_from:
+        out = out.copy()
+        for ticker, start in listed_from.items():
+            if ticker in out.columns and ticker != benchmark:
+                out.loc[out.index < pd.Timestamp(start), ticker] = np.nan
+    if close_mask is not None:
+        keep = close_mask(out, universe)
+        out = out.copy()
+        for ticker in keep.columns:
+            if ticker in out.columns and ticker != benchmark:
+                out.loc[~keep[ticker].reindex(out.index, fill_value=False).to_numpy(), ticker] = np.nan
+    if abstain:
+        out = out.copy()
+        for ticker in abstain:
+            if ticker in out.columns and ticker != benchmark:
+                out.loc[:, ticker] = np.nan
+    return out
+
+
+def _mask_abstaining_panel(panel: v1.TrialPanel, abstain: Iterable[str]) -> v1.TrialPanel:
+    """Blank abstaining entity columns on a TrialPanel copy, preserving subclass fields (e.g. v9 benchmark)."""
+    abstain_set = [t for t in abstain if t in panel.entities]
+    if not abstain_set:
+        return panel
+    abstain_cols = {panel.entities.index(t) for t in abstain_set}
+    label = panel.label.copy()
+    feature = panel.feature.copy()
+    momentum = panel.momentum.copy() if panel.momentum is not None else None
+    largest = panel.largest.copy() if panel.largest is not None else None
+    for j in abstain_cols:
+        label[:, j] = np.nan
+        feature[:, j] = np.nan
+        if momentum is not None:
+            momentum[:, j] = np.nan
+        if largest is not None:
+            largest[:, j] = np.nan
+    return dc_replace(
+        panel,
+        decision_at=list(panel.decision_at),
+        label_end=list(panel.label_end),
+        entities=list(panel.entities),
+        feature=feature,
+        label=label,
+        momentum=momentum,
+        largest=largest,
+    )
+
+
 def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: pd.DataFrame,
                        prices: v1.PricePanel, window: str, *,
                        blank_before_listing: bool = False,
@@ -505,22 +569,16 @@ def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: p
     ciks = list(universe["cik"].astype(int))
     groups = list(universe["sic_group"])
     listed = dict(getattr(prices.manifest, "listed_from", ()) or ())
-    if blank_before_listing:
-        closes = closes.copy()
-        for ticker, start in listed.items():
-            if ticker in closes.columns and ticker != benchmark:
-                closes.loc[closes.index < pd.Timestamp(start), ticker] = np.nan
-    if close_mask is not None:
-        keep = close_mask(closes, universe)
-        closes = closes.copy()
-        for ticker in keep.columns:
-            if ticker in closes.columns and ticker != benchmark:
-                closes.loc[~keep[ticker].reindex(closes.index, fill_value=False).to_numpy(), ticker] = np.nan
-    if abstain:
-        closes = closes.copy()
-        for ticker in abstain:
-            if ticker in closes.columns and ticker != benchmark:
-                closes.loc[:, ticker] = np.nan
+    closes = apply_close_masks(
+        closes,
+        universe,
+        benchmark=benchmark,
+        window=window,
+        listed_from=listed,
+        blank_before_listing=blank_before_listing,
+        close_mask=close_mask,
+        abstain_tickers=abstain,
+    )
     panels = {}
     for h in v1.HORIZONS:
         positions, labels, momentum = v1.relative_labels(closes, benchmark, tickers, h, window)
@@ -1152,25 +1210,7 @@ class Harness:
             abstain = holdout_abstaining(key.holdout_probe, panel.entities)
             if abstain:
                 all_abstaining.update(abstain)
-                abstain_cols = {panel.entities.index(t) for t in abstain}
-                label = panel.label.copy()
-                feature = panel.feature.copy()
-                momentum = panel.momentum.copy() if panel.momentum is not None else None
-                largest = panel.largest.copy() if panel.largest is not None else None
-                for j in abstain_cols:
-                    label[:, j] = np.nan
-                    feature[:, j] = np.nan
-                    if momentum is not None:
-                        momentum[:, j] = np.nan
-                    if largest is not None:
-                        largest[:, j] = np.nan
-                panel = TrialPanel(
-                    trial=panel.trial, window=panel.window, horizon=panel.horizon,
-                    decision_at=list(panel.decision_at), label_end=list(panel.label_end),
-                    entities=list(panel.entities), feature=feature, label=label,
-                    momentum=momentum, largest=largest,
-                    groups=list(getattr(panel, "groups", []) or []),
-                )
+                panel = _mask_abstaining_panel(panel, abstain)
             effective_panels[trial] = panel
             ic, _ = v1.rank_ic_series(panel.feature, panel.label)
             n = int(np.isfinite(ic).sum())
@@ -1596,19 +1636,25 @@ class Harness:
         if not sealed or snapshot is None or snapshot <= stamp(sealed[-1]["run_at"]):
             raise PermissionError("the holdout basis report must be produced after the discovery was sealed")
         prereg = report.get("prereg")
-        if isinstance(prereg, Mapping) and prereg.get("body_sha256") is not None:
-            if prereg.get("body_sha256") != self.prereg_sha256:
-                raise PermissionError(f"the holdout basis report prereg hash does not match {self.version}")
+        prereg_body_sha = prereg.get("body_sha256") if isinstance(prereg, Mapping) else None
+        if not v1._is_hex64(prereg_body_sha):
+            raise PermissionError(f"the holdout basis report must carry prereg.body_sha256 for {self.version}")
+        if prereg_body_sha != self.prereg_sha256:
+            raise PermissionError(f"the holdout basis report prereg hash does not match {self.version}")
         df_info = report.get("discovery_frozen")
-        if isinstance(df_info, Mapping) and df_info.get("sha256") is not None:
-            if df_info.get("sha256") != v1._record_sha256(sealed[-1]):
-                raise PermissionError("the holdout basis report names a different discovery_frozen record")
+        df_sha = df_info.get("sha256") if isinstance(df_info, Mapping) else None
+        if not v1._is_hex64(df_sha):
+            raise PermissionError("the holdout basis report must carry discovery_frozen.sha256")
+        if df_sha != v1._record_sha256(sealed[-1]):
+            raise PermissionError("the holdout basis report names a different discovery_frozen record")
         manifest_info = report.get("manifest")
-        if isinstance(manifest_info, Mapping) and manifest_info.get("digest") is not None:
-            inputs_sha = sealed[-1].get("inputs_frozen_sha256")
-            frozen_in = [r for r in v1._kind(records, "inputs_frozen") if v1._record_sha256(r) == inputs_sha]
-            if frozen_in and manifest_info.get("digest") != frozen_in[0]["inputs"].get("price_manifest_sha256"):
-                raise PermissionError("the holdout basis report names a different price manifest")
+        manifest_digest = manifest_info.get("digest") if isinstance(manifest_info, Mapping) else None
+        if not v1._is_hex64(manifest_digest):
+            raise PermissionError("the holdout basis report must carry manifest.digest")
+        inputs_sha = sealed[-1].get("inputs_frozen_sha256")
+        frozen_in = [r for r in v1._kind(records, "inputs_frozen") if v1._record_sha256(r) == inputs_sha]
+        if len(frozen_in) != 1 or manifest_digest != frozen_in[0]["inputs"].get("price_manifest_sha256"):
+            raise PermissionError("the holdout basis report names a different price manifest")
         admitted = sorted({str(t) for t in (report.get("admitted") or ())})
         abstaining_set = {str(t) for t in (report.get("abstaining") or ())}
         tickers_map = report.get("tickers")

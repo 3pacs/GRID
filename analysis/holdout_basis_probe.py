@@ -62,9 +62,16 @@ from analysis import price_admission_fetch as fetch
 from analysis import price_admission_probe as gd4
 from analysis.offline_research_proof import digest, stamp
 from analysis.research_forward_log import ForwardLog, _lines
+from ingestion import market_calendar as mc
 
 PROBE_NAME = "vs1-holdout-basis-probe"
 PROBE_VERSION = 1
+
+#: Canonical top-level report keys shared with downstream harnesses (single source of truth).
+REPORT_KEY_XLK_ADMITTED = "xlk_admitted_for_magnitudes"
+REPORT_KEY_ADMITTED = "admitted"
+REPORT_KEY_ABSTAINING = "abstaining"
+REPORT_KEY_CALENDAR = "calendar"
 
 PRICE_SOURCE = v6.PRICE_SOURCE
 PRICE_SOURCE_ID = v6.PRICE_SOURCE_ID
@@ -81,11 +88,9 @@ DEFAULT_WINDOW = (HOLDOUT_START, HOLDOUT_END)
 #: Maximum calendar days before HOLDOUT_START permitted for the single 2020-01-01 splice boundary anchor.
 MAX_BOUNDARY_LOOKBACK_DAYS = 10
 
-CALENDAR_SCHEMA = "grid.xnys-session-manifest.v1"
-CALENDAR_VERSION_RE = re.compile(
-    r"^exchange_calendars:4\.11\.2:pandas:2\.3\.3:numpy:[0-9.]+:tzdata:[0-9.]+:XNYS:\d{4}-\d{2}-\d{2}:\d{4}-\d{2}-\d{2}$"
-)
-SESSION_KEY_RE = re.compile(r"^XNYS:(\d{4}-\d{2}-\d{2}):RTH$")
+CALENDAR_SCHEMA = mc.SCHEMA
+CALENDAR_VERSION_RE = mc.VERSION
+SESSION_KEY_RE = mc.KEY
 
 FORBIDDEN_FORM4_ARGS = frozenset({
     "form4", "form4_path", "form4_events", "events", "purchases",
@@ -322,7 +327,14 @@ def _manifest_digest(raw: Mapping[str, Any]) -> str:
     items = listed.items() if isinstance(listed, Mapping) else listed
     norm_listed = [[str(t), str(d)] for t, d in sorted((str(t), str(d)) for t, d in items)]
     admitted = sorted(str(t) for t in raw["admitted"])
-    return digest({**raw, "admitted": admitted, "listed_from": norm_listed})
+    payload: dict[str, Any] = {**raw, "admitted": admitted, "listed_from": norm_listed}
+    if "selected_adj_close_sha256" in raw:
+        rows_sha = raw.get("selected_adj_close_sha256") or {}
+        rows_items = rows_sha.items() if isinstance(rows_sha, Mapping) else rows_sha
+        payload["selected_adj_close_sha256"] = [
+            [str(t), str(h)] for t, h in sorted((str(t), str(h)) for t, h in rows_items)
+        ]
+    return digest(payload)
 
 
 def load_price_manifest(path: Path) -> PriceManifestInfo:
@@ -1291,7 +1303,7 @@ def run_holdout_probe(
     boundary_anchor = calendar.boundary_anchor if lo == HOLDOUT_START else None
     mask = interval.mask(sessions) if interval is not None and sessions else None
     names = dict(sec_names or {})
-    require_entity = bool(sec_names)
+    require_entity = sec_names is not None
 
     benchmark_record = probe_holdout_ticker(
         conn, benchmark, source_id, lo, hi, as_of_ts,
@@ -1441,7 +1453,7 @@ def _holdout_summary(
         "admitted_issuers": len(admitted_issuers),
         "abstaining_issuers": len(abstaining_issuers),
         "abstaining_by_reason": _count(x for r in issuers.values() if r["abstains"] for x in r["reasons"]),
-        "xlk_admitted_for_magnitudes": bool(benchmark_record.get("admitted")),
+        REPORT_KEY_XLK_ADMITTED: bool(benchmark_record.get("admitted")),
         "source_filtering": {
             "tickers_with_other_source_rows": len(others),
             "other_source_rows_by_source": dict(sorted(by_source.items())),
@@ -1501,7 +1513,7 @@ def build_holdout_basis_report(
             "digest": manifest.digest,
             "admitted_count": len(manifest.admitted),
         },
-        "calendar": {
+        REPORT_KEY_CALENDAR: {
             "sha256": calendar.sha256,
             "calendar_version": calendar.calendar_version,
             "sessions": probe["calendar_sessions"],
@@ -1510,7 +1522,7 @@ def build_holdout_basis_report(
         "series_template": SERIES_TEMPLATE,
         "basis": BASIS,
         "benchmark": benchmark,
-        "xlk_admitted_for_magnitudes": bool(bench_rec.get("admitted")),
+        REPORT_KEY_XLK_ADMITTED: bool(bench_rec.get("admitted")),
         "benchmark_check": _slim_record(bench_rec),
         "tolerances": {
             "same_value_rtol": gd4.SAME_VALUE_RTOL,
@@ -1530,8 +1542,8 @@ def build_holdout_basis_report(
         "c1_admission_receipt_sha256": probe.get("interval_receipt_sha256"),
         "inputs": dict(inputs),
         "summary": _holdout_summary(records, bench_rec, benchmark),
-        "admitted": admitted,
-        "abstaining": abstaining,
+        REPORT_KEY_ADMITTED: admitted,
+        REPORT_KEY_ABSTAINING: abstaining,
         "tickers": {t: _slim_record(records[t]) for t in sorted(records)},
     }
 
@@ -1572,8 +1584,8 @@ def write_holdout_outputs(
         "out": str(out_dir),
         "window": report["window"],
         "summary": report["summary"],
-        "xlk_admitted_for_magnitudes": report["xlk_admitted_for_magnitudes"],
-        "admitted": report["admitted"],
-        "abstaining": report["abstaining"],
+        REPORT_KEY_XLK_ADMITTED: report[REPORT_KEY_XLK_ADMITTED],
+        REPORT_KEY_ADMITTED: report[REPORT_KEY_ADMITTED],
+        REPORT_KEY_ABSTAINING: report[REPORT_KEY_ABSTAINING],
         "sha256": hashes,
     }

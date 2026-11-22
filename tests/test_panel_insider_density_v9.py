@@ -70,6 +70,8 @@ def test_v9_prereg_body_hash_and_one_byte_change_refuses(tmp_path):
         "3,061",
         "2007-11-02",
         "2019-12-31",
+        "per-date identity is confirmed by the operator",
+        "order-preserving (up to floating-point rounding)",
         "no XLK subtraction",
         "not available: benchmark not admitted",
         "2026-10-03T00:17:40+00:00",
@@ -79,11 +81,15 @@ def test_v9_prereg_body_hash_and_one_byte_change_refuses(tmp_path):
         "Accept the rejection as a result.",
         "STOP_SUPERSEDED_BY_V9_UNOPENED",
         "STOP_SUPERSEDED_BY_SECTORS_V7_UNOPENED",
+        "Step 3b",
+        "follows the witnessed v8 and `sectors-v6` STOPs",
         "sectors-v7",
         "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822",
         "promotion_allowed=false",
     ):
         assert phrase in body
+    assert "strictly order-preserving" not in body
+    assert "Fill every placeholder hash constant and body token" not in body
 
     # One-byte change inside the body must refuse.
     fake_repo = tmp_path / "repo"
@@ -433,13 +439,15 @@ def test_v9_stage0_selection_holdout_settings_equal_v8_and_code_files_pinned(tmp
     with pytest.raises(ValueError, match="discovery window"):
         v9.verify_power(moved)
 
-    # V9_CODE_FILES covers v9 harness, CLI, manifest builder, calendar manifest, and v8/E0 code.
+    # V9_CODE_FILES covers v9 harness, CLI, manifest builder, holdout basis probe, calendar manifest, and v8/E0 code.
     files = runner._code_files(v9)
     assert set(files) == set(runner.V9_CODE_FILES)
     assert {
         "analysis/panel_insider_density_v9.py",
+        "analysis/holdout_basis_probe.py",
         "scripts/run_vs1_v9_insider_density.py",
         "scripts/run_vs1_v9_manifest_from_v8_probe.py",
+        "scripts/run_holdout_basis_probe.py",
         "docs/reference/calendar-manifests/vs1-xnys-2007-11-01-2026-06-30.json",
         "evals/e0/MANIFEST.sha256",
     } <= set(files)
@@ -743,3 +751,471 @@ def test_v9_freeze_as_of_equals_probe_snapshot_and_discovery_reproduces_rows_sha
                 start=date(2007, 11, 2), as_of=date(2019, 12, 31),
                 window="discovery", key=key,
             )
+
+
+# --- 8. Cross-module holdout basis probe -> v9._holdout_probe (INT-B1, HOLD-N5) ---
+
+
+@pytest.mark.parametrize("xlk_passes", [True, False])
+def test_v9_holdout_probe_roundtrips_real_holdout_basis_report_and_checks_calendar(tmp_path, monkeypatch, xlk_passes):
+    from analysis import holdout_basis_probe as hb
+    from tests.test_holdout_basis_probe import (
+        BOUNDARY_ANCHOR,
+        DISC_FROZEN_AT,
+        HO_HI,
+        HO_LO,
+        HO_SESSIONS,
+        HOLDOUT_PULL,
+        SNAPSHOT,
+        TIINGO,
+        _build_holdout_db,
+        _series,
+        _write_td_dir,
+        _write_tiingo_meta_dir,
+    )
+
+    vault, v8_reg, _, _, _, body_sha = _bind_v9_all(monkeypatch, tmp_path)
+    v9_reg = tmp_path / "v9_reg"
+    v9.register(v9_reg, NOW, "a" * 40, v8_log_dir=v8_reg, vault_repo=vault.cache, remote_url=str(vault.remote))
+    heads = tuple(v1._line_sha256(v9.registry(v9_reg)))
+    anchor = (v9_reg / v9.REGISTRY_ANCHORS).read_bytes().splitlines()[0]
+    monkeypatch.setattr(v9, "REGISTERED_RECORD_SHA256", heads)
+    monkeypatch.setattr(v9, "REGISTERED_ANCHOR_LINE", anchor)
+    vault.add_file(v9.WITNESS_PATH, anchor + b"\n")
+
+    issuers = ["AAA", "BBB"]
+    manifest = v9.PriceManifest(
+        source="TIINGO",
+        series_template="YF:{ticker}:adj_close",
+        basis="split+dividend adjusted",
+        benchmark="XLK",
+        benchmark_admitted=False,
+        admitted=tuple(issuers),
+        probe_report_sha256=v9.PROBE_REPORT_SHA256,
+        crosscheck_report_sha256=v9.CROSSCHECK_REPORT_SHA256,
+        tiingo_meta_report_sha256=v9.TIINGO_META_REPORT_SHA256,
+        listed_from=tuple((t, "2007-11-02") for t in issuers),
+        calendar_manifest=v9.XNYS_MANIFEST_PATH.as_posix(),
+        calendar_manifest_sha256=v9.XNYS_MANIFEST_SHA256,
+        probe_snapshot_as_of_ts="2026-10-03T00:17:40+00:00",
+        selected_adj_close_sha256=tuple((t, hashlib.sha256(t.encode()).hexdigest()) for t in issuers),
+    )
+    manifest_path = tmp_path / "price_manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    hb_manifest = hb.load_price_manifest(manifest_path)
+    assert hb_manifest.digest == manifest.digest()
+
+    frozen_inputs = {
+        "sector": v1.VS1_SECTOR,
+        "price_manifest_sha256": manifest.digest(),
+        "probe_report_sha256": manifest.probe_report_sha256,
+        "form4_sha256": "1" * 64,
+        "submissions_sha256": "2" * 64,
+        "issuer_map_sha256": "3" * 64,
+        "sic_map_sha256": "4" * 64,
+        "power_sha256": "5" * 64,
+        "accept_underpowered": False,
+        "as_of_ts": "2026-10-03T00:17:40+00:00",
+    }
+    v9.freeze_inputs(v9_reg, DISC_FROZEN_AT, frozen_inputs)
+    observed = {k: v for k, v in frozen_inputs.items() if k not in ("as_of_ts", "accept_underpowered")}
+    v9.open_discovery(v9_reg, DISC_FROZEN_AT, observed, v9.check_offhost(vault.cache, remote_url=str(vault.remote)))
+    vault.add_file(v9.WITNESS_PATH, (v9_reg / v9.REGISTRY_ANCHORS).read_bytes())
+    dkey = v9.resume_discovery(v9_reg, observed, v9.check_offhost(vault.cache, remote_url=str(vault.remote)))
+    frozen = {
+        "payload": {
+            "version": v9.VERSION,
+            "prereg_sha256": body_sha,
+            "state": "DISCOVERY_FROZEN",
+            "inputs": {"inputs_frozen_sha256": dkey.inputs_frozen_sha256},
+            "calibration": {"state": "CONSISTENT"},
+            "ledger": [],
+        }
+    }
+    frozen["sha256"] = v1.digest(frozen["payload"])
+    v9.seal_discovery(v9_reg, DISC_FROZEN_AT, dkey, frozen)
+    vault.add_file(v9.WITNESS_PATH, (v9_reg / v9.REGISTRY_ANCHORS).read_bytes())
+
+    # Use the real pinned XNYS calendar manifest over a holdout sub-span (>= 260 sessions).
+    cal = hb.load_calendar_manifest(REPO / v9.XNYS_MANIFEST_PATH, expected_sha256=v9.XNYS_MANIFEST_SHA256)
+    ho_lo, ho_hi = date(2020, 1, 1), date(2021, 6, 30)
+    ho_days = cal.window_sessions(ho_lo, ho_hi)
+    series = {
+        "AAA": _series(ho_days, base=45.0),
+        "BBB": _series(ho_days, base=32.0),
+        "XLK": _series(ho_days, base=95.0),
+    }
+    extra_rows = [
+        # BBB has a QUARANTINED row -> must abstain!
+        {
+            "series_id": "YF:BBB:close",
+            "source_id": TIINGO,
+            "obs_date": ho_days[5],
+            "pull_timestamp": HOLDOUT_PULL,
+            "value": 1.0,
+            "raw_payload": "{}",
+            "pull_status": "QUARANTINED",
+        },
+    ]
+    engine = _build_holdout_db(series, extra_rows=extra_rows)
+    bad_td = () if xlk_passes else ("XLK",)
+    td_dir = _write_td_dir(tmp_path / "td", series, bad_tickers=bad_td)
+    meta_dir = _write_tiingo_meta_dir(
+        tmp_path / "meta", list(series), start_dates={"AAA": "2007-11-02", "BBB": "2007-11-02"}
+    )
+    proof = hb.verify_witnessed_discovery_frozen(
+        v9_reg,
+        vault.cache,
+        prereg_sha256=body_sha,
+        snapshot_as_of_ts=SNAPSHOT,
+        allow_holdout=True,
+        remote_url=str(vault.remote),
+        expected_manifest_digest=hb_manifest.digest,
+        expected_manifest_file_sha256=hb_manifest.file_sha256,
+    )
+    vendors = hb.HoldoutVendorFiles(
+        td_dir, meta_dir, lo=ho_lo, hi=ho_hi, boundary_anchor=cal.boundary_anchor,
+        discovery_frozen_run_at=proof.run_at_dt,
+    )
+    with engine.connect() as conn:
+        probe_res = hb.run_holdout_probe(
+            conn, manifest=hb_manifest, calendar=cal, lo=ho_lo, hi=ho_hi,
+            as_of_ts=SNAPSHOT, vendors=vendors,
+            sec_names={"AAA": "AAA Systems Inc", "BBB": "BBB Systems Inc"},
+        )
+    out_dir = tmp_path / "hb_out"
+    written = hb.write_holdout_outputs(
+        out_dir, probe_res, proof=proof, manifest=hb_manifest, calendar=cal, lo=ho_lo, hi=ho_hi,
+        code_sha="c" * 40, snapshot_as_of_ts=SNAPSHOT, inputs={"calendar_manifest_sha256": cal.sha256},
+    )
+    report_path = out_dir / "holdout_basis_report.json"
+    report_doc = json.loads(report_path.read_text(encoding="utf-8"))
+    report_sha = written["sha256"]["holdout_basis_report.json"]
+
+    # Feed real writer output through v9.V9._holdout_probe: XLK flag and abstaining set must round-trip!
+    records = v9.registry(v9_reg).read_all()
+    parsed = v9.V9._holdout_probe(records, {"sha256": report_sha, "report": report_doc})
+    assert parsed is not None
+    assert parsed[hb.REPORT_KEY_XLK_ADMITTED] is xlk_passes
+    assert parsed[hb.REPORT_KEY_ABSTAINING] == ["BBB"]
+    assert parsed[hb.REPORT_KEY_ADMITTED] == ["AAA"]
+    assert "abstains" not in parsed
+    assert parsed["calendar_sha256"] == v9.XNYS_MANIFEST_SHA256
+
+    # HOLD-N5: wrong or missing calendar sha256 in the report must refuse in v9._holdout_probe.
+    bad_cal_report = {**report_doc, hb.REPORT_KEY_CALENDAR: {**report_doc[hb.REPORT_KEY_CALENDAR], "sha256": "0" * 64}}
+    with pytest.raises(PermissionError, match="calendar"):
+        v9.V9._holdout_probe(records, {"sha256": report_sha, "report": bad_cal_report})
+    no_cal_report = {k: v for k, v in report_doc.items() if k != hb.REPORT_KEY_CALENDAR}
+    with pytest.raises(PermissionError, match="calendar"):
+        v9.V9._holdout_probe(records, {"sha256": report_sha, "report": no_cal_report})
+
+
+# --- 9. CLI-level v9 holdout with abstaining ticker & XLK magnitudes True/False (INT-B2, V9-N1) ---
+
+
+def test_v9_cli_holdout_abstaining_ticker_and_xlk_magnitudes_both_modes(tmp_path, monkeypatch):
+    from datetime import timedelta
+    import scripts.run_real_panel_scan as rps
+    from analysis import holdout_basis_probe as hb
+    from tests.test_panel_insider_density_v2 import _map
+
+    # Build a 24-issuer synthetic dataset spanning discovery (2018-01..2019-12) and holdout (2020-01..2021-06).
+    all_xnys = v9.load_xnys_calendar(REPO)
+    disc_probe_days = [d for d in all_xnys if date(2007, 11, 2) <= d <= date(2019, 12, 31)]
+    disc_sample = [d for d in disc_probe_days if d >= date(2017, 6, 1)]
+    ho_days = [d for d in all_xnys if date(2020, 1, 1) <= d <= date(2021, 6, 30)]
+    all_days = disc_sample + ho_days
+
+    rng = np.random.default_rng(73)
+    tickers = [f"T{i:02d}" for i in range(24)]
+    ciks = list(range(1000, 1024))
+    rets = rng.normal(0.0, 0.01, (len(all_days), len(tickers)))
+    rows = []
+    for j, cik in enumerate(ciks):
+        for i in range(40 + (j * 5) % 35, len(all_days) - 25, 55):
+            # Vary shares so both large-line (>= $500k) and small-line (< $500k) strata are populated.
+            shares = "60000" if (j + i) % 2 == 0 else "2000"
+            rows.append(_row(
+                accession_number=f"p-{cik}-{i}",
+                issuer_cik=str(cik),
+                owner_cik=str((i % 5) + 1),
+                filing_date=all_days[i + 1].isoformat(),
+                transaction_date=all_days[i].isoformat(),
+                trans_shares=shares,
+                trans_pricepershare="10.0",
+            ))
+            rets[i + 2 : i + 10, j] += 0.005
+    prices_df = pd.DataFrame(100.0 * np.exp(np.cumsum(rets, axis=0)), index=all_days, columns=tickers)
+    xlk_series = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.008, len(all_days)))), index=all_days)
+    pull_ts = datetime(2026, 10, 2, 12, 0)  # naive in SQLite, before PROBE_SNAPSHOT_AS_OF_TS
+
+    # DB with XLK (including pre-2020 rows to verify pre-2020 XLK is NEVER loaded during holdout!)
+    engine_with_xlk = _sqlite_price_db({**{t: prices_df[t] for t in tickers}, "XLK": xlk_series}, pull_ts)
+    # DB without XLK at all (for xlk_admitted_for_magnitudes=False mode!)
+    engine_no_xlk = _sqlite_price_db({t: prices_df[t] for t in tickers}, pull_ts)
+    # DB where abstaining ticker T00's holdout prices are wildly mutated -> holdout IC must NOT change!
+    mutated_t00 = prices_df["T00"].copy()
+    mutated_t00.loc[[d for d in all_days if d >= date(2020, 1, 1)]] *= np.linspace(1.0, 50.0, len(ho_days))
+    engine_mutated_t00 = _sqlite_price_db(
+        {**{t: prices_df[t] for t in tickers if t != "T00"}, "T00": mutated_t00, "XLK": xlk_series}, pull_ts
+    )
+
+    with engine_no_xlk.connect() as conn:
+        expected_rows_sha = {
+            t: gd4.rows_sha256(
+                gd4.Row(o.obs_date, float(o.value), o.pull_timestamp)
+                for o in v1.observations.read_window(
+                    conn, f"YF:{t}:adj_close", source="TIINGO",
+                    start=date(2007, 11, 2), as_of=date(2019, 12, 31),
+                    as_of_ts=datetime(2026, 10, 3, 0, 17, 40, tzinfo=timezone.utc),
+                )
+            )
+            for t in tickers
+        }
+
+    # Write synthetic SEC files (form4, submissions, issuer-map, sic-map).
+    subs = [
+        {**_submission(accession_number=r["accession_number"], filing_date=r["filing_date"],
+                       issuer_cik=r["issuer_cik"], owner_cik=r["owner_cik"]),
+         "issuer_ticker": tickers[int(r["issuer_cik"]) - 1000]}
+        for r in rows
+    ]
+    subs += [
+        {**_submission(accession_number=f"h-{c}-{d.isoformat()}", issuer_cik=str(c),
+                       filing_date=d.isoformat(), document_type="4", owner_cik="9"),
+         "issuer_ticker": tickers[c - 1000]}
+        for c in ciks for d in all_days[::20]
+    ]
+    form4_path = tmp_path / "form4.parquet"
+    subs_path = tmp_path / "submissions.parquet"
+    issuer_map_path = tmp_path / "company_tickers.json"
+    sic_map_path = tmp_path / "sic_map.jsonl"
+    pd.DataFrame(rows).to_parquet(form4_path)
+    pd.DataFrame(subs).to_parquet(subs_path)
+    issuer_map_path.write_text(json.dumps(
+        {str(k): {"cik_str": c, "ticker": t, "title": t} for k, (t, c) in enumerate(zip(tickers, ciks))}
+    ), encoding="utf-8")
+    sic_map_path.write_text("".join(
+        json.dumps({"cik": c, "sic": 7372, "name": f"{t} Systems Inc", "tickers": [t],
+                    "former_names": [], "http_status": 200}) + "\n"
+        for t, c in zip(tickers, ciks)
+    ), encoding="utf-8")
+
+    monkeypatch.setattr(v1, "load_sector_map", lambda repo_root=None: _map([("Technology", "a", "T00", 0.1, "company")]))
+    monkeypatch.setattr(v2, "ISSUER_MAP_SHA256", v1.data_sha256(issuer_map_path))
+    monkeypatch.setattr(v2, "SIC_MAP_SHA256", v1.data_sha256(sic_map_path))
+
+    # Bind v9 pins (v8 STOP + sectors-v6 STOP + consistent probe triple).
+    vault, v8_reg, _, _, probe_dir, body_sha = _bind_v9_all(monkeypatch, tmp_path / "bind")
+
+    manifest = v9.PriceManifest(
+        source="TIINGO",
+        series_template="YF:{ticker}:adj_close",
+        basis="split+dividend adjusted",
+        benchmark="XLK",
+        benchmark_admitted=False,
+        admitted=tuple(sorted(tickers)),
+        probe_report_sha256=v9.PROBE_REPORT_SHA256,
+        crosscheck_report_sha256=v9.CROSSCHECK_REPORT_SHA256,
+        tiingo_meta_report_sha256=v9.TIINGO_META_REPORT_SHA256,
+        listed_from=tuple((t, "2007-11-02") for t in sorted(tickers)),
+        calendar_manifest=v9.XNYS_MANIFEST_PATH.as_posix(),
+        calendar_manifest_sha256=v9.XNYS_MANIFEST_SHA256,
+        probe_snapshot_as_of_ts="2026-10-03T00:17:40+00:00",
+        selected_adj_close_sha256=tuple(sorted(expected_rows_sha.items())),
+    )
+    manifest_path = tmp_path / "price_manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # Build a valid synthetic v9 Stage-0 power.json matching these exact inputs.
+    universe_df, info = v9.v2_universe(
+        v1.load_sector_map(), v9.load_issuer_map(issuer_map_path), v9.load_sic_map(sic_map_path)
+    )
+    info["universe_sha256"] = v1.digest(universe_df.to_dict("records"))
+    events_obj, admission_obj = v9.load_inputs(form4_path, subs_path, universe_df)
+    proxy_n = len(v1.proxy_sessions(date(2008, 1, 1), date(2020, 1, 1)))
+    table = {t: [{"target_ic": ic, "power": 0.65, "sims": v1.POWER_SIMS} for ic in v1.POWER_TARGET_ICS]
+             for t in v1.trial_names()}
+    e0row = {"sims": v9.E0_SIMS, "perms": v1.POWER_PERMS, "alpha_one_sided": 0.05, "target_ic": 0.01,
+             "e0_manifest_sha256": v9.E0_MANIFEST_SHA256, "e0_seeds": {"base": 20260930, "pilot": 20260931}}
+    power_doc = {
+        "version": v9.VERSION,
+        "primary_trial": v9.PRIMARY_TRIAL,
+        "settings": v1.power_settings(),
+        "table": table,
+        "gate_passed": True,
+        "v9_stage0": {
+            "settings": json.loads(json.dumps(v9.STAGE0_SETTINGS)),
+            "models": {
+                "gaussian_v1": {"model": "gaussian_v1", "power": 0.72, "sims": v9.GAUSSIAN_SIMS,
+                                "perms": v1.POWER_PERMS, "seed": v1.SEED, "alpha_one_sided": 0.05, "target_ic": 0.01},
+                "e0:factor_t_garch_exposed": {**e0row, "model": "e0:factor_t_garch_exposed", "power": 0.68},
+                "e0:factor_t_garch": {**e0row, "model": "e0:factor_t_garch", "power": 0.70},
+            },
+            "discovery_start": v9.DISCOVERY_START,
+            "n_sessions": proxy_n,
+        },
+        "inputs": {
+            "price_manifest_sha256": manifest.digest(),
+            "form4_receipt_sha256": events_obj.receipt_sha256,
+            "admission_receipt_sha256": admission_obj.receipt_sha256,
+            "universe_sha256": info["universe_sha256"],
+            "prereg_sha256": body_sha,
+        },
+    }
+    power_path = tmp_path / "power.json"
+    power_path.write_text(json.dumps(power_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # Helper that runs full discovery -> open-holdout -> holdout through v9_cli.main for a given mode.
+    monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
+
+    def _run_case(label: str, *, xlk_admitted: bool, holdout_engine):
+        case_dir = tmp_path / label
+        case_dir.mkdir()
+        case_vault_root = case_dir / "vault"
+        shutil.copytree(vault.remote.parent, case_vault_root)
+        # Re-point local vault cache remote to case copy.
+        case_remote = case_vault_root / "remote.git"
+        case_work = case_vault_root / "worktree"
+        case_cache = case_vault_root / "cache"
+        v1._git(case_work, "remote", "set-url", "origin", str(case_remote))
+        monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(case_remote))
+        monkeypatch.setattr(v9, "WITNESS_REMOTE_URL", str(case_remote))
+
+        v9_reg = case_dir / "v9_reg"
+        monkeypatch.setattr(v9, "REGISTERED_RECORD_SHA256", None)
+        monkeypatch.setattr(v9, "REGISTERED_ANCHOR_LINE", None)
+        v9.register(v9_reg, NOW, "a" * 40, v8_log_dir=v8_reg, vault_repo=case_cache, remote_url=str(case_remote))
+        heads = tuple(v1._line_sha256(v9.registry(v9_reg)))
+        anchor = (v9_reg / v9.REGISTRY_ANCHORS).read_bytes().splitlines()[0]
+        monkeypatch.setattr(v9, "REGISTERED_RECORD_SHA256", heads)
+        monkeypatch.setattr(v9, "REGISTERED_ANCHOR_LINE", anchor)
+
+        def publish_v9():
+            dst = case_work / v9.WITNESS_PATH
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes((v9_reg / v9.REGISTRY_ANCHORS).read_bytes())
+            v1._git(case_work, "add", v9.WITNESS_PATH)
+            v1._git(case_work, "-c", "user.name=Test", "-c", "user.email=test@grid.local", "commit", "-m", "v9 witness")
+            v1._git(case_work, "push", "origin", "HEAD:refs/heads/main")
+
+        publish_v9()
+
+        common_cli = [
+            "--log-dir", str(v9_reg),
+            "--form4", str(form4_path),
+            "--submissions", str(subs_path),
+            "--issuer-map", str(issuer_map_path),
+            "--sic-map", str(sic_map_path),
+            "--price-manifest", str(manifest_path),
+            "--probe-report", str(probe_dir / "probe_report.json"),
+            "--crosscheck-report", str(probe_dir / "crosscheck_report.json"),
+            "--tiingo-meta-report", str(probe_dir / "tiingo_meta_report.json"),
+            "--power", str(power_path),
+        ]
+
+        # Discovery via CLI (using engine_no_xlk: XLK is never read on discovery!).
+        monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: engine_no_xlk)
+        monkeypatch.setattr(engine_no_xlk, "dispose", lambda: None)
+        v9_cli.main([
+            "freeze-inputs", *common_cli, "--vault-repo", str(case_cache),
+            "--as-of-ts", "2026-10-03T00:17:40+00:00", "--code-sha", "a" * 40,
+        ])
+        v9_cli.main(["open-discovery", *common_cli, "--vault-repo", str(case_cache)])
+        publish_v9()
+        run_dir = case_dir / "disc_out"
+        v9_cli.main(["discover", *common_cli, "--vault-repo", str(case_cache), "--out", str(run_dir)])
+        publish_v9()
+
+        # Build holdout basis report where T00 abstains and XLK admission is parameterized.
+        sealed_rec = [r for r in v9.registry(v9_reg).read_all() if r["kind"] == "discovery_frozen"][-1]
+        later = (datetime.fromisoformat(sealed_rec["run_at"]) + timedelta(hours=2)).isoformat()
+        ho_admitted = [t for t in sorted(tickers) if t != "T00"]
+        ho_report = {
+            "window": "holdout",
+            "prereg": {"study": v9.VERSION, "body_sha256": body_sha},
+            "snapshot_as_of_ts": later,
+            "discovery_frozen": {"sha256": v1._record_sha256(sealed_rec), "run_at": sealed_rec["run_at"]},
+            "manifest": {"digest": manifest.digest()},
+            hb.REPORT_KEY_CALENDAR: {"sha256": v9.XNYS_MANIFEST_SHA256},
+            hb.REPORT_KEY_XLK_ADMITTED: xlk_admitted,
+            hb.REPORT_KEY_ADMITTED: ho_admitted,
+            hb.REPORT_KEY_ABSTAINING: ["T00"],
+            "tickers": {
+                t: {"ticker": t, "abstains": t == "T00", "admitted": t != "T00",
+                    "reasons": ["splice_failed"] if t == "T00" else []}
+                for t in sorted(tickers)
+            },
+        }
+        ho_report_path = case_dir / "holdout_basis_report.json"
+        ho_report_path.write_text(json.dumps(ho_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        # open-holdout + holdout via CLI!
+        v9_cli.main([
+            "open-holdout", *common_cli, "--vault-repo", str(case_cache),
+            "--run-dir", str(run_dir), "--allow-holdout", "--prereg-sha256", body_sha,
+            "--holdout-probe-report", str(ho_report_path),
+        ])
+        publish_v9()
+
+        monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: holdout_engine)
+        monkeypatch.setattr(holdout_engine, "dispose", lambda: None)
+        v9_cli.main([
+            "holdout", *common_cli, "--vault-repo", str(case_cache),
+            "--run-dir", str(run_dir), "--allow-holdout", "--prereg-sha256", body_sha,
+        ])
+        result = json.loads((run_dir / "holdout-result.json").read_text(encoding="utf-8"))
+        price_receipt = json.loads((run_dir / "holdout-price-receipt.json").read_text(encoding="utf-8"))
+        return result, price_receipt
+
+    res_xlk_on, receipt_on = _run_case("xlk_true", xlk_admitted=True, holdout_engine=engine_with_xlk)
+    res_xlk_off, receipt_off = _run_case("xlk_false", xlk_admitted=False, holdout_engine=engine_no_xlk)
+    res_t00_mut, _ = _run_case("t00_mutated", xlk_admitted=True, holdout_engine=engine_mutated_t00)
+
+    # INT-B2: abstaining ticker T00 recorded and excluded from holdout IC (mutating T00 changes nothing!).
+    assert res_xlk_on["holdout_abstaining_tickers"] == ["T00"]
+    assert res_xlk_off["holdout_abstaining_tickers"] == ["T00"]
+    assert res_xlk_on["holdout_checks"] == res_t00_mut["holdout_checks"]
+    assert res_xlk_on["holdout_sha256"] == res_t00_mut["holdout_sha256"]
+
+    # V9-N1 (xlk_admitted_for_magnitudes=True): XLK loaded ONLY for holdout (>= 2020-01-01), magnitudes numeric!
+    assert receipt_on["benchmark_admitted"] is True
+    assert "XLK" in receipt_on["series"]
+    assert receipt_on["series"]["XLK"]["first"] >= "2020-01-01"
+    chk_on = {r["trial"]: r for r in res_xlk_on["holdout_checks"]}[v9.PRIMARY_TRIAL]
+    assert chk_on["status"] == "tested"
+    mag_on = chk_on["magnitude"]
+    assert mag_on["benchmark_admitted"] is True
+    for key in (
+        "buyer_minus_benchmark",
+        "nonbuyer_minus_benchmark",
+        "large_line_buyer_minus_benchmark",
+        "small_line_buyer_minus_benchmark",
+    ):
+        assert isinstance(mag_on[key], float) and np.isfinite(mag_on[key]), f"{key}={mag_on[key]!r}"
+
+    # V9-N1 (xlk_admitted_for_magnitudes=False): XLK never read, magnitudes "not available: benchmark not admitted"!
+    assert receipt_off["benchmark_admitted"] is False
+    assert "XLK" not in receipt_off["series"]
+    chk_off = {r["trial"]: r for r in res_xlk_off["holdout_checks"]}[v9.PRIMARY_TRIAL]
+    assert chk_off["status"] == "tested"
+    mag_off = chk_off["magnitude"]
+    assert mag_off["benchmark_admitted"] is False
+    for key in (
+        "buyer_minus_benchmark",
+        "nonbuyer_minus_benchmark",
+        "large_line_buyer_minus_benchmark",
+        "small_line_buyer_minus_benchmark",
+    ):
+        assert mag_off[key] == v9.BENCHMARK_MAGNITUDE_UNAVAILABLE
+
+    # XLK never affects labels, IC, testability, or gating!
+    for field in ("status", "n", "mean_ic", "p", "p_one_sided_positive", "p_one_sided_negative", "retrospective_survivor"):
+        assert chk_on[field] == chk_off[field]
+    assert mag_on["buyer_minus_nonbuyer"] == pytest.approx(mag_off["buyer_minus_nonbuyer"], abs=1e-12)
+    assert res_xlk_on["verdict"]["state"] == res_xlk_off["verdict"]["state"]
+
+    # Direct check: v9.build_trial_panels rejects abstain_tickers on discovery window.
+    with pytest.raises(ValueError, match="holdout window"):
+        v9.build_trial_panels(events_obj, admission_obj, universe_df, types.SimpleNamespace(verify=lambda: None, window="discovery"), "discovery", abstain_tickers=["T00"])

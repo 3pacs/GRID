@@ -104,11 +104,13 @@ V8_CODE_FILES = V7_CODE_FILES + (
     "evals/e0/structure.py",
     "evals/e0/MANIFEST.sha256",
 )
-# v9 additionally pins its harness/CLI, probe-to-manifest builder and pinned XNYS calendar manifest.
+# v9 additionally pins its harness/CLI, probe-to-manifest builder, holdout basis probe, and pinned XNYS calendar manifest.
 V9_CODE_FILES = V8_CODE_FILES + (
     "analysis/panel_insider_density_v9.py",
+    "analysis/holdout_basis_probe.py",
     "scripts/run_vs1_v9_insider_density.py",
     "scripts/run_vs1_v9_manifest_from_v8_probe.py",
+    "scripts/run_holdout_basis_probe.py",
     "scripts/build_vs1_calendar_manifest.py",
     "docs/reference/calendar-manifests/vs1-xnys-2007-11-01-2026-06-30.json",
 )

@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from analysis import holdout_basis_probe as hb
 from analysis import panel_insider_density as v1
 from analysis import panel_insider_density_sectors_v6 as s6
 from analysis import panel_insider_density_v2 as v2
@@ -41,6 +42,7 @@ from analysis import panel_insider_density_v8 as v8
 from analysis import price_admission_probe as gd4
 from analysis.offline_research_proof import digest, stamp
 from analysis.research_forward_log import canonical
+from ingestion import market_calendar as mc
 from store import observations
 
 VERSION = "vs1-v9"
@@ -48,12 +50,12 @@ REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v9-preregistration.md")
 #: SHA-256 of the UTF-8 LF body strictly between <!-- PREREG-BODY-START --> and <!-- PREREG-BODY-END -->.
 #: Recompute and re-pin after filling operator placeholder tokens in the body.
-PREREG_BODY_SHA256 = "befebfc952daa49698c24c9fe8f1686333027c73803d0beb90c898b285d441c9"
+PREREG_BODY_SHA256 = "87227eb6c9a2363aee76b7601d728554a43c76f3591d811659753bd9e5e3dabd"
 
 #: Pinned XNYS session calendar manifest (replaces XLK closes as the session calendar).
 XNYS_MANIFEST_PATH = Path("docs/reference/calendar-manifests/vs1-xnys-2007-11-01-2026-06-30.json")
 XNYS_MANIFEST_SHA256 = "9b8f0079f89eb6b5f744a6466373fb9af1af74abaafb01b68dc89e39984372ac"
-XNYS_CALENDAR_SCHEMA = "grid.xnys-session-manifest.v1"
+XNYS_CALENDAR_SCHEMA = mc.SCHEMA
 XNYS_CALENDAR_VERSION = (
     "exchange_calendars:4.11.2:pandas:2.3.3:numpy:2.4.6:tzdata:2026.6:XNYS:2007-11-01:2026-06-30"
 )
@@ -990,11 +992,16 @@ def build_trial_panels(
     universe: pd.DataFrame,
     prices: PricePanel,
     window: str,
+    *,
+    abstain_tickers: Iterable[str] | None = None,
 ) -> dict[str, TrialPanel]:
-    """Build v9 trial panels using pinned XNYS sessions, C1 close masking, and raw issuer forward returns."""
+    """Build v9 trial panels using pinned XNYS sessions, C1 close masking, holdout abstention, and raw issuer forward returns."""
     prices.verify()
     if prices.window != window:
         raise ValueError("price panel window differs")
+    abstain = {str(t) for t in (abstain_tickers or ())}
+    if abstain and window != "holdout":
+        raise ValueError("abstain_tickers applies only to the holdout window")
     closes = prices.closes()
     benchmark = prices.manifest.benchmark
     bench_admitted = bool(getattr(prices, "benchmark_admitted", False)) and benchmark in closes.columns
@@ -1003,14 +1010,16 @@ def build_trial_panels(
     ciks = list(universe["cik"].astype(int))
     groups = list(universe["sic_group"])
     listed = dict(getattr(prices.manifest, "listed_from", ()) or ())
-    closes = closes.copy()
-    for ticker, start in listed.items():
-        if ticker in closes.columns and ticker != benchmark:
-            closes.loc[closes.index < pd.Timestamp(start), ticker] = np.nan
-    keep = v6.interval_close_mask(admission)(closes, universe)
-    for ticker in keep.columns:
-        if ticker in closes.columns and ticker != benchmark:
-            closes.loc[~keep[ticker].reindex(closes.index, fill_value=False).to_numpy(), ticker] = np.nan
+    closes = v2.apply_close_masks(
+        closes,
+        universe,
+        benchmark=benchmark,
+        window=window,
+        listed_from=listed,
+        blank_before_listing=True,
+        close_mask=v6.interval_close_mask(admission),
+        abstain_tickers=abstain,
+    )
 
     lo, hi = v1.window_bounds(window)
     day = pd.DatetimeIndex(closes.index)
@@ -1172,8 +1181,24 @@ class V9Harness(v2.Harness):
         if out is None:
             return None
         report = (holdout_probe or {}).get("report") or {}
-        out["xlk_admitted_for_magnitudes"] = bool(report.get("benchmark_admitted") is True)
-        out["abstains"] = sorted(report.get("abstains") or [])
+        xlk_flag = report.get(hb.REPORT_KEY_XLK_ADMITTED)
+        if not isinstance(xlk_flag, bool):
+            raise PermissionError(
+                f"v9 holdout basis report must carry boolean {hb.REPORT_KEY_XLK_ADMITTED!r}"
+            )
+        if hb.REPORT_KEY_ABSTAINING not in report or not isinstance(report.get(hb.REPORT_KEY_ABSTAINING), list):
+            raise PermissionError(
+                f"v9 holdout basis report must carry list {hb.REPORT_KEY_ABSTAINING!r}"
+            )
+        cal = report.get(hb.REPORT_KEY_CALENDAR)
+        cal_sha = cal.get("sha256") if isinstance(cal, Mapping) else None
+        if cal_sha != XNYS_MANIFEST_SHA256:
+            raise PermissionError(
+                f"v9 holdout basis report calendar sha256 ({cal_sha!r}) does not match "
+                f"pinned XNYS manifest {XNYS_MANIFEST_SHA256}"
+            )
+        out[hb.REPORT_KEY_XLK_ADMITTED] = xlk_flag
+        out["calendar_sha256"] = cal_sha
         return out
 
     def open_holdout(self, frozen: dict, *, log_dir: Path, **kwargs) -> dict:
@@ -1227,29 +1252,34 @@ class V9Harness(v2.Harness):
         if not sessions:
             raise ValueError("no pinned XNYS sessions in the read window")
 
-        include_benchmark = bool(manifest.benchmark_admitted)
-        if window == "holdout" and include_benchmark:
+        if window == "holdout":
             log = self.registry(key.log_dir)
             with log.locked():
                 records = self._chain(log)
             h_opened = v1._kind(records, "holdout_opened")
-            hp = (h_opened[-1].get("holdout_probe") or {}) if h_opened else {}
-            if hp.get("xlk_admitted_for_magnitudes") is False:
-                include_benchmark = False
+            hp = (h_opened[-1].get("holdout_probe") or {}) if h_opened else (key.holdout_probe or {})
+            include_benchmark = bool(hp.get(hb.REPORT_KEY_XLK_ADMITTED) is True)
+        else:
+            include_benchmark = bool(manifest.benchmark_admitted)
 
         issuer_tickers = sorted(t for t in set(tickers) if t != manifest.benchmark)
-        wanted = sorted(set(issuer_tickers) | ({manifest.benchmark} if include_benchmark else set()))
-        refused = [t for t in wanted if t not in manifest.admitted]
+        refused = [t for t in issuer_tickers if t not in manifest.admitted]
         if refused:
             raise PermissionError(f"tickers not in the admitted-price manifest: {refused[:10]}")
+        wanted = sorted(set(issuer_tickers) | ({manifest.benchmark} if include_benchmark else set()))
 
+        holdout_start = stamp(v1.SPLIT).date()
         data = {
             ticker: tuple(
                 observations.read_window(
                     conn,
                     manifest.series_template.format(ticker=ticker),
                     source=manifest.source,
-                    start=start,
+                    start=(
+                        max(start, holdout_start)
+                        if (window == "holdout" and ticker == manifest.benchmark)
+                        else start
+                    ),
                     as_of=as_of,
                     as_of_ts=key.as_of_ts,
                 )
@@ -1426,6 +1456,9 @@ class V9Harness(v2.Harness):
         for row in result["holdout_checks"]:
             if row["status"] == "tested":
                 panel = panels[row["trial"]]
+                abstain = v2.holdout_abstaining(key.holdout_probe, panel.entities)
+                if abstain:
+                    panel = v2._mask_abstaining_panel(panel, abstain)
                 ic, _ = v1.rank_ic_series(panel.feature, panel.label)
                 row["magnitude"] = buyer_excess(panel, np.flatnonzero(np.isfinite(ic)))
         return result

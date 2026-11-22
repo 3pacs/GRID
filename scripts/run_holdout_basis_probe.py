@@ -26,7 +26,18 @@ from pathlib import Path
 from analysis import holdout_basis_probe as hb
 from analysis import price_admission_fetch as fetch
 from analysis import price_admission_probe as gd4
+from analysis import research_forward_log as fl
 from scripts.run_price_admission_probe import PROBE_MAX_STATEMENT_TIMEOUT_S, _issuers, _log
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def resolve_code_sha(repo_root: Path = REPO) -> str:
+    """Compute the running code's commit SHA (VERSION file or clean git HEAD); refuses dirty trees."""
+    try:
+        return fl.resolve_code_sha(repo_root)
+    except RuntimeError as exc:
+        raise hb.HoldoutProbeRefused(str(exc)) from exc
 
 
 def _parse_as_of_ts(raw: str) -> datetime:
@@ -55,13 +66,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--as-of-ts", required=True, help="UTC snapshot instant (must be > discovery_frozen.run_at)")
     parser.add_argument("--allow-holdout", action="store_true", help="explicit authorization to read holdout basis")
     parser.add_argument("--prereg-sha256", required=True, help="pinned preregistration body sha256")
-    parser.add_argument("--code-sha", required=True, help="git commit SHA of the running code")
+    parser.add_argument(
+        "--code-sha",
+        help="optional assertion: if given, must equal the computed running code SHA (VERSION or clean git HEAD)",
+    )
     parser.add_argument("--out", required=True, help="write-once output directory (must not exist)")
     parser.add_argument("--start", default=hb.HOLDOUT_START.isoformat(), help="holdout read start (default 2020-01-01)")
     parser.add_argument("--end", default=hb.HOLDOUT_END.isoformat(), help="holdout read end (default 2026-06-30)")
-    parser.add_argument("--submissions", help="optional derived/submissions.parquet (C1 interval bounds only)")
-    parser.add_argument("--issuers", help="optional issuers JSON (cik/current_tickers for C1/entity checks)")
-    parser.add_argument("--sic-map", help="optional pinned issuer_sic_map.jsonl (SEC names for entity check)")
+    parser.add_argument(
+        "--submissions", required=True,
+        help="derived/submissions.parquet (required for C1 ticker-interval bounds, v6 §2.3/§8)",
+    )
+    parser.add_argument(
+        "--issuers", required=True,
+        help="issuers JSON with cik/current_tickers (required for C1 and entity checks, v6 §2.3/§8)",
+    )
+    parser.add_argument(
+        "--sic-map", required=True,
+        help="pinned issuer_sic_map.jsonl (required for SEC entity check, v6 §2.3/§8)",
+    )
     parser.add_argument("--unpinned-sic-map", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--statement-timeout-s", type=int, default=60,
@@ -85,6 +108,11 @@ def main(argv: list[str] | None = None) -> None:
         hb.check_holdout_window(lo, hi)
         snapshot = _parse_as_of_ts(args.as_of_ts)
         out = hb.check_write_once_out(Path(args.out))
+        code_sha = resolve_code_sha(REPO)
+        if args.code_sha is not None and args.code_sha.strip() != code_sha:
+            raise hb.HoldoutProbeRefused(
+                f"--code-sha ({args.code_sha!r}) does not match computed running code SHA {code_sha}"
+            )
         manifest = hb.load_price_manifest(Path(args.manifest))
         calendar = hb.load_calendar_manifest(Path(args.calendar_manifest), expected_sha256=args.calendar_sha256)
         calendar.window_sessions(lo, hi)
@@ -96,19 +124,16 @@ def main(argv: list[str] | None = None) -> None:
             expected_manifest_digest=manifest.digest,
             expected_manifest_file_sha256=manifest.file_sha256,
         )
-        issuers = _issuers(Path(args.issuers)) if args.issuers else []
-        sec_names = (
-            gd4.sec_names_by_ticker(Path(args.sic_map), issuers, pinned=not args.unpinned_sic_map)
-            if args.sic_map and issuers else {}
-        )
-        if args.submissions:
-            hb.check_submissions_not_form4(Path(args.submissions))
-            if not issuers:
-                raise hb.HoldoutProbeRefused("--submissions requires --issuers (for CIK mapping)")
-        interval = (
-            hb.load_c1_interval(Path(args.submissions), issuers)
-            if args.submissions and issuers else None
-        )
+        hb.check_submissions_not_form4(Path(args.submissions))
+        issuers = _issuers(Path(args.issuers))
+        by_ticker = {m["ticker"]: m for m in issuers}
+        missing_issuers = [t for t in manifest.admitted_issuers if t not in by_ticker or by_ticker[t].get("cik") is None]
+        if missing_issuers:
+            raise hb.HoldoutProbeRefused(
+                f"--issuers is missing CIK mappings for manifest issuers: {missing_issuers[:10]}"
+            )
+        sec_names = gd4.sec_names_by_ticker(Path(args.sic_map), issuers, pinned=not args.unpinned_sic_map)
+        interval = hb.load_c1_interval(Path(args.submissions), issuers)
 
         vendors = hb.HoldoutVendorFiles(
             Path(args.twelvedata_dir), Path(args.tiingo_meta_dir),
@@ -131,7 +156,7 @@ def main(argv: list[str] | None = None) -> None:
             with engine.connect() as conn:
                 probe = hb.run_holdout_probe(
                     conn, manifest=manifest, calendar=calendar, lo=lo, hi=hi,
-                    as_of_ts=snapshot, vendors=vendors, sec_names=sec_names or None,
+                    as_of_ts=snapshot, vendors=vendors, sec_names=sec_names,
                     interval=interval, progress=progress,
                 )
         finally:
@@ -145,13 +170,13 @@ def main(argv: list[str] | None = None) -> None:
             "calendar_manifest_sha256": calendar.sha256,
             "twelvedata_fetch_log_sha256": fetch.fetch_log_sha256(Path(args.twelvedata_dir)),
             "tiingo_meta_fetch_log_sha256": fetch.fetch_log_sha256(Path(args.tiingo_meta_dir)),
-            "issuers_sha256": gd4.file_sha256(Path(args.issuers)) if args.issuers else None,
-            "sic_map_sha256": gd4.file_sha256(Path(args.sic_map)) if args.sic_map else None,
-            "submissions_sha256": gd4.file_sha256(Path(args.submissions)) if args.submissions else None,
+            "issuers_sha256": gd4.file_sha256(Path(args.issuers)),
+            "sic_map_sha256": gd4.file_sha256(Path(args.sic_map)),
+            "submissions_sha256": gd4.file_sha256(Path(args.submissions)),
         }
         written = hb.write_holdout_outputs(
             out, probe, proof=proof, manifest=manifest, calendar=calendar, lo=lo, hi=hi,
-            code_sha=args.code_sha, snapshot_as_of_ts=snapshot, inputs=inputs,
+            code_sha=code_sha, snapshot_as_of_ts=snapshot, inputs=inputs,
         )
     except (hb.HoldoutProbeRefused, FileExistsError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
