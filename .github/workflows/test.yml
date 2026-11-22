@@ -262,6 +262,27 @@ jobs:
             exit 1
           fi
 
+      # regime_history keeps every version (#1302, regime_history_revs_20261122):
+      # proves on real PostgreSQL that a second default write leaves the row
+      # unchanged, every change keeps the superseded version in
+      # regime_history_revisions (an unattributed one, like the pinned
+      # scheduler's upsert, is archived as such), TRUNCATE and obs_date changes
+      # are refused, revisions are append-only, the readers see the current
+      # label, and downgrade refuses while revisions exist. A skip must fail.
+      - name: regime_history revisions PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_regime_history_revisions.py -q -rA | tee /tmp/grid-regime-history-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-regime-history-pg.txt; then
+            echo "::error::regime_history revisions PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Each database fixture uses a private schema. Run the competing
       # writers, scorers and hourly advisory-lock tests serially.
       - name: Oracle forward measurement PostgreSQL contracts

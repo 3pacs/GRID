@@ -1897,8 +1897,9 @@ def run_daily_pulls(
             "data_as_of={da} ({age} days old)",
             s=result.get("regime", "?"),
             c=result.get("confidence", "?"),
+            # False without an error: the day's row already held these values (#1302).
             rh=result.get("regime", "?") if result.get("regime_history_written")
-            else "NOT WRITTEN",
+            else "NOT WRITTEN" if result.get("regime_history_error") else "unchanged",
             da=result.get("data_as_of") or "unknown",
             age=result.get("data_staleness_days") if result.get("data_staleness_days") is not None
             else "?",
