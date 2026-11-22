@@ -229,10 +229,11 @@ def ask_ollama(req: AskRequest) -> dict[str, Any]:
         system_parts.append(knowledge_context)
     if findings_context:
         system_parts.append(findings_context)
-    if reports_context:
-        system_parts.append(reports_context)
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+    if reports_context:
+        # Agent-written text: passed as data in its own message, never in the system instructions
+        messages.append({"role": "user", "content": reports_context})
     messages.append({"role": "user", "content": req.question})
 
     response = client.chat(
