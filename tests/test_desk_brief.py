@@ -218,7 +218,8 @@ def test_selector_choices_without_outcomes(tmp_path):
     con.close()
     t = S.selector({"id": "selector/1", "name": "Sel", "db": str(p)}, "post_close", SESSION, POST)
     assert t.today == "default: no_trade" and t.have == 1
-    assert "42" not in json.dumps(t.to_dict(POST))
+    shown = {k: v for k, v in t.to_dict(POST).items() if k not in ("source", "registration")}
+    assert "42" not in json.dumps(shown)
 
 
 def test_plays_names_only(tmp_path):
@@ -233,7 +234,8 @@ def test_plays_names_only(tmp_path):
     con.close()
     t = S.plays({"id": "desk-plays", "name": "Plays", "db": str(p)}, "post_close", SESSION, PREV, POST)
     assert t.today == "night of 2026-11-20: on reversal_5d" and "held back" in t.withheld
-    assert "15.76" not in json.dumps(t.to_dict(POST)) and "0.99" not in json.dumps(t.to_dict(POST))
+    shown = json.dumps({k: v for k, v in t.to_dict(POST).items() if k not in ("source", "registration")})
+    assert "15.76" not in shown and "0.99" not in shown
 
 
 # ── records, files, live state ───────────────────────────────────────────────
@@ -328,7 +330,7 @@ def test_paper_record_follows_its_disclosure(tmp_path):
     assert "outcomes withheld (registration: one look at 100)" in text_ and "9.9" not in text_   # no gross-only
     assert "mean +0.125 vs null -0.050" in text_                     # stats copied only where supplied
     assert "the owner runs the registered look once (not a pass)" in text_
-    assert "description, not evidence" in text_
+    assert "description, not evidence" in text_ and "of None" not in text_
     assert any("selector: ledger locked" in p for p in sec.problems)
 
 
@@ -442,3 +444,57 @@ def test_sources_config_is_valid():
         for k in ("table", "day", "clock", "status"):
             assert S.IDENT.match(spec[k]), (spec["id"], k)
         assert spec.get("need") is None or isinstance(spec["need"], int)
+
+
+# ── factory slots (panel-factory/1) ──────────────────────────────────────────
+
+def _panel(tmp_path, slots, generated_at="2026-11-21T03:19:00+00:00"):
+    p = tmp_path / "panel.json"
+    p.write_text(json.dumps({"generated_at": generated_at, "factory": {
+        "version": "panel-factory/1", "status": "ok", "family": {"k": 10, "used": 0},
+        "features": {"z_history_have_min": 1, "z_history_needed": 60}, "slots": slots}}))
+    db = tmp_path / "signals.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE factory_fires (trial_id TEXT, day TEXT, decision TEXT, z REAL, fired INTEGER, side INTEGER, "
+                "abstain TEXT, recorded_at TEXT)")
+    con.execute("CREATE TABLE factory_feature_values (day TEXT, decision TEXT, feature TEXT, raw REAL, eligible INTEGER, "
+                "reasons TEXT, recorded_at TEXT)")
+    con.execute("INSERT INTO factory_fires VALUES ('s1', '2026-11-20', '14:00', 0.4, 0, 0, 'z_history_short', "
+                "'2026-11-20T19:00:01+00:00')")
+    con.execute("INSERT INTO factory_fires VALUES ('s2', '2026-11-20', '11:00', 2.4, 1, -1, NULL, '2026-11-20T16:00:01+00:00')")
+    con.executemany("INSERT INTO factory_feature_values VALUES ('2026-11-20', '10:00', ?, 1.0, ?, '[]', "
+                    "'2026-11-20T15:00:01+00:00')", [("a", 1), ("b", 0), ("c", 1)])
+    con.commit()
+    con.close()
+    return str(p), str(db)
+
+
+def test_no_slot_registered_is_said_plainly(tmp_path):
+    panel, db = _panel(tmp_path, [])
+    sec, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert sec.status == "ok" and trials == []
+    assert sec.lines[0] == "no slot registered (0 of 10)"
+    assert "feature history: 1 of 60 sessions" in sec.lines[1]
+    assert "2 of 3 eligible" in sec.lines[2]
+
+
+def test_slots_say_fire_or_abstain_and_stay_unproven(tmp_path):
+    slots = [{"trial_id": "s1", "name": "Slot one", "state": "collecting", "resolved_fires": 3, "min_n": 100,
+              "citable": False},
+             {"trial_id": "s2", "name": "Slot two", "state": "collecting", "resolved_fires": 7, "min_n": 100,
+              "citable": False}]
+    panel, db = _panel(tmp_path, slots)
+    sec, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    by = {t.trial_id: t for t in trials}
+    assert by["s1"].withheld == "no fire at 14:00: z_history_short" and by["s1"].today is None
+    assert by["s2"].today == "fired at 11:00 (side -1)"
+    assert by["s2"].card(POST)["label"] == "unproven, 7 of 100"
+    cit = B.Trial(**{**by["s2"].__dict__, "citable": True})
+    assert cit.card(POST)["label"].startswith("citable per its owner's record")
+
+
+def test_slot_fire_after_clock_not_shown(tmp_path):
+    slots = [{"trial_id": "s1", "name": "Slot one", "state": "collecting", "resolved_fires": 3, "min_n": 100}]
+    panel, db = _panel(tmp_path, slots)
+    sec, trials = S.factory_slots(panel, db, "pre_open", SESSION, PRE)
+    assert trials[0].today is None and trials[0].withheld is None    # recorded 19:00Z, after 09:00 ET
