@@ -1,13 +1,17 @@
-"""Same-key revision clock for options_daily_signals (disposable PostgreSQL).
+"""options_daily_signals write clock vs the thesis scorer (disposable PostgreSQL).
 
-Codex HOLD on #1382 (6ab82ac7): the daily-signals upsert replaced PCR /
-max-pain / spot on the same (ticker, signal_date) key without moving
-created_at, so a value revised after a decision clock kept a pre-clock
-timestamp and passed the thesis scorer's as-of fence.
+Codex HOLDs on #1382:
+- 6ab82ac7: a same-key revision kept a pre-clock created_at.
+- a5bfc4ac: excluding a late revision is not replay (the scorer fell back to
+  the prior session's 1.25 and could not recover the original 0.45), and
+  NOW() is the writing transaction's start, so a write that straddles a
+  cutoff carries a created_at from before its commit.
 
-These tests run the real upsert (ingestion.options._DAILY_SIGNALS_UPSERT_SQL)
-and the real scorer query (analysis.thesis_scorer._score_dealer_gamma)
-against PostgreSQL. Skipped without GRID_TEST_DB_URL (or DB_URL).
+So created_at is a last-write lower bound, the scorer scores live only, a
+session row written after its clock is unavailable (not replaced), and an
+explicit decision clock is refused. These tests run the real upsert
+(ingestion.options._DAILY_SIGNALS_UPSERT_SQL) and the real scorer against
+PostgreSQL. Skipped without GRID_TEST_DB_URL (or DB_URL).
 """
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 
 _DB_URL = os.environ.get("GRID_TEST_DB_URL") or os.environ.get("DB_URL")
 pytestmark = pytest.mark.skipif(
@@ -50,26 +54,31 @@ CREATE TABLE options_daily_signals (
 
 
 _SCHEMA = "rc_options_revision_clock_test"
+_SCHEMA_LOCK_KEY = 1382_2026_1122
 
 
 @pytest.fixture
 def engine():
-    eng = create_engine(_DB_URL)
-
-    @event.listens_for(eng, "connect")
-    def _search_path(dbapi_conn, _record):  # pragma: no cover - driver hook
-        cur = dbapi_conn.cursor()
-        cur.execute("SET search_path TO rc_options_revision_clock_test")
-        cur.close()
-
-    with eng.begin() as conn:
-        conn.execute(text("DROP SCHEMA IF EXISTS rc_options_revision_clock_test CASCADE"))
-        conn.execute(text("CREATE SCHEMA rc_options_revision_clock_test"))
-        conn.execute(text(_DDL))
-    yield eng
-    with eng.begin() as conn:
-        conn.execute(text("DROP SCHEMA rc_options_revision_clock_test CASCADE"))
-    eng.dispose()
+    # A connection option, not a SET in a connect hook: that SET runs in an
+    # implicit transaction, and the first rollback quietly reverts it.
+    eng = create_engine(_DB_URL, connect_args={"options": "-csearch_path=rc_options_revision_clock_test"})
+    # One fixed schema, so tests on parallel workers (pytest -n) take turns: a
+    # session-level advisory lock, held on its own connection, survives the
+    # tests' commits and rollbacks.
+    lock = eng.connect()
+    lock.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _SCHEMA_LOCK_KEY})
+    try:
+        with eng.begin() as conn:
+            conn.execute(text("DROP SCHEMA IF EXISTS rc_options_revision_clock_test CASCADE"))
+            conn.execute(text("CREATE SCHEMA rc_options_revision_clock_test"))
+            conn.execute(text(_DDL))
+        yield eng
+        with eng.begin() as conn:
+            conn.execute(text("DROP SCHEMA rc_options_revision_clock_test CASCADE"))
+    finally:
+        lock.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _SCHEMA_LOCK_KEY})
+        lock.close()
+        eng.dispose()
 
 
 def _params(sd: date, pcr: float, spot: float = 600.0) -> dict:
@@ -121,23 +130,14 @@ def test_identical_rewrite_keeps_the_clock_and_a_changed_value_moves_it(engine):
     assert revised_at >= before - timedelta(seconds=1)
 
 
-def test_value_revised_after_the_clock_falls_back_to_the_earlier_eligible_row(engine, monkeypatch):
-    import analysis.thesis_scorer as ts
-
-    now = datetime.now(timezone.utc)
-    today = now.date()
-    prior = today - timedelta(days=1)
+def _prior_weekday(day: date) -> date:
+    prior = day - timedelta(days=1)
     while prior.weekday() >= 5:
         prior -= timedelta(days=1)
+    return prior
 
-    _upsert(engine, _params(prior, 1.25))
-    _set_created_at(engine, prior, datetime.combine(prior, datetime.min.time(), timezone.utc) + timedelta(hours=21))
-    _upsert(engine, _params(today, 0.45))
-    _set_created_at(engine, today, now - timedelta(hours=3))  # captured before the clock
-    _upsert(engine, _params(today, 0.40))  # revised in place now, after the clock below
 
-    decision = now - timedelta(hours=1)  # after first capture, before the revision
-
+def _freeze_scorer_clock(monkeypatch, ts, decision: datetime) -> None:
     class _FakeDatetime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -150,12 +150,81 @@ def test_value_revised_after_the_clock_falls_back_to_the_earlier_eligible_row(en
 
     monkeypatch.setattr(ts, "datetime", _FakeDatetime)
     monkeypatch.setattr(ts, "date", _FakeDate)
+
+
+def test_a_value_revised_after_the_clock_is_unavailable_not_replaced(engine, monkeypatch):
+    import analysis.thesis_scorer as ts
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    prior = _prior_weekday(today)
+
+    _upsert(engine, _params(prior, 1.25))
+    _set_created_at(engine, prior, datetime.combine(prior, datetime.min.time(), timezone.utc) + timedelta(hours=21))
+    _upsert(engine, _params(today, 0.45))
+    _set_created_at(engine, today, now - timedelta(hours=3))  # captured before the clock
+    _upsert(engine, _params(today, 0.40))  # revised in place now, after the clock below
+
+    decision = now - timedelta(hours=1)  # after the first capture, before the revision
+    _freeze_scorer_clock(monkeypatch, ts, decision)
     monkeypatch.setattr(ts, "VISIBLE_DAILY_SIGNALS", "options_daily_signals")
 
     verdict = ts._score_dealer_gamma(engine, 0.5)
-    # Before the fix, the revised 0.40 kept its pre-clock created_at and was
-    # scored. Now the revision is invisible at the decision clock, and the
-    # earlier eligible row (prior session, PCR 1.25) is used instead.
-    assert verdict["status"] in ("active", "stale"), verdict
-    assert "1.25" in verdict["reasoning"], verdict["reasoning"]
-    assert "0.40" not in verdict["reasoning"] and "0.45" not in verdict["reasoning"]
+    # The 0.45 seen at the clock is gone; the prior session's 1.25 is not a
+    # substitute for it. The score is unavailable, and says why.
+    assert verdict["status"] == "no_data", verdict
+    assert verdict["evidence_availability"] == ts.OPTIONS_WRITTEN_AFTER_CLOCK
+    for value in ("1.25", "0.40", "0.45"):
+        assert value not in verdict["data_point"] and value not in verdict["reasoning"]
+
+
+def test_a_writer_transaction_straddling_a_live_read_is_invisible_until_commit(engine, monkeypatch):
+    """begin < read < commit: the live read sees only committed rows, and the
+    committed row's created_at (NOW() = transaction start) predates that read.
+    That is why a created_at-fenced replay is refused instead of answered."""
+    import analysis.thesis_scorer as ts
+
+    monkeypatch.setattr(ts, "VISIBLE_DAILY_SIGNALS", "options_daily_signals")
+    today = datetime.now(timezone.utc).date()
+    _upsert(engine, _params(today, 0.45))
+    _set_created_at(engine, today, datetime.now(timezone.utc) - timedelta(hours=3))
+
+    writer = engine.connect()
+    tx = writer.begin()
+    try:
+        writer.execute(text("SELECT 1"))  # the transaction (and its NOW()) starts here
+        from ingestion.options import _DAILY_SIGNALS_UPSERT_SQL
+
+        writer.execute(_DAILY_SIGNALS_UPSERT_SQL, _params(today, 0.40))
+
+        during = ts._score_dealer_gamma(engine, 0.5)  # live read while the write is open
+        read_clock = datetime.now(timezone.utc)
+        assert during["status"] == "active", during
+        assert "0.45" in during["data_point"]
+        assert during["evidence_basis"] == "same_session"
+        tx.commit()
+    finally:
+        writer.close()
+
+    revised_at = _created_at(engine, today)
+    assert revised_at < read_clock  # stamped before the read that could not see it
+
+    # A created_at fence at read_clock would now return the value that read
+    # could not see: the lookahead a replay would commit.
+    with engine.connect() as conn:
+        fenced = conn.execute(
+            text(
+                "SELECT put_call_ratio FROM options_daily_signals "
+                "WHERE ticker = 'SPY' AND signal_date <= :d AND created_at <= :c "
+                "ORDER BY signal_date DESC LIMIT 1"
+            ),
+            {"d": today, "c": read_clock},
+        ).scalar_one()
+    assert fenced == pytest.approx(0.40)
+
+    replay = ts._score_dealer_gamma(engine, 0.5, as_of_ts=read_clock)
+    assert replay["status"] == "no_data"
+    assert replay["evidence_availability"] == ts.OPTIONS_REPLAY_UNAVAILABLE
+
+    after = ts._score_dealer_gamma(engine, 0.5)  # live, after the commit
+    assert "0.40" in after["data_point"]

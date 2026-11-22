@@ -95,6 +95,17 @@ _VANNA_CHARM_NAME = "Vanna/Charm (Max-Pain Proxy)"
 _VANNA_CHARM_MEASUREMENT = "proxy:max_pain_distance"
 _UNSET = object()
 
+# The two options scorers are live-only. options_daily_signals keeps one mutable
+# row per (ticker, signal_date): no immutable revision history, and no commit-time
+# availability clock (created_at is a write-time lower bound; PostgreSQL NOW() is
+# the writing transaction's start, before its commit). A live read sees only
+# committed rows, so it is sound; the value as of a past decision clock cannot be
+# reproduced. So a replay request, or a session row last written after the
+# decision clock, is reported unavailable and never replaced by an earlier session.
+# A live score's decision clock is the instant just before its read.
+OPTIONS_REPLAY_UNAVAILABLE = "historical_replay_unavailable"
+OPTIONS_WRITTEN_AFTER_CLOCK = "unavailable_written_after_decision_clock"
+
 # News sentiment scoring thresholds
 NEWS_MIN_DIRECTIONAL_ARTICLES = 5
 NEWS_DEFAULT_ARTICLE_CONF = 0.5
@@ -172,6 +183,69 @@ def _coerce_signal_date(value: Any) -> date | None:
     return None
 
 
+def _options_decision_clock(as_of_ts: datetime | None) -> tuple[datetime, bool]:
+    """``(decision_clock, is_replay)``. None means live: now, UTC.
+
+    Any explicit clock is a replay, even one a moment ago: a row committed
+    between that clock and the read is visible to the read but carries a
+    created_at from before its commit, so only a live read is sound.
+    """
+    if as_of_ts is None:
+        now = datetime.now(timezone.utc)
+        return (now if now.tzinfo else now.replace(tzinfo=timezone.utc)), False
+    clock = as_of_ts if as_of_ts.tzinfo else as_of_ts.replace(tzinfo=timezone.utc)
+    return clock.astimezone(timezone.utc), True
+
+
+def _options_unavailable(
+    model_key: str,
+    model_name: str,
+    measurement: str,
+    accuracy: float,
+    availability: str,
+    threshold: str,
+    reasoning: str,
+) -> dict[str, Any]:
+    """A fail-closed ``no_data`` verdict that says why the evidence is unavailable."""
+    verdict = _verdict(
+        model_key, model_name,
+        0, 0, "historical value unavailable", threshold, reasoning,
+        data_age_hours=None, historical_accuracy=accuracy, status="no_data",
+        measurement=measurement,
+    )
+    verdict["evidence_availability"] = availability
+    return verdict
+
+
+def _options_replay_refusal(
+    model_key: str, model_name: str, measurement: str, accuracy: float, as_of_ts: datetime,
+) -> dict[str, Any]:
+    return _options_unavailable(
+        model_key, model_name, measurement, accuracy, OPTIONS_REPLAY_UNAVAILABLE,
+        "live decision clock only",
+        f"SPY options values as of {as_of_ts.isoformat()} cannot be reproduced: "
+        "options_daily_signals keeps one mutable row per session, with no revision "
+        "history or commit-time availability clock. Not scored; no other session substituted.",
+    )
+
+
+def _label_options_session(verdict: dict[str, Any], sig_date_raw: Any, as_of_date: date) -> dict[str, Any]:
+    """Name the session a live score used; say so when it is an earlier session."""
+    sig_date = _coerce_signal_date(sig_date_raw)
+    if sig_date is None:
+        return verdict
+    verdict["evidence_session"] = sig_date.isoformat()
+    if sig_date == as_of_date:
+        verdict["evidence_basis"] = "same_session"
+    else:
+        verdict["evidence_basis"] = "prior_session"
+        verdict["reasoning"] = (
+            f"Uses an earlier session's row ({sig_date.isoformat()}): no {as_of_date.isoformat()} "
+            "row was written by the decision clock. " + verdict["reasoning"]
+        )
+    return verdict
+
+
 def _validate_options_clock(
     *,
     model_key: str,
@@ -245,14 +319,14 @@ def _validate_options_clock(
                 m=model_name, ca=created_ts.isoformat(), as_of=as_of_ts.isoformat(),
                 ah=capture_age_hours,
             )
-            return None, _verdict(
-                model_key, model_name,
-                0, 0, "no eligible data",
+            return None, _options_unavailable(
+                model_key, model_name, measurement, accuracy, OPTIONS_WRITTEN_AFTER_CLOCK,
                 f"created_at <= {as_of_ts.isoformat()}",
-                f"SPY options row captured at {created_ts.isoformat()} after decision clock "
-                f"{as_of_ts.isoformat()}; excluded from score (lookahead guard).",
-                data_age_hours=None, historical_accuracy=accuracy, status="no_data",
-                measurement=measurement,
+                f"SPY options row for {sig_date.isoformat()} was last written at "
+                f"{created_ts.isoformat()}, after decision clock {as_of_ts.isoformat()} "
+                "(late capture or in-place revision). Its value as of the decision clock "
+                "cannot be reproduced; not scored, and no earlier session substituted "
+                "(lookahead guard).",
             )
         age_hours = max(date_age_hours, capture_age_hours)
 
@@ -463,7 +537,7 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
             status="broken", historical_accuracy=accuracy)
 
 
-def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
+def _score_dealer_gamma(engine: Engine, accuracy: float, as_of_ts: datetime | None = None) -> dict:
     """Put/call ratio proxy for dealer gamma (not directly observed dealer gamma).
 
     Model key remains ``dealer_gamma`` for downstream accuracy table stability.
@@ -478,11 +552,16 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
     Note: PCR is CONTRARIAN.  High put buying = bullish setup.
     """
     try:
-        as_of_ts = datetime.now(timezone.utc)
-        if as_of_ts.tzinfo is None:
-            as_of_ts = as_of_ts.replace(tzinfo=timezone.utc)
+        as_of_ts, is_replay = _options_decision_clock(as_of_ts)
+        if is_replay:
+            return _options_replay_refusal(
+                "dealer_gamma", _DEALER_GAMMA_NAME, _DEALER_GAMMA_MEASUREMENT, accuracy, as_of_ts,
+            )
         as_of_date = as_of_ts.date()
 
+        # The newest session at or before the decision date, whatever its write
+        # time: if it was written after the clock, the guard below reports it
+        # unavailable rather than letting SQL fall through to an earlier session.
         with engine.connect() as conn:
             row = conn.execute(
                 visible_sql(
@@ -490,10 +569,9 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
                     "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = 'SPY' AND put_call_ratio IS NOT NULL "
                     "AND signal_date <= :as_of_date "
-                    "AND created_at <= :as_of_ts "
                     "ORDER BY signal_date DESC, created_at DESC LIMIT 1"
                 ),
-                {"as_of_date": as_of_date, "as_of_ts": as_of_ts},
+                {"as_of_date": as_of_date},
             ).fetchone()
 
             if not row or not row[0]:
@@ -542,7 +620,7 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
             if age_hours and age_hours > 48:
                 confidence *= 0.7
 
-            return _verdict(
+            return _label_options_session(_verdict(
                 "dealer_gamma", _DEALER_GAMMA_NAME,
                 score, confidence,
                 data_point=f"SPY PCR = {pcr:.2f}" + (f", spot ${spot:.0f}" if spot else ""),
@@ -555,7 +633,7 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
                 measurement=_DEALER_GAMMA_MEASUREMENT,
-            )
+            ), sig_date_raw, as_of_date)
     except Exception as exc:
         log.debug("Dealer gamma scorer error: {e}", e=str(exc))
         return _verdict(
@@ -566,7 +644,7 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
         )
 
 
-def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
+def _score_vanna_charm(engine: Engine, accuracy: float, as_of_ts: datetime | None = None) -> dict:
     """Max-pain distance proxy for vanna/charm (not directly observed dealer vanna/charm).
 
     Model key remains ``vanna_charm`` for downstream accuracy table stability.
@@ -581,11 +659,16 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
     Confidence increases closer to OpEx (Friday).
     """
     try:
-        as_of_ts = datetime.now(timezone.utc)
-        if as_of_ts.tzinfo is None:
-            as_of_ts = as_of_ts.replace(tzinfo=timezone.utc)
+        as_of_ts, is_replay = _options_decision_clock(as_of_ts)
+        if is_replay:
+            return _options_replay_refusal(
+                "vanna_charm", _VANNA_CHARM_NAME, _VANNA_CHARM_MEASUREMENT, accuracy, as_of_ts,
+            )
         as_of_date = as_of_ts.date()
 
+        # The newest session at or before the decision date, whatever its write
+        # time: if it was written after the clock, the guard below reports it
+        # unavailable rather than letting SQL fall through to an earlier session.
         with engine.connect() as conn:
             row = conn.execute(
                 visible_sql(
@@ -593,10 +676,9 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
                     "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0 "
                     "AND signal_date <= :as_of_date "
-                    "AND created_at <= :as_of_ts "
                     "ORDER BY signal_date DESC, created_at DESC LIMIT 1"
                 ),
-                {"as_of_date": as_of_date, "as_of_ts": as_of_ts},
+                {"as_of_date": as_of_date},
             ).fetchone()
 
             if not row:
@@ -643,7 +725,7 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
             if age_hours and age_hours > 48:
                 confidence *= 0.6
 
-            return _verdict(
+            return _label_options_session(_verdict(
                 "vanna_charm", _VANNA_CHARM_NAME,
                 score, confidence,
                 data_point=f"Spot ${spot:.0f} vs max pain ${mp:.0f} (gap {gap_pct:+.1f}%)",
@@ -658,7 +740,7 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
                 measurement=_VANNA_CHARM_MEASUREMENT,
-            )
+            ), sig_date_raw, as_of_date)
     except Exception as exc:
         log.debug("Vanna/charm scorer error: {e}", e=str(exc))
         return _verdict(

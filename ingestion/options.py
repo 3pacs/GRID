@@ -962,10 +962,12 @@ _DAILY_SIGNALS_UPSERT_SQL = text(
     "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
     ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
     "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
-    # created_at is the row's revision clock: it moves to NOW() only when a
-    # stored value actually changes (SET expressions read the existing row),
-    # so an as-of reader (analysis/thesis_scorer) never takes a value revised
-    # after its decision clock.
+    # created_at is the row's last-write time: it moves to NOW() only when a
+    # stored value actually changes (SET expressions read the existing row).
+    # NOW() is the writing transaction's start, so this is a lower bound on
+    # the write, not a commit-time availability clock; analysis/thesis_scorer
+    # therefore scores options live only and reports a row written after its
+    # decision clock as unavailable.
     "created_at = CASE WHEN ("
     "options_daily_signals.put_call_ratio, options_daily_signals.max_pain, "
     "options_daily_signals.iv_skew, options_daily_signals.total_oi, "

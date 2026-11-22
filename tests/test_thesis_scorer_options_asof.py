@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -139,66 +139,89 @@ def _bypass_engine(row: tuple[Any, ...] | None):
 # ── 1. Selection cutoff: future row, same-day late fetch, earlier fallback ─
 
 
-def test_dealer_gamma_ignores_future_and_same_day_late_fetch_and_uses_earlier_fallback(monkeypatch):
-    _freeze_clock(monkeypatch, _DECISION_TS)
-    candidates = [
-        # Future signal_date (poison: extreme complacency PCR -> bearish -30)
-        (0.40, 590.0, date(2026, 11, 26), datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc)),
-        # Same-day late fetch after 15:00Z decision clock (poison: bearish -30)
-        (0.45, 585.0, date(2026, 11, 25), datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)),
-        # Eligible earlier fallback: Tue 2026-11-24 captured before clock (bullish PCR 1.25)
-        (1.25, 580.0, date(2026, 11, 24), datetime(2026, 11, 24, 21, 0, tzinfo=timezone.utc)),
-        # Older eligible row (should not beat 2026-11-24)
-        (0.50, 575.0, date(2026, 11, 23), datetime(2026, 11, 23, 21, 0, tzinfo=timezone.utc)),
-    ]
-    engine, recorded = _asof_options_engine(candidates)
+_POISON_DG = [
+    # Future signal_date (poison: extreme complacency PCR -> bearish -30)
+    (0.40, 590.0, date(2026, 11, 26), datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc)),
+    # Same-session row last written after the 15:00Z decision clock (poison)
+    (0.45, 585.0, date(2026, 11, 25), datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)),
+    # Earlier session captured before the clock: must NOT be substituted
+    (1.25, 580.0, date(2026, 11, 24), datetime(2026, 11, 24, 21, 0, tzinfo=timezone.utc)),
+]
+_POISON_VC = [
+    (610.0, 580.0, date(2026, 11, 26), datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc)),
+    (605.0, 580.0, date(2026, 11, 25), datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)),
+    (560.0, 580.0, date(2026, 11, 24), datetime(2026, 11, 24, 21, 0, tzinfo=timezone.utc)),
+]
 
-    verdict = ts._score_dealer_gamma(engine, accuracy=0.5)
+
+@pytest.mark.parametrize("scorer,rows,poison", [
+    ("_score_dealer_gamma", _POISON_DG, ("0.40", "0.45", "1.25")),
+    ("_score_vanna_charm", _POISON_VC, ("$610", "$605", "$560")),
+])
+def test_session_row_written_after_the_clock_is_unavailable_not_replaced(monkeypatch, scorer, rows, poison):
+    """Codex HOLD on #1382 (a5bfc4ac): the newest session at or before the
+    decision date was written after the clock, so its as-of value cannot be
+    reproduced. The scorer says so; it does not fall back to 2026-11-24."""
+    _freeze_clock(monkeypatch, _DECISION_TS)
+    engine, recorded = _asof_options_engine(rows)
+
+    verdict = getattr(ts, scorer)(engine, accuracy=0.5)
 
     assert len(recorded) == 1
     sql, bound = recorded[0]
     assert re.search(r"signal_date\s*<=\s*:\w+", sql), "query must bind signal_date upper cutoff"
-    assert re.search(r"created_at\s*<=\s*:\w+", sql), "query must bind created_at availability cutoff"
+    assert not re.search(r"created_at\s*<=", sql), "SQL must not silently fall through to an earlier session"
     assert str(_DECISION_DATE) not in sql, "decision date must be a bound parameter, not interpolated"
-    assert _DECISION_DATE in bound.values()
-    assert _DECISION_TS in bound.values()
+    assert bound["as_of_date"] == _DECISION_DATE
+    assert _DECISION_TS not in bound.values()
 
-    assert verdict["status"] == "active"
-    assert verdict["direction"] == "bullish"
-    assert verdict["score"] > 0
-    assert "1.25" in verdict["data_point"]
-    assert verdict["data_age_hours"] is not None and verdict["data_age_hours"] >= 0
+    assert verdict["status"] == "no_data"
+    assert (verdict["score"], verdict["confidence"], verdict["data_age_hours"]) == (0, 0, None)
+    assert verdict["evidence_availability"] == ts.OPTIONS_WRITTEN_AFTER_CLOCK
+    assert "no earlier session substituted" in verdict["reasoning"]
+    for value in poison:
+        assert value not in verdict["data_point"]
 
 
-def test_vanna_charm_ignores_future_and_same_day_late_fetch_and_uses_earlier_fallback(monkeypatch):
+@pytest.mark.parametrize("scorer,rows,expect", [
+    ("_score_dealer_gamma", _POISON_DG[:1] + _POISON_DG[2:], ("bullish", "1.25")),
+    ("_score_vanna_charm", _POISON_VC[:1] + _POISON_VC[2:], ("bearish", "$560")),
+])
+def test_an_earlier_session_used_live_is_labelled_as_such(monkeypatch, scorer, rows, expect):
+    """No 2026-11-25 row exists at the 15:00Z clock (EOD data): the live score
+    uses 2026-11-24 and names it as an earlier session."""
     _freeze_clock(monkeypatch, _DECISION_TS)
-    candidates = [
-        # Future signal_date (poison: spot well below max pain -> bullish)
-        (610.0, 580.0, date(2026, 11, 26), datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc)),
-        # Same-day late fetch after 15:00Z decision clock (poison: bullish)
-        (605.0, 580.0, date(2026, 11, 25), datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)),
-        # Eligible earlier fallback: spot 580 vs max pain 560 (+3.4% above -> bearish)
-        (560.0, 580.0, date(2026, 11, 24), datetime(2026, 11, 24, 21, 0, tzinfo=timezone.utc)),
-        # Older eligible row (should not beat 2026-11-24)
-        (600.0, 580.0, date(2026, 11, 23), datetime(2026, 11, 23, 21, 0, tzinfo=timezone.utc)),
-    ]
-    engine, recorded = _asof_options_engine(candidates)
-
-    verdict = ts._score_vanna_charm(engine, accuracy=0.5)
-
-    assert len(recorded) == 1
-    sql, bound = recorded[0]
-    assert re.search(r"signal_date\s*<=\s*:\w+", sql), "query must bind signal_date upper cutoff"
-    assert re.search(r"created_at\s*<=\s*:\w+", sql), "query must bind created_at availability cutoff"
-    assert str(_DECISION_DATE) not in sql, "decision date must be a bound parameter, not interpolated"
-    assert _DECISION_DATE in bound.values()
-    assert _DECISION_TS in bound.values()
-
+    verdict = getattr(ts, scorer)(_asof_options_engine(rows)[0], accuracy=0.5)
     assert verdict["status"] == "active"
-    assert verdict["direction"] == "bearish"
-    assert verdict["score"] < 0
-    assert "$560" in verdict["data_point"]
+    assert verdict["direction"] == expect[0]
+    assert expect[1] in verdict["data_point"]
+    assert verdict["evidence_basis"] == "prior_session"
+    assert verdict["evidence_session"] == "2026-11-24"
+    assert verdict["reasoning"].startswith("Uses an earlier session's row (2026-11-24)")
     assert verdict["data_age_hours"] is not None and verdict["data_age_hours"] >= 0
+
+
+@pytest.mark.parametrize("scorer", ["_score_dealer_gamma", "_score_vanna_charm"])
+@pytest.mark.parametrize("offset", [timedelta(days=-30), timedelta(hours=-1), timedelta(seconds=-1),
+                                    timedelta(0), timedelta(hours=2)])
+def test_any_explicit_decision_clock_is_refused_as_a_replay(monkeypatch, scorer, offset):
+    """Values as of an explicit clock cannot be reproduced from one mutable row
+    per session, even a second ago: refused, and the table is not read."""
+    _freeze_clock(monkeypatch, _DECISION_TS)
+    engine, recorded = _asof_options_engine(_POISON_DG)
+    verdict = getattr(ts, scorer)(engine, accuracy=0.5, as_of_ts=_DECISION_TS + offset)
+    assert recorded == []
+    assert verdict["status"] == "no_data"
+    assert verdict["evidence_availability"] == ts.OPTIONS_REPLAY_UNAVAILABLE
+    assert verdict["score"] == 0 and verdict["confidence"] == 0
+
+
+def test_decision_clock_helper():
+    clock, replay = ts._options_decision_clock(None)
+    assert replay is False and clock.tzinfo is not None
+    naive = datetime(2026, 11, 25, 15, 0)
+    clock, replay = ts._options_decision_clock(naive)
+    assert replay is True and clock == _DECISION_TS
 
 
 def test_only_future_or_late_rows_return_no_data(monkeypatch):
@@ -311,12 +334,11 @@ def test_scorers_fail_closed_if_future_or_negative_age_row_bypasses_sql(
 
 
 def test_earlier_fallback_older_than_2_trading_days_is_marked_stale(monkeypatch):
-    # Wed 2026-11-25 15:00Z; future (Nov 26) and late same-day (Nov 25 21:00Z) skipped;
-    # newest eligible fallback is Fri 2026-11-20 = 3 trading days old -> stale.
+    # Wed 2026-11-25 15:00Z; the future (Nov 26) row is skipped and no Nov 25 row
+    # exists yet; the newest session is Fri 2026-11-20 = 3 trading days old -> stale.
     _freeze_clock(monkeypatch, _DECISION_TS)
     dg_engine, _ = _asof_options_engine([
         (1.45, 580.0, date(2026, 11, 26), datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc)),
-        (1.45, 580.0, date(2026, 11, 25), datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)),
         (1.45, 580.0, date(2026, 11, 20), datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)),
     ])
     dg = ts._score_dealer_gamma(dg_engine, accuracy=0.5)
@@ -328,7 +350,6 @@ def test_earlier_fallback_older_than_2_trading_days_is_marked_stale(monkeypatch)
 
     vc_engine, _ = _asof_options_engine([
         (560.0, 580.0, date(2026, 11, 26), datetime(2026, 11, 26, 20, 0, tzinfo=timezone.utc)),
-        (560.0, 580.0, date(2026, 11, 25), datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)),
         (560.0, 580.0, date(2026, 11, 20), datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)),
     ])
     vc = ts._score_vanna_charm(vc_engine, accuracy=0.5)
