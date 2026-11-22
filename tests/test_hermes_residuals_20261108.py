@@ -146,7 +146,7 @@ class _Conn:
         return False
 
     def execute(self, query, params=None):
-        if params is not None:  # the pull_log relation probe
+        if "to_regclass" in str(query):  # the pull_log relation probe
             return SimpleNamespace(scalar=lambda: True)
         return SimpleNamespace(fetchall=lambda: self.rows)
 
