@@ -228,6 +228,39 @@ def effective_asset_type(ticker: str, stored: str | None) -> str:
     return _guess_asset_type(ticker)
 
 
+_ASSET_TYPE_SECTOR: dict[str, str] = {
+    "crypto": "Crypto", "etf": "ETF", "commodity": "Commodities",
+}
+
+
+def watchlist_sectors(items: list[tuple[str, str]]) -> dict[str, str]:
+    """Sector label for each ``(ticker, effective_asset_type)`` watchlist item.
+
+    A ticker named as an actor in ``analysis.sector_map.SECTOR_MAP`` gets
+    that sector. A ticker listed under several sectors (AAPL, TSLA, LLY,
+    RTX on 2026-11-23) gets the last one in map order. Any other ticker is
+    labelled from its asset type: Crypto, ETF, Commodities, else Other.
+    The portfolio view and the risk map's concentration block both use
+    this. The watchlist table has no sector column.
+    """
+    tickers = {t for t, _ in items}
+    sectors: dict[str, str] = {}
+    try:
+        from analysis.sector_map import SECTOR_MAP
+        for sector_name, sector in SECTOR_MAP.items():
+            for sub in sector.get("subsectors", {}).values():
+                for actor in sub.get("actors", []):
+                    tk = actor.get("ticker")
+                    if tk and tk in tickers:
+                        sectors[tk] = sector_name
+    except Exception as exc:
+        log.debug("Watchlist: sector map context failed: {e}", e=str(exc))
+    for tk, asset_type in items:
+        if tk not in sectors:
+            sectors[tk] = _ASSET_TYPE_SECTOR.get(asset_type, "Other")
+    return sectors
+
+
 def _row_to_dict(row: Any) -> dict:
     """Convert a DB row to a watchlist item dict."""
     d = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
