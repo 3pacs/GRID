@@ -53,6 +53,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--registered-release", help="unread-receipt: commit that sealed the registration")
     ap.add_argument("--abandoning-release", help="unread-receipt: commit that ran the abandoning cycle")
     ap.add_argument("--out", help="unread-receipt: the receipt file to create (0444, never overwritten)")
+    ap.add_argument("--cache", action="append", default=[],
+                    help="unread-receipt: one cache on the owner-approved list (repeat for each)")
+    ap.add_argument("--writers-through", help="unread-receipt: the release whose history holds every cache writer")
+    ap.add_argument("--writer-tree", action="append", default=[],
+                    help="unread-receipt: a staged code tree a rehearsal ran against a listed cache (repeat)")
     args = ap.parse_args(argv)
     if args.family and not args.dry_run:
         ap.error("--family is a dry-run preview")
@@ -88,15 +93,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "unread-receipt":
         if not (args.registration and args.repo and args.registered_release and args.abandoning_release
-                and args.out and data):
+                and args.out and data and args.cache and args.writers_through):
             ap.error("unread-receipt needs --registration, --repo, --registered-release, --abandoning-release, "
-                     "--out and --data-dir")
+                     "--writers-through, --cache (one per listed cache), --out and --data-dir")
         ledger.verify(full=True)
         from . import receipt as RC
 
-        # every local filesystem in the mount table is walked; no cache list is taken from the caller
+        # the cache list is the owner's; the policy's attestation must name the same list
         rc = RC.build(ledger, args.registration, Path(data), repo=Path(args.repo),
-                      registered_release=args.registered_release, abandoning_release=args.abandoning_release)
+                      registered_release=args.registered_release, abandoning_release=args.abandoning_release,
+                      caches=args.cache, writers_through=args.writers_through, writer_trees=args.writer_tree)
         sha = RC.write(rc, Path(args.out))
         print(json.dumps({"verdict": rc["verdict"], "failed": rc.get("failed"), "out": args.out, "sha256": sha,
                           "consumed_through_exclusive": rc.get("consumed_through_exclusive")}))

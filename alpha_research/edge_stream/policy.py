@@ -12,7 +12,7 @@ environment.
 Version 5 (2026-11-22) adds one owner decision that names one registration sealed before
 read records existed: the single-stocks history registration abandoned on 2026-11-20. A
 receipt reconciled from the ledger, cycle.log, the release that ran the cycle, the data
-dir and every edge-stream bar cache on grid-svr (sha256 pinned below) shows no read of its
+dir and the owner-approved list of edge-stream bar caches on grid-svr (sha256 pinned below) shows no read of its
 window except four sessions (2024-12-19..24) whose move sizes rehearsal copies read; those
 stay consumed and the rest of its window is freed.
 
@@ -125,12 +125,13 @@ OWNER_DECISIONS: tuple[dict, ...] = (
     },
     {
         "id": "GRID#1379",
-        "url": "https://github.com/3pacs/GRID/issues/1379#issuecomment-7085985405",
+        "url": "https://github.com/3pacs/GRID/issues/1379#issuecomment-7089739325",
         "decided_by": "Anik (repository owner)",
         "decided_on": "2026-11-22",
-        "text_sha256": "603ac1939d464ce6962a08e09b5df2806ee75d084ec0c4880770aff531642715",
+        "text_sha256": "6bd08e4747ebe94040bd3eff7471c2479597812d1f36a4cd3f74a422ba044321",
         "summary": "the 2026-11-20 abandonment of IM1-v1:us_single_stocks:history:2024-12-19 is attested unread by "
-                   "receipt 5e002ed6 except 2024-12-19..24, which stay consumed; the rest of its window is freed and "
+                   "receipt 98b395fe over the 13 caches the owner approved, except 2024-12-19..24, which stay "
+                   "consumed; the rest of its window is freed and "
                    "single stocks may register again; its alpha stays spent",
         "waives": ["unread_abandonment"],
     },
@@ -151,8 +152,9 @@ UNREAD_ABANDONMENT: dict = {
             "registration whose presence was counted was read: its window stays consumed and its (family, group, "
             "lane) stays closed. Any registration sealed before this policy, and any whose evidence is missing, "
             "partial or disputed, keeps its window and its (family, group, lane) closed, except a history "
-            "registration an owner decision names below with a reconciled receipt (its sha256 pinned; its bytes, "
-            "shipped with this code, must agree with this ledger on every load): its window up to "
+            "registration an owner decision names below with a reconciled receipt (its sha256 and the owner's cache "
+            "list pinned; its bytes, shipped with this code, must agree with this ledger and that list on every "
+            "load): its window up to "
             "consumed_through_exclusive stays consumed and the rest is freed, and only while the ledger still "
             "holds no look and no edge_read of it and its abandonment shows no read. The alpha of an abandoned "
             "registration stays spent and it counts toward max_registrations",
@@ -163,20 +165,40 @@ UNREAD_ABANDONMENT: dict = {
             "frees_window": True,
             "proposal_id": "IM1-v1:us_single_stocks:history:2024-12-19",
             "decision": "GRID#1379",
-            "receipt": "unread-cfa25376-v2-20261122.json",
-            "receipt_sha256": "5e002ed65f177e6a39a7b5a07d7bb1cb8b102c300b75d69564a95753a555ff0a",
+            "receipt": "unread-cfa25376-v3-20261122.json",
+            "receipt_sha256": "98b395fe10145a62b047e17cf60d88d66445425fa557f49b5809716c7796339a",
             "receipt_verdict": "UNREAD_EXCEPT",
             "consumed_through_exclusive": "2024-12-25",
-            "evidence": "receipt edge-unread-receipt/2 built read-only on grid-svr 2026-11-22 against the 14-record "
+            # the owner-approved cache list (every cache the stream's code wrote on grid-svr since
+            # 2026-11-13: the live data dir and preflight, one scratch install, ten rehearsal copies)
+            "inventory": [
+                "/data/agent-home/anikdang/edge-rehearsal4-20261122/copy/data/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-rehearsal5-20261122/copy/data/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-ss-rehearsal-20261122/copy/data/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-ss-rehearsal-20261122/copy/data/preflight/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-unread-rehearsal-20261122/copy/data/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-unread-rehearsal-20261122/copy/data/preflight/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-unread-rehearsal2-20261122/copy/data/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-unread-rehearsal2-20261122/copy/data/preflight/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-unread-rehearsal3-20261122/copy/data/bars.sqlite3",
+                "/data/agent-home/anikdang/edge-unread-rehearsal3-20261122/copy/data/preflight/bars.sqlite3",
+                "/data/agent-home/anikdang/scratch-edge-stream-20261113/data/bars.sqlite3",
+                "/data/grid_ledgers/edge-looks/data/bars.sqlite3",
+                "/data/grid_ledgers/edge-looks/data/preflight/bars.sqlite3",
+            ],
+            "evidence": "receipt edge-unread-receipt/3 built read-only on grid-svr 2026-11-22 against the 14-record "
                         "ledger (head line 69a84820): the ledger holds only its abandonment (seq 11, no look, no "
                         "edge_read); cycle.log holds one cycle between its registration and abandonment, not a dry "
                         "run, with no look line for it; release 1c94dae9 rebuilds its registered code hash 799ed2d5 "
                         "and release 15975857 rebuilds a9f28c3a, the hash the forward registration 69a84820 sealed "
                         "in the abandoning cycle, and runs the code-hash check before any read; no staged report or "
-                        "failed attempt; every SQLite file changed since its registration on the host's disk "
-                        "filesystems was opened read-only: of ten bar caches, the live one holds nothing in its "
-                        "window and only three rehearsal copies (2026-11-22) hold sessions in it, 2024-12-19..24. "
-                        "Those four sessions stay consumed",
+                        "failed attempt. Each of the 13 listed caches was copied whole under its own read lock (a "
+                        "rollback-journal file, no journal or WAL beside it) and inspected from the hashed copy: no "
+                        "removed rows or pages, no daily or event row of the instruments, the live cache born "
+                        "2026-11-13 before the registration. Every committed data.py and families.py up to release "
+                        "c0ef04a0, the 156 releases deployed since 2026-11-13 (all in that history) and the seven "
+                        "staged rehearsal trees only add sessions, and read only the hedge (SPY) complete. Only three "
+                        "rehearsal copies hold sessions in the window, 2024-12-19..24. Those four sessions stay consumed",
         },
     ],
 }

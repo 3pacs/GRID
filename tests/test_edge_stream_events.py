@@ -83,7 +83,8 @@ V2_RULE = ("per calendar year (UTC): q_year over at most max_registrations stage
 
 
 V5_EXCEPTION = (", except a history registration an owner decision names below with a reconciled receipt (its "
-                "sha256 pinned; its bytes, shipped with this code, must agree with this ledger on every load): its "
+                "sha256 and the owner's cache list pinned; its bytes, shipped with this code, must agree with this "
+                "ledger and that list on every load): its "
                 "window up to consumed_through_exclusive stays consumed and the rest is freed, "
                 "and only while the ledger still holds no look and no edge_read of it and its abandonment shows no "
                 "read. ")
@@ -819,7 +820,12 @@ def test_the_pinned_receipt_binds_to_the_live_ledger():
     assert rel["registered_release"]["code_sha256"][:8] == "799ed2d5"
     assert [(w["registration_sha256"][:8], w["code_sha256"][:8]) for w in rel["witnesses"]] == [("69a84820", "a9f28c3a")]
     assert rel["code_changed"] and rel["code_order"]["ok"]
-    assert rc["checks"]["caches"]["detail"]["live_cache_found"] and not rc["checks"]["caches"]["detail"]["errors"]
+    inv = rc["checks"]["caches"]["detail"]
+    assert inv["ok"] and inv["errors"] == inv["problems"] == [] and inv["listed"] == sorted(hist["inventory"])
+    assert set(inv["stream_caches"]) <= set(inv["listed"]) and len(inv["listed"]) == 13
+    assert all(c["retention"]["nothing_removed"] and c["snapshot"]["journal_mode"] == "delete" for c in inv["caches"])
+    wr = rc["checks"]["writers"]["detail"]
+    assert wr["ok"] and wr["deployed"]["not_in_history"] == [] and wr["hedge_instrument"] == "SPY"
     fx = REPO / "tests" / "fixtures" / "edge_stream"
     state = L.load_state(L.open_ledger(fx / "live-ledger-20261122.jsonl", fx / "live-ledger-20261122.anchors.jsonl"))
     assert RC.verify(state, hist) == []

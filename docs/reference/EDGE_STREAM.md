@@ -81,13 +81,23 @@ cannot prove it unread. `python -m alpha_research.edge_stream unread-receipt` (`
   That release's `compute_look` checks the code hash before any read.
 - **`cycle.log`:** sha256 pinned; one cycle between registration and abandonment; not a dry run; no look line.
 - **Data dir:** no staged report and no failed attempt.
-- **Every bar cache on the host:** the builder reads the mount table and walks every local filesystem. It opens every
-  SQLite file changed since the registration was sealed (WAL files from a private copy), and a file counts as a bar
-  cache when it has a schema the stream writes. The stream's own cache must be among them. The walk stops at every
-  mount point without touching it: a disk mount is walked as its own root, and the rest (proc, overlay, the FUSE
-  document portal, …) are not disks and are counted by type. Names containing `ocmri` are never opened (PHI floor)
-  and are counted and hashed per root, never named. Other SQLite files are listed by path sha256. Any unreadable
-  file refuses.
+- **The owner-approved cache list:** which caches exist cannot be proven from disk (a deleted cache leaves
+  nothing), so the owner decision names them, and `verify` holds the receipt to that list. The stream's own caches
+  (`data/bars.sqlite3`, and `data/preflight/bars.sqlite3` if present) must be on it, and names containing `ocmri`
+  refuse. For each listed cache the receipt shows that what it holds now is everything it ever held for the
+  registration's instruments:
+  - **One coherent, hashed snapshot.** The file must be in rollback-journal mode with no journal or WAL beside it. It
+    is copied whole under the snapshot connection's SHARED lock, so no writer can commit mid-copy. The copy's bytes
+    are the bytes hashed and the bytes inspected.
+  - **The file.** Its inode birth time is recorded, and the live cache must predate the registration. As
+    corroboration: no free pages, no auto-vacuum, and every table's row count equals its largest rowid.
+  - **The writers.** Every committed `data.py` and `families.py` up to the release named, every release the
+    repo's reflog deployed since the oldest cache was born (all inside that history), and each staged rehearsal
+    tree writes the caches only with `INSERT OR IGNORE INTO sessions`, `INSERT OR REPLACE INTO daily|edgar_events`
+    and `DELETE FROM daily`. That delete runs only for a `require_complete` read, which every `families.py` asks only
+    of the hedge (SPY), not one of the instruments. So sessions and event rows are only ever added. A daily REPLACE
+    can narrow a ticker's range, so any daily row of an instrument refuses, and so does any event row reaching the
+    window.
 
 The receipt lives in `alpha_research/edge_stream/receipts/` with its sha256 pinned in
 `policy.UNREAD_ABANDONMENT`. On every load, `receipt.verify` re-reads its bytes and compares them with the ledger:
@@ -99,11 +109,17 @@ freed. The first receipt (`docs/receipts/edge-stream/unread-cfa25376-20261122.js
 runner bytes and cache paths. Codex review of #1380 at `b31e1d68` held it, and schema 2 replaces it. Owner decisions
 may change `unread_abandonment` (`OWNER_WAIVABLE`), so policy 5 amends from 3 or from 4.
 
-The pinned receipt (`unread-cfa25376-v2-20261122.json`, sha256 `5e002ed6…`, built on grid-svr 2026-11-22 against the
-14-record ledger) is `UNREAD_EXCEPT`: about 18 million files on 14 roots, no errors, ten bar caches. The live cache
-holds nothing in the window; three rehearsal copies from 2026-11-22 hold 2024-12-19..24, which stay consumed. The
-owner decision naming it is https://github.com/3pacs/GRID/issues/1379#issuecomment-7085985405; it supersedes the
-earlier comment 7078049008, which named the schema-1 receipt.
+Codex held schema 2 at `fc00c90f`: a host-wide walk of the files visible now cannot show that a deleted or rotated
+cache, or a WAL-only change, never held the window, and copying a mutable DB and its WAL separately is not one
+snapshot. Schema 3 replaces the walk with the owner's bounded list and one locked, hashed snapshot per cache. The
+schema-2 receipt (`5e002ed6…`) is kept, superseded, in `docs/receipts/edge-stream/`.
+
+The pinned receipt (`unread-cfa25376-v3-20261122.json`, sha256 `98b395fe…`, built on grid-svr 2026-11-22 against the
+14-record ledger) is `UNREAD_EXCEPT`. Its 13 listed caches are the live data dir and preflight caches, one scratch
+install from 2026-11-13, and ten rehearsal copies from 2026-11-22. None of them has errors or removed rows. The live
+cache holds nothing in the window; three rehearsal copies hold 2024-12-19..24, which stay consumed. The writers are
+checked through release `c0ef04a0` (156 deployed releases since 2026-11-13, all in its history) and seven staged
+trees. The owner decision naming it and approving the cache list is [GRID#1379](https://github.com/3pacs/GRID/issues/1379#issuecomment-7089739325); it replaces the two earlier decisions there.
 
 ## The evidence bar (policy 3, owner decision GRID#1213)
 

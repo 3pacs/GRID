@@ -19,23 +19,23 @@ builder finds each input itself; nothing the caller supplies is trusted:
   each one's summary (not a dry run, no look of it), and no ``edge_stream look`` line for
   its proposal anywhere. The log's sha256 is pinned.
 * **data dir**: no staged report and no failed attempt for it.
-* **every bar cache on the host**: the builder reads the mount table itself and walks every
-  local filesystem. It opens every SQLite file changed since the registration was sealed
-  (a file unchanged since then cannot hold a later read). A file is a bar cache when its
-  schema is one the stream writes (``sessions`` or ``daily``). Each bar cache's sessions
-  of the registration's instruments on or after the window start are listed. The stream's
-  own cache must be among them. Directories and files whose name contains ``ocmri`` are
-  never opened (PHI floor); they are listed as excluded. Other SQLite files are listed by
-  the sha256 of their path.
+* **the owner-approved cache list**: which caches exist cannot be proven from disk, so the
+  owner decision names them (:func:`verify` holds the receipt to that list). For each one the
+  receipt takes one coherent, hashed snapshot and shows that what the cache holds now is
+  all it ever held for the registration's instruments (see the inventory section below).
+  The stream's own caches must be on the list. Names containing ``ocmri`` are refused.
+* **the cache writers**: every committed ``data.py`` and ``families.py`` up to the release
+  named, so that the snapshot's rows are the complete history.
 
 The receipt never decides more than the sources show. Any session found on or after the
 window start stays consumed (``consumed_through_exclusive``). Any failed or missing check,
 including an unreadable file, is a ``REFUSED`` receipt. Read-only: SQLite files are opened
-``mode=ro``, and the receipt file is created with ``x`` and set 0444.
+``mode=ro`` and copied under their own read lock, and the receipt file is created with ``x``
+and set 0444.
 
 At run time :func:`verify` re-reads the pinned receipt bytes and compares them with the
-ledger. The ledger frees nothing when the bytes, the ledger prefix, the registration, the
-abandonment record or the witness disagree.
+ledger and the attestation. The ledger frees nothing when the bytes, the ledger prefix, the
+registration, the abandonment record, the witness or the cache list disagree.
 """
 
 from __future__ import annotations
@@ -45,13 +45,11 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -59,7 +57,7 @@ from urllib.parse import quote
 from . import ledger as L
 from . import policy as P
 
-SCHEMA = "edge-unread-receipt/2"
+SCHEMA = "edge-unread-receipt/3"
 FREEING_VERDICTS = ("UNREAD", "UNREAD_EXCEPT")
 RECEIPTS_DIR = Path(__file__).resolve().parent / "receipts"
 _LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| ")
@@ -69,14 +67,11 @@ _READ_CALLS = frozenset({"_read", "_event_look", "forward_progress", "collect", 
 V3_MODULES = ("families", "stats", "runner", "data", "policy")
 _PKG = "alpha_research/edge_stream"
 _COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
-#: filesystems a cache file could live on; overlay mounts show layers that live under /var/lib/docker
-DISK_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "vfat", "exfat", "f2fs", "ntfs3", "fuseblk",
-                     "tmpfs", "nfs", "nfs4", "cifs"})
 EXCLUDE = "ocmri"
-_SQLITE_MAGIC = b"SQLite format 3\x00"
 #: the cache schemas the stream writes (data.py): table -> columns a bar cache carries
 CACHE_SCHEMAS = {"sessions": frozenset({"ticker", "day", "fetched_at"}),
-                 "daily": frozenset({"ticker", "start", "end", "fetched_at"})}
+                 "daily": frozenset({"ticker", "start", "end", "fetched_at"}),
+                 "edgar_events": frozenset({"ticker", "start", "end"})}
 
 
 def _ts(text: str) -> datetime:
@@ -166,121 +161,184 @@ def release_code(repo: Path, commit: str, family: str, version: int, policy_sha2
             "code_sha256": hashlib.sha256("\n".join(parts).encode()).hexdigest(), "modules": modules}
 
 
-# --- cache inventory ----------------------------------------------------------------
+# --- cache inventory (bounded, owner-approved) ----------------------------------------
+#
+# Which caches exist is not provable from disk (a deleted cache leaves nothing), so the
+# list is the owner's: the decision names it and :func:`verify` holds the receipt to it.
+# What the receipt proves about each listed cache is that what it holds now is everything
+# it ever held for the registration's instruments:
+#
+# * the writers: every committed ``data.py`` in the release's history writes the caches
+#   only with :data:`CACHE_WRITES`. Sessions and EDGAR events are only ever added (a
+#   REPLACE of an event leaves a row for that ticker). The one DELETE removes a daily row
+#   only for a ``require_complete`` read, and every committed ``families.py`` asks that
+#   only of the hedge instrument, which is not one of the registration's instruments. A
+#   daily REPLACE can narrow a ticker's range, so any daily row of an instrument refuses.
+# * the image: one coherent snapshot per cache, taken under a SHARED lock (no writer can
+#   commit) of a rollback-journal file with no hot journal and no WAL beside it. The bytes
+#   copied are the bytes hashed and the bytes inspected.
+# * the file: its inode birth time (the live cache must predate the registration), and
+#   corroboration that nothing was removed: no free pages, no auto-vacuum, and every
+#   table's row count equal to its largest rowid.
+
+#: the only cache writes the stream's code may contain (every committed data.py)
+CACHE_WRITES = frozenset({"INSERT OR IGNORE INTO sessions", "INSERT OR REPLACE INTO daily",
+                          "DELETE FROM daily", "INSERT OR REPLACE INTO edgar_events"})
+_WRITE_SQL = re.compile(r"\b(DELETE\s+FROM|INSERT\s+OR\s+[A-Z]+\s+INTO|INSERT\s+INTO|REPLACE\s+INTO|UPDATE|"
+                        r"DROP\s+TABLE|ALTER\s+TABLE|VACUUM|TRUNCATE)\s*([A-Za-z_]*)", re.I)
+_SIDE_FILES = ("-journal", "-wal", "-shm")
 
 
-def _unescape(field: str) -> str:
-    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
-
-
-def mounts(mountinfo_text: str) -> dict[str, str]:
-    """Every mount point in ``/proc/self/mountinfo`` and its filesystem type."""
-    out: dict[str, str] = {}
-    for line in mountinfo_text.splitlines():
-        left, _, right = line.partition(" - ")
-        fields, rfields = left.split(), right.split()
-        if len(fields) >= 5 and rfields:
-            out[_unescape(fields[4])] = rfields[0]
-    return out
-
-
-def disk_mounts(mountinfo_text: str) -> list[str]:
-    """Mount points of every filesystem in :data:`DISK_FS` (``/proc/self/mountinfo``)."""
-    return sorted(m for m, fs in mounts(mountinfo_text).items() if fs in DISK_FS)
+class SnapshotError(Exception):
+    """A cache that cannot give one coherent image."""
 
 
 def _excluded(name: str) -> bool:
     return EXCLUDE in name.lower()
 
 
-def _is_sqlite(path: str) -> bool:
-    with open(path, "rb") as fh:
-        return fh.read(16) == _SQLITE_MAGIC
+def cache_writes(source: str) -> list[str]:
+    """The SQL write statements in one module's source, normalised (``DELETE FROM daily``)."""
+    return sorted({f"{' '.join(m.group(1).upper().split())} {m.group(2)}".strip()
+                   for m in _WRITE_SQL.finditer(source)})
 
 
-def walk(root: str, since: float, boundaries: frozenset[str] = frozenset()) -> dict:
-    """Every regular file on ``root``'s filesystem (other mounts are their own roots): counts,
-    the SQLite files whose inode changed at or after ``since``, exclusions and errors.
-    ``boundaries`` are the mount points in the mount table: the walk stops at them without
-    touching them (a disk mount is walked as its own root; anything else is not a disk)."""
-    out: dict = {"root": root, "dirs": 0, "files": 0, "changed_since_registration": 0, "vanished": 0,
-                 "mount_boundaries": 0, "sqlite": [], "excluded": [], "errors": []}
-    if any(_excluded(p) for p in Path(root).parts):
-        out["excluded"].append(root)
-        return out
-    dev = os.lstat(root).st_dev
-    stack = [root]
-    while stack:
-        d = stack.pop()
-        try:
-            it = os.scandir(d)
-        except FileNotFoundError:
-            out["vanished"] += 1
-            continue
-        except OSError as exc:
-            out["errors"].append(f"{d}: {type(exc).__name__}")
-            continue
-        with it:
-            for e in it:
-                if e.path in boundaries:
-                    out["mount_boundaries"] += 1
-                    continue
-                try:
-                    st = e.stat(follow_symlinks=False)
-                except FileNotFoundError:
-                    out["vanished"] += 1
-                    continue
-                except OSError as exc:
-                    out["errors"].append(f"{e.path}: {type(exc).__name__}")
-                    continue
-                if _excluded(e.name) and (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
-                    out["excluded"].append(e.path)
-                elif stat.S_ISDIR(st.st_mode):
-                    if st.st_dev == dev:
-                        out["dirs"] += 1
-                        stack.append(e.path)
-                elif stat.S_ISREG(st.st_mode):
-                    out["files"] += 1
-                    if st.st_ctime >= since:
-                        out["changed_since_registration"] += 1
-                        try:
-                            if st.st_size >= 512 and _is_sqlite(e.path):
-                                out["sqlite"].append(e.path)
-                        except FileNotFoundError:
-                            out["vanished"] += 1
-                        except OSError as exc:
-                            out["errors"].append(f"{e.path}: {type(exc).__name__}")
-    out["sqlite"].sort()
-    out["excluded"].sort()
+def _hedge_only_complete_reads(source: str) -> bool:
+    """Every ``.daily(..., require_complete=True)`` call reads ``self.hedge``."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "daily" and any(
+                k.arg == "require_complete" and not (isinstance(k.value, ast.Constant) and k.value.value is False)
+                for k in node.keywords):
+            first = node.args[0] if node.args else None
+            if not (isinstance(first, ast.Attribute) and first.attr == "hedge"
+                    and isinstance(first.value, ast.Name) and first.value.id == "self"):
+                return False
+    return True
+
+
+_CACHE_TABLES = ("sessions", "daily", "edgar_events")
+
+
+def _tree_check(tree: Path) -> dict:
+    """A staged code tree (a rehearsal's ``PYTHONPATH``): its ``data.py`` writes only
+    :data:`CACHE_WRITES`, no other module writes a cache table, and its ``families.py``
+    reads only the hedge complete."""
+    row: dict = {"tree": str(tree), "data": None, "other_cache_writes": [], "complete_reads_hedge_only": True}
+    for f in sorted(tree.rglob("*.py")):
+        src = f.read_text()
+        writes = cache_writes(src)
+        if f.name == "data.py" and f.parent.name == "edge_stream":
+            row["data"] = writes
+        elif hits := [w for w in writes if w.split()[-1] in _CACHE_TABLES]:
+            row["other_cache_writes"].append([str(f.relative_to(tree)), hits])
+        if f.name == "families.py" and not _hedge_only_complete_reads(src):
+            row["complete_reads_hedge_only"] = False
+    row["ok"] = (row["data"] is not None and set(row["data"]) <= CACHE_WRITES and not row["other_cache_writes"]
+                 and row["complete_reads_hedge_only"])
+    return row
+
+
+def _deployed_since(repo: Path, full: str, since: datetime) -> dict:
+    """Every commit the repo's HEAD reflog moved to on or after ``since``, and those not in
+    ``full``'s history (a deployed release whose writers the history check would miss)."""
+    out = _git(repo, "reflog", "--date=iso-strict", "--format=%H %gd").decode().splitlines()
+    seen = []
+    for line in out:
+        commit, _, ref = line.partition(" ")
+        m = re.search(r"@\{(.+)\}", ref)
+        if m and datetime.fromisoformat(m.group(1)) >= since:
+            seen.append(commit)
+    seen = sorted(set(seen))
+    outside = [c for c in seen if subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", c, full],
+                                                 capture_output=True).returncode != 0]
+    return {"since": since.isoformat(), "commits": len(seen), "not_in_history": outside}
+
+
+def writer_check(repo: Path, through: str, instruments: list[str], trees: list[Path] = (),
+                 deployed_since: datetime | None = None) -> dict:
+    """Every cache writer that ran against the rules above: each committed ``data.py`` and
+    ``families.py`` in ``through``'s history, every release the reflog deployed since
+    ``deployed_since`` inside that history, and each staged tree a rehearsal ran."""
+    if not _COMMIT.match(through):
+        raise ValueError(f"not a commit id: {through!r}")
+    full = _git(repo, "rev-parse", "--verify", f"{through}^{{commit}}").decode().strip()
+    out: dict = {"through": full, "data": [], "families": []}
+    for mod in ("data", "families"):
+        path = f"{_PKG}/{mod}.py"
+        for c in _git(repo, "log", "--format=%H", full, "--", path).decode().split():
+            try:
+                src = _git(repo, "cat-file", "blob", f"{c}:{path}").decode()
+            except subprocess.CalledProcessError:  # the commit that deleted the file
+                continue
+            row = {"commit": c}
+            if mod == "data":
+                row["writes"] = cache_writes(src)
+            else:
+                row["complete_reads_hedge_only"] = _hedge_only_complete_reads(src)
+            out[mod].append(row)
+    hedge = _git(repo, "cat-file", "blob", f"{full}:{_PKG}/policy.py").decode()
+    m = re.search(r'^HEDGE_INSTRUMENT\s*=\s*"([A-Z.]+)"', hedge, re.M)
+    out["hedge_instrument"] = m.group(1) if m else None
+    out["deployed"] = _deployed_since(repo, full, deployed_since) if deployed_since else None
+    out["trees"] = [_tree_check(Path(t)) for t in trees]
+    out["ok"] = (bool(out["data"]) and all(set(r["writes"]) <= CACHE_WRITES for r in out["data"])
+                 and all(r["complete_reads_hedge_only"] for r in out["families"])
+                 and out["hedge_instrument"] is not None and out["hedge_instrument"] not in instruments
+                 and out["deployed"] is not None and not out["deployed"]["not_in_history"]
+                 and all(t["ok"] for t in out["trees"]))
     return out
 
 
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _birth(path: str) -> int | None:
+    """The inode's birth time (statx), or None where the filesystem does not keep one."""
+    got = subprocess.run(["stat", "-c", "%W", "--", path], capture_output=True, text=True)
+    try:
+        t = int(got.stdout.strip())
+    except ValueError:
+        return None
+    return t if got.returncode == 0 and t > 0 else None
 
 
-def inspect(path: str, instruments: list[str], start: str) -> dict:
-    """One SQLite file: a bar cache (a schema the stream writes) with its sessions and daily
-    rows of ``instruments`` on or after ``start``, or another file (tables counted only).
+def _iso(t: float) -> str:
+    return datetime.fromtimestamp(t, timezone.utc).isoformat()
 
-    A WAL-mode file (header bytes 18-19 = 2) is copied with its ``-wal`` into a private temp
-    dir and opened there: a read-only open in place may create a ``-shm`` beside it, owned by
-    whoever runs the builder."""
-    with open(path, "rb") as fh:
-        header = fh.read(100)
-    if len(header) == 100 and 2 in (header[18], header[19]):
-        with tempfile.TemporaryDirectory(prefix="edge-receipt-") as tmp:
-            copy = Path(tmp) / "db.sqlite3"
-            shutil.copyfile(path, copy)
-            if os.path.exists(path + "-wal"):
-                shutil.copyfile(path + "-wal", str(copy) + "-wal")
-            got = _inspect_open(str(copy), path, instruments, start)
-        return got | {"opened": "copy (WAL)"} if "cache" in got else got
-    return _inspect_open(path, path, instruments, start)
+
+def snapshot(path: str, dest: Path) -> dict:
+    """One coherent image of ``path`` copied to ``dest``: a rollback-journal SQLite file with no
+    hot journal and no WAL beside it, read in full under a SHARED lock, which no writer can
+    commit through. The file must not move or change while it is copied."""
+    if not stat.S_ISREG(os.stat(path).st_mode):  # a missing file raises here, not as a new empty DB
+        raise SnapshotError("not a regular file")
+    side = [x for x in _SIDE_FILES if os.path.lexists(path + x)]
+    if side:
+        raise SnapshotError(f"{side} beside it")
+    con = sqlite3.connect(f"file:{quote(path)}?mode=ro", uri=True, isolation_level=None)
+    try:
+        mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+        if mode != "delete":
+            raise SnapshotError(f"journal_mode {mode}")
+        con.execute("BEGIN")
+        con.execute("SELECT count(*) FROM sqlite_master").fetchone()  # holds SHARED until COMMIT
+        before = os.stat(path)
+        h = hashlib.sha256()
+        with open(path, "rb") as src, open(dest, "xb") as out:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                h.update(chunk)
+                out.write(chunk)
+        after = os.stat(path)
+        side = [x for x in _SIDE_FILES if os.path.lexists(path + x)]
+        con.execute("COMMIT")
+    finally:
+        con.close()
+    if side or (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+        raise SnapshotError("changed while copied")
+    if dest.stat().st_size != before.st_size:
+        raise SnapshotError("short copy")
+    born = _birth(path)
+    if born is None:
+        raise SnapshotError("no inode birth time")
+    return {"sha256": h.hexdigest(), "bytes": before.st_size, "inode": before.st_ino, "born": _iso(born),
+            "modified": _iso(before.st_mtime), "journal_mode": mode}
 
 
 def _inspect_open(open_path: str, path: str, instruments: list[str], start: str) -> dict:
@@ -290,63 +348,86 @@ def _inspect_open(open_path: str, path: str, instruments: list[str], start: str)
         cols = {t: {r[0] for r in con.execute("SELECT name FROM pragma_table_info(?)", (t,))} for t in tables}
         kinds = sorted(t for t, need in CACHE_SCHEMAS.items() if t in cols and need <= cols[t])
         if not kinds:
-            return {"path_sha256": hashlib.sha256(path.encode()).hexdigest(), "tables": len(tables)}
+            return {"tables": len(tables)}
         rows: list[tuple] = []
         daily: list[tuple] = []
+        events: list[tuple] = []
         for t in instruments:
             if "sessions" in kinds:
                 rows += con.execute("SELECT ticker, day, fetched_at FROM sessions WHERE ticker = ? AND day >= ?",
                                     (t, start)).fetchall()
             if "daily" in kinds:
-                daily += con.execute("SELECT ticker, start, end, fetched_at FROM daily WHERE ticker = ? AND end > ?",
-                                     (t, start)).fetchall()
+                daily += con.execute("SELECT ticker, start, end, fetched_at FROM daily WHERE ticker = ?",
+                                     (t,)).fetchall()
+            if "edgar_events" in kinds:
+                events += con.execute("SELECT ticker, start, end FROM edgar_events WHERE ticker = ? AND end > ?",
+                                      (t, start)).fetchall()
+        counts = {t: list(con.execute(f'SELECT count(*), coalesce(max(rowid), 0) FROM "{t}"').fetchone())  # noqa: S608
+                  for t in tables if t in CACHE_SCHEMAS}  # names come from sqlite_master and CACHE_SCHEMAS
+        retention = {"freelist_count": con.execute("PRAGMA freelist_count").fetchone()[0],
+                     "auto_vacuum": con.execute("PRAGMA auto_vacuum").fetchone()[0],
+                     "rows_and_max_rowid": counts}
     finally:
         con.close()
     days = sorted({r[1] for r in rows})
+    retention["nothing_removed"] = (retention["freelist_count"] == 0 and retention["auto_vacuum"] == 0
+                                    and all(n == top for n, top in counts.values()))
     return {
         "cache": path,
         "schema": kinds,
-        "sha256": _sha256_file(Path(path)),
         "sessions_on_or_after_start": len(rows),
         "days": days,
         "fetched_at": [min(r[2] for r in rows), max(r[2] for r in rows)] if rows else [],
-        "daily_rows_reaching_start": [list(r) for r in daily],
+        "daily_rows_of_instruments": [list(r) for r in daily],
+        "event_rows_reaching_start": [list(r) for r in events],
+        "retention": retention,
     }
 
 
-def inventory(roots: list[str], since: float, instruments: list[str], start: str, live_cache: Path,
-              mount_table: dict[str, str] | None = None) -> dict:
-    """Walk every root, inspect every changed SQLite file, and say whether it is complete.
-    Excluded paths are counted and hashed, never named: their names are not this receipt's
-    business. ``mount_table`` (mount point -> filesystem type) sets the walk boundaries;
-    the mounts it skips that are not disks are listed by type."""
-    table = mount_table or {}
-    walks = [walk(r, since, frozenset(table)) for r in roots]
-    caches, other, errors = [], [], [e for w in walks for e in w["errors"]]
-    for p in sorted({p for w in walks for p in w["sqlite"]}):
+def inspect(path: str, instruments: list[str], start: str) -> dict:
+    """One listed cache from its coherent snapshot: the snapshot's facts, its sessions of
+    ``instruments`` on or after ``start``, daily and event rows, and retention facts."""
+    if _excluded(path):
+        raise SnapshotError("excluded name")
+    with tempfile.TemporaryDirectory(prefix="edge-receipt-") as tmp:
+        copy = Path(tmp) / "snapshot.sqlite3"
+        snap = snapshot(path, copy)
+        got = _inspect_open(str(copy), path, instruments, start)
+    return {"cache": path, **got, "snapshot": snap}
+
+
+def inventory(caches: list[str], instruments: list[str], start: str, data_dir: Path, registered_at: datetime) -> dict:
+    """Every listed cache inspected; ``ok`` only when each is a readable bar cache with full
+    retention evidence and the stream's own caches are on the list."""
+    listed = sorted({str(Path(c)) for c in caches})
+    live = [str(data_dir / "bars.sqlite3")] + ([str(data_dir / "preflight" / "bars.sqlite3")]
+                                               if (data_dir / "preflight" / "bars.sqlite3").exists() else [])
+    got, errors = [], []
+    for c in listed:
         try:
-            got = inspect(p, instruments, start)
-        except (OSError, sqlite3.Error) as exc:
-            errors.append(f"{p}: {type(exc).__name__}")
+            r = inspect(c, instruments, start)
+        except (OSError, sqlite3.Error, SnapshotError) as exc:
+            errors.append(f"{c}: {type(exc).__name__}: {exc}"[:300])
             continue
-        (caches if "cache" in got else other).append(got)
-    live = str(live_cache.resolve())
-    live_found = any(str(Path(c["cache"]).resolve()) == live for c in caches)
-    return {
-        "since_ctime": datetime.fromtimestamp(since, timezone.utc).isoformat(),
-        "roots": [{k: w[k] for k in ("root", "dirs", "files", "changed_since_registration", "vanished",
-                                     "mount_boundaries")}
-                  | {"sqlite_changed": len(w["sqlite"]), "excluded": len(w["excluded"]),
-                     "excluded_sha256": hashlib.sha256("\n".join(w["excluded"]).encode()).hexdigest()}
-                  for w in walks],
-        "non_disk_mounts": dict(sorted(Counter(fs for m, fs in table.items()
-                                               if fs not in DISK_FS and not _excluded(m)).items())),
-        "bar_caches": caches,
-        "other_sqlite": other,
-        "errors": errors,
-        "live_cache": live,
-        "live_cache_found": live_found,
-    }
+        if "schema" not in r:
+            errors.append(f"{c}: not a bar cache")
+            continue
+        got.append(r)
+    problems = []
+    if missing := [x for x in live if x not in listed]:
+        problems.append(f"stream caches not listed: {missing}")
+    for r in got:
+        if not r["retention"]["nothing_removed"]:
+            problems.append(f"{r['cache']}: rows or pages removed")
+        if r["daily_rows_of_instruments"]:
+            problems.append(f"{r['cache']}: daily rows of the instruments")
+        if r["event_rows_reaching_start"]:
+            problems.append(f"{r['cache']}: event rows reaching the window")
+    live_born = [r["snapshot"]["born"] for r in got if r["cache"] == live[0]]
+    if not live_born or datetime.fromisoformat(live_born[0]) >= registered_at:
+        problems.append("the live cache is not the file that existed when the registration was sealed")
+    return {"listed": listed, "stream_caches": live, "caches": got, "errors": errors, "problems": problems,
+            "ok": bool(listed) and not errors and not problems}
 
 
 # --- the receipt --------------------------------------------------------------------
@@ -358,20 +439,17 @@ def _refused(reg_sha: str, checks: dict) -> dict:
 
 
 def build(ledger: L.Ledger, reg_sha: str, data_dir: Path, *, repo: Path, registered_release: str,
-          abandoning_release: str, roots: list[str] | None = None, numpy_mm: str | None = None,
-          now: datetime | None = None) -> dict:
+          abandoning_release: str, caches: list[str], writers_through: str, writer_trees: list[str] = (),
+          numpy_mm: str | None = None, now: datetime | None = None) -> dict:
     """The receipt for ``reg_sha``. ``verdict`` is ``UNREAD`` (nothing on or after the window
-    start anywhere), ``UNREAD_EXCEPT`` (only the listed sessions, which stay consumed), or
-    ``REFUSED`` with the failed checks. ``roots`` defaults to every local filesystem in the
-    mount table; tests pass their own."""
+    start in any listed cache), ``UNREAD_EXCEPT`` (only the listed sessions, which stay
+    consumed), or ``REFUSED`` with the failed checks. ``caches`` is the owner-approved cache
+    list; ``writers_through`` the release whose history holds every deployed cache writer;
+    ``writer_trees`` the staged code trees rehearsals ran against listed caches."""
     if numpy_mm is None:
         import numpy
 
         numpy_mm = ".".join(numpy.__version__.split(".")[:2])
-    table: dict[str, str] = {}
-    if roots is None:
-        text = Path("/proc/self/mountinfo").read_text()
-        roots, table = disk_mounts(text), mounts(text)
     state = L.load_state(ledger)  # refuses a broken chain or anchor
     checks: dict[str, dict] = {}
     reg = state.registrations.get(reg_sha)
@@ -426,11 +504,16 @@ def build(ledger: L.Ledger, reg_sha: str, data_dir: Path, *, repo: Path, registe
                           "detail": {"staged_reports": staged, "failed_attempts": len(attempts)}}
 
     start = reg["window"]["start"]
-    inv = inventory(list(roots), reg_at.timestamp(), list(reg["instruments"]), start, data_dir / "bars.sqlite3",
-                    table)
-    read_days = sorted({d for c in inv["bar_caches"] for d in c["days"]})
-    daily = [c["cache"] for c in inv["bar_caches"] if c["daily_rows_reaching_start"]]
-    checks["caches"] = {"ok": inv["live_cache_found"] and not inv["errors"] and not daily, "detail": inv}
+    inv = inventory(caches, list(reg["instruments"]), start, data_dir, reg_at)
+    try:
+        born = [datetime.fromisoformat(c["snapshot"]["born"]) for c in inv["caches"]]
+        writers = writer_check(repo, writers_through, list(reg["instruments"]), [Path(t) for t in writer_trees],
+                               min(born) if born else reg_at)
+    except (subprocess.CalledProcessError, ValueError, OSError) as exc:
+        writers = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    checks["writers"] = {"ok": writers["ok"], "detail": writers}
+    read_days = sorted({d for c in inv["caches"] for d in c["days"]})
+    checks["caches"] = {"ok": inv["ok"], "detail": inv}
 
     refused = [k for k, v in checks.items() if not v["ok"]]
     verdict = "REFUSED" if refused else ("UNREAD_EXCEPT" if read_days else "UNREAD")
@@ -453,8 +536,8 @@ def build(ledger: L.Ledger, reg_sha: str, data_dir: Path, *, repo: Path, registe
         "built_at": (now or datetime.now(timezone.utc)).isoformat(),
         "built_with": {"python": sys.version.split()[0], "numpy": numpy_mm,
                        "receipt_code_sha256": L.sha256_bytes(Path(__file__).read_bytes())},
-        "scope": "the stream's own records, the releases' git blobs, and every SQLite file on this host's local "
-                 "filesystems changed since the registration was sealed (names containing 'ocmri' never opened)",
+        "scope": "the stream's own records, the releases' git blobs, and one coherent snapshot of each cache on the "
+                 "owner-approved list (which caches exist is the owner's attestation, not this receipt's)",
     }
 
 
@@ -555,6 +638,9 @@ def verify(state: L.StreamState, entry: dict) -> list[str]:
         bad.append("verdict")
     if rc.get("consumed_through_exclusive") != entry.get("consumed_through_exclusive"):
         bad.append("consumed_through_exclusive")
+    listed = (((rc.get("checks") or {}).get("caches") or {}).get("detail") or {}).get("listed")
+    if not listed or listed != sorted(entry.get("inventory") or ()):
+        bad.append("cache inventory")
     want = {k: reg.get(k) for k in ("proposal_id", "family", "family_version", "lane", "stage", "recorded_at",
                                     "code_sha256", "policy_sha256")} | {
         "window": reg.get("window"), "instruments": list(reg.get("instruments") or ())}

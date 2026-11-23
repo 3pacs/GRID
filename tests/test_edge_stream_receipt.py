@@ -3,12 +3,10 @@ and the run-time check that binds the pinned receipt bytes to the ledger."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import stat
 import subprocess
-import time
 from datetime import date
 from pathlib import Path
 
@@ -45,13 +43,17 @@ def _git(repo: Path, *args: str) -> str:
                            "-c", "user.name=t", *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+MODULE_SRC = {"runner": OLD_RUNNER, "policy": '"""policy"""\nHEDGE_INSTRUMENT = "SPY"\n',
+              "data": '"""data"""\nQ = "INSERT OR IGNORE INTO sessions VALUES (?, ?, ?, ?)"\n'}
+
+
 def _repo(root: Path, runner_c: str = OLD_RUNNER) -> tuple[Path, str, str]:
     """Two commits of the five evaluation modules: R registered, C changed families.py."""
     pkg = root / "alpha_research" / "edge_stream"
     pkg.mkdir(parents=True)
     _git(root, "init", "-q")
     for m in RC.V3_MODULES:
-        (pkg / f"{m}.py").write_text(OLD_RUNNER if m == "runner" else f'"""{m}"""\nX = 1\n')
+        (pkg / f"{m}.py").write_text(MODULE_SRC.get(m, f'"""{m}"""\nX = 1\n'))
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "registered")
     r = _git(root, "rev-parse", "HEAD")
@@ -74,6 +76,13 @@ def _cache(path: Path, rows, table: str = "sessions") -> Path:
     con.commit()
     con.close()
     return path
+
+
+@pytest.fixture(autouse=True)
+def _old_inodes(monkeypatch):
+    """Test files are born now; the ledger's registration is dated 2026-11-13. Every inode
+    is reported born in 2023 unless a test says otherwise."""
+    monkeypatch.setattr(RC, "_birth", lambda path: 1_700_000_000)
 
 
 def _v3():
@@ -118,19 +127,24 @@ def _world(tmp_path: Path, *, witness: bool = True, runner_c: str = OLD_RUNNER):
     ]) + "\n")
     _cache(data / "bars.sqlite3", [("GLD", "2024-11-25", "2026-11-13T11:10:00+00:00")])  # pre-window only
     return {"led": led, "sha": sha, "pid": pid, "wsha": wsha, "repo": repo, "r": r, "c": c, "data": data,
-            "host": tmp_path / "host"}
+            "host": tmp_path / "host", "caches": [str(data / "bars.sqlite3")]}
 
 
 def _build(w: dict, **kw) -> dict:
-    args = {"repo": w["repo"], "registered_release": w["r"], "abandoning_release": w["c"],
-            "roots": [str(w["host"])], "numpy_mm": NP} | kw
+    args = {"repo": w["repo"], "registered_release": w["r"], "abandoning_release": w["c"], "caches": w["caches"],
+            "writers_through": w["c"], "numpy_mm": NP} | kw
     return RC.build(w["led"], w["sha"], w["data"], **args)
+
+
+def _start(w: dict) -> str:
+    return L.load_state(w["led"]).registrations[w["sha"]]["window"]["start"]
 
 
 def test_unread_when_no_source_shows_a_read(tmp_path):
     w = _world(tmp_path)
     rc = _build(w)
     assert rc["verdict"] == "UNREAD" and rc["failed"] == [], rc["failed"]
+    assert rc["schema"] == "edge-unread-receipt/3"
     assert rc["consumed_through_exclusive"] == rc["registration"]["window"]["start"]
     assert rc["checks"]["cycle_log"]["detail"]["cycles_between_registration_and_abandonment"] == [
         "2026-11-16T11:05:50+00:00"]
@@ -139,7 +153,14 @@ def test_unread_when_no_source_shows_a_read(tmp_path):
     assert [x["registration_sha256"] for x in rel["witnesses"]] == [w["wsha"]]
     assert rel["abandoning_release"]["commit"] == _git(w["repo"], "rev-parse", w["c"])
     inv = rc["checks"]["caches"]["detail"]
-    assert inv["live_cache_found"] and [c["cache"] for c in inv["bar_caches"]] == [str(w["data"] / "bars.sqlite3")]
+    live = str(w["data"] / "bars.sqlite3")
+    assert inv["listed"] == [live] and inv["stream_caches"] == [live] and inv["errors"] == inv["problems"] == []
+    snap = inv["caches"][0]["snapshot"]
+    assert snap["sha256"] == L.sha256_bytes(Path(live).read_bytes()) and snap["journal_mode"] == "delete"
+    assert inv["caches"][0]["retention"]["nothing_removed"]
+    wr = rc["checks"]["writers"]["detail"]
+    assert wr["ok"] and wr["hedge_instrument"] == "SPY" and [x["writes"] for x in wr["data"]] == [
+        ["INSERT OR IGNORE INTO sessions"]]
     assert rc["abandonment"] == {"seq": 3, "recorded_at": "2026-11-16T11:05:50+00:00", "reason": REASON, "cause": None}
 
 
@@ -160,38 +181,47 @@ def test_the_release_bytes_are_rebuilt_from_git_not_supplied(tmp_path):
         RC.release_code(repo, "HEAD; rm -rf /", "IM1", 1, "p" * 64, NP)
 
 
-def test_sessions_found_in_the_window_stay_consumed(tmp_path):
+def test_sessions_found_in_a_listed_cache_stay_consumed(tmp_path):
     w = _world(tmp_path)
-    start = L.load_state(w["led"]).registrations[w["sha"]]["window"]["start"]
-    _cache(w["host"] / "elsewhere" / "copy.db", [("SLV", start, "2026-11-22T03:41:00+00:00")])
+    w["caches"].append(str(_cache(w["host"] / "elsewhere" / "copy.db", [("SLV", _start(w), "2026-11-22T03:41:00+00:00")])))
     rc = _build(w)
-    assert rc["verdict"] == "UNREAD_EXCEPT" and rc["sessions_read_on_or_after_start"] == [start]
-    assert rc["consumed_through_exclusive"] > start
+    assert rc["verdict"] == "UNREAD_EXCEPT" and rc["sessions_read_on_or_after_start"] == [_start(w)]
+    assert rc["consumed_through_exclusive"] > _start(w)
 
 
-def test_other_schemas_and_excluded_names_are_listed_not_counted(tmp_path):
+def test_a_cache_off_the_list_is_not_opened(tmp_path):
+    """Which caches exist is the owner's list: the receipt neither finds nor counts others."""
     w = _world(tmp_path)
-    start = L.load_state(w["led"]).registrations[w["sha"]]["window"]["start"]
-    _cache(w["host"] / "misc" / "unrelated.sqlite3", [("SLV", start, "x")], table="other")
-    (w["host"] / "OCMRI-private").mkdir()
-    (w["host"] / "OCMRI-private" / "x.sqlite3").write_bytes(b"SQLite format 3\x00" + b"\x00" * 600)  # never opened
+    _cache(w["host"] / "elsewhere" / "copy.db", [("SLV", _start(w), "2026-11-22T03:41:00+00:00")])
     rc = _build(w)
-    assert rc["verdict"] == "UNREAD", rc["failed"]
-    inv = rc["checks"]["caches"]["detail"]
-    assert len(inv["other_sqlite"]) == 1 and set(inv["other_sqlite"][0]) == {"path_sha256", "tables"}
-    root = inv["roots"][0]
-    assert root["excluded"] == 1 and "OCMRI" not in json.dumps(inv)  # counted and hashed, never named
-    assert root["excluded_sha256"] == hashlib.sha256(str(w["host"] / "OCMRI-private").encode()).hexdigest()
+    assert rc["verdict"] == "UNREAD" and "elsewhere" not in json.dumps(rc)
+
+
+def _daily(path: Path, ticker: str) -> None:
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE IF NOT EXISTS daily (ticker TEXT PRIMARY KEY, start TEXT, end TEXT, bars TEXT, fetched_at TEXT)")
+    con.execute("INSERT OR REPLACE INTO daily VALUES (?, '2020-01-01', '2021-01-01', '[]', 'x')", (ticker,))
+    con.commit()
+    con.close()
 
 
 @pytest.mark.parametrize("break_it", [
     "look_line", "extra_cycle", "dry_run", "attempt", "staged", "reads_first", "no_witness", "wrong_registered",
-    "same_code", "no_live_cache", "unreadable_sqlite", "daily_rows", "bad_commit"])
-def test_any_missing_or_contrary_evidence_refuses(tmp_path, break_it):
+    "same_code", "bad_commit", "live_unlisted", "preflight_unlisted", "unreadable", "not_a_cache", "ocmri_name",
+    "daily_row", "event_row", "rows_removed", "wal_mode", "journal_beside", "live_born_after", "no_birth",
+    "writer_deletes_sessions", "complete_read_not_hedge", "hedge_is_instrument", "tree_writes_sessions",
+    "tree_without_data", "deployed_outside_history"])
+def test_any_missing_or_contrary_evidence_refuses(tmp_path, monkeypatch, break_it):
     w = _world(tmp_path, witness=break_it != "no_witness",
                runner_c=READS_FIRST if break_it == "reads_first" else OLD_RUNNER)
-    log = w["data"] / "cycle.log"
+    log, live, pkg = w["data"] / "cycle.log", w["data"] / "bars.sqlite3", w["repo"] / "alpha_research" / "edge_stream"
     kw = {}
+
+    def commit(module: str, text: str) -> None:
+        (pkg / f"{module}.py").write_text(text)
+        _git(w["repo"], "commit", "-qam", module)
+        kw["writers_through"] = _git(w["repo"], "rev-parse", "HEAD")
+
     if break_it == "look_line":
         log.write_text(log.read_text() + f"2026-11-16 11:06:00 | INFO     | runner:x:1 — edge_stream look {w['pid']}: FAIL\n")
     elif break_it == "extra_cycle":
@@ -210,20 +240,100 @@ def test_any_missing_or_contrary_evidence_refuses(tmp_path, break_it):
         kw["registered_release"] = w["c"]
     elif break_it == "same_code":
         kw["abandoning_release"] = w["r"]
-    elif break_it == "no_live_cache":
-        (w["data"] / "bars.sqlite3").unlink()
-    elif break_it == "unreadable_sqlite":
-        (w["host"] / "broken.sqlite3").write_bytes(b"SQLite format 3\x00" + b"\xff" * 600)
-    elif break_it == "daily_rows":
-        con = sqlite3.connect(w["host"] / "daily.sqlite3")
-        con.execute("CREATE TABLE daily (ticker TEXT PRIMARY KEY, start TEXT, end TEXT, bars TEXT, fetched_at TEXT)")
-        con.execute("INSERT INTO daily VALUES ('GLD', '2020-01-01', '2026-11-01', '[]', 'x')")
-        con.commit()
-        con.close()
     elif break_it == "bad_commit":
         kw["abandoning_release"] = "0" * 40
+    elif break_it == "live_unlisted":
+        w["caches"] = [str(_cache(w["host"] / "elsewhere" / "copy.db", [("GLD", "2024-11-25", "x")]))]
+    elif break_it == "preflight_unlisted":
+        _cache(w["data"] / "preflight" / "bars.sqlite3", [("GLD", "2024-11-25", "x")])
+    elif break_it == "unreadable":
+        bad = w["host"] / "broken.sqlite3"
+        bad.write_bytes(b"SQLite format 3\x00" + b"\xff" * 600)
+        w["caches"].append(str(bad))
+    elif break_it == "not_a_cache":
+        w["caches"].append(str(_cache(w["host"] / "misc.sqlite3", [("GLD", "2026-01-01", "x")], table="other")))
+    elif break_it == "ocmri_name":
+        w["caches"].append(str(_cache(w["host"] / "OCMRI-x" / "bars.sqlite3", [("GLD", "2024-11-25", "x")])))
+    elif break_it == "daily_row":
+        _daily(live, "GLD")  # a REPLACE could have narrowed its range: any daily row of an instrument refuses
+    elif break_it == "event_row":
+        con = sqlite3.connect(live)
+        con.execute("CREATE TABLE edgar_events (ticker TEXT PRIMARY KEY, start TEXT, end TEXT, events TEXT, fetched_at TEXT)")
+        con.execute("INSERT INTO edgar_events VALUES ('SLV', '2024-01-01', '2026-01-01', '[]', 'x')")
+        con.commit()
+        con.close()
+    elif break_it == "rows_removed":
+        con = sqlite3.connect(live)
+        con.executemany("INSERT INTO sessions VALUES (?, ?, '[]', 'x')", [("GLD", "2024-11-26"), ("GLD", "2024-11-27")])
+        con.execute("DELETE FROM sessions WHERE day = '2024-11-26'")
+        con.commit()
+        con.close()
+    elif break_it == "wal_mode":
+        con = sqlite3.connect(live)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.close()
+    elif break_it == "journal_beside":
+        Path(str(live) + "-journal").write_bytes(b"\x00" * 512)
+    elif break_it == "live_born_after":
+        monkeypatch.setattr(RC, "_birth", lambda path: 1_800_000_000)  # 2027: after the registration
+    elif break_it == "no_birth":
+        monkeypatch.setattr(RC, "_birth", lambda path: None)
+    elif break_it == "writer_deletes_sessions":
+        commit("data", 'Q = "DELETE FROM sessions WHERE ticker = ?"\n')
+    elif break_it == "complete_read_not_hedge":
+        commit("families", "def f(self, daily, t):\n    return daily.daily(t, 1, 2, require_complete=True)\n")
+    elif break_it == "hedge_is_instrument":
+        commit("policy", 'HEDGE_INSTRUMENT = "GLD"\n')
+    elif break_it in ("tree_writes_sessions", "tree_without_data"):
+        tree = _tree(tmp_path / "tree")
+        if break_it == "tree_writes_sessions":
+            (tree / "rehearse.py").write_text('db.execute("DELETE FROM sessions")\n')
+        else:
+            (tree / "alpha_research" / "edge_stream" / "data.py").unlink()
+        kw["writer_trees"] = [str(tree)]
+    elif break_it == "deployed_outside_history":
+        _git(w["repo"], "checkout", "-q", "-b", "side", w["r"])
+        commit("stats", "X = 3\n")
+        _git(w["repo"], "checkout", "-q", w["c"])
+        kw["writers_through"] = w["c"]
     rc = _build(w, **kw)
-    assert rc["verdict"] == "REFUSED" and rc["failed"], break_it
+    assert rc["verdict"] == "REFUSED" and rc["failed"] == [EXPECT.get(break_it, "caches")], (break_it, rc["failed"])
+
+
+EXPECT = {"look_line": "cycle_log", "extra_cycle": "cycle_log", "dry_run": "cycle_log", "attempt": "data_dir",
+          "staged": "data_dir", "reads_first": "release", "no_witness": "release", "wrong_registered": "release",
+          "same_code": "release", "bad_commit": "release", "writer_deletes_sessions": "writers",
+          "complete_read_not_hedge": "writers", "hedge_is_instrument": "writers", "tree_writes_sessions": "writers",
+          "tree_without_data": "writers", "deployed_outside_history": "writers"}
+
+
+def _tree(root: Path) -> Path:
+    """A staged rehearsal tree carrying the shipped cache writers."""
+    here = Path(F.__file__).resolve().parent
+    pkg = root / "alpha_research" / "edge_stream"
+    pkg.mkdir(parents=True)
+    for m in ("data", "families"):
+        (pkg / f"{m}.py").write_text((here / f"{m}.py").read_text())
+    (root / "rehearse.py").write_text('con.execute("SELECT count(*) FROM sessions")\n')
+    return root
+
+
+def test_a_staged_tree_with_the_shipped_writers_passes(tmp_path):
+    w = _world(tmp_path)
+    rc = _build(w, writer_trees=[str(_tree(tmp_path / "tree"))])
+    assert rc["verdict"] == "UNREAD", rc["failed"]
+    t = rc["checks"]["writers"]["detail"]["trees"][0]
+    assert t["ok"] and set(t["data"]) == RC.CACHE_WRITES and t["other_cache_writes"] == []
+    assert rc["checks"]["writers"]["detail"]["deployed"]["not_in_history"] == []
+
+
+def test_the_hedge_may_be_read_complete(tmp_path):
+    w = _world(tmp_path)
+    pkg = w["repo"] / "alpha_research" / "edge_stream"
+    (pkg / "families.py").write_text(
+        "class E:\n    def f(self, daily):\n        return daily.daily(self.hedge, 1, 2, require_complete=True)\n")
+    _git(w["repo"], "commit", "-qam", "hedge read")
+    assert _build(w, writers_through=_git(w["repo"], "rev-parse", "HEAD"))["verdict"] == "UNREAD"
 
 
 def test_a_ledger_read_or_look_refuses(tmp_path):
@@ -235,8 +345,8 @@ def test_a_ledger_read_or_look_refuses(tmp_path):
     L.append_read(other, osha, "look", "2026-11-14T11:00:00+00:00")
     L.append_abandoned(other, osha, "x", "2026-11-16T11:00:00+00:00", cause=L.CODE_CHANGED,
                        read_evidence={"ledger_reads": ["look"], "failed_attempts": 0, "report_staged": False})
-    args = {"repo": w["repo"], "registered_release": w["r"], "abandoning_release": w["c"], "roots": [str(w["host"])],
-            "numpy_mm": NP}
+    args = {"repo": w["repo"], "registered_release": w["r"], "abandoning_release": w["c"], "caches": w["caches"],
+            "writers_through": w["c"], "numpy_mm": NP}
     assert RC.build(other, osha, w["data"], **args)["verdict"] == "REFUSED"
     assert RC.build(w["led"], "0" * 64, w["data"], **args)["verdict"] == "REFUSED"
 
@@ -249,59 +359,47 @@ def test_the_code_order_check_reads_the_shipped_runner():
     assert not RC.code_check_precedes_reads("def other():\n    pass\n")["ok"]
 
 
-def test_the_mount_table_decides_the_roots():
-    text = "\n".join([
-        "24 1 253:0 / / rw,relatime shared:1 - ext4 /dev/mapper/root rw",
-        "30 24 8:33 / /data rw,relatime shared:9 - ext4 /dev/sdc1 rw",
-        "31 24 0:26 / /dev/shm rw shared:3 - tmpfs tmpfs rw",
-        "32 24 0:5 / /proc rw - proc proc rw",
-        "33 24 0:50 / /var/lib/docker/overlay2/x/merged rw - overlay overlay rw",
-        r"34 24 259:1 /ocmri/private /home/grid/ocmri\040x rw - ext4 /dev/nvme1n1p1 rw",
-    ])
-    assert RC.disk_mounts(text) == ["/", "/data", "/dev/shm", "/home/grid/ocmri x"]
-    assert RC.mounts(text)["/proc"] == "proc" and RC.mounts(text)["/var/lib/docker/overlay2/x/merged"] == "overlay"
+def test_the_shipped_writers_pass_the_writer_rules():
+    here = Path(F.__file__).resolve().parent
+    assert set(RC.cache_writes((here / "data.py").read_text())) == RC.CACHE_WRITES
+    assert RC._hedge_only_complete_reads((here / "families.py").read_text())
+    assert P.HEDGE_INSTRUMENT == "SPY"
 
 
-def test_the_walk_stops_at_mount_points_without_touching_them(tmp_path):
-    # /run/user/1000/doc (the desktop document portal, FUSE) refuses even root's stat
-    portal = tmp_path / "doc"
-    portal.mkdir()
-    (portal / "inside.sqlite3").write_bytes(b"SQLite format 3\x00" + b"\x00" * 600)
-    out = RC.walk(str(tmp_path), time.time() - 3600, frozenset({str(portal)}))
-    assert out["mount_boundaries"] == 1 and out["dirs"] == 0 and out["sqlite"] == [] and out["errors"] == []
-    assert RC.walk(str(tmp_path), time.time() - 3600)["sqlite"] == [str(portal / "inside.sqlite3")]
-
-
-def test_files_unchanged_since_the_registration_are_not_opened(tmp_path):
-    _cache(tmp_path / "a.sqlite3", [("GLD", "2026-01-02", "x")])
-    assert RC.walk(str(tmp_path), time.time() - 3600)["sqlite"] == [str(tmp_path / "a.sqlite3")]
-    later = RC.walk(str(tmp_path), time.time() + 3600)
-    assert later["sqlite"] == [] and later["files"] == 1 and later["changed_since_registration"] == 0
-
-
-def test_caches_are_opened_read_only(tmp_path):
+def test_the_snapshot_is_the_hashed_image_and_leaves_the_cache_alone(tmp_path):
     c = _cache(tmp_path / "c.sqlite3", [("GLD", "2026-01-02", "x")])
-    before = c.read_bytes()
+    before = sorted(p.name for p in tmp_path.iterdir()), c.read_bytes()
     got = RC.inspect(str(c), ["GLD", "SLV"], "2026-01-01")
-    assert got["days"] == ["2026-01-02"] and got["schema"] == ["sessions"] and c.read_bytes() == before
+    assert got["days"] == ["2026-01-02"] and got["schema"] == ["sessions"]
+    assert got["snapshot"]["sha256"] == L.sha256_bytes(before[1]) and got["snapshot"]["bytes"] == len(before[1])
+    assert (sorted(p.name for p in tmp_path.iterdir()), c.read_bytes()) == before
     with pytest.raises(OSError):
         RC.inspect(str(tmp_path / "missing.sqlite3"), ["GLD"], "2026-01-01")
 
 
-def test_a_wal_file_is_read_from_a_copy(tmp_path):
-    """Nothing is created beside a WAL-mode file, and its uncheckpointed rows are still read."""
-    db = tmp_path / "w.sqlite3"
-    con = sqlite3.connect(db)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA wal_autocheckpoint=0")
-    con.execute("CREATE TABLE sessions (ticker TEXT, day TEXT, bars TEXT, fetched_at TEXT)")
-    con.execute("INSERT INTO sessions VALUES ('GLD', '2026-01-02', '[]', 'x')")
-    con.commit()
-    before = sorted(p.name for p in tmp_path.iterdir())
-    got = RC.inspect(str(db), ["GLD"], "2026-01-01")
-    after = sorted(p.name for p in tmp_path.iterdir())
-    con.close()
-    assert got["days"] == ["2026-01-02"] and got["opened"] == "copy (WAL)" and after == before
+def test_a_writer_cannot_commit_while_the_snapshot_holds_its_lock(tmp_path, monkeypatch):
+    """The copy runs under the snapshot connection's SHARED lock: a writer that tries to
+    commit mid-copy is refused, so the copied image is one committed state."""
+    c = _cache(tmp_path / "c.sqlite3", [("GLD", "2026-01-02", "x")])
+    tried = []
+    real_open = open
+
+    def spying_open(path, mode="r", *a, **k):
+        if str(path) == str(c) and mode == "rb":
+            w = sqlite3.connect(c, timeout=0)
+            try:
+                w.execute("INSERT INTO sessions VALUES ('GLD', '2026-01-05', '[]', 'y')")
+                w.commit()
+                tried.append("committed")
+            except sqlite3.OperationalError:
+                tried.append("locked")
+            finally:
+                w.close()
+        return real_open(path, mode, *a, **k)
+
+    monkeypatch.setattr("builtins.open", spying_open)
+    got = RC.inspect(str(c), ["GLD"], "2026-01-01")
+    assert tried == ["locked"] and got["days"] == ["2026-01-02"]
 
 
 def test_the_receipt_is_written_once_and_read_only(tmp_path):
@@ -325,7 +423,8 @@ def _pinned(tmp_path, monkeypatch, w: dict, rc: dict | None = None) -> dict:
     sha = RC.write(rc, rdir / name)
     return {"registration_sha256": w["sha"], "lane": "history", "frees_window": True, "decision": "GRID#1379",
             "receipt": name, "receipt_sha256": sha, "receipt_verdict": rc["verdict"],
-            "consumed_through_exclusive": rc["consumed_through_exclusive"]}
+            "consumed_through_exclusive": rc["consumed_through_exclusive"],
+            "inventory": rc["checks"]["caches"]["detail"]["listed"] if "caches" in rc["checks"] else []}
 
 
 def test_verify_binds_the_bytes_to_this_ledger(tmp_path, monkeypatch):
@@ -338,7 +437,7 @@ def test_verify_binds_the_bytes_to_this_ledger(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("tamper", ["bytes", "sha", "name", "verdict", "through", "prefix", "abandonment",
-                                    "registration", "witness", "refused"])
+                                    "registration", "witness", "refused", "inventory"])
 def test_verify_refuses_any_disagreement(tmp_path, monkeypatch, tamper):
     w = _world(tmp_path)
     rc = _build(w)
@@ -366,13 +465,15 @@ def test_verify_refuses_any_disagreement(tmp_path, monkeypatch, tamper):
         state.registrations[w["sha"]] = {**state.registrations[w["sha"]], "code_sha256": "f" * 64}
     elif tamper == "witness":
         state.registrations[w["wsha"]] = {**state.registrations[w["wsha"]], "code_sha256": "f" * 64}
+    elif tamper == "inventory":
+        entry["inventory"] = [*entry["inventory"], "/another/bars.sqlite3"]
     assert RC.verify(state, entry), tamper
 
 
 def test_the_ledger_frees_the_window_only_through_a_verified_receipt(tmp_path, monkeypatch):
     w = _world(tmp_path)
-    start = L.load_state(w["led"]).registrations[w["sha"]]["window"]["start"]
-    _cache(w["host"] / "elsewhere" / "copy.db", [("GLD", start, "2026-11-22T03:41:00+00:00")])
+    start = _start(w)
+    w["caches"].append(str(_cache(w["host"] / "elsewhere" / "copy.db", [("GLD", start, "2026-11-22T03:41:00+00:00")])))
     entry = _pinned(tmp_path, monkeypatch, w)
     pol = json.loads(P.canonical_bytes(P.policy_payload()))
     pol["unread_abandonment"]["attested"] = [entry]
