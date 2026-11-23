@@ -1022,3 +1022,28 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
 - Remaining review gates: Claude reviews the pushed head; Anik alone decides
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
+
+## 2026-11-23 - BKH, GWHT, KPTI, ROKU retired in the ticker lifecycle sidecar (draft only)
+
+Branch `claude/retire-four-tickers-20261123`. Anik: "mark the four tickers
+retired". Only `analysis/sector_map_ticker_status.yaml` and tests change.
+
+| Symbol | Mark | End date from Tiingo's listing (read 2026-11-23) | Source for the event |
+|---|---|---|---|
+| BKH | renamed -> HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07 |
+| GWHT | renamed -> GWHTQ | none: GWHT is not found | Panabee 2026-11-13 (Chapter 7 petition; an AI-written summary page); Tiingo lists GWHTQ as ESS Tech Inc |
+| KPTI | renamed -> KPTIQ | 2026-11-10 | Panabee 2026-11-02 (Nasdaq suspension from 11-11, OTC as KPTIQ; AI-written); Tiingo lists KPTIQ |
+| ROKU | acquired by Fox | 2026-11-06 | TheWrap 2026-11-06 |
+
+- `GWH` (the map's symbol) now points at GWHTQ as well.
+- GWHT and KPTI are not sector-map tickers; they reach the routine price list
+  from other universes, so the sidecar gains a last section for such symbols
+  and `tests/test_sector_map_ticker_status.py` names the two exceptions.
+- Readers of the sidecar: `price_ticker` (what the routine Tiingo list fetches)
+  and `tiingo_symbol_contract.tiingo_cutoff` (TIINGO rows after `last_session`
+  are dropped by `store/observations.py` and the resolver). Stored rows up to
+  each last session stay readable; BKH and GWHT have no cutoff; the map keeps
+  its actors.
+- Prices for three issuers continue under HZN, KPTIQ and GWHTQ. KPTIQ and
+  GWHTQ are bankrupt companies' OTC shares: change them to `delisted` if they
+  should not be priced at all.

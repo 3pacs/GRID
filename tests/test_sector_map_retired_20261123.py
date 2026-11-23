@@ -1,0 +1,96 @@
+"""BKH, GWHT, KPTI and ROKU are retired in the lifecycle sidecar, and nothing
+that reads the sidecar loses their history.
+
+Tiingo stopped serving the four symbols between 2026-11-06 and 2026-11-13
+(its listing, read 2026-11-23: ROKU endDate 2026-11-06, KPTI endDate
+2026-11-10, BKH no dates, GWHT not found). Each kept the routine price run
+PARTIAL for days. Three live on under another symbol in Tiingo's own listing
+(HZN, KPTIQ, GWHTQ); ROKU was acquired.
+
+The sidecar has two readers: ``analysis.sector_map.price_ticker`` (what to
+fetch today) and ``tiingo_symbol_contract.tiingo_cutoff`` (TIINGO rows after
+``last_session`` are not this instrument).
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pytest
+
+import tiingo_symbol_contract as contract
+from analysis import sector_map as sm
+from ingestion import tiingo_pull as tp
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cutoffs():
+    contract._last_sessions.cache_clear()
+    yield
+    contract._last_sessions.cache_clear()
+
+
+@pytest.mark.parametrize(("ticker", "status", "today"), [
+    ("BKH", "renamed", "HZN"),
+    ("GWHT", "renamed", "GWHTQ"),
+    ("GWH", "renamed", "GWHTQ"),      # was GWH -> GWHT; the chain ends at a live symbol again
+    ("KPTI", "renamed", "KPTIQ"),
+    ("ROKU", "acquired", None),
+])
+def test_the_four_symbols_are_retired(ticker, status, today):
+    assert sm.TICKER_STATUS[ticker]["status"] == status
+    assert sm.price_ticker(ticker) == today
+
+
+def test_roku_names_its_acquirer_and_no_successor():
+    entry = sm.TICKER_STATUS["ROKU"]
+    assert entry["acquirer"] == "Fox" and "successor" not in entry
+
+
+@pytest.mark.parametrize(("ticker", "last_session"), [
+    ("ROKU", date(2026, 11, 6)),      # Tiingo's listing endDate
+    ("KPTI", date(2026, 11, 10)),     # Tiingo's listing endDate
+    ("BKH", None),                    # the listing has no dates: none invented
+    ("GWHT", None),                   # the listing is not found: none invented
+])
+def test_last_session_is_tiingos_end_date_or_absent(ticker, last_session):
+    assert sm.TICKER_STATUS[ticker].get("last_session") == last_session
+    assert contract.tiingo_cutoff(f"YF:{ticker}:close") == last_session
+
+
+@pytest.mark.parametrize("ticker", ["BKH", "GWHT", "KPTI", "ROKU"])
+def test_every_note_says_where_its_facts_come_from(ticker):
+    note = sm.TICKER_STATUS[ticker]["note"]
+    assert "Tiingo" in note and "read 2026-11-23" in note
+    assert any(src in note for src in ("WOWT", "Panabee", "TheWrap"))
+
+
+def test_stored_history_stays_readable():
+    """Rows up to the last session are kept; only TIINGO rows after it are cut."""
+    assert not contract.is_foreign_tiingo_row("YF:ROKU:close", "TIINGO", date(2026, 11, 6))
+    assert contract.is_foreign_tiingo_row("YF:ROKU:close", "TIINGO", date(2026, 11, 9))
+    assert not contract.is_foreign_tiingo_row("YF:KPTI:close", "TIINGO", date(2026, 11, 10))
+    assert contract.is_foreign_tiingo_row("YF:KPTI:close", "TIINGO", date(2026, 11, 11))
+    # Another source's rows are never cut (yfinance holds KPTI closes to 11-18).
+    assert not contract.is_foreign_tiingo_row("YF:KPTI:close", "yfinance", date(2026, 11, 18))
+    # No end date known: every stored row stays (BKH and GWHT closes run to 11-13).
+    for ticker in ("BKH", "GWHT"):
+        assert not contract.is_foreign_tiingo_row(f"YF:{ticker}:close", "TIINGO", date(2026, 11, 13))
+
+
+def test_map_actors_keep_their_place_in_the_map():
+    """Survivorship: the panels read the map historically, so nothing leaves it."""
+    tickers = {a["ticker"] for sector in sm.SECTOR_MAP.values()
+               for sub in sector.get("subsectors", {}).values()
+               for a in sub.get("actors", []) if a.get("ticker")}
+    assert {"BKH", "ROKU", "GWH"} <= tickers
+
+
+def test_the_routine_price_list_fetches_the_successors_not_the_retired_symbols(monkeypatch):
+    monkeypatch.setattr(tp.TiingoPuller, "oracle_tickers", staticmethod(lambda e: ["KPTI", "ROKU"]))
+    monkeypatch.setattr(tp.TiingoPuller, "hypothesis_tickers", staticmethod(lambda e: ["GWHT"]))
+    monkeypatch.setattr(tp.TiingoPuller, "insider_buyer_tickers", staticmethod(lambda e: ["BKH"]))
+    monkeypatch.setattr(tp.TiingoPuller, "supply_chain_tickers", staticmethod(lambda e: []))
+    tickers = set(tp.TiingoPuller.default_tickers(object()))
+    assert {"HZN", "KPTIQ", "GWHTQ"} <= tickers
+    assert not tickers & {"BKH", "GWHT", "GWH", "KPTI", "ROKU"}
