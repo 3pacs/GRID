@@ -64,6 +64,81 @@ def rank_icir(ic_series: pd.Series) -> float:
     return float(ic_series.mean() / ic_series.std())
 
 
+def long_short_book(
+    signal: pd.DataFrame,
+    forward_returns: pd.DataFrame,
+    top_n: int = 5,
+    cost_bps: float = 10.0,
+) -> pd.DataFrame:
+    """Per decision date: the frozen long-short book, its net return and outcome coverage.
+
+    The book (top ``top_n`` long, bottom ``top_n`` short) is picked from
+    ``signal.loc[t]`` alone, the universe known at the decision, before any
+    forward return is read. A book member whose outcome goes missing
+    (delisted, halted, data gap) stays in the book and is never replaced by
+    the next-ranked name: its outcome is counted as missing, not imputed.
+    Each leg returns the equal-weight mean over its members with an observed
+    outcome; a leg with none leaves the date unscored (``return`` NaN).
+    ``coverage`` is observed book slots / book slots and ``missing`` names
+    the members without one. Turnover cost is charged on the frozen book.
+    Rows with no realized forward return at all (not yet scorable) are skipped.
+
+    Contract: ``forward_returns`` must already be aligned to the decision row
+    (i.e. ``forward_returns.loc[t]`` is the forward return realized after the
+    signal at date ``t`` is known, such as ``prices.pct_change(h).shift(-h)``).
+    This function does NOT shift ``forward_returns``.
+    """
+    fwd = forward_returns
+    common_dates = signal.index.intersection(fwd.dropna(how="all").index)
+
+    rows = []
+    prev_longs = set()
+    prev_shorts = set()
+
+    for dt in common_dates:
+        sig_row = signal.loc[dt].dropna()
+        if len(sig_row) < 2 * top_n:
+            continue
+
+        ranked = sig_row.sort_values()
+        shorts = list(ranked.index[:top_n])
+        longs = list(ranked.index[-top_n:])
+        out_row = fwd.loc[dt]  # outcomes are read only for the frozen book
+        long_out, short_out = out_row.reindex(longs), out_row.reindex(shorts)
+
+        net_ret = float("nan")
+        if long_out.notna().any() and short_out.notna().any():
+            gross_ret = long_out.mean() - short_out.mean()  # mean skips missing outcomes
+
+            # Transaction costs: turnover-based
+            long_turnover = len(set(longs) - prev_longs) / max(top_n, 1)
+            short_turnover = len(set(shorts) - prev_shorts) / max(top_n, 1)
+            avg_turnover = (long_turnover + short_turnover) / 2
+            cost = avg_turnover * cost_bps * 2 / 10_000  # round-trip
+            net_ret = float(gross_ret - cost)
+
+        n_observed = int(long_out.notna().sum() + short_out.notna().sum())
+        missing = tuple(n for n, v in [*long_out.items(), *short_out.items()] if pd.isna(v))
+        rows.append((dt, net_ret, 2 * top_n, n_observed, n_observed / (2 * top_n), missing))
+
+        prev_longs = set(longs)
+        prev_shorts = set(shorts)
+
+    cols = ["date", "return", "n_book", "n_observed", "coverage", "missing"]
+    return pd.DataFrame(rows, columns=cols).set_index("date")
+
+
+def outcome_coverage(book: pd.DataFrame) -> dict[str, float | int]:
+    """Coverage of a :func:`long_short_book` (0.0 when no book was formed)."""
+    n_slots = int(book["n_book"].sum())
+    n_observed = int(book["n_observed"].sum())
+    return {
+        "outcome_coverage": n_observed / n_slots if n_slots else 0.0,
+        "n_missing_outcomes": n_slots - n_observed,
+        "n_unscored_days": int(book["return"].isna().sum()),
+    }
+
+
 def long_short_returns(
     signal: pd.DataFrame,
     forward_returns: pd.DataFrame,
@@ -75,51 +150,12 @@ def long_short_returns(
 
     Top N tickers by signal → long. Bottom N → short.
     Average long return minus average short return, net of costs.
-
-    Contract: ``forward_returns`` must already be aligned to the decision row
-    (i.e. ``forward_returns.loc[t]`` is the forward return realized after the
-    signal at date ``t`` is known, such as ``prices.pct_change(h).shift(-h)``).
-    This function does NOT shift ``forward_returns``.
+    The book is frozen at the decision and a missing outcome is never
+    reselected (rule and alignment contract: :func:`long_short_book`);
+    unscored dates are dropped.
     """
-    fwd = forward_returns
-    common_dates = signal.index.intersection(fwd.dropna(how="all").index)
-
-    ls_returns = []
-    prev_longs = set()
-    prev_shorts = set()
-
-    for dt in common_dates:
-        sig_row = signal.loc[dt].dropna()
-        ret_row = fwd.loc[dt].dropna()
-        common = sig_row.index.intersection(ret_row.index)
-
-        if len(common) < 2 * top_n:
-            continue
-
-        ranked = sig_row[common].sort_values()
-        shorts = set(ranked.index[:top_n])
-        longs = set(ranked.index[-top_n:])
-
-        long_ret = ret_row[list(longs)].mean()
-        short_ret = ret_row[list(shorts)].mean()
-        gross_ret = long_ret - short_ret
-
-        # Transaction costs: turnover-based
-        long_turnover = len(longs - prev_longs) / max(top_n, 1)
-        short_turnover = len(shorts - prev_shorts) / max(top_n, 1)
-        avg_turnover = (long_turnover + short_turnover) / 2
-        cost = avg_turnover * cost_bps * 2 / 10_000  # round-trip
-
-        net_ret = gross_ret - cost
-        ls_returns.append({"date": dt, "return": net_ret})
-
-        prev_longs = longs
-        prev_shorts = shorts
-
-    if not ls_returns:
-        return pd.Series(dtype=float, name="ls_return")
-
-    return pd.DataFrame(ls_returns).set_index("date")["return"]
+    ls = long_short_book(signal, forward_returns, top_n, cost_bps)["return"].dropna()
+    return ls.astype(float) if len(ls) else pd.Series(dtype=float, name="ls_return")
 
 
 def sharpe_ratio(returns: pd.Series, annualize: int = 252) -> float:
@@ -190,7 +226,8 @@ def compute_signal_metrics(
 ) -> dict:
     """Compute full metrics suite for a signal."""
     ic = rank_ic(signal, forward_returns)
-    ls_ret = long_short_returns(signal, forward_returns, top_n, cost_bps)
+    book = long_short_book(signal, forward_returns, top_n, cost_bps)
+    ls_ret = book["return"].dropna().astype(float)
 
     return {
         "mean_rank_ic": float(ic.mean()) if len(ic) > 0 else 0.0,
@@ -205,4 +242,5 @@ def compute_signal_metrics(
         "turnover": turnover(signal, top_n),
         "n_days": len(ls_ret),
         "passes_threshold": sharpe_ratio(ls_ret) > 1.4,
+        **outcome_coverage(book),
     }

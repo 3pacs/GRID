@@ -6,9 +6,14 @@ Gates ensure that only properly validated models advance through the
 lifecycle.
 
 Behavior notes:
-- No model can currently pass STAGING -> PRODUCTION: no writer in this
-  codebase stores per-``model_version_id`` ``validation_results`` rows
-  containing ``n_scored`` / ``hit_rate`` (or Brier vs climatology).
+- No model can currently pass STAGING -> PRODUCTION. The gate reads skill
+  only from a typed, versioned OOS record (``gate_detail["oos_evidence"]``)
+  through a registered reader that proves which forward predictions were
+  scored and when (cohort and clock provenance). No reader is registered
+  because no writer emits such a record: the shipped writer,
+  ``WalkForwardBacktest._store_result``, stores no ``model_version_id`` and
+  no record version. Generic counts or rates (``n_scored``, ``hit_rate``,
+  ``brier`` ...) are refused wherever they sit.
 - SHADOW -> STAGING refuses with ``drift_check_unavailable`` when the drift
   checker fails or returns no evaluated metrics.
 - ``force`` and ``override_reason`` on ``GateChecker`` are intentionally not
@@ -30,6 +35,58 @@ from sqlalchemy.engine import Engine
 MIN_OOS_SCORED_PREDICTIONS: int = 30
 WILSON_Z_95: float = 1.959963984540054
 CRITICAL_DRIFT_SCORE_THRESHOLD: float = 0.8
+
+#: Typed OOS evidence sits at ``gate_detail[OOS_EVIDENCE_KEY]`` and carries
+#: ``schema == OOS_EVIDENCE_SCHEMA`` plus an integer ``version``.
+OOS_EVIDENCE_KEY: str = "oos_evidence"
+OOS_EVIDENCE_SCHEMA: str = "grid.oos_forward_evidence"
+
+#: ``reader(record, model_version_id) -> proven counts`` (``n_scored`` plus
+#: ``n_hits``/``hit_rate``, and/or ``brier`` with ``climatology_brier``). It must
+#: prove the cohort (which forward predictions of this version were scored)
+#: and the clock (each made after the version existed, before its outcome),
+#: and raise to refuse.
+OOSEvidenceReader = Callable[[dict[str, Any], int], dict[str, Any]]
+
+#: Readers by version. Empty on purpose (Codex HOLD 6011907730): no typed OOS
+#: writer exists, so STAGING -> PRODUCTION stays fail-closed until a typed
+#: writer and its reader land together.
+_OOS_EVIDENCE_READERS: dict[int, OOSEvidenceReader] = {}
+
+
+def _read_typed_oos_evidence(
+    gate_detail: dict[str, Any], model_id: int
+) -> tuple[dict[str, Any] | None, str]:
+    """Return ``(proven_counts, "")`` from a typed OOS record, else ``(None, refusal)``.
+
+    Never reads generic counts or rates: a bare ``n_scored`` or ``hit_rate``
+    says nothing about which predictions were scored or when.
+    """
+    record = gate_detail.get(OOS_EVIDENCE_KEY)
+    if not isinstance(record, dict):
+        return None, (
+            f"untyped_oos_evidence: no typed gate_detail.{OOS_EVIDENCE_KEY} record; "
+            "generic counts or rates without OOS cohort and clock provenance are refused"
+        )
+    version = record.get("version")
+    if record.get("schema") != OOS_EVIDENCE_SCHEMA or type(version) is not int:
+        return None, (
+            f"unversioned_oos_evidence: gate_detail.{OOS_EVIDENCE_KEY} must carry "
+            f"schema={OOS_EVIDENCE_SCHEMA!r} and an integer version"
+        )
+    reader = _OOS_EVIDENCE_READERS.get(version)
+    if reader is None:
+        return None, (
+            f"unsupported_oos_evidence_version: no registered reader for "
+            f"{OOS_EVIDENCE_SCHEMA} v{version} (no typed OOS writer/reader exists yet)"
+        )
+    try:
+        proven = reader(record, model_id)
+    except Exception as exc:  # noqa: BLE001 - a reader that fails refuses
+        return None, f"oos_evidence_rejected: {type(exc).__name__}: {exc}"
+    if not isinstance(proven, dict):
+        return None, "oos_evidence_rejected: reader returned no proven counts"
+    return proven, ""
 
 
 def _wilson_lower_95(p: float, n: int) -> float:
@@ -444,7 +501,10 @@ class GateChecker:
         Requirements:
         - At least 20 journal entries for this model
         - Out-of-sample evidence record in ``validation_results`` for this
-          ``model_version_id`` showing:
+          ``model_version_id`` whose ``gate_detail`` holds a typed, versioned
+          OOS record that a registered reader accepts (none is registered
+          yet, so this gate refuses; generic counts or rates are refused),
+          with the reader's proven counts showing:
           (a) ``n >= 30`` scored forward predictions produced by this model,
           (b) hit rate's Wilson 95% lower bound > 0.5 OR Brier < climatology,
           (c) no failed overfitting check if one is recorded
@@ -504,7 +564,9 @@ class GateChecker:
             else:
                 details.append(f"No existing PRODUCTION model in layer {layer}")
 
-            # Gate 3: Out-of-sample evidence record strictly for this model_version_id
+            # Gate 3: typed out-of-sample evidence bound to this model_version_id.
+            # No hypothesis_id fallback: rows the shipped WalkForwardBacktest
+            # writer stores carry no model_version_id and never match.
             val_row = conn.execute(
                 text(
                     "SELECT overall_verdict, full_period_metrics, "
@@ -516,6 +578,7 @@ class GateChecker:
                 {"mid": model_id},
             ).fetchone()
 
+            proven: dict[str, Any] | None = None
             if val_row is None:
                 details.append(
                     f"missing_oos_evidence: no validation_results record for model_version_id={model_id}"
@@ -524,7 +587,7 @@ class GateChecker:
             else:
                 overall_verdict = val_row[0]
                 full_metrics = _parse_json_dict(val_row[1])
-                baseline_cmp = _parse_json_dict(val_row[2])
+                # val_row[2] (baseline_comparison) is not OOS evidence and is not read.
                 gate_detail = _parse_json_dict(val_row[3])
 
                 if overall_verdict not in ("PASS", "CONDITIONAL"):
@@ -534,15 +597,31 @@ class GateChecker:
                     )
                     passed = False
 
-                # (a) n >= 30 scored forward predictions produced by this model
-                n_scored = _extract_int(
-                    (full_metrics, gate_detail),
-                    ("n_scored_forward_predictions", "n_scored", "scored_predictions", "oos_n"),
+                # (c) No failed overfitting check if one is recorded
+                overfit_ok, overfit_reason = _check_recorded_overfitting(
+                    gate_detail, full_metrics
                 )
+                if overfit_ok is False:
+                    details.append(f"overfitting_check_failed: {overfit_reason}")
+                    passed = False
+                elif overfit_ok is True:
+                    details.append("Overfitting check passed")
+                else:
+                    details.append("No overfitting check recorded")
+
+                # (a) + (b) need a typed record a registered reader accepts
+                proven, refusal = _read_typed_oos_evidence(gate_detail, model_id)
+                if proven is None:
+                    details.append(refusal)
+                    passed = False
+
+            if proven is not None:
+                # Skill is read only from the counts a typed reader proved.
+                # (a) n >= 30 scored forward predictions produced by this model
+                n_scored = _extract_int((proven,), ("n_scored",))
                 if n_scored is None:
                     details.append(
-                        "missing_scored_predictions_count: OOS evidence lacks scored "
-                        "forward prediction count"
+                        "missing_scored_predictions_count: proven OOS evidence lacks n_scored"
                     )
                     passed = False
                 elif n_scored < MIN_OOS_SCORED_PREDICTIONS:
@@ -557,15 +636,9 @@ class GateChecker:
                     )
 
                 # (b) Hit rate Wilson 95% lower bound > 0.5 OR Brier < climatology
-                hit_rate = _extract_float(
-                    (full_metrics, gate_detail),
-                    ("hit_rate", "oos_hit_rate"),
-                )
+                hit_rate = _extract_float((proven,), ("hit_rate",))
                 if hit_rate is None and n_scored and n_scored > 0:
-                    n_hits = _extract_int(
-                        (full_metrics, gate_detail),
-                        ("n_hits", "hits", "oos_hits"),
-                    )
+                    n_hits = _extract_int((proven,), ("n_hits",))
                     if n_hits is not None and n_hits <= n_scored:
                         hit_rate = n_hits / n_scored
 
@@ -575,16 +648,8 @@ class GateChecker:
                     wilson_lo = _wilson_lower_95(hit_rate, n_scored)
                     hit_rate_ok = wilson_lo > 0.5
 
-                brier = _extract_float(
-                    (full_metrics, gate_detail),
-                    ("brier", "brier_score", "oos_brier"),
-                )
-                clim_brier = _extract_float(
-                    (full_metrics, baseline_cmp, gate_detail),
-                    ("climatology_brier", "brier_climatology"),
-                )
-                if clim_brier is None:
-                    clim_brier = _extract_float((baseline_cmp,), ("brier", "brier_score"))
+                brier = _extract_float((proven,), ("brier",))
+                clim_brier = _extract_float((proven,), ("climatology_brier",))
                 brier_present = (
                     brier is not None
                     and clim_brier is not None
@@ -595,7 +660,7 @@ class GateChecker:
 
                 if wilson_lo is None and not brier_present:
                     details.append(
-                        "missing_skill_metrics: OOS evidence must record hit_rate (or n_hits) "
+                        "missing_skill_metrics: proven OOS evidence must give hit_rate (or n_hits) "
                         "or both brier and climatology_brier"
                     )
                     passed = False
@@ -616,18 +681,6 @@ class GateChecker:
                         details.append(
                             f"OOS brier={brier:.4f} < climatology={clim_brier:.4f}"
                         )
-
-                # (c) No failed overfitting check if one is recorded
-                overfit_ok, overfit_reason = _check_recorded_overfitting(
-                    gate_detail, full_metrics
-                )
-                if overfit_ok is False:
-                    details.append(f"overfitting_check_failed: {overfit_reason}")
-                    passed = False
-                elif overfit_ok is True:
-                    details.append("Overfitting check passed")
-                else:
-                    details.append("No overfitting check recorded")
 
         log.info(
             "Gate check STAGING->PRODUCTION for model {m}: {r}",

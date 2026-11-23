@@ -32,6 +32,7 @@ class EnsembleResult:
     val_sharpe: float
     n_features: int
     n_train_samples: int
+    val_outcome_coverage: float     # observed val book slots / val book slots
 
 
 _DEFAULT_LGB_PARAMS: dict[str, Any] = {
@@ -55,7 +56,14 @@ def _build_feature_matrix(
     signal_panels: dict[str, pd.DataFrame],
     forward_returns: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Stack signal panels into (date × ticker) feature rows with target."""
+    """Stack signal panels into (date × ticker) feature rows with target.
+
+    Rows are the decision-time universe: every (date, ticker) whose factor
+    values are all known. A row is never dropped because its forward return
+    is missing (delisted, halted, data gap); the target is NaN there, so
+    prediction and ranking see what the decision saw and only training
+    drops unlabeled rows.
+    """
     frames = []
     for name, panel in signal_panels.items():
         stacked = panel.stack()
@@ -63,11 +71,9 @@ def _build_feature_matrix(
         frames.append(stacked)
 
     features = pd.concat(frames, axis=1).dropna()
-    target = forward_returns.stack()
+    target = forward_returns.stack().reindex(features.index)
     target.name = "forward_return"
-
-    common = features.index.intersection(target.index)
-    return features.loc[common], target.loc[common]
+    return features, target
 
 
 def train_ensemble(
@@ -106,8 +112,9 @@ def train_ensemble(
         raise ValueError(f"inner_val_frac must be in (0, 1), got {inner_val_frac}")
 
     features, target = _build_feature_matrix(signal_panels, forward_returns)
-    if len(features) < 100:
-        raise ValueError(f"Insufficient data: {len(features)} samples (need >= 100)")
+    labeled = target.notna().to_numpy()
+    if int(labeled.sum()) < 100:
+        raise ValueError(f"Insufficient data: {int(labeled.sum())} samples (need >= 100)")
 
     params = {**_DEFAULT_LGB_PARAMS, **(lgb_params or {})}
     feature_names = list(features.columns)
@@ -115,7 +122,7 @@ def train_ensemble(
     # Expanding-window split by date with outer embargo >= label_horizon.
     # Outer train: dates[:split_idx]; dropped embargo: dates[split_idx : split_idx + embargo];
     # outer validation: dates[split_idx + embargo :].
-    dates = features.index.get_level_values(0).unique().sort_values()
+    dates = features.index[labeled].get_level_values(0).unique().sort_values()
     split_idx = int(len(dates) * train_frac)
     train_dates = dates[:split_idx]
     val_dates = dates[split_idx + embargo :]
@@ -136,8 +143,8 @@ def train_ensemble(
     es_dates = train_dates[es_start_idx:]
 
     date_level = features.index.get_level_values(0)
-    fit_mask = date_level.isin(fit_dates)
-    es_mask = date_level.isin(es_dates)
+    fit_mask = date_level.isin(fit_dates) & labeled
+    es_mask = date_level.isin(es_dates) & labeled
     val_mask = date_level.isin(val_dates)
 
     X_fit, y_fit = features[fit_mask], target[fit_mask]
@@ -170,7 +177,7 @@ def train_ensemble(
     total_imp = sum(importance.values()) or 1
     importance = {k: round(v / total_imp, 4) for k, v in importance.items()}
 
-    # Predict on full dataset
+    # Predict on the full decision-time universe (labeled or not)
     preds = model.predict(features)
 
     # Rank predictions cross-sectionally per date
@@ -179,7 +186,12 @@ def train_ensemble(
     ranked = pred_panel.rank(axis=1, pct=True)
 
     # Compute train/val Sharpe from long-short (val_dates untouched during training/ES)
-    from alpha_research.validation.metrics import long_short_returns, sharpe_ratio
+    from alpha_research.validation.metrics import (
+        long_short_book,
+        long_short_returns,
+        outcome_coverage,
+        sharpe_ratio,
+    )
 
     train_pred = ranked.loc[ranked.index.isin(fit_dates)]
     val_pred = ranked.loc[ranked.index.isin(val_dates)]
@@ -187,12 +199,18 @@ def train_ensemble(
     train_fwd_aligned = train_fwd.reindex(index=ranked.index, columns=ranked.columns)
 
     train_ls = long_short_returns(train_pred, train_fwd_aligned.loc[train_pred.index])
-    val_ls = long_short_returns(val_pred, train_fwd_aligned.loc[val_pred.index])
+    val_book = long_short_book(val_pred, train_fwd_aligned.loc[val_pred.index])
+    val_ls = val_book["return"].dropna()
+    val_coverage = float(outcome_coverage(val_book)["outcome_coverage"])
 
     train_sr = sharpe_ratio(train_ls)
     val_sr = sharpe_ratio(val_ls)
 
-    log.info("Ensemble trained: train Sharpe={ts:.3f}, val Sharpe={vs:.3f}", ts=train_sr, vs=val_sr)
+    log.info(
+        "Ensemble trained: train Sharpe={ts:.3f}, val Sharpe={vs:.3f}, "
+        "val outcome coverage={vc:.4f}",
+        ts=train_sr, vs=val_sr, vc=val_coverage,
+    )
     log.info("Feature importance: {fi}", fi=importance)
 
     return EnsembleResult(
@@ -202,4 +220,5 @@ def train_ensemble(
         val_sharpe=val_sr,
         n_features=len(feature_names),
         n_train_samples=len(X_fit),
+        val_outcome_coverage=val_coverage,
     )
