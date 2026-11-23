@@ -31,6 +31,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.feature_ids import feature_id
+
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -135,16 +137,24 @@ def _get_latest_value(engine: Engine, series_id: str) -> tuple[float | None, dat
 
 
 def _get_feature_value(engine: Engine, feature_name: str) -> tuple[float | None, date | None]:
-    """Fetch the most recent resolved value for a feature by name."""
+    """Fetch the most recent resolved value for a feature by name.
+
+    The id is looked up first and bound (store.feature_ids): through a
+    feature_registry name join the planner walked every vintage of a large
+    feature (china_indpro_yoy, 75k rows: 70 ms on griddb, 2026-11-23; < 1 ms
+    with the id bound).
+    """
     with engine.connect() as conn:
+        fid = feature_id(conn, feature_name)
+        if fid is None:
+            return None, None
         row = conn.execute(
             text(
                 "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                "WHERE fr.name = :name "
+                "WHERE rs.feature_id = :fid "
                 "ORDER BY rs.obs_date DESC LIMIT 1"
             ),
-            {"name": feature_name},
+            {"fid": fid},
         ).fetchone()
     if row is None:
         return None, None

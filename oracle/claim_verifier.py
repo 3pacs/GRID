@@ -15,6 +15,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
 
 from oracle.claim_extractor import Claim
+from store.feature_ids import feature_id
 
 Verdict = Literal["supported", "contradicted", "insufficient", "ambiguous"]
 
@@ -39,6 +40,11 @@ _PCT_TOLERANCE_ABS = 3.0     # within 3 percentage-points = supported
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────
+#
+# The readers below look the feature id up first and bind it
+# (store.feature_ids): matched through a feature_registry name join, a
+# latest read of spy_full walked all 225k vintages (195 ms on griddb,
+# 2026-11-23); with the id bound it reads the newest rows first (< 1 ms).
 
 def _lookup_latest_value(
     engine: Engine,
@@ -50,15 +56,17 @@ def _lookup_latest_value(
     try:
         with engine.connect() as conn:
             for name in candidates:
+                fid = feature_id(conn, name)
+                if fid is None:
+                    continue
                 row = conn.execute(sql_text(
-                    "SELECT rs.value, rs.obs_date, fr.name "
+                    "SELECT rs.value, rs.obs_date "
                     "FROM resolved_series rs "
-                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE fr.name = :name "
+                    "WHERE rs.feature_id = :fid "
                     "ORDER BY rs.obs_date DESC LIMIT 1"
-                ), {"name": name}).fetchone()
+                ), {"fid": fid}).fetchone()
                 if row and row[0] is not None:
-                    return (float(row[0]), str(row[1]), row[2])
+                    return (float(row[0]), str(row[1]), name)
     except Exception as exc:
         log.debug("claim_verifier: DB lookup failed for {t}: {e}", t=ticker, e=str(exc))
     return (None, None, None)
@@ -71,13 +79,13 @@ def _lookup_feature_value(
     """Return (value, obs_date) for a named feature."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(sql_text(
+            fid = feature_id(conn, feature_name)
+            row = None if fid is None else conn.execute(sql_text(
                 "SELECT rs.value, rs.obs_date "
                 "FROM resolved_series rs "
-                "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                "WHERE fr.name = :name "
+                "WHERE rs.feature_id = :fid "
                 "ORDER BY rs.obs_date DESC LIMIT 1"
-            ), {"name": feature_name}).fetchone()
+            ), {"fid": fid}).fetchone()
             if row and row[0] is not None:
                 return (float(row[0]), str(row[1]))
     except Exception as exc:
@@ -96,13 +104,15 @@ def _lookup_price_change(
     try:
         with engine.connect() as conn:
             for name in candidates:
+                fid = feature_id(conn, name)
+                if fid is None:
+                    continue
                 rows = conn.execute(sql_text(
                     "SELECT rs.value "
                     "FROM resolved_series rs "
-                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE fr.name = :name "
+                    "WHERE rs.feature_id = :fid "
                     "ORDER BY rs.obs_date DESC LIMIT :n"
-                ), {"name": name, "n": periods}).fetchall()
+                ), {"fid": fid, "n": periods}).fetchall()
                 if rows and len(rows) >= 2:
                     return (float(rows[0][0]), float(rows[-1][0]))
     except Exception as exc:

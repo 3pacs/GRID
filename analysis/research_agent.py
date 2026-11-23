@@ -22,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from analysis.sector_map import SECTOR_MAP, get_actor_influence
+from store.feature_ids import feature_id
 
 
 # ── Gap Analysis ────────────────────────────────────────────────
@@ -195,12 +196,17 @@ def research_actor(actor: dict, sector: str, engine: Engine) -> dict[str, Any]:
     if actor.get("features"):
         with engine.connect() as c:
             for feat in actor["features"]:
+                # Bound id, not a feature_registry name join: actors carry
+                # large features (usdjpy 276k rows, tsm_full 274k), which the
+                # name join read in full before keeping one row.
+                fid = feature_id(c, feat)
+                if fid is None:
+                    continue
                 row = c.execute(text(
                     "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE fr.name = :name "
+                    "WHERE rs.feature_id = :fid "
                     "ORDER BY rs.obs_date DESC LIMIT 1"
-                ), {"name": feat}).fetchone()
+                ), {"fid": fid}).fetchone()
                 if row:
                     data_context.append(f"{feat}: {row[0]} (as of {row[1]})")
 

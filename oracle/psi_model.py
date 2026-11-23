@@ -25,6 +25,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.feature_ids import feature_id
+
 
 @dataclass(frozen=True)
 class PSISignal:
@@ -107,19 +109,26 @@ _PSI_CONFIGS: list[dict[str, Any]] = [
 
 
 def _load_latest_value(engine: Engine, feature_name: str) -> float | None:
-    """Load the most recent value for a feature from resolved_series."""
+    """Load the most recent value for a feature from resolved_series.
+
+    The id is bound rather than matched through a feature_registry name
+    join, which read all 375k vix_spot vintages per call (320 ms on griddb,
+    2026-11-23; < 1 ms bound).
+    """
     with engine.connect() as conn:
+        fid = feature_id(conn, feature_name)
+        if fid is None:
+            return None
         row = conn.execute(
             text("""
                 SELECT rs.value, rs.obs_date
                 FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name = :name
+                WHERE rs.feature_id = :fid
                 AND rs.obs_date <= CURRENT_DATE
                 ORDER BY rs.obs_date DESC
                 LIMIT 1
             """),
-            {"name": feature_name},
+            {"fid": fid},
         ).fetchone()
     if row:
         return float(row[0])
