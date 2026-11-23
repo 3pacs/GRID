@@ -22,15 +22,16 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.market_calendar import last_trading_day
-from store.feature_ids import feature_id, feature_ids
+from store.feature_ids import feature_ids
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_SNAPSHOTS, visible_sql
 from trading.trade_ticket_generator import MAX_KELLY_PER_TICKET
 
@@ -101,6 +102,125 @@ def _to_date(value: Any) -> date | None:
         except ValueError:
             return None
     return None
+
+
+# ── CROSS_ASSET momentum: the option's own underlying close ─────────
+#
+# Source decision (griddb, read-only, 2026-11-23; 194 tickers with an
+# options_daily_signals row in the last 30 days):
+# * ``{t}_close`` (the old source): CL only, and that is WTI crude
+#   (YF:CL=F), not Colgate, the CL option's underlying. The other 193
+#   tickers had no feature and read a fake +0.00% momentum.
+# * ``{t}_full``: 41 tickers; bare ``{t}``: 38 registered, none with a row
+#   in 30 days.
+# * ``options_daily_signals.spot_price``: every ticker has some row, but it
+#   is an intraday quote (mostly 15:xx ET, some 09-14h; median 0.24 %, p90
+#   2.1 % off the close), overwritten in place by each capture, and no
+#   visible row exists for 2026-11-20 (131-168 tickers on the other days).
+# * ``raw_series`` ``YF:{T}:close`` completed closes (yfinance + TIINGO):
+#   190 tickers; 180 with both newest sessions. Each vintage carries its
+#   pull time, so the read is fenced at the run date by when GRID had the
+#   row, not by its label.
+# The completed close is the official close of the option's own listing,
+# so it is the source here.
+
+#: Momentum is the close-to-close return over this many trading sessions.
+MOMENTUM_SESSIONS: int = 5
+# Calendar days read back from the run date: 5 sessions plus weekends,
+# holidays and a stale newest close fit well inside.
+_MOMENTUM_LOOKBACK_DAYS: int = 21
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class UnderlyingMomentum:
+    """A 5-session return of the underlying's completed close, or why there is none.
+
+    ``momentum`` is None when no return can be measured; ``reason`` then
+    says why (no close, stale, missing base session, ambiguous close).
+    """
+
+    momentum: float | None
+    start: date | None
+    end: date | None
+    reason: str
+
+
+def momentum_cutoff(run_date: date) -> datetime:
+    """The last instant a run dated ``run_date`` may read: the end of that day in New York.
+
+    Date-granular, like the DATA_QUALITY snapshot fence (``snap_date <=
+    run_date``): a replay of a day sees that day's close if it was pulled
+    that evening, as a run after the close did.
+    """
+    return datetime.combine(run_date, time.max, _NEW_YORK)
+
+
+def underlying_momentum(conn: Any, ticker: str, run_date: date) -> UnderlyingMomentum:
+    """Return of ``ticker``'s completed close over the last ``MOMENTUM_SESSIONS`` sessions.
+
+    Reads ``YF:{TICKER}:close`` through ``store.observations.read_completed_closes``:
+    SUCCESS rows from yfinance or TIINGO pulled after 17:00 New York on the
+    session day (``evaluation.prices.us_listed_close_boundary``) and by
+    :func:`momentum_cutoff`, labels up to ``run_date``, TIINGO rows of
+    another listing dropped (``tiingo_symbol_contract``). A label whose
+    completed vintages disagree is ambiguous and is not used.
+
+    The newest completed close must fall in the fresh window
+    (``min_fresh_snap_date(run_date)`` on), and a completed close must exist
+    for the session exactly ``MOMENTUM_SESSIONS`` sessions before it. Both
+    closes are put on the newest close's share basis with the recorded
+    splits (``store.observations.price_in_basis``); dividends are not
+    adjusted. Anything missing gives ``momentum=None`` and a reason, never 0.
+    """
+    from evaluation.prices import COMPLETED_CLOSE_SOURCES, us_listed_close_boundary
+    from ingestion.market_calendar import trading_days_between
+    from store.observations import price_in_basis, read_completed_closes, read_splits
+
+    symbol = (ticker or "").strip().upper()
+    if not symbol:
+        return UnderlyingMomentum(None, None, None, "no ticker")
+    cutoff = momentum_cutoff(run_date)
+    start = run_date - timedelta(days=_MOMENTUM_LOOKBACK_DAYS)
+    closes = read_completed_closes(
+        conn, f"YF:{symbol}:close", start=start, end=run_date,
+        boundary=us_listed_close_boundary, source=COMPLETED_CLOSE_SOURCES,
+        as_of_ts=cutoff,
+    )
+    if not closes:
+        return UnderlyingMomentum(
+            None, None, None, f"no completed {symbol} close from {start} to {run_date}")
+    end = max(closes)
+    fresh_from = min_fresh_snap_date(run_date)
+    if end < fresh_from:
+        return UnderlyingMomentum(
+            None, None, end,
+            f"newest completed {symbol} close is {end}, before the fresh window from {fresh_from}")
+    sessions = trading_days_between(start, end)
+    if len(sessions) <= MOMENTUM_SESSIONS or sessions[-1] != end:
+        return UnderlyingMomentum(
+            None, None, end, f"fewer than {MOMENTUM_SESSIONS + 1} sessions to {end}")
+    base = sessions[-1 - MOMENTUM_SESSIONS]
+    if base not in closes:
+        return UnderlyingMomentum(
+            None, base, end,
+            f"no completed {symbol} close for {base}, {MOMENTUM_SESSIONS} sessions before {end}")
+    for d in (base, end):
+        if closes[d].ambiguous:
+            return UnderlyingMomentum(
+                None, base, end, f"completed {symbol} close for {d} is ambiguous (vintages disagree)")
+    splits = read_splits(conn, symbol, start=base, as_of_ts=cutoff)
+
+    def _on_end_basis(d: date) -> float:
+        obs = closes[d].latest
+        return price_in_basis(obs.value, obs.obs_date, basis_date=end, splits=splits,
+                              source=obs.source, pull_timestamp=obs.pull_timestamp)
+
+    latest, older = _on_end_basis(end), _on_end_basis(base)
+    if not (math.isfinite(latest) and math.isfinite(older) and older > 0):
+        return UnderlyingMomentum(None, base, end, f"{symbol} close is not a positive price")
+    return UnderlyingMomentum(
+        latest / older - 1.0, base, end, f"{symbol} close {base} to {end}")
 
 # Default payout ratio when no explicit R:R is supplied (rule-of-thumb for
 # options tickets: 3:1 target:risk).
@@ -1576,7 +1696,7 @@ class OptionsRecommender:
             rec, db, run_date=run_date, resolved_iv=resolved_iv,
         )
         sanity["DEALER_FLOW"] = self._sanity_dealer_flow(rec, gex_profile)
-        sanity["CROSS_ASSET"] = self._sanity_cross_asset(rec, db)
+        sanity["CROSS_ASSET"] = self._sanity_cross_asset(rec, db, run_date=run_date)
         sanity["LLM_REVIEW"] = self._sanity_llm_review(rec, opp, gex_profile)
         sanity["HISTORICAL_ANALOG"] = self._sanity_historical_analog(rec, db)
 
@@ -1717,55 +1837,38 @@ class OptionsRecommender:
         return {"status": "PASS", "reason": "Neutral gamma regime — no strong headwind or tailwind"}
 
     def _sanity_cross_asset(
-        self, rec: OptionsRecommendation, db: Engine,
+        self, rec: OptionsRecommendation, db: Engine, *, run_date: date | None = None,
     ) -> dict[str, str]:
         """Layer 3: Cross-asset alignment (momentum + news energy).
 
         Checks recent price momentum and decision journal sentiment
         to see if they align with the recommended direction.
 
-        Momentum is the return from the 6th-newest stored session of
-        ``{ticker}_close`` to the newest (a 5-session return), one value per
-        ``obs_date``: the newest vintage of each date, as
-        ``trading.signal_executor._get_latest_prices`` reads it. ``{t}_close``
-        holds several vintages of one date (griddb 2026-11-23: cl_close has
-        a same-day and a next-day vintage on most dates, up to 3.6% apart).
-        The old ``ORDER BY obs_date DESC LIMIT 6`` counted each vintage as a
-        session, so its 6 rows covered 4 dates there, and which vintage of a
-        date came first or last was left to the query plan.
+        Momentum is the 5-session return of the option's own underlying,
+        close to completed close (:func:`underlying_momentum`), known by the
+        end of ``run_date``. Until 2026-11-23 it read ``{ticker}_close`` from
+        ``resolved_series``: only CL had one, and that was WTI crude, so
+        every other ticker read +0.00% and passed on a number nobody
+        measured. No measurable momentum is now SKIP (CROSS_ASSET is
+        optional), never 0%. The journal state is the newest entry decided
+        by the same cutoff.
         """
+        effective_run_date = run_date or date.today()
         try:
             with db.connect() as conn:
-                # Bound id (store.feature_ids): the feature_registry name join
-                # read every vintage of the feature first (~200 ms on griddb).
-                # (obs_date, vintage_date) is unique per feature, so the
-                # vintage picked for each date is fixed.
-                fid = feature_id(conn, f"{rec.ticker.lower()}_close")
-                prices = [] if fid is None else conn.execute(text("""
-                    SELECT DISTINCT ON (rs.obs_date) rs.value, rs.obs_date
-                    FROM resolved_series rs
-                    WHERE rs.feature_id = :fid
-                    ORDER BY rs.obs_date DESC, rs.vintage_date DESC
-                    LIMIT 6
-                """), {"fid": fid}).fetchall()
+                measured = underlying_momentum(conn, rec.ticker, effective_run_date)
+                if measured.momentum is None:
+                    return {"status": "SKIP", "reason": f"No momentum: {measured.reason}"}
+                momentum = measured.momentum
 
-                if len(prices) >= 2:
-                    latest = float(prices[0][0])
-                    older = float(prices[-1][0])
-                    if older > 0:
-                        momentum = (latest - older) / older
-                    else:
-                        momentum = 0.0
-                else:
-                    momentum = 0.0
-
-                # News energy from decision journal (latest regime)
+                # News energy from decision journal (latest regime known by the cutoff)
                 journal_row = conn.execute(text("""
                     SELECT inferred_state, grid_recommendation
                     FROM decision_journal
+                    WHERE decision_timestamp <= :cutoff
                     ORDER BY decision_timestamp DESC
                     LIMIT 1
-                """)).fetchone()
+                """), {"cutoff": momentum_cutoff(effective_run_date)}).fetchone()
 
                 news_aligned = True  # default: no contradiction
                 if journal_row:
@@ -1782,21 +1885,22 @@ class OptionsRecommender:
             else:
                 momentum_aligned = momentum <= 0.02   # not in sharp rally
 
+            window = measured.reason
             if momentum_aligned and news_aligned:
                 return {
                     "status": "PASS",
-                    "reason": f"Momentum ({momentum:+.2%}) and regime aligned with {rec.direction}",
+                    "reason": f"Momentum ({momentum:+.2%}, {window}) and regime aligned with {rec.direction}",
                 }
             elif not momentum_aligned and not news_aligned:
                 return {
                     "status": "FAIL",
-                    "reason": f"Momentum ({momentum:+.2%}) and regime both contradict {rec.direction}",
+                    "reason": f"Momentum ({momentum:+.2%}, {window}) and regime both contradict {rec.direction}",
                 }
             else:
                 # One aligned, one not — pass with warning
                 return {
                     "status": "PASS",
-                    "reason": f"Partial alignment — momentum={momentum:+.2%}, news_aligned={news_aligned}",
+                    "reason": f"Partial alignment — momentum={momentum:+.2%} ({window}), news_aligned={news_aligned}",
                 }
 
         except Exception as exc:
