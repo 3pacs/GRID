@@ -81,6 +81,7 @@ def test_weighted_watchlist_is_scored_from_weight(scratch):
     block = ir._build_risk_map()["concentration_risk"]
 
     assert block["available"] is True, block
+    assert block["weight_basis"] == "explicit_watchlist_weight"
     assert block["weighted_names"] == 3
     assert block["unweighted_names"] == 1
     assert block["single_name_max"] == {"ticker": "BTC", "weight": 0.6}

@@ -392,6 +392,15 @@ def _build_risk_map() -> dict[str, Any]:
         # is ``weight``. Only names with a positive weight are scored. A name
         # without one holds no stated position, and no size is invented for
         # it: equal weights would score the list's length as concentration.
+        #
+        # What this measures: concentration among the explicitly weighted
+        # watchlist names only (``weight_basis``). It is not brokerage
+        # holdings and not portfolio exposure. It also differs from
+        # /watchlist/portfolio, which gives every name 1/n when no weights
+        # are set, and 1/n to the unweighted names when only some are set.
+        # When both views are shown, their top-5 and sector shares differ by
+        # design. ``weighted_names`` / ``unweighted_names`` show the size of
+        # the subset.
         with engine.connect() as conn:
             rows = conn.execute(sql_text(
                 "SELECT ticker, asset_type, weight FROM watchlist ORDER BY added_at"
@@ -439,6 +448,7 @@ def _build_risk_map() -> dict[str, Any]:
             "top_5_watchlist_weight": round(top5_w, 2),
             "sector_concentration": {k: round(v, 2) for k, v in sorted(sectors.items(), key=lambda x: -x[1])[:6]},
             "single_name_max": {"ticker": max_name[0], "weight": round(max_name[1], 2)},
+            "weight_basis": "explicit_watchlist_weight",
             "weighted_names": len(held),
             "unweighted_names": len(rows) - len(held),
             "risk_level": _compute_risk_level(c_score),

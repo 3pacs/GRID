@@ -174,6 +174,14 @@ def get_portfolio(
     unless a custom weight column is set. Computes allocation by sector and
     asset type, risk metrics (concentration, beta, diversification), and
     options P&L from the recommendation tracker.
+
+    This view's weights are an illustration, not holdings. The risk map's
+    concentration block (``intelligence_risk``, ``weight_basis:
+    "explicit_watchlist_weight"``) differs on purpose. It scores only the
+    names with ``weight > 0``, and it is unavailable when none are set. So
+    its top-N and sector shares will not match this view's
+    ``concentration_top3`` or ``allocation`` unless every name is weighted.
+    Both views read sectors from ``watchlist_helpers.watchlist_sectors``.
     """
 
     # ── Load watchlist with weights ──────────────────────────────

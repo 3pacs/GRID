@@ -122,6 +122,7 @@ def test_weighted_names_are_scored_unweighted_reported(build, monkeypatch):
     block = build(rows)[0]["concentration_risk"]
 
     assert block["available"] is True
+    assert block["weight_basis"] == "explicit_watchlist_weight"
     assert block["weighted_names"] == 4
     assert block["unweighted_names"] == 2
     assert block["top_5_watchlist_weight"] == 1.0
@@ -164,6 +165,24 @@ def test_weighted_names_use_the_effective_asset_type_for_sectors(build, monkeypa
 
     assert ("BTC", "crypto") in seen
     assert block["sector_concentration"] == {"Crypto": 0.5, "Other": 0.5}
+
+
+def test_only_explicitly_weighted_names_are_reported(build, monkeypatch):
+    """The unweighted names (here the only "Other" names) appear nowhere in
+    the block: not as the largest name, not as a sector share."""
+    _fixed_sectors(monkeypatch, {"NVDA": "Technology", "MSFT": "Technology"})
+    rows = [("NVDA", "stock", Decimal("3")), ("MSFT", "stock", Decimal("1"))] + [
+        (f"U{i}", "stock", None) for i in range(19)
+    ]
+    block = build(rows)[0]["concentration_risk"]
+
+    assert block["weighted_names"] == 2
+    assert block["unweighted_names"] == 19
+    assert block["single_name_max"] == {"ticker": "NVDA", "weight": 0.75}
+    assert block["sector_concentration"] == {"Technology": 1.0}
+    assert block["top_5_watchlist_weight"] == 1.0
+    # The equal-weight portfolio view would give these 21 names 1/21 each:
+    # top-5 = 0.24 and Technology = 0.10. Here only the explicit weights count.
 
 
 # ── watchlist_sectors ────────────────────────────────────────────────────
