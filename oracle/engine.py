@@ -3041,6 +3041,16 @@ class EnsemblePrediction:
     crowd_aligned: bool = False
     market_implied_prob: float = 0.0
     market_divergence_severity: str = ""
+    # Why the options-implied adjustment was not applied ("" = not reached).
+    market_adjustment_withheld: str = ""
+
+
+# The only options-implied probability GRID computes today
+# (intelligence.market_implied_prob.options_implied_probability) prices
+# P(spot crosses a +/-k sigma strike) from the latest options snapshot, with no
+# as_of. The ensemble calls P(up/down) at the horizon as of the decision clock.
+# Different event, not point-in-time: the adjustment is withheld for every call.
+_MARKET_ADJUSTMENT_WITHHELD = "event_mismatch;not_point_in_time"
 
 
 class EnsemblePredictor:
@@ -3048,9 +3058,6 @@ class EnsemblePredictor:
 
     _HIT_RATE_PRIOR_HITS: float = 5.0
     _HIT_RATE_PRIOR_N: float = 10.0
-    _TARGET_MOVE_SIGMA_K: float = 1.0
-    _REALIZED_VOL_LOOKBACK_DAYS: int = 45
-    _REALIZED_VOL_MIN_RETURNS: int = 10
 
     def __init__(self, engine: Engine):
         from oracle.model_factory import ModelFactory
@@ -3070,6 +3077,25 @@ class EnsemblePredictor:
         if d == "bearish":
             return 1.0 - c
         return 0.5
+
+    @staticmethod
+    def _damp_edge(confidence: float, multiplier: float) -> float:
+        """Scale the edge of a max-side probability around 0.5.
+
+        ``confidence`` is P(called side), in [0.5, 1]. Dampers scale the edge
+        ``confidence - 0.5``, never the whole probability, so a 60% call
+        damped by 0.5 is 55% and can never cross 0.5 or flip the side. A
+        multiplier above 1 widens the edge, capped at 1.0. Non-finite inputs or
+        a negative multiplier fail closed to 0.5 (no edge).
+        """
+        c = float(confidence)
+        k = float(multiplier)
+        if not math.isfinite(c):
+            return 0.5
+        if not math.isfinite(k) or k < 0.0:
+            k = 0.0
+        edge = max(0.0, min(0.5, c - 0.5))
+        return round(min(1.0, 0.5 + k * edge), 4)
 
     def predict(
         self,
@@ -3188,6 +3214,7 @@ class EnsemblePredictor:
                 horizon=horizon,
                 regime=regime_state_for_routing if regime_obj is not None else "",
                 regime_router_weights=regime_router_weights,
+                market_adjustment_withheld=_MARKET_ADJUSTMENT_WITHHELD,
             )
 
         raw_weights = [max(0.0, float(v["vote_weight"])) for v in votes]
@@ -3239,10 +3266,11 @@ class EnsemblePredictor:
             directional_entropy_val = float(disagreement.directional_entropy)
         except Exception as exc:
             log.debug("disagreement metrics failed for {t}: {e}", t=ticker, e=str(exc))
+        # Every damper below scales the edge over 0.5 (Codex HOLD 6011902881):
+        # confidence stays a probability of the called side, never < 0.5.
         if disagreement_score_val > 0 and confidence > 0.5:
-            confidence = round(
-                0.5 + (confidence - 0.5) * (1.0 - 0.4 * disagreement_score_val),
-                4,
+            confidence = self._damp_edge(
+                confidence, 1.0 - 0.4 * disagreement_score_val,
             )
 
         catalyst_proximity = 0.0
@@ -3265,21 +3293,21 @@ class EnsemblePredictor:
                 e=str(exc),
             )
         if catalyst_proximity > 0:
-            confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
+            confidence = self._damp_edge(confidence, 1.0 - 0.5 * catalyst_proximity)
 
         liquidity_state_val = ""
         liquidity_level_pct = 50.0
         if regime_obj is not None:
             try:
-                from intelligence.liquidity_regime import apply_to_confidence
+                from intelligence.liquidity_regime import STATE_CONFIDENCE_MULTIPLIER
 
                 liquidity_state_val = str(getattr(regime_obj, "state", ""))
                 liquidity_level_pct = float(
                     getattr(regime_obj, "level_percentile", 50.0)
                 )
-                confidence = round(
-                    apply_to_confidence(confidence, liquidity_state_val),
-                    4,
+                confidence = self._damp_edge(
+                    confidence,
+                    STATE_CONFIDENCE_MULTIPLIER.get(liquidity_state_val, 1.0),
                 )
             except Exception as exc:
                 log.debug(
@@ -3303,9 +3331,8 @@ class EnsemblePredictor:
                 1.0 if direction == "bullish"
                 else (-1.0 if direction == "bearish" else 0.0)
             )
-            confidence = round(
-                confidence * (1.0 + 0.05 * fci_dir_sign * clamped_fci),
-                4,
+            confidence = self._damp_edge(
+                confidence, 1.0 + 0.05 * fci_dir_sign * clamped_fci,
             )
         except Exception as exc:
             log.debug("FCI unavailable for {t}: {e}", t=ticker, e=str(exc))
@@ -3320,7 +3347,7 @@ class EnsemblePredictor:
             fragility_mult = float(attr.fragility_multiplier)
             shap_top = str(attr.top_contributor)
             shap_top_share = float(attr.top_share)
-            confidence = round(confidence * fragility_mult, 4)
+            confidence = self._damp_edge(confidence, fragility_mult)
         except Exception as exc:
             log.debug("shapley unavailable for {t}: {e}", t=ticker, e=str(exc))
 
@@ -3338,52 +3365,15 @@ class EnsemblePredictor:
             crowd_dir = crowd.crowd_direction or ""
             penalty = compute_penalty(crowd, direction)
             crowd_aligned_flag = bool(penalty.aligned)
-            confidence = round(confidence * float(penalty.multiplier), 4)
+            confidence = self._damp_edge(confidence, float(penalty.multiplier))
         except Exception as exc:
             log.debug("crowdedness unavailable for {t}: {e}", t=ticker, e=str(exc))
 
+        # Options-implied adjustment withheld (see _MARKET_ADJUSTMENT_WITHHELD):
+        # no point-in-time, matching-event market probability exists, so the
+        # options table is not read and nothing from it reaches the output.
         market_prob_val = 0.0
         market_sev = ""
-        if direction in ("bullish", "bearish"):
-            try:
-                sigma_daily = self._get_realized_daily_vol(ticker, as_of)
-                if sigma_daily is None:
-                    log.debug(
-                        "market_implied_prob abstained for {t}: realized vol unavailable",
-                        t=ticker,
-                    )
-                else:
-                    from intelligence.market_implied_prob import (
-                        compare_to_oracle,
-                        options_implied_probability,
-                    )
-
-                    horizon_eff = max(1, int(horizon))
-                    move_mag = min(
-                        0.95,
-                        self._TARGET_MOVE_SIGMA_K * sigma_daily * float(np.sqrt(horizon_eff)),
-                    )
-                    target_move = move_mag if direction == "bullish" else -move_mag
-                    market = options_implied_probability(
-                        self.engine,
-                        ticker,
-                        target_move_pct=target_move,
-                        horizon_days=horizon,
-                    )
-                    if market is not None:
-                        market_prob_val = float(market.prob)
-                        div_report = compare_to_oracle(confidence, market.prob)
-                        market_sev = str(div_report.severity)
-                        confidence = round(
-                            confidence * float(div_report.confidence_multiplier),
-                            4,
-                        )
-            except Exception as exc:
-                log.debug(
-                    "market_implied_prob unavailable for {t}: {e}",
-                    t=ticker,
-                    e=str(exc),
-                )
 
         confidence = max(0.0, min(1.0, confidence))
 
@@ -3517,6 +3507,7 @@ class EnsemblePredictor:
             crowd_aligned=crowd_aligned_flag,
             market_implied_prob=market_prob_val,
             market_divergence_severity=market_sev,
+            market_adjustment_withheld=_MARKET_ADJUSTMENT_WITHHELD,
         )
 
     def predict_batch(
@@ -3549,91 +3540,6 @@ class EnsemblePredictor:
                 for vote in prediction.model_votes
             ],
         }
-
-    def _get_realized_daily_vol(
-        self,
-        ticker: str,
-        as_of: datetime,
-    ) -> float | None:
-        """PIT daily realized volatility (sample std of daily log returns).
-
-        Reads ``YF:{symbol}:close`` through ``store.observations.read_window``
-        bounded by ``as_of`` and ``as_of_ts`` and split-adjusts with
-        ``read_splits`` / ``adjust_history_for_splits``. Returns ``None``
-        (fail closed) when insufficient valid closes exist.
-        """
-        from store.observations import (
-            adjust_history_for_splits,
-            read_splits,
-            read_window,
-        )
-
-        sym = ticker.strip().upper()
-        try:
-            from ticker_symbols import get_yf_symbol
-
-            sym = get_yf_symbol(sym)
-        except Exception:
-            pass
-
-        end_date = as_of.date()
-        start_date = end_date - timedelta(days=self._REALIZED_VOL_LOOKBACK_DAYS)
-        series_id = f"YF:{sym}:close"
-
-        try:
-            with self.engine.connect() as conn:
-                points: list[tuple[date, float]] = []
-                for source in ("yfinance", "TIINGO"):
-                    obs = read_window(
-                        conn,
-                        series_id,
-                        source=source,
-                        start=start_date,
-                        as_of=end_date,
-                        as_of_ts=as_of,
-                    )
-                    valid = [
-                        (o.obs_date, float(o.value))
-                        for o in obs
-                        if o.value is not None
-                        and np.isfinite(float(o.value))
-                        and float(o.value) > 0.0
-                    ]
-                    if len(valid) >= self._REALIZED_VOL_MIN_RETURNS + 1:
-                        points = valid
-                        break
-                if len(points) < self._REALIZED_VOL_MIN_RETURNS + 1:
-                    return None
-                try:
-                    splits = read_splits(
-                        conn, sym, start=start_date, end=end_date, as_of_ts=as_of,
-                    )
-                    if splits:
-                        points, _ = adjust_history_for_splits(points, splits)
-                except Exception as exc:
-                    log.debug(
-                        "_get_realized_daily_vol split lookup skipped for {t}: {e}",
-                        t=ticker,
-                        e=str(exc),
-                    )
-        except Exception as exc:
-            log.debug(
-                "_get_realized_daily_vol read failed for {t}: {e}",
-                t=ticker,
-                e=str(exc),
-            )
-            return None
-
-        closes = np.array([p[1] for p in points], dtype=float)
-        if len(closes) < self._REALIZED_VOL_MIN_RETURNS + 1 or np.any(closes <= 0.0):
-            return None
-        log_returns = np.diff(np.log(closes))
-        if len(log_returns) < self._REALIZED_VOL_MIN_RETURNS:
-            return None
-        sigma_daily = float(np.std(log_returns, ddof=1))
-        if not np.isfinite(sigma_daily) or sigma_daily <= 0.0:
-            return None
-        return sigma_daily
 
     def _get_hit_rate(
         self,
