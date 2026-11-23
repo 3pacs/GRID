@@ -10,13 +10,20 @@ momentum and passed. The read had no point-in-time fence.
 The read is now ``underlying_momentum``: ``YF:{TICKER}:close`` completed
 closes (yfinance + TIINGO, pulled after 17:00 New York on the session day,
 ``store.observations.read_completed_closes``), labels up to ``run_date`` and
-pulls up to the end of ``run_date`` in New York, the close 5 sessions before
-the newest one, recorded splits re-based. No measurable momentum is SKIP.
-The journal state is fenced by the same cutoff.
+pulls up to the end of ``run_date`` in New York. All 6 consecutive sessions
+ending at the newest (fresh) close need a valid, unambiguous close; momentum
+is newest over first, recorded splits re-based. No measurable momentum is
+SKIP. The journal state is fenced by the same cutoff.
+
+Codex review 6030034930 (#1400 at 344f5d11) asked for tests of: the ticker
+collision (CL the equity vs crude), missing and sparse rows (two rows must
+not be enough), reversals and retractions, and a later regime not lifting a
+historical veto. Each has a named test below.
 
 Calendar used by the seed: run date Monday 2026-11-23, so the fresh window
 starts Friday 11-20 and the base session is Friday 11-13 (EST: 17:00 New York
-is 22:00 UTC). A replay dated Wednesday 11-18 reads 11-11 to 11-18.
+is 22:00 UTC). A replay dated Wednesday 11-18 reads 11-11 to 11-18; one
+dated Friday 11-20 reads 11-13 to 11-20.
 
 Skips without ``GRID_TEST_DB_URL`` (a local throwaway database); fails
 instead when ``REQUIRE_BOUND_ID_READS_PG=1`` (CI, the bound-id reads step).
@@ -44,6 +51,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 
 RUN = date(2026, 11, 23)
 REPLAY = date(2026, 11, 18)
+FRIDAY = date(2026, 11, 20)
 SESSIONS = [date(2026, 11, d) for d in (11, 12, 13, 16, 17, 18, 19, 20)]
 
 
@@ -71,10 +79,13 @@ RAW += [
     ("YF:AAA:close", "yfinance", SESSIONS[-1], _utc(SESSIONS[-1], 20), 90.0, "SUCCESS", None),
     # A failed pull marker dated 11-20.
     ("YF:AAA:close", "yfinance", SESSIONS[-1], _utc(SESSIONS[-1], 23, 45), 0.0, "FAILED", None),
-    # A re-pull of 11-18 at 06:00 UTC on 11-19: after a run dated 11-18 could
-    # see it. Seen, it would make 11-18 ambiguous (97.0 vs 97.5).
-    ("YF:AAA:close", "yfinance", date(2026, 11, 18), _utc(date(2026, 11, 19), 6), 97.5, "SUCCESS", None),
 ]
+# REV: a later vintage revises 11-18 (97.0 -> 97.5, pulled 06:00 UTC 11-19,
+# after a run dated 11-18 could see it). Seen, the label is ambiguous.
+_tiingo_closes("REV", dict(zip(SESSIONS, (100.0, 101.0, 100.0, 99.0, 98.0, 97.0, 96.0, 95.0), strict=True)))
+RAW.append(("YF:REV:close", "yfinance", date(2026, 11, 18), _utc(date(2026, 11, 19), 6), 97.5, "SUCCESS", None))
+# PATH: down 15% and back inside the window; momentum is newest over first.
+_tiingo_closes("PATH", dict(zip(SESSIONS, (100.0, 100.0, 100.0, 90.0, 85.0, 90.0, 95.0, 101.0), strict=True)))
 # SPL: 2-for-1 effective 11-18; TIINGO closes are as traded.
 _tiingo_closes("SPL", {SESSIONS[2]: 200.0, SESSIONS[3]: 202.0, SESSIONS[4]: 204.0,
                        SESSIONS[5]: 103.0, SESSIONS[6]: 104.0, SESSIONS[7]: 105.0})
@@ -87,6 +98,22 @@ RAW.append(("YF:AMB:close", "yfinance", SESSIONS[-1], _utc(date(2026, 11, 21), 5
 _tiingo_closes("STL", {d: 20.0 for d in SESSIONS[:6]})
 # GAP: no close on the base session 11-13.
 _tiingo_closes("GAP", {d: 30.0 for d in SESSIONS if d != date(2026, 11, 13)})
+# SPARSE: no close on 11-17, inside the window.
+_tiingo_closes("SPARSE", {d: 30.0 for d in SESSIONS if d != date(2026, 11, 17)})
+# TWO: only the two end points; the old read needed no more than this.
+_tiingo_closes("TWO", {date(2026, 11, 13): 30.0, date(2026, 11, 20): 33.0})
+# QRT: the only 11-18 row was quarantined (a withdrawn observation).
+_tiingo_closes("QRT", {d: 40.0 for d in SESSIONS if d != date(2026, 11, 18)})
+RAW.append(("YF:QRT:close", "TIINGO", date(2026, 11, 18), _utc(date(2026, 11, 18), 23, 30), 44.0,
+            "QUARANTINED", None))
+# QOK: a quarantined row beside the SUCCESS row of 11-17 disagrees; it is
+# not a vintage, so the label is not ambiguous.
+_tiingo_closes("QOK", dict(zip(SESSIONS, (40.0, 40.0, 40.0, 40.0, 40.0, 41.0, 41.0, 42.0), strict=True)))
+RAW.append(("YF:QOK:close", "TIINGO", date(2026, 11, 17), _utc(date(2026, 11, 18), 1), 400.0, "QUARANTINED", None))
+# K: Kellanova's last session is 2025-12-11 (analysis.sector_map status), so
+# TIINGO rows after it are another listing's prices (tiingo_symbol_contract,
+# the rule behind cl_close's 35,223 retractions on griddb).
+_tiingo_closes("K", {d: 60.0 for d in SESSIONS})
 # UNK: only yfinance rows the writer marked capture_state UNKNOWN (griddb:
 # AMBR, AVLN, COYA, KLRA, UPB on 2026-11-23).
 for d in SESSIONS:
@@ -94,6 +121,9 @@ for d in SESSIONS:
                 {"capture_state": "UNKNOWN", "price_basis": "YF:UNK:close"}))
 # CL: Colgate's TIINGO closes as on griddb (11-13 99.67, 11-20 98.71).
 _tiingo_closes("CL", dict(zip(SESSIONS, (98.09, 97.90, 99.67, 100.99, 99.61, 98.85, 96.88, 98.71), strict=True)))
+# Crude under its own symbol (yfinance YF:CL=F); the CL option never reads it.
+RAW += [("YF:CL=F:close", "yfinance", d, _utc(_next(d), 0, 30), v, "SUCCESS", None)
+        for d, v in zip(SESSIONS, (85.0, 86.0, 88.92, 85.15, 84.98, 82.45, 82.92, 83.62), strict=True)]
 # cl_close = WTI crude in resolved_series, which the old read used (11-13
 # 88.92 -> 11-20 83.62: -5.96%).
 CRUDE = {date(2026, 11, 13): 88.92, date(2026, 11, 16): 85.15, date(2026, 11, 17): 84.98,
@@ -201,9 +231,8 @@ def test_cross_asset_verdicts_on_the_run_date(pg):
 
 
 def test_replay_is_fenced_at_run_date(pg):
-    # Dated 11-18: closes labelled after 11-18 and the 11-18 re-pull of
-    # 06:00 UTC 11-19 are unseen (seen, 11-18 would be ambiguous), and the
-    # journal state is GROWTH (11-17), not the later FRAGILE.
+    # Dated 11-18: closes labelled after 11-18 are unseen, and the journal
+    # state is GROWTH (11-17), not the later FRAGILE.
     m = _momentum(pg, "AAA", REPLAY)
     assert m.momentum == pytest.approx(97.0 / 100.0 - 1.0)
     assert (m.start, m.end) == (date(2026, 11, 11), date(2026, 11, 18))
@@ -217,6 +246,70 @@ def test_replay_is_fenced_at_run_date(pg):
     }
 
 
+def test_later_regime_does_not_lift_a_historical_veto(pg):
+    # The CALL veto decided on Friday 11-20 (FRAGILE, -5%) and on Monday 11-23
+    # stands although a later entry (11-24, GROWTH) would align the regime.
+    with pg.connect() as conn:
+        newest = conn.execute(text(
+            "SELECT inferred_state FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1")).scalar()
+    assert newest == "GROWTH"
+    for run_date in (FRIDAY, RUN):
+        assert _cross_asset(pg, "AAA", "CALL", run_date) == {
+            "status": "FAIL",
+            "reason": "Momentum (-5.00%, AAA close 2026-11-13 to 2026-11-20) and regime both contradict CALL",
+        }
+
+
+def test_revision_pulled_after_the_cutoff_is_unseen_then_ambiguous(pg):
+    # Reversal of a stored close: 11-18 is revised 97.0 -> 97.5 at 06:00 UTC
+    # 11-19. A run dated 11-18 never saw the revision; a later run sees two
+    # completed values for one session and does not pick one.
+    m = _momentum(pg, "REV", REPLAY)
+    assert m.momentum == pytest.approx(97.0 / 100.0 - 1.0)
+    assert _cross_asset(pg, "REV", "PUT") == {
+        "status": "SKIP",
+        "reason": "No momentum: completed REV close for 2026-11-18 is ambiguous (vintages disagree)",
+    }
+
+
+def test_path_reversal_inside_the_window_is_newest_over_first(pg):
+    # 100 -> 85 -> 101: the 5-session return is +1%, not the -15% trough.
+    assert _momentum(pg, "PATH").momentum == pytest.approx(0.01)
+
+
+def test_quarantined_rows_are_withdrawn(pg):
+    # A QUARANTINED row (the raw_series form of a retraction) is no close:
+    # the only 11-18 row of QRT leaves a hole; QOK's beside a SUCCESS row
+    # does not make that label ambiguous.
+    assert _cross_asset(pg, "QRT", "CALL") == {
+        "status": "SKIP",
+        "reason": "No momentum: no completed QRT close for 2026-11-18 (needs all 6 sessions 2026-11-13 to 2026-11-20)",
+    }
+    assert _momentum(pg, "QOK").momentum == pytest.approx(42.0 / 40.0 - 1.0)
+
+
+def test_another_listings_tiingo_rows_are_not_the_tickers(pg):
+    # K stopped trading 2025-12-11; TIINGO rows after that are another
+    # listing's prices (tiingo_symbol_contract), so K has no close at all.
+    assert _cross_asset(pg, "K", "CALL") == {
+        "status": "SKIP",
+        "reason": "No momentum: no completed K close from 2026-11-02 to 2026-11-23",
+    }
+
+
+def test_symbol_collision_cl_equity_vs_crude(pg):
+    # The option CL is Colgate: 98.71 / 99.67 = -0.96% (griddb's verdict on
+    # 2026-11-23). Crude reads only under its own symbol, CL=F (-5.96%);
+    # cl_close (crude, in resolved_series) was the old read and would FAIL
+    # the CALL.
+    assert _momentum(pg, "CL").momentum == pytest.approx(98.71 / 99.67 - 1.0)
+    assert _momentum(pg, "CL=F").momentum == pytest.approx(83.62 / 88.92 - 1.0)
+    assert _cross_asset(pg, "CL", "CALL") == {
+        "status": "PASS",
+        "reason": "Partial alignment — momentum=-0.96% (CL close 2026-11-13 to 2026-11-20), news_aligned=False",
+    }
+
+
 def test_split_is_rebased_not_read_as_a_crash(pg):
     # 105 against 200 / 2: +5%, not -47.5%.
     m = _momentum(pg, "SPL")
@@ -227,24 +320,21 @@ def test_split_is_rebased_not_read_as_a_crash(pg):
     }
 
 
-def test_cl_reads_colgate_not_crude(pg):
-    # Colgate 98.71 / 99.67 = -0.96% (griddb's verdict on 2026-11-23); the
-    # crude feature cl_close would read -5.96% and FAIL the CALL.
-    assert _cross_asset(pg, "CL", "CALL") == {
-        "status": "PASS",
-        "reason": "Partial alignment — momentum=-0.96% (CL close 2026-11-13 to 2026-11-20), news_aligned=False",
-    }
+_WINDOW = "(needs all 6 sessions 2026-11-13 to 2026-11-20)"
 
 
 @pytest.mark.parametrize(("ticker", "reason"), [
     ("AMB", "No momentum: completed AMB close for 2026-11-20 is ambiguous (vintages disagree)"),
     ("STL", "No momentum: newest completed STL close is 2026-11-18, before the fresh window from 2026-11-20"),
-    ("GAP", "No momentum: no completed GAP close for 2026-11-13, 5 sessions before 2026-11-20"),
+    ("GAP", f"No momentum: no completed GAP close for 2026-11-13 {_WINDOW}"),
+    ("SPARSE", f"No momentum: no completed SPARSE close for 2026-11-17 {_WINDOW}"),
+    ("TWO", "No momentum: no completed TWO close for 2026-11-16, 2026-11-17, 2026-11-18, 2026-11-19 "
+            f"{_WINDOW}"),
     ("UNK", "No momentum: no completed UNK close from 2026-11-02 to 2026-11-23"),
     ("NONE", "No momentum: no completed NONE close from 2026-11-02 to 2026-11-23"),
 ])
 @pytest.mark.parametrize("direction", ["CALL", "PUT"])
-def test_no_measurable_momentum_is_skip_not_zero(pg, ticker, reason, direction):
+def test_missing_or_sparse_momentum_is_skip_not_zero(pg, ticker, reason, direction):
     assert _cross_asset(pg, ticker, direction) == {"status": "SKIP", "reason": reason}
 
 

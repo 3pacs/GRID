@@ -167,11 +167,21 @@ def underlying_momentum(conn: Any, ticker: str, run_date: date) -> UnderlyingMom
     completed vintages disagree is ambiguous and is not used.
 
     The newest completed close must fall in the fresh window
-    (``min_fresh_snap_date(run_date)`` on), and a completed close must exist
-    for the session exactly ``MOMENTUM_SESSIONS`` sessions before it. Both
-    closes are put on the newest close's share basis with the recorded
-    splits (``store.observations.price_in_basis``); dividends are not
-    adjusted. Anything missing gives ``momentum=None`` and a reason, never 0.
+    (``min_fresh_snap_date(run_date)`` on), and every one of the
+    ``MOMENTUM_SESSIONS + 1`` consecutive sessions ending there (market
+    calendar) needs its own valid, unambiguous completed close. The closes
+    are put on the newest close's share basis with the recorded splits
+    (``store.observations.price_in_basis``); dividends are not adjusted.
+    Momentum is the newest close over the first. Anything missing gives
+    ``momentum=None`` and a reason, never 0.
+
+    Retractions: this reads ``raw_series``, not ``resolved_series``, so
+    ``resolved_series_retractions`` does not key it. The rows such a
+    retraction withdraws are withdrawn here at the source: QUARANTINED rows
+    are not SUCCESS, and TIINGO rows of another listing
+    (``tiingo_symbol_contract``, the rule behind cl_close's 35,223
+    retractions) are dropped by ``read_completed_closes``. A later vintage
+    that revises a close makes that label ambiguous, so the window SKIPs.
     """
     from evaluation.prices import COMPLETED_CLOSE_SOURCES, us_listed_close_boundary
     from ingestion.market_calendar import trading_days_between
@@ -200,15 +210,23 @@ def underlying_momentum(conn: Any, ticker: str, run_date: date) -> UnderlyingMom
     if len(sessions) <= MOMENTUM_SESSIONS or sessions[-1] != end:
         return UnderlyingMomentum(
             None, None, end, f"fewer than {MOMENTUM_SESSIONS + 1} sessions to {end}")
-    base = sessions[-1 - MOMENTUM_SESSIONS]
-    if base not in closes:
+    # Every one of the MOMENTUM_SESSIONS + 1 consecutive sessions needs its own
+    # valid close: two end points with a hole between them are not a
+    # measured 5-session path (Codex review 6030034930).
+    window = sessions[-1 - MOMENTUM_SESSIONS:]
+    base = window[0]
+    missing = [d for d in window if d not in closes]
+    if missing:
         return UnderlyingMomentum(
             None, base, end,
-            f"no completed {symbol} close for {base}, {MOMENTUM_SESSIONS} sessions before {end}")
-    for d in (base, end):
-        if closes[d].ambiguous:
-            return UnderlyingMomentum(
-                None, base, end, f"completed {symbol} close for {d} is ambiguous (vintages disagree)")
+            f"no completed {symbol} close for {', '.join(str(d) for d in missing)}"
+            f" (needs all {len(window)} sessions {base} to {end})")
+    ambiguous = [d for d in window if closes[d].ambiguous]
+    if ambiguous:
+        return UnderlyingMomentum(
+            None, base, end,
+            f"completed {symbol} close for {', '.join(str(d) for d in ambiguous)}"
+            " is ambiguous (vintages disagree)")
     splits = read_splits(conn, symbol, start=base, as_of_ts=cutoff)
 
     def _on_end_basis(d: date) -> float:
@@ -216,11 +234,11 @@ def underlying_momentum(conn: Any, ticker: str, run_date: date) -> UnderlyingMom
         return price_in_basis(obs.value, obs.obs_date, basis_date=end, splits=splits,
                               source=obs.source, pull_timestamp=obs.pull_timestamp)
 
-    latest, older = _on_end_basis(end), _on_end_basis(base)
-    if not (math.isfinite(latest) and math.isfinite(older) and older > 0):
+    path = [_on_end_basis(d) for d in window]
+    if not all(math.isfinite(p) and p > 0 for p in path):
         return UnderlyingMomentum(None, base, end, f"{symbol} close is not a positive price")
     return UnderlyingMomentum(
-        latest / older - 1.0, base, end, f"{symbol} close {base} to {end}")
+        path[-1] / path[0] - 1.0, base, end, f"{symbol} close {base} to {end}")
 
 # Default payout ratio when no explicit R:R is supplied (rule-of-thumb for
 # options tickets: 3:1 target:risk).
