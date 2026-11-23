@@ -1255,7 +1255,9 @@ def _get_pullers_for_group(
         #    not in the plan (HTTP 403 to 2026-11-10). The "30 of 30 tickers
         #    failed" runs after that were the puller's own invalid sort=volume
         #    (HTTP 400), fixed 2026-11-23; the key now gets the snapshot.
-        #    Hermes's stale-source repair still runs the puller (interval 24 h).
+        #    Hermes's stale-source repair still calls the puller (interval 24 h),
+        #    but pull() writes nothing while POLYGON_OPTIONS_PULL_ENABLED is
+        #    off (the default; rollout is a separate decision, GRID#1401).
         #    Only this registration is retired: gex and research read Polygon
         #    minute history through their own code paths, and the module stays.
         # NASA FIRMS — active fire/thermal anomaly detection (daily)
