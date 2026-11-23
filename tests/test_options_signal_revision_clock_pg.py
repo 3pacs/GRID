@@ -161,11 +161,18 @@ def test_a_value_revised_after_the_clock_is_unavailable_not_replaced(engine, mon
 
     _upsert(engine, _params(prior, 1.25))
     _set_created_at(engine, prior, datetime.combine(prior, datetime.min.time(), timezone.utc) + timedelta(hours=21))
-    _upsert(engine, _params(today, 0.45))
-    _set_created_at(engine, today, now - timedelta(hours=3))  # captured before the clock
-    _upsert(engine, _params(today, 0.40))  # revised in place now, after the clock below
+    # Every clock stays on today's UTC date: a decision clock that crossed
+    # midnight would make today's row future-dated and the test would pass
+    # or fail with the time of day (it failed at 00:10Z on 11-23).
+    midnight = datetime.combine(today, datetime.min.time(), timezone.utc)
+    if now - midnight < timedelta(seconds=4):
+        pytest.skip("too close to 00:00 UTC to place a same-day decision clock")
+    first_capture = midnight + (now - midnight) / 4
+    decision = midnight + (now - midnight) / 2  # after the first capture, before the revision
 
-    decision = now - timedelta(hours=1)  # after the first capture, before the revision
+    _upsert(engine, _params(today, 0.45))
+    _set_created_at(engine, today, first_capture)  # captured before the clock
+    _upsert(engine, _params(today, 0.40))  # revised in place now, after the clock
     _freeze_scorer_clock(monkeypatch, ts, decision)
     monkeypatch.setattr(ts, "VISIBLE_DAILY_SIGNALS", "options_daily_signals")
 

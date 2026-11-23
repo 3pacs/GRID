@@ -57,6 +57,60 @@ def _safe_json(data: Any) -> str:
 # Keys a producer adds to its decision_journal ``contradiction_flags`` to name
 # the analytical_snapshots row behind the decision. They are provenance, not
 # contradictions: display paths strip them with ``strip_binding_flags``.
+class InvalidFeatureFilter(ValueError):
+    """A producer payload declares a feature filter that readers cannot trust."""
+
+
+_ELIGIBLE_FILTER_KEYS = ("eligible_feature_ids", "eligible_features")
+_EXCLUDED_FILTER_KEYS = ("ineligible_features", "excluded_features")
+
+
+def producer_feature_filters(payload: dict[str, Any]) -> tuple[list[Any] | None, list[Any]]:
+    """The eligibility and exclusion filters a regime producer payload declares.
+
+    Returns ``(eligible, excluded)``:
+
+    * ``eligible`` is None only when neither ``eligible_feature_ids`` nor
+      ``eligible_features`` is present. A present empty list means no feature
+      is eligible; it is never read as "no filter". When both keys are
+      present they must name the same ids.
+    * ``excluded`` is the union of ``ineligible_features`` and
+      ``excluded_features`` (a dict contributes its keys).
+
+    Raises ``InvalidFeatureFilter`` when a present filter is not a list (null,
+    a string, a number, or a dict for eligibility) or the two eligibility keys
+    disagree. The market briefing and the daily publication packet both count
+    a producer's eligible features through this rule, so they count alike.
+    """
+    eligible: list[Any] | None = None
+    for key in _ELIGIBLE_FILTER_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if not isinstance(value, (list, tuple, set)):
+            raise InvalidFeatureFilter(f"{key} is present but not a list")
+        items = list(value)
+        if eligible is not None and _filter_identity(items) != _filter_identity(eligible):
+            raise InvalidFeatureFilter("eligible_feature_ids and eligible_features disagree")
+        eligible = items
+    excluded: list[Any] = []
+    for key in _EXCLUDED_FILTER_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, dict):
+            excluded.extend(value.keys())
+        elif isinstance(value, (list, tuple, set)):
+            excluded.extend(value)
+        else:
+            raise InvalidFeatureFilter(f"{key} is present but not a list")
+    return eligible, excluded
+
+
+def _filter_identity(items: list[Any]) -> set[str]:
+    return {json.dumps(item, sort_keys=True, default=str) for item in items}
+
+
 REGIME_BINDING_FLAG_KEYS: frozenset[str] = frozenset(
     {"snapshot_id", "snapshot_hash", "regime_run_tag"}
 )

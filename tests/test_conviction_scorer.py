@@ -167,49 +167,44 @@ def test_score_setup_bucket_maxes_on_extreme_macro_conditions(
     assert any("[EXTREME]" in signal for signal in result.signals)
 
 
-def test_score_company_buckets_growth_profit_buyback_and_cash(
+def test_score_company_returns_none_without_xbrl_writer() -> None:
+    """No XBRL:* writer exists in raw_series, so COMPANY returns None (unavailable)."""
+    conn = _RecordingConn()
+    assert cs.score_company(conn, "ABC", as_of_date=date(2026, 5, 13)) is None
+    assert conn.calls == []
+
+
+def test_score_smart_money_scores_reported_ps_form4_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = {
-        "XBRL:ABC:Revenues": _series([100.0, 120.0]),
-        "XBRL:ABC:EarningsPerShareDiluted": _series([-1.0, 1.0]),
-        "XBRL:ABC:CommonStockSharesOutstanding": _series([100.0, 90.0]),
-        "XBRL:ABC:CashAndCashEquivalentsAtCarryingValue": _series([60.0]),
-        "XBRL:ABC:Liabilities": _series([100.0]),
-    }
+    calls: list[tuple[str, date | None]] = []
 
-    def fake_raw_series(_conn: Any, series_id: str, *_args: Any, **_kwargs: Any) -> pd.Series:
-        return data.get(series_id, pd.Series(dtype=float))
+    def fake_window(_conn: Any, ticker: str, as_of_date: date | None) -> cs.Form4PSWindow:
+        calls.append((ticker, as_of_date))
+        return cs.Form4PSWindow(
+            start=date(2026, 2, 12), end=date(2026, 5, 12), txns=3.0, shares_valid=3.0,
+            priced=3.0, net_shares=12_000.0, net_value=600_000.0,
+        )
 
-    monkeypatch.setattr(cs, "_load_raw_series", fake_raw_series)
-
-    result = cs.score_company(object(), "ABC", as_of_date=date(2026, 5, 13))
-
-    assert result.name == "COMPANY"
-    assert result.score == 15
-    assert result.trust == pytest.approx(0.90)
-    assert result.data_available is True
-
-
-def test_score_smart_money_buckets_insider_surge_and_inflow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    data = {
-        "SEC_FORM4:ABC:monthly": _series([1.0, 1.0, 1.0, 3.0, 3.0, 3.0]),
-        "INST_FLOW:ABC:%": _series([-1.0, 2.0]),
-    }
-
-    def fake_raw_series(_conn: Any, series_id: str, *_args: Any, **_kwargs: Any) -> pd.Series:
-        return data.get(series_id, pd.Series(dtype=float))
-
-    monkeypatch.setattr(cs, "_load_raw_series", fake_raw_series)
+    monkeypatch.setattr(cs, "_form4_ps_window", fake_window)
 
     result = cs.score_smart_money(object(), "ABC", as_of_date=date(2026, 5, 13))
 
+    assert calls == [("ABC", date(2026, 5, 13))]
     assert result.name == "SMART_MONEY"
-    assert result.score == 10
-    assert "Institutional net inflow" in result.signals
+    assert result.score == 5
+    assert (
+        "Insider reported P/S (non-derivative, venue unknown) net buy $600,000 "
+        "(verified 2026-02-12..2026-05-12, 90d of 90d)"
+    ) in result.signals
+    assert result.trust == 0.85
+    assert any("Institutional flow unavailable" in s for s in result.signals)
     assert result.data_available is True
+
+
+def test_form4_ps_fields_never_include_all_code_or_legacy_series() -> None:
+    assert not {"NET_SHARES", "NET_VALUE", "TXN_COUNT"} & set(cs._FORM4_PS_FIELDS)
+    assert not any(f.startswith("OPEN_MKT") for f in cs._FORM4_PS_FIELDS)
 
 
 def test_score_crowd_buckets_short_ftd_and_put_call_extremes(
