@@ -267,10 +267,18 @@ def test_score_crowd_buckets_ftd_and_put_call_extremes(
         "put_call_ratio": _obs("put_call_ratio", [1.30]),
     })
 
+    checked: list[tuple[str, str, int]] = []
+
+    def fake_identity(_conn: Any, series_id: str, symbol: str, _as_of: date, selected: Any) -> None:
+        checked.append((series_id, symbol, len(selected)))
+
+    monkeypatch.setattr(cs, "_ftd_identity_break", fake_identity)
+
     result = cs.score_crowd(
         object(), "ABC", as_of_date=date(2026, 5, 13), ftd_series_ids={"ABC": (ftd_id,)},
     )
 
+    assert checked == [(ftd_id, "ABC", 40)]  # every selected balance goes to the identity check
     assert result.name == "CROWD"
     assert result.score == 8  # FTD surge 5 + PCR 3; short interest scores nothing
     assert result.score == cs.LAYER_ATTAINABLE_SCORE["CROWD"]
@@ -295,22 +303,26 @@ def test_score_crowd_reads_nothing_for_short_interest(
     assert cs.SHORT_INTEREST_UNAVAILABLE in result.signals
 
 
-def test_score_narrative_buckets_news_surge_and_reports_wiki_gdelt_unavailable(
+def test_score_narrative_shows_news_and_scores_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sid = "TIINGO_NEWS:ABC:daily_count"
-    # Trailing 7-day counts: 7 (1/day) for 60 days, then 49 (7/day).
-    reads = _install_known(monkeypatch, {sid: _obs(sid, [7.0] * 60 + [49.0] * 31)})
+    # A jump in the trailing 7-day count (7 -> 49) is shown and never scored.
+    reads = _install_known(monkeypatch, {sid: _obs(sid, [7.0] * 6 + [49.0])})
     monkeypatch.setattr(cs, "_load_latest", lambda *_a, **_k: pytest.fail("wiki/GDELT must not be read"))
 
     result = cs.score_narrative(object(), "ABC", as_of_date=date(2026, 5, 13))
 
     assert result.name == "NARRATIVE"
-    assert result.score == 5 == cs.LAYER_ATTAINABLE_SCORE["NARRATIVE"]
-    assert any("News volume surging (7.0/day vs 1.0/day" in signal for signal in result.signals)
-    assert cs.WIKI_UNAVAILABLE in result.signals and cs.GDELT_UNAVAILABLE in result.signals
-    assert result.data_available is True
-    assert reads == [(sid, "tiingo_news", 90)]
+    assert result.score == 0 == cs.LAYER_ATTAINABLE_SCORE["NARRATIVE"]
+    assert result.data_available is False
+    assert result.signals == (
+        cs.NEWS_NOT_SCORED,
+        "Tiingo news, not scored: 49 articles returned for the 7 days to 2026-05-13",
+        cs.WIKI_UNAVAILABLE,
+        cs.GDELT_UNAVAILABLE,
+    )
+    assert reads == [(sid, "tiingo_news", 7)]
 
 
 def test_score_flow_buckets_volatility_and_equity_put_call(
@@ -470,6 +482,152 @@ def test_score_crowd_ftd_fails_closed(setup: str, expected: str) -> None:
     assert any(s.startswith("Total put/call unavailable") for s in result.signals)
 
 
+# ── FTD identity: the scored balance must be filed under the ticker ──────
+#
+# The symbol lookup finds a CUSIP from any row filed under the symbol, while
+# the balances are read from the CUSIP series. Codex HOLD on #1395 f821c50c:
+# old A/C rows plus newer B/C rows (a symbol change, or a corrected filing)
+# must not let A score B's balance. Every row of the series in the read
+# bounds has to be filed under the ticker, and every selected vintage has to
+# be one of those rows.
+
+_CUSIP = "30303M102"
+_FTD_SID = f"sec:ftd_balance:{_CUSIP}"
+_SURGE = [5_000.0] * 30 + [20_000.0] * 10  # FTD surge: 5 points when it scores
+
+
+def _ftd_result(db: _RawDB, ticker: str) -> cs.LayerResult:
+    with db.engine.connect() as conn:
+        return cs.score_crowd(conn, ticker, as_of_date=_AS_OF)
+
+
+def test_ftd_symbol_change_on_one_cusip_abstains_for_both_symbols() -> None:
+    db = _RawDB()
+    # One CUSIP: filed as FB for 40 dates, then as META for the newest 10.
+    db.ftd(_CUSIP, "FB", _SURGE, _AS_OF - timedelta(days=20))
+    db.ftd(_CUSIP, "META", [90_000.0] * 10, _AS_OF - timedelta(days=10))
+
+    with db.engine.connect() as conn:
+        ids = cs._ftd_series_ids(conn, ["FB", "META"], _AS_OF)
+    assert ids == {"FB": (_FTD_SID,), "META": (_FTD_SID,)}
+
+    fb, meta = _ftd_result(db, "FB"), _ftd_result(db, "META")
+
+    # Before the fix FB scored META's fresh 90,000 sh balance as its own.
+    assert (fb.score, fb.data_available) == (0, False)
+    assert (meta.score, meta.data_available) == (0, False)
+    assert f"FTD not scored ({_FTD_SID} was also filed as META in the window)" in fb.signals
+    assert f"FTD not scored ({_FTD_SID} was also filed as FB in the window)" in meta.signals
+
+
+@pytest.mark.parametrize(
+    ("pulled", "scores"),
+    [
+        # A corrected vintage of the newest date, filed under another symbol.
+        # Known by the end of the as-of date: the identity is broken.
+        (datetime.combine(_AS_OF, datetime.min.time()) + timedelta(hours=23, minutes=59), False),
+        # Pulled at the end of the as-of date (UTC) or later: not known yet,
+        # so it neither breaks the identity nor replaces the balance.
+        (datetime.combine(_AS_OF + timedelta(days=1), datetime.min.time()), True),
+        (_evening(_AS_OF + timedelta(days=3)), True),
+    ],
+    ids=["known", "at-cutoff", "after-cutoff"],
+)
+def test_ftd_corrected_vintage_breaks_identity_only_once_known(pulled: datetime, scores: bool) -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    db.add(_FTD_SID, _AS_OF - timedelta(days=10), 1.0, source="SEC_FTD", symbol="MVRS", pulled=pulled)
+
+    result = _ftd_result(db, "META")
+
+    if scores:
+        assert (result.score, result.data_available) == (5, True)
+        assert any("FTD balance surging (20,000 vs 5,000 sh" in s for s in result.signals), result.signals
+    else:
+        assert (result.score, result.data_available) == (0, False)
+        assert f"FTD not scored ({_FTD_SID} was also filed as MVRS in the window)" in result.signals
+
+
+def test_ftd_identity_is_judged_on_the_read_window_only() -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    # Another symbol settled before the window, after the as-of date, from
+    # another source, or on a failed pull: none of them is a row the read can
+    # select, so none breaks the identity.
+    db.add(_FTD_SID, _AS_OF - timedelta(days=cs.FTD_WINDOW_DAYS + 1), 1.0, source="SEC_FTD", symbol="FB")
+    db.add(_FTD_SID, _AS_OF + timedelta(days=1), 1.0, source="SEC_FTD", symbol="FB",
+           pulled=_evening(_AS_OF - timedelta(days=1)))
+    db.add(_FTD_SID, _AS_OF - timedelta(days=5), 1.0, source="SEC_EDGAR", symbol="FB")
+    db.add(_FTD_SID, _AS_OF - timedelta(days=5), 0.0, source="SEC_FTD", symbol="FB", status="FAILED")
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (5, True)
+    # On the first day of the window it does.
+    db.add(_FTD_SID, _AS_OF - timedelta(days=cs.FTD_WINDOW_DAYS), 1.0, source="SEC_FTD", symbol="FB")
+    assert _ftd_result(db, "META").data_available is False
+
+
+def test_ftd_row_without_a_symbol_breaks_identity() -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    db.add(_FTD_SID, _AS_OF - timedelta(days=30), 7.0, source="SEC_FTD", symbol=None)
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (0, False)
+    assert f"FTD not scored ({_FTD_SID} was also filed as no symbol in the window)" in result.signals
+
+
+def test_ftd_selected_vintage_must_be_a_row_on_file_under_the_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    real_read = cs._read_known
+
+    def read_with_a_vintage_not_on_file(conn: Any, series_id: str, source: str, as_of: date, days: int) -> list[Any]:
+        obs = real_read(conn, series_id, source, as_of, days)
+        if series_id != _FTD_SID:
+            return obs
+        stray = cs.Observation(_FTD_SID, obs[-1].obs_date, 90_000.0, _evening(_AS_OF - timedelta(days=2)), "SEC_FTD")
+        return [*obs[:-1], stray]
+
+    monkeypatch.setattr(cs, "_read_known", read_with_a_vintage_not_on_file)
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (0, False)
+    assert (
+        f"FTD not scored (the {_AS_OF - timedelta(days=10)} balance read from {_FTD_SID} "
+        "is not on file under META)"
+    ) in result.signals
+
+
+def test_ftd_row_pulled_between_the_read_and_the_check_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As of today, a pull can land after the balances are read. The identity
+    # check runs after the read, so the new row is judged, not skipped.
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    real_read = cs._read_known
+
+    def read_then_a_pull_lands(conn: Any, series_id: str, source: str, as_of: date, days: int) -> list[Any]:
+        obs = real_read(conn, series_id, source, as_of, days)
+        if series_id == _FTD_SID:
+            db.add(_FTD_SID, _AS_OF - timedelta(days=10), 1.0, source="SEC_FTD", symbol="MVRS",
+                   pulled=_evening(_AS_OF) - timedelta(hours=1))
+        return obs
+
+    monkeypatch.setattr(cs, "_read_known", read_then_a_pull_lands)
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (0, False)
+    assert f"FTD not scored ({_FTD_SID} was also filed as MVRS in the window)" in result.signals
+
+
 @pytest.mark.parametrize("ticker", ["GOLD", "BTC"])
 def test_symbol_keyed_inputs_skip_a_ticker_whose_panel_is_another_instrument(ticker: str) -> None:
     # gold_full is gold futures and btc_full Binance BTCUSDT; SEC and Tiingo
@@ -496,39 +654,28 @@ def _news_db(values: list[float], end: date = _AS_OF) -> _RawDB:
 
 
 @pytest.mark.parametrize(
-    ("values", "end", "score", "signal"),
+    ("values", "signal"),
     [
-        # Trailing 7-day counts: 7 (1/day) for the oldest 30 days, then 21 (3/day).
-        ([7.0] * 30 + [21.0] * 61, _AS_OF, 5.0, "News volume surging (3.0/day vs 1.0/day"),
-        # 3/day is not above the moderate bar (the old rule read 21 as 21/day).
-        ([21.0] * 91, _AS_OF, 0.0, "Light news coverage (3.0/day"),
-        # A value at the fetch cap is a lower bound: moderate, never a surge
-        # off a capped baseline.
-        ([50.0] * 91, _AS_OF, 2.0, "Moderate news coverage (>=7.1/day"),
-        # Fewer than a week of baseline pulls: no surge test.
-        ([7.0] * 6 + [None] * 24 + [49.0] * 61, _AS_OF, 2.0, "Moderate news coverage (7.0/day"),
+        ([7.0, 21.0], "Tiingo news, not scored: 21 articles returned for the 7 days to 2026-11-20"),
+        # A value at the fetch cap is a lower bound.
+        ([49.0, 50.0], "Tiingo news, not scored: >=50 articles returned for the 7 days to 2026-11-20"),
     ],
-    ids=["surge", "units", "capped", "thin-baseline"],
+    ids=["count", "capped"],
 )
-def test_score_narrative_reads_tiingo_counts_as_trailing_7_day_totals(
-    values: list[float | None], end: date, score: float, signal: str,
+def test_score_narrative_shows_the_newest_tiingo_count_and_never_scores(
+    values: list[float], signal: str,
 ) -> None:
-    db = _RawDB()
-    first = end - timedelta(days=len(values) - 1)
-    for i, v in enumerate(values):
-        if v is not None:
-            db.add("TIINGO_NEWS:SPY:daily_count", first + timedelta(days=i), v, source="tiingo_news")
+    db = _news_db(values)
 
     with db.engine.connect() as conn:
         result = cs.score_narrative(conn, "SPY", as_of_date=_AS_OF)
 
-    assert result.score == score
-    assert result.data_available is True
-    assert any(s.startswith(signal) for s in result.signals), result.signals
+    assert (result.score, result.data_available) == (0, False)
+    assert result.signals[:2] == (cs.NEWS_NOT_SCORED, signal)
 
 
 def test_score_narrative_ignores_stale_and_unpulled_news_counts() -> None:
-    db = _news_db([49.0] * 10, end=_AS_OF - timedelta(days=cs.NEWS_FRESH_DAYS + 1))
+    db = _news_db([49.0] * 10, end=_AS_OF - timedelta(days=cs.NEWS_TRAILING_DAYS + 1))
     db.add("TIINGO_NEWS:SPY:daily_count", _AS_OF, 49.0, source="tiingo_news",
            pulled=_evening(_AS_OF + timedelta(days=1)))
     # The legacy id carries nothing any more.
@@ -537,9 +684,8 @@ def test_score_narrative_ignores_stale_and_unpulled_news_counts() -> None:
     with db.engine.connect() as conn:
         result = cs.score_narrative(conn, "SPY", as_of_date=_AS_OF)
 
-    assert result.score == 0
-    assert result.data_available is False
-    assert any(s.startswith("No fresh Tiingo news count for SPY") for s in result.signals)
+    assert (result.score, result.data_available) == (0, False)
+    assert result.signals[1] == "No Tiingo news count for SPY in the 7 days to 2026-11-20"
 
 
 def test_score_flow_counts_a_quiet_tape_as_measured() -> None:

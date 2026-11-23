@@ -131,7 +131,32 @@ def _record_lines(rec: dict) -> tuple[list[str], list[str]]:
     ns = rec.get("news_shock") or {}
     if ns:
         lines.append(f"news uncertainty ({ns.get('obs_date')}): {ns.get('kind')}; attribution {ns.get('news_attribution')}")
+    pr = rec.get("policy_response") or {}
+    if pr:
+        lines.append(_policy_line(pr))
     return lines, notable
+
+
+def _policy_line(pr: dict) -> str:
+    """market-state/3's policy_response (the Fed put composite): descriptive research only, so the line says so."""
+    head = f"policy response ({pr.get('rule')}, descriptive research only, decides nothing): "
+    if pr.get("status") != "ok":
+        return head + f"unknown ({pr.get('reason')})"
+    c = pr.get("controls") or {}
+    end = ((pr.get("windows") or {}).get("vix") or {}).get("end_close")
+    text_ = (f"{pr.get('label')}, VIX z {c.get('vix_only_z'):+.2f}, front-end easing z "
+             f"{c.get('front_end_easing_z'):+.2f}" + (f" (through the {end} close)" if end else ""))
+    nm = pr.get("next_meeting") or {}
+    if nm.get("status") == "ok":
+        text_ += f"; next meeting {str(nm.get('meeting_at'))[:10]} expected upper {nm.get('expected_upper'):.3f}%"
+        odds = nm.get("odds")
+        if odds:
+            text_ += f" (hike {odds['hike']:.0%}, hold {odds['hold']:.0%}, cut {odds['cut']:.0%})"
+        elif nm.get("odds_withheld"):
+            text_ += f" (odds withheld: {nm['odds_withheld']})"
+        avail = (nm.get("snapshot") or {}).get("availability") or "not recorded"
+        text_ += f"; Kalshi availability: {avail}, not exact point-in-time evidence"
+    return head + text_
 
 
 def _provisional(row: Any, session: SessionTimes, as_of: datetime) -> tuple[list[str], dict | None, list[str]]:

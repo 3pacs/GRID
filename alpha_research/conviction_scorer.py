@@ -12,15 +12,17 @@ Layers (weight; inputs read today, then inputs reported unavailable):
   2. COMPANY    (15 pts) — unavailable: no XBRL:* writer
   3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4); institutional flow unavailable
   4. CROWD      (15 pts) — SEC fails-to-deliver balance, total put/call; short interest unavailable
-  5. NARRATIVE  (10 pts) — Tiingo news count; wiki attention and GDELT unavailable
+  5. NARRATIVE  (10 pts) — nothing scored: Tiingo news count shown, not scored; wiki and GDELT unavailable
   6. FLOW       (15 pts) — Volatility spike, equity put/call (market-wide); unusual options not scored
   7. CONFIRM    (10 pts) — Price momentum turning, higher low formed
 
-CROWD and NARRATIVE read raw_series through
+CROWD, NARRATIVE and FLOW's equity put/call read raw_series through
 store.observations.read_window_known_at with each writer's own source: a row
 counts only if it was pulled by the end of the as-of date (UTC), and only the
-latest vintage pulled by then. See "CROWD / NARRATIVE / FLOW inputs" below for
-the per-input measurements (griddb, 2026-11-23).
+latest vintage pulled by then. An FTD balance scores only when every row of
+its CUSIP series in the read window was filed under the ticker, including the
+selected vintages (see _score_ftd). See "CROWD / NARRATIVE / FLOW inputs"
+below for the per-input measurements (griddb, 2026-11-23).
 
 Each layer returns (score, max_possible, trust_weight, signals[]).
 Final score = sum(score * trust) / sum(max * full_trust) * 100, where
@@ -40,12 +42,13 @@ minimum is at or below anything it could have measured. score_high is the
 same with every unknown at its best attainable value (LAYER_ATTAINABLE_SCORE).
 
 CONVICTION (85) and FIRE (70) are dormant: with the current scorers the best
-attainable total is 68 (42.70 of 63.15), so the ladder tops out at SCALE. It
+attainable total is 64 (40.20 of 63.15), so the ladder tops out at SCALE. It
 was 81 (50.95) while CROWD, NARRATIVE and FLOW still counted points from inputs
-that no live writer feeds (short interest, wiki, GDELT, equity put/call) or
-that fire for every covered ticker (unusual options). In production those
-inputs had added only wiki's +2, to GOLD and SP500, from series last updated
-2026-04-03. It was 65 until the CBOE puller began storing the equity put/call
+that no live writer feeds (short interest, wiki, GDELT, equity put/call), that
+fire for every covered ticker (unusual options), or whose counts cannot tell
+an empty fetch from a missing one (Tiingo news). In production those inputs
+had added only wiki's +2, to GOLD and SP500, from series last updated
+2026-04-03. It was 61 until the CBOE puller began storing the equity put/call
 ratio (equity_put_call_ratio, 2026-11-23), which FLOW reads again. Each report
 says so (max_attainable_score, dormant_alert_levels); raising it needs a
 separately approved recalibration, not a quiet threshold change.
@@ -106,7 +109,7 @@ class ConvictionReport:
     score_low: int | None = None
     score_high: int | None = None
     # Best total the current scorers can produce over the present layers,
-    # and the alert levels it cannot reach (CONVICTION and FIRE while it is 68).
+    # and the alert levels it cannot reach (CONVICTION and FIRE while it is 64).
     max_attainable_score: int | None = None
     dormant_alert_levels: tuple[str, ...] = ()
 
@@ -264,12 +267,12 @@ LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
 # SMART_MONEY goes below zero (the Form 4 sell cap, -2); the others top out
 # where their scored components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4,
 # SMART_MONEY the +5 strong-buy tier, CROWD 5 (FTD) + 3 (put/call), NARRATIVE
-# 5 (news), FLOW 5 (volatility) + 3 (equity put/call), CONFIRM 3+4+3. The
-# inputs reported unavailable score nothing, so they add nothing here (CROWD
-# was 13 with short interest, NARRATIVE 8 with wiki and GDELT, FLOW 13 with
-# unusual options). They bound what an unknown could have been (score_low /
-# score_high) and which alert levels are reachable at all; max_score stays the
-# weight.
+# 0 (news is descriptive), FLOW 5 (volatility) + 3 (equity put/call), CONFIRM
+# 3+4+3. The inputs reported unavailable or not scored score nothing, so they
+# add nothing here (CROWD was 13 with short interest, NARRATIVE 8 with news,
+# wiki and GDELT, FLOW 13 with unusual options). They bound what an unknown
+# could have been (score_low / score_high) and which alert levels are
+# reachable at all; max_score stays the weight.
 LAYER_MIN_SCORE: Mapping[str, float] = MappingProxyType({
     "SETUP": 0.0,
     "COMPANY": 0.0,
@@ -284,7 +287,7 @@ LAYER_ATTAINABLE_SCORE: Mapping[str, float] = MappingProxyType({
     "COMPANY": 15.0,
     "SMART_MONEY": 5.0,
     "CROWD": 8.0,
-    "NARRATIVE": 5.0,
+    "NARRATIVE": 0.0,
     "FLOW": 8.0,
     "CONFIRM": 10.0,
 })
@@ -740,6 +743,14 @@ WHALE_NOT_SCORED = (
     "Unusual options activity not scored (the WHALE:* detector flags every covered "
     "ticker every day, so a flag is not unusual)"
 )
+# Read and shown, never scored (Codex HOLD on #1395 f821c50c): the writer
+# stores a count only when a fetch returns articles, so an empty fetch and a
+# failed or skipped one look alike; it counts every article returned, repeats
+# included; and each day's count covers an overlapping trailing 7 days.
+NEWS_NOT_SCORED = (
+    "News count not scored (Tiingo stores no row for an empty fetch, counts repeated "
+    "articles, and each count overlaps the last 7 days)"
+)
 
 # CROWD: SEC fails-to-deliver balances (ingestion/altdata/sec_ftd.py).
 # Each row is the outstanding balance on a settlement date, published about
@@ -752,6 +763,11 @@ FTD_WINDOW_DAYS = 90
 # Newest balance must settle within this many days of the as-of date: the
 # normal publication lag is up to ~31 days, plus pull cadence.
 FTD_FRESH_DAYS = 45
+# Both queries use the bounds _read_known applies to the balances it selects:
+# SUCCESS rows of the writer's source, settled in [as_of - FTD_WINDOW_DAYS,
+# as_of], pulled before the end of as_of's UTC day (pull_timestamp is
+# TIMESTAMPTZ, so this is read_window_known_at's pulled-by rule).
+# Symbol -> CUSIP series: one batch per scan.
 _FTD_IDS_SQL = text("""
     SELECT r.raw_payload ->> 'symbol' AS symbol, r.series_id
     FROM raw_series r
@@ -765,6 +781,19 @@ _FTD_IDS_SQL = text("""
       AND r.raw_payload ->> 'symbol' IN :symbols
     GROUP BY 1, 2
 """).bindparams(bindparam("symbols", expanding=True))
+# CUSIP series -> the symbol on each of its rows, run after the balances are
+# read so every selected vintage is already on file (~10 ms per ticker).
+_FTD_FILED_AS_SQL = text("""
+    SELECT r.obs_date, r.pull_timestamp, r.raw_payload ->> 'symbol' AS symbol
+    FROM raw_series r
+    JOIN source_catalog sc ON sc.id = r.source_id
+    WHERE r.series_id = :sid
+      AND LOWER(sc.name) = LOWER(:source)
+      AND r.pull_status = 'SUCCESS'
+      AND r.obs_date >= :start
+      AND r.obs_date <= :as_of
+      AND r.pull_timestamp < :known_by
+""")
 
 # CROWD: Cboe total exchange put/call ratio (ingestion/altdata/cboe_indices.py),
 # one value per trading day, market-wide. The newest must be at most
@@ -773,20 +802,16 @@ PCR_SERIES = "put_call_ratio"
 PCR_SOURCE = "CBOE"
 PCR_FRESH_DAYS = 5
 
-# NARRATIVE: Tiingo news (ingestion/tiingo_news_pull.py). Each day's value is
-# the number of articles a trailing NEWS_TRAILING_DAYS query returned, capped
-# at the pull's limit (NEWS_FETCH_CAP), written once per day by the first
-# pull. A value at the cap is a lower bound. Per-day volume is value / 7.
+# NARRATIVE: Tiingo news (ingestion/tiingo_news_pull.py), shown, not scored
+# (NEWS_NOT_SCORED). Each day's value is the number of articles a trailing
+# NEWS_TRAILING_DAYS query returned, capped at the pull's limit
+# (NEWS_FETCH_CAP), written once per day by the first pull that found any. A
+# value at the cap is a lower bound. The newest count within
+# NEWS_TRAILING_DAYS is shown with its date.
 NEWS_SOURCE = "tiingo_news"
 NEWS_SERIES = "TIINGO_NEWS:{ticker}:daily_count"
 NEWS_TRAILING_DAYS = 7
 NEWS_FETCH_CAP = 50
-NEWS_WINDOW_DAYS = 90
-NEWS_FRESH_DAYS = 3
-# Baseline: the window's oldest 30 days (the legacy rule's head(30) of daily
-# counts), at least a trailing window's worth of pulls.
-NEWS_BASELINE_BEFORE_DAYS = 60
-NEWS_BASELINE_MIN_OBS = 7
 
 # FLOW: a volatility spike needs a 60-day baseline of daily returns.
 FLOW_BASELINE_RETURNS = 60
@@ -847,6 +872,50 @@ def _ftd_series_ids(conn, tickers: Sequence[str], as_of: date) -> dict[str, tupl
     return {symbol: tuple(sorted(ids)) for symbol, ids in found.items()}
 
 
+def _utc(ts: object) -> datetime | None:
+    """A raw_series pull_timestamp as an aware UTC instant (naive is UTC, as griddb runs Etc/UTC)."""
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts)
+    if not isinstance(ts, datetime):
+        return None
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+
+
+def _ftd_identity_break(
+    conn,
+    series_id: str,
+    symbol: str,
+    as_of: date,
+    selected: Sequence[Observation],
+) -> str | None:
+    """Why ``selected`` (read from ``series_id``) is not ``symbol``'s balance, or None.
+
+    The symbol -> CUSIP lookup finds a CUSIP from any one row filed under the
+    symbol; the balances read from that CUSIP series may be filed under
+    another. So every row of the series in the read bounds, all vintages,
+    must be filed under ``symbol``. One that is not means a symbol change
+    (old A rows and newer B rows on one CUSIP) or a corrected filing in the
+    window, and the input abstains. Each selected vintage must also be one of
+    those rows. This query runs after the read, so a row pulled in between
+    (an as-of of today) is checked, never scored unchecked.
+    """
+    rows = conn.execute(_FTD_FILED_AS_SQL, {
+        "sid": series_id,
+        "source": FTD_SOURCE,
+        "start": as_of - timedelta(days=FTD_WINDOW_DAYS),
+        "as_of": as_of,
+        "known_by": datetime.combine(as_of + timedelta(days=1), time(0), tzinfo=timezone.utc),
+    }).fetchall()
+    others = sorted({"no symbol" if s is None else str(s) for _, _, s in rows if s != symbol})
+    if others:
+        return f"{series_id} was also filed as {', '.join(others)} in the window"
+    on_file = {(str(d)[:10], _utc(ts)) for d, ts, _ in rows}
+    for o in selected:
+        if (o.obs_date.isoformat(), _utc(o.pull_timestamp)) not in on_file:
+            return f"the {o.obs_date} balance read from {series_id} is not on file under {symbol}"
+    return None
+
+
 def _score_ftd(
     conn,
     ticker: str,
@@ -867,6 +936,9 @@ def _score_ftd(
     obs = _read_known(conn, ids[0], FTD_SOURCE, as_of, FTD_WINDOW_DAYS)
     if not obs:
         return 0.0, f"No SEC FTD balance known for {ticker} at {as_of}", False
+    unbound = _ftd_identity_break(conn, ids[0], ticker.upper(), as_of, obs)
+    if unbound is not None:
+        return 0.0, f"FTD not scored ({unbound})", False
     latest = obs[-1].obs_date
     if latest < as_of - timedelta(days=FTD_FRESH_DAYS):
         return 0.0, f"SEC FTD balance stale for {ticker} (newest settlement {latest})", False
@@ -917,30 +989,20 @@ def score_crowd(
     return _layer_result("CROWD", min(score, 15), trust, signals, has_data)
 
 
-def _score_news(conn, ticker: str, as_of: date) -> tuple[float, str, bool]:
-    """(points, signal, has_data) for NARRATIVE's Tiingo news part."""
+def _describe_news(conn, ticker: str, as_of: date) -> str:
+    """NARRATIVE's Tiingo news count as a signal; it never scores (NEWS_NOT_SCORED)."""
     conflict = _panel_instrument_conflict(ticker)
     if conflict is not None:
-        return 0.0, f"News not read ({ticker}'s price panel is {conflict}, not the listed {ticker})", False
-    obs = _read_known(conn, NEWS_SERIES.format(ticker=ticker), NEWS_SOURCE, as_of, NEWS_WINDOW_DAYS)
-    if not obs or obs[-1].obs_date < as_of - timedelta(days=NEWS_FRESH_DAYS):
-        newest = f"newest {obs[-1].obs_date}" if obs else "none"
-        return 0.0, f"No fresh Tiingo news count for {ticker} ({newest} in the {NEWS_WINDOW_DAYS} days to {as_of})", False
+        return f"News not read ({ticker}'s price panel is {conflict}, not the listed {ticker})"
+    obs = _read_known(conn, NEWS_SERIES.format(ticker=ticker), NEWS_SOURCE, as_of, NEWS_TRAILING_DAYS)
+    if not obs:
+        return f"No Tiingo news count for {ticker} in the {NEWS_TRAILING_DAYS} days to {as_of}"
     latest = obs[-1]
-    recent = latest.value / NEWS_TRAILING_DAYS
     at_least = ">=" if latest.value >= NEWS_FETCH_CAP else ""  # at Tiingo's fetch cap
-    baseline = [o.value for o in obs if o.obs_date < as_of - timedelta(days=NEWS_BASELINE_BEFORE_DAYS)]
-    # A baseline value at the cap is a lower bound, so it cannot show a surge.
-    if len(baseline) >= NEWS_BASELINE_MIN_OBS and max(baseline) < NEWS_FETCH_CAP:
-        older = sum(baseline) / len(baseline) / NEWS_TRAILING_DAYS
-        if recent > older * 2:
-            return 5.0, (
-                f"News volume surging ({at_least}{recent:.1f}/day vs {older:.1f}/day, "
-                f"trailing {NEWS_TRAILING_DAYS}d to {latest.obs_date})"
-            ), True
-    if recent > 3:
-        return 2.0, f"Moderate news coverage ({at_least}{recent:.1f}/day, trailing {NEWS_TRAILING_DAYS}d)", True
-    return 0.0, f"Light news coverage ({recent:.1f}/day, trailing {NEWS_TRAILING_DAYS}d)", True
+    return (
+        f"Tiingo news, not scored: {at_least}{latest.value:.0f} articles returned for the "
+        f"{NEWS_TRAILING_DAYS} days to {latest.obs_date}"
+    )
 
 
 def score_narrative(
@@ -948,12 +1010,15 @@ def score_narrative(
     ticker: str,
     as_of_date: date | None = None,
 ) -> LayerResult:
-    """Layer 5: Is there a narrative catalyst? Tiingo news count (wiki, GDELT unavailable)."""
+    """Layer 5: Is there a narrative catalyst? Nothing scored today.
+
+    The Tiingo news count is shown, not scored (NEWS_NOT_SCORED); wiki
+    attention and GDELT have no writer. The layer has no data and stays in the
+    denominator at its full weight.
+    """
     as_of = _resolve_as_of_date(as_of_date)
-    score, news_signal, has_data = _score_news(conn, ticker, as_of)
-    signals = [news_signal, WIKI_UNAVAILABLE, GDELT_UNAVAILABLE]
-    trust = LAYER_FULL_TRUST["NARRATIVE"] if has_data else 0.10
-    return _layer_result("NARRATIVE", min(score, 10), trust, signals, has_data)
+    signals = [NEWS_NOT_SCORED, _describe_news(conn, ticker, as_of), WIKI_UNAVAILABLE, GDELT_UNAVAILABLE]
+    return _layer_result("NARRATIVE", 0.0, 0.10, signals, False)
 
 
 def score_flow(
