@@ -116,17 +116,34 @@ class MockResult:
 
     def fetchall(self):
         if "trade_postmortems" in self._query and "select" in self._query:
+            # Last column: op.model_name (old LEFT JOIN shape) or tp.prediction_id.
+            joined = "op.model_name" in self._query
+            by_id = {p.get("id"): p for p in self._engine._predictions if p.get("id")}
+
+            def _tail(pm):
+                if not joined:
+                    return pm.get("prediction_id")
+                if pm.get("model_name") is not None:
+                    return pm["model_name"]
+                return by_id.get(pm.get("prediction_id"), {}).get("model_name")
+
             return [
                 (pm["ticker"], pm["outcome"], pm["failure_category"],
                  pm["root_cause"], json.dumps(pm["signals_wrong"]),
                  json.dumps(pm["signals_right"]), pm["what_we_missed"],
                  pm["recommended_fix"], pm["confidence"], pm["generated_at"],
-                 pm.get("model_name"))
+                 _tail(pm))
                 for pm in self._engine._postmortems
             ]
         if "oracle_predictions" in self._query and "having" in self._query:
             # Top performer query (_get_top_performer) — must be before scoring match
             return [("flow_momentum", 0.65)]
+        if "select id, verdict, model_name, signals" in self._query and "oracle_predictions" in self._query:
+            return [
+                (p.get("id") or f"op-{i}", p["verdict"], p.get("model_name"), p.get("signals"))
+                for i, p in enumerate(self._engine._predictions)
+                if p.get("verdict") in ("hit", "miss", "partial")
+            ]
         if "select verdict, signals" in self._query and "oracle_predictions" in self._query:
             return [
                 (p["verdict"], p.get("signals"))
@@ -278,12 +295,14 @@ class TestTraceAnalyzer:
 
     def test_identifies_failure_category_clustering(self):
         """Should find rate-based patterns when winning+losing denominators exist."""
+        # Each postmortem belongs to one of the 6 scored misses (same ids on
+        # both sides of the rate; Codex review 6011905413).
         self.engine._postmortems = [
             {"ticker": f"T{i}", "outcome": "miss", "failure_category": "wrong_signal",
              "root_cause": "test", "signals_wrong": ["feature:sentiment"],
              "signals_right": ["feature:equity"], "what_we_missed": "",
              "recommended_fix": "fix", "confidence": 0.7, "generated_at": "2026-04-01",
-             "model_name": "flow_momentum"}
+             "prediction_id": f"miss-{i}"}
             for i in range(6)
         ]
         # 4 winning + 6 losing predictions: feature:sentiment failed 6/8 (75% > 40%)
@@ -292,8 +311,8 @@ class TestTraceAnalyzer:
               "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for _ in range(2)]
             + [{"model_name": "flow_momentum", "verdict": "hit",
                 "signals": [{"name": "feature:equity"}]} for _ in range(2)]
-            + [{"model_name": "flow_momentum", "verdict": "miss",
-                "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for _ in range(6)]
+            + [{"id": f"miss-{i}", "model_name": "flow_momentum", "verdict": "miss",
+                "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for i in range(6)]
         )
         patterns = self.analyzer.analyze()
         wrong = [p for p in patterns if p.category == "wrong_signal"]
@@ -506,7 +525,7 @@ class TestTraceEvolver:
              "root_cause": "sentiment was wrong", "signals_wrong": ["feature:sentiment"],
              "signals_right": ["feature:equity"], "what_we_missed": "",
              "recommended_fix": "remove sentiment", "confidence": 0.8,
-             "generated_at": "2026-04-01", "model_name": "flow_momentum"}
+             "generated_at": "2026-04-01", "prediction_id": f"miss-{i}"}
             for i in range(6)
         ]
         self.engine._predictions = (
@@ -514,8 +533,8 @@ class TestTraceEvolver:
               "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for _ in range(2)]
             + [{"model_name": "flow_momentum", "verdict": "hit",
                 "signals": [{"name": "feature:equity"}]} for _ in range(2)]
-            + [{"model_name": "flow_momentum", "verdict": "miss",
-                "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for _ in range(6)]
+            + [{"id": f"miss-{i}", "model_name": "flow_momentum", "verdict": "miss",
+                "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for i in range(6)]
         )
         result = self.evolver.evolve_cycle()
         assert len(result["patterns_found"]) >= 1

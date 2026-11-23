@@ -138,6 +138,20 @@ class FakeDB:
             return FakeResult(self.hypotheses)
 
         if "from trade_postmortems" in q:
+            # Answer the column the query asks for in the last slot: the
+            # LEFT JOIN shape (op.model_name, any prediction row) or the bare
+            # tp.prediction_id shape.
+            joined = "op.model_name" in q
+            by_id = {_pred_id(i, p): p for i, p in enumerate(self.scored_predictions)}
+
+            def _tail(pm: dict[str, Any]) -> Any:
+                if not joined:
+                    return pm.get("prediction_id")
+                if pm.get("model_name") is not None:
+                    return pm["model_name"]
+                pred = by_id.get(pm.get("prediction_id"))
+                return pred.get("model_name") if pred else None
+
             return FakeResult([
                 (
                     pm["ticker"],
@@ -150,7 +164,7 @@ class FakeDB:
                     pm.get("recommended_fix", ""),
                     pm.get("confidence", 0.7),
                     pm.get("generated_at", "2026-11-01"),
-                    pm.get("model_name"),
+                    _tail(pm),
                 )
                 for pm in self.postmortems
             ])
@@ -167,13 +181,31 @@ class FakeDB:
                     agg[st]["w"] += 1
             return FakeResult([(st, v["c"], v["w"], v["t"]) for st, v in agg.items()])
 
-        # Signal fire-counts query from oracle_predictions (verdict, signals)
+        # Eligible scored Oracle predictions: verdict IN (hit, miss, partial),
+        # dedup_keep = TRUE, id NOT LIKE 'astrogrid:%' (the scored_at window is
+        # not modelled; a test pins the SQL text for it instead).
+        def _eligible(p: dict[str, Any]) -> bool:
+            return (
+                p.get("verdict") in ("hit", "miss", "partial")
+                and p.get("dedup_keep", True)
+                and not str(p.get("id", "")).startswith("astrogrid:")
+            )
+
+        if "select id, verdict, model_name, signals from oracle_predictions" in q:
+            return FakeResult([
+                (_pred_id(i, p), p["verdict"], p.get("model_name"), p.get("signals"))
+                for i, p in enumerate(self.scored_predictions)
+                if _eligible(p)
+            ])
+
+        # Pre-fix fire-counts shape (verdict, signals); kept so the new tests
+        # can be shown failing against the pre-fix code.
         if "select verdict, signals from oracle_predictions" in q:
-            rows = []
-            for p in self.scored_predictions:
-                if p.get("verdict") in ("hit", "miss", "partial") and p.get("dedup_keep", True):
-                    rows.append((p["verdict"], p.get("signals")))
-            return FakeResult(rows)
+            return FakeResult([
+                (p["verdict"], p.get("signals"))
+                for p in self.scored_predictions
+                if _eligible(p)
+            ])
 
         # Scoring data aggregation on oracle_predictions
         if "from oracle_predictions" in q and "group by model_name" in q:
@@ -252,6 +284,11 @@ class FakeDB:
                 ])
 
         return FakeResult([])
+
+
+def _pred_id(index: int, pred: dict[str, Any]) -> str:
+    """oracle_predictions.id for a fake row (explicit, or a stable default)."""
+    return str(pred.get("id") or f"op-{index}")
 
 
 def _seed_two_active_models(db: FakeDB) -> None:
@@ -545,6 +582,8 @@ class TestDefect3Pattern1BaseRate:
         #   (14 wins + 6 misses -> 30% failure rate <= 40% threshold -> NOT flagged)
         # - feature:sentiment mentioned in 5 failures, fired 8 times overall
         #   (3 wins + 5 misses -> 62.5% failure rate > 40% threshold -> FLAGGED)
+        # Each postmortem belongs to one of the 6 scored misses (Codex HOLD
+        # 6011905413: both sides come from the same prediction ids).
         db.postmortems = [
             {
                 "ticker": f"T{i}",
@@ -553,12 +592,13 @@ class TestDefect3Pattern1BaseRate:
                 "signals_wrong": ["feature:equity", "feature:sentiment"] if i < 5 else ["feature:equity"],
                 "signals_right": [],
                 "what_we_missed": "",
-                "model_name": "flow_momentum",
+                "prediction_id": f"loss-{i}",
             }
             for i in range(6)
         ]
         wins = [
             {
+                "id": f"win-{i}",
                 "model_name": "flow_momentum",
                 "verdict": "hit",
                 "dedup_keep": True,
@@ -574,6 +614,7 @@ class TestDefect3Pattern1BaseRate:
         ]
         losses = [
             {
+                "id": f"loss-{i}",
                 "model_name": "flow_momentum",
                 "verdict": "miss",
                 "dedup_keep": True,
@@ -596,6 +637,7 @@ class TestDefect3Pattern1BaseRate:
         assert wrong_patterns[0].signals_commonly_wrong == ["feature:sentiment"]
         assert "feature:equity" not in wrong_patterns[0].signals_commonly_wrong
         assert wrong_patterns[0].fraction == pytest.approx(6 / 20, abs=1e-3)
+        assert wrong_patterns[0].affected_models == ["flow_momentum"]
 
     def test_aggregate_signals_fails_closed_without_denominator(self):
         db = FakeDB()
@@ -657,3 +699,332 @@ class TestDefect4ProseMatching:
         add_proposals = [p for p in proposals if p.mutation_type == "add_signal"]
         assert len(add_proposals) == 1
         assert add_proposals[0].params["signals_to_add"] == ["feature:event_risk"]
+
+
+# ── Codex HOLD 6011905413: Pattern 1 failures and fires from one population ──
+
+
+def _trade_postmortem(i: int, signals_wrong: list[str]) -> dict[str, Any]:
+    """A paper-trade postmortem: trade_id set, no Oracle prediction id."""
+    return {
+        "ticker": f"TR{i}",
+        "outcome": "loss",
+        "failure_category": "wrong_signal",
+        "signals_wrong": list(signals_wrong),
+        "signals_right": [],
+        "what_we_missed": "",
+        "prediction_id": None,
+    }
+
+
+def _oracle_postmortem(pid: str, signals_wrong: list[str]) -> dict[str, Any]:
+    return {
+        "ticker": "NVDA",
+        "outcome": "miss",
+        "failure_category": "wrong_signal",
+        "signals_wrong": list(signals_wrong),
+        "signals_right": [],
+        "what_we_missed": "",
+        "prediction_id": pid,
+    }
+
+
+def _scored(pid: str, verdict: str, signals: list[str], **extra: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": pid,
+        "model_name": "flow_momentum",
+        "verdict": verdict,
+        "dedup_keep": True,
+        "signals": {"items": [{"name": s} for s in signals]},
+    }
+    row.update(extra)
+    return row
+
+
+def _wrong_signal_patterns(db: FakeDB) -> list[FailurePattern]:
+    patterns = TraceAnalyzer(db).analyze()  # type: ignore[arg-type]
+    return [p for p in patterns if p.category == "wrong_signal"]
+
+
+class TestCodexHold6011905413Pattern1Population:
+    X = "feature:sentiment"
+
+    def test_unrelated_postmortems_do_not_make_a_false_failure_rate(self):
+        """Codex's example: two postmortems naming X that belong to no scored
+        Oracle prediction, three Oracle X fires that did not fail. The old
+        code read 2/3 = 67% (> 40%) and flagged X."""
+        db = FakeDB()
+        db.postmortems = (
+            [_trade_postmortem(i, [self.X]) for i in range(2)]
+            + [_trade_postmortem(i, []) for i in range(2, 5)]
+        )
+        db.scored_predictions = [_scored(f"hit-{i}", "hit", [self.X]) for i in range(3)]
+
+        wrong = _wrong_signal_patterns(db)
+        assert wrong == [], f"unrelated postmortems produced a failure rate: {wrong}"
+
+    def test_postmortems_of_ineligible_predictions_do_not_count(self):
+        """Postmortems of an AstroGrid row, a soft duplicate and a prediction
+        scored outside the window are outside the denominator's population."""
+        db = FakeDB()
+        db.postmortems = [
+            _oracle_postmortem("astrogrid:abc", [self.X]),
+            _oracle_postmortem("dup-1", [self.X]),
+            _oracle_postmortem("scored-before-window", [self.X]),
+            _trade_postmortem(3, []),
+            _trade_postmortem(4, []),
+        ]
+        db.scored_predictions = [
+            _scored("astrogrid:abc", "miss", [self.X]),
+            _scored("dup-1", "miss", [self.X], dedup_keep=False),
+        ] + [_scored(f"hit-{i}", "hit", [self.X]) for i in range(3)]
+
+        assert _wrong_signal_patterns(db) == []
+
+    def test_repeated_postmortems_of_one_prediction_count_once(self):
+        """Three postmortems of the same failed prediction are one failure
+        per (prediction id, signal), not three."""
+        db = FakeDB()
+        db.postmortems = (
+            [_oracle_postmortem("miss-1", [self.X]) for _ in range(3)]
+            + [_trade_postmortem(i, []) for i in range(2)]
+        )
+        db.scored_predictions = (
+            [_scored("miss-1", "miss", [self.X])]
+            + [_scored(f"hit-{i}", "hit", [self.X]) for i in range(3)]
+        )
+
+        # Old code: 3 mentions / 4 fires = 75% -> flagged.
+        assert _wrong_signal_patterns(db) == []
+
+    def test_failure_counts_only_where_the_signal_fired(self):
+        """A postmortem naming X for a prediction that never fired X is not a
+        failure of X (the pair is outside the fire population)."""
+        db = FakeDB()
+        db.postmortems = (
+            [_oracle_postmortem("m1", [self.X]), _oracle_postmortem("m2", [self.X])]
+            + [_oracle_postmortem(f"m{i}", []) for i in range(3, 6)]
+        )
+        db.scored_predictions = (
+            [_scored("m1", "miss", ["feature:equity"]), _scored("m2", "miss", [self.X])]
+            + [_scored(f"m{i}", "miss", ["feature:equity"]) for i in range(3, 6)]
+            + [_scored(f"hit-{i}", "hit", [self.X]) for i in range(2)]
+        )
+
+        # Old code: 2 mentions / 3 fires = 67% -> flagged. Now 1 / 3.
+        assert _wrong_signal_patterns(db) == []
+
+    def test_eligible_failures_give_the_rate_over_the_same_ids(self):
+        """Positive control: three failed eligible X fires out of five, plus two
+        unrelated postmortems naming X that must not add to the count."""
+        db = FakeDB()
+        db.postmortems = (
+            [_oracle_postmortem(f"miss-{i}", [self.X]) for i in range(3)]
+            + [_trade_postmortem(i, [self.X]) for i in range(2)]
+        )
+        db.scored_predictions = (
+            [_scored(f"miss-{i}", "miss", [self.X]) for i in range(3)]
+            + [_scored(f"hit-{i}", "hit", [self.X]) for i in range(2)]
+        )
+
+        wrong = _wrong_signal_patterns(db)
+        assert len(wrong) == 1
+        assert wrong[0].signals_commonly_wrong == [self.X]
+        assert wrong[0].frequency == 3          # eligible failed predictions, not 5 postmortems
+        assert wrong[0].fraction == pytest.approx(3 / 5, abs=1e-3)
+        assert wrong[0].affected_models == ["flow_momentum"]
+
+    def test_signal_failure_counts_join_on_prediction_id_and_signal(self):
+        from oracle import trace_evolver as te
+
+        eligible = {
+            "miss-1": te.ScoredPrediction("miss-1", "miss", "m", frozenset({self.X})),
+            "miss-2": te.ScoredPrediction("miss-2", "miss", "m", frozenset({"feature:equity"})),
+            "hit-1": te.ScoredPrediction("hit-1", "hit", "m", frozenset({self.X})),
+            "hit-2": te.ScoredPrediction("hit-2", "hit", "m", frozenset({self.X})),
+        }
+        postmortems = [
+            {"prediction_id": "miss-1", "signals_wrong": [self.X, self.X]},
+            {"prediction_id": "miss-1", "signals_wrong": [self.X]},       # re-run of the same failure
+            {"prediction_id": "miss-2", "signals_wrong": [self.X]},       # X never fired here
+            {"prediction_id": "hit-1", "signals_wrong": [self.X]},        # not a failure
+            {"prediction_id": None, "signals_wrong": [self.X]},           # paper trade
+            {"prediction_id": "not-eligible", "signals_wrong": [self.X]},
+        ]
+
+        counts = te._signal_failure_counts(postmortems, "signals_wrong", eligible)
+        assert counts[self.X] == (1, 3)
+        assert "feature:equity" not in counts or counts["feature:equity"][0] == 0
+
+    def test_queries_pin_the_eligible_population(self):
+        db = FakeDB()
+        db.postmortems = [_oracle_postmortem(f"miss-{i}", [self.X]) for i in range(5)]
+        db.scored_predictions = [_scored(f"miss-{i}", "miss", [self.X]) for i in range(5)] + [
+            _scored("hit-1", "hit", [self.X])
+        ]
+        TraceAnalyzer(db).analyze()  # type: ignore[arg-type]
+
+        norm = [(" ".join(sql.lower().split()), bound) for sql, bound in db.executed]
+        eligible = [(q, b) for q, b in norm if q.startswith("select id, verdict, model_name, signals from oracle_predictions")]
+        assert len(eligible) == 1, "expected one eligible scored-prediction read"
+        q, bound = eligible[0]
+        for needle in (
+            "scored_at >= :cutoff",
+            "verdict in ('hit', 'miss', 'partial')",
+            "dedup_keep = true",
+            "id not like 'astrogrid:%'",
+        ):
+            assert needle in q, f"eligible population filter missing: {needle}"
+        assert "cutoff" in bound
+        pm_queries = [q for q, _ in norm if "from trade_postmortems" in q]
+        assert pm_queries and all("tp.prediction_id" in q for q in pm_queries)
+
+
+# ── Open question for Anik: ModelEvolver still retires active models ──────
+
+
+class _RosterDB:
+    """Active roster for ModelEvolver.evolve_cycle: stats, count, deactivate."""
+
+    def __init__(self, roster: dict[str, tuple[int, int, int]]) -> None:
+        self.stats = dict(roster)  # name -> (hits, misses, partials)
+        self.active = {name: True for name in roster}
+        self.executed: list[tuple[str, dict[str, Any]]] = []
+        self.writes: list[str] = []
+
+    def connect(self) -> RecordingConn:
+        return RecordingConn(self)  # type: ignore[arg-type]
+
+    def begin(self) -> RecordingConn:
+        return RecordingConn(self)  # type: ignore[arg-type]
+
+    def handle(self, sql: str, params: dict[str, Any]) -> FakeResult:
+        q = " ".join(sql.lower().split())
+        if q.startswith(("update", "insert", "delete")):
+            self.writes.append(q)
+        if q.startswith("update oracle_models set active=false"):
+            self.active[params["n"]] = False
+            return FakeResult(rowcount=1)
+        if "from oracle_models m left join" in q:
+            return FakeResult([
+                (name, "[]", "[]", h, m, p)
+                for name, (h, m, p) in self.stats.items()
+                if self.active[name]
+            ])
+        if q.startswith("select count(*) from oracle_models where active=true"):
+            return FakeResult([(sum(self.active.values()),)])
+        return FakeResult([])
+
+
+class TestModelEvolverRosterPin:
+    """Pins ModelEvolver.evolve_cycle's retirement of ACTIVE models as it is at
+    this PR (Codex review 6011905413). Whether the cycle should do this to the
+    existing roster is an open question for Anik; change it deliberately, and
+    update these pins with it."""
+
+    _DEACTIVATE = "update oracle_models set active=false, last_updated=now() where name=:n"
+
+    def test_kill_rule_deactivates_active_models_below_20pct_after_20_scored(self):
+        db = _RosterDB({
+            "loser": (3, 17, 0),           # 20 scored, hit rate 15% -> retired
+            "partial_heavy": (2, 8, 10),   # 20 scored, hit rate 10% (partials are not hits) -> retired
+            "at_threshold": (4, 16, 0),    # hit rate exactly 20% -> kept (strict <)
+            "young_loser": (0, 19, 0),     # 19 scored -> kept
+            "winner": (12, 8, 0),
+        })
+        result = ModelEvolver(db).evolve_cycle()  # type: ignore[arg-type]
+
+        assert sorted(result["killed"]) == ["loser", "partial_heavy"]
+        assert {n for n, a in db.active.items() if not a} == {"loser", "partial_heavy"}
+        updates = [w for w in db.writes if w.startswith("update")]
+        assert updates == [self._DEACTIVATE] * 2   # only active=FALSE; weight untouched
+        assert not any(w.startswith(("delete", "insert into oracle_models")) for w in db.writes)
+
+    def test_cap_deactivates_lowest_scored_active_models_down_to_50(self):
+        roster: dict[str, tuple[int, int, int]] = {
+            f"strong_{i:02d}": (15, 4, 0) for i in range(48)
+        }
+        weak = {f"weak_{i}": (i + 1, 18 - i, 0) for i in range(5)}  # 19 scored: below the kill rule
+        roster.update(weak)
+        roster.update({"fresh_0": (0, 9, 0), "fresh_1": (0, 9, 0)})  # 9 scored: never ranked
+        db = _RosterDB(roster)
+
+        result = ModelEvolver(db).evolve_cycle()  # type: ignore[arg-type]
+
+        assert result["active_before"] == 55
+        assert sorted(result["killed"]) == sorted(weak)
+        assert result["active_after"] == 50
+        assert db.active["fresh_0"] and db.active["fresh_1"]
+
+    def test_no_cap_deactivation_at_exactly_50_active(self):
+        db = _RosterDB({f"strong_{i:02d}": (15, 4, 0) for i in range(50)})
+        result = ModelEvolver(db).evolve_cycle()  # type: ignore[arg-type]
+
+        assert result["killed"] == []
+        assert not [w for w in db.writes if w.startswith("update")]
+
+
+# ── The evolution cycle stays off outside OracleEngine.run_cycle ──────────
+
+
+class TestEvolutionCycleHeld:
+    ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
+    _SKIP = {"tests", "migrations", "notebooks", "pwa", "node_modules", ".git", ".venv",
+             "venv", "__pycache__", "site-packages"}
+
+    def _tree(self, rel: str) -> Any:
+        import ast
+
+        return ast.parse((self.ROOT / rel).read_text(encoding="utf-8"))
+
+    def test_hermes_oracle_slot_never_runs_the_evolvers(self):
+        import ast
+
+        tree = self._tree("scripts/hermes_operator.py")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert node.module not in ("oracle.model_evolver", "oracle.trace_evolver")
+            if isinstance(node, ast.Name):
+                assert node.id not in ("ModelEvolver", "TraceEvolver")
+        forward = [n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "_run_oracle_forward_pass"]
+        assert len(forward) == 1
+        called = {n.func.attr for n in ast.walk(forward[0])
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        assert not called & {"run_cycle", "evolve_weights", "evolve_cycle"}
+
+    def test_evolvers_are_constructed_only_inside_oracle_engine_run_cycle(self):
+        import ast
+        import warnings
+
+        sites: list[tuple[str, str]] = []
+        for path in self.ROOT.rglob("*.py"):
+            rel = path.relative_to(self.ROOT)
+            if self._SKIP.intersection(rel.parts):
+                continue
+            try:
+                source = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if "ModelEvolver(" not in source and "TraceEvolver(" not in source:
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(source)
+
+            def visit(node: ast.AST, enclosing: str) -> None:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    enclosing = node.name
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id in ("ModelEvolver", "TraceEvolver")):
+                    sites.append((rel.as_posix(), enclosing))
+                for child in ast.iter_child_nodes(node):
+                    visit(child, enclosing)
+
+            visit(tree, "<module>")
+        assert sorted(set(sites)) == [("oracle/engine.py", "run_cycle")]
+
+    def test_surfacer_gap_worker_runs_the_oracle_predict_only(self):
+        from scripts import drain_surfacer_oracle_gap_worker as worker
+
+        assert "--predict-only" in worker._oracle_cycle_command("SPY")
