@@ -30,7 +30,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.market_calendar import last_trading_day
-from store.feature_ids import feature_ids
+from store.feature_ids import feature_id, feature_ids
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_SNAPSHOTS, visible_sql
 from trading.trade_ticket_generator import MAX_KELLY_PER_TICKET
 
@@ -1723,19 +1723,31 @@ class OptionsRecommender:
 
         Checks recent price momentum and decision journal sentiment
         to see if they align with the recommended direction.
+
+        Momentum is the return from the 6th-newest stored session of
+        ``{ticker}_close`` to the newest (a 5-session return), one value per
+        ``obs_date``: the newest vintage of each date, as
+        ``trading.signal_executor._get_latest_prices`` reads it. ``{t}_close``
+        holds several vintages of one date (griddb 2026-11-23: cl_close has
+        a same-day and a next-day vintage on most dates, up to 3.6% apart).
+        The old ``ORDER BY obs_date DESC LIMIT 6`` counted each vintage as a
+        session, so its 6 rows covered 4 dates there, and which vintage of a
+        date came first or last was left to the query plan.
         """
         try:
             with db.connect() as conn:
-                # Price momentum: 5-day return
-                feature_name = f"{rec.ticker.lower()}_close"
-                prices = conn.execute(text("""
-                    SELECT rs.value
+                # Bound id (store.feature_ids): the feature_registry name join
+                # read every vintage of the feature first (~200 ms on griddb).
+                # (obs_date, vintage_date) is unique per feature, so the
+                # vintage picked for each date is fixed.
+                fid = feature_id(conn, f"{rec.ticker.lower()}_close")
+                prices = [] if fid is None else conn.execute(text("""
+                    SELECT DISTINCT ON (rs.obs_date) rs.value, rs.obs_date
                     FROM resolved_series rs
-                    JOIN feature_registry fr ON rs.feature_id = fr.id
-                    WHERE fr.name = :fname
-                    ORDER BY rs.obs_date DESC
+                    WHERE rs.feature_id = :fid
+                    ORDER BY rs.obs_date DESC, rs.vintage_date DESC
                     LIMIT 6
-                """), {"fname": feature_name}).fetchall()
+                """), {"fid": fid}).fetchall()
 
                 if len(prices) >= 2:
                     latest = float(prices[0][0])
