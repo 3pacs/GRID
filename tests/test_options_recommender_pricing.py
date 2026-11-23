@@ -519,6 +519,105 @@ def test_defect4_optional_checks_constant_and_skip_allowed() -> None:
     assert rec_ok.all_sanity_passed is True
 
 
+# ── CROSS_ASSET is a shadow check (Anik 2026-11-23, Codex review 6030559940) ──
+
+
+def _gated_engine(monkeypatch: pytest.MonkeyPatch, **checks: dict) -> tuple[OptionsRecommender, Any, Any]:
+    """A recommender on the fake DB whose named sanity layers return fixed verdicts."""
+    _freeze_date(monkeypatch, RUN_WED)
+    db = _FakeDb(_FakeConn(snapshots=[_contract_row(strike=105.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.28)]))
+    rec_engine = OptionsRecommender(db)
+    _disable_llm(rec_engine, monkeypatch)
+    layer = {
+        "DATA_QUALITY": "_sanity_data_quality",
+        "DEALER_FLOW": "_sanity_dealer_flow",
+        "CROSS_ASSET": "_sanity_cross_asset",
+        "HISTORICAL_ANALOG": "_sanity_historical_analog",
+    }
+    defaults = {"DATA_QUALITY": {"status": "PASS", "reason": "ok"},
+                "DEALER_FLOW": {"status": "PASS", "reason": "ok"},
+                "CROSS_ASSET": {"status": "PASS", "reason": "ok"},
+                "HISTORICAL_ANALOG": {"status": "SKIP", "reason": "cold start"}}
+    for name, verdict in {**defaults, **checks}.items():
+        monkeypatch.setattr(rec_engine, layer[name], lambda *_a, _v=verdict, **_k: dict(_v))
+    gex = _make_gex_engine({"regime": "SHORT_GAMMA", "call_wall": 110.0, "put_wall": 90.0})
+    return rec_engine, db, gex
+
+
+def test_check_classes_are_disjoint_and_cross_asset_is_shadow() -> None:
+    required = recommender_mod.REQUIRED_CHECKS
+    optional = recommender_mod.OPTIONAL_CHECKS
+    shadow = recommender_mod.SHADOW_CHECKS
+    assert shadow == frozenset({"CROSS_ASSET"})
+    assert not (required & optional) and not (required & shadow) and not (optional & shadow)
+    assert "DEALER_FLOW" in optional  # its FAIL still rejects
+
+
+def test_cross_asset_fail_alone_does_not_reject_and_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    fail = {"status": "FAIL", "reason": "Momentum (-5.00%, SPY close 2026-11-10 to 2026-11-17) and regime both contradict CALL"}
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=fail)
+    rec = rec_engine._build_recommendation(_make_opp(direction="CALL", spot=100.0, score=8.5), gex, db)
+    assert rec is not None
+    assert rec.sanity_status["CROSS_ASSET"] == {**fail, "shadow": True}
+    assert rec.all_sanity_passed is True
+    assert rec_engine.last_rejection_counts == {}
+
+
+_SHADOW_VERDICTS = [{"status": "FAIL", "reason": "shadow"}, {"status": "SKIP", "reason": "shadow"}]
+
+
+@pytest.mark.parametrize("shadow", _SHADOW_VERDICTS, ids=["shadow-FAIL", "shadow-SKIP"])
+@pytest.mark.parametrize(("dq", "code"), [
+    ({"status": "FAIL", "reason": "stale snapshot"}, "sanity_failed:DATA_QUALITY"),
+    ({"status": "SKIP", "reason": "no snapshot"}, "required_check_skipped:DATA_QUALITY"),
+])
+def test_data_quality_still_rejects_beside_a_shadow_verdict(monkeypatch: pytest.MonkeyPatch, dq, code, shadow) -> None:
+    rec_engine, db, gex = _gated_engine(monkeypatch, DATA_QUALITY=dq, CROSS_ASSET=shadow)
+    assert rec_engine._build_recommendation(_make_opp(), gex, db) is None
+    assert rec_engine.last_rejection_counts == {code: 1}
+
+
+@pytest.mark.parametrize("shadow", _SHADOW_VERDICTS, ids=["shadow-FAIL", "shadow-SKIP"])
+def test_dealer_flow_fail_still_rejects_and_is_named(monkeypatch: pytest.MonkeyPatch, shadow) -> None:
+    # The rejection reason is DEALER_FLOW's, never the shadow check's (a
+    # shadow SKIP is not a "required check skipped").
+    rec_engine, db, gex = _gated_engine(
+        monkeypatch, DEALER_FLOW={"status": "FAIL", "reason": "long gamma, low confidence"}, CROSS_ASSET=shadow)
+    assert rec_engine._build_recommendation(_make_opp(), gex, db) is None
+    assert rec_engine.last_rejection_counts == {"sanity_failed:DEALER_FLOW": 1}
+
+
+def test_shadow_does_not_leak_into_required_check_handling(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A shadow SKIP is not a "required check skipped", and a missing or
+    # malformed shadow entry neither passes nor fails a recommendation.
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET={"status": "SKIP", "reason": "No momentum: stale"})
+    rec = rec_engine._build_recommendation(_make_opp(), gex, db)
+    assert rec is not None and rec_engine.last_rejection_counts == {}
+    assert rec.sanity_status["CROSS_ASSET"] == {"status": "SKIP", "reason": "No momentum: stale", "shadow": True}
+    base = {"DATA_QUALITY": {"status": "PASS", "reason": "ok"}, "DEALER_FLOW": {"status": "PASS", "reason": "ok"}}
+    for shadow_entry in ({}, {"CROSS_ASSET": "garbage"}, {"CROSS_ASSET": {"status": "FAIL", "reason": "x"}}):
+        rec_x = OptionsRecommendation(ticker="SPY", direction="CALL", strike=105.0, expiry=EXP_21D.isoformat(),
+                                      entry_price=1.06, sanity_status={**base, **shadow_entry})
+        assert rec_x.all_sanity_passed is True
+    only_shadow = OptionsRecommendation(ticker="SPY", direction="CALL", strike=105.0, expiry=EXP_21D.isoformat(),
+                                        entry_price=1.06, sanity_status={"CROSS_ASSET": {"status": "PASS", "reason": "x"}})
+    assert only_shadow.all_sanity_passed is False  # DATA_QUALITY is still required
+
+
+def test_pipeline_log_counts_shadow_fail_separately(monkeypatch: pytest.MonkeyPatch) -> None:
+    from loguru import logger
+
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(str(m)), format="{message}")
+    try:
+        rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET={"status": "FAIL", "reason": "shadow"})
+        assert rec_engine._build_recommendation(_make_opp(), gex, db) is not None
+    finally:
+        logger.remove(sink)
+    pipeline = [line for line in lines if line.startswith("Sanity pipeline for")]
+    assert pipeline and pipeline[-1].strip().endswith("2 PASS, 2 SKIP, 0 FAIL, 1 shadow FAIL")
+
+
 # ── Defect 5: Data-quality SQL must filter by expiry with bound params ──────
 
 

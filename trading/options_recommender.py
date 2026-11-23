@@ -14,7 +14,8 @@ Pipeline:
        stop from gamma flip point
      - Size via Kelly criterion (signal_executor pattern)
      - Run 5-layer sanity pipeline (hundredx_digest pattern)
-  3. Return only recommendations passing all sanity layers
+  3. Return only recommendations passing all gating sanity layers; shadow
+     layers (SHADOW_CHECKS: CROSS_ASSET) are recorded, never gating
 """
 
 from __future__ import annotations
@@ -61,12 +62,21 @@ TARGET_HORIZON_DTE_FRACTION: float = 0.5
 # Required checks guard pricing, data quality, liquidity, or freshness and MUST PASS.
 REQUIRED_CHECKS: frozenset[str] = frozenset({"DATA_QUALITY"})
 # Genuinely optional checks may return SKIP without rejecting a recommendation.
+# A FAIL from one still rejects.
 OPTIONAL_CHECKS: frozenset[str] = frozenset({
     "DEALER_FLOW",
-    "CROSS_ASSET",
     "LLM_REVIEW",
     "HISTORICAL_ANALOG",
 })
+# Shadow checks run and keep their real verdict (PASS/FAIL/SKIP and reason)
+# in ``sanity_status``, marked ``"shadow": True``, but never reject or change
+# a recommendation. The persisted ``sanity_status`` is their forward record.
+# CROSS_ASSET is shadow until a separately approved validation look (its
+# thresholds and its role) says it should veto: Anik's decision of
+# 2026-11-23 on Codex review 6030559940. Before it leaves this set, a
+# date-only reconstruction (``basis: date_only_reconstruction``) must still
+# never veto (tests/test_options_sanity_momentum_pg.py has a tripwire).
+SHADOW_CHECKS: frozenset[str] = frozenset({"CROSS_ASSET"})
 
 
 def min_fresh_snap_date(run_date: date) -> date:
@@ -149,8 +159,8 @@ class UnderlyingMomentum:
 #: ``basis`` of a CROSS_ASSET result fenced at the run's decision instant.
 DECISION_TIME_BASIS = "decision_time"
 #: ``basis`` of a result fenced only at the end of ``run_date`` (a replay that
-#: has no decision instant). It is a reconstruction, never a veto (Codex
-#: review 6030559940): its FAIL is reported as SKIP.
+#: has no decision instant). It is a reconstruction and never a veto (Codex
+#: review 6030559940); see ``SHADOW_CHECKS``.
 DATE_ONLY_BASIS = "date_only_reconstruction"
 
 
@@ -733,10 +743,12 @@ class OptionsRecommendation:
 
     @property
     def all_sanity_passed(self) -> bool:
-        """True only if every required sanity check PASSed and no check FAILed.
+        """True only if every required sanity check PASSed and no gating check FAILed.
 
         SKIP is accepted only for checks explicitly listed in ``OPTIONAL_CHECKS``.
-        An empty ``sanity_status`` or a missing/SKIPped required check fails closed.
+        Checks in ``SHADOW_CHECKS`` are recorded, never gating: their verdict
+        does not count either way. An empty ``sanity_status`` or a
+        missing/SKIPped required check fails closed.
         """
         if not self.sanity_status:
             return False
@@ -745,6 +757,8 @@ class OptionsRecommendation:
             if not isinstance(entry, dict) or entry.get("status") != "PASS":
                 return False
         for name, entry in self.sanity_status.items():
+            if name in SHADOW_CHECKS:
+                continue
             if not isinstance(entry, dict):
                 return False
             status = entry.get("status")
@@ -884,6 +898,10 @@ class OptionsRecommender:
                 recommendation's ``generated_at``; CROSS_ASSET reads nothing
                 pulled or written after it. A past ``run_date`` without it is a
                 date-only reconstruction (``DATE_ONLY_BASIS``).
+
+        CROSS_ASSET is a shadow check (``SHADOW_CHECKS``): its verdict is
+        recorded in each recommendation's ``sanity_status`` but changes
+        neither which recommendations are emitted nor the rejection reasons.
 
         Returns:
             list[OptionsRecommendation]: Only recommendations passing all required
@@ -1241,15 +1259,17 @@ class OptionsRecommender:
         )
         rec.sanity_status = sanity
 
-        # Fail closed on any FAIL or on SKIP/absence of a required check
+        # Fail closed on any gating FAIL or on SKIP/absence of a required check.
+        # Shadow checks (SHADOW_CHECKS) never reject.
         if not rec.all_sanity_passed:
+            gating = {k: v for k, v in sanity.items() if k not in SHADOW_CHECKS}
             skipped_required = [
-                k for k, v in sanity.items()
+                k for k, v in gating.items()
                 if isinstance(v, dict) and v.get("status") == "SKIP" and k not in OPTIONAL_CHECKS
             ]
             missing_required = [k for k in sorted(REQUIRED_CHECKS) if k not in sanity]
             failed = [
-                k for k, v in sanity.items()
+                k for k, v in gating.items()
                 if not isinstance(v, dict) or v.get("status") not in ("PASS", "SKIP")
             ]
             if skipped_required:
@@ -1758,7 +1778,8 @@ class OptionsRecommender:
         Layers:
           1. DATA_QUALITY (REQUIRED): fresh snapshot, IV in 5-200%, OI >= 100, valid spread <= 25% of mid
           2. DEALER_FLOW (OPTIONAL): GEX regime supports direction
-          3. CROSS_ASSET (OPTIONAL): momentum + news energy aligned with direction
+          3. CROSS_ASSET (SHADOW): momentum + news energy aligned with direction;
+             recorded with ``"shadow": True``, never gating (``SHADOW_CHECKS``)
           4. LLM_REVIEW (OPTIONAL): structured prompt to LLM, graceful SKIP if unavailable
           5. HISTORICAL_ANALOG (OPTIONAL): query past scanner results with similar setups
 
@@ -1776,12 +1797,20 @@ class OptionsRecommender:
         sanity["LLM_REVIEW"] = self._sanity_llm_review(rec, opp, gex_profile)
         sanity["HISTORICAL_ANALOG"] = self._sanity_historical_analog(rec, db)
 
-        passed = sum(1 for v in sanity.values() if v["status"] == "PASS")
-        skipped = sum(1 for v in sanity.values() if v["status"] == "SKIP")
-        failed = sum(1 for v in sanity.values() if v["status"] == "FAIL")
+        for name in SHADOW_CHECKS:
+            if isinstance(sanity.get(name), dict):
+                sanity[name] = {**sanity[name], "shadow": True}
+        gating = [v for k, v in sanity.items() if k not in SHADOW_CHECKS]
+        passed = sum(1 for v in gating if v["status"] == "PASS")
+        skipped = sum(1 for v in gating if v["status"] == "SKIP")
+        failed = sum(1 for v in gating if v["status"] == "FAIL")
+        shadow_failed = sum(
+            1 for k in SHADOW_CHECKS
+            if isinstance(sanity.get(k), dict) and sanity[k].get("status") == "FAIL"
+        )
         log.info(
-            "Sanity pipeline for {t} {d}: {p} PASS, {s} SKIP, {f} FAIL",
-            t=rec.ticker, d=rec.direction, p=passed, s=skipped, f=failed,
+            "Sanity pipeline for {t} {d}: {p} PASS, {s} SKIP, {f} FAIL, {sf} shadow FAIL",
+            t=rec.ticker, d=rec.direction, p=passed, s=skipped, f=failed, sf=shadow_failed,
         )
 
         return sanity
@@ -1932,9 +1961,10 @@ class OptionsRecommender:
         all stop at the decision instant (:func:`decision_time`; a live run
         decides now). Each result carries ``as_of`` (that instant) and
         ``basis``. A replay given only a past ``run_date`` has no decision
-        instant: it reads to the end of that day in New York, is labelled
-        ``DATE_ONLY_BASIS``, and is never a veto: a FAIL there is reported as
-        SKIP.
+        instant: it reads to the end of that day in New York and is labelled
+        ``DATE_ONLY_BASIS``. Its verdict is kept as computed; it is never a
+        veto because CROSS_ASSET is in ``SHADOW_CHECKS`` (and must stay
+        non-vetoing for reconstructions if it ever leaves that set).
         """
         effective_run_date = run_date or date.today()
         decided_at = decision_time(run_date, decision_ts)
@@ -1988,12 +2018,6 @@ class OptionsRecommender:
                 result = {
                     "status": "PASS",
                     "reason": f"Partial alignment — momentum={momentum:+.2%} ({window}), news_aligned={news_aligned}",
-                }
-            if basis == DATE_ONLY_BASIS and result["status"] == "FAIL":
-                result = {
-                    "status": "SKIP",
-                    "reason": "Date-only reconstruction, not a veto (no decision time): would FAIL: "
-                              + result["reason"],
                 }
             return {**result, **stamp}
 
