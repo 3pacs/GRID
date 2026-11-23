@@ -38,6 +38,7 @@ from sqlalchemy import (
     event,
     text,
 )
+from sqlalchemy.pool import StaticPool
 
 from alpha_research import conviction_scorer as cs
 from intelligence import signal_convergence_scanner as scs
@@ -419,7 +420,10 @@ def _evening(d: date) -> datetime:
 
 class _Form4DB:
     def __init__(self) -> None:
-        self.engine = create_engine("sqlite://")
+        # One shared connection: the API test reads it from a worker thread.
+        self.engine = create_engine(
+            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False},
+        )
         md = MetaData()
         source_catalog = Table(
             "source_catalog", md,
@@ -884,3 +888,117 @@ class TestDefect6Form4AndCompanyUnavailable:
         assert report.alert_level == "FIRE"
         assert report.unavailable_layers == ("COMPANY", "NARRATIVE", "FLOW")
         assert report.confidence_pct == pytest.approx(round(94 * 4 / 7, 1))
+
+
+# ── Defect 7: SMART_MONEY certainty never promotes the composite total ────
+#
+# Codex HOLD on #1353 57514cc5: score_ticker divides by sum(max * trust), so a
+# neutral SMART_MONEY with lower trust (short window 0.5, unavailable 0.15)
+# shrank the denominator and raised the total: 51 / (63.9 + 15 x 0.85) = 67
+# SCALE with full coverage, but 71 FIRE short and 77 unavailable. The other
+# layers below hold Codex's 51 earned of 63.9 weighted maximum.
+
+
+def _fix_other_layers(monkeypatch: pytest.MonkeyPatch, as_of: date) -> None:
+    idx = pd.date_range(end=as_of, periods=91, freq="D")
+    monkeypatch.setattr(cs, "_load_price", lambda *_a, **_k: pd.Series([100.0] * 91, index=idx))
+    fixed = {
+        "score_setup": cs.LayerResult("SETUP", 17.0, 17, 0.95, (), True),        # 16.15 / 16.15
+        "score_company": cs.LayerResult("COMPANY", 15.0, 15, 0.90, (), True),    # 13.50 / 13.50
+        "score_crowd": cs.LayerResult("CROWD", 10.0, 15, 0.75, (), True),        #  7.50 / 11.25
+        "score_narrative": cs.LayerResult("NARRATIVE", 4.9, 10, 0.50, (), True),  # 2.45 / 5.00
+        "score_flow": cs.LayerResult("FLOW", 7.0, 15, 0.60, (), True),           #  4.20 / 9.00
+        "score_confirmation": cs.LayerResult("CONFIRM", 8.0, 10, 0.90, (), True),  # 7.20 / 9.00
+    }
+    for name, layer in fixed.items():
+        monkeypatch.setattr(cs, name, lambda *_a, _layer=layer, **_k: _layer)
+
+
+def _coverage_db(kind: str, as_of: date, ps_value: float = 0.0, ps_shares: float = 0.0) -> _Form4DB:
+    db = _Form4DB()
+    last = as_of - timedelta(days=1)
+    trade = {"ps_shares": ps_shares, "ps_value": ps_value, "txns": 1.0} if ps_value else {}
+    days = {as_of - timedelta(days=3): trade} if trade else {}
+    if kind == "full":
+        db.cover(as_of - timedelta(days=90), last, days)
+    elif kind == "short":
+        db.cover(as_of - timedelta(days=7), last, days)
+    return db
+
+
+def _smart_money(report: cs.ConvictionReport) -> cs.LayerResult:
+    return next(layer for layer in report.layers if layer.name == "SMART_MONEY")
+
+
+class TestDefect7CompositeNoPromotion:
+    def test_neutral_smart_money_full_short_unavailable_leave_the_total_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _fix_other_layers(monkeypatch, AS_OF)
+        totals = {}
+        for kind, trust in (("full", 0.85), ("short", 0.5), ("unavailable", 0.15)):
+            report = cs.score_ticker(_coverage_db(kind, AS_OF).engine, "AAPL", as_of_date=AS_OF)
+            layer = _smart_money(report)
+            assert layer.score == 0
+            assert layer.trust == trust
+            assert layer.denominator_trust == 0.85
+            totals[kind] = (report.total_score, report.alert_level)
+
+        # round(100 x 51 / (63.9 + 15 x 0.85)) = 67 in every case: certainty
+        # lost on a neutral layer moves nothing (it was 67 / 71 FIRE / 77 FIRE).
+        assert totals == {"full": (67, "SCALE"), "short": (67, "SCALE"), "unavailable": (67, "SCALE")}
+
+    @pytest.mark.parametrize(
+        ("ps_value", "ps_shares"),
+        [(750_000.0, 9_000.0), (-750_000.0, -9_000.0)],
+        ids=["insider-buy", "insider-sell"],
+    )
+    def test_less_certainty_never_raises_the_total_above_its_evidence(
+        self, monkeypatch: pytest.MonkeyPatch, ps_value: float, ps_shares: float,
+    ) -> None:
+        _fix_other_layers(monkeypatch, AS_OF)
+        total = {
+            kind: cs.score_ticker(
+                _coverage_db(kind, AS_OF, ps_value, ps_shares).engine, "AAPL", as_of_date=AS_OF,
+            ).total_score
+            for kind in ("full", "short", "unavailable")
+        }
+        neutral = 67
+        if ps_value > 0:
+            # Buying: less certainty, less lift; never below neutral.
+            assert total["full"] >= total["short"] >= total["unavailable"] == neutral
+        else:
+            # Selling: less certainty, less penalty; never above neutral.
+            assert total["full"] <= total["short"] <= total["unavailable"] == neutral
+
+    def test_conviction_api_reports_the_unpromoted_total_and_the_weights(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from api.auth import require_auth
+        from api.routers import signals as signals_module
+
+        today = date.today()  # the route scores as of today
+        _fix_other_layers(monkeypatch, today)
+        app = FastAPI()
+        app.include_router(signals_module.router)
+        app.dependency_overrides[require_auth] = lambda: "test-token"
+        client = TestClient(app)
+
+        bodies = {}
+        for kind in ("full", "short", "unavailable"):
+            db = _coverage_db(kind, today)
+            monkeypatch.setattr(signals_module, "get_db_engine", lambda _e=db.engine: _e)
+            resp = client.get("/api/v1/signals/conviction/aapl")
+            assert resp.status_code == 200, resp.text
+            bodies[kind] = resp.json()
+
+        assert {k: (b["total_score"], b["alert_level"]) for k, b in bodies.items()} == {
+            "full": (67, "SCALE"), "short": (67, "SCALE"), "unavailable": (67, "SCALE"),
+        }
+        layers = {k: next(x for x in b["layers"] if x["name"] == "SMART_MONEY") for k, b in bodies.items()}
+        assert {k: (x["trust"], x["denominator_trust"]) for k, x in layers.items()} == {
+            "full": (0.85, 0.85), "short": (0.5, 0.85), "unavailable": (0.15, 0.85),
+        }

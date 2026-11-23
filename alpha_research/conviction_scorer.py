@@ -39,9 +39,19 @@ class LayerResult:
     name: str
     score: float  # may be negative (e.g., SMART_MONEY Form 4 net sell, capped at -2)
     max_score: float
-    trust: float  # 0-1, how much we trust this data
+    trust: float  # 0-1, how much we trust this data (weights the layer's score)
     signals: tuple[str, ...]
     data_available: bool
+    # Weight of max_score in the composite denominator; None means ``trust``.
+    # A layer whose certainty can drop (SMART_MONEY's Form 4 coverage) keeps
+    # its full-certainty weight here, so lost certainty can only shrink its
+    # contribution toward neutral and never raises total_score by shrinking
+    # the denominator (Codex HOLD on #1353 57514cc5).
+    baseline_trust: float | None = None
+
+    @property
+    def denominator_trust(self) -> float:
+        return self.trust if self.baseline_trust is None else max(self.trust, self.baseline_trust)
 
 
 @dataclass(frozen=True)
@@ -405,6 +415,9 @@ _FORM4_MIN_VERIFIED_DAYS = 7
 _FORM4_PS_LABEL = "Insider reported P/S (non-derivative, venue unknown)"
 _FORM4_VALUE_STRONG_USD = 500_000.0
 _FORM4_SELL_CAP = -2.0
+# SMART_MONEY's trust on a full verified 90-day window, and its fixed weight
+# in score_ticker's denominator whatever the coverage (LayerResult.baseline_trust).
+_SMART_MONEY_FULL_TRUST = 0.85
 
 
 @dataclass(frozen=True)
@@ -566,7 +579,7 @@ def score_smart_money(
     # sorted last (Codex HOLD on #1353 5c4c7b32).
     signals.append("Institutional flow unavailable (no INST_FLOW writer; 13F is non-directional)")
 
-    trust = (0.85 if full_window else 0.5) if has_data else 0.15
+    trust = (_SMART_MONEY_FULL_TRUST if full_window else 0.5) if has_data else 0.15
     return LayerResult(
         "SMART_MONEY",
         max(_FORM4_SELL_CAP, min(points, 15.0)),
@@ -574,6 +587,7 @@ def score_smart_money(
         trust,
         tuple(signals),
         has_data,
+        baseline_trust=_SMART_MONEY_FULL_TRUST,
     )
 
 
@@ -798,8 +812,12 @@ def score_ticker(
     # Exclude never-written None layers (COMPANY) from the weighted total, while
     # keeping data_available=False layers as before (counted as 0) so thin data
     # cannot inflate total_score.
+    # A layer's denominator weight is its baseline_trust when set (see
+    # LayerResult): for SMART_MONEY, a shorter verified window or no coverage
+    # lowers the numerator weight only, so the same evidence with less
+    # certainty can never promote the total.
     weighted_score = sum(layer.score * layer.trust for layer in present_layers)
-    weighted_max = sum(layer.max_score * layer.trust for layer in present_layers)
+    weighted_max = sum(layer.max_score * layer.denominator_trust for layer in present_layers)
     total = (
         max(0, min(100, int(round(weighted_score / weighted_max * 100))))
         if weighted_max > 0
