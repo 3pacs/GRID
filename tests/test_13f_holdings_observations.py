@@ -869,3 +869,92 @@ def test_a_newer_unvalidatable_receipt_withholds_the_manager(engine, monkeypatch
     snap = h13f.read_13f_holdings_snapshot(engine)
     assert snap.holdings == () and snap.counts["managers_receipt_unreadable"] == 1
     assert h13f.read_13f_holdings_snapshot(engine, as_of=later - timedelta(days=1)).holdings != ()
+
+
+# ── Codex HOLD 6016542599: undated amendment candidates ───────────────────
+
+def _restatement_scenario(edgar, *, restated_cover="ok", index_report_date=False, fail=None):
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    y_unchanged = {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, dict(y_unchanged)))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    amendment = s.Filing("A-0R", q0_filed + timedelta(days=3), q0_report, dict(y_unchanged), form="13F-HR/A",
+                         cover=restated_cover, index_report_date=index_report_date)
+    if fail:
+        amendment.fail, amendment.fail_on = fail, "cover"
+    edgar.add(s.CIK_ALPHA, amendment)
+    return q0_filed
+
+
+def test_an_undated_restatement_takes_its_quarter_from_its_cover(engine, monkeypatch, served):
+    """The index leaves the restatement's reportDate blank. Its cover page
+    dates it (and says RESTATEMENT), so it still withdraws the original's X
+    through the served route."""
+    edgar = s.FakeEdgar()
+    q0_filed = _restatement_scenario(edgar)
+    s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    edgar.today = q0_filed
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    assert s.ROOT in _served_layer9(served)["actors"][0]["shared_tickers"]
+
+    edgar.today = date.today()
+    results = s.run_writer(engine, monkeypatch, edgar, filers)
+    assert _served_layer9(served)["actors"] == []
+    assert results[0]["status"] == "SUCCESS" and results[0]["changes_detected"] == 0
+    receipt = _receipt(engine, "A-0R")
+    assert receipt["comparison_status"] == "compared" and receipt["report_date"] == s.quarter_dates(0)[0].isoformat()
+
+
+@pytest.mark.parametrize("defect", ["missing", "malformed", "503"])
+def test_an_undated_amendment_with_no_recoverable_quarter_withholds_the_current_quarter(
+    engine, monkeypatch, served, defect
+):
+    """The index leaves a newer amendment's reportDate blank and its cover
+    cannot date it (missing, malformed, a 503): the current quarter is
+    withheld rather than left to the original. As of before it, the original
+    shows (control)."""
+    edgar = s.FakeEdgar()
+    q0_filed = _restatement_scenario(
+        edgar, restated_cover="ok" if defect == "503" else defect, fail="503" if defect == "503" else None
+    )
+    s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    edgar.today = q0_filed
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    s.set_receipt(engine, q0_filed, datetime.combine(q0_filed, datetime.min.time()).replace(hour=6))
+
+    edgar.today = date.today()
+    results = s.run_writer(engine, monkeypatch, edgar, filers)
+    assert _served_layer9(served)["actors"] == []
+    assert results[0]["status"] == "QUARANTINED"
+    assert results[0]["curr_snapshot"] == "unresolved_undated_amendment"
+    receipt = _receipt(engine, "A-0")
+    assert receipt["comparison_status"] == "withheld_incomplete"
+    assert [u["accession"] for u in receipt["curr_snapshot"]["unresolved_amendments"]] == ["A-0R"]
+    assert h13f.read_13f_holdings_snapshot(engine).counts["managers_latest_filing_unverified"] == 1
+    control = _by_key(h13f.read_13f_holdings_snapshot(engine, as_of=q0_filed))
+    assert {(s.CIK_ALPHA, s.ROOT), (s.CIK_ALPHA, s.PEER_A)} <= set(control)
+
+
+def test_an_old_undated_amendment_does_not_touch_the_compared_quarters(engine, monkeypatch):
+    """An undated amendment filed before every compared filing cannot amend
+    them: its cover is not fetched and the comparison proceeds."""
+    edgar = s.two_quarter_scenario()
+    old_report, old_filed = s.quarter_dates(3)
+    edgar.add(s.CIK_ALPHA, s.Filing("A-OLD", old_filed, old_report, {}, form="13F-HR/A", cover="missing",
+                                    index_report_date=False))
+    fetched: list[str] = []
+    real_get = edgar.get
+
+    def spy(url, headers=None, timeout=None):
+        fetched.append(url)
+        return real_get(url, headers=headers, timeout=timeout)
+
+    edgar.get = spy
+    results = s.run_writer(engine, monkeypatch, edgar, {s.CIK_ALPHA: s.ALPHA})
+    assert results[0]["status"] == "SUCCESS"
+    assert not [u for u in fetched if "A-OLD".replace("-", "") in u]
+    assert (s.CIK_ALPHA, s.ROOT) in _by_key(h13f.read_13f_holdings_snapshot(engine))

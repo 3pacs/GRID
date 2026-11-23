@@ -62,6 +62,7 @@ class Filing:
     # on "index" (index.json), "cover" (primary_doc.xml) or "infotable".
     fail: str | None = None
     fail_on: str = "index"
+    index_report_date: bool = True  # False: the submissions index leaves reportDate blank
 
 
 class _Resp:
@@ -102,7 +103,8 @@ class FakeEdgar:
                 return _Resp(status=404)
             # The real submissions shape: parallel arrays under filings.recent,
             # other forms mixed in, and no amendment type anywhere.
-            rows = [(f.form, f.accession, f.filing_date, f.report_date, "xslForm13F_X02/primary_doc.xml")
+            rows = [(f.form, f.accession, f.filing_date, f.report_date if f.index_report_date else None,
+                     "xslForm13F_X02/primary_doc.xml")
                     for f in self._visible(match)]
             rows.append(("4", f"{match}-26-900001", self.today, None, "xslF345X05/form4.xml"))
             rows.sort(key=lambda r: r[2], reverse=True)

@@ -55,7 +55,9 @@ Point in time
   as-of) and once received by GRID (``pull_timestamp`` <= the as-of instant;
   for an explicit as-of date, the end of that UTC day).
 * Per ``(series_id, obs_date)`` the latest visible vintage wins (the same
-  rule as ``store/observations.py`` LATEST_AS_OF).
+  rule as ``store/observations.py`` LATEST_AS_OF). Receipts and change rows
+  come from one statement, so one PostgreSQL snapshot: a writer committing
+  between two reads cannot pair old receipts with new change rows.
 * Per filer-quarter, the winning filing is the latest by (filing date,
   amendment, accession) among the filings the receipts name, current or
   prior side: the writer's own selection rule. A restatement therefore
@@ -170,6 +172,9 @@ _SNAPSHOT_TTL_SECONDS = 600.0
 # 13F <value> is whole dollars for filings on/after 2023-01-03, thousands before.
 _13F_DOLLAR_CUTOVER_DATE = date(2023, 1, 3)
 
+# One statement for receipts and change rows: under PostgreSQL READ COMMITTED
+# every statement takes its own snapshot, so two reads could pair a receipt
+# from before a writer's commit with change rows from after it.
 _READ_SQL = text(
     "SELECT series_id, obs_date, value, raw_payload, pull_timestamp FROM ("
     " SELECT series_id, obs_date, value, raw_payload, pull_timestamp,"
@@ -177,7 +182,7 @@ _READ_SQL = text(
     "  PARTITION BY series_id, obs_date ORDER BY pull_timestamp DESC"
     " ) AS vintage_rank"
     " FROM raw_series"
-    " WHERE series_id LIKE :pattern"
+    " WHERE (series_id LIKE :change_pattern OR series_id LIKE :receipt_pattern)"
     " AND pull_status = 'SUCCESS'"
     " AND obs_date >= :earliest"
     " AND obs_date <= :as_of"
@@ -503,11 +508,24 @@ def read_13f_holdings_snapshot(
     return snapshot
 
 
-def _latest_vintages(conn: Any, pattern: str, earliest: date, day: date, instant: datetime) -> list[Any]:
-    return conn.execute(
+def _latest_vintages(
+    conn: Any, earliest: date, day: date, instant: datetime
+) -> tuple[list[Any], list[Any]]:
+    """``(receipt_rows, change_rows)`` read in one statement (one snapshot)."""
+    rows = conn.execute(
         _READ_SQL,
-        {"pattern": pattern, "earliest": earliest, "as_of": day, "as_of_ts": instant},
+        {
+            "change_pattern": "13F:%",
+            "receipt_pattern": f"{WRITER_RECEIPT_PREFIX}:%",
+            "earliest": earliest,
+            "as_of": day,
+            "as_of_ts": instant,
+        },
     ).fetchall()
+    receipt_prefix = f"{WRITER_RECEIPT_PREFIX}:"
+    receipts = [r for r in rows if str(r[0]).startswith(receipt_prefix)]
+    changes = [r for r in rows if str(r[0]).startswith("13F:")]
+    return receipts, changes
 
 
 def _visible(raw_obs_date: Any, raw_pull_ts: Any, day: date, instant: datetime) -> tuple[date, datetime] | None:
@@ -528,15 +546,14 @@ def _read(
 ) -> HoldingsSnapshot:
     earliest = day - timedelta(days=max(int(lookback_days), 1))
     with engine.connect() as conn:
+        receipt_rows, change_rows = _latest_vintages(conn, earliest, day, instant)
         # Stage 1: filing comparison receipts -> per-quarter authority.
         receipts: dict[tuple[str, str], dict[str, Any]] = {}
         # Latest filing date of a receipt that could not be validated, per
         # manager: a newer unreadable receipt must not leave an older valid
         # one standing as the latest.
         unreadable_since: dict[str, date] = {}
-        for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in _latest_vintages(
-            conn, f"{WRITER_RECEIPT_PREFIX}:%", earliest, day, instant
-        ):
+        for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in receipt_rows:
             _bump(counts, "receipts_read")
             parts = str(series_id).split(":")
             seen = _visible(raw_obs_date, raw_pull_ts, day, instant)
@@ -560,9 +577,7 @@ def _read(
 
         # Stage 2: labelled change rows from a verified, winning comparison.
         by_manager: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-        for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in _latest_vintages(
-            conn, "13F:%", earliest, day, instant
-        ):
+        for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in change_rows:
             _bump(counts, "rows_read")
             parts = str(series_id).split(":")
             if len(parts) != 4 or parts[0] != "13F" or parts[3].strip().upper() not in _KIND_FOR_ACTION:

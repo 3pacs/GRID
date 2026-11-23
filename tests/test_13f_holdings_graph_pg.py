@@ -243,3 +243,73 @@ def test_pg_known_newer_filing_that_fails_to_read_is_recorded_until_recovery(pg_
     assert s.run_writer(pg_engine, monkeypatch, edgar, filers)[0]["status"] == "SUCCESS"
     recovered = _layer9_live(monkeypatch, pg_engine)
     assert recovered["actors"][0]["observation"]["held_through_report_date"] == dates[0][0].isoformat()
+
+
+def test_pg_receipts_and_change_rows_come_from_one_snapshot(pg_engine, monkeypatch):
+    """Codex HOLD 6016542599 (2): a writer whose transaction began before the
+    read commits a new comparison (Q0 against Q-1's restatement) right after
+    the reader's first raw_series statement. Under READ COMMITTED a second
+    statement would see the new change rows against the old receipts and
+    drop them as stale (a state that never existed). The reader must show
+    one consistent state: the one before the commit, then the new one."""
+    from sqlalchemy import event
+
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    earlier = datetime.combine(q0_filed, datetime.min.time(), tzinfo=timezone.utc).replace(hour=6)
+
+    s.run_writer(pg_engine, monkeypatch, edgar, filers)
+    s.set_receipt(pg_engine, q0_filed, earlier)
+    # The real writer's next run (after Q-1 is restated), captured on a
+    # scratch engine so its rows can be committed concurrently on PG.
+    scratch = s.make_sqlite_engine()
+    s.run_writer(scratch, monkeypatch, edgar, filers)
+    s.set_receipt(scratch, q0_filed, earlier.replace(tzinfo=None))
+    with scratch.connect() as conn:
+        first_run_max = conn.execute(text("SELECT MAX(id) FROM raw_series")).scalar()
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1R", q0_filed + timedelta(days=1), q1_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)},
+        form="13F-HR/A"))
+    s.run_writer(scratch, monkeypatch, edgar, filers)
+    with scratch.connect() as conn:
+        second_run = conn.execute(
+            text("SELECT series_id, obs_date, value, raw_payload FROM raw_series WHERE id > :m ORDER BY id"),
+            {"m": first_run_max},
+        ).fetchall()
+    assert any(r[0].startswith("13F-FILING:") for r in second_run)
+    assert any(r[0].endswith(":INCREASED") for r in second_run)
+
+    writer_conn = pg_engine.connect()
+    writer_tx = writer_conn.begin()  # NOW() = this transaction's start, before the read
+    for series_id, obs_date, value, payload in second_run:
+        writer_conn.execute(
+            text("INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                 "VALUES (:sid, 7, :d, :v, :p, 'SUCCESS')"),
+            {"sid": series_id, "d": obs_date, "v": value, "p": payload},
+        )
+    fired: list[str] = []
+
+    def commit_mid_read(conn, cursor, statement, params, context, executemany):
+        if "FROM raw_series" in statement and "vintage_rank" in statement and not fired:
+            fired.append(statement)
+            writer_tx.commit()
+
+    event.listen(pg_engine, "after_cursor_execute", commit_mid_read)
+    try:
+        during = h13f.read_13f_holdings_snapshot(pg_engine)
+    finally:
+        event.remove(pg_engine, "after_cursor_execute", commit_mid_read)
+        writer_conn.close()
+    assert len(fired) == 1
+    assert {h.ticker for h in during.holdings} == {s.ROOT, s.PEER_A}  # the state before the commit
+    assert "stale_comparison" not in during.counts
+
+    h13f.clear_snapshot_cache()
+    after = h13f.read_13f_holdings_snapshot(pg_engine)
+    assert {h.ticker for h in after.holdings} == {s.PEER_A}  # the committed state
+    assert after.counts["stale_comparison"] == 1
