@@ -1317,7 +1317,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "prediction_pmxt",   "mod": "ingestion.altdata.prediction_pmxt",   "cls": "PmxtPredictionPuller",     "method": "pull",          "freq_h": 12, "timeout_s": 120},
     {"name": "smart_money",       "mod": "ingestion.altdata.smart_money",       "cls": "SmartMoneyPuller",         "method": "pull_all",      "freq_h": 1, "timeout_s": 240},  # hourly: 5 Arctic Shift reads per run (free community API; Reddit RSS 404 since 2026-11-17)
     {"name": "fed_liquidity",     "mod": "ingestion.altdata.fed_liquidity",     "cls": "FedLiquidityPuller",       "method": "pull_all",      "freq_h": 12, "timeout_s": 60, "api_key": "FRED_API_KEY"},
-    {"name": "etf_flows",         "mod": "ingestion.altdata.institutional_flows","cls": "InstitutionalFlowsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120},
+    {"name": "etf_flows",         "mod": "ingestion.altdata.institutional_flows","cls": "InstitutionalFlowsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 600},  # 11 ETFs then 75 managers' two latest 13F filings read in full: 346 s on 2026-11-23; 120 s cut every run off at manager 26
     {"name": "analyst_ratings",   "mod": "ingestion.altdata.analyst_ratings",   "cls": "AnalystRatingsPuller",     "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
     {
         "name": "gdelt",
@@ -1407,7 +1407,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env",
      "hold_reason": "Retired 2026-11-08 (owner): the Tiingo plan covers only the DOW 30 (89 of 138 tickers refused); market cap and shares come from sec_xbrl_shares (ticker_metrics_daily) for the full universe"},
-    {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
+    {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 240, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},  # 10 endpoints take 84-124 s; 120 s failed 5 of 13 runs (2026-11-19..23) that then finished and stored their rows
 
     # ── Crypto (DexScreener) ──
     # PumpFun is deliberately not registered (E1-V3): the entry named a

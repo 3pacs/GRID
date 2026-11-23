@@ -72,6 +72,7 @@ _REQUEST_TIMEOUT = 30
 ROUTINE_OVERLAP_DAYS = 10          # re-check this many days behind the latest stored session
 LAPSED_WINDOW_DAYS = 10            # a close this recent before the expected session = the ticker was live
 MAX_NAMED_TICKERS = 50             # tickers named per bucket in the pull summary and log
+MAX_COVERAGE_CHECKS = 25           # lapsed tickers looked up in Tiingo's own listing per run
 NEW_TICKER_START = "2020-01-01"    # routine first pull for a ticker with no TIINGO rows (pull_ticker's default)
 EOD_READY_ET = dtime(18, 0)        # a session's EOD bar is treated as published from 18:00 America/New_York
 DEFAULT_MAX_WORKERS = 3            # concurrent HTTP fetches
@@ -186,9 +187,10 @@ def still_behind(results: list[dict[str, Any]], expected: date) -> list[tuple[st
     """(ticker, latest close before the run) for every fetched ticker that
     still has no close for ``expected``: no data, a failed fetch, or data
     that stops earlier. A ticker last seen inside ``LAPSED_WINDOW_DAYS`` was
-    trading, so missing it now is a failure, not a delisting; the pull
-    reports PARTIAL and names it. Long-dead and never-served symbols (renamed
-    companies, FX, crypto) are counted but do not fail the run.
+    trading, so missing it now is a failure unless Tiingo's own listing says
+    it stopped (:func:`ended_at_source`); the pull reports PARTIAL and names
+    it. Long-dead and never-served symbols (renamed companies, FX, crypto)
+    are counted but do not fail the run.
     """
     out: list[tuple[str, date | None]] = []
     for r in results:
@@ -199,6 +201,28 @@ def still_behind(results: list[dict[str, Any]], expected: date) -> list[tuple[st
         if latest is None or latest < expected:
             out.append((r["ticker"], before))
     return out
+
+
+def ended_at_source(coverage_end: date | None, expected: date) -> bool:
+    """True when Tiingo's own listing stops before the session ahead of ``expected``.
+
+    ``coverage_end`` is the ``endDate`` of ``/tiingo/daily/{ticker}``, or
+    ``None`` when Tiingo lists no price history under the symbol. An
+    ``endDate`` on the prior session is not proof: Tiingo may only be late
+    with the newest bar, so that ticker stays lapsed.
+
+    2026-11-10..23: no routine price run reported SUCCESS for two weeks while
+    prices arrived for about 1,700 tickers each day. Every run named a few
+    tickers Tiingo itself had stopped serving (KPTI ``endDate`` 2026-11-10,
+    ROKU 2026-11-06, BKH no dates, GWHT not found). A stopped symbol is the
+    provider's answer, not a missed bar; it is named in ``ended_at_source``
+    and no longer makes the run PARTIAL.
+    """
+    from ingestion.market_calendar import last_trading_day
+
+    if coverage_end is None:
+        return True
+    return coverage_end < last_trading_day(expected - timedelta(days=1))
 
 
 def _tiingo_headers() -> dict[str, str]:
@@ -396,6 +420,41 @@ class TiingoPuller(BasePuller):
             result["errors"].append(err_str)
 
         return result
+
+    def _coverage_end(
+        self, ticker: str, limiter: _RateLimiter | None = None,
+    ) -> tuple[bool, date | None]:
+        """Tiingo's own listing for ``ticker``: ``(known, endDate)``.
+
+        ``(True, None)``: Tiingo answered and holds no price history under the
+        symbol (HTTP 404, or a listing without an ``endDate``). ``(False,
+        None)``: no usable answer (rate limit, server error, network, odd
+        body), so the caller must keep treating the ticker as lapsed.
+        """
+        if limiter is not None:
+            limiter.wait()
+        try:
+            resp = requests.get(
+                f"{_BASE_URL}/tiingo/daily/{ticker}",
+                headers=_tiingo_headers(), timeout=_REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 404:
+                return True, None
+            if resp.status_code != 200:
+                return False, None
+            meta = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Tiingo {t}: listing lookup failed ({e})", t=ticker, e=type(exc).__name__)
+            return False, None
+        if not isinstance(meta, dict):
+            return False, None
+        raw_end = meta.get("endDate")
+        if raw_end is None:
+            return True, None
+        try:
+            return True, date.fromisoformat(str(raw_end)[:10])
+        except ValueError:
+            return False, None
 
     def _split_rows(self, ticker: str, df: pd.DataFrame) -> list[dict[str, Any]]:
         """``YF:{ticker}:split_factor`` rows for the non-unit ``splitFactor`` days in ``df``.
@@ -722,7 +781,8 @@ class TiingoPuller(BasePuller):
         dict whose ``status`` is SUCCESS, PARTIAL (stopped by
         ``should_continue`` or the index-corruption breaker, or a ticker that
         was trading inside ``LAPSED_WINDOW_DAYS`` got no close for the expected
-        session: see :func:`still_behind`), FAILED (most
+        session: see :func:`still_behind`; one Tiingo's own listing shows as
+        stopped is named in ``ended_at_source`` instead), FAILED (most
         fetches failed) or SKIPPED (another run holds the lock -- callers
         must not treat that as a completed pull).
         """
@@ -793,6 +853,16 @@ class TiingoPuller(BasePuller):
             lapsed = [t for t, before in behind
                       if before is not None
                       and before >= expected - timedelta(days=LAPSED_WINDOW_DAYS)]
+            # Ask Tiingo's listing about each lapsed ticker: one it stopped
+            # serving is its answer, not a missed bar (see ended_at_source).
+            ended: dict[str, str | None] = {}
+            for ticker in lapsed[:MAX_COVERAGE_CHECKS]:
+                if should_continue is not None and not should_continue():
+                    break
+                known, coverage_end = self._coverage_end(ticker, limiter)
+                if known and ended_at_source(coverage_end, expected):
+                    ended[ticker] = coverage_end.isoformat() if coverage_end else None
+            lapsed = [t for t in lapsed if t not in ended]
             if fetched >= 10 and failed * 2 > fetched:
                 status = "FAILED"
             elif unattempted or _INDEX_CORRUPTED_BREAKER or lapsed:
@@ -815,6 +885,7 @@ class TiingoPuller(BasePuller):
                                     if r["status"] == "PARTIAL"][:MAX_NAMED_TICKERS],
                 "behind": len(behind),
                 "lapsed_tickers": lapsed[:MAX_NAMED_TICKERS],
+                "ended_at_source": ended,
             }
             if status == "FAILED":
                 summary["error"] = f"{failed}/{fetched} Tiingo fetches failed"
@@ -834,6 +905,12 @@ class TiingoPuller(BasePuller):
                          t=", ".join(summary["no_data_tickers"]))
             if lapsed:
                 log.warning("Tiingo incremental pull: {e}", e=summary["error"])
+            if ended:
+                log.info(
+                    "Tiingo's listing has stopped for: {t}. Mark them in "
+                    "analysis/sector_map_ticker_status.yaml to stop fetching them",
+                    t=", ".join(f"{t} (last {d or 'none listed'})" for t, d in ended.items()),
+                )
             return summary
         finally:
             if lock_conn is not None:

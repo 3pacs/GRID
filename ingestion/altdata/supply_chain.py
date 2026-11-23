@@ -150,6 +150,36 @@ _DREWRY_PROSE_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 _DREWRY_SENTENCE_SPLIT_RE = re.compile(r"(?<!\d)\.(?:\s+|$)|[;!?]\s+")
+# The live page's own shape (read 2026-11-23; the rules above refused it and
+# container_index got nothing):
+#   <h4>Our detailed assessment for Thursday, 19 Nov 2026</h4>
+#   <ul><li>The Drewry World Container Index (WCI), ..., decreased 3% to $4,176
+#   per 40ft container this week due to declining rates on the Transpacific
+#   trade route. ...</li> ...</ul>
+# Two narrow allowances read it. Everything else still fails closed.
+# 1. A lane named after the value counts as the reason for the move only when
+#    the index is the subject of the sentence and a causal phrase stands
+#    between the value and the lane ("... to $4,176 ... due to ... the
+#    Transpacific"). "WCI rose to $2,680 on Shanghai - Rotterdam" is a lane rate.
+_DREWRY_WCI_SUBJECT_RE = re.compile(
+    r"^(?:the\s+)?(?:drewry\s+)?(?:world\s+container\s+index|wci)\b",
+    re.IGNORECASE,
+)
+_DREWRY_CAUSAL_RE = re.compile(
+    r"\b(?:due\s+to|driven\s+by|because\s+of|owing\s+to|led\s+by|"
+    r"following|amid|on\s+the\s+back\s+of)\b",
+    re.IGNORECASE,
+)
+# 2. The assessment date may come from the heading that directly introduces the
+#    sentence's paragraph or list (its nearest preceding sibling heading) when
+#    that heading says it is the assessment date.
+_DREWRY_ASSESSMENT_HEADING_DATE_RE = re.compile(
+    r"\bassess(?:ment|ed)\s+(?:for|on|of)\s*:?\s*"
+    r"(?:(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*,?\s*)?"
+    rf"({_DREWRY_DATE_TOKEN})",
+    re.IGNORECASE,
+)
+_DREWRY_HEADING_TAGS: tuple[str, ...] = ("h1", "h2", "h3", "h4", "h5", "h6")
 _DREWRY_USD_CELL_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)")
 _DREWRY_JS_PROP_STR_RE = re.compile(
     r"(?:[\"']?(?:label|name|title|id|seriesName|caption|metric|index)[\"']?)"
@@ -468,6 +498,44 @@ def _extract_drewry_chart_candidates(script_text: str) -> tuple[dict[date, float
     return {}, saw_unproven
 
 
+def _drewry_lane_is_trailing_cause(sentence: str, value_end: int) -> bool:
+    """True when every lane the sentence names follows the value as its stated cause.
+
+    ``value_end`` is where the matched index value ends. See the note above
+    ``_DREWRY_WCI_SUBJECT_RE``.
+    """
+    lane = _DREWRY_LANE_RE.search(sentence)
+    if lane is None:
+        return True
+    if lane.start() < value_end or not _DREWRY_WCI_SUBJECT_RE.match(sentence):
+        return False
+    return _DREWRY_CAUSAL_RE.search(sentence[value_end:lane.start()]) is not None
+
+
+def _drewry_introducing_assessment_date(block: Any) -> date | None:
+    """Assessment date from the heading that directly introduces ``block``.
+
+    The heading must be the nearest preceding sibling heading of the block
+    (of its list, for a list item), must say it is the assessment date and
+    must not name a lane or another index. A sibling that wraps a heading
+    ends the search: the date would no longer be this block's own.
+    """
+    start = block
+    parent = getattr(block, "parent", None)
+    if block.name == "li" and parent is not None and parent.name in ("ul", "ol"):
+        start = parent
+    for sibling in start.find_previous_siblings():
+        if sibling.name in _DREWRY_HEADING_TAGS:
+            text = sibling.get_text(" ", strip=True)
+            if _DREWRY_LANE_RE.search(text) or _DREWRY_FOREIGN_INDEX_RE.search(text):
+                return None
+            match = _DREWRY_ASSESSMENT_HEADING_DATE_RE.search(text)
+            return _parse_drewry_date(match.group(1)) if match else None
+        if sibling.find(list(_DREWRY_HEADING_TAGS)) is not None:
+            return None
+    return None
+
+
 def _parse_drewry_date(raw: str) -> date | None:
     """Parse a Drewry assessment date string; returns None if unparseable."""
     if not raw or not isinstance(raw, str):
@@ -656,17 +724,21 @@ def _parse_drewry_wci_html(
                 sentence = sentence.strip()
                 if not sentence:
                     continue
-                if _DREWRY_LANE_RE.search(sentence) or _DREWRY_FOREIGN_INDEX_RE.search(sentence):
+                if _DREWRY_FOREIGN_INDEX_RE.search(sentence):
                     continue
 
                 val: float | None = None
+                value_end = 0
                 for pattern in _DREWRY_PROSE_VALUE_PATTERNS:
                     val_match = pattern.search(sentence)
                     if val_match:
                         val = _parse_drewry_usd(val_match.group(1))
                         if val is not None:
+                            value_end = val_match.end()
                             break
                 if val is None:
+                    continue
+                if not _drewry_lane_is_trailing_cause(sentence, value_end):
                     continue
 
                 assessment_date: date | None = None
@@ -678,6 +750,8 @@ def _parse_drewry_wci_html(
                             break
                 if assessment_date is None:
                     assessment_date = scoped_heading_date
+                if assessment_date is None:
+                    assessment_date = _drewry_introducing_assessment_date(block)
 
                 if assessment_date is not None:
                     candidates[assessment_date] = val

@@ -1022,3 +1022,35 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
 - Remaining review gates: Claude reviews the pushed head; Anik alone decides
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
+
+## 2026-11-23 - puller triage: four stalled sources and the Twelve Data backfill unit (draft only)
+
+Branch `claude/puller-triage-20261123-a5d8fb`. Read-only on grid-svr; nothing
+deployed, restarted or run by hand.
+
+- **Tiingo prices were never stalled.** `smart:tiingo` / `Tiingo_Prices` had no
+  SUCCESS row from 11-10 to 11-23 while each run wrote the session's closes
+  (SPY and about 1,700 others current to 11-20). Each run was PARTIAL for a few
+  tickers Tiingo itself stopped serving (KPTI `endDate` 11-10, ROKU 11-06, BKH
+  no dates, GWHT not found). `pull_incremental` now asks Tiingo's listing
+  (`/tiingo/daily/{ticker}`) about each lapsed ticker; one whose listing stops
+  before the prior session is named in `ended_at_source` and no longer makes
+  the run PARTIAL. A ticker Tiingo still lists, or no listing answer, stays
+  lapsed (the 11-08 no-false-green rule is unchanged).
+- **etf_flows**: since #1393 the full 13F read takes 346 s; `timeout_s` was 120.
+  Raised to 600. **quiverquant**: runs take 84-124 s against 120; raised to 240.
+  Both are `PULLER_REGISTRY` data, so `tests/test_hermes_sec_only.py` carries a
+  dated SCHED re-pin (08c0356f -> 5a2d3ff5) that needs reviewer acceptance.
+- **Drewry WCI**: the 11-22 proof rules refused the live page's own sentence
+  (the date sits in an `<h4>` above a list; the sentence names the Transpacific
+  as the cause). Two narrow allowances read it; `tests/test_drewry_live_page_shape.py`
+  holds the live structure and one refusal per changed detail.
+- **`scripts/td_backfill_universe.py`**: a symbol Twelve Data refuses (404 about
+  the symbol, or 400 "No data is available on the specified dates") is skipped
+  with Twelve Data's reason and does not decide the exit code. The run still
+  exits 1 when every attempted fetch fails.
+- **GDELT**: no code change. `api.gdeltproject.org:443` refused TCP from
+  grid-svr, precision5520 and i7gen10 at 22:30Z; before that the DOC API
+  answered grid-svr with 429 on most runs since October.
+- Not fixed here: each `etf_flows` run more than an hour after the last appends
+  about 41,700 13F rows again (`BasePuller._row_exists` has a one-hour window).
