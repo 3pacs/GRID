@@ -59,6 +59,7 @@ from typing import Any
 import pandas as pd
 import requests
 from loguru import logger as log
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, _http_status_from_exc, retry_on_failure
@@ -118,6 +119,16 @@ PUT_CALL_DEFAULT_LOOKBACK_DAYS: int = 10
 # CDN is blocking us rather than describing holidays: FAILED, not SUCCESS.
 PUT_CALL_ALL_REFUSED_MIN: int = 3
 _PUT_CALL_DELAY: float = 0.3
+# One put/call writer at a time (Codex review 6029448579). The insert
+# transaction takes this transaction-scoped lock before it looks the stored
+# dates up again, so an overlapping run waits for the first to commit and
+# then sees its rows. raw_series' unique index includes pull_timestamp, so
+# without the lock two runs could each store a SUCCESS row for one session.
+# Only this writer takes it; other raw_series writers and their vintages are
+# unchanged.
+PUT_CALL_WRITER_LOCK_KEY: str = "ingestion.altdata.cboe_indices.put_call_pages"
+_PUT_CALL_WRITER_LOCK = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
+_PUT_CALL_LOCK_TIMEOUT = text("SET LOCAL lock_timeout = '60s'")
 
 _HEADERS: dict[str, str] = {
     # CBOE's CDN returns 403 for generic bot User-Agents. A mainstream
@@ -261,8 +272,10 @@ class CBOEIndicesPuller(BasePuller):
         page URL. Three steps, so no transaction is open while pages are
         read: look up the stored dates (a read-only connection), read the
         pages, then insert in one transaction that opens after the last read.
-        The insert transaction looks the dates up again and skips any a
-        concurrent run stored meanwhile. pull_timestamp (DEFAULT NOW()) is
+        The insert transaction takes the put/call writer lock, then looks the
+        dates up again and skips any another run stored: an overlapping run
+        waits for the lock, so one session gets one SUCCESS row per series
+        (a lock wait over 60 s fails the run). pull_timestamp (DEFAULT NOW()) is
         that transaction's start: at or after every page's read, a proxy for
         the acquisition time (module docstring). Returns one result per
         series, so a page that loses one ratio fails that series alone.
@@ -308,11 +321,14 @@ class CBOEIndicesPuller(BasePuller):
                 day += timedelta(days=1)
             if read:
                 # Opens after the last page was read: NOW() is at or after
-                # every read below.
+                # every read below. The lock comes before the recheck, so a
+                # run that held it has committed by the time this one looks.
                 with self.engine.begin() as conn:
+                    conn.execute(_PUT_CALL_LOCK_TIMEOUT)
+                    conn.execute(_PUT_CALL_WRITER_LOCK, {"key": PUT_CALL_WRITER_LOCK_KEY})
                     stored = {
                         sid: self._get_existing_dates(sid, conn, start_date=start, end_date=end)
-                        for sid in {sid for sid, *_ in read}
+                        for sid in dict.fromkeys(sid for sid, *_ in read)
                     }
                     for sid, day, value, payload in read:
                         if day in stored[sid]:

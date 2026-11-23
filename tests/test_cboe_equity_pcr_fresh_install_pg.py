@@ -15,6 +15,13 @@ put/call series, and this file runs both on PostgreSQL:
   transaction's start. Every stored row's stamp must be at or after the
   database clock when its page was read.
 
+Codex review 6029448579 (at 0ae0c4d7) added one more: two overlapping runs
+could both pass the stored-dates recheck before either wrote, and since
+uq_raw_series_composite includes pull_timestamp, both would store a SUCCESS
+row for one session. The second test runs two pullers on two connections,
+holds the first one's insert transaction open after its inserts, and checks
+the second waits for the writer lock, then stores nothing.
+
 Throwaway schema per test, dropped afterwards. Skips without
 ``GRID_TEST_DB_URL``; the CI step "Cboe equity put/call fresh-install
 PostgreSQL contract" fails on any skip.
@@ -26,6 +33,8 @@ import importlib
 import json
 import os
 import re
+import threading
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -190,4 +199,92 @@ def test_fresh_upgrade_first_pull_and_resolve_leave_no_ghost_mapping(pg_engine, 
     assert [tuple(r) for r in resolved] == [
         (EQUITY_PUT_CALL_SERIES_ID, _SESSION, 0.77),
         (PUT_CALL_SERIES_ID, _SESSION, 1.13),
+    ]
+
+
+def _advisory_lock_waiters(engine: Engine) -> int:
+    with engine.connect() as conn:
+        return conn.execute(text(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event = 'advisory'"
+        )).scalar_one()
+
+
+def _run(target, out: dict[str, Any]) -> threading.Thread:
+    def body() -> None:
+        try:
+            out["results"] = {r["feature_name"]: r for r in target()}
+        except Exception as exc:  # noqa: BLE001 - a thread error is surfaced by the asserts below
+            out["error"] = exc
+
+    thread = threading.Thread(target=body, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_overlapping_runs_store_one_success_row_per_session(pg_engine, monkeypatch) -> None:
+    # Two pullers, two connections, the same session missing for both. Run A
+    # reads the page, takes the writer lock, inserts both ratios and is held
+    # before commit; run B, started then, has read the page too and must wait
+    # on the lock, then recheck, see A's rows and insert nothing.
+    _upgrade(pg_engine)
+    monkeypatch.setattr(cboe_indices, "date", _Today)
+    monkeypatch.setattr(cboe_indices.time, "sleep", lambda *_a: None)
+    page = json.loads(REAL_PAGE.read_text(encoding="utf-8"))
+
+    def fake_json(url: str) -> dict[str, Any] | None:
+        return page if url.rsplit("/", 1)[1].startswith(_SESSION.isoformat()) else None
+
+    first, second = CBOEIndicesPuller(pg_engine), CBOEIndicesPuller(pg_engine)
+    for puller in (first, second):
+        monkeypatch.setattr(puller, "_download_json", fake_json)
+
+    inserted_by_a, release_a = threading.Event(), threading.Event()
+    real_insert = first._insert_raw
+    calls = {"n": 0}
+
+    def insert_then_hold(**kwargs: Any) -> Any:
+        out = real_insert(**kwargs)
+        calls["n"] += 1
+        if calls["n"] == 2:  # both ratios written, transaction still open
+            inserted_by_a.set()
+            assert release_a.wait(60)
+        return out
+
+    monkeypatch.setattr(first, "_insert_raw", insert_then_hold)
+
+    a_out: dict[str, Any] = {}
+    b_out: dict[str, Any] = {}
+    run_a = _run(lambda: first.pull_put_call_ratio(days_back=3), a_out)
+    try:
+        assert inserted_by_a.wait(30), a_out
+        run_b = _run(lambda: second.pull_put_call_ratio(days_back=3), b_out)
+        deadline = time.monotonic() + 15
+        while _advisory_lock_waiters(pg_engine) == 0 and run_b.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        b_waited = _advisory_lock_waiters(pg_engine) == 1 and run_b.is_alive()
+    finally:
+        release_a.set()
+    run_a.join(60)
+    run_b.join(60)
+
+    assert "error" not in a_out and "error" not in b_out, (a_out, b_out)
+    assert b_waited, "the second run did not wait for the writer lock"
+    assert a_out["results"] == {
+        PUT_CALL_SERIES_ID: {"status": "SUCCESS", "rows_inserted": 1, "feature_name": PUT_CALL_SERIES_ID},
+        EQUITY_PUT_CALL_SERIES_ID: {"status": "SUCCESS", "rows_inserted": 1, "feature_name": EQUITY_PUT_CALL_SERIES_ID},
+    }
+    # B read the page, found A's rows on the recheck, and wrote nothing.
+    assert b_out["results"] == {
+        PUT_CALL_SERIES_ID: {"status": "SUCCESS", "rows_inserted": 0, "feature_name": PUT_CALL_SERIES_ID},
+        EQUITY_PUT_CALL_SERIES_ID: {"status": "SUCCESS", "rows_inserted": 0, "feature_name": EQUITY_PUT_CALL_SERIES_ID},
+    }
+    with pg_engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT series_id, obs_date, pull_status, count(*) AS n FROM raw_series "
+            "GROUP BY series_id, obs_date, pull_status ORDER BY series_id"
+        )).fetchall()
+    assert [tuple(r) for r in rows] == [
+        (EQUITY_PUT_CALL_SERIES_ID, _SESSION, "SUCCESS", 1),
+        (PUT_CALL_SERIES_ID, _SESSION, "SUCCESS", 1),
     ]

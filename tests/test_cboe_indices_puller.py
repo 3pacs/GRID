@@ -330,8 +330,12 @@ class TestPutCallDailyPages:
         engine = MagicMock()
 
         def ctx(label):
+            conn = MagicMock()
+            conn.label = label
+            conn.execute.side_effect = lambda stmt, *_a, **_k: events.append(
+                f"{label} lock" if "pg_advisory_xact_lock" in str(stmt) else f"{label} {str(stmt).split()[2]}")
             cm = MagicMock()
-            cm.__enter__ = MagicMock(side_effect=lambda *_a: events.append(f"{label} opens") or MagicMock())
+            cm.__enter__ = MagicMock(side_effect=lambda *_a: events.append(f"{label} opens") or conn)
             cm.__exit__ = MagicMock(side_effect=lambda *_a: events.append(f"{label} closes") or False)
             return cm
 
@@ -348,16 +352,20 @@ class TestPutCallDailyPages:
             return pages.get(day)
 
         with patch.object(puller, "_download_json", side_effect=fake_json), \
-             patch.object(puller, "_get_existing_dates", side_effect=lambda sid, conn, **_: set(on_file)), \
+             patch.object(puller, "_get_existing_dates",
+                          side_effect=lambda sid, conn, **_: events.append(f"{conn.label} lookup {sid}") or set(on_file)), \
              patch.object(puller, "_insert_raw",
                           side_effect=lambda conn, series_id, obs_date, **_: events.append(
                               f"insert {series_id} {obs_date}")):
             out = puller.pull_put_call_ratio()
 
         assert events == [
-            "read opens", "read closes",
+            "read opens", f"read lookup {TOTAL}", f"read lookup {EQUITY}", "read closes",
             "fetch 2026-11-02", "fetch 2026-11-03", "fetch 2026-11-04",
-            "write opens",
+            # Codex review 6029448579: the writer lock (bounded wait) comes
+            # before the recheck, so an overlapping run sees committed rows.
+            "write opens", "write lock_timeout", "write lock",
+            f"write lookup {TOTAL}", f"write lookup {EQUITY}",
             f"insert {TOTAL} 2026-11-02", f"insert {EQUITY} 2026-11-02",
             f"insert {TOTAL} 2026-11-03", f"insert {EQUITY} 2026-11-03",
             "write closes",
@@ -387,6 +395,13 @@ class TestPutCallDailyPages:
         assert inserted == [(EQUITY, date(2026, 11, 2))]
         assert out[TOTAL] == {"status": "SUCCESS", "rows_inserted": 0, "feature_name": TOTAL}
         assert out[EQUITY]["rows_inserted"] == 1
+
+    def test_writer_lock_is_transaction_scoped_and_keyed_to_this_writer(self):
+        sql = " ".join(str(cboe_indices._PUT_CALL_WRITER_LOCK).split())
+        # Released at commit or rollback; no session lock to leak on error.
+        assert sql == "SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"
+        assert cboe_indices.PUT_CALL_WRITER_LOCK_KEY == "ingestion.altdata.cboe_indices.put_call_pages"
+        assert str(cboe_indices._PUT_CALL_LOCK_TIMEOUT) == "SET LOCAL lock_timeout = '60s'"
 
     def test_no_page_read_opens_no_write_transaction(self, puller, monkeypatch):
         on_file = {date(2026, 10, 25) + timedelta(days=i) for i in range(10)}

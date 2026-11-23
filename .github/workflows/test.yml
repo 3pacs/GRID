@@ -958,7 +958,9 @@ jobs:
       # database (schema.sql tables and seeds, no raw rows) the registry
       # revision registers equity_put_call_ratio, the first pull stores it
       # with no row stamped before its page was read, and the resolver
-      # resolves it with no ghost mapping. A skip must fail this step.
+      # resolves it with no ghost mapping. Two overlapping runs on two
+      # connections store one SUCCESS row per session (writer lock, Codex
+      # review 6029448579). A skip must fail this step.
       - name: Cboe equity put/call fresh-install PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
