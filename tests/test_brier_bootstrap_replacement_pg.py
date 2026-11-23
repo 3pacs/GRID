@@ -17,7 +17,7 @@ skips when no PostgreSQL is reachable.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -130,31 +130,77 @@ def test_flat_replacement_rolls_back_when_an_insert_fails(scratch):
     assert get_signal_scorecard(scratch, "tiny_lucky", 7).conviction_weight == 1.5
 
 
-def test_regime_replacement_retires_rejected_and_absent_legacy_rows(scratch):
+# The regime bootstrap reads oracle_predictions through the visibility view; the
+# tests point its query at a scratch table with the same nine columns instead.
+_ORACLE_FIXTURE_DDL = """
+    CREATE TABLE oracle_fixture (
+        id TEXT, created_at TIMESTAMPTZ, expiry DATE, confidence DOUBLE PRECISION,
+        verdict TEXT, model_name TEXT, signals TEXT, signal_contributions TEXT, regime TEXT
+    )
+"""
+_ORACLE_FIXTURE_QUERY = text(
+    "SELECT id, created_at, expiry, confidence, verdict, model_name, signals, "
+    "signal_contributions, regime FROM oracle_fixture WHERE :days > 0 ORDER BY created_at"
+)
+
+
+def _seed_lucky_predictions(engine: Engine, n: int = 25) -> None:
+    """``n`` CRISIS hits at 0.9: tiny_lucky has w=0.05 (Σw = 1.25 at n=25), main_driver 0.95."""
+    with engine.begin() as conn:
+        conn.execute(text(_ORACLE_FIXTURE_DDL))
+        for i in range(n):
+            conn.execute(
+                text(
+                    "INSERT INTO oracle_fixture "
+                    "VALUES (:id, :c, :x, 0.9, 'hit', 'm', NULL, :sc, 'CRISIS')"
+                ),
+                {
+                    "id": f"lucky-{i}",
+                    "c": _STAMP + timedelta(days=i),
+                    "x": (_STAMP + timedelta(days=i + 7)).date(),
+                    "sc": '{"tiny_lucky": 0.05, "main_driver": 0.95}',
+                },
+            )
+
+
+def test_regime_replacement_retires_rejected_and_absent_legacy_rows(scratch, monkeypatch):
     _seed_regime(scratch, "tiny_lucky", 7, "CRISIS")
     _seed_regime(scratch, "retired_feed", 30, "EXPANSION")
     assert rcb.get_regime_conditional_scorecard(scratch, "tiny_lucky", 7, "CRISIS").conviction_weight == 1.5
+    _seed_lucky_predictions(scratch)
+    monkeypatch.setattr(rcb, "_BOOTSTRAP_QUERY", _ORACLE_FIXTURE_QUERY)
 
-    stats = rcb._replace_regime_buckets(
-        scratch,
-        {("tiny_lucky", 7, "CRISIS"): _acc(25, 1.25), ("main_driver", 7, "CRISIS"): _acc(25, 23.75)},
-    )
+    summary = rcb.bootstrap_from_oracle_predictions(scratch, days=365)
 
-    assert stats == {"written": 1, "skipped_low_effective_weight": 1, "retired": 2, "replaced": True}
+    assert summary["replaced"] is True
+    assert summary["written_count"] == 1
+    assert summary["skipped_low_effective_weight"] == 1
+    assert summary["retired_count"] == 2
     assert _regime_keys(scratch) == {("main_driver", 7, "CRISIS")}
     assert rcb.get_regime_conditional_scorecard(scratch, "tiny_lucky", 7, "CRISIS") is None
     # Falls back to the empty per-signal table: no history, so neutral.
     assert rcb.get_scorecard_with_regime_fallback(scratch, "tiny_lucky", 7, "CRISIS") is None
     assert rcb.get_regime_conditional_scorecard(scratch, "retired_feed", 30, "EXPANSION") is None
+    main = rcb.get_regime_conditional_scorecard(scratch, "main_driver", 7, "CRISIS")
+    assert main.conviction_weight == 1.5
 
 
-def test_regime_replacement_rolls_back_when_an_insert_fails(scratch):
+def test_regime_replacement_rolls_back_when_an_insert_fails(scratch, monkeypatch):
     _seed_regime(scratch, "tiny_lucky", 7, "CRISIS")
+    _seed_regime(scratch, "retired_feed", 30, "EXPANSION")
+    _seed_lucky_predictions(scratch)
+    monkeypatch.setattr(rcb, "_BOOTSTRAP_QUERY", _ORACLE_FIXTURE_QUERY)
+    # Scratch-schema-only constraint: the main_driver insert fails after the delete.
+    with scratch.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE regime_conditional_brier_history "
+                "ADD CONSTRAINT scratch_refuses_main_driver CHECK (signal_source <> 'main_driver')"
+            )
+        )
 
-    stats = rcb._replace_regime_buckets(
-        scratch,
-        {("main_driver", 7, "CRISIS"): _acc(25, 23.75), ("overflow", 7, "CRISIS"): _acc(2**40, 23.75)},
-    )
+    summary = rcb.bootstrap_from_oracle_predictions(scratch, days=365)
 
-    assert stats["replaced"] is False and stats["written"] == 0
-    assert _regime_keys(scratch) == {("tiny_lucky", 7, "CRISIS")}
+    assert summary["replaced"] is False and summary["retired_count"] == 0
+    assert _regime_keys(scratch) == {("tiny_lucky", 7, "CRISIS"), ("retired_feed", 30, "EXPANSION")}
+    assert rcb.get_regime_conditional_scorecard(scratch, "tiny_lucky", 7, "CRISIS").conviction_weight == 1.5

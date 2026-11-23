@@ -331,15 +331,16 @@ def test_replay_happy_path_calls_record_for_each_row():
     rows = _sample_rows()
     with patch.object(boot, "_fetch_scored_predictions", return_value=rows), patch.object(
         boot, "_load_oracle_models_lookup", return_value={"MACRO": ["rates", "credit"]}
-    ), patch.object(boot, "_truncate_per_signal_brier_history") as trunc, patch.object(
+    ), patch.object(
         boot,
         "_write_bootstrapped_buckets",
-        return_value={"written": 5, "skipped_low_effective_weight": 0, "skipped_existing": 0},
+        return_value={"written": 5, "skipped_low_effective_weight": 0, "retired": 0, "replaced": True},
     ) as writer:
         summary = boot.replay_predictions(engine, days=30)
 
     assert writer.call_count == 1
-    assert trunc.call_count == 1
+    # The writer is the whole replacement (delete + insert in one transaction).
+    assert writer.call_args.kwargs == {}
     buckets = writer.call_args[0][1]
     # Layer 1 row (7d): alpha & beta
     assert ("alpha", 7) in buckets and ("beta", 7) in buckets
@@ -356,13 +357,12 @@ def test_replay_dry_run_never_writes():
     rows = _sample_rows()
     with patch.object(boot, "_fetch_scored_predictions", return_value=rows), patch.object(
         boot, "_load_oracle_models_lookup", return_value={}
-    ), patch.object(boot, "_truncate_per_signal_brier_history") as trunc, patch.object(
+    ), patch.object(
         boot, "_write_bootstrapped_buckets"
     ) as writer:
         summary = boot.replay_predictions(engine, dry_run=True)
 
-    assert writer.call_count == 0
-    assert trunc.call_count == 0  # dry-run skips truncate too
+    assert writer.call_count == 0  # dry-run never touches the table
     assert summary["replayed_count"] == 3
     assert summary["dry_run"] is True
 
@@ -372,10 +372,10 @@ def test_replay_limit_stops_after_n_rows():
     rows = _sample_rows()
     with patch.object(boot, "_fetch_scored_predictions", return_value=rows), patch.object(
         boot, "_load_oracle_models_lookup", return_value={}
-    ), patch.object(boot, "_truncate_per_signal_brier_history"), patch.object(
+    ), patch.object(
         boot,
         "_write_bootstrapped_buckets",
-        return_value={"written": 3, "skipped_low_effective_weight": 0, "skipped_existing": 0},
+        return_value={"written": 3, "skipped_low_effective_weight": 0, "retired": 0, "replaced": True},
     ) as writer:
         summary = boot.replay_predictions(engine, limit=2)
 
@@ -386,39 +386,44 @@ def test_replay_limit_stops_after_n_rows():
     assert summary["replayed_count"] == 2
 
 
-def test_replay_default_truncates_first():
+def test_replay_default_replaces_through_the_writer_only():
     engine = _fake_engine()
     with patch.object(boot, "_fetch_scored_predictions", return_value=[]), patch.object(
         boot, "_load_oracle_models_lookup", return_value={}
-    ), patch.object(boot, "_truncate_per_signal_brier_history") as trunc, patch.object(
+    ), patch.object(
         boot,
         "_write_bootstrapped_buckets",
-        return_value={"written": 0, "skipped_low_effective_weight": 0, "skipped_existing": 0},
-    ):
-        boot.replay_predictions(engine, append=False)
+        return_value={"written": 0, "skipped_low_effective_weight": 0, "retired": 3, "replaced": True},
+    ) as writer:
+        summary = boot.replay_predictions(engine, append=False)
 
-    trunc.assert_called_once_with(engine)
+    # No separate truncate: an empty replay still replaces (retires) the table.
+    writer.assert_called_once_with(engine, {})
+    assert summary["replaced"] is True
+    assert summary["retired_count"] == 3
+    assert summary["append_refused"] is False
 
 
-def test_replay_append_does_not_truncate():
+def test_replay_append_is_refused_without_reading_or_writing():
     engine = _fake_engine()
-    with patch.object(boot, "_fetch_scored_predictions", return_value=[]), patch.object(
+    with patch.object(boot, "_fetch_scored_predictions", return_value=[]) as fetch, patch.object(
         boot, "_load_oracle_models_lookup", return_value={}
-    ), patch.object(boot, "_truncate_per_signal_brier_history") as trunc, patch.object(
-        boot,
-        "_write_bootstrapped_buckets",
-        return_value={"written": 0, "skipped_low_effective_weight": 0, "skipped_existing": 0},
-    ):
-        boot.replay_predictions(engine, append=True)
+    ), patch.object(boot, "_write_bootstrapped_buckets") as writer:
+        summary = boot.replay_predictions(engine, append=True)
 
-    trunc.assert_not_called()
+    fetch.assert_not_called()
+    writer.assert_not_called()
+    assert summary["append_refused"] is True
+    assert summary["replaced"] is False
 
 
-def test_truncate_swallows_db_error():
+def test_writer_reports_not_replaced_when_db_is_down():
     engine = MagicMock()
     engine.begin.side_effect = RuntimeError("db down")
-    # Should not raise — log only.
-    boot._truncate_per_signal_brier_history(engine)
+    # Should not raise — logs, and says the table was not replaced.
+    stats = boot._write_bootstrapped_buckets(engine, {})
+    assert stats["replaced"] is False
+    assert stats["written"] == 0
 
 
 def test_replay_skips_malformed_row_continues_processing():
@@ -442,10 +447,10 @@ def test_replay_skips_malformed_row_continues_processing():
     )
     with patch.object(boot, "_fetch_scored_predictions", return_value=rows), patch.object(
         boot, "_load_oracle_models_lookup", return_value={}
-    ), patch.object(boot, "_truncate_per_signal_brier_history"), patch.object(
+    ), patch.object(
         boot,
         "_write_bootstrapped_buckets",
-        return_value={"written": 4, "skipped_low_effective_weight": 0, "skipped_existing": 0},
+        return_value={"written": 4, "skipped_low_effective_weight": 0, "retired": 0, "replaced": True},
     ) as writer:
         summary = boot.replay_predictions(engine)
 
@@ -476,10 +481,10 @@ def test_replay_skips_pending_verdict_rows():
     ]
     with patch.object(boot, "_fetch_scored_predictions", return_value=rows), patch.object(
         boot, "_load_oracle_models_lookup", return_value={}
-    ), patch.object(boot, "_truncate_per_signal_brier_history"), patch.object(
+    ), patch.object(
         boot,
         "_write_bootstrapped_buckets",
-        return_value={"written": 0, "skipped_low_effective_weight": 0, "skipped_existing": 0},
+        return_value={"written": 0, "skipped_low_effective_weight": 0, "retired": 0, "replaced": True},
     ) as writer:
         summary = boot.replay_predictions(engine)
 

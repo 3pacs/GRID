@@ -304,6 +304,13 @@ def _row_to_scorecard(row: Any) -> SignalScorecard:
     ``is_calibrated=False`` and neutral ``conviction_weight=1.0``. The
     bootstrap writer enforces the ``Σw >= MIN_EFFECTIVE_WEIGHT_SUM (5.0)``
     floor fail-closed before persisting any row with ``scored_count >= 20``.
+
+    A row cannot be checked for Σw or metric version here, so trust rests on
+    the only writer that creates rows: ``scripts/bootstrap_per_signal_brier``
+    replaces the whole table in one transaction and retires every row it
+    rejects or no longer produces. Rows from before that cutover stay readable
+    until the first replacement run. The live updater writes nothing, and
+    ``intelligence.forensic_journal`` can only raise an existing row's Brier.
     """
     source = row[0]
     horizon = int(row[1])

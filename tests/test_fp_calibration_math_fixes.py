@@ -1500,6 +1500,22 @@ class TestCodexHold6011907767RetireLegacyRows:
         assert _run_cli(monkeypatch, engine, _lucky_flat_rows(), []) == 0
         assert set(engine.flat) == {("main_driver", 7)}
 
+    def test_flat_read_failure_changes_nothing_and_exits_nonzero(self, monkeypatch):
+        """An unreadable oracle_predictions is not an empty population to replace with."""
+        engine = _FakeBrierEngine()
+        engine.flat[("tiny_lucky", 7)] = _legacy_flat_row("tiny_lucky", 7)
+        before = copy.deepcopy(engine.flat)
+        engine.fail_sql_prefixes = ("SELECT id, ticker, created_at",)
+        monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: engine))
+
+        with patch.object(boot, "_load_oracle_models_lookup", return_value={}):
+            summary = boot.replay_predictions(engine, days=365)
+            exit_code = boot.main([])
+
+        assert engine.flat == before
+        assert summary["replaced"] is False
+        assert exit_code != 0
+
     # ── regime table ──────────────────────────────────────────────────────
 
     def test_regime_bootstrap_retires_legacy_boost_when_bucket_is_ineligible(self):

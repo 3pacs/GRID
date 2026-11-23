@@ -185,6 +185,11 @@ class _FakeEngine:
                     )
                 )
 
+            if sql.startswith("DELETE FROM per_signal_brier_history"):
+                keys = sorted(self.parent.store)
+                self.parent.store.clear()
+                return _FakeResult(fetchall_value=keys)
+
             if sql.startswith("INSERT INTO per_signal_brier_history"):
                 key = (params["s"], int(params["h"]))
                 if key in self.parent.store and "DO NOTHING" in sql:
@@ -520,7 +525,9 @@ class TestRecordScoredPredictionBackdated:
         stamp = engine.store[("jodi_oil", 7)]["last_updated"]
         assert before <= stamp <= after
 
-    def test_bootstrap_upsert_takes_greatest_of_existing_and_scored_at(self):
+    def test_bootstrap_replacement_stamps_each_bucket_with_its_own_latest_scored_at(self):
+        """Each run replaces the table, so a retired row's timestamp is never carried
+        onto the new row: last_updated is the replayed bucket's latest scored_at."""
         from scripts import bootstrap_per_signal_brier as boot
 
         engine = _FakeEngine()
@@ -536,7 +543,7 @@ class TestRecordScoredPredictionBackdated:
         }
         boot._write_bootstrapped_buckets(engine, {("jodi_oil", 7): {**base_bucket, "last_updated": newer}})
         boot._write_bootstrapped_buckets(engine, {("jodi_oil", 7): {**base_bucket, "last_updated": older}})
-        assert engine.store[("jodi_oil", 7)]["last_updated"] == newer
+        assert engine.store[("jodi_oil", 7)]["last_updated"] == older
         boot._write_bootstrapped_buckets(engine, {("jodi_oil", 7): {**base_bucket, "last_updated": latest}})
         assert engine.store[("jodi_oil", 7)]["last_updated"] == latest
 

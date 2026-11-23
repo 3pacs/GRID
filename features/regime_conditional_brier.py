@@ -243,7 +243,9 @@ def _row_to_scorecard(
     ``is_calibrated=False`` and neutral ``conviction_weight=1.0`` (even when
     ``MIN_REGIME_SAMPLES (10) <= scored_count < 20``). The bootstrap writer
     enforces ``Σw >= MIN_EFFECTIVE_WEIGHT_SUM (5.0)`` fail-closed at write
-    time.
+    time, and replaces the whole table in one transaction, so a row it rejects
+    or no longer produces is retired. Rows from before that cutover stay
+    readable until the first replacement run.
     """
     count = int(row[0] or 0)
     brier = float(row[1] or 0.0)
@@ -616,7 +618,9 @@ def bootstrap_from_oracle_predictions(
     Walks scored predictions in chronological order, pulls the
     ``regime`` column directly off each row (defaults to ``"NEUTRAL"``
     when the column is missing — early predictions pre-date ALPHA-5),
-    and calls ``record_scored_prediction`` for each contributing signal.
+    and accumulates ``Σ(w·se)`` / ``Σw`` per bucket. After a successful read the
+    whole table is replaced in one transaction (delete, then insert the eligible
+    buckets), so rows the replay rejects or no longer produces are retired.
 
     Parameters
     ----------
@@ -632,8 +636,9 @@ def bootstrap_from_oracle_predictions(
     -------
     Summary dict with ``replayed_count``, ``skipped_count``,
     ``seeded_buckets`` (list of ``{source, regime, count}``),
-    ``regime_histogram`` (regime → replayed count) and
-    ``finished_at``. Empty shells on DB error.
+    ``regime_histogram`` (regime → replayed count), ``replaced``,
+    ``retired_count`` and ``finished_at``. Empty shells and ``replaced=False``
+    on DB error; the table is then unchanged.
     """
     ensure_regime_brier_table(engine)
     summary: dict[str, Any] = {
@@ -641,6 +646,10 @@ def bootstrap_from_oracle_predictions(
         "skipped_count": 0,
         "seeded_buckets": [],
         "regime_histogram": {},
+        "replaced": False,
+        "written_count": 0,
+        "retired_count": 0,
+        "skipped_low_effective_weight": 0,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -757,67 +766,78 @@ def bootstrap_from_oracle_predictions(
             )
             continue
 
-    if accumulators:
-        try:
-            with engine.begin() as conn:
-                for (source, horizon_days, canonical), acc in accumulators.items():
-                    weight_sum = acc["weight_sum"]
-                    if weight_sum <= 0.0:
-                        continue
-                    scored_count = int(acc["scored_count"])
-                    if (
-                        scored_count >= MIN_REGIME_SAMPLES
-                        and weight_sum + 1e-12 < MIN_EFFECTIVE_WEIGHT_SUM
-                    ):
-                        # Fail closed on current schema (no weight_sum column):
-                        # persisting scored_count >= threshold with Σw < 5
-                        # would let readers bypass the effective-sample floor.
-                        log.warning(
-                            "regime_conditional_brier.bootstrap: skipping "
-                            "({s}, {h}d, {r}) — scored_count={n} but effective "
-                            "weight Σw={w:.3f} < {floor}",
-                            s=source,
-                            h=horizon_days,
-                            r=canonical,
-                            n=scored_count,
-                            w=weight_sum,
-                            floor=MIN_EFFECTIVE_WEIGHT_SUM,
-                        )
-                        continue
-                    running_brier = acc["weighted_brier_sum"] / weight_sum
-                    running_ece = acc["weighted_ece_sum"] / weight_sum
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO regime_conditional_brier_history
-                                (signal_source, horizon_days, regime,
-                                 scored_count, running_brier, running_ece,
-                                 hit_count, last_updated)
-                            VALUES (:s, :h, :r, :n, :b, :e, :hit, NOW())
-                            ON CONFLICT (signal_source, horizon_days, regime)
-                            DO UPDATE SET
-                                scored_count  = EXCLUDED.scored_count,
-                                running_brier = EXCLUDED.running_brier,
-                                running_ece   = EXCLUDED.running_ece,
-                                hit_count     = EXCLUDED.hit_count,
-                                last_updated  = EXCLUDED.last_updated
-                            """
-                        ),
-                        {
-                            "s": source,
-                            "h": horizon_days,
-                            "r": canonical,
-                            "n": scored_count,
-                            "b": running_brier,
-                            "e": running_ece,
-                            "hit": int(acc["hit_count"]),
-                        },
+    written_keys: set[tuple[str, int, str]] = set()
+    skipped_low = 0
+    try:
+        with engine.begin() as conn:
+            previous = conn.execute(
+                text(
+                    "DELETE FROM regime_conditional_brier_history "
+                    "RETURNING signal_source, horizon_days, regime"
+                )
+            ).fetchall()
+            previous_keys = {(str(r[0]), int(r[1]), str(r[2])) for r in previous or []}
+            for (source, horizon_days, canonical), acc in accumulators.items():
+                weight_sum = acc["weight_sum"]
+                if weight_sum <= 0.0:
+                    continue
+                scored_count = int(acc["scored_count"])
+                if (
+                    scored_count >= MIN_REGIME_SAMPLES
+                    and weight_sum + 1e-12 < MIN_EFFECTIVE_WEIGHT_SUM
+                ):
+                    # Fail closed on current schema (no weight_sum column):
+                    # persisting scored_count >= threshold with Σw < 5
+                    # would let readers bypass the effective-sample floor.
+                    # The DELETE above has already retired any old row.
+                    log.warning(
+                        "regime_conditional_brier.bootstrap: skipping "
+                        "({s}, {h}d, {r}) — scored_count={n} but effective "
+                        "weight Σw={w:.3f} < {floor}; old row retired",
+                        s=source,
+                        h=horizon_days,
+                        r=canonical,
+                        n=scored_count,
+                        w=weight_sum,
+                        floor=MIN_EFFECTIVE_WEIGHT_SUM,
                     )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "regime_conditional_brier.bootstrap: persist failed: {e}",
-                e=str(exc),
-            )
+                    skipped_low += 1
+                    continue
+                running_brier = acc["weighted_brier_sum"] / weight_sum
+                running_ece = acc["weighted_ece_sum"] / weight_sum
+                # Plain INSERT: the table was emptied in this transaction, so
+                # a key conflict means a concurrent writer and rolls back all.
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO regime_conditional_brier_history
+                            (signal_source, horizon_days, regime,
+                             scored_count, running_brier, running_ece,
+                             hit_count, last_updated)
+                        VALUES (:s, :h, :r, :n, :b, :e, :hit, NOW())
+                        """
+                    ),
+                    {
+                        "s": source,
+                        "h": horizon_days,
+                        "r": canonical,
+                        "n": scored_count,
+                        "b": running_brier,
+                        "e": running_ece,
+                        "hit": int(acc["hit_count"]),
+                    },
+                )
+                written_keys.add((source, int(horizon_days), canonical))
+        summary["replaced"] = True
+        summary["written_count"] = len(written_keys)
+        summary["retired_count"] = len(previous_keys - written_keys)
+        summary["skipped_low_effective_weight"] = skipped_low
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "regime_conditional_brier.bootstrap: replacement rolled back, "
+            "table unchanged: {e}",
+            e=str(exc),
+        )
 
     summary["replayed_count"] = replayed
     summary["skipped_count"] = skipped
