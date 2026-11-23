@@ -41,13 +41,16 @@ def _engine():
 
 
 def test_model_rows_use_kept_predictions_not_legacy_counters() -> None:
-    models = {m["name"]: m for m in sb._fetch_model_rows(_engine())}
+    models = {m["name"]: m for m in sb._fetch_model_rows(_engine(), include_schwab=True)}
     of = models["options_flow"]
     assert of["predictions_made"] == 5           # a, b, c, d, f (e is not kept)
     assert (of["hits"], of["misses"], of["partials"], of["pending"]) == (1, 1, 1, 1)
     assert of["total_scored"] == 3 and of["cumulative_pnl"] == 1.0
     assert of["weight"] == 1.4 and of["description"] == "flow"
     assert of["basis"] == "oracle_predictions dedup_keep"
+    # Weight is model state written from every verdict: admin requests only.
+    contributor = {m["name"]: m for m in sb._fetch_model_rows(_engine())}["options_flow"]
+    assert contributor["weight"] is None and contributor["predictions_made"] == 5
 
 
 def test_registered_model_without_predictions_reads_zero() -> None:
