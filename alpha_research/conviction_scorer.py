@@ -13,10 +13,10 @@ Layers (weight; inputs read today, then inputs reported unavailable):
   3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4); institutional flow unavailable
   4. CROWD      (15 pts) — SEC fails-to-deliver balance; total put/call shown, not scored; short interest unavailable
   5. NARRATIVE  (10 pts) — nothing scored: Tiingo news count shown, not scored; wiki and GDELT unavailable
-  6. FLOW       (15 pts) — Volatility spike; unusual options not scored, equity put/call unavailable
+  6. FLOW       (15 pts) — Volatility spike; equity put/call shown, not scored; unusual options not scored
   7. CONFIRM    (10 pts) — Price momentum turning, higher low formed
 
-CROWD and NARRATIVE read raw_series through
+CROWD, NARRATIVE and FLOW's equity put/call read raw_series through
 store.observations.read_window_known_at with each writer's own source: a row
 counts only if it was pulled by the end of the as-of date (UTC), and only the
 latest vintage pulled by then. An FTD balance scores only when every row of
@@ -49,7 +49,9 @@ fire for every covered ticker (unusual options), whose counts cannot tell an
 empty fetch from a missing one (Tiingo news), or whose pull clock is not the
 acquisition time (Cboe total put/call). In production those inputs
 had added only wiki's +2, to GOLD and SP500, from series last updated
-2026-04-03. Each report says so (max_attainable_score,
+2026-04-03. The equity put/call ratio the CBOE puller stores since #1397
+(equity_put_call_ratio) is shown in FLOW on the same terms as the total
+ratio and scores nothing. Each report says so (max_attainable_score,
 dormant_alert_levels); raising it needs a separately approved recalibration,
 not a quiet threshold change.
 """
@@ -118,16 +120,37 @@ def _resolve_as_of_date(as_of_date: date | None) -> date:
     return as_of_date or date.today()
 
 
+def _feature_id(conn, feature_name: str) -> int | None:
+    """``feature_registry.id`` of ``feature_name`` (names are unique), or None.
+
+    The two resolved_series readers below bind this id rather than matching
+    the name through a feature_registry join. With the id known only through
+    the join, PostgreSQL plans for an average feature (~5.5k rows) and walks
+    every vintage of a large one before sorting: on griddb (2026-11-23)
+    ofr_financial_stress (1.03M rows) took 2.7 s per latest read and
+    vix_spot (375k rows) 1.1 s. With the id bound it uses that feature's
+    statistics and reads the newest dates first through
+    idx_resolved_series_pit_latest: 2 ms, the same value.
+    """
+    row = conn.execute(
+        text("SELECT fr.id FROM feature_registry fr WHERE fr.name = :n"),
+        {"n": feature_name},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
 def _load_latest(
     conn,
     feature_name: str,
     as_of_date: date | None = None,
 ) -> float | None:
     as_of = _resolve_as_of_date(as_of_date)
+    feature_id = _feature_id(conn, feature_name)
+    if feature_id is None:
+        return None
     row = conn.execute(text("""
         SELECT rs.value FROM resolved_series rs
-        JOIN feature_registry fr ON rs.feature_id = fr.id
-        WHERE fr.name = :n
+        WHERE rs.feature_id = :fid
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
           AND rs.vintage_date <= :as_of
@@ -140,7 +163,7 @@ def _load_latest(
           )
         ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
         LIMIT 1
-    """), {"n": feature_name, "as_of": as_of,
+    """), {"fid": feature_id, "as_of": as_of,
            "retraction_cutoff": retraction_cutoff(as_of)}).fetchone()
     return float(row[0]) if row else None
 
@@ -204,12 +227,24 @@ def _load_price(
     ticker: str,
     as_of_date: date | None = None,
 ) -> pd.Series:
+    """``{ticker}_full`` known at the as-of date: one value per obs_date, split-adjusted.
+
+    Each date's value is its row with the greatest (release_date,
+    vintage_date) among the rows known by then and not retracted: the last
+    row in (obs_date, release_date, vintage_date) order, which is what the
+    reader kept when it fetched every vintage and dropped all but the last in
+    Python. DISTINCT ON picks that row in the database, so ``spy_full`` sends
+    8.5k rows instead of 225k (griddb 2026-11-23: 1.1 s -> 0.26 s, identical
+    series). The whole history is still read: SETUP's drawdown is against
+    the all-time high, and adjust_splits needs every date.
+    """
     as_of = _resolve_as_of_date(as_of_date)
-    feat = f"{ticker.lower()}_full"
+    feature_id = _feature_id(conn, f"{ticker.lower()}_full")
+    if feature_id is None:
+        return pd.Series(dtype=float)
     rows = conn.execute(text("""
-        SELECT rs.obs_date, rs.value FROM resolved_series rs
-        JOIN feature_registry fr ON rs.feature_id = fr.id
-        WHERE fr.name = :n
+        SELECT DISTINCT ON (rs.obs_date) rs.obs_date, rs.value FROM resolved_series rs
+        WHERE rs.feature_id = :fid
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
           AND rs.vintage_date <= :as_of
@@ -220,13 +255,13 @@ def _load_price(
                 AND rr.vintage_date = rs.vintage_date
                 AND rr.retracted_at <= :retraction_cutoff
           )
-        ORDER BY rs.obs_date, rs.release_date, rs.vintage_date
-    """), {"n": feat, "as_of": as_of,
+        ORDER BY rs.obs_date, rs.release_date DESC, rs.vintage_date DESC
+    """), {"fid": feature_id, "as_of": as_of,
            "retraction_cutoff": retraction_cutoff(as_of)}).fetchall()
     if not rows:
         return pd.Series(dtype=float)
     s = pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
-    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s = s[~s.index.duplicated(keep="first")].sort_index()
     return adjust_splits(s)
 
 
@@ -267,7 +302,8 @@ LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
 # SMART_MONEY goes below zero (the Form 4 sell cap, -2); the others top out
 # where their scored components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4,
 # SMART_MONEY the +5 strong-buy tier, CROWD 5 (FTD; put/call is
-# descriptive), NARRATIVE 0 (news is descriptive), FLOW 5 (volatility),
+# descriptive), NARRATIVE 0 (news is descriptive), FLOW 5 (volatility;
+# equity put/call is descriptive),
 # CONFIRM 3+4+3. The inputs reported unavailable or not scored score nothing,
 # so they add nothing here (CROWD was 13 with short interest and put/call,
 # NARRATIVE 8 with news, wiki and GDELT, FLOW 13 with unusual options and
@@ -313,23 +349,60 @@ def _layer_result(
     )
 
 
+@dataclass(frozen=True)
+class MarketSetup:
+    """SETUP's market-wide inputs known at ``as_of``: the same for every ticker.
+
+    scan_all reads them once and passes them to every score_ticker, so one
+    scan scores all tickers against one snapshot.
+    """
+
+    as_of: date
+    vix: float | None
+    hy: float | None
+    yc: float | None
+
+
+def load_market_setup(conn, as_of_date: date | None = None) -> MarketSetup:
+    """Read SETUP's market-wide inputs (VIX, HY OAS, 2s10s) at ``as_of_date``.
+
+    score_setup used to read ofr_financial_stress as well and throw the value
+    away; it was never scored. It is no longer read (it was 2.7 s of every
+    ticker's 4.5 s on griddb, 2026-11-23).
+    """
+    as_of = _resolve_as_of_date(as_of_date)
+    # planetary_stress_index was removed from this layer 2026-09-10: a celestial
+    # feature must not be an input to a market-scoring endpoint
+    # (LEVER-PACKAGE.md §4.1 / §7 T0.5). It stays available to AstroGrid.
+    return MarketSetup(
+        as_of=as_of,
+        vix=_load_latest(conn, "vix_spot", as_of_date=as_of),
+        hy=_load_latest(conn, "hy_oas_spread", as_of_date=as_of),
+        yc=_load_latest(conn, "yld_curve_2s10s", as_of_date=as_of),
+    )
+
+
 def score_setup(
     conn,
     ticker: str,
     price: pd.Series,
     as_of_date: date | None = None,
+    market: MarketSetup | None = None,
 ) -> LayerResult:
-    """Layer 1: Macro setup — is this the right moment?"""
+    """Layer 1: Macro setup — is this the right moment?
+
+    ``market`` is load_market_setup at the same as-of date (read here when
+    None); a snapshot for another date is refused.
+    """
     score = 0.0
     signals = []
 
-    vix = _load_latest(conn, "vix_spot", as_of_date=as_of_date)
-    hy = _load_latest(conn, "hy_oas_spread", as_of_date=as_of_date)
-    _load_latest(conn, "ofr_financial_stress", as_of_date=as_of_date)
-    # planetary_stress_index was removed from this layer 2026-09-10: a celestial
-    # feature must not be an input to a market-scoring endpoint
-    # (LEVER-PACKAGE.md §4.1 / §7 T0.5). It stays available to AstroGrid.
-    yc = _load_latest(conn, "yld_curve_2s10s", as_of_date=as_of_date)
+    as_of = _resolve_as_of_date(as_of_date)
+    if market is None:
+        market = load_market_setup(conn, as_of)
+    elif market.as_of != as_of:
+        raise ValueError(f"market setup is for {market.as_of}, not the as-of date {as_of}")
+    vix, hy, yc = market.vix, market.hy, market.yc
 
     if price.empty:
         return _layer_result("SETUP", 0, LAYER_FULL_TRUST["SETUP"], (), False)
@@ -716,7 +789,8 @@ def score_smart_money(
 #     CUSIP, sec:ftd_balance:<CUSIP>, with the file's SYMBOL in raw_payload.
 #   * CBOE:totalpc stopped with Cboe's totalpc.csv; the CBOE puller (24 h)
 #     stores the total exchange ratio as put_call_ratio since 2026-11-04.
-#     CBOE:equitypc has no writer.
+#     CBOE:equitypc never had a writer; since #1397 the same daily page's
+#     equity ratio is stored as equity_put_call_ratio (shown, not scored).
 #   * News is written as TIINGO_NEWS:{t}:daily_count (6 h), not
 #     NEWS:{t}:daily_count. wiki_{t} was a one-off topic load ending
 #     2026-04-03, and gdelt_article_count was deleted by the 2026-11-16 GDELT
@@ -742,9 +816,6 @@ WHALE_NOT_SCORED = (
     "Unusual options activity not scored (the WHALE:* detector flags every covered "
     "ticker every day, so a flag is not unusual)"
 )
-EQUITY_PCR_UNAVAILABLE = (
-    "Equity put/call unavailable (no writer; the CBOE puller stores the total ratio only)"
-)
 # Read and shown, never scored (Codex HOLD on #1395 f821c50c): the writer
 # stores a count only when a fetch returns articles, so an empty fetch and a
 # failed or skipped one look alike; it counts every article returned, repeats
@@ -754,13 +825,23 @@ NEWS_NOT_SCORED = (
     "articles, and each count overlaps the last 7 days)"
 )
 # Read and shown, never scored (Codex HOLD on #1395 a994e347): the CBOE
-# puller opens one transaction before its HTTP fetches and leaves
+# puller opened one transaction before its HTTP fetches and leaves
 # pull_timestamp to DEFAULT NOW(), the transaction start, so a session
-# fetched late can carry an earlier pull time and pass an as-of cutoff it did
-# not meet. Scoring it waits for a qualified clock and an approved policy.
+# fetched late could carry an earlier pull time and pass an as-of cutoff it
+# did not meet. Since #1397 it reads every page before the insert
+# transaction opens, so a new row's stamp is at or after the read, but it is
+# still a proxy, and rows stored before that keep the early stamp. Scoring
+# it waits for a qualified clock and an approved policy.
 PCR_NOT_SCORED = (
     "Total put/call not scored (the Cboe puller stamps rows with its transaction start, "
     "not the fetch time)"
+)
+# The equity ratio comes from the same page and writer, so it carries the
+# same proxy clock (Codex HOLD on #1397 cd0b24b1 / 4e30ed90). Shown, adds no
+# points, never makes FLOW available; scoring it needs a qualified clock, a
+# same-tape ablation against the total ratio and an approved policy.
+EQUITY_PCR_NOT_SCORED = (
+    "Equity put/call not scored (same Cboe page and pull-time proxy as the total ratio)"
 )
 
 # CROWD: SEC fails-to-deliver balances (ingestion/altdata/sec_ftd.py).
@@ -812,6 +893,14 @@ _FTD_FILED_AS_SQL = text("""
 PCR_SERIES = "put_call_ratio"
 PCR_SOURCE = "CBOE"
 PCR_FRESH_DAYS = 5
+
+# FLOW: Cboe equity put/call ratio, same page and writer
+# (ingestion/altdata/cboe_indices.py), one value per trading day,
+# market-wide, shown, not scored (EQUITY_PCR_NOT_SCORED). The newest within
+# EQUITY_PCR_FRESH_DAYS is shown.
+EQUITY_PCR_SERIES = "equity_put_call_ratio"
+EQUITY_PCR_SOURCE = "CBOE"
+EQUITY_PCR_FRESH_DAYS = 5
 
 # NARRATIVE: Tiingo news (ingestion/tiingo_news_pull.py), shown, not scored
 # (NEWS_NOT_SCORED). Each day's value is the number of articles a trailing
@@ -1013,15 +1102,28 @@ def score_narrative(
     return _layer_result("NARRATIVE", 0.0, 0.10, signals, False)
 
 
+def _describe_equity_pcr(conn, as_of: date) -> str:
+    """FLOW's equity put/call as a signal; it never scores (EQUITY_PCR_NOT_SCORED)."""
+    obs = _read_known(conn, EQUITY_PCR_SERIES, EQUITY_PCR_SOURCE, as_of, EQUITY_PCR_FRESH_DAYS)
+    if not obs:
+        return f"No equity put/call in the {EQUITY_PCR_FRESH_DAYS} days to {as_of}"
+    return f"Equity put/call, not scored: {obs[-1].value:.2f} ({obs[-1].obs_date})"
+
+
 def score_flow(
     conn,
     ticker: str,
     price: pd.Series,
     as_of_date: date | None = None,
 ) -> LayerResult:
-    """Layer 6: Is money actually moving? Volatility spike (options inputs not scored)."""
+    """Layer 6: Is money actually moving? Volatility spike; options inputs not scored.
+
+    The equity put/call ratio (market-wide) is shown with its date, adds no
+    points and never makes FLOW available (EQUITY_PCR_NOT_SCORED).
+    """
+    as_of = _resolve_as_of_date(as_of_date)
     score = 0.0
-    signals = [WHALE_NOT_SCORED, EQUITY_PCR_UNAVAILABLE]
+    signals = [WHALE_NOT_SCORED, EQUITY_PCR_NOT_SCORED, _describe_equity_pcr(conn, as_of)]
     has_data = False
 
     if price.empty or len(price) < 20:
@@ -1145,11 +1247,13 @@ def score_ticker(
     ticker: str,
     as_of_date: date | None = None,
     ftd_series_ids: Mapping[str, tuple[str, ...]] | None = None,
+    market: MarketSetup | None = None,
 ) -> ConvictionReport:
     """Score a single ticker across all 7 layers.
 
     ``ftd_series_ids``: scan_all's one-pass _ftd_series_ids for the universe;
-    None looks up this ticker alone.
+    None looks up this ticker alone. ``market``: scan_all's one
+    load_market_setup for the scan; None reads it for this ticker.
     """
     as_of = _resolve_as_of_date(as_of_date)
     with engine.connect() as conn:
@@ -1158,7 +1262,7 @@ def score_ticker(
             ftd_series_ids = _ftd_series_ids(conn, [ticker], as_of)
 
         named_layers: list[tuple[str, LayerResult | None]] = [
-            ("SETUP", score_setup(conn, ticker, price, as_of_date=as_of)),
+            ("SETUP", score_setup(conn, ticker, price, as_of_date=as_of, market=market)),
             ("COMPANY", score_company(conn, ticker, as_of_date=as_of)),
             ("SMART_MONEY", score_smart_money(conn, ticker, as_of_date=as_of)),
             ("CROWD", score_crowd(conn, ticker, as_of_date=as_of, ftd_series_ids=ftd_series_ids)),
@@ -1221,26 +1325,40 @@ def scan_all(
     min_score: int = 20,
     as_of_date: date | None = None,
 ) -> list[ConvictionReport]:
-    """Score all tickers with price data."""
+    """Score all tickers with price data.
+
+    The universe is every ``*_full`` feature with more than 50 rows known at
+    the as-of date, in name order. The EXISTS stops at a feature's 51st row
+    instead of counting all of them (griddb 2026-11-23: 6.4 s -> 0.01 s, the
+    same 139 tickers). SETUP's market-wide inputs are read once for the scan.
+    """
     as_of = _resolve_as_of_date(as_of_date)
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT UPPER(REPLACE(fr.name, '_full', ''))
-            FROM feature_registry fr JOIN resolved_series rs ON fr.id = rs.feature_id
+            FROM feature_registry fr
             WHERE fr.name LIKE '%%_full'
-              AND rs.obs_date <= :as_of
-              AND rs.release_date <= :as_of
-              AND rs.vintage_date <= :as_of
-            GROUP BY fr.name HAVING COUNT(*) > 50
+              AND EXISTS (
+                  SELECT 1 FROM resolved_series rs
+                  WHERE rs.feature_id = fr.id
+                    AND rs.obs_date <= :as_of
+                    AND rs.release_date <= :as_of
+                    AND rs.vintage_date <= :as_of
+                  OFFSET 50 LIMIT 1
+              )
+            ORDER BY fr.name
         """), {"as_of": as_of}).fetchall()
         tickers = [r[0] for r in rows]
         # One FTD symbol lookup for the whole universe instead of one per ticker.
         ftd_series_ids = _ftd_series_ids(conn, tickers, as_of)
+        market = load_market_setup(conn, as_of)
 
     reports = []
 
     for ticker in tickers:
-        report = score_ticker(engine, ticker, as_of_date=as_of, ftd_series_ids=ftd_series_ids)
+        report = score_ticker(
+            engine, ticker, as_of_date=as_of, ftd_series_ids=ftd_series_ids, market=market,
+        )
         if report.total_score >= min_score:
             reports.append(report)
 

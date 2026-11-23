@@ -63,6 +63,7 @@ FEATURE_POLARITY: dict[str, int] = {
     "vvix": -1,
     "skew_index": -1,
     "put_call_ratio": -1,
+    "equity_put_call_ratio": -1,
     "correlation_index": -1,
     "implied_correlation_3m": -1,
     "vxn": -1,
