@@ -13,6 +13,11 @@ Covers:
 7. The entry anchor and scanner context read by date only, so an intraday
    decision could anchor on that day's later close and a later revision could
    move the anchor (Codex HOLD 6011903681): both are now fenced at generated_at.
+8. Reconstructed decision context claimed more than it proves (Codex HOLD
+   6030815214): the options_daily_signals row is labelled descriptive context
+   (date, age, reason) and is never the consumed row, an entry anchor or an
+   attribution input without recorded lineage; regime and capital-flow context
+   is read by date only and labelled descriptive.
 
 All tests are offline (synthetic inputs, mocks, or in-memory SQLite).
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import types
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -63,6 +69,12 @@ def _capture_emits(monkeypatch) -> list:
     return captured
 
 
+# Scanner values the classifier may attribute from must carry recorded lineage
+# to the recommendation (Codex HOLD 6030815214). Nothing in GRID records one
+# today, so these direct classifier fixtures stand in for a future recorder.
+_LINEAGE = "fixture: scanner row recorded by the recommender at decision"
+
+
 # ── Defect 1: Unit mixing (option premium vs underlying spot) ───────────────
 
 
@@ -90,6 +102,7 @@ class TestDefect1UnitMixing:
                 "scanner_signals": {
                     "spot_price": 180.0,
                     "signal_date": "2026-04-10",
+                    "lineage": _LINEAGE,
                 },
             },
             sanity={},
@@ -119,6 +132,7 @@ class TestDefect1UnitMixing:
                 "scanner_signals": {
                     "spot_price": 180.0,
                     "signal_date": "2026-04-10",
+                    "lineage": _LINEAGE,
                 },
             },
             sanity={},
@@ -208,6 +222,8 @@ class _ClockFakeDB:
         self.closes: list[dict] = []
         self.signals: list[dict] = []
         self.statements: list[tuple[str, dict]] = []
+        self.regime = None  # (inferred_state, state_confidence, transition_probability)
+        self.flow = None    # (narrative, snapshot_date)
 
     def add_close(self, ticker, d, value, pulled, *, source="TIINGO", status="SUCCESS", payload=None):
         self.closes.append({"sid": f"YF:{ticker}:close", "od": d, "val": value,
@@ -236,6 +252,10 @@ class _ClockFakeDB:
         self.statements.append((sql, p))
         if "FROM options_recommendations" in sql:
             return _Res(one=self.trade_row)
+        if "FROM decision_journal" in sql:
+            return _Res(one=self.regime)
+        if "FROM capital_flow_snapshots" in sql:
+            return _Res(one=self.flow)
         if "options_daily_signals" in sql:
             return self._signal_read(sql, p)
         if "FROM raw_series" in sql:
@@ -258,7 +278,9 @@ class _ClockFakeDB:
             return _Res()
         s = rows[0]
         if sql.startswith("SELECT spot_price"):
-            return _Res(one=(s["spot"],))
+            return _Res(one=(s["spot"], s["sd"], s["created"]))
+        if sql.startswith("SELECT signal_date, created_at"):  # newest row: metadata only
+            return _Res(one=(s["sd"], s["created"]))
         return _Res(one=(s["pcr"], 0.3, s["iv_skew"], None, s["spot"], 1000, -0.01, 0.1,
                          s["sd"], s["created"]))
 
@@ -394,7 +416,8 @@ class TestEntryAnchorDecisionClockFence:
 
     def test_scanner_lookup_ignores_a_row_written_after_the_decision(self, monkeypatch):
         """Wednesday's options_daily_signals row was written at 16:30 ET, after the
-        11:00 ET decision: the scanner context and anchor are Tuesday's row."""
+        11:00 ET decision: the scanner context is Tuesday's row. It is context
+        only (Codex HOLD 6030815214), so it is not the entry anchor either."""
         gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
         db = _ClockFakeDB(_trade_row(14, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
                                      _ny(date(2026, 4, 17), 17)))
@@ -403,14 +426,21 @@ class TestEntryAnchorDecisionClockFence:
             db.add_signal("AAPL", d, v, _ny(d, 16, 30), pcr=pcr)
 
         pm = _run_trade_postmortem(monkeypatch, db, 14)
-        scanner = pm.data_at_decision["scanner_signals"]
+        scanner = pm.data_at_decision["descriptive_context"]["scanner"]
         assert scanner["signal_date"] == "2026-04-14"
         assert scanner["put_call_ratio"] == pytest.approx(0.5)
-        assert pm.data_at_decision["underlying_entry_spot"] == pytest.approx(100.0)
-        assert pm.failure_category == "right_signal_wrong_timing", pm.root_cause
-        fenced = [p for sql, p in db.statements
-                  if "options_daily_signals" in sql and "signal_date <= :d" in sql]
-        assert fenced and all(p["decision_ts"] == gen_ts for p in fenced)
+        assert "scanner_signals" not in pm.data_at_decision
+        assert "underlying_entry_spot" not in pm.data_at_decision
+        assert pm.failure_category == "insufficient_data", pm.root_cause
+        # Values are read only from rows written by the clock; a row written
+        # later is read for its date and write time alone.
+        value_reads = [p for sql, p in db.statements
+                       if "options_daily_signals" in sql and "put_call_ratio" in sql]
+        assert value_reads and all(p["decision_ts"] == gen_ts for p in value_reads)
+        unfenced = [sql for sql, _ in db.statements
+                    if "options_daily_signals" in sql and "signal_date <= :d" in sql
+                    and "created_at <= :decision_ts" not in sql]
+        assert all(sql.startswith("SELECT signal_date, created_at FROM") for sql in unfenced)
 
     def test_scanner_row_revised_after_the_decision_is_not_used(self, monkeypatch):
         """Tuesday's row was revised in place on Thursday (its created_at moved past
@@ -425,9 +455,12 @@ class TestEntryAnchorDecisionClockFence:
             db.add_signal("AAPL", d, v, _ny(d, 16, 30))
 
         pm = _run_trade_postmortem(monkeypatch, db, 15)
-        assert pm.data_at_decision["scanner_signals"]["signal_date"] == "2026-04-13"
-        assert pm.data_at_decision["underlying_entry_spot"] == pytest.approx(99.0)
-        assert pm.failure_category == "right_signal_wrong_timing", pm.root_cause
+        scanner = pm.data_at_decision["descriptive_context"]["scanner"]
+        assert scanner["signal_date"] == "2026-04-13"
+        assert scanner["spot_price"] == pytest.approx(99.0)
+        # Context only (Codex HOLD 6030815214): not the anchor, no attribution.
+        assert "underlying_entry_spot" not in pm.data_at_decision
+        assert pm.failure_category == "insufficient_data", pm.root_cause
 
     def test_scanner_abstains_when_every_row_was_written_after_the_decision(self, monkeypatch):
         """No options_daily_signals row existed by the decision: no scanner
@@ -440,8 +473,10 @@ class TestEntryAnchorDecisionClockFence:
             db.add_signal("AAPL", d, v, _ny(d, 16, 30))
 
         pm = _run_trade_postmortem(monkeypatch, db, 16)
+        context = pm.data_at_decision["descriptive_context"]
+        assert "scanner" not in context
         assert "scanner_signals" not in pm.data_at_decision
-        assert gen_ts.isoformat() in pm.data_at_decision["scanner_signals_unavailable"]
+        assert gen_ts.isoformat() in context["scanner_unavailable"]
         assert "underlying_entry_spot" not in pm.data_at_decision
         assert pm.failure_category == "insufficient_data"
 
@@ -470,11 +505,206 @@ class TestEntryAnchorDecisionClockFence:
         db.add_signal("AAPL", date(2026, 4, 14), 100.0, _ny(date(2026, 4, 14), 16, 30))
         data = pm_mod._reconstruct_decision_data(db, "AAPL", date(2026, 4, 15), {}, "")
         assert "scanner_signals" not in data
-        assert "scanner_signals_unavailable" in data
+        assert "scanner" not in data["descriptive_context"]
+        assert "timestamp" in data["descriptive_context"]["scanner_unavailable"]
         spot, note = pm_mod._load_underlying_entry_spot(db, "AAPL", date(2026, 4, 15), data)
         assert spot is None and "timestamp" in note
         assert not [sql for sql, _ in db.statements
                     if "options_daily_signals" in sql or "FROM raw_series" in sql]
+
+
+# ── Reconstructed context is descriptive (Codex HOLD 6030815214) ──────────
+
+
+_SCANNER_NAMES = ("pcr_", "iv_skew_", "max_pain_")
+
+
+def _scanner_attributions(pm_or_lists) -> list[str]:
+    names = list(pm_or_lists[0]) + list(pm_or_lists[1])
+    return [n for n in names if n.startswith(_SCANNER_NAMES)]
+
+
+class TestReconstructedContextIsDescriptive:
+    """options_daily_signals, regime and capital-flow context is shown, labelled,
+    and never used as the consumed row, an entry anchor or an attribution input.
+
+    Same calendar as TestEntryAnchorDecisionClockFence (EDT, Wed 2026-04-15).
+    """
+
+    WED = date(2026, 4, 15)
+
+    def test_older_visible_scanner_row_is_labelled_fallback_context(self, monkeypatch):
+        """The newest row (Wednesday's) was written after the 11:00 ET decision, so
+        Tuesday's row is shown as fallback context with its date, age and reason.
+        It is not the consumed row, not the entry anchor and drives no signal."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(21, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        db.add_signal("AAPL", date(2026, 4, 14), 100.0, _ny(date(2026, 4, 14), 16, 30), pcr=0.5)
+        for d, v in ((self.WED, 104.0), (date(2026, 4, 16), 103.0), (date(2026, 4, 17), 102.5)):
+            db.add_signal("AAPL", d, v, _ny(d, 16, 30), pcr=1.5)
+
+        pm = _run_trade_postmortem(monkeypatch, db, 21)
+        data = pm.data_at_decision
+        assert "underlying_entry_spot" not in data, "fallback row must not anchor"
+        context = data["descriptive_context"]
+        assert "not proven known at decision" in context["label"]
+        scanner = context["scanner"]
+        assert scanner["signal_date"] == "2026-04-14"
+        assert scanner["age_days"] == 1
+        assert scanner["fallback"] is True
+        assert scanner["reason"].startswith("newest row written after decision")
+        assert "2026-04-15" in scanner["reason"]
+        assert scanner["created_at"] == _ny(date(2026, 4, 14), 16, 30).astimezone(timezone.utc).isoformat()
+        # Not the consumed row, not the anchor, not an attribution input.
+        assert "scanner_signals" not in data
+        assert "underlying_entry_spot" not in data
+        assert "descriptive" in data["underlying_entry_spot_unavailable"]
+        assert pm.failure_category == "insufficient_data", pm.root_cause
+        assert _scanner_attributions((pm.which_signals_were_right, pm.which_signals_were_wrong)) == []
+
+    def test_newest_scanner_row_is_still_context_not_an_anchor(self, monkeypatch):
+        """17:00 ET decision, Wednesday's row written at 16:30 ET: it is the newest
+        row, so not a fallback, but created_at is a write-start proxy and no
+        lineage ties it to the recommendation, so it stays context only."""
+        gen_ts = _ny(self.WED, 17).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(22, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        for d, v in ((self.WED, 100.0), (date(2026, 4, 16), 103.0), (date(2026, 4, 17), 102.5)):
+            db.add_signal("AAPL", d, v, _ny(d, 16, 30), pcr=0.5)
+
+        pm = _run_trade_postmortem(monkeypatch, db, 22)
+        assert "underlying_entry_spot" not in pm.data_at_decision, "scanner spot must not anchor"
+        scanner = pm.data_at_decision["descriptive_context"]["scanner"]
+        assert scanner["signal_date"] == "2026-04-15"
+        assert scanner["age_days"] == 0
+        assert scanner["fallback"] is False
+        assert "write-start proxy" in scanner["reason"]
+        assert "scanner_signals" not in pm.data_at_decision
+        assert "underlying_entry_spot" not in pm.data_at_decision
+        assert pm.failure_category == "insufficient_data", pm.root_cause
+
+    def test_scanner_based_attribution_abstains_without_lineage(self, monkeypatch):
+        """A 12-day-old scanner row with a bearish PCR and a flat skew was the
+        newest one visible. Without recorded lineage it neither makes the CALL
+        bad_data nor names pcr/iv_skew signals; the completed-close anchor and
+        the path decide the category, and the abstention is recorded."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(23, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        db.add_signal("AAPL", date(2026, 4, 3), 100.0, _ny(date(2026, 4, 3), 16, 30),
+                      pcr=1.5, iv_skew=0.0)
+        for d, v in ((date(2026, 4, 14), 100.0), (self.WED, 99.0),
+                     (date(2026, 4, 16), 98.0), (date(2026, 4, 17), 97.0)):
+            db.add_close("AAPL", d, v, _ny(d, 17, 30))
+
+        pm = _run_trade_postmortem(monkeypatch, db, 23)
+        data = pm.data_at_decision
+        assert pm.failure_category == "wrong_signal", pm.root_cause
+        assert data["underlying_entry_spot"] == pytest.approx(100.0)  # completed close
+        assert data["descriptive_context"]["scanner"]["age_days"] == 12
+        assert "days old" not in pm.root_cause
+        assert _scanner_attributions((pm.which_signals_were_right, pm.which_signals_were_wrong)) == []
+        assert "lineage" in data["scanner_attribution_unavailable"]
+
+    def test_classifier_ignores_scanner_values_without_lineage(self):
+        """Scanner values handed to the classifier without lineage are not
+        attributed from: no signal names, no staleness verdict, no anchor."""
+        kwargs = dict(
+            ticker="NVDA", direction="PUT", entry_price=3.00, strike=120.0, target=6.00,
+            expiry=date(2026, 5, 15), outcome="EXPIRED", actual_return=-1.0,
+            price_path=[{"date": "2026-04-10", "price": 125.0},
+                        {"date": "2026-05-15", "price": 130.0}],
+            sanity={},
+        )
+        unlinked = {"spot_price": 125.0, "signal_date": "2026-03-25",
+                    "put_call_ratio": 0.5, "iv_skew": 0.0}
+        data = {"decision_date": "2026-04-10", "scanner_signals": unlinked}
+
+        no_anchor = _classify_failure(data_at_decision=data, **kwargs)
+        assert no_anchor[0] == "insufficient_data"
+        assert _scanner_attributions((no_anchor[3], no_anchor[2])) == []
+
+        anchored = _classify_failure(data_at_decision=data, underlying_entry_price=125.0, **kwargs)
+        assert anchored[0] == "wrong_signal", anchored[1]
+        assert _scanner_attributions((anchored[3], anchored[2])) == []
+
+        linked = dict(unlinked, lineage=_LINEAGE)
+        with_lineage = _classify_failure(
+            data_at_decision={"decision_date": "2026-04-10", "scanner_signals": linked}, **kwargs)
+        assert with_lineage[0] == "bad_data"
+        assert "pcr_was_bullish" in with_lineage[2]
+
+    def test_regime_and_capital_flow_are_descriptive_and_do_not_change_the_root_cause(self, monkeypatch):
+        """Regime and capital-flow rows are read by date only: they are kept under
+        the descriptive label with that basis, and the category, root cause and
+        signals are the same with or without them."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+
+        def build():
+            db = _ClockFakeDB(_trade_row(24, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                         _ny(date(2026, 4, 17), 17)))
+            for d, v in ((date(2026, 4, 14), 100.0), (self.WED, 99.0),
+                         (date(2026, 4, 16), 98.0), (date(2026, 4, 17), 97.0)):
+                db.add_close("AAPL", d, v, _ny(d, 17, 30))
+            return db
+
+        plain = _run_trade_postmortem(monkeypatch, build(), 24)
+        with_context_db = build()
+        with_context_db.regime = ("CRISIS", 0.9, 0.4)
+        with_context_db.flow = ("risk-off rotation into treasuries", date(2026, 4, 15))
+        with_context = _run_trade_postmortem(monkeypatch, with_context_db, 24)
+
+        context = with_context.data_at_decision["descriptive_context"]
+        assert context["regime"]["state"] == "CRISIS"
+        assert "not proven known at decision" in context["regime"]["basis"]
+        assert context["capital_flow"]["snapshot_date"] == "2026-04-15"
+        assert "not proven known at decision" in context["capital_flow"]["basis"]
+        for key in ("regime", "flow_narrative", "flow_date"):
+            assert key not in with_context.data_at_decision
+        assert (with_context.failure_category, with_context.root_cause,
+                with_context.which_signals_were_wrong, with_context.which_signals_were_right) == (
+                plain.failure_category, plain.root_cause,
+                plain.which_signals_were_wrong, plain.which_signals_were_right)
+
+    def test_llm_prompt_keeps_descriptive_context_out_of_decision_data(self, monkeypatch):
+        """The narrative LLM sees descriptive context under its own label, never
+        inside DATA AT DECISION."""
+        prompts: list[str] = []
+
+        class _LLM:
+            is_available = True
+
+            def generate(self, prompt, **_kw):
+                prompts.append(prompt)
+                return "MISSED: x\nFIX: y\nCONFIDENCE: 0.4"
+
+        monkeypatch.setattr("llm.router.get_llm", lambda _tier: _LLM())
+        # No RAG store or database in this test: stub both imports.
+        monkeypatch.setitem(sys.modules, "intelligence.rag",
+                            types.SimpleNamespace(get_rag_context=lambda *a, **k: ""))
+        monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: None))
+        data = {
+            "decision_date": "2026-04-15",
+            "underlying_entry_spot": 100.0,
+            "descriptive_context": {
+                "label": "descriptive",
+                "regime": {"state": "CRISIS_MARKER"},
+                "capital_flow": {"narrative": "FLOW_MARKER"},
+            },
+        }
+        pm_mod._get_llm_postmortem(
+            ticker="AAPL", direction="CALL", thesis="t", outcome="EXPIRED", actual_return=-1.0,
+            category="wrong_signal", root_cause="rc", what_happened="wh", data_at_decision=data,
+            price_path=[], signals_wrong=[], signals_right=[],
+        )
+        assert prompts
+        decision_part = prompts[0].split("DATA AT DECISION:", 1)[1].split("\n\n", 1)[0]
+        assert "100.0" in decision_part
+        assert "CRISIS_MARKER" not in decision_part and "FLOW_MARKER" not in decision_part
+        descriptive_part = prompts[0].split("DESCRIPTIVE CONTEXT", 1)[1]
+        assert "not proven known at decision" in descriptive_part.split("\n", 1)[0]
+        assert "CRISIS_MARKER" in descriptive_part and "FLOW_MARKER" in descriptive_part
 
 
 # ── Defect 2: Staleness check uses future expiry instead of decision time ──
@@ -502,6 +732,7 @@ class TestDefect2Staleness:
                 "scanner_signals": {
                     "spot_price": 125.0,
                     "signal_date": "2026-04-10",
+                    "lineage": _LINEAGE,
                 },
             },
             sanity={},
@@ -529,6 +760,7 @@ class TestDefect2Staleness:
                 "scanner_signals": {
                     "spot_price": 125.0,
                     "signal_date": "2026-03-25",  # 16 days before 2026-04-10
+                    "lineage": _LINEAGE,
                 },
             },
             sanity={},
@@ -1130,55 +1362,27 @@ class TestDefect6ThesisInvalidationMonitor:
         assert run.had_query_error is False
 
     def test_generate_postmortem_end_to_end_expired_put_fresh_signal(self, monkeypatch):
-        """End-to-end trade postmortem on an EXPIRED PUT with 35 DTE, fresh signal,
-        option premium $2.50, and underlying dipping from $180 to $176 before
-        rallying to $185 -> right_signal_wrong_timing, verdict=MISS,
-        producer='trading.options_recommender'."""
-        gen_ts = datetime(2026, 4, 10, 14, 30, tzinfo=timezone.utc)
+        """End-to-end trade postmortem on an EXPIRED PUT with 35 DTE, option
+        premium $2.50, and underlying dipping from $180 to $176 before rallying
+        to $185 -> right_signal_wrong_timing, verdict=MISS,
+        producer='trading.options_recommender'. The anchor is the completed
+        close known at the decision; the scanner row is descriptive context only
+        (Codex HOLD 6030815214)."""
+        gen_ts = datetime(2026, 4, 10, 14, 30, tzinfo=timezone.utc)  # 10:30 ET
         closed_ts = datetime(2026, 5, 15, 21, 0, tzinfo=timezone.utc)
         captured = _capture_emits(monkeypatch)
-
-        class _FakeConn:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def execute(self, stmt, params=None):
-                sql = " ".join(str(stmt).split())
-                res = MagicMock()
-                if "FROM options_recommendations" in sql:
-                    res.fetchone.return_value = (
-                        88, "AAPL", "PUT", 175.0, date(2026, 5, 15), 2.50,
-                        5.00, 1.25, 0.65, "bearish put", "{}", gen_ts,
-                        "EXPIRED", -1.0, closed_ts, "",
-                        json.dumps([{"name": "iv_skew", "score": 3.5, "direction": "bearish"}]),
-                        "[]",
-                    )
-                elif "put_call_ratio" in sql:
-                    # Written at 09:00 ET, before the 10:30 ET decision.
-                    res.fetchone.return_value = (
-                        1.4, 0.32, 0.25, 172.0, 180.0, 50000, -0.04, 0.12, date(2026, 4, 10),
-                        datetime(2026, 4, 10, 13, 0, tzinfo=timezone.utc),
-                    )
-                elif "signal_date >= :s" in sql:
-                    res.fetchall.return_value = [
-                        (date(2026, 4, 10), 180.0),
-                        (date(2026, 4, 20), 176.0),  # -2.22% favorable for PUT
-                        (date(2026, 5, 15), 185.0),
-                    ]
-                else:
-                    res.fetchone.return_value = None
-                    res.fetchall.return_value = []
-                return res
-
-        class _FakeEngine:
-            def connect(self):
-                return _FakeConn()
-
-            def begin(self):
-                return _FakeConn()
+        db = _ClockFakeDB((
+            88, "AAPL", "PUT", 175.0, date(2026, 5, 15), 2.50,
+            5.00, 1.25, 0.65, "bearish put", "{}", gen_ts,
+            "EXPIRED", -1.0, closed_ts, "",
+            json.dumps([{"name": "iv_skew", "score": 3.5, "direction": "bearish"}]),
+            "[]",
+        ))
+        db.add_signal("AAPL", date(2026, 4, 9), 180.0, _ny(date(2026, 4, 9), 16, 30), pcr=1.4)
+        for d, v in ((date(2026, 4, 9), 180.0), (date(2026, 4, 10), 180.0),
+                     (date(2026, 4, 20), 176.0),  # -2.22% favorable for PUT
+                     (date(2026, 5, 15), 185.0)):
+            db.add_close("AAPL", d, v, _ny(d, 17, 30))
 
         monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
         monkeypatch.setattr(pm_mod, "_store_postmortem", lambda *a, **k: None)
@@ -1188,9 +1392,11 @@ class TestDefect6ThesisInvalidationMonitor:
             lambda **k: {"recommended_fix": k["root_cause"], "what_we_missed": "", "confidence": 0.6},
         )
 
-        pm = generate_postmortem(_FakeEngine(), trade_id=88)
+        pm = generate_postmortem(db, trade_id=88)
         assert pm is not None
         assert pm.failure_category == "right_signal_wrong_timing"
+        assert pm.data_at_decision["underlying_entry_spot"] == pytest.approx(180.0)
+        assert pm.data_at_decision["descriptive_context"]["scanner"]["signal_date"] == "2026-04-09"
         assert pm.actual_return == pytest.approx(-1.0)
         assert len(captured) == 1
         assert captured[0].verdict == "MISS"
