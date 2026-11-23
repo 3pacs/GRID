@@ -18,7 +18,23 @@ Each layer returns (score, max_possible, trust_weight, signals[]).
 Final score = sum(score * trust) / sum(max * full_trust) * 100, where
 full_trust is the layer's trust with its data in hand (LAYER_FULL_TRUST):
 missing or thinner data lowers a layer's numerator weight only, never the
-denominator, so less evidence can never raise the total.
+denominator, so a missing layer can never raise the total above that layer
+read neutral. (It can still sit above that layer read adverse, which is why
+the alert does not come from the total; see score_low below.)
+
+total_score treats a missing layer as contributing nothing (neutral). The
+alert level instead comes from score_low, the total with every unknown at
+its worst attainable value (LAYER_MIN_SCORE): a missing layer at its minimum
+over its full weight, and the untrusted share of a partly trusted layer
+(full_trust - trust) at its minimum. Lost evidence therefore never promotes
+an alert: a layer that goes missing can only lower score_low, since its
+minimum is at or below anything it could have measured. score_high is the
+same with every unknown at its best attainable value (LAYER_ATTAINABLE_SCORE).
+
+CONVICTION (85) is dormant: with the current scorers the best attainable
+total is 81 (50.95 of 63.15), so the ladder tops out at FIRE. Each report
+says so (max_attainable_score, dormant_alert_levels); raising it needs a
+separately approved recalibration, not a quiet threshold change.
 """
 
 from __future__ import annotations
@@ -67,9 +83,17 @@ class ConvictionReport:
     total_score: int  # 0-100
     confidence_pct: float
     layers: tuple[LayerResult, ...]
-    alert_level: str  # WATCH / PILOT / SCALE / FIRE / CONVICTION
+    alert_level: str  # PASS / WATCH / PILOT / SCALE / FIRE / CONVICTION, from score_low
     timestamp: str
     unavailable_layers: tuple[str, ...] = ()
+    # Total with every unknown at its worst / best attainable value (see the
+    # module docstring); score_ticker sets the alert level from score_low.
+    score_low: int | None = None
+    score_high: int | None = None
+    # Best total the current scorers can produce over the present layers,
+    # and the alert levels it cannot reach (CONVICTION while it is 81).
+    max_attainable_score: int | None = None
+    dormant_alert_levels: tuple[str, ...] = ()
 
 
 def _resolve_as_of_date(as_of_date: date | None) -> date:
@@ -224,6 +248,31 @@ LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
     "NARRATIVE": 0.50,
     "FLOW": 0.60,
     "CONFIRM": 0.90,
+})
+
+# Each layer's lowest and highest points its current scorer can produce. Only
+# SMART_MONEY goes below zero (the Form 4 sell cap, -2); the others top out
+# where their components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4, SMART_MONEY the
+# +5 strong-buy tier, CROWD 5+5+3, NARRATIVE 5+2+1, FLOW 5+5+3, CONFIRM
+# 3+4+3. They bound what an unknown could have been (score_low / score_high)
+# and which alert levels are reachable at all; max_score stays the weight.
+LAYER_MIN_SCORE: Mapping[str, float] = MappingProxyType({
+    "SETUP": 0.0,
+    "COMPANY": 0.0,
+    "SMART_MONEY": -2.0,
+    "CROWD": 0.0,
+    "NARRATIVE": 0.0,
+    "FLOW": 0.0,
+    "CONFIRM": 0.0,
+})
+LAYER_ATTAINABLE_SCORE: Mapping[str, float] = MappingProxyType({
+    "SETUP": 17.0,
+    "COMPANY": 15.0,
+    "SMART_MONEY": 5.0,
+    "CROWD": 13.0,
+    "NARRATIVE": 8.0,
+    "FLOW": 13.0,
+    "CONFIRM": 10.0,
 })
 
 
@@ -827,6 +876,45 @@ def score_confirmation(price: pd.Series) -> LayerResult:
 # ═══════════════════════════════════════════════════════════════
 
 MIN_COVERAGE_FOR_ALERT = 0.5
+CONVICTION_MIN_COVERAGE = 0.8
+# Alert ladder, highest first: (level, minimum score). Below the last is PASS.
+ALERT_THRESHOLDS: tuple[tuple[str, int], ...] = (
+    ("CONVICTION", 85),
+    ("FIRE", 70),
+    ("SCALE", 55),
+    ("PILOT", 40),
+    ("WATCH", 25),
+)
+
+
+def _pct(weighted: float, weighted_max: float) -> int:
+    return max(0, min(100, int(round(weighted / weighted_max * 100)))) if weighted_max > 0 else 0
+
+
+def _layer_bound(layer: LayerResult, extreme: Mapping[str, float]) -> float:
+    """The layer's weighted contribution with its unknown part at ``extreme``.
+
+    A missing layer is all unknown: its full weight at the extreme (any
+    market-wide points it scored at low trust are not ticker evidence). An
+    available layer keeps its measured score * trust and puts the untrusted
+    share of its weight (full trust - trust) at the extreme.
+    """
+    full = layer.denominator_trust
+    if not layer.data_available:
+        return extreme[layer.name] * full
+    return layer.score * layer.trust + extreme[layer.name] * (full - layer.trust)
+
+
+def _alert_level(score: int, coverage: float) -> str:
+    """Alert for ``score``; thin coverage (< 50 %) caps the alert at WATCH."""
+    level = "PASS"
+    for name, floor in ALERT_THRESHOLDS:
+        if score >= floor and (name != "CONVICTION" or coverage >= CONVICTION_MIN_COVERAGE):
+            level = name
+            break
+    if coverage < MIN_COVERAGE_FOR_ALERT and level in {"CONVICTION", "FIRE", "SCALE", "PILOT"}:
+        level = "WATCH"
+    return level
 
 
 def score_ticker(
@@ -860,51 +948,41 @@ def score_ticker(
     # cannot inflate total_score.
     # A layer's denominator weight is its baseline_trust (its full-data trust,
     # LAYER_FULL_TRUST): missing data, a shorter SMART_MONEY window or a
-    # too-short price history lowers the numerator weight only, so the same
-    # evidence with less certainty, or a missing layer, can never promote the
-    # total.
-    weighted_score = sum(layer.score * layer.trust for layer in present_layers)
+    # too-short price history lowers the numerator weight only, so a missing
+    # layer never lifts total_score above that layer read neutral. Against an
+    # adverse reading it still can (SMART_MONEY -2 lost), so the alert comes
+    # from score_low, where every unknown sits at its worst attainable value
+    # (Codex HOLD on #1394 7da0c760).
     weighted_max = sum(layer.max_score * layer.denominator_trust for layer in present_layers)
-    total = (
-        max(0, min(100, int(round(weighted_score / weighted_max * 100))))
-        if weighted_max > 0
-        else 0
+    total = _pct(sum(layer.score * layer.trust for layer in present_layers), weighted_max)
+    # Unknowns at their worst / best attainable value: a missing layer over
+    # its full weight, a partly trusted layer over its untrusted share.
+    score_low = _pct(sum(_layer_bound(layer, LAYER_MIN_SCORE) for layer in present_layers), weighted_max)
+    score_high = _pct(sum(_layer_bound(layer, LAYER_ATTAINABLE_SCORE) for layer in present_layers), weighted_max)
+    max_attainable = _pct(
+        sum(LAYER_ATTAINABLE_SCORE[layer.name] * LAYER_FULL_TRUST[layer.name] for layer in present_layers),
+        sum(LAYER_MAX_SCORE[layer.name] * LAYER_FULL_TRUST[layer.name] for layer in present_layers),
     )
 
     # Confidence = how much data we actually have across the 7 designed layers
     data_coverage = len(available_layers) / len(named_layers)
     confidence = total * data_coverage
 
-    # Alert level (coverage floor: thin data < 50% coverage is capped at WATCH)
-    if total >= 85 and data_coverage >= 0.8:
-        level = "CONVICTION"
-    elif total >= 70:
-        level = "FIRE"
-    elif total >= 55:
-        level = "SCALE"
-    elif total >= 40:
-        level = "PILOT"
-    elif total >= 25:
-        level = "WATCH"
-    else:
-        level = "PASS"
-
-    if data_coverage < MIN_COVERAGE_FOR_ALERT and level in {
-        "CONVICTION",
-        "FIRE",
-        "SCALE",
-        "PILOT",
-    }:
-        level = "WATCH"
-
     return ConvictionReport(
         ticker=ticker,
         total_score=total,
         confidence_pct=round(confidence, 1),
         layers=present_layers,
-        alert_level=level,
+        # From score_low, so lost evidence never promotes the alert.
+        alert_level=_alert_level(score_low, data_coverage),
         timestamp=pd.Timestamp.now().isoformat(),
         unavailable_layers=unavailable_layers,
+        score_low=score_low,
+        score_high=score_high,
+        max_attainable_score=max_attainable,
+        dormant_alert_levels=tuple(
+            name for name, floor in ALERT_THRESHOLDS if floor > max_attainable
+        ),
     )
 
 
@@ -940,9 +1018,9 @@ def scan_all(
 def print_report(report: ConvictionReport) -> None:
     """Pretty-print a conviction report."""
     log.info(
-        "\n  {t:8s} [{level:10s}] Score={s:3d}/100  Confidence={c:.0f}%",
+        "\n  {t:8s} [{level:10s}] Score={s:3d}/100 (unknowns {lo}..{hi}; alert from {lo})  Confidence={c:.0f}%",
         t=report.ticker, level=report.alert_level,
-        s=report.total_score, c=report.confidence_pct,
+        s=report.total_score, lo=report.score_low, hi=report.score_high, c=report.confidence_pct,
     )
     for layer in report.layers:
         data_flag = "+" if layer.data_available else "-"

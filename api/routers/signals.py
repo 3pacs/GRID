@@ -257,6 +257,13 @@ def _conviction_report_to_dict(report) -> dict:
     return {
         "ticker": report.ticker,
         "total_score": report.total_score,
+        # Unknowns (missing layers, untrusted shares) at their worst / best
+        # attainable value; alert_level is set from score_low.
+        "score_low": report.score_low,
+        "score_high": report.score_high,
+        "alert_basis": "score_low",
+        "max_attainable_score": report.max_attainable_score,
+        "dormant_alert_levels": list(report.dormant_alert_levels),
         "confidence_pct": report.confidence_pct,
         "alert_level": report.alert_level,
         "timestamp": report.timestamp,
