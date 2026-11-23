@@ -1127,9 +1127,13 @@ def _insert_flow_at(engine, amount, direction, *, confidence, evidence, created_
         )
 
 
-def _utc_clock(day: date, hours: int) -> datetime:
-    """A tz-aware UTC capture clock ``hours`` after 00:00 UTC on ``day``."""
-    return datetime.combine(day, datetime.min.time(), timezone.utc) + timedelta(hours=hours)
+def _written_before_now() -> datetime:
+    """A tz-aware UTC capture clock a minute before the live read.
+
+    Relative to now, not to a fixed hour: just after 00:00 UTC a fixed
+    "01:00 today" is still in the future, and the layer's live cutoff is now.
+    """
+    return datetime.now(timezone.utc) - timedelta(minutes=1)
 
 
 def test_institutional_layer_counts_only_qualified_13f_rows_known_by_as_of():
@@ -1137,8 +1141,8 @@ def test_institutional_layer_counts_only_qualified_13f_rows_known_by_as_of():
 
     today = date.today()
     engine = _make_engine()
-    known = _utc_clock(today, 1)  # written earlier today
-    after_today = _utc_clock(today + timedelta(days=1), 1)  # after the end of the as-of date
+    known = _written_before_now()
+    after_today = datetime.now(timezone.utc) + timedelta(days=1)  # written after the read
     _insert_flow_at(engine, 10_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
     _insert_flow_at(engine, 4_000_000.0, "outflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
     # legacy rows: 'derived' without qualification evidence, and 'confirmed'
@@ -1173,7 +1177,7 @@ def test_institutional_layer_without_qualified_rows_is_unknown_not_zero():
     today = date.today()
     engine = _make_engine()
     _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"},
-                    created_at=_utc_clock(today, 1))
+                    created_at=_written_before_now())
     # A qualified row with no capture clock supplies no coverage either.
     _insert_flow_at(engine, 10_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=None)
     node = layer_institutional._build_13f_aggregate(engine, today)
