@@ -23,7 +23,7 @@ from oracle.entry_price_policy import (
 )
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
-from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS, visible_sql
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS, include_schwab_rows, visible_sql
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])
@@ -244,10 +244,15 @@ def get_predictions(
 @router.get("/scoreboard")
 def get_scoreboard(
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict:
-    """Model tournament: overall accuracy, by-model, by-ticker, calibration."""
+    """Model tournament: overall accuracy, by-model, by-ticker, calibration.
+
+    Counts are the public cohort's for every viewer; model weights and Sharpe
+    reach admin requests only (``oracle.scoreboard.MODEL_STATE_ADMIN_ONLY``).
+    """
     engine = get_db_engine()
-    return build_oracle_scoreboard(engine)
+    return build_oracle_scoreboard(engine, include_schwab=include_schwab)
 
 
 # ── GET /evidence ──────────────────────────────────────────────────────────
@@ -472,42 +477,62 @@ def trigger_evolve(
 @router.get("/scorecard")
 def get_scorecard(
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
-    """Per-model performance stats: hits, misses, hit_rate, cumulative_pnl."""
+    """Per-model performance stats: hits, misses, hit_rate, cumulative_pnl.
+
+    An admin request reads the running counters in ``oracle_models``, which the
+    scorer and weight evolution update from every scored row, the Oracle's
+    Schwab-built (private-use) predictions included. Every other viewer gets
+    the same fields built from the public cohort (``oracle.scoreboard``), with
+    the model state (weight, Sharpe, last update) withheld, so a private
+    verdict never moves what a contributor sees (Codex review 6029863205).
+    """
+    from oracle.scoreboard import _fetch_model_rows
+
     engine = get_db_engine()
+    admin = include_schwab_rows(include_schwab)
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT name, weight, predictions_made, hits, misses, partials, "
-                "cumulative_pnl, sharpe, last_updated "
-                "FROM oracle_models ORDER BY cumulative_pnl DESC"
-            )).fetchall()
+        records: list[tuple[Any, ...]] = []
+        if admin:
+            with engine.connect() as conn:
+                records = [tuple(r) for r in conn.execute(text(
+                    "SELECT name, weight, predictions_made, hits, misses, partials, "
+                    "cumulative_pnl, sharpe, last_updated "
+                    "FROM oracle_models ORDER BY cumulative_pnl DESC"
+                )).fetchall()]
+        else:
+            public = sorted(_fetch_model_rows(engine), key=lambda m: (-m["cumulative_pnl"], m["name"]))
+            records = [(m["name"], None, m["predictions_made"], m["hits"], m["misses"], m["partials"],
+                        m["cumulative_pnl"], None, None) for m in public]
 
         models = []
         totals = {"predictions": 0, "hits": 0, "misses": 0, "partials": 0, "pnl": 0.0}
 
-        for r in rows:
+        for r in records:
             name, weight, total, hits, misses, partials, pnl, sharpe, updated = r
+            hits, misses, partials = hits or 0, misses or 0, partials or 0
             scored = hits + misses + partials
             hit_rate = (hits + partials * 0.5) / scored if scored > 0 else 0.0
 
             models.append({
                 "model": name,
-                "weight": round(float(weight), 4) if weight else 1.0,
+                "weight": (round(float(weight), 4) if weight else 1.0) if admin else None,
                 "predictions_made": total or 0,
-                "hits": hits or 0,
-                "misses": misses or 0,
-                "partials": partials or 0,
+                "hits": hits,
+                "misses": misses,
+                "partials": partials,
                 "hit_rate": round(hit_rate, 4),
                 "cumulative_pnl": round(float(pnl), 2) if pnl else 0.0,
-                "sharpe": round(float(sharpe), 3) if sharpe else 0.0,
-                "last_updated": updated.isoformat() if updated else None,
+                "sharpe": (round(float(sharpe), 3) if sharpe else 0.0) if admin else None,
+                "last_updated": (updated.isoformat() if hasattr(updated, "isoformat") else updated)
+                if admin else None,
             })
 
             totals["predictions"] += total or 0
-            totals["hits"] += hits or 0
-            totals["misses"] += misses or 0
-            totals["partials"] += partials or 0
+            totals["hits"] += hits
+            totals["misses"] += misses
+            totals["partials"] += partials
             totals["pnl"] += float(pnl) if pnl else 0.0
 
         scored_total = totals["hits"] + totals["misses"] + totals["partials"]
@@ -516,7 +541,9 @@ def get_scorecard(
         ) if scored_total > 0 else 0.0
         totals["pnl"] = round(totals["pnl"], 2)
 
-        return {"models": models, "totals": totals}
+        basis = ("oracle_models running counters (every scored row)" if admin
+                 else "oracle_predictions dedup_keep, public cohort")
+        return {"models": models, "totals": totals, "basis": basis}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Scorecard query failed: {exc}") from exc
 
