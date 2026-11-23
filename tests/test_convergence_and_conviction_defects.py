@@ -804,47 +804,49 @@ class TestDefect6Form4AndCompanyUnavailable:
         monkeypatch.setattr(cs, "_load_price", lambda *_a, **_k: pd.Series([100.0] * 91, index=idx))
         monkeypatch.setattr(
             cs, "score_setup",
-            lambda *_a, **_k: cs.LayerResult("SETUP", 17.0, 17, 0.95, (), True),
+            lambda *_a, **_k: cs._layer_result("SETUP", 17.0, 0.95, (), True),
         )
         monkeypatch.setattr(cs, "score_company", lambda *_a, **_k: None)
         monkeypatch.setattr(
             cs, "score_smart_money",
-            lambda *_a, **_k: cs.LayerResult("SMART_MONEY", 0.0, 15, 0.15, (), False),
+            lambda *_a, **_k: cs._layer_result("SMART_MONEY", 0.0, 0.15, (), False),
         )
         monkeypatch.setattr(
             cs, "score_crowd",
-            lambda *_a, **_k: cs.LayerResult("CROWD", 0.0, 15, 0.15, (), False),
+            lambda *_a, **_k: cs._layer_result("CROWD", 0.0, 0.15, (), False),
         )
         monkeypatch.setattr(
             cs, "score_narrative",
-            lambda *_a, **_k: cs.LayerResult("NARRATIVE", 0.0, 10, 0.10, (), False),
+            lambda *_a, **_k: cs._layer_result("NARRATIVE", 0.0, 0.10, (), False),
         )
         monkeypatch.setattr(
             cs, "score_flow",
-            lambda *_a, **_k: cs.LayerResult("FLOW", 0.0, 15, 0.15, (), False),
+            lambda *_a, **_k: cs._layer_result("FLOW", 0.0, 0.15, (), False),
         )
         monkeypatch.setattr(
             cs, "score_confirmation",
-            lambda *_a, **_k: cs.LayerResult("CONFIRM", 10.0, 10, 0.90, (), True),
+            lambda *_a, **_k: cs._layer_result("CONFIRM", 10.0, 0.90, (), True),
         )
 
         report = cs.score_ticker(_DummyEngine(_RawSeriesConn({})), "AAPL", as_of_date=AS_OF)
 
         # COMPANY (None) is excluded; data_available=False layers remain in the
-        # weighted total as 0 (25.15 / 32.90 = 76), and coverage 2/7 < 0.5 caps alert at WATCH.
-        assert report.total_score == 76
+        # weighted total as 0 at their full-data weight (25.15 / 63.15 = 40
+        # PILOT; this test asserted 25.15 / 32.90 = 76 while missing data
+        # shrank the denominator), and coverage 2/7 < 0.5 caps alert at WATCH.
+        assert report.total_score == 40
         assert report.alert_level == "WATCH"
         assert report.unavailable_layers == ("COMPANY", "SMART_MONEY", "CROWD", "NARRATIVE", "FLOW")
-        assert report.confidence_pct == pytest.approx(round(76 * 2 / 7, 1))
+        assert report.confidence_pct == pytest.approx(round(40 * 2 / 7, 1))
 
         # Low score with thin coverage still stays PASS (floor caps, never promotes).
         monkeypatch.setattr(
             cs, "score_setup",
-            lambda *_a, **_k: cs.LayerResult("SETUP", 1.0, 17, 0.95, (), True),
+            lambda *_a, **_k: cs._layer_result("SETUP", 1.0, 0.95, (), True),
         )
         monkeypatch.setattr(
             cs, "score_confirmation",
-            lambda *_a, **_k: cs.LayerResult("CONFIRM", 1.0, 10, 0.90, (), True),
+            lambda *_a, **_k: cs._layer_result("CONFIRM", 1.0, 0.90, (), True),
         )
         low_report = cs.score_ticker(_DummyEngine(_RawSeriesConn({})), "AAPL", as_of_date=AS_OF)
         assert low_report.total_score < 25
@@ -857,37 +859,39 @@ class TestDefect6Form4AndCompanyUnavailable:
         monkeypatch.setattr(cs, "_load_price", lambda *_a, **_k: pd.Series([100.0] * 91, index=idx))
         monkeypatch.setattr(
             cs, "score_setup",
-            lambda *_a, **_k: cs.LayerResult("SETUP", 17.0, 17, 0.95, (), True),
+            lambda *_a, **_k: cs._layer_result("SETUP", 17.0, 0.95, (), True),
         )
         monkeypatch.setattr(cs, "score_company", lambda *_a, **_k: None)
         monkeypatch.setattr(
             cs, "score_smart_money",
-            lambda *_a, **_k: cs.LayerResult("SMART_MONEY", 15.0, 15, 0.85, (), True),
+            lambda *_a, **_k: cs._layer_result("SMART_MONEY", 15.0, 0.85, (), True),
         )
         monkeypatch.setattr(
             cs, "score_crowd",
-            lambda *_a, **_k: cs.LayerResult("CROWD", 15.0, 15, 0.75, (), True),
+            lambda *_a, **_k: cs._layer_result("CROWD", 15.0, 0.75, (), True),
         )
         monkeypatch.setattr(
             cs, "score_narrative",
-            lambda *_a, **_k: cs.LayerResult("NARRATIVE", 0.0, 10, 0.10, (), False),
+            lambda *_a, **_k: cs._layer_result("NARRATIVE", 0.0, 0.10, (), False),
         )
         monkeypatch.setattr(
             cs, "score_flow",
-            lambda *_a, **_k: cs.LayerResult("FLOW", 0.0, 15, 0.15, (), False),
+            lambda *_a, **_k: cs._layer_result("FLOW", 0.0, 0.15, (), False),
         )
         monkeypatch.setattr(
             cs, "score_confirmation",
-            lambda *_a, **_k: cs.LayerResult("CONFIRM", 10.0, 10, 0.90, (), True),
+            lambda *_a, **_k: cs._layer_result("CONFIRM", 10.0, 0.90, (), True),
         )
 
         report = cs.score_ticker(_DummyEngine(_RawSeriesConn({})), "AAPL", as_of_date=AS_OF)
 
-        # 4/7 layers available (>= 0.5, < 0.8): 49.15 / 52.40 = 94 -> alert stays FIRE.
-        assert report.total_score == 94
+        # 4/7 layers available (>= 0.5, < 0.8): 49.15 / 63.15 = 78 -> alert stays
+        # FIRE (this test asserted 49.15 / 52.40 = 94 while missing data shrank
+        # the denominator).
+        assert report.total_score == 78
         assert report.alert_level == "FIRE"
         assert report.unavailable_layers == ("COMPANY", "NARRATIVE", "FLOW")
-        assert report.confidence_pct == pytest.approx(round(94 * 4 / 7, 1))
+        assert report.confidence_pct == pytest.approx(round(78 * 4 / 7, 1))
 
 
 # ── Defect 7: SMART_MONEY certainty never promotes the composite total ────
@@ -1001,4 +1005,220 @@ class TestDefect7CompositeNoPromotion:
         layers = {k: next(x for x in b["layers"] if x["name"] == "SMART_MONEY") for k, b in bodies.items()}
         assert {k: (x["trust"], x["denominator_trust"]) for k, x in layers.items()} == {
             "full": (0.85, 0.85), "short": (0.5, 0.85), "unavailable": (0.15, 0.85),
+        }
+
+
+# ── Defect 8: no layer's missing data promotes the composite total ────────
+#
+# The Defect 7 hole in every other layer: CROWD (0.75 -> 0.15), NARRATIVE
+# (0.50 -> 0.10), FLOW (0.60 -> 0.15 or 0.10) and CONFIRM (0.90 -> 0.10)
+# lowered their trust when their data was missing, and score_ticker divided
+# by sum(max * trust), so a ticker missing a layer scored above the same
+# ticker whose layer read neutral. SETUP's no-price branch also carried a
+# 20-point max against 17 everywhere else. Every layer now reports its fixed
+# weight (LAYER_MAX_SCORE x LAYER_FULL_TRUST) as its denominator weight.
+#
+# Evidence held fixed below: SETUP 12 of 17 (VIX 36, HY 5.5, curve -0.25)
+# and CONFIRM 10 of 10 (a turn off a 50 low), 11.40 + 9.00 = 20.40 earned of
+# a fixed 63.15 maximum (COMPANY is None and excluded), so 32 WATCH.
+
+_D8_TICKER = "AAPL"
+_D8_NEUTRAL_TOTAL = 32  # round(100 x 20.40 / 63.15)
+
+
+def _d8_turning_price(as_of: date) -> pd.Series:
+    # 100 -> 50 over 50 days, then 50 -> 74 over 40: CONFIRM 10 (5d +4.2 %,
+    # 30d up while 90d down, above the 30-day low by > 5 %), drawdown -26 %
+    # (no SETUP drawdown points), no volatility spike (no FLOW points).
+    values = [100.0 - i for i in range(51)] + [50.0 + 0.6 * i for i in range(1, 41)]
+    return pd.Series(values, index=pd.date_range(end=as_of, periods=len(values), freq="D"))
+
+
+def _d8_neutral_data(as_of: date) -> dict[str, Any]:
+    """Every layer has data and reads neutral (0 points) except SETUP and CONFIRM."""
+    t = _D8_TICKER
+    return {
+        "latest": {
+            "vix_spot": 36.0, "hy_oas_spread": 5.5, "yld_curve_2s10s": -0.25,
+            "gdelt_article_count": 500.0,
+        },
+        "raw_series": {
+            f"SHORT:{t}:ratio": [0.0] * 20,        # CROWD data, 0 points
+            f"FTD:{t}:qty": [100.0] * 40,          # CROWD data, 0 points
+            f"NEWS:{t}:daily_count": [1.0] * 40,   # NARRATIVE data, 0 points
+        },
+        "raw_latest": {"CBOE:totalpc": 0.9, "CBOE:equitypc": 0.6},  # FLOW data, 0 points
+        # SMART_MONEY: a full verified 90-day window with no P/S rows, 0 points.
+        "form4": cs.Form4PSWindow(start=as_of - timedelta(days=89), end=as_of),
+        "price": _d8_turning_price(as_of),
+    }
+
+
+def _d8_drop(data: dict[str, Any], layer: str) -> dict[str, Any]:
+    """The same data with one layer's ticker inputs missing."""
+    t = _D8_TICKER
+    out = {k: (dict(v) if isinstance(v, dict) else v) for k, v in data.items()}
+    if layer == "CROWD":
+        out["raw_series"].pop(f"SHORT:{t}:ratio")
+        out["raw_series"].pop(f"FTD:{t}:qty")
+    elif layer == "NARRATIVE":
+        out["raw_series"].pop(f"NEWS:{t}:daily_count")
+    elif layer == "FLOW":
+        out["raw_latest"].pop("CBOE:equitypc")
+    elif layer == "SMART_MONEY":
+        out["form4"] = cs.Form4PSWindow()
+    else:
+        raise AssertionError(layer)
+    return out
+
+
+def _d8_install(monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]) -> None:
+    monkeypatch.setattr(cs, "_load_price", lambda *_a, **_k: data["price"])
+    monkeypatch.setattr(cs, "_load_latest", lambda _c, name, **_k: data["latest"].get(name))
+    monkeypatch.setattr(
+        cs, "_load_raw_series",
+        lambda _c, sid, *_a, **_k: pd.Series(data["raw_series"].get(sid, []), dtype=float),
+    )
+    monkeypatch.setattr(cs, "_load_raw_latest", lambda _c, pat, *_a, **_k: data["raw_latest"].get(pat))
+    monkeypatch.setattr(cs, "_form4_ps_window", lambda *_a, **_k: data["form4"])
+
+
+def _d8_score(monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]) -> cs.ConvictionReport:
+    _d8_install(monkeypatch, data)
+    return cs.score_ticker(_DummyEngine(_RawSeriesConn({})), _D8_TICKER, as_of_date=AS_OF)
+
+
+def _d8_layer(report: cs.ConvictionReport, name: str) -> cs.LayerResult:
+    return next(layer for layer in report.layers if layer.name == name)
+
+
+class TestDefect8NoLayerPromotesByMissingData:
+    def test_neutral_baseline_is_32_watch_with_every_weight_fixed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        report = _d8_score(monkeypatch, _d8_neutral_data(AS_OF))
+
+        assert (report.total_score, report.alert_level) == (_D8_NEUTRAL_TOTAL, "WATCH")
+        assert report.unavailable_layers == ("COMPANY",)
+        assert {layer.name: layer.score for layer in report.layers} == {
+            "SETUP": 12, "SMART_MONEY": 0, "CROWD": 0, "NARRATIVE": 0, "FLOW": 0, "CONFIRM": 10,
+        }
+        assert sum(layer.max_score * layer.denominator_trust for layer in report.layers) == pytest.approx(63.15)
+
+    @pytest.mark.parametrize(
+        "missing",
+        # Before the fix: CROWD 38, NARRATIVE 34, FLOW 36 (SMART_MONEY was 32
+        # since Defect 7).
+        ["CROWD", "NARRATIVE", "FLOW", "SMART_MONEY"],
+    )
+    def test_a_missing_layer_scores_the_same_as_that_layer_read_neutral(
+        self, monkeypatch: pytest.MonkeyPatch, missing: str,
+    ) -> None:
+        report = _d8_score(monkeypatch, _d8_drop(_d8_neutral_data(AS_OF), missing))
+
+        layer = _d8_layer(report, missing)
+        assert layer.data_available is False
+        assert layer.trust < cs.LAYER_FULL_TRUST[missing]
+        assert layer.denominator_trust == cs.LAYER_FULL_TRUST[missing]
+        assert report.unavailable_layers == ("COMPANY", missing)
+        assert (report.total_score, report.alert_level) == (_D8_NEUTRAL_TOTAL, "WATCH")
+
+    def test_every_ticker_layer_missing_still_scores_32_not_47(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data = _d8_neutral_data(AS_OF)
+        for layer in ("CROWD", "NARRATIVE", "FLOW", "SMART_MONEY"):
+            data = _d8_drop(data, layer)
+
+        report = _d8_score(monkeypatch, data)
+
+        # Was round(100 x 20.40 / 43.40) = 47 (SMART_MONEY already held its
+        # weight since Defect 7); the evidence is the same 20.40 of 63.15.
+        assert report.total_score == _D8_NEUTRAL_TOTAL
+        assert report.alert_level == "WATCH"
+        assert report.unavailable_layers == ("COMPANY", "SMART_MONEY", "CROWD", "NARRATIVE", "FLOW")
+
+    def test_evidence_raises_the_total_and_missing_data_never_does(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        neutral = _d8_neutral_data(AS_OF)
+        shorted = {**neutral, "raw_series": {**neutral["raw_series"], f"SHORT:{_D8_TICKER}:ratio": [0.6] * 20}}
+
+        totals = {
+            "missing": _d8_score(monkeypatch, _d8_drop(neutral, "CROWD")).total_score,
+            "neutral": _d8_score(monkeypatch, neutral).total_score,
+            # Heavily shorted: CROWD +5 at trust 0.75 -> (20.40 + 3.75) / 63.15.
+            "evidence": _d8_score(monkeypatch, shorted).total_score,
+        }
+
+        assert totals == {"missing": 32, "neutral": 32, "evidence": 38}
+
+    def test_every_layer_branch_reports_its_fixed_weight(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        conn = _RawSeriesConn({})
+        short_price = _d8_turning_price(AS_OF).tail(10)
+        empty_price = pd.Series(dtype=float)
+        results: list[cs.LayerResult] = []
+        for data in (_d8_neutral_data(AS_OF), *(
+            _d8_drop(_d8_neutral_data(AS_OF), name)
+            for name in ("CROWD", "NARRATIVE", "FLOW", "SMART_MONEY")
+        )):
+            _d8_install(monkeypatch, data)
+            price = data["price"]
+            results += [
+                cs.score_setup(conn, _D8_TICKER, price, as_of_date=AS_OF),
+                cs.score_smart_money(conn, _D8_TICKER, as_of_date=AS_OF),
+                cs.score_crowd(conn, _D8_TICKER, as_of_date=AS_OF),
+                cs.score_narrative(conn, _D8_TICKER, as_of_date=AS_OF),
+                cs.score_flow(conn, _D8_TICKER, price, as_of_date=AS_OF),
+                cs.score_confirmation(price),
+            ]
+        # Too little or no price history: SETUP, FLOW and CONFIRM still carry
+        # their full weights (SETUP's no-price max was 20 against 17).
+        results += [
+            cs.score_setup(conn, _D8_TICKER, empty_price, as_of_date=AS_OF),
+            cs.score_flow(conn, _D8_TICKER, short_price, as_of_date=AS_OF),
+            cs.score_confirmation(short_price),
+        ]
+
+        assert {r.name for r in results} == set(cs.LAYER_FULL_TRUST) - {"COMPANY"}
+        assert any(not r.data_available for r in results if r.name == "SETUP")
+        for r in results:
+            assert r.max_score == cs.LAYER_MAX_SCORE[r.name], r
+            assert r.baseline_trust == cs.LAYER_FULL_TRUST[r.name], r
+            assert r.denominator_trust == cs.LAYER_FULL_TRUST[r.name], r
+            assert 0 <= r.trust <= r.denominator_trust, r
+
+    def test_conviction_api_reports_the_fixed_weight_of_every_layer(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from api.auth import require_auth
+        from api.routers import signals as signals_module
+
+        today = date.today()  # the route scores as of today
+        data = _d8_neutral_data(today)
+        for layer in ("CROWD", "NARRATIVE", "FLOW"):
+            data = _d8_drop(data, layer)
+        _d8_install(monkeypatch, data)
+        monkeypatch.setattr(signals_module, "get_db_engine", lambda: _DummyEngine(_RawSeriesConn({})))
+        app = FastAPI()
+        app.include_router(signals_module.router)
+        app.dependency_overrides[require_auth] = lambda: "test-token"
+
+        resp = TestClient(app).get("/api/v1/signals/conviction/aapl")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert (body["total_score"], body["alert_level"]) == (_D8_NEUTRAL_TOTAL, "WATCH")
+        assert {x["name"]: (x["trust"], x["denominator_trust"]) for x in body["layers"]} == {
+            "SETUP": (0.95, 0.95),
+            "SMART_MONEY": (0.85, 0.85),
+            "CROWD": (0.15, 0.75),
+            "NARRATIVE": (0.1, 0.5),
+            "FLOW": (0.15, 0.6),
+            "CONFIRM": (0.9, 0.9),
         }

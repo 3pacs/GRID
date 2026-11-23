@@ -6,23 +6,28 @@ trust in the underlying data. A score of 85+ with all layers confirming
 = highest conviction. Uses ONLY data that actually exists in raw_series.
 
 Layers:
-  1. SETUP      (20 pts) — VIX, HY spread, PSI, drawdown severity
+  1. SETUP      (17 pts) — VIX, HY spread, curve, drawdown severity
   2. COMPANY    (15 pts) — Revenue trend, EPS, shares outstanding, cash
-  3. SMART_MONEY(15 pts) — Insider buying (Form 4), institutional flows
+  3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4)
   4. CROWD      (15 pts) — Short ratio, FTD, put/call ratio
   5. NARRATIVE  (10 pts) — News volume trend, wiki attention
   6. FLOW       (15 pts) — Volume spike, options unusual activity
   7. CONFIRM    (10 pts) — Price momentum turning, higher low formed
 
 Each layer returns (score, max_possible, trust_weight, signals[]).
-Final score = sum(score * trust) / sum(max * trust) * 100
+Final score = sum(score * trust) / sum(max * full_trust) * 100, where
+full_trust is the layer's trust with its data in hand (LAYER_FULL_TRUST):
+missing or thinner data lowers a layer's numerator weight only, never the
+denominator, so less evidence can never raise the total.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
+from types import MappingProxyType
 
 import pandas as pd
 from loguru import logger as log
@@ -43,10 +48,12 @@ class LayerResult:
     signals: tuple[str, ...]
     data_available: bool
     # Weight of max_score in the composite denominator; None means ``trust``.
-    # A layer whose certainty can drop (SMART_MONEY's Form 4 coverage) keeps
-    # its full-certainty weight here, so lost certainty can only shrink its
-    # contribution toward neutral and never raises total_score by shrinking
-    # the denominator (Codex HOLD on #1353 57514cc5).
+    # Every layer scorer sets it to the layer's full-data trust
+    # (LAYER_FULL_TRUST), so missing or thinner data can only shrink a
+    # layer's contribution toward zero and never raises total_score by
+    # shrinking the denominator (Codex HOLD on #1353 57514cc5 for
+    # SMART_MONEY; the same hole in CROWD / NARRATIVE / FLOW / CONFIRM /
+    # SETUP closed 2026-11-23).
     baseline_trust: float | None = None
 
     @property
@@ -192,9 +199,51 @@ def _load_price(
 
 # Max attainable SETUP points: drawdown 5 + VIX 5 + credit 4 + curve 3. The
 # 3-point planetary_stress_index component was removed 2026-09-10 (astrology
-# is not a market-scoring input); the layer's 20-point weight in the composite
-# is preserved through LayerResult.max_score.
+# is not a market-scoring input), so the layer's weight is 17, not 20.
 SETUP_MAX_SCORE = 17
+
+# Each layer's fixed weight in score_ticker's denominator: its max points and
+# its trust with its data in hand. A layer scorer returns its own trust
+# (lower when its data is missing or thin), which weights the numerator only;
+# the denominator weight is the same for every ticker and date, so a ticker
+# with a missing layer never scores above one whose same layer read neutral.
+LAYER_MAX_SCORE: Mapping[str, float] = MappingProxyType({
+    "SETUP": float(SETUP_MAX_SCORE),
+    "COMPANY": 15.0,
+    "SMART_MONEY": 15.0,
+    "CROWD": 15.0,
+    "NARRATIVE": 10.0,
+    "FLOW": 15.0,
+    "CONFIRM": 10.0,
+})
+LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
+    "SETUP": 0.95,
+    "COMPANY": 0.90,
+    "SMART_MONEY": 0.85,
+    "CROWD": 0.75,
+    "NARRATIVE": 0.50,
+    "FLOW": 0.60,
+    "CONFIRM": 0.90,
+})
+
+
+def _layer_result(
+    name: str,
+    score: float,
+    trust: float,
+    signals: Sequence[str],
+    data_available: bool,
+) -> LayerResult:
+    """A layer's result with its fixed composite weight (LAYER_MAX_SCORE, LAYER_FULL_TRUST)."""
+    return LayerResult(
+        name,
+        score,
+        LAYER_MAX_SCORE[name],
+        trust,
+        tuple(signals),
+        data_available,
+        baseline_trust=LAYER_FULL_TRUST[name],
+    )
 
 
 def score_setup(
@@ -216,7 +265,7 @@ def score_setup(
     yc = _load_latest(conn, "yld_curve_2s10s", as_of_date=as_of_date)
 
     if price.empty:
-        return LayerResult("SETUP", 0, 20, 0.95, (), False)
+        return _layer_result("SETUP", 0, LAYER_FULL_TRUST["SETUP"], (), False)
 
     ath = price.max()
     current = price.iloc[-1]
@@ -259,9 +308,8 @@ def score_setup(
         score += 3
         signals.append(f"YC={yc:.2f} [INVERTED]")
 
-    # Max is 17 since the 3-point celestial component was removed; the layer
-    # keeps its 20-point weight in the composite via LayerResult.max_score.
-    return LayerResult("SETUP", min(score, SETUP_MAX_SCORE), SETUP_MAX_SCORE, 0.95, tuple(signals), True)
+    # Max is 17 since the 3-point celestial component was removed.
+    return _layer_result("SETUP", min(score, SETUP_MAX_SCORE), LAYER_FULL_TRUST["SETUP"], signals, True)
 
 
 def score_company(
@@ -368,8 +416,8 @@ def score_company(
         else:
             signals.append(f"Cash/Liab={cash_ratio:.2f} [WEAK]")
 
-    trust = 0.90 if has_data else 0.20
-    return LayerResult("COMPANY", max(score, 0), 15, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["COMPANY"] if has_data else 0.20
+    return _layer_result("COMPANY", max(score, 0), trust, signals, has_data)
 
 
 # SMART_MONEY Form 4 input: reported non-derivative P/S transactions only
@@ -415,9 +463,9 @@ _FORM4_MIN_VERIFIED_DAYS = 7
 _FORM4_PS_LABEL = "Insider reported P/S (non-derivative, venue unknown)"
 _FORM4_VALUE_STRONG_USD = 500_000.0
 _FORM4_SELL_CAP = -2.0
-# SMART_MONEY's trust on a full verified 90-day window, and its fixed weight
-# in score_ticker's denominator whatever the coverage (LayerResult.baseline_trust).
-_SMART_MONEY_FULL_TRUST = 0.85
+# SMART_MONEY's trust on a full verified 90-day window is
+# LAYER_FULL_TRUST["SMART_MONEY"], which is also its fixed weight in
+# score_ticker's denominator whatever the coverage (LayerResult.baseline_trust).
 
 
 @dataclass(frozen=True)
@@ -579,15 +627,13 @@ def score_smart_money(
     # sorted last (Codex HOLD on #1353 5c4c7b32).
     signals.append("Institutional flow unavailable (no INST_FLOW writer; 13F is non-directional)")
 
-    trust = (_SMART_MONEY_FULL_TRUST if full_window else 0.5) if has_data else 0.15
-    return LayerResult(
+    trust = (LAYER_FULL_TRUST["SMART_MONEY"] if full_window else 0.5) if has_data else 0.15
+    return _layer_result(
         "SMART_MONEY",
         max(_FORM4_SELL_CAP, min(points, 15.0)),
-        15,
         trust,
-        tuple(signals),
+        signals,
         has_data,
-        baseline_trust=_SMART_MONEY_FULL_TRUST,
     )
 
 
@@ -641,8 +687,8 @@ def score_crowd(
             score += 1
             signals.append(f"PCR={pcr:.2f} [BEARISH]")
 
-    trust = 0.75 if has_data else 0.15
-    return LayerResult("CROWD", min(score, 15), 15, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["CROWD"] if has_data else 0.15
+    return _layer_result("CROWD", min(score, 15), trust, signals, has_data)
 
 
 def score_narrative(
@@ -682,8 +728,8 @@ def score_narrative(
         score += 1
         signals.append(f"GDELT high ({gdelt:.0f} articles)")
 
-    trust = 0.50 if has_data else 0.10
-    return LayerResult("NARRATIVE", min(score, 10), 10, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["NARRATIVE"] if has_data else 0.10
+    return _layer_result("NARRATIVE", min(score, 10), trust, signals, has_data)
 
 
 def score_flow(
@@ -698,7 +744,7 @@ def score_flow(
     has_data = False
 
     if price.empty or len(price) < 20:
-        return LayerResult("FLOW", 0, 15, 0.10, (), False)
+        return _layer_result("FLOW", 0, 0.10, (), False)
 
     # Volume spike (from price data — use returns as proxy if no volume)
     returns = price.pct_change().dropna()
@@ -729,8 +775,8 @@ def score_flow(
             score += 3
             signals.append(f"Equity PCR={epcr:.2f} [BEARISH - contrarian buy]")
 
-    trust = 0.60 if has_data else 0.15
-    return LayerResult("FLOW", min(score, 15), 15, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["FLOW"] if has_data else 0.15
+    return _layer_result("FLOW", min(score, 15), trust, signals, has_data)
 
 
 def score_confirmation(price: pd.Series) -> LayerResult:
@@ -739,7 +785,7 @@ def score_confirmation(price: pd.Series) -> LayerResult:
     signals = []
 
     if price.empty or len(price) < 30:
-        return LayerResult("CONFIRM", 0, 10, 0.10, (), False)
+        return _layer_result("CONFIRM", 0, 0.10, (), False)
 
     current = price.iloc[-1]
 
@@ -773,7 +819,7 @@ def score_confirmation(price: pd.Series) -> LayerResult:
             score += 3
             signals.append(f"Higher low forming (${current:.2f} vs 30d low ${low_30d:.2f})")
 
-    return LayerResult("CONFIRM", min(score, 10), 10, 0.90, tuple(signals), True)
+    return _layer_result("CONFIRM", min(score, 10), LAYER_FULL_TRUST["CONFIRM"], signals, True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -810,12 +856,13 @@ def score_ticker(
     )
 
     # Exclude never-written None layers (COMPANY) from the weighted total, while
-    # keeping data_available=False layers as before (counted as 0) so thin data
+    # keeping data_available=False layers in it (counted as 0) so thin data
     # cannot inflate total_score.
-    # A layer's denominator weight is its baseline_trust when set (see
-    # LayerResult): for SMART_MONEY, a shorter verified window or no coverage
-    # lowers the numerator weight only, so the same evidence with less
-    # certainty can never promote the total.
+    # A layer's denominator weight is its baseline_trust (its full-data trust,
+    # LAYER_FULL_TRUST): missing data, a shorter SMART_MONEY window or a
+    # too-short price history lowers the numerator weight only, so the same
+    # evidence with less certainty, or a missing layer, can never promote the
+    # total.
     weighted_score = sum(layer.score * layer.trust for layer in present_layers)
     weighted_max = sum(layer.max_score * layer.denominator_trust for layer in present_layers)
     total = (
