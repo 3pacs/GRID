@@ -750,3 +750,138 @@ class TestRowToScorecard:
         card = _row_to_scorecard(row, signal_source="flow_momentum", horizon_days=7)
         assert card.is_calibrated is False
         assert card.conviction_weight == 1.0
+
+
+# ── get_scorecard_with_regime_source (Codex HOLD 6011905360) ─────────────
+
+
+def _flat_sentinel() -> SignalScorecard:
+    return SignalScorecard(
+        signal_source="flow_momentum",
+        horizon_days=7,
+        scored_count=99,
+        running_brier=0.12,
+        running_ece=0.15,
+        hit_rate=0.72,
+        last_updated=datetime(2026, 4, 13, tzinfo=timezone.utc),
+        is_calibrated=True,
+        conviction_weight=0.9,
+    )
+
+
+class TestRegimeSourceAPI:
+    """Same resolution as the fallback API, plus which table answered, so
+    callers can count only regime-specific hits."""
+
+    def _seed(self, engine: _FakeEngine, *, count: int) -> None:
+        for _ in range(count):
+            record_scored_prediction(
+                engine,
+                horizon_days=7,
+                confidence=0.9,
+                outcome=1.0,
+                signal_contributions={"flow_momentum": 1.0},
+                regime="EXPANSION",
+            )
+
+    def test_warm_regime_row_reports_regime(self):
+        from features.regime_conditional_brier import (
+            CALIBRATION_SOURCE_REGIME,
+            get_scorecard_with_regime_source,
+        )
+
+        engine = _FakeEngine()
+        self._seed(engine, count=MIN_REGIME_SAMPLES + 5)
+        with patch(
+            "features.regime_conditional_brier.get_signal_scorecard",
+            return_value=_flat_sentinel(),
+        ) as flat:
+            card, source = get_scorecard_with_regime_source(
+                engine, "flow_momentum", 7, "EXPANSION"
+            )
+        assert CALIBRATION_SOURCE_REGIME == "regime"
+        assert source == "regime"
+        assert card is not None and card.scored_count == MIN_REGIME_SAMPLES + 5
+        flat.assert_not_called()
+
+    def test_thin_regime_row_reports_flat_fallback(self):
+        from features.regime_conditional_brier import (
+            CALIBRATION_SOURCE_FLAT_FALLBACK,
+            get_scorecard_with_regime_source,
+        )
+
+        engine = _FakeEngine()
+        self._seed(engine, count=MIN_REGIME_SAMPLES - 1)
+        sentinel = _flat_sentinel()
+        with patch(
+            "features.regime_conditional_brier.get_signal_scorecard",
+            return_value=sentinel,
+        ):
+            card, source = get_scorecard_with_regime_source(
+                engine, "flow_momentum", 7, "EXPANSION"
+            )
+        assert CALIBRATION_SOURCE_FLAT_FALLBACK == "flat_fallback"
+        assert source == "flat_fallback"
+        assert card is sentinel
+
+    def test_missing_regime_row_reports_flat_fallback(self):
+        from features.regime_conditional_brier import get_scorecard_with_regime_source
+
+        sentinel = _flat_sentinel()
+        with patch(
+            "features.regime_conditional_brier.get_signal_scorecard",
+            return_value=sentinel,
+        ):
+            card, source = get_scorecard_with_regime_source(
+                _FakeEngine(), "flow_momentum", 7, "CRISIS"
+            )
+        assert (card, source) == (sentinel, "flat_fallback")
+
+    def test_no_regime_reports_flat(self):
+        from features.regime_conditional_brier import (
+            CALIBRATION_SOURCE_FLAT,
+            get_scorecard_with_regime_source,
+        )
+
+        sentinel = _flat_sentinel()
+        with patch(
+            "features.regime_conditional_brier.get_signal_scorecard",
+            return_value=sentinel,
+        ):
+            card, source = get_scorecard_with_regime_source(
+                _FakeEngine(), "flow_momentum", 7, None
+            )
+        assert CALIBRATION_SOURCE_FLAT == "flat"
+        assert (card, source) == (sentinel, "flat")
+
+    def test_unknown_signal_reports_no_source(self):
+        from features.regime_conditional_brier import get_scorecard_with_regime_source
+
+        with patch(
+            "features.regime_conditional_brier.get_signal_scorecard",
+            return_value=None,
+        ):
+            assert get_scorecard_with_regime_source(
+                _FakeEngine(), "never_seen", 7, "EXPANSION"
+            ) == (None, None)
+            assert get_scorecard_with_regime_source(
+                _FakeEngine(), "never_seen", 7, None
+            ) == (None, None)
+
+    def test_fallback_api_returns_the_same_card(self):
+        from features.regime_conditional_brier import get_scorecard_with_regime_source
+
+        engine = _FakeEngine()
+        self._seed(engine, count=MIN_REGIME_SAMPLES - 1)
+        sentinel = _flat_sentinel()
+        with patch(
+            "features.regime_conditional_brier.get_signal_scorecard",
+            return_value=sentinel,
+        ):
+            via_source, _ = get_scorecard_with_regime_source(
+                engine, "flow_momentum", 7, "EXPANSION"
+            )
+            via_fallback = get_scorecard_with_regime_fallback(
+                engine, "flow_momentum", 7, "EXPANSION"
+            )
+        assert via_source is via_fallback is sentinel

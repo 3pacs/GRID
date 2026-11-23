@@ -853,3 +853,259 @@ class TestScriptsMatchProductionMath:
         assert "Disagreement penalty:" not in out
         assert "Red-team penalty:" not in out
         assert "Fragility multiplier:  ×" not in out
+
+
+# ── Codex HOLD 6011905360: regime-calibrated count and the builder's clock ──
+#
+# 1. The regime lookup falls back to the flat per-signal scorecard when the
+#    prediction has no regime, or when the regime row is missing or thin.
+#    Only scorecards from the regime-conditional table count toward
+#    regime_calibrated_signal_count, and every evidence row reports which
+#    table answered ("regime", "flat_fallback", "flat", or None).
+# 2. The builder dates its layers from the prediction's own clock
+#    (prediction.as_of), not date.today(). The undated layers (scorecards,
+#    confidence bucket, null hypothesis, meta-learning, co-occurrence, memory,
+#    fudge alerts) read current state, so the builder is live-only: a
+#    prediction whose clock is outside the live window is refused before any
+#    layer is read.
+
+
+def _patch_calibration_tables(
+    stack: ExitStack,
+    *,
+    regime_cards: dict[str, SignalScorecard],
+    flat_cards: dict[str, SignalScorecard],
+) -> dict[str, list[Any]]:
+    """Stand in for the two scorecard tables behind the regime fallback.
+
+    ``regime_cards`` holds the regime-conditional rows that are warm enough
+    to return (a missing key is a missing or thin regime row); ``flat_cards``
+    holds the flat per-signal scorecards.
+    """
+    calls: dict[str, list[Any]] = {"regime": [], "flat": []}
+
+    def _regime(_eng: Any, src: str, _h: int, regime: str | None) -> SignalScorecard | None:
+        calls["regime"].append((src, regime))
+        return regime_cards.get(src)
+
+    def _flat(_eng: Any, src: str, _h: int) -> SignalScorecard | None:
+        calls["flat"].append(src)
+        return flat_cards.get(src)
+
+    stack.enter_context(
+        patch("features.regime_conditional_brier.get_regime_conditional_scorecard", _regime)
+    )
+    stack.enter_context(patch("features.regime_conditional_brier.get_signal_scorecard", _flat))
+    return calls
+
+
+def _evidence_rows(report: Any) -> dict[str, dict[str, Any]]:
+    return {row["signal_source"]: row for row in report.to_dict()["signal_evidence"]}
+
+
+class TestCodexHold6011905360RegimeCalibratedCount:
+    def test_missing_regime_reports_flat_source_and_counts_zero(self) -> None:
+        pred = _prediction(signal_contributions={"jodi_oil": 0.6, "pcr": 0.4})
+        pred.regime = ""
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            calls = _patch_calibration_tables(
+                stack,
+                regime_cards={"jodi_oil": _card("jodi_oil", 1.3), "pcr": _card("pcr", 1.2)},
+                flat_cards={"jodi_oil": _card("jodi_oil", 1.1), "pcr": _card("pcr", 1.0)},
+            )
+            report = sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert calls["regime"] == []  # no regime: the regime table is never read
+        assert report.regime_calibrated_signal_count == 0
+        rows = _evidence_rows(report)
+        assert rows["jodi_oil"]["calibration_source"] == "flat"
+        assert rows["pcr"]["calibration_source"] == "flat"
+        assert all(ev.calibration_source == "flat" for ev in report.signal_evidence)
+
+    def test_flat_fallback_is_reported_and_not_counted_as_regime_calibrated(self) -> None:
+        # The prediction carries a regime, but neither signal has a warm
+        # regime row, so both scorecards come from the flat fallback.
+        pred = _prediction(signal_contributions={"jodi_oil": 0.6, "pcr": 0.4})
+        assert pred.regime == "EXPANSION"
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            calls = _patch_calibration_tables(
+                stack,
+                regime_cards={},
+                flat_cards={"jodi_oil": _card("jodi_oil", 1.3), "pcr": _card("pcr", 1.2)},
+            )
+            report = sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert ("jodi_oil", "EXPANSION") in calls["regime"]
+        assert report.regime_calibrated_signal_count == 0
+        rows = _evidence_rows(report)
+        assert rows["jodi_oil"]["calibration_source"] == "flat_fallback"
+        assert rows["pcr"]["calibration_source"] == "flat_fallback"
+        # The flat scorecard is still the evidence used (behaviour unchanged).
+        assert rows["jodi_oil"]["scorecard"]["conviction_weight"] == pytest.approx(1.3)
+        assert report.aggregate_conviction == pytest.approx(0.6 * 1.3 + 0.4 * 1.2)
+
+    def test_only_regime_specific_hits_are_counted(self) -> None:
+        pred = _prediction(
+            signal_contributions={"jodi_oil": 0.5, "pcr": 0.3, "ghost_signal": 0.2}
+        )
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            _patch_calibration_tables(
+                stack,
+                regime_cards={"jodi_oil": _card("jodi_oil", 1.3)},
+                flat_cards={"jodi_oil": _card("jodi_oil", 0.9), "pcr": _card("pcr", 1.2)},
+            )
+            report = sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert report.regime_calibrated_signal_count == 1
+        assert report.to_dict()["regime_calibrated_signal_count"] == 1
+        rows = _evidence_rows(report)
+        assert rows["jodi_oil"]["calibration_source"] == "regime"
+        assert rows["jodi_oil"]["scorecard"]["conviction_weight"] == pytest.approx(1.3)
+        assert rows["pcr"]["calibration_source"] == "flat_fallback"
+        assert rows["ghost_signal"]["calibration_source"] is None
+        assert rows["ghost_signal"]["scorecard"] is None
+
+
+_LIVE_NOW = datetime(2026, 3, 5, 15, 30, tzinfo=timezone.utc)
+
+_DATED_ADAPTERS = (
+    "scenario_conviction_multiplier",
+    "contra_conviction_multiplier",
+    "squeeze_conviction_multiplier",
+    "arbitrage_conviction_multiplier",
+    "money_flow_conviction_multiplier",
+)
+
+
+def _capture_dated_layers(stack: ExitStack) -> dict[str, Any]:
+    """Patch every layer that takes a date and record the date it was given."""
+    seen: dict[str, Any] = {}
+
+    def _capture(name: str) -> Any:
+        def _fn(*_a: Any, **kw: Any) -> float:
+            seen[name] = kw.get("as_of")
+            return 1.0
+
+        return _fn
+
+    for name in _DATED_ADAPTERS:
+        stack.enter_context(patch.object(sp, name, _capture(name)))
+    stack.enter_context(patch.object(sp, "_lookup_convergence", _capture("convergence")))
+    return seen
+
+
+def _spy_every_layer(stack: ExitStack) -> list[str]:
+    """Patch every layer and scorecard read so any read is recorded."""
+    reads: list[str] = []
+
+    def _spy(name: str) -> Any:
+        def _fn(*_a: Any, **_k: Any) -> Any:
+            reads.append(name)
+            return None
+
+        return _fn
+
+    for name in (
+        "get_lift_multiplier",
+        "conviction_multiplier_for_bucket",
+        "null_hypothesis_penalty",
+        "get_aggregate_weight_multiplier",
+        "memory_lesson_conviction_multiplier",
+        "_recent_fudge_alerts",
+        "_lookup_convergence",
+        "_resolve_signal_contributions",
+        *_DATED_ADAPTERS,
+    ):
+        stack.enter_context(patch.object(sp, name, _spy(name)))
+    stack.enter_context(
+        patch("features.regime_conditional_brier.get_regime_conditional_scorecard", _spy("regime_card"))
+    )
+    stack.enter_context(
+        patch("features.regime_conditional_brier.get_signal_scorecard", _spy("flat_card"))
+    )
+    return reads
+
+
+class TestCodexHold6011905360PredictionClock:
+    def test_dated_layers_use_the_prediction_clock_not_the_wall_clock(self) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = _LIVE_NOW - timedelta(minutes=10)
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            seen = _capture_dated_layers(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            _patch_calibration_tables(
+                stack, regime_cards={}, flat_cards={"jodi_oil": _card("jodi_oil", 1.3)}
+            )
+            report = sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        expected = _LIVE_NOW.date()
+        assert set(seen) == {*_DATED_ADAPTERS, "convergence"}
+        assert all(value == expected for value in seen.values()), seen
+        assert report.generated_at == _LIVE_NOW.isoformat()
+
+    def test_missing_clock_uses_the_builder_utc_date(self) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        assert getattr(pred, "as_of", None) is None
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            seen = _capture_dated_layers(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            _patch_calibration_tables(
+                stack, regime_cards={}, flat_cards={"jodi_oil": _card("jodi_oil", 1.3)}
+            )
+            sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert all(value == _LIVE_NOW.date() for value in seen.values()), seen
+
+    def test_naive_clock_is_read_as_utc(self) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        # 00:10 UTC on 2026-03-06, written without tzinfo.
+        late_now = datetime(2026, 3, 6, 0, 20, tzinfo=timezone.utc)
+        pred.as_of = datetime(2026, 3, 6, 0, 10)
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            seen = _capture_dated_layers(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: late_now, create=True))
+            _patch_calibration_tables(
+                stack, regime_cards={}, flat_cards={"jodi_oil": _card("jodi_oil", 1.3)}
+            )
+            sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert all(value == late_now.date() for value in seen.values()), seen
+
+    @pytest.mark.parametrize(
+        "clock",
+        [
+            pytest.param(_LIVE_NOW - timedelta(days=30), id="historical-replay"),
+            pytest.param(_LIVE_NOW - timedelta(hours=2), id="stale-beyond-tolerance"),
+            pytest.param(_LIVE_NOW + timedelta(days=2), id="future"),
+            pytest.param(_LIVE_NOW.date() - timedelta(days=1), id="date-only-yesterday"),
+            pytest.param("2026-03-05T15:30:00+00:00", id="string-clock"),
+        ],
+    )
+    def test_clock_outside_live_window_is_refused_before_any_read(self, clock: Any) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = clock
+        with ExitStack() as stack:
+            reads = _spy_every_layer(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            with pytest.raises(ValueError, match="live-only"):
+                sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert reads == []
+
+    def test_historical_clock_fails_closed_through_the_decision_gateway(self) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = _LIVE_NOW - timedelta(days=30)
+        with ExitStack() as stack:
+            reads = _spy_every_layer(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            report, err = dg._run_provenance(MagicMock(), pred, None)
+
+        assert report is None
+        assert err is not None and "live-only" in err
+        assert reads == []
