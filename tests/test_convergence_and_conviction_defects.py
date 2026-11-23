@@ -42,6 +42,7 @@ from sqlalchemy.pool import StaticPool
 
 from alpha_research import conviction_scorer as cs
 from intelligence import signal_convergence_scanner as scs
+from store.observations import Observation
 
 AS_OF = date(2026, 4, 13)
 T3 = AS_OF - timedelta(days=3)
@@ -1034,20 +1035,33 @@ def _d8_turning_price(as_of: date) -> pd.Series:
     return pd.Series(values, index=pd.date_range(end=as_of, periods=len(values), freq="D"))
 
 
+_D8_FTD = "sec:ftd_balance:037833100"
+_D8_NEWS = f"TIINGO_NEWS:{_D8_TICKER}:daily_count"
+
+
+def _d8_obs(series_id: str, values: list[float], as_of: date) -> list[Observation]:
+    """Daily observations ending at as_of, as store.observations returns them."""
+    first = as_of - timedelta(days=len(values) - 1)
+    return [Observation(series_id, first + timedelta(days=i), v) for i, v in enumerate(values)]
+
+
 def _d8_neutral_data(as_of: date) -> dict[str, Any]:
-    """Every layer has data and reads neutral (0 points) except SETUP and CONFIRM."""
-    t = _D8_TICKER
+    """Every layer with a scored input has data and reads neutral (0 points) except SETUP and CONFIRM.
+
+    NARRATIVE has no scored input (its Tiingo news count is shown, not
+    scored, since the Codex HOLD on #1395 f821c50c), so it is unavailable here.
+    """
     return {
-        "latest": {
-            "vix_spot": 36.0, "hy_oas_spread": 5.5, "yld_curve_2s10s": -0.25,
-            "gdelt_article_count": 500.0,
+        "latest": {"vix_spot": 36.0, "hy_oas_spread": 5.5, "yld_curve_2s10s": -0.25},
+        # Rows the CROWD / NARRATIVE inputs read through _read_known.
+        "known": {
+            _D8_FTD: _d8_obs(_D8_FTD, [100.0] * 40, as_of),        # CROWD data, 0 points
+            "put_call_ratio": _d8_obs("put_call_ratio", [0.9], as_of),  # market-wide, shown, not scored
+            _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 40, as_of),        # NARRATIVE: shown, not scored
         },
-        "raw_series": {
-            f"SHORT:{t}:ratio": [0.0] * 20,        # CROWD data, 0 points
-            f"FTD:{t}:qty": [100.0] * 40,          # CROWD data, 0 points
-            f"NEWS:{t}:daily_count": [1.0] * 40,   # NARRATIVE data, 0 points
-        },
-        "raw_latest": {"CBOE:totalpc": 0.9, "CBOE:equitypc": 0.6},  # FLOW data, 0 points
+        "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
+        # FLOW data: a 60-day volatility baseline and no spike, 0 points.
+        "flow_baseline_returns": cs.FLOW_BASELINE_RETURNS,
         # SMART_MONEY: a full verified 90-day window with no P/S rows, 0 points.
         "form4": cs.Form4PSWindow(start=as_of - timedelta(days=89), end=as_of),
         "price": _d8_turning_price(as_of),
@@ -1056,15 +1070,15 @@ def _d8_neutral_data(as_of: date) -> dict[str, Any]:
 
 def _d8_drop(data: dict[str, Any], layer: str) -> dict[str, Any]:
     """The same data with one layer's ticker inputs missing."""
-    t = _D8_TICKER
     out = {k: (dict(v) if isinstance(v, dict) else v) for k, v in data.items()}
     if layer == "CROWD":
-        out["raw_series"].pop(f"SHORT:{t}:ratio")
-        out["raw_series"].pop(f"FTD:{t}:qty")
+        out["ftd_ids"] = {}
+        out["known"].pop(_D8_FTD)
     elif layer == "NARRATIVE":
-        out["raw_series"].pop(f"NEWS:{t}:daily_count")
+        out["known"].pop(_D8_NEWS)
     elif layer == "FLOW":
-        out["raw_latest"].pop("CBOE:equitypc")
+        # No 60-day return baseline: the volatility comparison is not a measurement.
+        out["flow_baseline_returns"] = 10_000
     elif layer == "SMART_MONEY":
         out["form4"] = cs.Form4PSWindow()
     else:
@@ -1075,11 +1089,12 @@ def _d8_drop(data: dict[str, Any], layer: str) -> dict[str, Any]:
 def _d8_install(monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]) -> None:
     monkeypatch.setattr(cs, "_load_price", lambda *_a, **_k: data["price"])
     monkeypatch.setattr(cs, "_load_latest", lambda _c, name, **_k: data["latest"].get(name))
-    monkeypatch.setattr(
-        cs, "_load_raw_series",
-        lambda _c, sid, *_a, **_k: pd.Series(data["raw_series"].get(sid, []), dtype=float),
-    )
-    monkeypatch.setattr(cs, "_load_raw_latest", lambda _c, pat, *_a, **_k: data["raw_latest"].get(pat))
+    monkeypatch.setattr(cs, "_read_known", lambda _c, sid, *_a, **_k: data["known"].get(sid, []))
+    monkeypatch.setattr(cs, "_ftd_series_ids", lambda *_a, **_k: data["ftd_ids"])
+    # The fixture's FTD rows are filed under the ticker (the identity check
+    # itself is tested on a real raw_series table in test_conviction_scorer.py).
+    monkeypatch.setattr(cs, "_ftd_identity_break", lambda *_a, **_k: None)
+    monkeypatch.setattr(cs, "FLOW_BASELINE_RETURNS", data["flow_baseline_returns"])
     monkeypatch.setattr(cs, "_form4_ps_window", lambda *_a, **_k: data["form4"])
 
 
@@ -1099,7 +1114,7 @@ class TestDefect8NoLayerPromotesByMissingData:
         report = _d8_score(monkeypatch, _d8_neutral_data(AS_OF))
 
         assert (report.total_score, report.alert_level) == (_D8_NEUTRAL_TOTAL, "WATCH")
-        assert report.unavailable_layers == ("COMPANY",)
+        assert report.unavailable_layers == ("COMPANY", "NARRATIVE")
         assert {layer.name: layer.score for layer in report.layers} == {
             "SETUP": 12, "SMART_MONEY": 0, "CROWD": 0, "NARRATIVE": 0, "FLOW": 0, "CONFIRM": 10,
         }
@@ -1108,8 +1123,8 @@ class TestDefect8NoLayerPromotesByMissingData:
     @pytest.mark.parametrize(
         "missing",
         # Before the fix: CROWD 38, NARRATIVE 34, FLOW 36 (SMART_MONEY was 32
-        # since Defect 7).
-        ["CROWD", "NARRATIVE", "FLOW", "SMART_MONEY"],
+        # since Defect 7). NARRATIVE is unavailable in the baseline itself.
+        ["CROWD", "FLOW", "SMART_MONEY"],
     )
     def test_a_missing_layer_scores_the_same_as_that_layer_read_neutral(
         self, monkeypatch: pytest.MonkeyPatch, missing: str,
@@ -1120,7 +1135,9 @@ class TestDefect8NoLayerPromotesByMissingData:
         assert layer.data_available is False
         assert layer.trust < cs.LAYER_FULL_TRUST[missing]
         assert layer.denominator_trust == cs.LAYER_FULL_TRUST[missing]
-        assert report.unavailable_layers == ("COMPANY", missing)
+        assert report.unavailable_layers == tuple(
+            name for name in cs.LAYER_MAX_SCORE if name in {"COMPANY", "NARRATIVE", missing}
+        )
         assert (report.total_score, report.alert_level) == (_D8_NEUTRAL_TOTAL, "WATCH")
 
     def test_every_ticker_layer_missing_still_scores_32_not_47(
@@ -1142,13 +1159,15 @@ class TestDefect8NoLayerPromotesByMissingData:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         neutral = _d8_neutral_data(AS_OF)
-        shorted = {**neutral, "raw_series": {**neutral["raw_series"], f"SHORT:{_D8_TICKER}:ratio": [0.6] * 20}}
+        surging = {**neutral, "known": {
+            **neutral["known"], _D8_FTD: _d8_obs(_D8_FTD, [1_000.0] * 30 + [50_000.0] * 10, AS_OF),
+        }}
 
         totals = {
             "missing": _d8_score(monkeypatch, _d8_drop(neutral, "CROWD")).total_score,
             "neutral": _d8_score(monkeypatch, neutral).total_score,
-            # Heavily shorted: CROWD +5 at trust 0.75 -> (20.40 + 3.75) / 63.15.
-            "evidence": _d8_score(monkeypatch, shorted).total_score,
+            # FTD balance surging: CROWD +5 at trust 0.75 -> (20.40 + 3.75) / 63.15.
+            "evidence": _d8_score(monkeypatch, surging).total_score,
         }
 
         assert totals == {"missing": 32, "neutral": 32, "evidence": 38}
@@ -1232,8 +1251,10 @@ class TestDefect8NoLayerPromotesByMissingData:
 # PASS, the same sell on a short window 24 PASS, and SMART_MONEY unavailable
 # 26 WATCH. The alert now comes from score_low (every unknown at its worst
 # attainable value) and total_score stays the neutral point estimate.
-# (2) The current scorers top out at 50.95 of 63.15 = 81, so CONVICTION (85)
-# is unreachable; reports say so instead of implying it is live.
+# (2) The current scorers top out at 36.15 of 63.15 = 57 (81 before the
+# inputs with no live writer stopped counting and news and total put/call
+# became descriptive, 2026-11-23), so CONVICTION (85) and FIRE (70) are
+# unreachable; reports say so instead of implying they are live.
 
 _LEVEL_ORDER = ("PASS", "WATCH", "PILOT", "SCALE", "FIRE", "CONVICTION")
 
@@ -1273,7 +1294,6 @@ _D9_CASES = {
 
 def _d9_max_data(as_of: date) -> dict[str, Any]:
     """Inputs that drive every current layer scorer to its attainable maximum."""
-    t = _D8_TICKER
     # Crash 100 -> 20, flat, then a 5-day rebound to 27: drawdown -73 %
     # (SETUP 5), a volatility spike (FLOW 5) and a confirmed turn (CONFIRM 10).
     values = (
@@ -1282,16 +1302,14 @@ def _d9_max_data(as_of: date) -> dict[str, Any]:
         + [21.0, 22.5, 24.0, 25.5, 27.0]
     )
     return {
-        "latest": {
-            "vix_spot": 36.0, "hy_oas_spread": 5.5, "yld_curve_2s10s": -0.25,
-            f"wiki_{t.lower()}": 1.0, "gdelt_article_count": 1_500.0,
+        "latest": {"vix_spot": 36.0, "hy_oas_spread": 5.5, "yld_curve_2s10s": -0.25},
+        "known": {
+            _D8_FTD: _d8_obs(_D8_FTD, [1_000.0] * 80 + [50_000.0] * 10, as_of),   # FTD surge 5
+            "put_call_ratio": _d8_obs("put_call_ratio", [1.3], as_of),          # shown, not scored
+            _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 60 + [49.0] * 31, as_of),       # shown, not scored
         },
-        "raw_series": {
-            f"SHORT:{t}:ratio": [0.6] * 20,
-            f"FTD:{t}:qty": [1_000.0] * 80 + [50_000.0] * 10,
-            f"NEWS:{t}:daily_count": [1.0] * 33 + [10.0] * 7,
-        },
-        "raw_latest": {"CBOE:totalpc": 1.3, "CBOE:equitypc": 0.9, f"WHALE:{t}:%": 1.0},
+        "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
+        "flow_baseline_returns": cs.FLOW_BASELINE_RETURNS,
         "form4": _d9_window(as_of, days=90, value=750_000.0),
         "price": pd.Series(values, index=pd.date_range(end=as_of, periods=len(values), freq="D")),
     }
@@ -1374,13 +1392,41 @@ class TestDefect9LostEvidenceAndDormantConviction:
         assert {layer.name: layer.score for layer in report.layers} == {
             name: cs.LAYER_ATTAINABLE_SCORE[name] for name in cs.LAYER_FULL_TRUST if name != "COMPANY"
         }
-        # ... earns 50.95 of 63.15 = 81: FIRE is the highest reachable alert.
-        assert (report.total_score, report.score_low, report.score_high) == (81, 81, 81)
-        assert report.alert_level == "FIRE"
-        assert report.max_attainable_score == 81
-        assert report.dormant_alert_levels == ("CONVICTION",)
-        assert dict(cs.ALERT_THRESHOLDS)["CONVICTION"] > report.max_attainable_score
-        assert all(floor <= 81 for name, floor in cs.ALERT_THRESHOLDS if name != "CONVICTION")
+        # ... earns 36.15 of 63.15 = 57: SCALE is the highest reachable alert.
+        assert (report.total_score, report.score_low, report.score_high) == (57, 57, 57)
+        assert report.alert_level == "SCALE"
+        assert report.max_attainable_score == 57
+        assert report.dormant_alert_levels == ("CONVICTION", "FIRE")
+        thresholds = dict(cs.ALERT_THRESHOLDS)
+        assert min(thresholds["CONVICTION"], thresholds["FIRE"]) > report.max_attainable_score
+        assert all(floor <= 57 for name, floor in cs.ALERT_THRESHOLDS if name not in {"CONVICTION", "FIRE"})
+
+    @pytest.mark.parametrize("crowd", ["ftd-surge", "ftd-neutral", "ftd-missing"])
+    def test_total_put_call_never_moves_the_total_or_its_bounds(
+        self, monkeypatch: pytest.MonkeyPatch, crowd: str,
+    ) -> None:
+        # Codex HOLD on #1395 a994e347: total put/call is descriptive, so no
+        # value of it (or its absence) changes total_score, score_low,
+        # score_high, the alert or max_attainable_score.
+        base = _d9_max_data(AS_OF) if crowd == "ftd-surge" else _d8_neutral_data(AS_OF)
+        if crowd == "ftd-missing":
+            base = _d8_drop(base, "CROWD")
+
+        def outcome(pcr: float | None) -> tuple[Any, ...]:
+            known = dict(base["known"])
+            if pcr is None:
+                known.pop("put_call_ratio", None)
+            else:
+                known["put_call_ratio"] = _d8_obs("put_call_ratio", [pcr], AS_OF)
+            r = _d8_score(monkeypatch, {**base, "known": known})
+            crowd_layer = _d8_layer(r, "CROWD")
+            return (
+                r.total_score, r.score_low, r.score_high, r.alert_level, r.max_attainable_score,
+                crowd_layer.score, crowd_layer.data_available,
+            )
+
+        outcomes = {pcr: outcome(pcr) for pcr in (None, 0.5, 1.05, 1.3, 3.0)}
+        assert len(set(outcomes.values())) == 1, outcomes
 
     def test_bound_tables_agree_with_the_scorers(self) -> None:
         assert set(cs.LAYER_MIN_SCORE) == set(cs.LAYER_ATTAINABLE_SCORE) == set(cs.LAYER_MAX_SCORE)
@@ -1422,5 +1468,5 @@ class TestDefect9LostEvidenceAndDormantConviction:
         }
         for body in bodies.values():
             assert body["alert_basis"] == "score_low"
-            assert body["max_attainable_score"] == 81
-            assert body["dormant_alert_levels"] == ["CONVICTION"]
+            assert body["max_attainable_score"] == 57
+            assert body["dormant_alert_levels"] == ["CONVICTION", "FIRE"]

@@ -126,11 +126,13 @@ def test_conviction_scorer_universe_excludes_rows_not_yet_held(scratch, monkeypa
     _seed(scratch, "ccc_full", [(d, d, d, 10.0) for d in days])       # honest
     seen: list[str] = []
 
-    def fake_score(_engine, ticker, *, as_of_date=None, market=None):
+    def fake_score(_engine, ticker, *, as_of_date=None, ftd_series_ids=None, market=None):
         seen.append(ticker)
         return cs.ConvictionReport(ticker, 90, 90.0, (), "CONVICTION", "ts")
 
     monkeypatch.setattr(cs, "score_ticker", fake_score)
+    # The scratch schema has no raw_series; the FTD lookup is covered in test_conviction_scorer.
+    monkeypatch.setattr(cs, "_ftd_series_ids", lambda _conn, tickers, _as_of: {})
     reports = cs.scan_all(scratch, min_score=0, as_of_date=AS_OF)
     assert [r.ticker for r in reports] == ["CCC"]
     assert seen == ["CCC"]

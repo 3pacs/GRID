@@ -3,16 +3,26 @@ Conviction Scorer — 98% confidence trade detector.
 
 Scores every ticker across 7 layers of evidence, each weighted by
 trust in the underlying data. A score of 85+ with all layers confirming
-= highest conviction. Uses ONLY data that actually exists in raw_series.
+= highest conviction. Uses ONLY data that a live writer puts in raw_series
+or resolved_series; an input with no such writer is reported unavailable
+(a signal saying why) and scores nothing.
 
-Layers:
+Layers (weight; inputs read today, then inputs reported unavailable):
   1. SETUP      (17 pts) — VIX, HY spread, curve, drawdown severity
-  2. COMPANY    (15 pts) — Revenue trend, EPS, shares outstanding, cash
-  3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4)
-  4. CROWD      (15 pts) — Short ratio, FTD, put/call ratio
-  5. NARRATIVE  (10 pts) — News volume trend, wiki attention
-  6. FLOW       (15 pts) — Volume spike, options unusual activity
+  2. COMPANY    (15 pts) — unavailable: no XBRL:* writer
+  3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4); institutional flow unavailable
+  4. CROWD      (15 pts) — SEC fails-to-deliver balance; total put/call shown, not scored; short interest unavailable
+  5. NARRATIVE  (10 pts) — nothing scored: Tiingo news count shown, not scored; wiki and GDELT unavailable
+  6. FLOW       (15 pts) — Volatility spike; unusual options not scored, equity put/call unavailable
   7. CONFIRM    (10 pts) — Price momentum turning, higher low formed
+
+CROWD and NARRATIVE read raw_series through
+store.observations.read_window_known_at with each writer's own source: a row
+counts only if it was pulled by the end of the as-of date (UTC), and only the
+latest vintage pulled by then. An FTD balance scores only when every row of
+its CUSIP series in the read window was filed under the ticker, including the
+selected vintages (see _score_ftd). See "CROWD / NARRATIVE / FLOW inputs"
+below for the per-input measurements (griddb, 2026-11-23).
 
 Each layer returns (score, max_possible, trust_weight, signals[]).
 Final score = sum(score * trust) / sum(max * full_trust) * 100, where
@@ -31,10 +41,17 @@ an alert: a layer that goes missing can only lower score_low, since its
 minimum is at or below anything it could have measured. score_high is the
 same with every unknown at its best attainable value (LAYER_ATTAINABLE_SCORE).
 
-CONVICTION (85) is dormant: with the current scorers the best attainable
-total is 81 (50.95 of 63.15), so the ladder tops out at FIRE. Each report
-says so (max_attainable_score, dormant_alert_levels); raising it needs a
-separately approved recalibration, not a quiet threshold change.
+CONVICTION (85) and FIRE (70) are dormant: with the current scorers the best
+attainable total is 57 (36.15 of 63.15), so the ladder tops out at SCALE. It
+was 81 (50.95) while CROWD, NARRATIVE and FLOW still counted points from inputs
+that no live writer feeds (short interest, wiki, GDELT, equity put/call), that
+fire for every covered ticker (unusual options), whose counts cannot tell an
+empty fetch from a missing one (Tiingo news), or whose pull clock is not the
+acquisition time (Cboe total put/call). In production those inputs
+had added only wiki's +2, to GOLD and SP500, from series last updated
+2026-04-03. Each report says so (max_attainable_score,
+dormant_alert_levels); raising it needs a separately approved recalibration,
+not a quiet threshold change.
 """
 
 from __future__ import annotations
@@ -42,16 +59,17 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from types import MappingProxyType
 
 import pandas as pd
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
 from alpha_research.data.split_adjuster import adjust_splits
-from store.observations import read_window_known_at
+from normalization.entity_map import pattern_collision
+from store.observations import Observation, read_window_known_at
 from store.pit import retraction_cutoff
 
 
@@ -148,40 +166,35 @@ def _load_latest(
     return float(row[0]) if row else None
 
 
-def _load_raw_latest(
+# _load_raw_latest (a ">= prefix / < prefix-plus-one" range scan) was removed
+# 2026-11-23. Under griddb's en_US.UTF-8 collation punctuation sorts at a lower
+# level, so 'WHALE:SPY:600' < 'WHALE:SPY;' is false and the scan returned 0 of
+# SPY's 88,256 WHALE rows. It also had no freshness bound, and CROWD passed it a
+# positional 5 as source_id (CBOE's id happens to be 5). Its three callers now
+# read named series through _read_known, or report the input unavailable.
+
+
+def _read_known(
     conn,
-    series_pattern: str,
-    source_id: int | None = None,
-    as_of_date: date | None = None,
-) -> float | None:
-    as_of = _resolve_as_of_date(as_of_date)
-    # Use >= / < range scan instead of LIKE for index efficiency
-    prefix = series_pattern.replace("%", "")
-    upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else "~"
-    # raw_series does not carry release_date in live griddb; use pull_timestamp
-    # as the conservative availability proxy for PIT reads.
-    if source_id is not None:
-        row = conn.execute(text("""
-            SELECT value FROM raw_series
-            WHERE series_id >= :lo AND series_id < :hi
-              AND source_id = :s
-              AND pull_status = 'SUCCESS'
-              AND obs_date <= :as_of
-              AND pull_timestamp::date <= :as_of
-            ORDER BY obs_date DESC, pull_timestamp DESC
-            LIMIT 1
-        """), {"lo": prefix, "hi": upper, "s": source_id, "as_of": as_of}).fetchone()
-    else:
-        row = conn.execute(text("""
-            SELECT value FROM raw_series
-            WHERE series_id >= :lo AND series_id < :hi
-              AND pull_status = 'SUCCESS'
-              AND obs_date <= :as_of
-              AND pull_timestamp::date <= :as_of
-            ORDER BY obs_date DESC, pull_timestamp DESC
-            LIMIT 1
-        """), {"lo": prefix, "hi": upper, "as_of": as_of}).fetchone()
-    return float(row[0]) if row else None
+    series_id: str,
+    source: str,
+    as_of: date,
+    days: int,
+) -> list[Observation]:
+    """``series_id``'s rows from ``source`` dated in the ``days`` to ``as_of``, oldest first.
+
+    Point in time: a row counts only if it was pulled by the end of ``as_of``
+    (UTC), and a date's value is its latest vintage pulled by then
+    (store.observations.read_window_known_at with no modeled lag).
+    """
+    return read_window_known_at(
+        conn,
+        series_id,
+        as_of=as_of,
+        lag=None,
+        source=source,
+        start=as_of - timedelta(days=days),
+    )
 
 
 def _load_raw_series(
@@ -285,10 +298,15 @@ LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
 
 # Each layer's lowest and highest points its current scorer can produce. Only
 # SMART_MONEY goes below zero (the Form 4 sell cap, -2); the others top out
-# where their components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4, SMART_MONEY the
-# +5 strong-buy tier, CROWD 5+5+3, NARRATIVE 5+2+1, FLOW 5+5+3, CONFIRM
-# 3+4+3. They bound what an unknown could have been (score_low / score_high)
-# and which alert levels are reachable at all; max_score stays the weight.
+# where their scored components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4,
+# SMART_MONEY the +5 strong-buy tier, CROWD 5 (FTD; put/call is
+# descriptive), NARRATIVE 0 (news is descriptive), FLOW 5 (volatility),
+# CONFIRM 3+4+3. The inputs reported unavailable or not scored score nothing,
+# so they add nothing here (CROWD was 13 with short interest and put/call,
+# NARRATIVE 8 with news, wiki and GDELT, FLOW 13 with unusual options and
+# equity put/call). They bound what an unknown could have been (score_low /
+# score_high) and which alert levels are reachable at all; max_score stays
+# the weight.
 LAYER_MIN_SCORE: Mapping[str, float] = MappingProxyType({
     "SETUP": 0.0,
     "COMPANY": 0.0,
@@ -302,9 +320,9 @@ LAYER_ATTAINABLE_SCORE: Mapping[str, float] = MappingProxyType({
     "SETUP": 17.0,
     "COMPANY": 15.0,
     "SMART_MONEY": 5.0,
-    "CROWD": 13.0,
-    "NARRATIVE": 8.0,
-    "FLOW": 13.0,
+    "CROWD": 5.0,
+    "NARRATIVE": 0.0,
+    "FLOW": 5.0,
     "CONFIRM": 10.0,
 })
 
@@ -756,58 +774,297 @@ def score_smart_money(
     )
 
 
+# ── CROWD / NARRATIVE / FLOW inputs ──────────────────────────────────────
+#
+# Measured on griddb 2026-11-23 (read-only; 139 tickers in the scan universe).
+# Before this, CROWD read no data for 139 of 139 tickers, NARRATIVE for 137
+# and FLOW for 94:
+#
+#   * SHORT:{t}:ratio and FTD:{t}:qty were one-off loads pulled 2026-04-01
+#     (obs to 2026-03-31 / 2026-03-13); nothing has written them since.
+#   * The SEC FTD writer (ingestion/altdata/sec_ftd.py, 24 h) keys balances by
+#     CUSIP, sec:ftd_balance:<CUSIP>, with the file's SYMBOL in raw_payload.
+#   * CBOE:totalpc stopped with Cboe's totalpc.csv; the CBOE puller (24 h)
+#     stores the total exchange ratio as put_call_ratio since 2026-11-04.
+#     CBOE:equitypc has no writer.
+#   * News is written as TIINGO_NEWS:{t}:daily_count (6 h), not
+#     NEWS:{t}:daily_count. wiki_{t} was a one-off topic load ending
+#     2026-04-03, and gdelt_article_count was deleted by the 2026-11-16 GDELT
+#     rebuild.
+#   * WHALE:{t}:* exists for 25 universe tickers, but the old prefix range
+#     scan read none of it (collation, see _read_known).
+
+# Reported unavailable: no live writer, or the live series does not measure
+# what the rule scores. Like COMPANY and INST_FLOW, nothing is read for them.
+SHORT_INTEREST_UNAVAILABLE = (
+    "Short interest unavailable (no SHORT:* writer since a one-off 2026-04-01 load; "
+    "FINRA daily short-sale volume is trade volume, not short interest)"
+)
+WIKI_UNAVAILABLE = (
+    "Wiki attention unavailable (no per-ticker writer; wiki_* was a one-off topic load "
+    "ending 2026-04-03)"
+)
+GDELT_UNAVAILABLE = (
+    "GDELT article count unavailable (gdelt_article_count was retired by the "
+    "2026-11-16 GDELT rebuild)"
+)
+WHALE_NOT_SCORED = (
+    "Unusual options activity not scored (the WHALE:* detector flags every covered "
+    "ticker every day, so a flag is not unusual)"
+)
+EQUITY_PCR_UNAVAILABLE = (
+    "Equity put/call unavailable (no writer; the CBOE puller stores the total ratio only)"
+)
+# Read and shown, never scored (Codex HOLD on #1395 f821c50c): the writer
+# stores a count only when a fetch returns articles, so an empty fetch and a
+# failed or skipped one look alike; it counts every article returned, repeats
+# included; and each day's count covers an overlapping trailing 7 days.
+NEWS_NOT_SCORED = (
+    "News count not scored (Tiingo stores no row for an empty fetch, counts repeated "
+    "articles, and each count overlaps the last 7 days)"
+)
+# Read and shown, never scored (Codex HOLD on #1395 a994e347): the CBOE
+# puller opens one transaction before its HTTP fetches and leaves
+# pull_timestamp to DEFAULT NOW(), the transaction start, so a session
+# fetched late can carry an earlier pull time and pass an as-of cutoff it did
+# not meet. Scoring it waits for a qualified clock and an approved policy.
+PCR_NOT_SCORED = (
+    "Total put/call not scored (the Cboe puller stamps rows with its transaction start, "
+    "not the fetch time)"
+)
+
+# CROWD: SEC fails-to-deliver balances (ingestion/altdata/sec_ftd.py).
+# Each row is the outstanding balance on a settlement date, published about
+# two weeks after each half-month closes. The file lists only securities with
+# fails, so a missing date is not a zero and is left out (the rule averages
+# the balances on file, as it did on the legacy FTD:{t}:qty rows).
+FTD_SOURCE = "SEC_FTD"
+FTD_SERIES_PREFIX = "sec:ftd_balance:"
+FTD_WINDOW_DAYS = 90
+# Newest balance must settle within this many days of the as-of date: the
+# normal publication lag is up to ~31 days, plus pull cadence.
+FTD_FRESH_DAYS = 45
+# Both queries use the bounds _read_known applies to the balances it selects:
+# SUCCESS rows of the writer's source, settled in [as_of - FTD_WINDOW_DAYS,
+# as_of], pulled before the end of as_of's UTC day (pull_timestamp is
+# TIMESTAMPTZ, so this is read_window_known_at's pulled-by rule).
+# Symbol -> CUSIP series: one batch per scan.
+_FTD_IDS_SQL = text("""
+    SELECT r.raw_payload ->> 'symbol' AS symbol, r.series_id
+    FROM raw_series r
+    JOIN source_catalog sc ON sc.id = r.source_id
+    WHERE LOWER(sc.name) = LOWER(:source)
+      AND r.series_id LIKE :pattern ESCAPE '\\'
+      AND r.pull_status = 'SUCCESS'
+      AND r.obs_date >= :start
+      AND r.obs_date <= :as_of
+      AND r.pull_timestamp < :known_by
+      AND r.raw_payload ->> 'symbol' IN :symbols
+    GROUP BY 1, 2
+""").bindparams(bindparam("symbols", expanding=True))
+# CUSIP series -> the symbol on each of its rows, run after the balances are
+# read so every selected vintage is already on file (~10 ms per ticker).
+_FTD_FILED_AS_SQL = text("""
+    SELECT r.obs_date, r.pull_timestamp, r.raw_payload ->> 'symbol' AS symbol
+    FROM raw_series r
+    JOIN source_catalog sc ON sc.id = r.source_id
+    WHERE r.series_id = :sid
+      AND LOWER(sc.name) = LOWER(:source)
+      AND r.pull_status = 'SUCCESS'
+      AND r.obs_date >= :start
+      AND r.obs_date <= :as_of
+      AND r.pull_timestamp < :known_by
+""")
+
+# CROWD: Cboe total exchange put/call ratio (ingestion/altdata/cboe_indices.py),
+# one value per trading day, market-wide, shown, not scored (PCR_NOT_SCORED).
+# The newest within PCR_FRESH_DAYS (covers a long weekend) is shown.
+PCR_SERIES = "put_call_ratio"
+PCR_SOURCE = "CBOE"
+PCR_FRESH_DAYS = 5
+
+# NARRATIVE: Tiingo news (ingestion/tiingo_news_pull.py), shown, not scored
+# (NEWS_NOT_SCORED). Each day's value is the number of articles a trailing
+# NEWS_TRAILING_DAYS query returned, capped at the pull's limit
+# (NEWS_FETCH_CAP), written once per day by the first pull that found any. A
+# value at the cap is a lower bound. The newest count within
+# NEWS_TRAILING_DAYS is shown with its date.
+NEWS_SOURCE = "tiingo_news"
+NEWS_SERIES = "TIINGO_NEWS:{ticker}:daily_count"
+NEWS_TRAILING_DAYS = 7
+NEWS_FETCH_CAP = 50
+
+# FLOW: a volatility spike needs a 60-day baseline of daily returns.
+FLOW_BASELINE_RETURNS = 60
+
+
+def _panel_instrument_conflict(ticker: str) -> str | None:
+    """The price feed showing ``{ticker}_full`` is not the listed security ``ticker``.
+
+    gold_full is gold futures (YF:GC=F) and btc_full Binance BTCUSDT, while SEC
+    and Tiingo file a listed security under the same symbol (Barrick Gold, a
+    bitcoin trust). Per-ticker inputs keyed by symbol are not read for such a
+    ticker (normalization.entity_map.pattern_collision).
+    """
+    return pattern_collision(f"YF:{ticker.upper()}:adj_close", f"{ticker.lower()}_full")
+
+
+def _ftd_series_ids(conn, tickers: Sequence[str], as_of: date) -> dict[str, tuple[str, ...]]:
+    """The SEC FTD balance series each ticker's symbol was filed under, known at ``as_of``.
+
+    One query for all tickers (scan_all passes the result down; one lookup
+    costs ~0.6 s on griddb, the batch for 139 tickers 0.8 s). Only SUCCESS
+    rows of the writer's source that settled in the read window and were
+    pulled by the end of ``as_of`` (UTC) count. A ticker whose price panel is
+    another instrument is not looked up.
+    """
+    symbols = sorted({t.upper() for t in tickers if _panel_instrument_conflict(t) is None})
+    if not symbols:
+        return {}
+    rows = conn.execute(_FTD_IDS_SQL, {
+        "source": FTD_SOURCE,
+        "pattern": FTD_SERIES_PREFIX.replace("_", "\\_") + "%",
+        "start": as_of - timedelta(days=FTD_WINDOW_DAYS),
+        "as_of": as_of,
+        "known_by": datetime.combine(as_of + timedelta(days=1), time(0), tzinfo=timezone.utc),
+        "symbols": symbols,
+    }).fetchall()
+    found: dict[str, set[str]] = {}
+    for symbol, series_id in rows:
+        if symbol is not None and str(series_id).startswith(FTD_SERIES_PREFIX):
+            found.setdefault(str(symbol).upper(), set()).add(str(series_id))
+    return {symbol: tuple(sorted(ids)) for symbol, ids in found.items()}
+
+
+def _utc(ts: object) -> datetime | None:
+    """A raw_series pull_timestamp as an aware UTC instant (naive is UTC, as griddb runs Etc/UTC)."""
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts)
+    if not isinstance(ts, datetime):
+        return None
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+
+
+def _ftd_identity_break(
+    conn,
+    series_id: str,
+    symbol: str,
+    as_of: date,
+    selected: Sequence[Observation],
+) -> str | None:
+    """Why ``selected`` (read from ``series_id``) is not ``symbol``'s balance, or None.
+
+    The symbol -> CUSIP lookup finds a CUSIP from any one row filed under the
+    symbol; the balances read from that CUSIP series may be filed under
+    another. So every row of the series in the read bounds, all vintages,
+    must be filed under ``symbol``. One that is not means a symbol change
+    (old A rows and newer B rows on one CUSIP) or a corrected filing in the
+    window, and the input abstains. Each selected vintage must also be one of
+    those rows. This query runs after the read, so a row pulled in between
+    (an as-of of today) is checked, never scored unchecked.
+    """
+    rows = conn.execute(_FTD_FILED_AS_SQL, {
+        "sid": series_id,
+        "source": FTD_SOURCE,
+        "start": as_of - timedelta(days=FTD_WINDOW_DAYS),
+        "as_of": as_of,
+        "known_by": datetime.combine(as_of + timedelta(days=1), time(0), tzinfo=timezone.utc),
+    }).fetchall()
+    others = sorted({"no symbol" if s is None else str(s) for _, _, s in rows if s != symbol})
+    if others:
+        return f"{series_id} was also filed as {', '.join(others)} in the window"
+    on_file = {(str(d)[:10], _utc(ts)) for d, ts, _ in rows}
+    for o in selected:
+        if (o.obs_date.isoformat(), _utc(o.pull_timestamp)) not in on_file:
+            return f"the {o.obs_date} balance read from {series_id} is not on file under {symbol}"
+    return None
+
+
+def _score_ftd(
+    conn,
+    ticker: str,
+    as_of: date,
+    series_ids: Mapping[str, tuple[str, ...]] | None,
+) -> tuple[float, str, bool]:
+    """(points, signal, has_data) for CROWD's fails-to-deliver part."""
+    conflict = _panel_instrument_conflict(ticker)
+    if conflict is not None:
+        return 0.0, f"FTD not read ({ticker}'s price panel is {conflict}, not the listed {ticker})", False
+    if series_ids is None:
+        series_ids = _ftd_series_ids(conn, [ticker], as_of)
+    ids = series_ids.get(ticker.upper(), ())
+    if not ids:
+        return 0.0, f"No SEC FTD balance filed under {ticker} in the {FTD_WINDOW_DAYS} days to {as_of}", False
+    if len(ids) > 1:
+        return 0.0, f"FTD not scored ({ticker} is filed under {len(ids)} CUSIPs in the window)", False
+    obs = _read_known(conn, ids[0], FTD_SOURCE, as_of, FTD_WINDOW_DAYS)
+    if not obs:
+        return 0.0, f"No SEC FTD balance known for {ticker} at {as_of}", False
+    unbound = _ftd_identity_break(conn, ids[0], ticker.upper(), as_of, obs)
+    if unbound is not None:
+        return 0.0, f"FTD not scored ({unbound})", False
+    latest = obs[-1].obs_date
+    if latest < as_of - timedelta(days=FTD_FRESH_DAYS):
+        return 0.0, f"SEC FTD balance stale for {ticker} (newest settlement {latest})", False
+    ftd = pd.Series([o.value for o in obs], dtype=float)
+    recent_ftd = ftd.tail(10).mean()
+    older_ftd = ftd.head(30).mean() if len(ftd) > 30 else recent_ftd
+    settled = f"settled to {latest}"
+    if recent_ftd > older_ftd * 2 and recent_ftd > 10000:
+        return 5.0, (
+            f"FTD balance surging ({recent_ftd:,.0f} vs {older_ftd:,.0f} sh; {settled}) [SQUEEZE SETUP]"
+        ), True
+    if recent_ftd > 10000:
+        return 2.0, f"FTD balance elevated ({recent_ftd:,.0f} sh; {settled})", True
+    return 0.0, f"FTD balance {recent_ftd:,.0f} sh ({settled})", True
+
+
 def score_crowd(
     conn,
     ticker: str,
     as_of_date: date | None = None,
+    ftd_series_ids: Mapping[str, tuple[str, ...]] | None = None,
 ) -> LayerResult:
-    """Layer 4: Is the crowd wrong? Short interest, FTD, PCR."""
-    score = 0.0
-    signals = []
-    has_data = False
+    """Layer 4: Is the crowd wrong? FTD balance scored; total put/call shown, not scored.
 
-    # Short ratio
-    short = _load_raw_series(conn, f"SHORT:{ticker}:ratio", 30, as_of_date=as_of_date)
-    if not short.empty:
-        has_data = True
-        avg_short = short.mean()
-        if avg_short > 0.5:
-            score += 5
-            signals.append(f"Short ratio {avg_short:.0%} [HEAVILY SHORTED]")
-        elif avg_short > 0.3:
-            score += 3
-            signals.append(f"Short ratio {avg_short:.0%} [ELEVATED]")
-        elif avg_short > 0:
-            score += 1
-            signals.append(f"Short ratio {avg_short:.0%}")
+    Short interest is unavailable.
 
-    # Fails-to-deliver
-    ftd = _load_raw_series(conn, f"FTD:{ticker}:qty", 90, as_of_date=as_of_date)
-    if not ftd.empty:
-        has_data = True
-        recent_ftd = ftd.tail(10).mean()
-        older_ftd = ftd.head(30).mean() if len(ftd) > 30 else recent_ftd
-        if recent_ftd > older_ftd * 2 and recent_ftd > 10000:
-            score += 5
-            signals.append(
-                f"FTD surging ({recent_ftd:,.0f} vs {older_ftd:,.0f}) [SQUEEZE SETUP]"
-            )
-        elif recent_ftd > 10000:
-            score += 2
-            signals.append(f"FTD elevated ({recent_ftd:,.0f})")
+    ``ftd_series_ids`` is _ftd_series_ids for the scan (looked up for this
+    ticker when None).
+    """
+    as_of = _resolve_as_of_date(as_of_date)
+    signals = [SHORT_INTEREST_UNAVAILABLE]
 
-    # Put/Call ratio (market-wide)
-    pcr = _load_raw_latest(conn, "CBOE:totalpc", 5, as_of_date=as_of_date)
-    if pcr is not None:
-        if pcr > 1.2:
-            score += 3
-            signals.append(f"PCR={pcr:.2f} [MAX BEARISH]")
-        elif pcr > 1.0:
-            score += 1
-            signals.append(f"PCR={pcr:.2f} [BEARISH]")
+    score, ftd_signal, has_data = _score_ftd(conn, ticker, as_of, ftd_series_ids)
+    signals.append(ftd_signal)
+
+    # Total put/call (market-wide): shown, adds no points, never makes the
+    # layer available (PCR_NOT_SCORED).
+    signals.append(PCR_NOT_SCORED)
+    pcr_obs = _read_known(conn, PCR_SERIES, PCR_SOURCE, as_of, PCR_FRESH_DAYS)
+    if pcr_obs:
+        signals.append(f"Total put/call, not scored: {pcr_obs[-1].value:.2f} ({pcr_obs[-1].obs_date})")
+    else:
+        signals.append(f"No total put/call in the {PCR_FRESH_DAYS} days to {as_of}")
 
     trust = LAYER_FULL_TRUST["CROWD"] if has_data else 0.15
     return _layer_result("CROWD", min(score, 15), trust, signals, has_data)
+
+
+def _describe_news(conn, ticker: str, as_of: date) -> str:
+    """NARRATIVE's Tiingo news count as a signal; it never scores (NEWS_NOT_SCORED)."""
+    conflict = _panel_instrument_conflict(ticker)
+    if conflict is not None:
+        return f"News not read ({ticker}'s price panel is {conflict}, not the listed {ticker})"
+    obs = _read_known(conn, NEWS_SERIES.format(ticker=ticker), NEWS_SOURCE, as_of, NEWS_TRAILING_DAYS)
+    if not obs:
+        return f"No Tiingo news count for {ticker} in the {NEWS_TRAILING_DAYS} days to {as_of}"
+    latest = obs[-1]
+    at_least = ">=" if latest.value >= NEWS_FETCH_CAP else ""  # at Tiingo's fetch cap
+    return (
+        f"Tiingo news, not scored: {at_least}{latest.value:.0f} articles returned for the "
+        f"{NEWS_TRAILING_DAYS} days to {latest.obs_date}"
+    )
 
 
 def score_narrative(
@@ -815,40 +1072,15 @@ def score_narrative(
     ticker: str,
     as_of_date: date | None = None,
 ) -> LayerResult:
-    """Layer 5: Is there a narrative catalyst?"""
-    score = 0.0
-    signals = []
-    has_data = False
+    """Layer 5: Is there a narrative catalyst? Nothing scored today.
 
-    # News article count trend
-    news = _load_raw_series(conn, f"NEWS:{ticker}:daily_count", 90, as_of_date=as_of_date)
-    if not news.empty:
-        has_data = True
-        recent = news.tail(7).mean() if len(news) >= 7 else news.mean()
-        older = news.head(30).mean() if len(news) >= 30 else recent
-        if recent > older * 2:
-            score += 5
-            signals.append(f"News volume surging ({recent:.0f}/day vs {older:.0f})")
-        elif recent > 3:
-            score += 2
-            signals.append(f"Moderate news coverage ({recent:.0f}/day)")
-
-    # Wiki attention (if available)
-    wiki_name = f"wiki_{ticker.lower()}"
-    wiki = _load_latest(conn, wiki_name, as_of_date=as_of_date)
-    if wiki is not None:
-        has_data = True
-        score += 2
-        signals.append("Wiki attention tracked")
-
-    # GDELT (market-wide narrative)
-    gdelt = _load_latest(conn, "gdelt_article_count", as_of_date=as_of_date)
-    if gdelt is not None and gdelt > 1000:
-        score += 1
-        signals.append(f"GDELT high ({gdelt:.0f} articles)")
-
-    trust = LAYER_FULL_TRUST["NARRATIVE"] if has_data else 0.10
-    return _layer_result("NARRATIVE", min(score, 10), trust, signals, has_data)
+    The Tiingo news count is shown, not scored (NEWS_NOT_SCORED); wiki
+    attention and GDELT have no writer. The layer has no data and stays in the
+    denominator at its full weight.
+    """
+    as_of = _resolve_as_of_date(as_of_date)
+    signals = [NEWS_NOT_SCORED, _describe_news(conn, ticker, as_of), WIKI_UNAVAILABLE, GDELT_UNAVAILABLE]
+    return _layer_result("NARRATIVE", 0.0, 0.10, signals, False)
 
 
 def score_flow(
@@ -857,18 +1089,22 @@ def score_flow(
     price: pd.Series,
     as_of_date: date | None = None,
 ) -> LayerResult:
-    """Layer 6: Is money actually moving?"""
+    """Layer 6: Is money actually moving? Volatility spike (options inputs not scored)."""
     score = 0.0
-    signals = []
+    signals = [WHALE_NOT_SCORED, EQUITY_PCR_UNAVAILABLE]
     has_data = False
 
     if price.empty or len(price) < 20:
-        return _layer_result("FLOW", 0, 0.10, (), False)
+        return _layer_result("FLOW", 0, 0.10, signals, False)
 
     # Volume spike (from price data — use returns as proxy if no volume)
     returns = price.pct_change().dropna()
     recent_vol = returns.tail(5).abs().mean()
-    avg_vol = returns.tail(60).abs().mean() if len(returns) >= 60 else recent_vol
+    baseline = len(returns) >= FLOW_BASELINE_RETURNS
+    avg_vol = returns.tail(FLOW_BASELINE_RETURNS).abs().mean() if baseline else recent_vol
+    # With a 60-day baseline the comparison is a measurement either way; a
+    # quiet tape scores 0 with data, not "no data".
+    has_data = bool(baseline and avg_vol > 0)
 
     if avg_vol > 0 and recent_vol > avg_vol * 2:
         has_data = True
@@ -878,21 +1114,8 @@ def score_flow(
         has_data = True
         score += 2
         signals.append(f"Elevated activity ({recent_vol/avg_vol:.1f}x)")
-
-    # Check for whale options activity
-    whale = _load_raw_latest(conn, f"WHALE:{ticker}:%", as_of_date=as_of_date)
-    if whale is not None:
-        has_data = True
-        score += 5
-        signals.append("Unusual options activity detected")
-
-    # CBOE equity PCR
-    epcr = _load_raw_latest(conn, "CBOE:equitypc", 5, as_of_date=as_of_date)
-    if epcr is not None:
-        has_data = True
-        if epcr > 0.8:
-            score += 3
-            signals.append(f"Equity PCR={epcr:.2f} [BEARISH - contrarian buy]")
+    elif has_data:
+        signals.append(f"No volatility spike ({recent_vol/avg_vol:.1f}x the 60d mean)")
 
     trust = LAYER_FULL_TRUST["FLOW"] if has_data else 0.15
     return _layer_result("FLOW", min(score, 15), trust, signals, has_data)
@@ -991,22 +1214,26 @@ def score_ticker(
     engine: Engine,
     ticker: str,
     as_of_date: date | None = None,
+    ftd_series_ids: Mapping[str, tuple[str, ...]] | None = None,
     market: MarketSetup | None = None,
 ) -> ConvictionReport:
     """Score a single ticker across all 7 layers.
 
-    ``market``: scan_all's one load_market_setup for the scan; None reads it
-    for this ticker.
+    ``ftd_series_ids``: scan_all's one-pass _ftd_series_ids for the universe;
+    None looks up this ticker alone. ``market``: scan_all's one
+    load_market_setup for the scan; None reads it for this ticker.
     """
     as_of = _resolve_as_of_date(as_of_date)
     with engine.connect() as conn:
         price = _load_price(conn, ticker, as_of_date=as_of)
+        if ftd_series_ids is None:
+            ftd_series_ids = _ftd_series_ids(conn, [ticker], as_of)
 
         named_layers: list[tuple[str, LayerResult | None]] = [
             ("SETUP", score_setup(conn, ticker, price, as_of_date=as_of, market=market)),
             ("COMPANY", score_company(conn, ticker, as_of_date=as_of)),
             ("SMART_MONEY", score_smart_money(conn, ticker, as_of_date=as_of)),
-            ("CROWD", score_crowd(conn, ticker, as_of_date=as_of)),
+            ("CROWD", score_crowd(conn, ticker, as_of_date=as_of, ftd_series_ids=ftd_series_ids)),
             ("NARRATIVE", score_narrative(conn, ticker, as_of_date=as_of)),
             ("FLOW", score_flow(conn, ticker, price, as_of_date=as_of)),
             ("CONFIRM", score_confirmation(price)),
@@ -1089,13 +1316,17 @@ def scan_all(
               )
             ORDER BY fr.name
         """), {"as_of": as_of}).fetchall()
+        tickers = [r[0] for r in rows]
+        # One FTD symbol lookup for the whole universe instead of one per ticker.
+        ftd_series_ids = _ftd_series_ids(conn, tickers, as_of)
         market = load_market_setup(conn, as_of)
 
-    tickers = [r[0] for r in rows]
     reports = []
 
     for ticker in tickers:
-        report = score_ticker(engine, ticker, as_of_date=as_of, market=market)
+        report = score_ticker(
+            engine, ticker, as_of_date=as_of, ftd_series_ids=ftd_series_ids, market=market,
+        )
         if report.total_score >= min_score:
             reports.append(report)
 
