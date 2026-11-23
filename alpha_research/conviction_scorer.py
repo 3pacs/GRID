@@ -100,16 +100,37 @@ def _resolve_as_of_date(as_of_date: date | None) -> date:
     return as_of_date or date.today()
 
 
+def _feature_id(conn, feature_name: str) -> int | None:
+    """``feature_registry.id`` of ``feature_name`` (names are unique), or None.
+
+    The two resolved_series readers below bind this id rather than matching
+    the name through a feature_registry join. With the id known only through
+    the join, PostgreSQL plans for an average feature (~5.5k rows) and walks
+    every vintage of a large one before sorting: on griddb (2026-11-23)
+    ofr_financial_stress (1.03M rows) took 2.7 s per latest read and
+    vix_spot (375k rows) 1.1 s. With the id bound it uses that feature's
+    statistics and reads the newest dates first through
+    idx_resolved_series_pit_latest: 2 ms, the same value.
+    """
+    row = conn.execute(
+        text("SELECT fr.id FROM feature_registry fr WHERE fr.name = :n"),
+        {"n": feature_name},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
 def _load_latest(
     conn,
     feature_name: str,
     as_of_date: date | None = None,
 ) -> float | None:
     as_of = _resolve_as_of_date(as_of_date)
+    feature_id = _feature_id(conn, feature_name)
+    if feature_id is None:
+        return None
     row = conn.execute(text("""
         SELECT rs.value FROM resolved_series rs
-        JOIN feature_registry fr ON rs.feature_id = fr.id
-        WHERE fr.name = :n
+        WHERE rs.feature_id = :fid
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
           AND rs.vintage_date <= :as_of
@@ -122,7 +143,7 @@ def _load_latest(
           )
         ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
         LIMIT 1
-    """), {"n": feature_name, "as_of": as_of,
+    """), {"fid": feature_id, "as_of": as_of,
            "retraction_cutoff": retraction_cutoff(as_of)}).fetchone()
     return float(row[0]) if row else None
 
@@ -191,12 +212,24 @@ def _load_price(
     ticker: str,
     as_of_date: date | None = None,
 ) -> pd.Series:
+    """``{ticker}_full`` known at the as-of date: one value per obs_date, split-adjusted.
+
+    Each date's value is its row with the greatest (release_date,
+    vintage_date) among the rows known by then and not retracted: the last
+    row in (obs_date, release_date, vintage_date) order, which is what the
+    reader kept when it fetched every vintage and dropped all but the last in
+    Python. DISTINCT ON picks that row in the database, so ``spy_full`` sends
+    8.5k rows instead of 225k (griddb 2026-11-23: 1.1 s -> 0.26 s, identical
+    series). The whole history is still read: SETUP's drawdown is against
+    the all-time high, and adjust_splits needs every date.
+    """
     as_of = _resolve_as_of_date(as_of_date)
-    feat = f"{ticker.lower()}_full"
+    feature_id = _feature_id(conn, f"{ticker.lower()}_full")
+    if feature_id is None:
+        return pd.Series(dtype=float)
     rows = conn.execute(text("""
-        SELECT rs.obs_date, rs.value FROM resolved_series rs
-        JOIN feature_registry fr ON rs.feature_id = fr.id
-        WHERE fr.name = :n
+        SELECT DISTINCT ON (rs.obs_date) rs.obs_date, rs.value FROM resolved_series rs
+        WHERE rs.feature_id = :fid
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
           AND rs.vintage_date <= :as_of
@@ -207,13 +240,13 @@ def _load_price(
                 AND rr.vintage_date = rs.vintage_date
                 AND rr.retracted_at <= :retraction_cutoff
           )
-        ORDER BY rs.obs_date, rs.release_date, rs.vintage_date
-    """), {"n": feat, "as_of": as_of,
+        ORDER BY rs.obs_date, rs.release_date DESC, rs.vintage_date DESC
+    """), {"fid": feature_id, "as_of": as_of,
            "retraction_cutoff": retraction_cutoff(as_of)}).fetchall()
     if not rows:
         return pd.Series(dtype=float)
     s = pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
-    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s = s[~s.index.duplicated(keep="first")].sort_index()
     return adjust_splits(s)
 
 
@@ -295,23 +328,60 @@ def _layer_result(
     )
 
 
+@dataclass(frozen=True)
+class MarketSetup:
+    """SETUP's market-wide inputs known at ``as_of``: the same for every ticker.
+
+    scan_all reads them once and passes them to every score_ticker, so one
+    scan scores all tickers against one snapshot.
+    """
+
+    as_of: date
+    vix: float | None
+    hy: float | None
+    yc: float | None
+
+
+def load_market_setup(conn, as_of_date: date | None = None) -> MarketSetup:
+    """Read SETUP's market-wide inputs (VIX, HY OAS, 2s10s) at ``as_of_date``.
+
+    score_setup used to read ofr_financial_stress as well and throw the value
+    away; it was never scored. It is no longer read (it was 2.7 s of every
+    ticker's 4.5 s on griddb, 2026-11-23).
+    """
+    as_of = _resolve_as_of_date(as_of_date)
+    # planetary_stress_index was removed from this layer 2026-09-10: a celestial
+    # feature must not be an input to a market-scoring endpoint
+    # (LEVER-PACKAGE.md §4.1 / §7 T0.5). It stays available to AstroGrid.
+    return MarketSetup(
+        as_of=as_of,
+        vix=_load_latest(conn, "vix_spot", as_of_date=as_of),
+        hy=_load_latest(conn, "hy_oas_spread", as_of_date=as_of),
+        yc=_load_latest(conn, "yld_curve_2s10s", as_of_date=as_of),
+    )
+
+
 def score_setup(
     conn,
     ticker: str,
     price: pd.Series,
     as_of_date: date | None = None,
+    market: MarketSetup | None = None,
 ) -> LayerResult:
-    """Layer 1: Macro setup — is this the right moment?"""
+    """Layer 1: Macro setup — is this the right moment?
+
+    ``market`` is load_market_setup at the same as-of date (read here when
+    None); a snapshot for another date is refused.
+    """
     score = 0.0
     signals = []
 
-    vix = _load_latest(conn, "vix_spot", as_of_date=as_of_date)
-    hy = _load_latest(conn, "hy_oas_spread", as_of_date=as_of_date)
-    _load_latest(conn, "ofr_financial_stress", as_of_date=as_of_date)
-    # planetary_stress_index was removed from this layer 2026-09-10: a celestial
-    # feature must not be an input to a market-scoring endpoint
-    # (LEVER-PACKAGE.md §4.1 / §7 T0.5). It stays available to AstroGrid.
-    yc = _load_latest(conn, "yld_curve_2s10s", as_of_date=as_of_date)
+    as_of = _resolve_as_of_date(as_of_date)
+    if market is None:
+        market = load_market_setup(conn, as_of)
+    elif market.as_of != as_of:
+        raise ValueError(f"market setup is for {market.as_of}, not the as-of date {as_of}")
+    vix, hy, yc = market.vix, market.hy, market.yc
 
     if price.empty:
         return _layer_result("SETUP", 0, LAYER_FULL_TRUST["SETUP"], (), False)
@@ -921,14 +991,19 @@ def score_ticker(
     engine: Engine,
     ticker: str,
     as_of_date: date | None = None,
+    market: MarketSetup | None = None,
 ) -> ConvictionReport:
-    """Score a single ticker across all 7 layers."""
+    """Score a single ticker across all 7 layers.
+
+    ``market``: scan_all's one load_market_setup for the scan; None reads it
+    for this ticker.
+    """
     as_of = _resolve_as_of_date(as_of_date)
     with engine.connect() as conn:
         price = _load_price(conn, ticker, as_of_date=as_of)
 
         named_layers: list[tuple[str, LayerResult | None]] = [
-            ("SETUP", score_setup(conn, ticker, price, as_of_date=as_of)),
+            ("SETUP", score_setup(conn, ticker, price, as_of_date=as_of, market=market)),
             ("COMPANY", score_company(conn, ticker, as_of_date=as_of)),
             ("SMART_MONEY", score_smart_money(conn, ticker, as_of_date=as_of)),
             ("CROWD", score_crowd(conn, ticker, as_of_date=as_of)),
@@ -991,24 +1066,36 @@ def scan_all(
     min_score: int = 20,
     as_of_date: date | None = None,
 ) -> list[ConvictionReport]:
-    """Score all tickers with price data."""
+    """Score all tickers with price data.
+
+    The universe is every ``*_full`` feature with more than 50 rows known at
+    the as-of date, in name order. The EXISTS stops at a feature's 51st row
+    instead of counting all of them (griddb 2026-11-23: 6.4 s -> 0.01 s, the
+    same 139 tickers). SETUP's market-wide inputs are read once for the scan.
+    """
     as_of = _resolve_as_of_date(as_of_date)
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT UPPER(REPLACE(fr.name, '_full', ''))
-            FROM feature_registry fr JOIN resolved_series rs ON fr.id = rs.feature_id
+            FROM feature_registry fr
             WHERE fr.name LIKE '%%_full'
-              AND rs.obs_date <= :as_of
-              AND rs.release_date <= :as_of
-              AND rs.vintage_date <= :as_of
-            GROUP BY fr.name HAVING COUNT(*) > 50
+              AND EXISTS (
+                  SELECT 1 FROM resolved_series rs
+                  WHERE rs.feature_id = fr.id
+                    AND rs.obs_date <= :as_of
+                    AND rs.release_date <= :as_of
+                    AND rs.vintage_date <= :as_of
+                  OFFSET 50 LIMIT 1
+              )
+            ORDER BY fr.name
         """), {"as_of": as_of}).fetchall()
+        market = load_market_setup(conn, as_of)
 
     tickers = [r[0] for r in rows]
     reports = []
 
     for ticker in tickers:
-        report = score_ticker(engine, ticker, as_of_date=as_of)
+        report = score_ticker(engine, ticker, as_of_date=as_of, market=market)
         if report.total_score >= min_score:
             reports.append(report)
 

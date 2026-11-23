@@ -46,6 +46,26 @@ class _RecordingConn:
         return _Result(self.rows)
 
 
+class _FeatureConn(_RecordingConn):
+    """Answers the feature_registry id lookup from ``ids``, every other read with ``rows``."""
+
+    def __init__(self, ids: dict[str, int], rows: list[tuple[Any, ...]] | None = None) -> None:
+        super().__init__(rows)
+        self.ids = ids
+
+    def execute(self, stmt: Any, params: dict[str, Any] | None = None) -> _Result:
+        result = super().execute(stmt, params)
+        if "FROM feature_registry fr WHERE fr.name = :n" in str(stmt):
+            name = (params or {})["n"]
+            return _Result([(self.ids[name],)] if name in self.ids else [])
+        return result
+
+
+class _NoReadConn:
+    def execute(self, stmt: Any, params: dict[str, Any] | None = None) -> _Result:
+        raise AssertionError(f"unexpected read: {stmt}")
+
+
 class _Engine:
     def __init__(self, conn: _RecordingConn) -> None:
         self.conn = conn
@@ -67,21 +87,35 @@ def _series(values: list[float], end: date = date(2026, 5, 13)) -> pd.Series:
 
 def test_load_latest_uses_release_and_vintage_as_of_filter() -> None:
     as_of = date(2026, 5, 13)
-    conn = _RecordingConn(rows=[(19.5,)])
+    conn = _FeatureConn({"vix_spot": 11}, rows=[(19.5,)])
 
     assert cs._load_latest(conn, "vix_spot", as_of_date=as_of) == 19.5
 
-    call = conn.calls[0]
+    lookup, call = conn.calls
+    assert lookup.params == {"n": "vix_spot"}
     assert "rs.release_date <= :as_of" in call.sql
     assert "rs.vintage_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
     assert "resolved_series_retractions" in call.sql
     assert "rr.retracted_at <= :retraction_cutoff" in call.sql
+    # The id is bound, not matched through a feature_registry join, so the
+    # planner uses the feature's own statistics (2.7 s -> 2 ms on griddb).
+    assert "rs.feature_id = :fid" in call.sql
+    assert "feature_registry" not in call.sql
+    assert "ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC" in call.sql
     assert call.params == {
-        "n": "vix_spot",
+        "fid": 11,
         "as_of": as_of,
         "retraction_cutoff": retraction_cutoff(as_of),
     }
+
+
+def test_load_latest_and_price_of_an_unregistered_feature_read_nothing_else() -> None:
+    conn = _FeatureConn({})
+
+    assert cs._load_latest(conn, "wiki_abc", as_of_date=date(2026, 5, 13)) is None
+    assert cs._load_price(conn, "ABC", as_of_date=date(2026, 5, 13)).empty
+    assert [c.params for c in conn.calls] == [{"n": "wiki_abc"}, {"n": "abc_full"}]
 
 
 def test_load_raw_latest_uses_pull_timestamp_as_release_proxy_with_source() -> None:
@@ -122,26 +156,77 @@ def test_load_raw_series_uses_as_of_window_and_pull_timestamp_release_proxy() ->
 
 def test_load_price_uses_release_and_vintage_as_of_filter() -> None:
     as_of = date(2026, 5, 13)
-    conn = _RecordingConn(
+    conn = _FeatureConn(
+        {"abc_full": 42},
         rows=[
             (date(2026, 5, 12), 100.0),
             (date(2026, 5, 13), 101.0),
-        ]
+        ],
     )
 
     out = cs._load_price(conn, "ABC", as_of_date=as_of)
 
-    call = conn.calls[0]
+    lookup, call = conn.calls
+    assert lookup.params == {"n": "abc_full"}
     assert "rs.release_date <= :as_of" in call.sql
     assert "rs.vintage_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
     assert "resolved_series_retractions" in call.sql
+    assert "rs.feature_id = :fid" in call.sql
+    assert "feature_registry" not in call.sql
+    # One row per obs_date: the one that sorted last in (obs_date,
+    # release_date, vintage_date) order, which the Python dedup used to keep.
+    assert "SELECT DISTINCT ON (rs.obs_date)" in call.sql
+    assert "ORDER BY rs.obs_date, rs.release_date DESC, rs.vintage_date DESC" in call.sql
     assert call.params == {
-        "n": "abc_full",
+        "fid": 42,
         "as_of": as_of,
         "retraction_cutoff": retraction_cutoff(as_of),
     }
     assert list(out) == [100.0, 101.0]
+
+
+def test_load_market_setup_reads_the_three_scored_inputs_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    as_of = date(2026, 5, 13)
+    reads: list[tuple[str, date | None]] = []
+    values = {"vix_spot": 21.0, "hy_oas_spread": 4.2, "yld_curve_2s10s": -0.1}
+
+    def fake_latest(_conn: Any, name: str, *, as_of_date: date | None = None) -> float | None:
+        reads.append((name, as_of_date))
+        return values.get(name)
+
+    monkeypatch.setattr(cs, "_load_latest", fake_latest)
+
+    market = cs.load_market_setup(object(), as_of)
+
+    assert market == cs.MarketSetup(as_of=as_of, vix=21.0, hy=4.2, yc=-0.1)
+    # ofr_financial_stress was read and discarded; it is no longer read.
+    assert reads == [("vix_spot", as_of), ("hy_oas_spread", as_of), ("yld_curve_2s10s", as_of)]
+
+
+def test_score_setup_with_a_market_snapshot_reads_nothing_and_matches_a_direct_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    as_of = date(2026, 5, 13)
+    values = {"vix_spot": 27.0, "hy_oas_spread": 4.5, "yld_curve_2s10s": -0.2}
+    monkeypatch.setattr(cs, "_load_latest", lambda _c, name, **_kw: values.get(name))
+    price = _series([100.0, 40.0])
+
+    direct = cs.score_setup(object(), "ABC", price, as_of_date=as_of)
+    market = cs.load_market_setup(object(), as_of)
+    hoisted = cs.score_setup(_NoReadConn(), "ABC", price, as_of_date=as_of, market=market)
+
+    assert hoisted == direct
+    assert direct.score == 4 + 3 + 2 + 3  # DD -60 %, VIX 27, HY 4.5, curve inverted
+
+
+def test_score_setup_refuses_a_market_snapshot_for_another_date() -> None:
+    market = cs.MarketSetup(as_of=date(2026, 5, 12), vix=None, hy=None, yc=None)
+
+    with pytest.raises(ValueError, match="market setup is for 2026-05-12"):
+        cs.score_setup(_NoReadConn(), "ABC", _series([100.0]), as_of_date=date(2026, 5, 13), market=market)
 
 
 def test_score_setup_bucket_maxes_on_extreme_macro_conditions(
@@ -297,8 +382,16 @@ def test_score_ticker_passes_as_of_date_to_layer_helpers(
     def layer(name: str, score: float, max_score: float):
         return cs.LayerResult(name, score, max_score, 1.0, (), True)
 
-    def fake_setup(_conn: Any, ticker: str, _price: pd.Series, *, as_of_date: date | None = None):
+    def fake_setup(
+        _conn: Any,
+        ticker: str,
+        _price: pd.Series,
+        *,
+        as_of_date: date | None = None,
+        market: cs.MarketSetup | None = None,
+    ):
         seen.append((f"setup:{ticker}", as_of_date))
+        assert market is None  # a lone score_ticker leaves the read to score_setup
         return layer("SETUP", 10, 20)
 
     def fake_company(_conn: Any, ticker: str, *, as_of_date: date | None = None):
@@ -421,13 +514,26 @@ def test_scan_all_filters_ticker_universe_as_of_and_scores_same_date(
 ) -> None:
     as_of = date(2026, 5, 13)
     conn = _RecordingConn(rows=[("BBB",), ("AAA",)])
-    seen: list[tuple[str, date | None]] = []
+    seen: list[tuple[str, date | None, cs.MarketSetup | None]] = []
+    market = cs.MarketSetup(as_of=as_of, vix=30.0, hy=None, yc=None)
+    market_reads: list[date | None] = []
 
-    def fake_score_ticker(_engine: Any, ticker: str, *, as_of_date: date | None = None):
-        seen.append((ticker, as_of_date))
+    def fake_market(_conn: Any, as_of_date: date | None = None) -> cs.MarketSetup:
+        market_reads.append(as_of_date)
+        return market
+
+    def fake_score_ticker(
+        _engine: Any,
+        ticker: str,
+        *,
+        as_of_date: date | None = None,
+        market: cs.MarketSetup | None = None,
+    ):
+        seen.append((ticker, as_of_date, market))
         score = 80 if ticker == "AAA" else 30
         return cs.ConvictionReport(ticker, score, score, (), "FIRE", "ts")
 
+    monkeypatch.setattr(cs, "load_market_setup", fake_market)
     monkeypatch.setattr(cs, "score_ticker", fake_score_ticker)
 
     reports = cs.scan_all(_Engine(conn), min_score=40, as_of_date=as_of)
@@ -436,6 +542,11 @@ def test_scan_all_filters_ticker_universe_as_of_and_scores_same_date(
     assert "rs.release_date <= :as_of" in call.sql
     assert "rs.vintage_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
+    # More than 50 rows known at as_of, found without counting every row, in name order.
+    assert "OFFSET 50 LIMIT 1" in call.sql
+    assert "ORDER BY fr.name" in call.sql
     assert call.params == {"as_of": as_of}
-    assert seen == [("BBB", as_of), ("AAA", as_of)]
+    # One market snapshot for the scan, the same object for every ticker.
+    assert market_reads == [as_of]
+    assert seen == [("BBB", as_of, market), ("AAA", as_of, market)]
     assert [report.ticker for report in reports] == ["AAA"]

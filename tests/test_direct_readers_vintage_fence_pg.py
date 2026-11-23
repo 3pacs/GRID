@@ -126,7 +126,7 @@ def test_conviction_scorer_universe_excludes_rows_not_yet_held(scratch, monkeypa
     _seed(scratch, "ccc_full", [(d, d, d, 10.0) for d in days])       # honest
     seen: list[str] = []
 
-    def fake_score(_engine, ticker, *, as_of_date=None):
+    def fake_score(_engine, ticker, *, as_of_date=None, market=None):
         seen.append(ticker)
         return cs.ConvictionReport(ticker, 90, 90.0, (), "CONVICTION", "ts")
 
