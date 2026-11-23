@@ -1,4 +1,4 @@
-"""intelligence.regime.market_state: the standardized daily market-state record (market-state/2).
+"""intelligence.regime.market_state: the standardized daily market-state record (market-state/3).
 
 Fixture: real ``raw_series`` + ``source_catalog`` on in-memory SQLite, every row backfilled by one pull (the way
 griddb looks), plus a few rows pulled later to prove a later publication never changes an earlier record.
@@ -90,13 +90,16 @@ CAL = {"cpi": [date(2025, 6, 11), date(2025, 7, 15)], "fomc": [date(2025, 6, 18)
 def test_record_is_complete_and_every_reading_is_standardized(engine):
     _seed(engine)
     st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
-    assert st["rule"] == "market-state/2" and st["baseline_rule"] == "trailing-robust/1"
+    assert st["rule"] == "market-state/3" and st["baseline_rule"] == "trailing-robust/1"
     assert st["freshness_rule"] == "max-age/1" and st["coverage"]["stale"] == 0
     missing = {k: v.get("reason") for k, v in st["variables"].items() if v["status"] != "ok"}
-    # No vintages stored in this fixture: the three news variables are unavailable, not guessed.
+    # No vintages stored in this fixture: the three news variables are unavailable, not guessed. No DGS2 or KXFED
+    # rows either (tests/test_market_state_policy.py seeds those), so the policy-path variables are unavailable too.
     assert set(missing) == {"short_volume_ratio", "news_uncertainty", "equity_news_uncertainty", "news_first_print",
-                            "dix", "dix_change_5d", "dealer_gamma", "spot_vs_gamma_flip"}
+                            "dix", "dix_change_5d", "dealer_gamma", "spot_vs_gamma_flip", "ust_2y_change_5d",
+                            "fed_path_next_meeting", "fed_path_change_5d", "fed_priced_move_next_meeting"}
     assert st["news_shock"]["status"] == "unavailable" and st["gamma_state"]["status"] == "unavailable"
+    assert st["policy_response"]["status"] == "unknown" and st["policy_response"]["decision_use"] == "none"
     for k, v in st["variables"].items():
         if v["status"] == "ok":
             assert {"value", "median", "robust_z", "percentile", "label", "n", "obs_date"} <= set(v), k
@@ -162,7 +165,7 @@ def test_storage_is_insert_only_unless_replace(engine):
     assert M.store_market_state(engine, st, replace=True) is True
     with engine.connect() as c:
         rows = c.execute(text("SELECT as_of_date, rule, record FROM market_state_daily")).fetchall()
-    assert len(rows) == 1 and rows[0][1] == "market-state/2"
+    assert len(rows) == 1 and rows[0][1] == "market-state/3"
     assert json.loads(rows[0][2])["as_of"] == AS_OF.isoformat()
 
 
@@ -394,7 +397,7 @@ def test_a_daily_input_that_stops_arriving_reads_stale_with_its_reading_kept(eng
     assert st["variables"]["vix_term"]["status"] == "stale"
     assert st["variables"]["hy_spread"]["status"] == "ok"
     assert st["variables"]["hy_spread"]["freshness"]["status"] == "fresh"
-    assert st["coverage"]["stale"] == 2 and st["coverage"]["ok"] == st["coverage"]["total"] - 10
+    assert st["coverage"]["stale"] == 2 and st["coverage"]["ok"] == st["coverage"]["total"] - 14
 
 
 def test_a_monthly_input_past_its_next_release_reads_stale(engine):
