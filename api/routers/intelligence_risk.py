@@ -194,20 +194,37 @@ def _build_risk_map() -> dict[str, Any]:
     try:
         from sqlalchemy import text as sql_text
 
+        from api.routers import watchlist_helpers as _wh
+
+        # The watchlist has no allocation_pct, sector or active column (it is
+        # ticker, display_name, asset_type, added_at, notes, weight), so the
+        # old read failed with UndefinedColumn on every call. Position size
+        # is ``weight``. Only names with a positive weight are scored. A name
+        # without one holds no stated position, and no size is invented for
+        # it: equal weights would score the list's length as concentration.
         with engine.connect() as conn:
-            positions = conn.execute(sql_text("""
-                SELECT ticker, allocation_pct, sector
-                FROM watchlist
-                WHERE active = true
-                ORDER BY allocation_pct DESC NULLS LAST
-            """)).fetchall()
+            rows = conn.execute(sql_text(
+                "SELECT ticker, asset_type, weight FROM watchlist ORDER BY added_at"
+            )).fetchall()
 
-        if not positions:
-            raise _NoData("no active watchlist positions")
+        if not rows:
+            raise _NoData("no watchlist rows")
+        held = []
+        for ticker, stored_type, weight in rows:
+            w = float(weight) if weight is not None else None
+            if w is not None and 0 < w < float("inf"):  # NaN compares False
+                held.append((ticker, w, _wh.effective_asset_type(ticker, stored_type)))
+        if not held:
+            raise _NoData(
+                f"no watchlist position weights set ({len(rows)} names, none with weight > 0)"
+            )
 
-        allocs = [(r[0], float(r[1] or 0), r[2] or "other") for r in positions]
-        total_alloc = sum(a for _, a, _ in allocs) or 1.0
-        weights = [(t, a / total_alloc, s) for t, a, s in allocs]
+        sector_of = _wh.watchlist_sectors([(t, at) for t, _, at in held])
+        total_alloc = sum(w for _, w, _ in held)
+        weights = sorted(
+            ((t, w / total_alloc, sector_of[t]) for t, w, _ in held),
+            key=lambda x: (-x[1], x[0]),
+        )
 
         top5_w = sum(w for _, w, _ in weights[:5])
         sectors: dict[str, float] = {}
@@ -232,6 +249,8 @@ def _build_risk_map() -> dict[str, Any]:
             "top_5_watchlist_weight": round(top5_w, 2),
             "sector_concentration": {k: round(v, 2) for k, v in sorted(sectors.items(), key=lambda x: -x[1])[:6]},
             "single_name_max": {"ticker": max_name[0], "weight": round(max_name[1], 2)},
+            "weighted_names": len(held),
+            "unweighted_names": len(rows) - len(held),
             "risk_level": _compute_risk_level(c_score),
             "available": True,
         }

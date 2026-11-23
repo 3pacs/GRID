@@ -233,30 +233,8 @@ def get_portfolio(
         if cached_prices:
             _wh._price_cache.set("prices", cached_prices)
 
-    # ── Sector map ───────────────────────────────────────────────
-    sector_ctx: dict[str, str] = {}
-    try:
-        from analysis.sector_map import SECTOR_MAP
-        for sector_name, sector in SECTOR_MAP.items():
-            for sub_name, sub in sector.get("subsectors", {}).items():
-                for actor in sub.get("actors", []):
-                    tk = actor.get("ticker")
-                    if tk and tk in tickers:
-                        sector_ctx[tk] = sector_name
-    except Exception as exc:
-        log.debug("Watchlist: sector map context failed: {e}", e=str(exc))
-
-    # Default sector guesses by asset_type
-    for it in items:
-        if it["ticker"] not in sector_ctx:
-            if it["asset_type"] == "crypto":
-                sector_ctx[it["ticker"]] = "Crypto"
-            elif it["asset_type"] == "etf":
-                sector_ctx[it["ticker"]] = "ETF"
-            elif it["asset_type"] == "commodity":
-                sector_ctx[it["ticker"]] = "Commodities"
-            else:
-                sector_ctx[it["ticker"]] = "Other"
+    # ── Sector map (shared with the risk map's concentration block) ──
+    sector_ctx = _wh.watchlist_sectors([(it["ticker"], it["asset_type"]) for it in items])
 
     # ── Build positions list ─────────────────────────────────────
     ESTIMATED_PORTFOLIO = 125_000  # estimated portfolio value
