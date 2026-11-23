@@ -32,6 +32,8 @@ Data stored:
 
 from __future__ import annotations
 
+import json
+
 import logging
 import math
 import time
@@ -43,6 +45,7 @@ from typing import Any
 import pandas as pd
 import requests
 from loguru import logger as log
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
@@ -534,6 +537,63 @@ def _aggregate_holdings_by_cusip(
 
 # Request timeout
 _REQUEST_TIMEOUT: int = 30
+
+# ── Re-runs write nothing new ────────────────────────────────────────────
+# The change rows used BasePuller._row_exists, whose window is one hour: every
+# run more than an hour after the last appended every row again (grid-svr
+# 2026-11-23: 167,475 rows for 41,762 distinct (series_id, obs_date), from five
+# runs in a day). A change row is now skipped only when the newest stored
+# vintage of its (series_id, obs_date) is the same observation: the same
+# filing pair (filing_accession, prev_filing_accession) and identical content.
+# Anything else is a new vintage and is stored, so point-in-time readers keep
+# every state GRID ever held: an amendment or a different prior filing, a
+# corrected value, a parser change, a quarantined or failed earlier row.
+# (uq_raw_series_composite makes pull_timestamp unique per series, source and
+# obs_date, so "newest" needs no tie-break.)
+_CHANGE_ROW_LOOKUP_CHUNK: int = 500
+_LATEST_CHANGE_ROWS_SQL = text(
+    "SELECT series_id, pull_status, value, raw_payload FROM ("
+    " SELECT series_id, pull_status, value, raw_payload,"
+    " ROW_NUMBER() OVER ("
+    "  PARTITION BY series_id ORDER BY pull_timestamp DESC"
+    " ) AS newest_rank"
+    " FROM raw_series"
+    " WHERE source_id = :src AND obs_date = :od AND series_id IN :sids"
+    " AND pull_status != 'QUARANTINED'"
+    ") newest_stored WHERE newest_rank = 1"
+).bindparams(bindparam("sids", expanding=True))
+_FILING_IDENTITY_KEYS: tuple[str, ...] = ("filing_accession", "prev_filing_accession")
+
+
+def _is_stored_observation(stored: tuple[Any, Any, Any] | None, value: float, payload: dict[str, Any]) -> bool:
+    """True when ``stored`` (status, value, raw_payload of the newest stored
+    vintage) is this same observation, so writing it again would add nothing.
+
+    Fails open: anything unreadable or different means "not stored", and the
+    caller writes a new vintage (the behaviour before this check existed).
+    """
+    if stored is None:
+        return False
+    status, stored_value, stored_payload = stored
+    if status != "SUCCESS" or stored_value is None:
+        return False
+    if isinstance(stored_payload, (str, bytes)):
+        try:
+            stored_payload = json.loads(stored_payload)
+        except ValueError:
+            return False
+    if not isinstance(stored_payload, dict):
+        return False
+    for key in _FILING_IDENTITY_KEYS:
+        if not payload.get(key) or stored_payload.get(key) != payload.get(key):
+            return False
+    try:
+        same_value = float(stored_value) == float(value)
+        # Compare what the store holds: the payload after its JSON round trip.
+        same_content = stored_payload == json.loads(json.dumps(payload))
+    except (TypeError, ValueError):
+        return False
+    return same_value and same_content
 
 # In-memory cache of CIKs that have permanently 404'd this process so we
 # stop hammering EDGAR (and stop spamming errors.jsonl) for filers whose
@@ -1327,6 +1387,21 @@ class InstitutionalFlowsPuller(BasePuller):
             evidence["failure"] = kind
             return FilingSnapshot(accession=accession, status=f"fetch_failed:{kind}", evidence=evidence)
 
+    def _latest_stored_change_rows(
+        self, conn: Any, series_ids: list[str], obs_date: date,
+    ) -> dict[str, tuple[Any, Any, Any]]:
+        """Newest non-quarantined vintage per series for ``obs_date``:
+        ``{series_id: (pull_status, value, raw_payload)}``."""
+        latest: dict[str, tuple[Any, Any, Any]] = {}
+        for start in range(0, len(series_ids), _CHANGE_ROW_LOOKUP_CHUNK):
+            chunk = series_ids[start:start + _CHANGE_ROW_LOOKUP_CHUNK]
+            for sid, status, value, payload in conn.execute(
+                _LATEST_CHANGE_ROWS_SQL,
+                {"src": self.source_id, "od": obs_date, "sids": chunk},
+            ):
+                latest[str(sid)] = (status, value, payload)
+        return latest
+
     def _insert_receipt(
         self,
         conn: Any,
@@ -1524,14 +1599,61 @@ class InstitutionalFlowsPuller(BasePuller):
 
                 # Store changes
                 rows_inserted = 0
+                rows_unchanged = 0
                 with self.engine.begin() as conn:
+                    stored_rows = self._latest_stored_change_rows(
+                        conn,
+                        [f"13F:{cik}:{chg['cusip']}:{chg['action']}" for chg in changes],
+                        obs_date,
+                    )
                     for chg in changes:
                         series_id = (
                             f"13F:{cik}:{chg['cusip']}:{chg['action']}"
                         )
                         value = float(chg.get("value_usd", 0))
+                        payload = {
+                            "manager_cik": cik,
+                            "manager_name": manager_name,
+                            "cusip": chg["cusip"],
+                            "issuer_name": chg.get("name", ""),
+                            "action": chg["action"],
+                            "estimated_flow_usd": chg.get("estimated_flow_usd"),
+                            "holdings_value_delta_usd": chg.get("holdings_value_delta_usd"),
+                            "curr_value_usd": chg.get("curr_value_usd"),
+                            "prev_value_usd": chg.get("prev_value_usd"),
+                            "pct_change": chg.get("pct_change"),
+                            "share_pct_change": chg.get("share_pct_change"),
+                            "shares": chg.get("shares"),
+                            "curr_shares": chg.get("curr_shares"),
+                            "prev_shares": chg.get("prev_shares"),
+                            "delta_shares": chg.get("delta_shares"),
+                            "valuation_price_usd": chg.get("valuation_price_usd"),
+                            "valuation_price_basis": chg.get("valuation_price_basis"),
+                            "flow_estimation_method": chg.get("flow_estimation_method"),
+                            "value_units": chg.get("value_units", "usd"),
+                            "value_multiplier": curr_mult,
+                            "prev_value_multiplier": prev_mult,
+                            "share_type": chg.get("share_type", "SH"),
+                            "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
+                            "unqualified_reason": chg.get("unqualified_reason"),
+                            "observation_kind": chg.get("observation_kind"),
+                            "measure": chg.get("measure"),
+                            "filing_accession": curr_acc,
+                            "prev_filing_accession": prev_acc,
+                            "filing_date": obs_date.isoformat(),
+                            "prev_filing_date": _parse_13f_date(prev_date_str).isoformat() if _parse_13f_date(prev_date_str) else None,
+                            "report_date": curr_report_date,
+                            "prev_report_date": prev_report_date,
+                            "form_type": curr_form,
+                            "is_amendment": curr_is_amendment,
+                            "replaces_accession": replaces_acc,
+                        }
 
-                        if self._row_exists(series_id, obs_date, conn):
+                        # A re-run that read the same filing pair and found
+                        # the same thing writes nothing (see the note above
+                        # _LATEST_CHANGE_ROWS_SQL).
+                        if _is_stored_observation(stored_rows.get(series_id), value, payload):
+                            rows_unchanged += 1
                             continue
 
                         self._insert_raw(
@@ -1539,43 +1661,7 @@ class InstitutionalFlowsPuller(BasePuller):
                             series_id=series_id,
                             obs_date=obs_date,
                             value=value,
-                            raw_payload={
-                                "manager_cik": cik,
-                                "manager_name": manager_name,
-                                "cusip": chg["cusip"],
-                                "issuer_name": chg.get("name", ""),
-                                "action": chg["action"],
-                                "estimated_flow_usd": chg.get("estimated_flow_usd"),
-                                "holdings_value_delta_usd": chg.get("holdings_value_delta_usd"),
-                                "curr_value_usd": chg.get("curr_value_usd"),
-                                "prev_value_usd": chg.get("prev_value_usd"),
-                                "pct_change": chg.get("pct_change"),
-                                "share_pct_change": chg.get("share_pct_change"),
-                                "shares": chg.get("shares"),
-                                "curr_shares": chg.get("curr_shares"),
-                                "prev_shares": chg.get("prev_shares"),
-                                "delta_shares": chg.get("delta_shares"),
-                                "valuation_price_usd": chg.get("valuation_price_usd"),
-                                "valuation_price_basis": chg.get("valuation_price_basis"),
-                                "flow_estimation_method": chg.get("flow_estimation_method"),
-                                "value_units": chg.get("value_units", "usd"),
-                                "value_multiplier": curr_mult,
-                                "prev_value_multiplier": prev_mult,
-                                "share_type": chg.get("share_type", "SH"),
-                                "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
-                                "unqualified_reason": chg.get("unqualified_reason"),
-                                "observation_kind": chg.get("observation_kind"),
-                                "measure": chg.get("measure"),
-                                "filing_accession": curr_acc,
-                                "prev_filing_accession": prev_acc,
-                                "filing_date": obs_date.isoformat(),
-                                "prev_filing_date": _parse_13f_date(prev_date_str).isoformat() if _parse_13f_date(prev_date_str) else None,
-                                "report_date": curr_report_date,
-                                "prev_report_date": prev_report_date,
-                                "form_type": curr_form,
-                                "is_amendment": curr_is_amendment,
-                                "replaces_accession": replaces_acc,
-                            },
+                            raw_payload=payload,
                         )
                         rows_inserted += 1
 
@@ -1605,15 +1691,17 @@ class InstitutionalFlowsPuller(BasePuller):
                     "status": "SUCCESS",
                     "changes_detected": len(changes),
                     "rows_inserted": rows_inserted,
+                    "rows_unchanged": rows_unchanged,
                     "receipts_inserted": receipts_inserted,
                     "quarantined": quarantined_total,
                 })
 
                 log.info(
-                    "13F {m}: {n} changes detected, {r} rows inserted",
+                    "13F {m}: {n} changes detected, {r} rows inserted, {u} already stored",
                     m=manager_name,
                     n=len(changes),
                     r=rows_inserted,
+                    u=rows_unchanged,
                 )
 
             except requests.HTTPError as http_exc:

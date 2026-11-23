@@ -1022,3 +1022,26 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
 - Remaining review gates: Claude reviews the pushed head; Anik alone decides
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
+
+## 2026-11-23 - 13F change rows: a re-run writes nothing new (draft only)
+
+Branch `claude/13f-rerun-dedupe-20261123`. Anik: "fix the 13F duplicates".
+
+- **Cause:** the 13F change-row loop in
+  `ingestion/altdata/institutional_flows.py` used `BasePuller._row_exists`,
+  whose window is one hour. Every `etf_flows` run more than an hour after the
+  last appended every row again. grid-svr, 2026-11-23 23:30Z, source 280:
+  166,760 `13F:%` rows for 41,690 distinct `(series_id, obs_date)`, exactly four
+  identical copies each, all written since 17:24Z (the first run after #1393).
+- **Fix:** the writer reads the newest stored vintage of each change row
+  (one `IN` lookup per 500 series) and skips the row only when that vintage is
+  the same observation: same `filing_accession` and `prev_filing_accession`,
+  same value, identical payload. Anything else is stored as a new vintage.
+  `BasePuller` is unchanged; no other puller is affected.
+- **Not changed:** filing receipts (`13F-FILING:...`) stay one per run (#1393:
+  the holdings reader ranks filings by receipt time). No reader is touched.
+- **Readers and the existing copies:** `holdings_observations_13f` and
+  `dollar_flows` take the newest vintage per key, so nothing is counted twice;
+  the holdings' `received_at` is the newest copy's time. The two 13F counts in
+  `intelligence/actor_discovery.py` (`COUNT(*)`, `SUM(value)`) count every copy.
+- **Production rows:** untouched. Cleanup is a separate owner decision.

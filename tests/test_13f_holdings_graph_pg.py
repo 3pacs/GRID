@@ -313,3 +313,33 @@ def test_pg_receipts_and_change_rows_come_from_one_snapshot(pg_engine, monkeypat
     after = h13f.read_13f_holdings_snapshot(pg_engine)
     assert {h.ticker for h in after.holdings} == {s.PEER_A}  # the committed state
     assert after.counts["stale_comparison"] == 1
+
+
+def test_a_rerun_writes_no_change_row_and_a_changed_filing_writes_one(pg_engine, monkeypatch):
+    """JSONB payloads compare equal after their round trip, so a re-run of the
+    same filings a day later adds no change row (grid-svr 2026-11-23: every run
+    more than an hour after the last appended all 41,762 again). A changed
+    filing is still a new vintage. See tests/test_13f_rerun_writes_nothing_new.py."""
+
+    def change_rows() -> int:
+        with pg_engine.connect() as conn:
+            return conn.execute(text("SELECT COUNT(*) FROM raw_series WHERE series_id LIKE '13F:%'")).scalar_one()
+
+    edgar = s.two_quarter_scenario()
+    s.run_writer(pg_engine, monkeypatch, edgar)
+    stored = change_rows()
+    assert stored > 0
+    _report, filed = s.quarter_dates(0)
+    assert s.set_receipt(pg_engine, filed, datetime.now(timezone.utc) - timedelta(days=1)) == stored
+
+    second = s.run_writer(pg_engine, monkeypatch, edgar)
+
+    assert change_rows() == stored
+    assert sum(r["rows_inserted"] for r in second) == 0
+    assert sum(r["rows_unchanged"] for r in second) == stored
+
+    edgar.filings[s.CIK_ALPHA][1].holdings[s.ROOT_CUSIP] = ("ROOT HOLDINGS INC", 280_000, 2_000)
+    third = s.run_writer(pg_engine, monkeypatch, edgar)
+
+    assert sum(r["rows_inserted"] for r in third) == 1
+    assert change_rows() == stored + 1
