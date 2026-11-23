@@ -12,6 +12,13 @@ DIMENSIONS = (
 )
 METRICS = ("gross_bp", "net_bp", "sd_bp", "t_gross")
 NIGHT_PARTITIONS = ("year", "market_phase", "fed_balance_sheet", "vix_third", "spike_state")
+# cross_section_factory.paid_split derives these from the card's own cuts: the
+# larger cuts split by net sign and sorted by size. Sorting the favorable cuts is
+# what this adapter never carries, so each entry must repeat a preserved cut
+# exactly and is then dropped; anything that is not such a copy is refused.
+PAID_SPLIT = {"where_it_paid": lambda net: net > 0, "where_it_did_not": lambda net: net <= 0}
+PAID_SPLIT_ENTRY = {"cut", "value", "nights", "net_bp", "t_gross"}
+CARD_FIELDS = {"overall", "state_rows_matched", *DIMENSIONS, *PAID_SPLIT}
 
 
 def _finite(value):
@@ -41,6 +48,36 @@ def _cut(value):
         if value["sd_bp"] < 0:
             raise ValueError("negative dispersion")
     return copy.deepcopy(value)
+
+
+def _paid_split(card, cuts):
+    """Check the producer's paid/did-not lists only repeat preserved cuts; carry neither."""
+    present = [key for key in PAID_SPLIT if key in card]
+    if not present:
+        return "not_supplied"
+    if len(present) != len(PAID_SPLIT):
+        raise ValueError("paid split must supply both sides")
+    seen = set()
+    supplied = sum(len(groups) for groups in cuts.values())
+    for key, side in PAID_SPLIT.items():
+        entries = card[key]
+        if not isinstance(entries, list) or len(entries) > supplied:
+            raise ValueError("paid split list bounded by the card's cuts required")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != PAID_SPLIT_ENTRY:
+                raise ValueError("paid split entry shape")
+            dim, group = entry["cut"], entry["value"]
+            if not isinstance(dim, str) or not isinstance(group, str) or (dim, group) in seen:
+                raise ValueError("paid split must name each cut once")
+            seen.add((dim, group))
+            cut = cuts.get(dim, {}).get(group)
+            if cut is None or "net_bp" not in cut:
+                raise ValueError("paid split names no scored cut")
+            if any(entry[name] != cut[name] for name in ("nights", "net_bp", "t_gross")):
+                raise ValueError("paid split disagrees with its cut")
+            if not side(cut["net_bp"]):
+                raise ValueError("paid split side disagrees with net sign")
+    return "checked_against_cuts_not_carried"
 
 
 def _metadata(value, depth=0):
@@ -89,7 +126,7 @@ def conditional_factory_cards(raw: bytes, **adapter_args) -> dict:
         _identity(trial_id)
         if trial_id not in ranked:
             raise ValueError("conditional card missing ranked trial")
-        if not isinstance(card, dict) or set(card) - {"overall", "state_rows_matched", *DIMENSIONS}:
+        if not isinstance(card, dict) or set(card) - CARD_FIELDS:
             raise ValueError("unknown conditional card fields")
         overall = _cut(card.get("overall"))
         if overall["nights"] != ranked[trial_id]["development_fires"]:
@@ -109,6 +146,7 @@ def conditional_factory_cards(raw: bytes, **adapter_args) -> dict:
                 if checked["nights"] > overall["nights"]:
                     raise ValueError("stratum exceeds overall nights")
                 cuts[dim][group] = checked
+        paid_split = _paid_split(card, cuts)
         partition_coverage = {}
         for dim in NIGHT_PARTITIONS:
             if dim not in cuts:
@@ -127,6 +165,7 @@ def conditional_factory_cards(raw: bytes, **adapter_args) -> dict:
             "partition_coverage": partition_coverage,
             "trial_id": trial_id, "evidence": copy.deepcopy(ranked[trial_id]["evidence"]),
             "overall": overall, "state_rows_matched": matched, "cuts": cuts,
+            "producer_paid_split": paid_split,
             "standing": "development_descriptions_only",
             "confirmation_status": "not_supplied",
             "forward_status": "not_supplied", "promotion_allowed": False,

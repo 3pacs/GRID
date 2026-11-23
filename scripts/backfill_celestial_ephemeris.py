@@ -325,7 +325,7 @@ def ensure_feature_registry_entries(engine: Engine, series_ids: list[str], start
                     "(name, family, description, transformation, transformation_version, "
                     "lag_days, normalization, missing_data_policy, eligible_from_date, model_eligible) "
                     "VALUES (:name, 'alternative', :description, 'RAW', 1, 0, 'ZSCORE', "
-                    "'FORWARD_FILL', :eligible_from_date, TRUE) "
+                    "'FORWARD_FILL', :eligible_from_date, FALSE) "
                     "ON CONFLICT (name) DO NOTHING"
                 ),
                 {

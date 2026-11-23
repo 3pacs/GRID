@@ -34,7 +34,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from oracle.entry_price_policy import entry_price_score_note
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_ORACLE_PREDICTIONS, visible_sql
 
 
 # Lessons come from official verdicts (oracle.engine.score_expired_predictions),
@@ -321,7 +321,7 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
                    anti_signals, flow_context, verdict, actual_price,
                    actual_move_pct, pnl_pct, scored_at, score_notes,
                    created_at
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE id = :id
         """), {"id": prediction_id}).fetchone()
 
@@ -500,7 +500,7 @@ def batch_postmortem(
         ORDER BY closed_at DESC
     """
     pred_sql = """
-        SELECT id FROM oracle_predictions
+        SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE verdict = 'miss'
           AND scored_at >= :cutoff
           AND id NOT LIKE 'astrogrid:%'

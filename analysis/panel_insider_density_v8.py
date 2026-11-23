@@ -92,7 +92,7 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"69a7d3276da1fffc10f0ea023151ff283dd0e154b9ee3509495c670ddff42bb5",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-10-01T15:05:27+00:00"}'
 )
-SUPERSEDED_BY: Mapping[str, Any] | None = None
+SUPERSEDED_BY: Mapping[str, Any] | None = {"version": "vs1-v9"}
 
 FROZEN_REGISTRIES = v7.FROZEN_REGISTRIES
 TERMINAL_REGISTRIES = {v6.VERSION: v7.V6_STOP_RECORDS, v7.VERSION: V7_STOP_RECORDS}
@@ -447,6 +447,7 @@ class V8Harness(v2.Harness):
         if inputs.get("accept_underpowered") is not False:
             raise PermissionError("v8 must STOP below either gated 0.50 Stage-0 model")
         self._refuse_if_stopped(log_dir)
+        v1.refuse_superseded(8, self.superseded_by)
         return super().freeze_inputs(log_dir, now, inputs)
 
     def open_discovery(self, log_dir: Path, now: datetime, observed: Mapping[str, Any], witness) -> dict:
@@ -604,7 +605,111 @@ def _gated_powers(power: Mapping[str, Any]) -> dict[str, float]:
     return {name: float(models[name]["power"]) for name in ("gaussian_v1", f"e0:{E0_GATED_SCENARIO}")}
 
 
-def _check_stop_record(record: Mapping[str, Any]) -> None:
+# --- terminal STOP: superseded unopened by v9 after XLK benchmark rejection (owner ruling R9) -
+
+STOP_SUPERSEDED_STATUS = "STOP_SUPERSEDED_BY_V9_UNOPENED"
+STOP_SUPERSEDED_SUCCESSOR = "vs1-v9"
+PROBE_DIR_NAME = "probe_20261003_001948"
+PROBE_SNAPSHOT_AS_OF_TS = "2026-10-03T00:17:40+00:00"
+#: Operator fills from sha256sum of /data/sec/vs8/probe_20261003_001948/probe_report.json (prefix 64d29785...).
+PROBE_REPORT_SHA256: str = "PLACEHOLDER_OPERATOR_FILL_FROM_SHA256SUM_64d29785"
+#: Operator fills from sha256sum of /data/sec/vs8/probe_20261003_001948/crosscheck_report.json (prefix ab78b1b0...).
+CROSSCHECK_REPORT_SHA256: str = "PLACEHOLDER_OPERATOR_FILL_FROM_SHA256SUM_ab78b1b0"
+#: Operator fills from sha256sum of /data/sec/vs8/probe_20261003_001948/tiingo_meta_report.json (prefix 84671265...).
+TIINGO_META_REPORT_SHA256: str = "PLACEHOLDER_OPERATOR_FILL_FROM_SHA256SUM_84671265"
+#: Operator fills full 40-hex commit SHA from probe_report.json["code_sha"] (prefix 390dbbed...).
+PROBE_CODE_SHA: str = "PLACEHOLDER_OPERATOR_FILL_40HEX_390dbbed"
+PROBE_XLK_REASON = "crosscheck_disagreement"
+PROBE_XLK_SHARE_WITHIN = 0.9810694121554301
+PROBE_XLK_PAIRS = 3011
+PROBE_ADMITTED_ISSUERS = 195
+OWNER_RULING_R9_VAULT_PATH = (
+    "00-Agent-Reports/2026-10-07/claude__grid-svr__grid-owner-rulings-r1-r12-confirmed-20261007.md"
+)
+#: Operator fills full 40-hex vault commit SHA (prefix 4b9f2c80...).
+OWNER_RULING_R9_VAULT_COMMIT: str = "PLACEHOLDER_OPERATOR_FILL_40HEX_4b9f2c80"
+#: Operator fills from sha256sum of OWNER_RULING_R9_VAULT_PATH in vault (prefix 051f6d4c...).
+OWNER_RULING_R9_FILE_SHA256: str = "PLACEHOLDER_OPERATOR_FILL_FROM_SHA256SUM_051f6d4c"
+OWNER_RULING_R9_TEXT = (
+    "Accept the rejection as a result. No rerun, no tolerance change, no power claim. "
+    "A new adjudication rule needs its own reviewed scope before the two-model chain advances."
+)
+STOP_SUPERSEDED_REASON = (
+    "v8 single binding admission probe rejected the XLK benchmark on the TwelveData cross-check "
+    "(share_within 0.9810694121554301 < 0.99 over 3,011 pairs; 195 of 306 issuers admitted); "
+    "stopped unopened under owner ruling R9 and superseded by reviewed scope vs1-v9, no VS1 outcome read"
+)
+STOP_SUPERSEDED_BASIS = (
+    "owner ruling R9 (2026-10-07) and owner decision (2026-11-22) on non-outcome admission probe "
+    "metadata only; no Stage-0, freeze, discovery or holdout ran"
+)
+
+
+def _is_hex40(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{40}", value))
+
+
+def _check_superseded_pins() -> None:
+    hex64_pins = {
+        "PROBE_REPORT_SHA256": PROBE_REPORT_SHA256,
+        "CROSSCHECK_REPORT_SHA256": CROSSCHECK_REPORT_SHA256,
+        "TIINGO_META_REPORT_SHA256": TIINGO_META_REPORT_SHA256,
+        "OWNER_RULING_R9_FILE_SHA256": OWNER_RULING_R9_FILE_SHA256,
+    }
+    hex40_pins = {
+        "PROBE_CODE_SHA": PROBE_CODE_SHA,
+        "OWNER_RULING_R9_VAULT_COMMIT": OWNER_RULING_R9_VAULT_COMMIT,
+    }
+    bad = [
+        name for name, val in hex64_pins.items()
+        if not v1._is_hex64(val) or "PLACEHOLDER" in str(val)
+    ] + [
+        name for name, val in hex40_pins.items()
+        if not _is_hex40(val) or "PLACEHOLDER" in str(val)
+    ]
+    if bad:
+        raise PermissionError(f"v8 superseded-STOP pins still contain placeholders or invalid hashes: {bad}")
+
+
+def _superseded_stop_required() -> dict[str, Any]:
+    return {
+        "kind": "status",
+        "version": VERSION,
+        "status": STOP_SUPERSEDED_STATUS,
+        "superseded_by": STOP_SUPERSEDED_SUCCESSOR,
+        "stage0_run": False,
+        "prereg_gate_evaluated": False,
+        "inputs_frozen": False,
+        "discovery_opened": False,
+        "holdout_opened": False,
+        "prereg_sha256": PREREG_BODY_SHA256,
+        "reason": STOP_SUPERSEDED_REASON,
+        "basis": STOP_SUPERSEDED_BASIS,
+        "promotion_allowed": False,
+        "probe": {
+            "dir": PROBE_DIR_NAME,
+            "probe_report_sha256": PROBE_REPORT_SHA256,
+            "crosscheck_report_sha256": CROSSCHECK_REPORT_SHA256,
+            "tiingo_meta_report_sha256": TIINGO_META_REPORT_SHA256,
+            "snapshot_as_of_ts": PROBE_SNAPSHOT_AS_OF_TS,
+            "code_sha": PROBE_CODE_SHA,
+            "benchmark_admitted": False,
+            "benchmark_reason": PROBE_XLK_REASON,
+            "benchmark_share_within": PROBE_XLK_SHARE_WITHIN,
+            "benchmark_pairs": PROBE_XLK_PAIRS,
+            "admitted_issuers": PROBE_ADMITTED_ISSUERS,
+        },
+        "owner_ruling": {
+            "ruling": "R9",
+            "vault_path": OWNER_RULING_R9_VAULT_PATH,
+            "vault_commit": OWNER_RULING_R9_VAULT_COMMIT,
+            "file_sha256": OWNER_RULING_R9_FILE_SHA256,
+            "text": OWNER_RULING_R9_TEXT,
+        },
+    }
+
+
+def _check_underpowered_stop_record(record: Mapping[str, Any]) -> None:
     if any(record.get(key) != value for key, value in _STOP_REQUIRED.items()):
         raise PermissionError("v8 terminal record is not the exact STOP status")
     if set(record) != _STOP_FIELDS:
@@ -617,6 +722,114 @@ def _check_stop_record(record: Mapping[str, Any]) -> None:
     if not v1._is_hex64(record.get("power_receipt_sha256")) or not str(record.get("decision_ref") or "").strip():
         raise PermissionError("v8 STOP needs the sealed power receipt hash and a decision reference")
     _check_power_inputs(record.get("power_inputs"))
+
+
+def _check_superseded_stop_record(record: Mapping[str, Any]) -> None:
+    from datetime import timedelta
+
+    _check_superseded_pins()
+    required = _superseded_stop_required()
+    allowed = frozenset(required) | {"run_at", "decision_ref", "prev_sha256"}
+    if set(record) != allowed:
+        raise PermissionError("v8 terminal STOP record has missing or extra fields")
+    if any(k.startswith("v9_") for k in record):
+        raise PermissionError("the v8 STOP must not contain a v9 hash")
+    if any(record.get(key) != value for key, value in required.items()):
+        raise PermissionError("v8 terminal record is not the exact superseded STOP status")
+    if not str(record.get("decision_ref") or "").strip():
+        raise PermissionError("v8 STOP needs a decision reference")
+    if not v1._is_hex64(record.get("prev_sha256")):
+        raise PermissionError("v8 STOP needs a valid prev_sha256")
+    try:
+        ts = datetime.fromisoformat(str(record.get("run_at") or ""))
+    except ValueError as exc:
+        raise PermissionError("v8 STOP needs a valid UTC run_at") from exc
+    if ts.tzinfo is None or ts.utcoffset() != timedelta(0):
+        raise PermissionError("v8 STOP needs a UTC run_at")
+
+
+def _check_stop_record(record: Mapping[str, Any]) -> None:
+    status = record.get("status")
+    if status == STOP_STATUS:
+        _check_underpowered_stop_record(record)
+    elif status == STOP_SUPERSEDED_STATUS:
+        _check_superseded_stop_record(record)
+    else:
+        raise PermissionError("v8 terminal record is not an accepted STOP status")
+
+
+def append_superseded_stop(
+    log_dir: Path,
+    now: datetime,
+    *,
+    probe_report_path: Path,
+    decision_ref: str,
+    expected_prev_sha256: str,
+    witness,
+    dry_run: bool = False,
+) -> dict:
+    """Append v8's one STOP_SUPERSEDED_BY_V9_UNOPENED record after checking the exact two-record chain."""
+    from datetime import timedelta
+
+    _check_superseded_pins()
+    if REGISTERED_RECORD_SHA256 is None:
+        raise PermissionError("v8 is not registered yet (no pinned registration in code)")
+    if now.tzinfo is None or now.utcoffset() != timedelta(0):
+        raise ValueError("STOP needs a UTC time")
+    if not str(decision_ref or "").strip():
+        raise ValueError("STOP needs a non-empty decision reference")
+    if expected_prev_sha256 != REGISTERED_RECORD_SHA256[1]:
+        raise ValueError("STOP needs the exact v8 registration head")
+    body = Path(probe_report_path).read_bytes()
+    report = json.loads(body)
+    prereg = report.get("prereg") or {}
+    if prereg.get("study") != VERSION or prereg.get("body_sha256") != PREREG_BODY_SHA256:
+        raise PermissionError("probe report is not bound to vs1-v8")
+    if report.get("benchmark_admitted") is not False:
+        raise PermissionError("v8 probe admitted the benchmark: superseded-STOP is refused")
+    if hashlib.sha256(body).hexdigest() != PROBE_REPORT_SHA256:
+        raise PermissionError("v8 probe report differs from the pinned evidence")
+    if (
+        report.get("crosscheck_report_sha256") != CROSSCHECK_REPORT_SHA256
+        or report.get("tiingo_meta_report_sha256") != TIINGO_META_REPORT_SHA256
+        or report.get("snapshot_as_of_ts") != PROBE_SNAPSHOT_AS_OF_TS
+        or report.get("code_sha") != PROBE_CODE_SHA
+    ):
+        raise PermissionError("v8 probe report metadata differs from the pinned evidence")
+    xlk = (report.get("tickers") or {}).get(BENCHMARK) or {}
+    xc = xlk.get("crosscheck") or {}
+    if (
+        PROBE_XLK_REASON not in (xlk.get("reasons") or ())
+        or xc.get("pairs") != PROBE_XLK_PAIRS
+        or not math.isclose(float(xc.get("share_within", -1.0)), PROBE_XLK_SHARE_WITHIN, rel_tol=0.0, abs_tol=1e-12)
+        or (report.get("summary") or {}).get("admitted_excluding_benchmark") != PROBE_ADMITTED_ISSUERS
+    ):
+        raise PermissionError("v8 probe report XLK rejection or admitted issuer count differs from pinned evidence")
+    if not isinstance(witness, v2.OffhostWitness) or witness.path != WITNESS_PATH:
+        raise PermissionError("v8 requires its pinned off-host witness")
+    if (witness.census.get("records") or {}).get(REGISTRY_ID) != 2 or json.loads(witness.lines[-1]).get("records") != 2:
+        raise PermissionError("v8's canonical witness is not at the two-record baseline")
+    proof = V8.require_witness(log_dir, witness, 2)
+    if proof["witnessed_records"] != 2:
+        raise PermissionError("v8's canonical witness is not at the two-record baseline")
+    log = V8.registry(log_dir)
+    with log.locked():
+        records = V8._chain(log)
+        if len(records) != 2:
+            raise PermissionError("v8 registry differs from its two-record baseline; reconcile before STOP")
+        if v1._record_sha256(records[-1]) != expected_prev_sha256:
+            raise PermissionError("v8 prior head differs from the expected head")
+        candidate = {
+            **_superseded_stop_required(),
+            "run_at": now.isoformat(),
+            "decision_ref": str(decision_ref).strip(),
+            "prev_sha256": v1._record_sha256(records[-1]),
+        }
+        _check_stop_record(candidate)
+        if dry_run:
+            return {"dry_run": True, "would_append": candidate,
+                    "would_be_head_sha256": v1._record_sha256(candidate)}
+        return log.append_locked([candidate])[0]
 
 
 def append_stop_status(log_dir: Path, now: datetime, *, power_path: Path, decision_ref: str,
@@ -669,6 +882,7 @@ def verify_terminal_stop(log_dir: Path, witness) -> dict:
     if (witness.census.get("records") or {}).get(REGISTRY_ID) != STOP_RECORDS:
         raise PermissionError("v8 census does not cover exactly the STOP record")
     return {"records": STOP_RECORDS, "head_sha256": v1._record_sha256(records[-1]),
+            "status": records[-1]["status"],
             "witness_path": WITNESS_PATH, "witness_tip": witness.tip}
 
 

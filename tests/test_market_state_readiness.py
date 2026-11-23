@@ -161,3 +161,13 @@ def test_explicit_recovery_date_kept_not_relabelled_daily(engine, capsys):
     p = stored(engine)["writer_provenance"]
     assert p["mode"] == "explicit_session" and p["target_session"] == "2026-11-12"
     assert not p["readiness"]["forward_qualified"]
+
+
+def test_stale_dealer_row_is_not_target_ready_and_says_why():
+    rec = {"gamma_state": {"status": "stale", "obs_date": "2026-11-12", "reason": "newest observation 2026-11-12 is "
+                           "1 sessions old; limit 0"},
+           "variables": {"vix": {"status": "stale", "obs_date": "2026-11-06", "freshness": {"age": 5, "limit": 2}}}}
+    ready = W.readiness(rec, TARGET)
+    assert ready["dealer_target_ready"] is False and ready["dealer_reason"].startswith("newest observation 2026-11-12")
+    assert ready["analysis_gaps"] == ["vix"]
+    assert ready["variable_status"]["vix"]["freshness"] == {"age": 5, "limit": 2}

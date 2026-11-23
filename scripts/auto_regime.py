@@ -24,9 +24,11 @@ vs straddling boundaries.
 
 import argparse
 import json
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import numpy as np
 from loguru import logger as log
@@ -590,6 +592,56 @@ def _binding_summary(bindings: dict[str, dict[str, Any]]) -> dict[str, str]:
     return {concept: b["feature"] for concept, b in bindings.items()}
 
 
+_STORED_SNAPSHOT_PAYLOAD_SQL = text(
+    "SELECT payload FROM analytical_snapshots WHERE id = :sid AND category = :category"
+)
+
+
+def _stored_snapshot_binding(engine, snapshot_id: int | None) -> dict[str, Any]:
+    """``{snapshot_id, snapshot_hash}`` for a saved regime_detection snapshot.
+
+    The hash is taken over the payload as read back from the database, not
+    the in-memory dict: JSONB normalizes numbers (``-0.0`` becomes ``0.0``,
+    ``1e20`` becomes an integer), and readers hash what they read back. So
+    both sides hash the identical post-JSONB object. Returns ``{}`` (no
+    binding, so readers withhold the regime) when the row can't be read back.
+    """
+    from store.snapshots import canonical_payload_sha256
+
+    if snapshot_id is None:
+        return {}
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                _STORED_SNAPSHOT_PAYLOAD_SQL,
+                {"sid": int(snapshot_id), "category": "regime_detection"},
+            ).fetchone()
+        stored = row[0] if row else None
+        if isinstance(stored, str):
+            stored = json.loads(stored)
+        if not isinstance(stored, dict):
+            log.warning("Snapshot {sid} could not be read back; journal entry carries no snapshot binding", sid=snapshot_id)
+            return {}
+        return {"snapshot_id": int(snapshot_id), "snapshot_hash": canonical_payload_sha256(stored)}
+    except Exception as exc:
+        log.warning("Snapshot {sid} read-back failed: {e}; journal entry carries no snapshot binding", sid=snapshot_id, e=str(exc))
+        return {}
+
+
+def _journal_will_accept(confidence: float, transition_probability: float) -> bool:
+    """Mirror DecisionJournal.log_decision's numeric checks (finite, in [0, 1]).
+
+    The snapshot is saved before the journal entry so the entry can name it;
+    when the journal would reject the values anyway, skip the save, as the
+    journal-first order did, so no unbound snapshot is left behind.
+    """
+    return all(
+        isinstance(v, (int, float, np.floating)) and not isinstance(v, bool)
+        and bool(np.isfinite(v)) and 0.0 <= float(v) <= 1.0
+        for v in (confidence, transition_probability)
+    )
+
+
 def compute_regime_at(
     engine,
     as_of: date,
@@ -670,25 +722,70 @@ def compute_regime_at(
     }
 
 
-# Two complete literal statements rather than one assembled from a fragment.
-# The fragment was constant, so there was no injection path, but
-# .claude/rules/security.md bans f-strings, .format() and concatenation in SQL
-# outright — a rule worth keeping absolute, because the moment a fragment stops
-# being constant the review that would have caught it has already happened.
-_REGIME_HISTORY_UPSERT_SQL = text(
-    "INSERT INTO regime_history (obs_date, regime, confidence, source, data_as_of) "
-    "VALUES (:obs_date, :regime, :confidence, :source, :data_as_of) "
-    "ON CONFLICT (obs_date) DO UPDATE SET "
-    "regime = EXCLUDED.regime, "
-    "confidence = EXCLUDED.confidence, "
-    "source = EXCLUDED.source, "
-    "data_as_of = EXCLUDED.data_as_of"
-)
+# ── regime_history is insert-only (#1302) ────────────────────────
+#
+# A day's row is what the chat regime context, trial_signal's BUY gate and the
+# HMM transition model read for that day, so a default write never changes an
+# existing row. A replacement is explicit: it names a reason and a run. The
+# trigger from migrations/versions/regime_history_revs_20261122.py copies
+# the superseded version into regime_history_revisions (when it was written,
+# when it was superseded, by which run and why) before the row changes. A
+# change made without a reason (the pinned scheduler's older release still
+# upserts) is archived as unattributed rather than refused. This writer in turn
+# refuses to replace when no revision row lands in the same transaction, so a
+# database without the trigger cannot lose a version silently.
+#
+# The scheduled run replaces only its own day's row. It runs about four times a
+# day (13, 16, 20 and 22 UTC on griddb), and readers have always seen the latest
+# of them: on 119 of 119 days to 2026-11-21 the stored label was the day's last
+# run, and on 8 of those days the label changed between runs. Earlier dates
+# change only through ``--backfill --overwrite --reason``.
+#
+# Every statement is a whole module-level literal with bound values:
+# .claude/rules/security.md bans f-strings, .format() and concatenation in SQL.
 
-_REGIME_HISTORY_INSERT_IGNORE_SQL = text(
+
+@dataclass(frozen=True)
+class RegimeReplacement:
+    """Why an existing ``regime_history`` row is replaced, and by which run; both are recorded."""
+
+    reason: str
+    run_tag: str
+
+    def __post_init__(self) -> None:
+        for name in ("reason", "run_tag"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"a regime_history replacement needs a non-empty {name}")
+
+
+SAME_DAY_REFRESH_REASON = "scheduled same-day refresh: a later run for the day still in progress"
+
+_REGIME_HISTORY_INSERT_SQL = text(
     "INSERT INTO regime_history (obs_date, regime, confidence, source, data_as_of) "
     "VALUES (:obs_date, :regime, :confidence, :source, :data_as_of) "
     "ON CONFLICT (obs_date) DO NOTHING"
+)
+
+_REGIME_HISTORY_LOCK_SQL = text(
+    "SELECT regime, confidence, source, data_as_of FROM regime_history "
+    "WHERE obs_date = :obs_date FOR UPDATE"
+)
+
+_REGIME_HISTORY_REASON_SQL = text(
+    "SELECT set_config('grid.regime_history_reason', :reason, true), "
+    "set_config('grid.regime_history_run', :run_tag, true)"
+)
+
+_REGIME_HISTORY_REPLACE_SQL = text(
+    "UPDATE regime_history SET regime = :regime, confidence = :confidence, "
+    "source = :source, data_as_of = :data_as_of WHERE obs_date = :obs_date"
+)
+
+_REGIME_HISTORY_ARCHIVED_SQL = text(
+    "SELECT count(*) FROM regime_history_revisions "
+    "WHERE obs_date = :obs_date AND run_tag = :run_tag "
+    "AND superseded_by_xid = pg_current_xact_id()::text"
 )
 
 
@@ -697,10 +794,11 @@ def persist_regime_history(
     obs_date: date,
     label: str,
     confidence: float,
-    overwrite: bool = True,
+    *,
     data_as_of: date | None = None,
+    replace: RegimeReplacement | None = None,
 ) -> bool:
-    """Upsert one row into ``regime_history``.
+    """Write one ``regime_history`` row; never change an existing one unless ``replace`` says why.
 
     One row per observation date, stamped with ``source`` so a reader can tell
     a row this writer produced from one the 2026-03 one-off load left behind.
@@ -710,13 +808,17 @@ def persist_regime_history(
         obs_date: The date the label describes.
         label: One of ``REGIME_HISTORY_LABELS``.
         confidence: 0-1 confidence score.
-        overwrite: When False, an existing row for ``obs_date`` is left alone.
         data_as_of: Newest real observation the label was computed from. This
             is what says whether the row is a fresh read or a stale one wearing
             today's date; None when the caller could not establish it.
+        replace: None (the default) inserts only: an existing row for
+            ``obs_date`` is left exactly as it is. A ``RegimeReplacement``
+            replaces an existing row whose values differ; the superseded
+            version is kept in ``regime_history_revisions`` with the reason
+            and run.
 
     Returns:
-        True if a row was written or updated.
+        True if this call inserted the row or replaced it with different values.
 
     Raises:
         ValueError: If ``label`` is outside the vocabulary, ``confidence`` is
@@ -725,6 +827,8 @@ def persist_regime_history(
             row — trial_signal would store it as UNKNOWN and downgrade every
             BUY — so this refuses rather than writing something downstream will
             misread. Data dated after the day it describes would be lookahead.
+        RuntimeError: If a replacement left no revision row (the revision
+            trigger is missing); the transaction is rolled back.
     """
     if label not in REGIME_HISTORY_LABELS:
         raise ValueError(
@@ -739,19 +843,36 @@ def persist_regime_history(
             f"data_as_of {data_as_of} is after the row's obs_date {obs_date}"
         )
 
-    stmt = _REGIME_HISTORY_UPSERT_SQL if overwrite else _REGIME_HISTORY_INSERT_IGNORE_SQL
+    params = {
+        "obs_date": obs_date,
+        "regime": label,
+        "confidence": conf,
+        "source": REGIME_HISTORY_SOURCE,
+        "data_as_of": data_as_of,
+    }
     with engine.begin() as conn:
-        result = conn.execute(
-            stmt,
-            {
-                "obs_date": obs_date,
-                "regime": label,
-                "confidence": conf,
-                "source": REGIME_HISTORY_SOURCE,
-                "data_as_of": data_as_of,
-            },
+        if replace is None:
+            return bool(conn.execute(_REGIME_HISTORY_INSERT_SQL, params).rowcount)
+        old = conn.execute(_REGIME_HISTORY_LOCK_SQL, {"obs_date": obs_date}).first()
+        if old is None:
+            return bool(conn.execute(_REGIME_HISTORY_INSERT_SQL, params).rowcount)
+        if tuple(old) == (label, conf, REGIME_HISTORY_SOURCE, data_as_of):
+            return False
+        conn.execute(
+            _REGIME_HISTORY_REASON_SQL,
+            {"reason": replace.reason, "run_tag": replace.run_tag},
         )
-    return bool(result.rowcount)
+        conn.execute(_REGIME_HISTORY_REPLACE_SQL, params)
+        archived = conn.execute(
+            _REGIME_HISTORY_ARCHIVED_SQL,
+            {"obs_date": obs_date, "run_tag": replace.run_tag},
+        ).scalar()
+        if archived != 1:
+            raise RuntimeError(
+                f"regime_history {obs_date}: the replacement left {archived!r} revision rows, "
+                "not 1; regime_history_revisions or its trigger is missing, so nothing was replaced"
+            )
+    return True
 
 
 def backfill_regime_history(
@@ -761,6 +882,7 @@ def backfill_regime_history(
     overwrite: bool = False,
     max_days: int = 400,
     weights: dict[str, float] | None = None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Recompute and persist daily regime_history rows over a bounded range.
 
@@ -773,15 +895,18 @@ def backfill_regime_history(
         engine: SQLAlchemy engine.
         start: First date to compute, inclusive.
         end: Last date to compute, inclusive.
-        overwrite: Replace rows that already exist for a date.
+        overwrite: Replace rows that already exist for a date. Each replaced
+            version is kept in ``regime_history_revisions`` with ``reason``.
         max_days: Hard cap on the span, so a typo cannot start a multi-year job.
         weights: Feature weights; defaults to the module's active weights.
+        reason: Required with ``overwrite``: why existing rows are replaced.
 
     Returns:
         Dict with written / skipped / failed counts and the per-day labels.
 
     Raises:
-        ValueError: If the range is inverted or wider than ``max_days``.
+        ValueError: If the range is inverted or wider than ``max_days``, or
+            ``overwrite`` is set without a ``reason``.
     """
     if end < start:
         raise ValueError(f"backfill end {end} is before start {start}")
@@ -791,6 +916,13 @@ def backfill_regime_history(
             f"backfill span of {span} days exceeds max_days={max_days}; "
             "narrow the range or raise --max-days deliberately"
         )
+    replacement = None
+    if overwrite:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                "overwrite needs a reason: it is recorded with every replaced regime_history row"
+            )
+        replacement = RegimeReplacement(reason=reason, run_tag=f"auto_regime.backfill:{uuid4().hex}")
 
     active_weights = weights if weights is not None else _load_effective_weights()
     fid_to_name = _resolve_regime_features(engine, active_weights)
@@ -834,17 +966,19 @@ def backfill_regime_history(
                     "Regime backfill {d}: {e}", d=current.isoformat(), e=result["error"]
                 )
                 failed += 1
-            else:
-                persist_regime_history(
-                    engine,
-                    current,
-                    result["regime"],
-                    result["confidence"],
-                    overwrite=True,
-                    data_as_of=result.get("data_as_of"),
-                )
+            elif persist_regime_history(
+                engine,
+                current,
+                result["regime"],
+                result["confidence"],
+                data_as_of=result.get("data_as_of"),
+                replace=replacement,
+            ):
                 labels[current.isoformat()] = result["regime"]
                 written += 1
+            else:
+                # Already present (a concurrent insert, or an identical replacement).
+                skipped += 1
         except Exception as exc:
             log.warning(
                 "Regime backfill {d} failed: {e}", d=current.isoformat(), e=str(exc)
@@ -863,6 +997,7 @@ def backfill_regime_history(
         "skipped": skipped,
         "failed": failed,
         "labels": labels,
+        "run_tag": replacement.run_tag if replacement else None,
     }
 
 
@@ -1070,6 +1205,62 @@ def run() -> dict[str, Any]:
                 f"{biggest_calm[0]} z={biggest_calm[1]['z']:.1f} is calm despite {regime} regime"
             )
 
+    # One run tag joins this run's analytical_snapshots row, its
+    # decision_journal entry and any regime_history revision it causes.
+    run_tag = f"auto_regime.run:{uuid4().hex}"
+
+    # Persist the snapshot FIRST so the journal entry can name it. The
+    # briefing and publication guards publish a regime only when its journal
+    # row binds the exact producer snapshot (id + hash of the stored payload).
+    # A failed save must not block the journal or regime_history writes: the
+    # journal then carries no snapshot binding and readers withhold the regime.
+    binding: dict[str, Any] = {"regime_run_tag": run_tag}
+    try:
+        if not _journal_will_accept(confidence, trans_prob):
+            raise ValueError(
+                f"journal would reject confidence={confidence} / transition_probability={trans_prob}; "
+                "not saving an unbound snapshot"
+            )
+        from store.snapshots import AnalyticalSnapshotStore
+
+        snapshot_payload = {
+            "regime": regime,
+            "confidence": confidence,
+            "posture": posture,
+            "stress_index": round(s_current, 4),
+            "stress_derivative": round(ds, 4),
+            "transition_probability": trans_prob,
+            "distribution": dist,
+            "contradictions": contradictions,
+            "contributions": {k: v for k, v in sorted_contribs[:10]},
+            "n_features": len(fid_to_name),
+            "n_observations": len(df),
+            "features_used": _binding_summary(bindings),
+            "features_missing": missing,
+            "data_as_of": data_as_of.isoformat() if data_as_of else None,
+            "data_staleness_days": data_staleness_days,
+            "stale_features": stale_features,
+            "regime_run_tag": run_tag,
+        }
+        snap_store = AnalyticalSnapshotStore(db_engine=engine)
+        snapshot_id = snap_store.save_snapshot(
+            category="regime_detection",
+            payload=snapshot_payload,
+            as_of_date=today,
+            metrics={
+                "regime": regime,
+                "confidence": round(confidence, 4),
+                "stress_index": round(s_current, 4),
+                "stress_derivative": round(ds, 4),
+            },
+        )
+        if snapshot_id is None:
+            log.warning("Snapshot persistence returned no id; the regime journal entry carries no snapshot binding")
+        binding.update(_stored_snapshot_binding(engine, snapshot_id))
+    except Exception as exc:
+        binding = {"regime_run_tag": run_tag}
+        log.warning("Snapshot persistence failed: {e}", e=str(exc))
+
     # Insert into decision_journal via DecisionJournal class
     # (ensures validation: NaN/Inf rejection, confidence range, etc.)
     from journal.log import DecisionJournal
@@ -1080,7 +1271,7 @@ def run() -> dict[str, Any]:
         inferred_state=regime,
         state_confidence=confidence,
         transition_probability=trans_prob,
-        contradiction_flags=contradictions,
+        contradiction_flags={**contradictions, **binding},
         grid_recommendation=posture,
         baseline_recommendation="NEUTRAL",
         action_taken=f"AUTO_{posture}",
@@ -1096,11 +1287,14 @@ def run() -> dict[str, Any]:
     regime_history_written = False
     regime_history_error: str | None = None
     try:
+        # Only today's row: earlier dates are never replaced by the scheduled run.
         regime_history_written = persist_regime_history(
-            engine, today, regime, confidence, data_as_of=data_as_of
+            engine, today, regime, confidence, data_as_of=data_as_of,
+            replace=RegimeReplacement(SAME_DAY_REFRESH_REASON, run_tag),
         )
         log.info(
-            "regime_history updated — {d} = {l} (data_as_of {da}, {n} days old)",
+            "regime_history {w} — {d} = {l} (data_as_of {da}, {n} days old)",
+            w="written" if regime_history_written else "unchanged (same values)",
             d=today.isoformat(), l=regime,
             da=data_as_of.isoformat() if data_as_of else "unknown",
             n=data_staleness_days if data_staleness_days is not None else "?",
@@ -1108,42 +1302,6 @@ def run() -> dict[str, Any]:
     except Exception as exc:
         regime_history_error = str(exc)
         log.warning("regime_history persistence failed: {e}", e=regime_history_error)
-
-    # Persist snapshot
-    try:
-        from store.snapshots import AnalyticalSnapshotStore
-
-        snap_store = AnalyticalSnapshotStore(db_engine=engine)
-        snap_store.save_snapshot(
-            category="regime_detection",
-            payload={
-                "regime": regime,
-                "confidence": confidence,
-                "posture": posture,
-                "stress_index": round(s_current, 4),
-                "stress_derivative": round(ds, 4),
-                "transition_probability": trans_prob,
-                "distribution": dist,
-                "contradictions": contradictions,
-                "contributions": {k: v for k, v in sorted_contribs[:10]},
-                "n_features": len(fid_to_name),
-                "n_observations": len(df),
-                "features_used": _binding_summary(bindings),
-                "features_missing": missing,
-                "data_as_of": data_as_of.isoformat() if data_as_of else None,
-                "data_staleness_days": data_staleness_days,
-                "stale_features": stale_features,
-            },
-            as_of_date=today,
-            metrics={
-                "regime": regime,
-                "confidence": round(confidence, 4),
-                "stress_index": round(s_current, 4),
-                "stress_derivative": round(ds, 4),
-            },
-        )
-    except Exception as exc:
-        log.warning("Snapshot persistence failed: {e}", e=str(exc))
 
     result = {
         "regime": regime,
@@ -1228,7 +1386,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Replace regime_history rows that already exist in the range",
+        help="Replace regime_history rows that already exist in the range (needs --reason)",
+    )
+    parser.add_argument(
+        "--reason",
+        help="Why existing rows are replaced; kept with every superseded row in regime_history_revisions",
     )
     parser.add_argument(
         "--max-days",
@@ -1244,6 +1406,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.start:
         parser.error("--backfill requires --start")
+    if args.overwrite and not (args.reason or "").strip():
+        parser.error("--overwrite requires --reason")
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end) if args.end else date.today()
 
@@ -1254,6 +1418,7 @@ def main(argv: list[str] | None = None) -> int:
         end,
         overwrite=args.overwrite,
         max_days=args.max_days,
+        reason=args.reason,
     )
     print(json.dumps({k: v for k, v in result.items() if k != "labels"}, indent=2))
     return 0 if not result.get("error") else 1

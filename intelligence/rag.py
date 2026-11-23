@@ -40,6 +40,8 @@ _GRID_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _GRID_DIR not in sys.path:
     sys.path.insert(0, _GRID_DIR)
 
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
+
 # ---------------------------------------------------------------------------
 # Embedding backend selection (graceful degradation)
 # Same pattern as subnet/semantic_scorer.py
@@ -598,7 +600,7 @@ class RAGIndexer:
                     "model_version, expected_move_pct, expiry, "
                     "prediction_type, signal_strength, coherence, "
                     "created_at "
-                    "FROM oracle_predictions "
+                    "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                     "ORDER BY created_at DESC"
                 )
             ).fetchall()

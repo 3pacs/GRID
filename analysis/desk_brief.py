@@ -147,6 +147,8 @@ class Trial:
     live: bool = False                 # read from a live endpoint at run time (see LIVE_GRACE)
     daily: bool = True                 # False: the source keeps counts only, no per-session row
     counts_in: str | None = None       # its look counts are kept under another record (named here)
+    citable: bool = False              # its owner's record says it may be cited as evidence (a passed look)
+    label: str | None = None           # the source's own standing in words, used in place of a count label
 
     def card(self, as_of: datetime) -> dict:
         """The desk_evidence label at the brief's clock. No counts or no clock: labelled, never a finding."""
@@ -154,6 +156,10 @@ class Trial:
             return {"label": "look spent; its result is on the Records page, not repeated here", "reasons": []}
         if self.counts_in:
             return {"label": f"counts kept under {self.counts_in}", "reasons": []}
+        if self.label:
+            return {"label": self.label, "reasons": []}
+        if self.citable:
+            return {"label": "citable per its owner's record (its look is on record)", "reasons": []}
         if self.have is None or self.need is None or self.need <= 0:
             return {"label": "unproven; registered count not supplied", "reasons": ["count_not_supplied"]}
         item = DeskEvidence(item_id=self.trial_id[:512], kind=EvidenceKind.FORWARD, receipt_id=self.source[:512],
@@ -194,7 +200,7 @@ def trial_clocked(trial: Trial, as_of: datetime, live_grace: timedelta = LIVE_GR
     if trial.clock is not None and trial.clock > as_of:
         return Trial(trial.trial_id, trial.name, trial.source, trial.registration, None, trial.need, trial.unit,
                      None, f"read at {iso(trial.clock)}, after the brief's clock; not used", trial.status, None,
-                     trial.decides, trial.max_age_days, trial.live, trial.daily, trial.counts_in)
+                     trial.decides, trial.max_age_days, trial.live, trial.daily, trial.counts_in, trial.citable, trial.label)
     return trial
 
 

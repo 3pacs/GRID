@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -359,6 +360,14 @@ def read_publications(engine: Any, day: date, limit: int) -> dict[str, Any]:
             bundle["existing_diary_context"] = [dict(row) for row in rows]
         except Exception as exc:  # noqa: BLE001
             bundle["failures"].append(f"market_diary context: {type(exc).__name__}; details suppressed")
+        # Last in the transaction: a failed read here leaves the other channels intact.
+        try:
+            bundle["producer_snapshots"] = read_producer_snapshots(conn, bundle["records"], asof)
+        except Exception as exc:  # noqa: BLE001
+            bundle["producer_snapshots"] = None
+            bundle["failures"].append(
+                f"producer snapshots: {type(exc).__name__}; details suppressed; carried regimes unverified"
+            )
         conn.rollback()
     return bundle
 
@@ -480,6 +489,1127 @@ def diary_run_evidence(bundle: dict[str, Any], day: date, unit_evidence: dict[st
     return state, body
 
 
+# Packet guards: regime bound-input minimum and cadence-aware staleness limits.
+MIN_REGIME_BOUND_INPUTS = 8
+# A carried regime label is verified only against its producer snapshot as
+# read from analytical_snapshots in the capture transaction: exact id, the
+# canonical payload hash, created_at <= publication, and the eligible-feature
+# count derived from that payload. Inline counts are never a source.
+REGIME_CONTAINER_KEYS = ("latest_regime", "regime", "regime_detection")
+PRODUCER_SNAPSHOT_CATEGORY = "regime_detection"
+MAX_PRODUCER_SNAPSHOT_LOOKUPS = 500
+PRODUCER_SNAPSHOT_QUERY = (
+    "SELECT id, category, payload, created_at FROM analytical_snapshots "
+    "WHERE id = :sid AND category = :category AND created_at <= :asof"
+)
+_UNASSERTED_REGIME_LABELS = frozenset({"", "UNKNOWN", "UNCALIBRATED", "NONE", "N/A"})
+_INVALID_FEATURE_ID_STRINGS = frozenset({
+    "", "null", "none", "n/a", "na", "unknown", "missing", "unavailable", "-",
+})
+_INELIGIBLE_FEATURE_STATUSES = frozenset({
+    "ineligible", "stale", "missing", "unavailable", "rejected",
+    "invalid", "unverified", "future", "withheld", "excluded",
+})
+_SNAPSHOT_ID_KEYS = ("snapshot_id", "producer_snapshot_id", "analytical_snapshot_id")
+_SNAPSHOT_HASH_KEYS = ("snapshot_hash", "producer_snapshot_hash", "snapshot_sha256", "payload_sha256")
+_OBSERVED_TIMESTAMP_KEYS = (
+    "data_as_of", "obs_date", "date", "as_of_date", "as_of",
+    "available_at", "snapshot_available_at", "created_at",
+    "trained_at", "model_updated_at", "updated_at", "timestamp",
+    "collected_at", "checked_at",
+)
+_NUMERIC_AGE_KEYS = (
+    ("age_seconds", "seconds"),
+    ("age_hours", "hours"),
+    ("age_days", "days"),
+    ("data_staleness_days", "days"),
+)
+# Only actual bound-input fields; n_features / feature_count / n_features_used
+# reflect registry or matrix sizes rather than bound inputs and are ignored.
+_BOUND_INPUT_KEYS = (
+    "features_used",
+    "eligible_feature_ids",
+    "bound_inputs",
+)
+# Cadence-aware max-age defaults (days), matching auto_regime.py (5d) and
+# intelligence/regime/state_vector.py (monthly 70d, general features 30d).
+DEFAULT_MAX_AGE_DAYS: dict[str, int] = {
+    "equities": 5,
+    "equity_volume": 5,
+    "rates": 5,
+    "credit": 5,
+    "volatility": 5,
+    "commodities": 5,
+    "fx": 5,
+    "equity_etf_proxies": 5,
+    "options": 5,
+    "latest_regime": 5,
+    "regime": 5,
+    "regime_detection": 5,
+    "market_moves": 5,
+    "features": 30,
+    "macro": 70,
+    "models": 30,
+    "model_states": 30,
+}
+DAILY_MACRO_SERIES = frozenset({"T5YIE", "T10YIE"})
+MONTHLY_MACRO_SERIES = frozenset({
+    "CPIAUCSL", "PCEPILFE", "UNRATE", "RSAFS", "UMCSENT",
+    "INDPRO", "TCU", "M2SL", "PAYEMS",
+})
+
+
+def _normalize_typed_feature_id(val: Any) -> tuple[tuple[str, Any], str | int] | None:
+    """Normalize a typed feature identifier (non-bool int >= 0 or non-blank str)."""
+    if val is None or isinstance(val, bool):
+        return None
+    if type(val) is int:
+        if val < 0:
+            return None
+        return ("int", val), val
+    if type(val) is str:
+        cleaned = val.strip()
+        if cleaned.lower() in _INVALID_FEATURE_ID_STRINGS:
+            return None
+        return ("str", cleaned.casefold()), cleaned
+    return None
+
+
+def _extract_distinct_eligible_feature_ids(
+    raw_features: Any,
+    *,
+    eligible_ids: set[tuple[str, Any]] | None = None,
+    excluded_ids: set[tuple[str, Any]] | None = None,
+    as_of: datetime | None = None,
+) -> list[str | int] | None:
+    """Return sorted distinct, non-null, typed, eligible feature IDs from *raw_features*."""
+    if not isinstance(raw_features, (dict, list, tuple, set)):
+        return None
+
+    def _entry_eligible(entry: dict[str, Any]) -> bool:
+        if "eligible" in entry and entry["eligible"] is not True:
+            return False
+        if "model_eligible" in entry and entry["model_eligible"] is not True:
+            return False
+        if entry.get("stale") is True:
+            return False
+        if "status" in entry:
+            st = entry["status"]
+            if type(st) is not str or st.strip().lower() in _INELIGIBLE_FEATURE_STATUSES:
+                return False
+        if as_of is not None and _check_entry_clock_sanity(entry, "feature", "input", as_of):
+            return False
+        return True
+
+    def _dict_entry_id(entry: dict[str, Any], fallback_key: Any = None) -> tuple[tuple[str, Any], str | int] | None:
+        for id_key in ("feature_id", "id", "feature", "series_id", "name"):
+            if id_key in entry:
+                return _normalize_typed_feature_id(entry[id_key])
+        if fallback_key is not None:
+            return _normalize_typed_feature_id(fallback_key)
+        return None
+
+    seen: dict[tuple[str, Any], str | int] = {}
+
+    def _consider(pair: tuple[tuple[str, Any], str | int] | None, alias_key: tuple[str, Any] | None = None) -> None:
+        if pair is None:
+            return
+        norm_key, display_val = pair
+        if excluded_ids and (norm_key in excluded_ids or (alias_key is not None and alias_key in excluded_ids)):
+            return
+        if eligible_ids is not None and norm_key not in eligible_ids and (alias_key is None or alias_key not in eligible_ids):
+            return
+        seen.setdefault(norm_key, display_val)
+
+    if isinstance(raw_features, dict):
+        for k, v in raw_features.items():
+            key_pair = _normalize_typed_feature_id(k)
+            if key_pair is None:
+                continue
+            if isinstance(v, dict):
+                if not _entry_eligible(v):
+                    continue
+                _consider(_dict_entry_id(v, fallback_key=k), alias_key=key_pair[0])
+            else:
+                _consider(_normalize_typed_feature_id(v), alias_key=key_pair[0])
+    else:
+        for item in raw_features:
+            if isinstance(item, dict):
+                if not _entry_eligible(item):
+                    continue
+                _consider(_dict_entry_id(item))
+            else:
+                _consider(_normalize_typed_feature_id(item))
+
+    return [val for _, val in sorted(seen.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))]
+
+
+def _snapshot_hash_matches(payload: dict[str, Any], expected_hash: Any) -> bool:
+    """Verify *expected_hash* against *payload* canonical sha256 or declared hash."""
+    if type(expected_hash) is not str or not expected_hash.strip():
+        return False
+    exp = expected_hash.strip().lower()
+    if exp.startswith("sha256:"):
+        exp = exp[7:]
+    if not exp:
+        return False
+
+    declared: list[str] = []
+    for hkey in _SNAPSHOT_HASH_KEYS:
+        val = payload.get(hkey)
+        if type(val) is str and val.strip():
+            norm = val.strip().lower()
+            if norm.startswith("sha256:"):
+                norm = norm[7:]
+            if norm != exp:
+                return False
+            declared.append(norm)
+
+    is_sha256_hex = len(exp) == 64 and all(c in "0123456789abcdef" for c in exp)
+    if is_sha256_hex:
+        if sha256(canonical(payload)) == exp:
+            return True
+        stripped = {k: v for k, v in payload.items() if k not in _SNAPSHOT_HASH_KEYS}
+        if len(stripped) != len(payload) and sha256(canonical(stripped)) == exp:
+            return True
+        if declared and all(h == exp for h in declared) and set(payload.keys()) <= {
+            "snapshot_id", "snapshot_hash", "available_at", "regime", "state",
+            "producer_snapshot_id", "producer_snapshot_hash", "snapshot_sha256",
+        }:
+            return True
+        return False
+    return bool(declared) and all(h == exp for h in declared)
+
+
+def _extract_snapshot_id(mapping: dict[str, Any], *, allow_bare_id: bool = False) -> int | str | None:
+    keys = ("id", *_SNAPSHOT_ID_KEYS) if allow_bare_id else _SNAPSHOT_ID_KEYS
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            val = mapping[key]
+            if type(val) is int and val >= 0:
+                return val
+            if type(val) is str and val.strip():
+                return val.strip()
+    return None
+
+
+def _extract_snapshot_hash(mapping: dict[str, Any]) -> str | None:
+    for key in _SNAPSHOT_HASH_KEYS:
+        val = mapping.get(key)
+        if type(val) is str and val.strip():
+            return val.strip()
+    return None
+
+
+def _extract_bound_input_count(mapping: dict[str, Any], *, as_of: datetime | None = None) -> int | None:
+    """Return an integer distinct eligible bound-input count from *mapping*, else None.
+
+    Reads ``features_used`` (distinct non-null typed eligible feature IDs) before
+    ``eligible_feature_ids`` and ``bound_inputs`` (collection distinct count or
+    non-negative int). Registry-size fields (``n_features``, ``feature_count``,
+    ``n_features_used``) are never treated as bound-input counts.
+    """
+    excl_raw = mapping.get("ineligible_features") or mapping.get("excluded_features")
+    excluded_set: set[tuple[str, Any]] | None = None
+    if isinstance(excl_raw, (list, tuple, set, dict)):
+        excl_items = excl_raw.keys() if isinstance(excl_raw, dict) else excl_raw
+        excluded_set = {
+            pair[0]
+            for item in excl_items
+            if (pair := _normalize_typed_feature_id(item)) is not None
+        }
+    elig_raw = mapping.get("eligible_features")
+    eligible_set: set[tuple[str, Any]] | None = None
+    if isinstance(elig_raw, (list, tuple, set)):
+        eligible_set = {
+            pair[0]
+            for item in elig_raw
+            if (pair := _normalize_typed_feature_id(item)) is not None
+        }
+
+    for key in _BOUND_INPUT_KEYS:
+        if key not in mapping:
+            continue
+        raw = mapping[key]
+        if key in ("features_used", "eligible_feature_ids"):
+            distinct = _extract_distinct_eligible_feature_ids(
+                raw,
+                eligible_ids=eligible_set if key == "features_used" else None,
+                excluded_ids=excluded_set,
+                as_of=as_of,
+            )
+            if distinct is not None:
+                return len(distinct)
+            continue
+        if isinstance(raw, (list, tuple, dict, set)):
+            distinct = _extract_distinct_eligible_feature_ids(
+                raw, eligible_ids=eligible_set, excluded_ids=excluded_set, as_of=as_of,
+            )
+            if distinct is not None:
+                return len(distinct)
+            continue
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            return raw
+    return None
+
+
+def _extract_regime_label(mapping: dict[str, Any]) -> str | None:
+    """Return an asserted regime label string from *mapping*, or None."""
+    for key in ("state", "regime", "inferred_state", "regime_label"):
+        val = mapping.get(key)
+        if isinstance(val, str) and val.strip().upper() not in _UNASSERTED_REGIME_LABELS:
+            return val.strip()
+    return None
+
+
+def _resolve_row_as_of(row: dict[str, Any], as_of: datetime | None) -> datetime | None:
+    if as_of is not None:
+        return clock(as_of)
+    for key in ("created_at", "generated_at", "timestamp"):
+        val = row.get(key)
+        if val is not None:
+            _, dt, _, _ = _parse_observed_clock(val)
+            if dt is not None:
+                return dt
+    return None
+
+
+def _verify_producer_snapshot_binding(
+    regime_mapping: dict[str, Any],
+    regime_label: str,
+    producer_snap: Any,
+    as_of: datetime | None,
+) -> tuple[bool, str | None, int | None]:
+    """Verify that *producer_snap* matches *regime_mapping* by id/hash, label, and clock."""
+    if not isinstance(producer_snap, dict):
+        return False, "invalid_producer_snapshot", None
+
+    if as_of is not None:
+        clock_errs = _check_entry_clock_sanity(producer_snap, "producer_snapshot", "model", as_of)
+        if clock_errs:
+            return False, f"producer_snapshot_{clock_errs[0]['reason']}", None
+
+    snap_label = _extract_regime_label(producer_snap)
+    if snap_label is None:
+        return False, "producer_snapshot_missing_regime_label", None
+    if snap_label.upper() != regime_label.upper():
+        return False, "producer_snapshot_regime_mismatch", None
+
+    expected_id = _extract_snapshot_id(regime_mapping)
+    actual_id = _extract_snapshot_id(producer_snap, allow_bare_id=True)
+    if expected_id is not None:
+        if actual_id is None or actual_id != expected_id:
+            return False, "producer_snapshot_id_mismatch", None
+
+    expected_hash = _extract_snapshot_hash(regime_mapping)
+    if expected_hash is not None:
+        if not _snapshot_hash_matches(producer_snap, expected_hash):
+            return False, "producer_snapshot_hash_mismatch", None
+
+    snap_count = _extract_bound_input_count(producer_snap, as_of=as_of)
+    return True, None, snap_count
+
+
+def _normalize_sha256_hex(value: Any) -> str | None:
+    """A 64-hex sha256 digest (``sha256:`` prefix allowed), lower-cased, else None."""
+    if type(value) is not str:
+        return None
+    digest = value.strip().lower()
+    if digest.startswith("sha256:"):
+        digest = digest[7:]
+    if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+        return digest
+    return None
+
+
+def _snapshot_ref_key(snapshot_id: Any) -> str | None:
+    """Lookup key for a cited analytical_snapshots id (non-negative integer)."""
+    if type(snapshot_id) is int and snapshot_id >= 0:
+        return str(snapshot_id)
+    if type(snapshot_id) is str:
+        raw = snapshot_id.strip()
+        # isascii(): str.isdigit() also accepts digits like "²" that int() rejects.
+        if raw.isascii() and raw.isdigit():
+            return str(int(raw))
+    return None
+
+
+def regime_snapshot_refs(record: dict[str, Any]) -> list[int]:
+    """Producer snapshot ids a captured row cites for any carried regime."""
+    refs: set[int] = set()
+    roots: list[Any] = [record]
+    if isinstance(record.get("snapshot_data"), dict):
+        roots.append(record["snapshot_data"])
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        for mapping in (root, *(root.get(k) for k in REGIME_CONTAINER_KEYS)):
+            if isinstance(mapping, dict):
+                key = _snapshot_ref_key(_extract_snapshot_id(mapping))
+                if key is not None:
+                    refs.add(int(key))
+    return sorted(refs)
+
+
+def _typed_id_keys(raw: Any) -> set[tuple[str, Any]] | None:
+    """Normalized keys of a list/tuple/set (or a dict's keys) of feature ids."""
+    if isinstance(raw, dict):
+        raw = raw.keys()
+    elif not isinstance(raw, (list, tuple, set)):
+        return None
+    return {pair[0] for item in raw if (pair := _normalize_typed_feature_id(item)) is not None}
+
+
+def producer_eligible_feature_ids(payload: dict[str, Any], *, as_of: datetime | None = None) -> list[str | int] | None:
+    """Distinct eligible feature ids a producer payload actually lists, or None.
+
+    Only ``features_used`` entries count, filtered through
+    ``store.snapshots.producer_feature_filters``: the rule the briefing
+    applies to the same payload (``MarketBriefingEngine._gather_market_snapshot``).
+    A present empty eligibility list means nothing is eligible. A scalar such
+    as ``bound_inputs``, ``n_features`` or ``feature_count`` is never a count,
+    so a payload without feature entries proves nothing. Raises
+    ``InvalidFeatureFilter`` for a malformed or self-contradictory filter.
+    """
+    from store.snapshots import producer_feature_filters
+
+    raw = payload.get("features_used")
+    if not isinstance(raw, (dict, list, tuple)):
+        return None
+    eligible, excluded = producer_feature_filters(payload)
+    return _extract_distinct_eligible_feature_ids(
+        raw,
+        eligible_ids=None if eligible is None else _typed_id_keys(eligible),
+        excluded_ids=_typed_id_keys(excluded) or None,
+        as_of=as_of,
+    )
+
+
+def describe_producer_snapshot(row: Any) -> dict[str, Any]:
+    """What the packet needs from one analytical_snapshots row, derived from it.
+
+    Hashes the payload exactly as read back (``store.snapshots`` canonical
+    form, the hash the producer stored), and lists the eligible feature ids the
+    payload itself names (``producer_eligible_feature_ids``); the count is their
+    number. The payload is not carried.
+    """
+    from store.snapshots import InvalidFeatureFilter, canonical_payload_sha256
+
+    if row is None:
+        return {"found": False}
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = None
+    entry: dict[str, Any] = {"found": True, "category": row["category"], "payload_valid": False}
+    _, created, _, _ = _parse_observed_clock(row["created_at"])
+    entry["created_at"] = iso(created) if created is not None else None
+    if not isinstance(payload, dict):
+        return entry
+    try:
+        digest = canonical_payload_sha256(payload)
+    except ValueError:
+        return entry
+    entry.update({
+        "payload_valid": True,
+        "payload_sha256": digest,
+        "regime": _extract_regime_label(payload),
+    })
+    try:
+        ids = producer_eligible_feature_ids(payload, as_of=created)
+    except InvalidFeatureFilter:
+        ids = None
+        entry["feature_filter_invalid"] = True
+    entry["eligible_feature_ids"] = ids
+    entry["bound_inputs"] = len(ids) if ids is not None else None
+    return entry
+
+
+def read_producer_snapshots(conn: Any, records: list[dict[str, Any]], asof: datetime) -> dict[str, dict[str, Any]]:
+    """Read every producer snapshot the captured briefings cite, by exact id."""
+    from sqlalchemy import text
+
+    ids: set[int] = set()
+    for item in records:
+        if item.get("channel") == "market_briefings" and isinstance(item.get("record"), dict):
+            ids.update(regime_snapshot_refs(item["record"]))
+    out: dict[str, dict[str, Any]] = {}
+    for sid in sorted(ids)[:MAX_PRODUCER_SNAPSHOT_LOOKUPS]:
+        row = conn.execute(
+            text(PRODUCER_SNAPSHOT_QUERY),
+            {"sid": sid, "category": PRODUCER_SNAPSHOT_CATEGORY, "asof": asof},
+        ).mappings().first()
+        out[str(sid)] = describe_producer_snapshot(row)
+    return out
+
+
+def _verified_producer_count(
+    mapping: dict[str, Any],
+    label: str,
+    producer_snapshots: dict[str, dict[str, Any]] | None,
+    as_of: datetime | None,
+) -> tuple[tuple[str, str] | None, int | None]:
+    """``(None, count)`` when *mapping*'s regime is bound to a captured producer
+    snapshot; otherwise ``(("mismatch" | "unverified", reason), None)``.
+
+    "mismatch" means the evidence contradicts the claim; "unverified" means the
+    evidence needed to check it is absent.
+    """
+    key = _snapshot_ref_key(_extract_snapshot_id(mapping))
+    digest = _normalize_sha256_hex(_extract_snapshot_hash(mapping))
+    if key is None or digest is None:
+        return ("unverified", "missing_producer_snapshot_binding"), None
+    if producer_snapshots is None or key not in producer_snapshots:
+        return ("unverified", "producer_snapshot_not_captured"), None
+    entry = producer_snapshots[key]
+    if entry.get("found") is not True:
+        return ("mismatch", "producer_snapshot_not_found"), None
+    if entry.get("category") != PRODUCER_SNAPSHOT_CATEGORY or entry.get("payload_valid") is not True:
+        return ("mismatch", "producer_snapshot_malformed_payload"), None
+    if entry.get("payload_sha256") != digest:
+        return ("mismatch", "producer_snapshot_hash_mismatch"), None
+    producer_label = entry.get("regime")
+    if type(producer_label) is not str or producer_label.upper() != label.upper():
+        return ("mismatch", "producer_snapshot_regime_mismatch"), None
+    _, available, _, _ = _parse_observed_clock(entry.get("created_at"))
+    if available is None:
+        return ("mismatch", "producer_snapshot_missing_availability_clock"), None
+    if as_of is None:
+        return ("unverified", "missing_publication_clock"), None
+    if available > as_of:
+        return ("mismatch", "producer_snapshot_future_clock"), None
+    if entry.get("feature_filter_invalid") is True:
+        return ("mismatch", "producer_snapshot_invalid_feature_filter"), None
+    producer_ids = entry.get("eligible_feature_ids")
+    if not isinstance(producer_ids, list):
+        return ("unverified", "producer_snapshot_missing_bound_inputs"), None
+    problem = _inline_claims_disagree(mapping, producer_ids)
+    if problem is not None:
+        return ("mismatch", problem), None
+    return None, len(producer_ids)
+
+
+def _inline_claims_disagree(mapping: dict[str, Any], producer_ids: list[Any]) -> str | None:
+    """Check every inline feature claim on its own against the producer's ids.
+
+    ``features_used``, ``eligible_feature_ids`` and ``bound_inputs`` are each
+    validated independently (not through ``_extract_bound_input_count``'s
+    first-key-wins order), so ids that match cannot mask a wrong scalar count.
+    Returns a mismatch reason, or None when every present claim agrees.
+    """
+    producer_keys = _typed_id_keys(producer_ids)
+    for key in ("features_used", "eligible_feature_ids", "bound_inputs"):
+        if key not in mapping or mapping[key] is None:
+            continue
+        value = mapping[key]
+        if key == "bound_inputs" and type(value) is int:
+            if value != len(producer_ids):
+                return f"inline_bound_inputs_disagree_with_producer:{value}!={len(producer_ids)}"
+            continue
+        if not isinstance(value, (dict, list, tuple)):
+            return f"invalid_inline_{key}"
+        inline_ids = _extract_distinct_eligible_feature_ids(value)
+        if inline_ids is None or _typed_id_keys(inline_ids) != producer_keys:
+            return "inline_feature_ids_disagree_with_producer"
+    return None
+
+
+def inspect_regime_binding(
+    row: dict[str, Any],
+    as_of: datetime | None = None,
+    producer_snapshots: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Read-only inspection of regime label binding, snapshot match, clock sanity,
+    and distinct eligible bound-input count.
+
+    A carried regime label is "ok" only when it names its producer snapshot by
+    id and canonical payload hash and *producer_snapshots* (read by exact id in
+    the capture transaction) shows that snapshot existed by *as_of* with the
+    same regime and at least MIN_REGIME_BOUND_INPUTS eligible features. Without
+    that evidence the label is "unverified"; inline feature lists or counts can
+    lower the verdict to "insufficient" but never raise it to "ok".
+    """
+    if not isinstance(row, dict):
+        return {"status": "ok", "label": None, "count": None, "reason": None}
+
+    resolved_as_of = _resolve_row_as_of(row, as_of)
+    roots: list[dict[str, Any]] = [row]
+    snap = row.get("snapshot_data")
+    if isinstance(snap, dict):
+        roots.append(snap)
+
+    # Explicit regime sub-containers carry regime declarations and must have a valid label.
+    explicit_containers: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for root in roots:
+        for key in ("latest_regime", "regime", "regime_detection"):
+            sub = root.get(key)
+            if isinstance(sub, dict) and sub:
+                explicit_containers.append((key, sub, root))
+
+    # Cross-check sibling regime containers within the same root (e.g. latest_regime vs regime_detection)
+    for root in roots:
+        siblings = [
+            (k, root[k])
+            for k in ("latest_regime", "regime", "regime_detection")
+            if isinstance(root.get(k), dict) and root[k]
+        ]
+        if len(siblings) >= 2:
+            labels = {_extract_regime_label(m).upper() for _, m in siblings if _extract_regime_label(m)}
+            if len(labels) > 1:
+                return {
+                    "status": "mismatch",
+                    "label": _extract_regime_label(siblings[0][1]),
+                    "count": None,
+                    "reason": "conflicting_regime_snapshots",
+                }
+            sids = {_extract_snapshot_id(m) for _, m in siblings if _extract_snapshot_id(m) is not None}
+            if len(sids) > 1:
+                return {
+                    "status": "mismatch",
+                    "label": _extract_regime_label(siblings[0][1]),
+                    "count": None,
+                    "reason": "conflicting_regime_snapshot_ids",
+                }
+
+    unverified: tuple[str, str] | None = None
+
+    def _inspect_one(
+        mapping: dict[str, Any],
+        parent: dict[str, Any] | None,
+        *,
+        explicit_regime_container: bool,
+    ) -> dict[str, Any] | None:
+        nonlocal unverified
+        label = _extract_regime_label(mapping)
+        if label is None:
+            if explicit_regime_container:
+                return {
+                    "status": "mismatch",
+                    "label": None,
+                    "count": None,
+                    "reason": "missing_regime_label",
+                }
+            return None
+
+        if resolved_as_of is not None:
+            clock_errs = _check_entry_clock_sanity(mapping, "regime", "model", resolved_as_of)
+            if clock_errs:
+                return {
+                    "status": "mismatch",
+                    "label": label,
+                    "count": None,
+                    "reason": f"regime_{clock_errs[0]['reason']}",
+                }
+
+        raw_bi = mapping.get("bound_inputs")
+        if "bound_inputs" in mapping and raw_bi is not None and (
+            isinstance(raw_bi, bool)
+            or (isinstance(raw_bi, int) and raw_bi < 0)
+        ):
+            return {
+                "status": "mismatch",
+                "label": label,
+                "count": None,
+                "reason": "invalid_bound_inputs",
+            }
+
+        # Embedded producer metadata (written by the briefing) must agree with
+        # this container, but it is never the source of the count.
+        for snap_key in ("producer_snapshot", "analytical_snapshot"):
+            if snap_key in mapping and mapping[snap_key] is not None:
+                ok, reason, _ = _verify_producer_snapshot_binding(
+                    mapping, label, mapping[snap_key], resolved_as_of,
+                )
+                if not ok:
+                    return {"status": "mismatch", "label": label, "count": None, "reason": reason}
+
+        inline_count = _extract_bound_input_count(mapping, as_of=resolved_as_of)
+        problem, count = _verified_producer_count(mapping, label, producer_snapshots, resolved_as_of)
+        if problem is not None:
+            kind, reason = problem
+            if kind == "mismatch":
+                return {"status": "mismatch", "label": label, "count": None, "reason": reason}
+            if inline_count is not None and inline_count < MIN_REGIME_BOUND_INPUTS:
+                # The row's own claim already admits too few inputs.
+                return {
+                    "status": "insufficient",
+                    "label": label,
+                    "count": inline_count,
+                    "reason": f"regime_bound_inputs_below_minimum:{inline_count}<{MIN_REGIME_BOUND_INPUTS}",
+                }
+            if unverified is None:
+                unverified = (label, reason)
+            return None
+
+        if inline_count is not None and inline_count != count:
+            return {
+                "status": "mismatch",
+                "label": label,
+                "count": None,
+                "reason": f"inline_bound_inputs_disagree_with_producer:{inline_count}!={count}",
+            }
+        if count < MIN_REGIME_BOUND_INPUTS:
+            return {
+                "status": "insufficient",
+                "label": label,
+                "count": count,
+                "reason": f"regime_bound_inputs_below_minimum:{count}<{MIN_REGIME_BOUND_INPUTS}",
+            }
+        return None
+
+    for _, mapping, parent in explicit_containers:
+        verdict = _inspect_one(mapping, parent, explicit_regime_container=True)
+        if verdict is not None:
+            return verdict
+
+    for root in roots:
+        verdict = _inspect_one(root, None, explicit_regime_container=False)
+        if verdict is not None:
+            return verdict
+
+    if unverified is not None:
+        return {"status": "unverified", "label": unverified[0], "count": None, "reason": unverified[1]}
+    return {"status": "ok", "label": None, "count": None, "reason": None}
+
+
+def inspect_regime_bound_inputs(
+    row: dict[str, Any],
+    as_of: datetime | None = None,
+    producer_snapshots: dict[str, dict[str, Any]] | None = None,
+) -> tuple[str, str | None, int | None]:
+    """Read-only inspection of any carried regime label's bound-input count.
+
+    Returns:
+        (``"insufficient"``, label, count) when a carried regime label has a
+            distinct eligible bound-input count < MIN_REGIME_BOUND_INPUTS;
+        (``"mismatch"``, label, None) when a carried regime container has a
+            missing label, unrelated/mismatched producer snapshot, or invalid clock;
+        (``"unverified"``, label, None) when a carried regime label is not bound
+            to a captured producer snapshot (no id/hash, or the snapshot was not
+            read), so its count cannot be checked;
+        (``"ok"``, None, None) when no regime label is asserted or every
+            asserted regime label is producer-verified with at least
+            MIN_REGIME_BOUND_INPUTS eligible features.
+    """
+    info = inspect_regime_binding(row, as_of=as_of, producer_snapshots=producer_snapshots)
+    return info["status"], info["label"], info["count"]
+
+
+def check_regime_bound_inputs(
+    row: dict[str, Any],
+    as_of: datetime | None = None,
+    producer_snapshots: dict[str, dict[str, Any]] | None = None,
+) -> tuple[str, int] | None:
+    """Read-only check: return (label, bound_count) if a carried regime label was
+    computed from fewer than MIN_REGIME_BOUND_INPUTS bound inputs and that count
+    is available in *row*; otherwise None."""
+    status, label, count = inspect_regime_bound_inputs(row, as_of=as_of, producer_snapshots=producer_snapshots)
+    if status == "insufficient" and label is not None and count is not None:
+        return label, count
+    return None
+
+
+def _parse_observed_clock(value: Any) -> tuple[date | None, datetime | None, str | None, bool]:
+    """Parse an ISO date or timestamp without mutating input.
+
+    Returns ``(date, utc_dt, raw_str, is_date_only)``.
+    """
+    if isinstance(value, datetime):
+        dt = clock(value)
+        return dt.date(), dt, iso(dt), False
+    if isinstance(value, date):
+        return value, datetime.combine(value, time(), timezone.utc), value.isoformat(), True
+    if not isinstance(value, str) or not value.strip():
+        return None, None, None, False
+    raw = value.strip()
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        try:
+            d = date.fromisoformat(raw)
+            return d, datetime.combine(d, time(), timezone.utc), d.isoformat(), True
+        except ValueError:
+            return None, None, None, False
+    try:
+        dt = clock(raw)
+        return dt.date(), dt, iso(dt), False
+    except ValueError:
+        return None, None, None, False
+
+
+def _resolve_item_max_age(item: dict[str, Any], category: str, name: str | None) -> tuple[float, str] | None:
+    """Resolve (limit, unit) from explicit per-item max-age fields or category defaults."""
+    for key, unit in (("max_age_seconds", "seconds"), ("max_age_hours", "hours"), ("max_age_days", "days")):
+        val = item.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
+            return float(val), unit
+    nested = item.get("max_age")
+    if isinstance(nested, dict):
+        unit = nested.get("unit")
+        limit = nested.get("limit")
+        if unit in ("days", "hours", "seconds") and isinstance(limit, (int, float)) and not isinstance(limit, bool) and math.isfinite(limit) and limit >= 0:
+            return float(limit), unit
+        for unit in ("seconds", "hours", "days"):
+            val = nested.get(unit)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
+                return float(val), unit
+    if category == "macro" and isinstance(name, str):
+        upper = name.upper()
+        if upper in DAILY_MACRO_SERIES:
+            return 5.0, "days"
+        if upper in MONTHLY_MACRO_SERIES:
+            return 70.0, "days"
+    default_days = DEFAULT_MAX_AGE_DAYS.get(category)
+    if default_days is not None:
+        return float(default_days), "days"
+    return None
+
+
+def _check_entry_clock_sanity(
+    item: dict[str, Any],
+    path: str,
+    kind: str,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    """Reject future timestamps (later than *as_of*) or negative/non-finite ages.
+
+    Never trusts a claimed ``age_days`` or ``freshness.status == 'fresh'`` over
+    an actual timestamp.
+    """
+    violations: list[dict[str, Any]] = []
+    as_of_utc = clock(as_of)
+    as_of_iso = iso(as_of_utc)
+    as_of_date = as_of_utc.date()
+
+    # 1. Check freshness block age
+    fresh = item.get("freshness")
+    if isinstance(fresh, dict) and "age" in fresh and fresh["age"] is not None:
+        f_age = fresh["age"]
+        if (
+            isinstance(f_age, bool)
+            or not isinstance(f_age, (int, float))
+            or not math.isfinite(f_age)
+            or f_age < 0
+        ):
+            violations.append({
+                "path": path, "kind": kind, "status": "rejected", "reason": "negative_age",
+                "field": "freshness.age", "observed_at": str(item.get("obs_date") or item.get("date") or "unknown"),
+                "as_of": as_of_iso, "age": f_age, "unit": fresh.get("unit") or "days",
+            })
+
+    # 2. Check explicit numeric age fields
+    for age_key, age_unit in _NUMERIC_AGE_KEYS:
+        if age_key in item and item[age_key] is not None:
+            raw_age = item[age_key]
+            if (
+                isinstance(raw_age, bool)
+                or not isinstance(raw_age, (int, float))
+                or not math.isfinite(raw_age)
+                or raw_age < 0
+            ):
+                violations.append({
+                    "path": path, "kind": kind, "status": "rejected", "reason": "negative_age",
+                    "field": age_key, "observed_at": str(item.get("obs_date") or item.get("date") or "unknown"),
+                    "as_of": as_of_iso, "age": raw_age, "unit": age_unit,
+                })
+
+    # 3. Check stale_features map for negative ages
+    stale_feat_map = item.get("stale_features")
+    if isinstance(stale_feat_map, dict):
+        for fname, age_d in sorted(stale_feat_map.items()):
+            if age_d is not None and (
+                isinstance(age_d, bool)
+                or not isinstance(age_d, (int, float))
+                or not math.isfinite(age_d)
+                or age_d < 0
+            ):
+                violations.append({
+                    "path": f"{path}.stale_features.{fname}", "kind": "input",
+                    "status": "rejected", "reason": "negative_age",
+                    "field": f"stale_features.{fname}", "observed_at": "unknown",
+                    "as_of": as_of_iso, "age": age_d, "unit": "days",
+                })
+
+    # 4. Check ALL observed/availability timestamps against the decision clock
+    for ts_key in _OBSERVED_TIMESTAMP_KEYS:
+        if ts_key not in item or item[ts_key] is None:
+            continue
+        raw_ts = item[ts_key]
+        if isinstance(raw_ts, str) and raw_ts.strip().lower() in _INVALID_FEATURE_ID_STRINGS:
+            continue
+        obs_date, obs_dt, obs_str, is_date_only = _parse_observed_clock(raw_ts)
+        if obs_date is None or obs_dt is None:
+            continue
+        if is_date_only:
+            if obs_date > as_of_date:
+                violations.append({
+                    "path": path, "kind": kind, "status": "rejected", "reason": "future_timestamp",
+                    "field": ts_key, "observed_at": obs_str, "as_of": as_of_iso,
+                    "age": (as_of_date - obs_date).days, "unit": "days",
+                })
+        elif obs_dt > as_of_utc:
+            violations.append({
+                "path": path, "kind": kind, "status": "rejected", "reason": "future_timestamp",
+                "field": ts_key, "observed_at": obs_str, "as_of": as_of_iso,
+                "age": round((as_of_utc - obs_dt).total_seconds(), 3), "unit": "seconds",
+            })
+
+    return violations
+
+
+def find_invalid_clock_items(row: dict[str, Any], as_of: datetime) -> list[dict[str, Any]]:
+    """Read-only scan for any carried input, model, or regime with a future timestamp or negative age."""
+    if not isinstance(row, dict):
+        return []
+    violations: list[dict[str, Any]] = []
+    input_categories = (
+        "equities", "equity_volume", "rates", "credit", "volatility",
+        "commodities", "fx", "equity_etf_proxies", "macro", "features",
+        "options", "inputs",
+    )
+    model_categories = ("models", "model_states")
+    regime_categories = ("latest_regime", "regime", "regime_detection")
+
+    def _scan_container(container: dict[str, Any], prefix: str) -> None:
+        for cat in input_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        violations.extend(_check_entry_clock_sanity(
+                            entry, f"{prefix}{cat}.{name}", "input", as_of,
+                        ))
+        for cat in model_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        violations.extend(_check_entry_clock_sanity(
+                            entry, f"{prefix}{cat}.{name}", "model", as_of,
+                        ))
+        for cat in regime_categories:
+            entry = container.get(cat)
+            if isinstance(entry, dict):
+                violations.extend(_check_entry_clock_sanity(
+                    entry, f"{prefix}{cat}", "model", as_of,
+                ))
+                for snap_key in ("producer_snapshot", "analytical_snapshot"):
+                    psnap = entry.get(snap_key)
+                    if isinstance(psnap, dict):
+                        violations.extend(_check_entry_clock_sanity(
+                            psnap, f"{prefix}{cat}.{snap_key}", "model", as_of,
+                        ))
+
+    snap = row.get("snapshot_data")
+    if isinstance(snap, dict):
+        _scan_container(snap, "snapshot_data.")
+    _scan_container(row, "")
+
+    moves = row.get("market_moves")
+    if isinstance(moves, dict):
+        indices = moves.get("indices")
+        if isinstance(indices, dict):
+            for name, entry in indices.items():
+                if isinstance(entry, dict):
+                    violations.extend(_check_entry_clock_sanity(
+                        entry, f"market_moves.indices.{name}", "input", as_of,
+                    ))
+        for list_key in ("notable", "sector_leaders", "sector_laggards"):
+            items = moves.get(list_key)
+            if isinstance(items, list):
+                for idx, entry in enumerate(items):
+                    if isinstance(entry, dict):
+                        label = str(entry.get("asset") or entry.get("etf") or entry.get("sector") or idx)
+                        violations.extend(_check_entry_clock_sanity(
+                            entry, f"market_moves.{list_key}.{label}", "input", as_of,
+                        ))
+    return violations
+
+
+def _check_entry_staleness(
+    item: dict[str, Any],
+    path: str,
+    category: str,
+    kind: str,
+    as_of: datetime,
+    name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read-only staleness check for one carried input or model dict.
+
+    Always verifies observed timestamps against *as_of* rather than trusting a
+    claimed ``age_days`` or ``freshness.status == 'fresh'`` to hide stale data.
+    """
+    findings: list[dict[str, Any]] = []
+    as_of_utc = clock(as_of)
+    as_of_iso = iso(as_of_utc)
+    as_of_date = as_of_utc.date()
+
+    # 1. Explicit freshness block (e.g. market_state.py shape) — can mark stale,
+    #    never short-circuits past timestamp verification when claiming fresh.
+    fresh = item.get("freshness")
+    if isinstance(fresh, dict):
+        f_status = fresh.get("status")
+        f_age = fresh.get("age")
+        f_limit = fresh.get("limit")
+        f_unit = fresh.get("unit") or "days"
+        over_limit = (
+            isinstance(f_age, (int, float)) and not isinstance(f_age, bool) and math.isfinite(f_age)
+            and isinstance(f_limit, (int, float)) and not isinstance(f_limit, bool) and math.isfinite(f_limit)
+            and f_age > f_limit
+        )
+        if f_status == "stale" or over_limit:
+            findings.append({
+                "path": path, "kind": kind, "status": "stale",
+                "observed_at": str(item.get("obs_date") or item.get("date") or "unknown"),
+                "as_of": as_of_iso, "age": f_age, "max_age": f_limit, "unit": f_unit,
+            })
+            return findings
+
+    # 2. Explicit stale_features / stale_dimensions lists (auto_regime / state_vector)
+    stale_feat_map = item.get("stale_features")
+    if isinstance(stale_feat_map, dict):
+        limit_days = item.get("max_age_days", DEFAULT_MAX_AGE_DAYS.get(category, 5))
+        for fname, age_d in sorted(stale_feat_map.items()):
+            findings.append({
+                "path": f"{path}.stale_features.{fname}", "kind": "input", "status": "stale",
+                "observed_at": "unknown", "as_of": as_of_iso, "age": age_d,
+                "max_age": limit_days, "unit": "days",
+            })
+    for dims_key in ("stale_dimensions", "stale_dims"):
+        dims = item.get(dims_key)
+        if isinstance(dims, list):
+            for dname in dims:
+                findings.append({
+                    "path": f"{path}.{dims_key}.{dname}", "kind": "input", "status": "stale",
+                    "observed_at": "unknown", "as_of": as_of_iso, "age": None,
+                    "max_age": None, "unit": "days",
+                })
+
+    max_spec = _resolve_item_max_age(item, category, name)
+    if max_spec is None:
+        return findings
+    limit, unit = max_spec
+
+    # 3. Direct non-negative numeric age fields (never trusted over an older timestamp)
+    explicit_age: float | None = None
+    for age_key, age_unit in _NUMERIC_AGE_KEYS:
+        raw_age = item.get(age_key)
+        if isinstance(raw_age, (int, float)) and not isinstance(raw_age, bool) and math.isfinite(raw_age) and raw_age >= 0:
+            if age_unit == unit:
+                explicit_age = float(raw_age)
+                break
+            if age_unit == "days" and unit == "hours":
+                explicit_age = float(raw_age) * 24.0
+                break
+            if age_unit == "days" and unit == "seconds":
+                explicit_age = float(raw_age) * 86400.0
+                break
+            if age_unit == "hours" and unit == "days":
+                explicit_age = float(raw_age) / 24.0
+                break
+            if age_unit == "seconds" and unit == "days":
+                explicit_age = float(raw_age) / 86400.0
+                break
+
+    obs_date: date | None = None
+    obs_dt: datetime | None = None
+    obs_str: str | None = None
+    for ts_key in _OBSERVED_TIMESTAMP_KEYS:
+        if ts_key in item and item[ts_key] is not None:
+            obs_date, obs_dt, obs_str, _ = _parse_observed_clock(item[ts_key])
+            if obs_date is not None:
+                break
+
+    timestamp_age: float | None = None
+    if obs_date is not None and obs_dt is not None:
+        if unit == "days":
+            timestamp_age = float((as_of_date - obs_date).days)
+        elif unit == "hours":
+            timestamp_age = round((as_of_utc - obs_dt).total_seconds() / 3600.0, 3)
+        elif unit == "seconds":
+            timestamp_age = round((as_of_utc - obs_dt).total_seconds(), 3)
+
+    if timestamp_age is not None and explicit_age is not None:
+        computed_age: float | None = max(timestamp_age, explicit_age)
+    elif timestamp_age is not None:
+        computed_age = timestamp_age
+    else:
+        computed_age = explicit_age
+
+    if computed_age is not None and computed_age > limit:
+        age_out: int | float = int(computed_age) if unit == "days" and computed_age.is_integer() else computed_age
+        limit_out: int | float = int(limit) if limit.is_integer() else limit
+        findings.append({
+            "path": path, "kind": kind, "status": "stale",
+            "observed_at": obs_str or "unknown", "as_of": as_of_iso,
+            "age": age_out, "max_age": limit_out, "unit": unit,
+        })
+    return findings
+
+
+def find_stale_carried_items(row: dict[str, Any], as_of: datetime) -> list[dict[str, Any]]:
+    """Read-only scan of carried inputs and models in *row* older than their max age."""
+    if not isinstance(row, dict):
+        return []
+    stale: list[dict[str, Any]] = []
+    input_categories = (
+        "equities", "equity_volume", "rates", "credit", "volatility",
+        "commodities", "fx", "equity_etf_proxies", "macro", "features",
+        "options", "inputs",
+    )
+    model_categories = ("models", "model_states")
+    regime_categories = ("latest_regime", "regime", "regime_detection")
+
+    def _scan_container(container: dict[str, Any], prefix: str) -> None:
+        for cat in input_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        stale.extend(_check_entry_staleness(
+                            entry, f"{prefix}{cat}.{name}", cat, "input", as_of, name=str(name),
+                        ))
+        for cat in model_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        stale.extend(_check_entry_staleness(
+                            entry, f"{prefix}{cat}.{name}", cat, "model", as_of, name=str(name),
+                        ))
+        for cat in regime_categories:
+            entry = container.get(cat)
+            if isinstance(entry, dict):
+                stale.extend(_check_entry_staleness(
+                    entry, f"{prefix}{cat}", cat, "model", as_of,
+                ))
+
+    snap = row.get("snapshot_data")
+    if isinstance(snap, dict):
+        _scan_container(snap, "snapshot_data.")
+    _scan_container(row, "")
+
+    moves = row.get("market_moves")
+    if isinstance(moves, dict):
+        indices = moves.get("indices")
+        if isinstance(indices, dict):
+            for name, entry in indices.items():
+                if isinstance(entry, dict):
+                    stale.extend(_check_entry_staleness(
+                        entry, f"market_moves.indices.{name}", "market_moves", "input", as_of, name=str(name),
+                    ))
+        for list_key in ("notable", "sector_leaders", "sector_laggards"):
+            items = moves.get(list_key)
+            if isinstance(items, list):
+                for idx, entry in enumerate(items):
+                    if isinstance(entry, dict):
+                        label = str(entry.get("asset") or entry.get("etf") or entry.get("sector") or idx)
+                        stale.extend(_check_entry_staleness(
+                            entry, f"market_moves.{list_key}.{label}", "market_moves", "input", as_of, name=label,
+                        ))
+    return stale
+
+
 # ---------------------------------------------------------------------------
 # Packet (screened) and receipts
 # ---------------------------------------------------------------------------
@@ -493,7 +1623,7 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         "publication_day": bundle["publication_day"],
         "session_start": bundle["session_start"], "session_end": bundle["session_end"],
         "publication_set_complete": False, "publications": [], "evidence": [], "claims": [],
-        "hypotheses": [], "blockers": [
+        "hypotheses": [], "stale_items": [], "notices": [], "blockers": [
             "Capture-only packet: exact claim extraction and independent review remain required.",
             "Matched outcomes, frozen resolution rules, input vintages and price basis unavailable; no performance scoring.",
             "All-channel publication inventory not proven; channels outside market_briefings, thesis_snapshots, "
@@ -550,12 +1680,50 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         # Screen the WHOLE canonical row: source_record (snapshot_data, grounding, etc.) enters packet.json too.
         reasons = screen_row(row)
         disposition = None
+        regime_info = inspect_regime_binding(
+            row, as_of=published, producer_snapshots=bundle.get("producer_snapshots"),
+        )
+        regime_status = regime_info["status"]
+        regime_label = regime_info["label"]
+        bound_count = regime_info["count"]
+        clock_violations = find_invalid_clock_items(row, published)
         if reasons:
             disposition = "QUARANTINED_SCREEN_HIT"
         elif len(text_bytes) > TEXT_FIELD_CAP_BYTES:
             disposition = "EXCLUDED_TEXT_OVER_FIELD_CAP"
         elif aggregate + len(text_bytes) > PUBLICATIONS_AGGREGATE_CAP_BYTES:
             disposition = "EXCLUDED_AGGREGATE_CAP_REACHED"
+        elif regime_status == "insufficient" and regime_label is not None and bound_count is not None:
+            disposition = "REFUSED_INSUFFICIENT_REGIME_INPUTS"
+            reasons = [f"regime_bound_inputs_below_minimum:{bound_count}<{MIN_REGIME_BOUND_INPUTS}"]
+            packet["blockers"].append(
+                f"{identity}: refused to carry regime label {regime_label!r} computed from "
+                f"{bound_count} bound inputs (minimum {MIN_REGIME_BOUND_INPUTS})"
+            )
+        elif regime_status == "mismatch":
+            disposition = "REFUSED_REGIME_BINDING_MISMATCH"
+            mismatch_reason = regime_info["reason"] or "regime_binding_mismatch"
+            reasons = [mismatch_reason]
+            log.warning("publication-packet: refused {} due to regime binding mismatch: {}", identity, mismatch_reason)
+            packet["blockers"].append(
+                f"{identity}: refused carried regime ({mismatch_reason})"
+            )
+        elif regime_status == "unverified":
+            disposition = "REFUSED_UNVERIFIED_REGIME_BINDING"
+            unverified_reason = regime_info["reason"] or "missing_producer_snapshot_binding"
+            reasons = [unverified_reason]
+            log.warning("publication-packet: refused {} carrying an unverified regime: {}", identity, unverified_reason)
+            packet["blockers"].append(
+                f"{identity}: refused regime label {regime_label!r}: not verified against its "
+                f"producer snapshot ({unverified_reason})"
+            )
+        elif clock_violations:
+            disposition = "REFUSED_INVALID_SOURCE_CLOCK"
+            reasons = [f"{v['reason']}:{v['path']}" for v in clock_violations]
+            log.warning("publication-packet: refused {} due to invalid source clock/age: {}", identity, reasons)
+            packet["blockers"].append(
+                f"{identity}: refused due to invalid source clock/age ({', '.join(reasons)})"
+            )
         if disposition:
             exclusions.append({"publication_id": identity, "channel": channel, "disposition": disposition,
                                "reasons": reasons, "text_sha256": text_sha, "text_utf8_bytes": len(text_bytes),
@@ -563,9 +1731,18 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
             packet["capture_receipt"]["quarantined_publication_ids"].append(identity)
             continue
         aggregate += len(text_bytes)
-        packet["publications"].append({
+        pub_entry: dict[str, Any] = {
             "id": identity, "source": channel, "published_at": iso(published), "text": content,
-            "sha256": text_sha, "claims_complete": False, "source_record": row})
+            "sha256": text_sha, "claims_complete": False, "source_record": row,
+        }
+        stale_items = find_stale_carried_items(row, published)
+        if stale_items:
+            pub_entry["stale"] = True
+            pub_entry["stale_items"] = stale_items
+            packet["stale_items"].extend(
+                {"publication_id": identity, **entry} for entry in stale_items
+            )
+        packet["publications"].append(pub_entry)
         packet["evidence"].append({"id": identity + ":receipt", "source": identity, "sha256": sha256(canonical(row)),
                                    "role": "hindsight", "available_at": None, "captured_at": bundle["captured_at"]})
         packet["claims"].append({

@@ -49,6 +49,8 @@ _GRID_DIR = os.path.dirname(os.path.abspath(__file__))
 if _GRID_DIR not in sys.path:
     sys.path.insert(0, _GRID_DIR)
 
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
+
 mcp = FastMCP(
     "GRID Intelligence",
     description=(
@@ -188,7 +190,7 @@ def grid_briefing() -> dict[str, Any]:
                 text(
                     "SELECT id, ticker, model_name, direction, confidence, "
                     "target_price, entry_price, expiry, created_at "
-                    "FROM oracle_predictions "
+                    "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                     "WHERE verdict = 'pending' AND expiry > :today "
                     "ORDER BY confidence DESC NULLS LAST "
                     "LIMIT 10"
@@ -241,7 +243,7 @@ def grid_briefing() -> dict[str, Any]:
             row = conn.execute(
                 text(
                     "SELECT "
-                    "  (SELECT COUNT(*) FROM oracle_predictions "
+                    "  (SELECT COUNT(*) FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                     "   WHERE verdict = 'pending' AND expiry > :today) AS active_preds, "
                     "  (SELECT COUNT(*) FROM signal_data "
                     "   WHERE signal_date >= :cutoff) AS signals_7d, "
@@ -343,7 +345,7 @@ def grid_search(query: str) -> dict[str, Any]:
                 text(
                     "SELECT DISTINCT ticker, model_name, direction, confidence, "
                     "verdict, created_at "
-                    "FROM oracle_predictions "
+                    "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                     "WHERE UPPER(ticker) = :q "
                     "ORDER BY created_at DESC "
                     "LIMIT 25"
@@ -409,7 +411,7 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "SELECT id, model_name, direction, target_price, entry_price, "
                     "confidence, expected_move_pct, expiry, verdict, created_at, "
                     "signals, anti_signals "
-                    "FROM oracle_predictions "
+                    "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                     "WHERE ticker = :t AND created_at >= :cutoff "
                     "ORDER BY created_at DESC "
                     "LIMIT 20"
@@ -900,7 +902,7 @@ def grid_predictions() -> dict[str, Any]:
                     "SELECT id, ticker, model_name, direction, confidence, "
                     "target_price, entry_price, expected_move_pct, expiry, "
                     "created_at, signals, anti_signals "
-                    "FROM oracle_predictions "
+                    "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                     "WHERE verdict = 'pending' AND expiry > :today "
                     "ORDER BY confidence DESC NULLS LAST "
                     "LIMIT 50"
@@ -937,7 +939,7 @@ def grid_predictions() -> dict[str, Any]:
                     "  COUNT(*) FILTER (WHERE verdict = 'pending') AS pending, "
                     "  COUNT(*) AS total, "
                     "  ROUND(AVG(confidence)::numeric, 3) AS avg_confidence "
-                    "FROM oracle_predictions"
+                    "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions"
                 ),
             ).fetchone()
             if row:

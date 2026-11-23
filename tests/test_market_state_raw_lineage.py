@@ -100,7 +100,8 @@ def test_compute_and_storage_retain_partial_receipt_without_promoting(monkeypatc
     lineage = state.to_dict()['source_lineage']
     assert lineage['status'] == 'partial' and lineage['pit_qualified'] is False
     assert lineage['raw_series']['CBOE:VIX']['rows'] == 1
-    assert len(lineage['unqualified_read_paths']) == 4
+    assert len(lineage['unqualified_read_paths']) == 5
+    assert any(x.startswith('KXFED row availability') for x in lineage['unqualified_read_paths'])
     M.store_market_state(engine, state)
     from sqlalchemy import text
     with engine.connect() as c:

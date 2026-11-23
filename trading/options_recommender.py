@@ -29,7 +29,9 @@ import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.market_calendar import last_trading_day
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_SNAPSHOTS, visible_sql
+from trading.trade_ticket_generator import MAX_KELLY_PER_TICKET
 
 
 # ── Canonical pricing/sizing utilities ──────────────────────────────
@@ -39,9 +41,65 @@ from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_SNAPSHOTS, v
 # across every pipeline that emits options tickets (scanner-driven,
 # contagion-driven, signal-driven).  Other trading modules should
 # import from here rather than rolling their own.
+#
+# ``MAX_KELLY_PER_TICKET`` (0.05) is imported from
+# ``trading.trade_ticket_generator`` so all ticket/recommendation paths share
+# one single hard per-ticket Kelly cap constant.
 
-# Cap any single ticket at this fraction of portfolio, regardless of Kelly math.
-MAX_KELLY_PER_TICKET: float = 0.05
+# Per-contract broker/exchange fee per leg ($0.65 per contract = $0.0065 per share).
+OPTION_FEE_PER_CONTRACT: float = 0.65
+CONTRACT_MULTIPLIER: int = 100
+FEE_PER_SHARE: float = OPTION_FEE_PER_CONTRACT / CONTRACT_MULTIPLIER
+
+# Risk-free rate and target horizon fraction used for Black-Scholes target repricing.
+RISK_FREE_RATE: float = 0.05
+TARGET_HORIZON_DTE_FRACTION: float = 0.5
+
+# Sanity pipeline check classification.
+# Required checks guard pricing, data quality, liquidity, or freshness and MUST PASS.
+REQUIRED_CHECKS: frozenset[str] = frozenset({"DATA_QUALITY"})
+# Genuinely optional checks may return SKIP without rejecting a recommendation.
+OPTIONAL_CHECKS: frozenset[str] = frozenset({
+    "DEALER_FLOW",
+    "CROSS_ASSET",
+    "LLM_REVIEW",
+    "HISTORICAL_ANALOG",
+})
+
+
+def min_fresh_snap_date(run_date: date) -> date:
+    """Return the oldest acceptable snapshot date (previous trading session).
+
+    Uses ``ingestion.market_calendar.last_trading_day`` so weekends and US
+    equity market holidays are handled accurately.
+    """
+    current_session = last_trading_day(run_date)
+    return last_trading_day(current_session - timedelta(days=1))
+
+
+def _positive_finite(value: Any) -> float | None:
+    """Return float(value) when positive and finite, otherwise None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) and out > 0 else None
+
+
+def _to_date(value: Any) -> date | None:
+    """Coerce a date, datetime, or ISO date string into a ``date``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
 
 # Default payout ratio when no explicit R:R is supplied (rule-of-thumb for
 # options tickets: 3:1 target:risk).
@@ -372,9 +430,10 @@ class OptionsRecommendation:
     expiry: str                     # ISO date (YYYY-MM-DD)
 
     # ── Entry ──
-    entry_price: float              # mid of bid-ask at recommendation time
+    entry_price: float              # effective entry cost per share (ask + leg fee)
     entry_bid: float = 0.0         # bid at recommendation time
     entry_ask: float = 0.0         # ask at recommendation time
+    entry_mid: float = 0.0         # displayed mid of bid-ask at recommendation time
     entry_by_date: str = ""        # enter by this date or cancel
     underlying_price: float = 0.0  # stock price at recommendation time
 
@@ -428,6 +487,7 @@ class OptionsRecommendation:
             "entry_price": self.entry_price,
             "entry_bid": self.entry_bid,
             "entry_ask": self.entry_ask,
+            "entry_mid": self.entry_mid,
             "entry_by_date": self.entry_by_date,
             "underlying_price": self.underlying_price,
             "target_price": self.target_price,
@@ -469,7 +529,7 @@ class OptionsRecommendation:
             f"  ENTRY:  ${self.entry_price:.2f} (bid ${self.entry_bid:.2f} / ask ${self.entry_ask:.2f})\n"
             f"  STOCK:  ${self.underlying_price:.2f} at time of rec\n"
             f"  TARGET: ${self.target_price:.2f} ({self.target_return_pct:+.0f}%)\n"
-            f"  STOP:   ${self.stop_loss:.2f} (or stock {'below' if self.direction == 'PUT' else 'above'} ${self.stop_loss_stock:.2f})\n"
+            f"  STOP:   ${self.stop_loss:.2f} (or stock {'above' if self.direction == 'PUT' else 'below'} ${self.stop_loss_stock:.2f})\n"
             f"  TIME:   Exit by {self.time_stop_date} if no move\n"
             f"  SIZE:   {self.suggested_contracts} contracts ({self.kelly_fraction:.1%} Kelly)\n"
             f"  R/R:    {rr:.1f}x | Confidence: {self.confidence:.0%}\n"
@@ -499,11 +559,27 @@ class OptionsRecommendation:
 
     @property
     def all_sanity_passed(self) -> bool:
-        """True only if every sanity layer returned PASS or SKIP."""
-        return all(
-            v.get("status") in ("PASS", "SKIP")
-            for v in self.sanity_status.values()
-        )
+        """True only if every required sanity check PASSed and no check FAILed.
+
+        SKIP is accepted only for checks explicitly listed in ``OPTIONAL_CHECKS``.
+        An empty ``sanity_status`` or a missing/SKIPped required check fails closed.
+        """
+        if not self.sanity_status:
+            return False
+        for req_name in REQUIRED_CHECKS:
+            entry = self.sanity_status.get(req_name)
+            if not isinstance(entry, dict) or entry.get("status") != "PASS":
+                return False
+        for name, entry in self.sanity_status.items():
+            if not isinstance(entry, dict):
+                return False
+            status = entry.get("status")
+            if status == "PASS":
+                continue
+            if status == "SKIP" and name in OPTIONAL_CHECKS:
+                continue
+            return False
+        return True
 
 
 # ── Weekly OpEx dates (third Friday of each month is monthly) ────────
@@ -575,15 +651,43 @@ class OptionsRecommender:
         db_engine: Engine,
         min_score: float = 1.5,
         capital: float = 10_000.0,
-        max_kelly: float = 0.25,
+        max_kelly: float = MAX_KELLY_PER_TICKET,
+        *,
+        allow_kelly_cap_override: bool = False,
     ) -> None:
+        if (
+            not isinstance(max_kelly, (int, float))
+            or isinstance(max_kelly, bool)
+            or not math.isfinite(max_kelly)
+            or max_kelly < 0
+        ):
+            raise ValueError(
+                f"max_kelly must be a finite non-negative number, got {max_kelly!r}"
+            )
+        if max_kelly > MAX_KELLY_PER_TICKET and not allow_kelly_cap_override:
+            raise ValueError(
+                f"max_kelly={max_kelly} exceeds MAX_KELLY_PER_TICKET={MAX_KELLY_PER_TICKET}; "
+                "pass allow_kelly_cap_override=True to override"
+            )
         self.engine = db_engine
         self.min_score = min_score
         self.capital = capital
-        self.max_kelly = max_kelly
+        self.max_kelly = float(max_kelly)
+        self._allow_kelly_cap_override = bool(allow_kelly_cap_override)
+        self.last_rejection_counts: dict[str, int] = {}
+        self.last_run_summary: dict[str, Any] = {}
         log.info(
-            "OptionsRecommender initialised — min_score={s}, capital=${c:,.0f}",
-            s=min_score, c=capital,
+            "OptionsRecommender initialised — min_score={s}, capital=${c:,.0f}, max_kelly={k:.2%}",
+            s=min_score, c=capital, k=self.max_kelly,
+        )
+
+    def _record_rejection(self, ticker: str, reason: str, detail: str = "") -> None:
+        """Increment rejection counter and emit a structured rejection log entry."""
+        self.last_rejection_counts[reason] = self.last_rejection_counts.get(reason, 0) + 1
+        suffix = f" ({detail})" if detail else ""
+        log.info(
+            "Recommendation rejected for {t}: reason={r}{s}",
+            t=ticker, r=reason, s=suffix,
         )
 
     # ── Public API ───────────────────────────────────────────────────
@@ -592,18 +696,25 @@ class OptionsRecommender:
         self,
         engine: Engine | None = None,
         tickers: list[str] | None = None,
+        run_date: date | None = None,
     ) -> list[OptionsRecommendation]:
         """Generate actionable options trade recommendations.
 
         Parameters:
             engine: Optional override SQLAlchemy engine (defaults to self.engine).
             tickers: Restrict scan to these tickers (default: all available).
+            run_date: Effective run date for freshness and DTE (default: today).
 
         Returns:
-            list[OptionsRecommendation]: Only recommendations passing all 5
-            sanity layers, sorted by expected return descending.
+            list[OptionsRecommendation]: Only recommendations passing all required
+            sanity layers and positive EV/Kelly checks, sorted by expected return
+            descending. Per-reason rejection counts are exposed on
+            ``self.last_rejection_counts`` and ``self.last_run_summary``.
         """
         db = engine or self.engine
+        effective_run_date = run_date or date.today()
+        self.last_rejection_counts = {}
+        self.last_run_summary = {}
 
         # 1. Run options scanner
         from discovery.options_scanner import OptionsScanner
@@ -617,6 +728,13 @@ class OptionsRecommender:
         )
 
         if not opportunities:
+            self.last_run_summary = {
+                "run_date": effective_run_date.isoformat(),
+                "opportunities": 0,
+                "emitted": 0,
+                "rejected": 0,
+                "rejection_counts": {},
+            }
             return []
 
         # 2. Load GEX engine
@@ -628,21 +746,28 @@ class OptionsRecommender:
 
         for opp in opportunities:
             try:
-                rec = self._build_recommendation(opp, gex_engine, db)
+                rec = self._build_recommendation(
+                    opp, gex_engine, db, run_date=effective_run_date,
+                )
                 if rec is not None:
                     recommendations.append(rec)
             except Exception as exc:
-                log.warning(
-                    "Recommendation build failed for {t}: {e}",
-                    t=opp.ticker, e=str(exc),
-                )
+                self._record_rejection(opp.ticker, "build_error", str(exc))
 
         # Sort by expected return descending
         recommendations.sort(key=lambda r: r.expected_return, reverse=True)
 
+        self.last_run_summary = {
+            "run_date": effective_run_date.isoformat(),
+            "opportunities": len(opportunities),
+            "emitted": len(recommendations),
+            "rejected": sum(self.last_rejection_counts.values()),
+            "rejection_counts": dict(self.last_rejection_counts),
+        }
+
         log.info(
-            "Generated {n} actionable recommendations from {t} opportunities",
-            n=len(recommendations), t=len(opportunities),
+            "Generated {n} actionable recommendations from {t} opportunities (rejections={r})",
+            n=len(recommendations), t=len(opportunities), r=self.last_rejection_counts,
         )
 
         # Persist recommendations to database
@@ -722,74 +847,155 @@ class OptionsRecommender:
         opp,  # MispricingOpportunity from options_scanner
         gex_engine,  # DealerGammaEngine
         db: Engine,
+        run_date: date | None = None,
     ) -> OptionsRecommendation | None:
         """Build a single recommendation from a scanner opportunity.
 
-        Returns None if the recommendation fails any required sanity layer.
+        Fails closed: returns None and records a rejection reason code whenever
+        the contract cannot be priced on a fresh, existing chain row or fails
+        EV, Kelly, or required sanity gates.
         """
         ticker = opp.ticker
         direction = opp.direction
-        spot = opp.spot_price
+        effective_run_date = run_date or date.today()
+        min_snap = min_fresh_snap_date(effective_run_date)
 
-        if not spot or spot <= 0:
-            log.debug("Skipping {t}: no spot price", t=ticker)
+        spot = _positive_finite(opp.spot_price)
+        if spot is None:
+            self._record_rejection(ticker, "no_spot")
             return None
 
         # Get GEX profile
         gex_profile = gex_engine.compute_gex_profile(ticker)
-        if "error" in gex_profile:
-            log.debug("Skipping {t}: GEX error — {e}", t=ticker, e=gex_profile["error"])
-            # Continue without GEX — graceful degradation
+        if not isinstance(gex_profile, dict) or "error" in gex_profile:
+            log.debug("GEX unavailable for {t} — continuing without GEX", t=ticker)
             gex_profile = {}
 
-        # Load options chain for strike/expiry selection
-        chain_df = self._load_chain(db, ticker)
+        # Load fresh options chain (bounded to current or previous trading session)
+        chain_df = self._load_chain(db, ticker, run_date=effective_run_date)
         if chain_df.empty:
-            log.debug("Skipping {t}: no options chain data", t=ticker)
+            self._record_rejection(ticker, "stale_or_missing_chain")
             return None
 
-        # Optimize strike
-        strike = self._optimize_strike(chain_df, direction, spot, gex_profile)
-        if strike is None:
-            log.debug("Skipping {t}: no suitable strike", t=ticker)
+        # Defense-in-depth freshness check on snapshot date
+        snap_d = _to_date(chain_df.attrs.get("snap_date"))
+        if snap_d is None and "snap_date" in chain_df.columns and not chain_df["snap_date"].isna().all():
+            snap_dates = [_to_date(v) for v in chain_df["snap_date"] if _to_date(v) is not None]
+            snap_d = max(snap_dates) if snap_dates else None
+        if snap_d is not None and (snap_d < min_snap or snap_d > effective_run_date):
+            self._record_rejection(
+                ticker, "stale_chain", f"snap_date={snap_d} < min={min_snap}",
+            )
             return None
 
-        # Pick expiry
-        expiry = self._pick_expiry(chain_df, spot)
+        # Jointly select an existing (strike, expiry) row from the same snapshot
+        opp_iv_atm = _positive_finite(getattr(opp, "iv_atm", None))
+        contract = self._select_contract(
+            chain_df,
+            direction,
+            spot,
+            gex_profile,
+            run_date=effective_run_date,
+            fallback_iv=opp_iv_atm,
+        )
+        if contract is None:
+            self._record_rejection(ticker, "contract_not_in_chain")
+            return None
+
+        strike = float(contract["strike"])
+        expiry = _to_date(contract["expiry"])
         if expiry is None:
-            log.debug("Skipping {t}: no suitable expiry", t=ticker)
+            self._record_rejection(ticker, "contract_not_in_chain", "unparseable expiry")
             return None
 
-        # Compute entry price from bid/ask mid
-        entry_price = self._get_entry_price(db, ticker, strike, expiry, direction)
-        if entry_price is None or entry_price <= 0:
-            log.debug("Skipping {t}: no valid entry price at K={k}", t=ticker, k=strike)
+        dte = (expiry - effective_run_date).days
+        if dte < self._MIN_DTE or dte > self._MAX_DTE:
+            self._record_rejection(
+                ticker, "contract_not_in_chain", f"dte={dte} outside [{self._MIN_DTE},{self._MAX_DTE}]",
+            )
             return None
 
-        # Target from GEX expected move (gamma wall distance)
+        # Real two-sided quote from the selected snapshot row
+        bid = _positive_finite(contract.get("bid"))
+        ask = _positive_finite(contract.get("ask"))
+        if bid is None or ask is None or ask < bid:
+            self._record_rejection(
+                ticker, "invalid_quote", f"K={strike} exp={expiry} bid={contract.get('bid')} ask={contract.get('ask')}",
+            )
+            return None
+
+        entry_mid = (bid + ask) / 2.0
+        half_spread = (ask - bid) / 2.0
+        # Entry cost for EV and Kelly: pay the ask plus per-contract leg fee
+        entry_cost = ask + FEE_PER_SHARE
+
+        # Resolve implied volatility: contract's own IV -> repo ATM IV fallback -> reject no_iv
+        iv = (
+            _positive_finite(contract.get("implied_volatility"))
+            or opp_iv_atm
+            or _positive_finite(self._get_atm_iv(db, ticker, run_date=effective_run_date))
+        )
+        if iv is None:
+            self._record_rejection(ticker, "no_iv", f"K={strike} exp={expiry}")
+            return None
+
+        # Target exit value: Black-Scholes repricing at target underlying & remaining time,
+        # minus half the entry spread and minus the exit leg fee
+        horizon_days = dte * TARGET_HORIZON_DTE_FRACTION
         target_price = self._compute_target_price(
-            entry_price, spot, strike, direction, gex_profile,
+            entry_cost,
+            spot,
+            strike,
+            direction,
+            gex_profile,
+            iv=iv,
+            dte=dte,
+            horizon_days=horizon_days,
+            half_spread=half_spread,
+            fee_per_share=FEE_PER_SHARE,
         )
+        if target_price is None or not math.isfinite(target_price):
+            self._record_rejection(ticker, "no_iv", "target pricing unavailable")
+            return None
 
-        # Conservative premium stop; the nearest modeled flip is not a
-        # directional or observed dealer-flow invalidation.
+        # Conservative 50% premium stop; net exit at stop also accounts for half-spread + exit fee
         stop_loss = self._compute_stop_loss(
-            entry_price, spot, strike, direction, gex_profile,
+            entry_cost, spot, strike, direction, gex_profile,
         )
+        stop_exit = max(0.0, stop_loss - half_spread - FEE_PER_SHARE)
 
-        # Win probability and payoff for Kelly
+        gain = target_price - entry_cost
+        loss = entry_cost - stop_exit
         win_prob = self._estimate_win_probability(opp, gex_profile)
-        payoff_ratio = (target_price - entry_price) / max(entry_price - stop_loss, 0.01)
 
-        # Kelly fraction
+        # Expected return (per share) and payoff ratio
+        expected_return = win_prob * gain - (1.0 - win_prob) * loss
+        if gain <= 0 or loss <= 0 or not math.isfinite(expected_return) or expected_return <= 0:
+            self._record_rejection(
+                ticker, "nonpositive_ev", f"ev={expected_return:.4f} gain={gain:.4f}",
+            )
+            return None
+
+        payoff_ratio = gain / loss
         kelly_fraction = self._compute_kelly(win_prob, payoff_ratio)
+        if not math.isfinite(kelly_fraction) or kelly_fraction <= 0:
+            self._record_rejection(ticker, "zero_kelly", f"payoff={payoff_ratio:.2f}")
+            return None
 
-        # Expected return
-        expected_return = win_prob * (target_price - entry_price) - (1 - win_prob) * (entry_price - stop_loss)
-
-        # Max risk in dollars (entry premium x 100 shares x kelly fraction of capital)
-        contracts = max(1, int(self.capital * kelly_fraction / (entry_price * 100)))
-        max_risk = contracts * entry_price * 100
+        # Contract sizing: never fabricate a contract. If the capped Kelly budget
+        # cannot buy one contract, the recommendation is not emitted (fail closed).
+        contracts = int(self.capital * kelly_fraction / (entry_cost * CONTRACT_MULTIPLIER))
+        if contracts < 1:
+            self._record_rejection(
+                ticker, "below_one_contract",
+                f"budget={self.capital * kelly_fraction:.2f} contract_cost={entry_cost * CONTRACT_MULTIPLIER:.2f}",
+            )
+            return None
+        max_risk = contracts * entry_cost * CONTRACT_MULTIPLIER
+        target_return_pct = ((target_price - entry_cost) / entry_cost) * 100.0
+        time_stop_date = (
+            effective_run_date + timedelta(days=max(1, int(round(horizon_days))))
+        ).isoformat()
 
         # Confidence from scanner score + GEX alignment
         confidence = self._compute_confidence(opp, gex_profile, direction)
@@ -812,13 +1018,20 @@ class OptionsRecommender:
             ticker=ticker,
             direction=direction,
             strike=round(strike, 2),
-            expiry=str(expiry),
-            entry_price=round(entry_price, 4),
+            expiry=expiry.isoformat(),
+            entry_price=round(entry_cost, 4),
+            entry_bid=round(bid, 4),
+            entry_ask=round(ask, 4),
+            entry_mid=round(entry_mid, 4),
+            underlying_price=round(spot, 4),
             target_price=round(target_price, 4),
+            target_return_pct=round(target_return_pct, 2),
             stop_loss=round(max(stop_loss, 0.01), 4),
+            time_stop_date=time_stop_date,
             expected_return=round(expected_return, 4),
             max_risk=round(max_risk, 2),
             kelly_fraction=round(kelly_fraction, 4),
+            suggested_contracts=contracts,
             confidence=round(confidence, 4),
             thesis=thesis,
             dealer_context=dealer_context,
@@ -829,21 +1042,209 @@ class OptionsRecommender:
         )
 
         # Run 5-layer sanity pipeline
-        sanity = self._run_sanity_pipeline(rec, db, opp, gex_profile)
+        sanity = self._run_sanity_pipeline(
+            rec, db, opp, gex_profile, run_date=effective_run_date, resolved_iv=iv,
+        )
         rec.sanity_status = sanity
 
-        # Only return if all layers pass or skip
+        # Fail closed on any FAIL or on SKIP/absence of a required check
         if not rec.all_sanity_passed:
-            failed = [
-                k for k, v in sanity.items() if v.get("status") == "FAIL"
+            skipped_required = [
+                k for k, v in sanity.items()
+                if isinstance(v, dict) and v.get("status") == "SKIP" and k not in OPTIONAL_CHECKS
             ]
-            log.info(
-                "Recommendation rejected for {t}: failed layers={f}",
-                t=ticker, f=failed,
-            )
+            missing_required = [k for k in sorted(REQUIRED_CHECKS) if k not in sanity]
+            failed = [
+                k for k, v in sanity.items()
+                if not isinstance(v, dict) or v.get("status") not in ("PASS", "SKIP")
+            ]
+            if skipped_required:
+                self._record_rejection(ticker, f"required_check_skipped:{skipped_required[0]}")
+            elif missing_required:
+                self._record_rejection(ticker, f"required_check_skipped:{missing_required[0]}")
+            elif failed:
+                self._record_rejection(ticker, f"sanity_failed:{failed[0]}")
+            else:
+                self._record_rejection(ticker, "sanity_failed")
             return None
 
         return rec
+
+    # ── Joint Strike & Expiry Selection ──────────────────────────────
+
+    def _score_expiries(
+        self,
+        chain_df: pd.DataFrame,
+        run_date: date,
+        is_earnings_play: bool = False,
+    ) -> list[tuple[float, date, int]]:
+        """Rank eligible listed expiries in descending preference order."""
+        work = chain_df.copy()
+        work["_exp_date"] = work["expiry"].apply(_to_date)
+        work = work[work["_exp_date"].notna()].copy()
+        if work.empty:
+            return []
+        work["_dte"] = work["_exp_date"].apply(lambda d: (d - run_date).days)
+
+        min_dte = self._EARNINGS_MIN_DTE if is_earnings_play else self._MIN_DTE
+        expiry_stats = (
+            work.groupby("_exp_date")
+            .agg(total_oi=("open_interest", "sum"), dte=("_dte", "first"))
+            .reset_index()
+        )
+        expiry_stats = expiry_stats[
+            (expiry_stats["dte"] >= min_dte)
+            & (expiry_stats["dte"] <= self._MAX_DTE)
+            & (expiry_stats["total_oi"] >= self._MIN_OI_FOR_EXPIRY)
+        ]
+        if expiry_stats.empty:
+            return []
+
+        ranked: list[tuple[float, date, int]] = []
+        for _, row in expiry_stats.iterrows():
+            exp_date = row["_exp_date"]
+            dte = int(row["dte"])
+            total_oi = float(row["total_oi"])
+
+            score = 0.0
+            if self._IDEAL_DTE_LO <= dte <= self._IDEAL_DTE_HI:
+                score += 5.0
+            elif self._MIN_DTE <= dte < self._IDEAL_DTE_LO:
+                score += 3.0
+            else:
+                score += 2.0
+
+            if _is_monthly_opex(exp_date):
+                score += 3.0
+            elif _is_weekly_opex(exp_date):
+                score -= 1.0
+
+            score += math.log1p(max(total_oi, 0.0)) / 5.0
+            ranked.append((score, exp_date, dte))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked
+
+    def _select_contract(
+        self,
+        chain_df: pd.DataFrame,
+        direction: str,
+        spot: float,
+        gex_profile: dict,
+        *,
+        run_date: date | None = None,
+        is_earnings_play: bool = False,
+        fallback_iv: float | None = None,
+    ) -> pd.Series | None:
+        """Select an existing (strike, expiry) contract row jointly from one snapshot.
+
+        Ranks eligible expiries first (measuring DTE from ``run_date``) and then
+        picks the best listed strike within the highest-ranked expiry that has at
+        least one matching contract in the target OTM/wall window. Never fabricates
+        a (strike, expiry) pair that is absent from ``chain_df``.
+        """
+        from physics.dealer_gamma import bs_gamma
+
+        if chain_df.empty:
+            return None
+
+        effective_run_date = run_date or date.today()
+        work = chain_df.copy()
+
+        # Restrict to a single snapshot date if multiple are present
+        if "snap_date" in work.columns:
+            work["_snap_date"] = work["snap_date"].apply(_to_date)
+            valid_snaps = work["_snap_date"].dropna()
+            if not valid_snaps.empty:
+                latest_snap = valid_snaps.max()
+                work = work[work["_snap_date"] == latest_snap].copy()
+
+        work["_exp_date"] = work["expiry"].apply(_to_date)
+        work = work[work["_exp_date"].notna()].copy()
+        if work.empty:
+            return None
+        work["_dte"] = work["_exp_date"].apply(lambda d: (d - effective_run_date).days)
+        work = work[work["_dte"] > 0].copy()
+        if work.empty:
+            return None
+
+        ranked_expiries = self._score_expiries(work, effective_run_date, is_earnings_play=is_earnings_play)
+        if not ranked_expiries:
+            return None
+
+        call_wall = _positive_finite(gex_profile.get("call_wall")) if gex_profile else None
+        put_wall = _positive_finite(gex_profile.get("put_wall")) if gex_profile else None
+
+        if direction == "CALL":
+            lo = spot * (1 + self._CALL_OTM_MIN_PCT)
+            hi = min(spot * (1 + self._CALL_OTM_MAX_PCT), call_wall or spot * 1.15)
+            opt_type = "call"
+        else:
+            hi = spot * (1 - self._PUT_OTM_MIN_PCT)
+            lo = max(spot * (1 - self._PUT_OTM_MAX_PCT), put_wall or spot * 0.85)
+            opt_type = "put"
+
+        if lo > hi:
+            return None
+
+        fb_iv = _positive_finite(fallback_iv)
+
+        for _, exp_date, dte in ranked_expiries:
+            exp_rows = work[
+                (work["_exp_date"] == exp_date)
+                & (work["opt_type"] == opt_type)
+                & (work["strike"] >= lo)
+                & (work["strike"] <= hi)
+            ]
+            if exp_rows.empty:
+                continue
+
+            liquid = exp_rows[exp_rows["open_interest"] >= self._MIN_OI]
+            candidates = liquid if not liquid.empty else exp_rows
+
+            # Prefer contracts with valid two-sided bid/ask quotes when available
+            if "bid" in candidates.columns and "ask" in candidates.columns:
+                quoted_mask = candidates.apply(
+                    lambda r: (
+                        _positive_finite(r.get("bid")) is not None
+                        and _positive_finite(r.get("ask")) is not None
+                        and float(r.get("ask")) >= float(r.get("bid"))
+                    ),
+                    axis=1,
+                )
+                if quoted_mask.any():
+                    candidates = candidates[quoted_mask]
+
+            T = float(dte) / 365.0
+            best_row: pd.Series | None = None
+            best_score = -1.0
+            fallback_no_iv_row: pd.Series | None = None
+            fallback_no_iv_oi = -1.0
+
+            for _, row in candidates.iterrows():
+                K = float(row["strike"])
+                oi = float(row["open_interest"]) if pd.notna(row["open_interest"]) else 0.0
+                iv = _positive_finite(row.get("implied_volatility")) or fb_iv
+                if iv is None:
+                    # Keep track of existing row with missing IV so caller can reject with 'no_iv'
+                    if oi > fallback_no_iv_oi:
+                        fallback_no_iv_oi = oi
+                        fallback_no_iv_row = row
+                    continue
+
+                gamma = bs_gamma(spot, K, T, RISK_FREE_RATE, iv)
+                cost_proxy = iv * math.sqrt(T) * spot
+                oi_bonus = math.log1p(max(oi, 0.0)) / 10.0
+                score = (gamma * spot * 100 / max(cost_proxy, 0.01)) + oi_bonus
+                if score > best_score:
+                    best_score = score
+                    best_row = row
+
+            chosen = best_row if best_row is not None else fallback_no_iv_row
+            if chosen is not None:
+                return chosen
+
+        return None
 
     # ── Strike Optimization ──────────────────────────────────────────
 
@@ -853,33 +1254,32 @@ class OptionsRecommender:
         direction: str,
         spot: float,
         gex_profile: dict,
+        fallback_iv: float | None = None,
     ) -> float | None:
-        """Pick the strike with best gamma/premium ratio within direction.
-
-        For CALL: strike above spot where call gamma is high but premium
-        is reasonable. For PUT: strike below spot where put gamma is high.
-        Avoids strikes beyond gamma wall (likely resistance/support).
-        """
+        """Pick the strike with best gamma/premium ratio within direction."""
         from physics.dealer_gamma import bs_gamma
 
-        call_wall = gex_profile.get("call_wall") or spot * 1.15
-        put_wall = gex_profile.get("put_wall") or spot * 0.85
+        call_wall = _positive_finite(gex_profile.get("call_wall")) if gex_profile else None
+        put_wall = _positive_finite(gex_profile.get("put_wall")) if gex_profile else None
 
         if direction == "CALL":
             lo = spot * (1 + self._CALL_OTM_MIN_PCT)
-            hi = min(spot * (1 + self._CALL_OTM_MAX_PCT), call_wall)
+            hi = min(spot * (1 + self._CALL_OTM_MAX_PCT), call_wall or spot * 1.15)
             opt_type = "call"
         else:
             hi = spot * (1 - self._PUT_OTM_MIN_PCT)
-            lo = max(spot * (1 - self._PUT_OTM_MAX_PCT), put_wall)
+            lo = max(spot * (1 - self._PUT_OTM_MAX_PCT), put_wall or spot * 0.85)
             opt_type = "put"
+
+        if lo > hi:
+            return None
 
         # Filter to relevant strikes and option type
         candidates = chain_df[
             (chain_df["strike"] >= lo)
             & (chain_df["strike"] <= hi)
             & (chain_df["opt_type"] == opt_type)
-            & (chain_df["open_interest"] > self._MIN_OI)
+            & (chain_df["open_interest"] >= self._MIN_OI)
         ].copy()
 
         if candidates.empty:
@@ -893,24 +1293,23 @@ class OptionsRecommender:
         if candidates.empty:
             return None
 
-        # Score each strike: gamma / (implied cost proxy)
-        # Higher gamma + lower IV = better value
         best_strike = None
         best_score = -1.0
+        fb_iv = _positive_finite(fallback_iv)
 
         for _, row in candidates.iterrows():
             K = float(row["strike"])
             T = float(row["dte"]) / 365.0
             if T <= 0:
                 continue
-            iv = float(row["implied_volatility"]) if row["implied_volatility"] > 0 else 0.25
+            iv = _positive_finite(row.get("implied_volatility")) or fb_iv
+            if iv is None:
+                continue
             oi = float(row["open_interest"])
 
-            gamma = bs_gamma(spot, K, T, 0.05, iv)
-            # Cost proxy: IV * sqrt(T) * spot (higher = more expensive)
-            cost_proxy = iv * math.sqrt(T) * spot if iv > 0 else 1.0
-            # OI liquidity bonus (log scale)
-            oi_bonus = math.log1p(oi) / 10.0
+            gamma = bs_gamma(spot, K, T, RISK_FREE_RATE, iv)
+            cost_proxy = iv * math.sqrt(T) * spot
+            oi_bonus = math.log1p(max(oi, 0.0)) / 10.0
 
             score = (gamma * spot * 100 / max(cost_proxy, 0.01)) + oi_bonus
             if score > best_score:
@@ -926,81 +1325,15 @@ class OptionsRecommender:
         chain_df: pd.DataFrame,
         spot: float,
         is_earnings_play: bool = False,
+        run_date: date | None = None,
     ) -> date | None:
-        """Pick optimal expiry: 2-4 months out, avoid weekly OpEx, prefer monthly.
-
-        For earnings plays with huge disparity, can go as short as 2 weeks.
-        Requires sufficient OI (>500 contracts) at the chosen expiry.
-        """
-        date.today()
-
-        # Get distinct expiries with aggregate OI
-        expiry_stats = (
-            chain_df.groupby("expiry")
-            .agg(total_oi=("open_interest", "sum"), dte=("dte", "first"))
-            .reset_index()
+        """Pick optimal expiry measuring DTE from ``run_date``."""
+        ranked = self._score_expiries(
+            chain_df,
+            run_date or date.today(),
+            is_earnings_play=is_earnings_play,
         )
-
-        # Earnings plays can use shorter DTE for event-driven trades
-        min_dte = self._EARNINGS_MIN_DTE if is_earnings_play else self._MIN_DTE
-
-        # Filter to acceptable DTE range
-        expiry_stats = expiry_stats[
-            (expiry_stats["dte"] >= min_dte)
-            & (expiry_stats["dte"] <= self._MAX_DTE)
-        ]
-
-        if expiry_stats.empty:
-            return None
-
-        # Score each expiry
-        best_expiry = None
-        best_score = -1.0
-
-        for _, row in expiry_stats.iterrows():
-            exp = row["expiry"]
-            dte = int(row["dte"])
-            total_oi = float(row["total_oi"])
-
-            # Parse expiry to date if needed
-            if isinstance(exp, str):
-                try:
-                    exp_date = date.fromisoformat(exp)
-                except ValueError:
-                    continue
-            elif isinstance(exp, date):
-                exp_date = exp
-            else:
-                continue
-
-            # OI threshold
-            if total_oi < self._MIN_OI_FOR_EXPIRY:
-                continue
-
-            score = 0.0
-
-            # Prefer ideal DTE range (3-4 weeks)
-            if self._IDEAL_DTE_LO <= dte <= self._IDEAL_DTE_HI:
-                score += 5.0
-            elif self._MIN_DTE <= dte < self._IDEAL_DTE_LO:
-                score += 3.0  # acceptable but shorter
-            else:
-                score += 2.0  # acceptable but longer
-
-            # Prefer monthly OpEx over weekly (more liquidity, less dealer unwind noise)
-            if _is_monthly_opex(exp_date):
-                score += 3.0
-            elif _is_weekly_opex(exp_date):
-                score -= 1.0  # penalise weekly OpEx
-
-            # OI liquidity bonus
-            score += math.log1p(total_oi) / 5.0
-
-            if score > best_score:
-                best_score = score
-                best_expiry = exp_date
-
-        return best_expiry
+        return ranked[0][1] if ranked else None
 
     # ── Entry / Target / Stop ────────────────────────────────────────
 
@@ -1011,70 +1344,55 @@ class OptionsRecommender:
         strike: float,
         expiry: date,
         direction: str,
+        run_date: date | None = None,
     ) -> float | None:
-        """Get entry price as mid of bid/ask from latest options snapshot."""
+        """Get effective entry cost (ask + leg fee) from a fresh options snapshot.
+
+        Fails closed: returns None if the contract is absent from fresh snapshots
+        or lacks a valid two-sided bid/ask quote (never falls back to BS or last).
+        """
         opt_type = "call" if direction == "CALL" else "put"
+        effective_run_date = run_date or date.today()
+        min_snap = min_fresh_snap_date(effective_run_date)
+        expiry_d = _to_date(expiry)
+        if expiry_d is None:
+            return None
 
         with db.connect() as conn:
             row = conn.execute(visible_sql("""
-                SELECT bid, ask, last_price
+                SELECT bid, ask, last_price, snap_date
                 FROM """ + VISIBLE_SNAPSHOTS + """ s
                 WHERE ticker = :ticker
                   AND strike = :strike
                   AND expiry = :expiry
                   AND opt_type = :opt_type
+                  AND snap_date >= :min_snap_date
+                  AND snap_date <= :run_date
                 ORDER BY snap_date DESC
                 LIMIT 1
             """), {
                 "ticker": ticker,
                 "strike": strike,
-                "expiry": expiry,
+                "expiry": expiry_d,
                 "opt_type": opt_type,
+                "min_snap_date": min_snap,
+                "run_date": effective_run_date,
             }).fetchone()
 
         if row is None:
-            # Fallback: estimate from IV using simplified model
-            return self._estimate_premium(db, ticker, strike, expiry, direction)
-
-        bid = float(row[0]) if row[0] and row[0] > 0 else 0.0
-        ask = float(row[1]) if row[1] and row[1] > 0 else 0.0
-        last = float(row[2]) if row[2] and row[2] > 0 else 0.0
-
-        if bid > 0 and ask > 0:
-            return (bid + ask) / 2.0
-        if last > 0:
-            return last
-        return None
-
-    def _estimate_premium(
-        self,
-        db: Engine,
-        ticker: str,
-        strike: float,
-        expiry: date,
-        direction: str,
-    ) -> float | None:
-        """Rough premium estimate from Black-Scholes when bid/ask unavailable."""
-        from physics.dealer_gamma import _d1, _d2
-        from scipy.stats import norm
-
-        spot = self._get_spot(db, ticker)
-        if spot <= 0:
             return None
 
-        T = max((expiry - date.today()).days, 1) / 365.0
-        r = 0.05
-        sigma = self._get_atm_iv(db, ticker) or 0.25
+        if len(row) >= 4 and row[3] is not None:
+            snap_d = _to_date(row[3])
+            if snap_d is None or snap_d < min_snap or snap_d > effective_run_date:
+                return None
 
-        d1 = _d1(spot, strike, T, r, sigma)
-        d2 = _d2(spot, strike, T, r, sigma)
+        bid = _positive_finite(row[0])
+        ask = _positive_finite(row[1])
+        if bid is None or ask is None or ask < bid:
+            return None
 
-        if direction == "CALL":
-            price = spot * norm.cdf(d1) - strike * math.exp(-r * T) * norm.cdf(d2)
-        else:
-            price = strike * math.exp(-r * T) * norm.cdf(-d2) - spot * norm.cdf(-d1)
-
-        return max(price, 0.01)
+        return ask + FEE_PER_SHARE
 
     def _compute_target_price(
         self,
@@ -1083,33 +1401,54 @@ class OptionsRecommender:
         strike: float,
         direction: str,
         gex_profile: dict,
-    ) -> float:
-        """Set target from GEX expected move (gamma wall distance).
+        *,
+        iv: float | None = None,
+        dte: float | None = None,
+        horizon_days: float | None = None,
+        half_spread: float = 0.0,
+        fee_per_share: float = FEE_PER_SHARE,
+        risk_free_rate: float = RISK_FREE_RATE,
+    ) -> float | None:
+        """Reprice the option at target underlying & remaining time via Black-Scholes.
 
-        If GEX data available: target is based on distance to gamma wall.
-        Otherwise: use 2x entry as conservative target.
+        Reuses ``analysis.vol_surface._bs_call_price`` / ``_bs_put_price`` (which
+        delegate to ``physics.greeks.black_scholes.d1`` via ``physics.dealer_gamma``).
+        Returns the net exit value at target: repriced premium minus half the entry
+        spread minus the exit leg fee. Returns None if ``iv`` or ``dte`` is missing.
         """
-        if not gex_profile:
-            return entry_price * 2.0
+        from analysis.vol_surface import _bs_call_price, _bs_put_price
+
+        sigma = _positive_finite(iv)
+        dte_f = _positive_finite(dte)
+        spot_f = _positive_finite(spot)
+        strike_f = _positive_finite(strike)
+        if sigma is None or dte_f is None or spot_f is None or strike_f is None:
+            return None
+
+        if horizon_days is None:
+            horizon = dte_f * TARGET_HORIZON_DTE_FRACTION
+        else:
+            horizon = max(0.0, min(float(horizon_days), dte_f))
+
+        t_rem = max(0.0, (dte_f - horizon) / 365.0)
+        t_horizon = max(horizon, 1.0) / 365.0
 
         if direction == "CALL":
-            call_wall = gex_profile.get("call_wall") or 0
-            if call_wall and call_wall > spot:
-                # Expected move: spot -> call wall
-                move_pct = (call_wall - spot) / spot
-                # Option delta ~0.3 for OTM call; option moves ~ delta * underlying move
-                # But with gamma acceleration, the option move is amplified
-                option_move_mult = max(1.5, move_pct / max(entry_price / spot, 0.001))
-                return entry_price * (1 + option_move_mult)
+            call_wall = _positive_finite(gex_profile.get("call_wall")) if gex_profile else None
+            if call_wall is not None and call_wall > spot_f:
+                target_spot = call_wall
+            else:
+                target_spot = spot_f * math.exp(sigma * math.sqrt(t_horizon))
+            theo_price = _bs_call_price(target_spot, strike_f, t_rem, risk_free_rate, sigma)
         else:
-            put_wall = gex_profile.get("put_wall") or 0
-            if put_wall and put_wall < spot:
-                move_pct = (spot - put_wall) / spot
-                option_move_mult = max(1.5, move_pct / max(entry_price / spot, 0.001))
-                return entry_price * (1 + option_move_mult)
+            put_wall = _positive_finite(gex_profile.get("put_wall")) if gex_profile else None
+            if put_wall is not None and put_wall < spot_f:
+                target_spot = put_wall
+            else:
+                target_spot = spot_f * math.exp(-sigma * math.sqrt(t_horizon))
+            theo_price = _bs_put_price(target_spot, strike_f, t_rem, risk_free_rate, sigma)
 
-        # Fallback: 2x entry
-        return entry_price * 2.0
+        return max(0.0, theo_price - max(0.0, half_spread) - max(0.0, fee_per_share))
 
     def _compute_stop_loss(
         self,
@@ -1165,22 +1504,23 @@ class OptionsRecommender:
     def _compute_kelly(self, win_prob: float, payoff_ratio: float) -> float:
         """Kelly criterion with half-Kelly shrink, capped at ``self.max_kelly``.
 
-        Delegates the raw Kelly math to the canonical module-level
-        ``compute_kelly_fraction`` and then applies a half-Kelly shrink on
-        top (scanner pipeline is more aggressive than contagion — it has
-        the full sanity pipeline behind it).  Follows the pattern from
-        ``trading/paper_engine.py``.
+        Enforces ``MAX_KELLY_PER_TICKET`` (0.05) unless ``allow_kelly_cap_override=True``
+        was explicitly passed at construction.
         """
         if payoff_ratio <= 0 or win_prob <= 0:
             return 0.0
-        # Use the canonical full-Kelly, then shrink to half-Kelly and cap.
+        effective_cap = self.max_kelly
+        if not self._allow_kelly_cap_override:
+            effective_cap = min(effective_cap, MAX_KELLY_PER_TICKET)
+        if effective_cap <= 0 or not math.isfinite(effective_cap):
+            return 0.0
         full_kelly = compute_kelly_fraction(
             accuracy=win_prob,
             payout_ratio=payoff_ratio,
-            cap=1.0,  # no cap here — caller applies max_kelly below
+            cap=min(1.0, effective_cap * 2.0),
         )
         half_kelly = full_kelly / 2.0
-        return max(0.0, min(half_kelly, self.max_kelly))
+        return round(max(0.0, min(half_kelly, effective_cap)), 4)
 
     def _compute_confidence(
         self, opp, gex_profile: dict, direction: str,
@@ -1214,21 +1554,26 @@ class OptionsRecommender:
         db: Engine,
         opp,
         gex_profile: dict,
+        *,
+        run_date: date | None = None,
+        resolved_iv: float | None = None,
     ) -> dict:
         """Run 5-layer sanity check on a recommendation.
 
         Layers:
-          1. DATA_QUALITY: IV in 5-200%, OI > 100, spread < 25% of mid
-          2. DEALER_FLOW: GEX regime supports direction
-          3. CROSS_ASSET: momentum + news energy aligned with direction
-          4. LLM_REVIEW: structured prompt to LLM, graceful SKIP if unavailable
-          5. HISTORICAL_ANALOG: query past scanner results with similar setups
+          1. DATA_QUALITY (REQUIRED): fresh snapshot, IV in 5-200%, OI >= 100, valid spread <= 25% of mid
+          2. DEALER_FLOW (OPTIONAL): GEX regime supports direction
+          3. CROSS_ASSET (OPTIONAL): momentum + news energy aligned with direction
+          4. LLM_REVIEW (OPTIONAL): structured prompt to LLM, graceful SKIP if unavailable
+          5. HISTORICAL_ANALOG (OPTIONAL): query past scanner results with similar setups
 
         Each returns {status: "PASS"/"FAIL"/"SKIP", reason: "..."}
         """
         sanity: dict[str, dict[str, str]] = {}
 
-        sanity["DATA_QUALITY"] = self._sanity_data_quality(rec, db)
+        sanity["DATA_QUALITY"] = self._sanity_data_quality(
+            rec, db, run_date=run_date, resolved_iv=resolved_iv,
+        )
         sanity["DEALER_FLOW"] = self._sanity_dealer_flow(rec, gex_profile)
         sanity["CROSS_ASSET"] = self._sanity_cross_asset(rec, db)
         sanity["LLM_REVIEW"] = self._sanity_llm_review(rec, opp, gex_profile)
@@ -1245,48 +1590,83 @@ class OptionsRecommender:
         return sanity
 
     def _sanity_data_quality(
-        self, rec: OptionsRecommendation, db: Engine,
+        self,
+        rec: OptionsRecommendation,
+        db: Engine,
+        *,
+        run_date: date | None = None,
+        resolved_iv: float | None = None,
     ) -> dict[str, str]:
-        """Layer 1: Data quality checks.
+        """Layer 1 (REQUIRED): Contract-specific data quality, liquidity, and freshness checks.
 
+        Filters by exact (ticker, strike, expiry, opt_type) and fresh snap_date window
+        using bound parameters:
+        - Snapshot from current or previous trading session
         - IV in 5-200%
-        - OI > 100
-        - Spread < 25% of mid
+        - OI >= 100
+        - Valid two-sided bid/ask quote with spread <= 25% of mid
         """
         opt_type = "call" if rec.direction == "CALL" else "put"
+        effective_run_date = run_date or date.today()
+        min_snap = min_fresh_snap_date(effective_run_date)
+        expiry_d = _to_date(rec.expiry)
+        if expiry_d is None:
+            return {"status": "FAIL", "reason": f"Invalid recommended expiry {rec.expiry!r}"}
 
         with db.connect() as conn:
             row = conn.execute(visible_sql("""
-                SELECT implied_vol, open_interest, bid, ask
+                SELECT implied_vol, open_interest, bid, ask, snap_date
                 FROM """ + VISIBLE_SNAPSHOTS + """ s
                 WHERE ticker = :ticker
                   AND strike = :strike
+                  AND expiry = :expiry
                   AND opt_type = :opt_type
+                  AND snap_date >= :min_snap_date
+                  AND snap_date <= :run_date
                 ORDER BY snap_date DESC
                 LIMIT 1
             """), {
                 "ticker": rec.ticker,
                 "strike": rec.strike,
+                "expiry": expiry_d,
                 "opt_type": opt_type,
+                "min_snap_date": min_snap,
+                "run_date": effective_run_date,
             }).fetchone()
 
         if row is None:
-            return {"status": "SKIP", "reason": "No snapshot data for strike — using estimated premium"}
+            return {
+                "status": "FAIL",
+                "reason": "No fresh snapshot data for recommended contract",
+            }
 
-        iv = float(row[0]) if row[0] else 0
-        oi = int(row[1]) if row[1] else 0
-        bid = float(row[2]) if row[2] else 0
-        ask = float(row[3]) if row[3] else 0
+        if len(row) >= 5 and row[4] is not None:
+            snap_d = _to_date(row[4])
+            if snap_d is None or snap_d < min_snap or snap_d > effective_run_date:
+                return {
+                    "status": "FAIL",
+                    "reason": f"Snapshot date {row[4]} is outside fresh window [{min_snap}, {effective_run_date}]",
+                }
+
+        row_iv = _positive_finite(row[0])
+        iv = row_iv if row_iv is not None else _positive_finite(resolved_iv)
+        oi = int(row[1]) if row[1] is not None else 0
+        bid = _positive_finite(row[2])
+        ask = _positive_finite(row[3])
 
         issues = []
 
-        if iv < self._IV_MIN or iv > self._IV_MAX:
+        if iv is None:
+            issues.append("Implied volatility missing")
+        elif iv < self._IV_MIN or iv > self._IV_MAX:
             issues.append(f"IV {iv:.1%} outside sane range ({self._IV_MIN:.0%}-{self._IV_MAX:.0%})")
 
         if oi < self._MIN_OI:
             issues.append(f"OI {oi} below minimum {self._MIN_OI}")
 
-        if bid > 0 and ask > 0:
+        if bid is None or ask is None or ask < bid:
+            issues.append(f"Invalid bid/ask quote (bid={row[2]}, ask={row[3]})")
+        else:
             mid = (bid + ask) / 2.0
             spread_pct = (ask - bid) / mid if mid > 0 else 1.0
             if spread_pct > self._MAX_SPREAD_PCT:
@@ -1295,7 +1675,7 @@ class OptionsRecommender:
         if issues:
             return {"status": "FAIL", "reason": "; ".join(issues)}
 
-        return {"status": "PASS", "reason": "IV, OI, and spread within acceptable bounds"}
+        return {"status": "PASS", "reason": "Fresh snapshot with IV, OI, and spread within acceptable bounds"}
 
     def _sanity_dealer_flow(
         self, rec: OptionsRecommendation, gex_profile: dict,
@@ -1586,31 +1966,65 @@ Respond with ONLY the JSON object."""
 
     # ── Database Helpers ─────────────────────────────────────────────
 
-    def _load_chain(self, db: Engine, ticker: str) -> pd.DataFrame:
-        """Load options chain from database (latest snap_date)."""
+    def _load_chain(
+        self, db: Engine, ticker: str, run_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Load fresh options chain from database (current or previous trading session).
+
+        DTE is measured from ``run_date`` (not ``snap_date``).
+        """
+        effective_run_date = run_date or date.today()
+        min_snap = min_fresh_snap_date(effective_run_date)
+
         with db.connect() as conn:
             rows = conn.execute(visible_sql("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
-                       expiry, (expiry - snap_date) AS dte, bid, ask
+                       expiry, bid, ask, snap_date
                 FROM """ + VISIBLE_SNAPSHOTS + """ s
                 WHERE ticker = :ticker
                   AND snap_date = (
-                      SELECT MAX(snap_date) FROM """ + VISIBLE_SNAPSHOTS + """ s_latest WHERE ticker = :ticker
+                      SELECT MAX(snap_date)
+                      FROM """ + VISIBLE_SNAPSHOTS + """ s_latest
+                      WHERE ticker = :ticker
+                        AND snap_date >= :min_snap_date
+                        AND snap_date <= :run_date
                   )
+                  AND snap_date >= :min_snap_date
+                  AND snap_date <= :run_date
                   AND open_interest > 0
-                  AND expiry > CURRENT_DATE
+                  AND expiry > :run_date
                 ORDER BY expiry, strike
-            """), {"ticker": ticker}).fetchall()
+            """), {
+                "ticker": ticker,
+                "min_snap_date": min_snap,
+                "run_date": effective_run_date,
+            }).fetchall()
 
         if not rows:
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=[
             "strike", "opt_type", "open_interest", "implied_volatility",
-            "expiry", "dte", "bid", "ask",
+            "expiry", "bid", "ask", "snap_date",
         ])
-        df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, "days") else int(x))
-        return df[df["dte"] > 0]
+        df["snap_date"] = df["snap_date"].apply(_to_date)
+        df["expiry"] = df["expiry"].apply(_to_date)
+        df = df[
+            df["snap_date"].notna()
+            & df["expiry"].notna()
+            & (df["snap_date"] >= min_snap)
+            & (df["snap_date"] <= effective_run_date)
+        ].copy()
+        if df.empty:
+            return pd.DataFrame()
+
+        latest_snap = df["snap_date"].max()
+        df = df[df["snap_date"] == latest_snap].copy()
+        df["dte"] = df["expiry"].apply(lambda exp: (exp - effective_run_date).days)
+        df = df[df["dte"] > 0].copy()
+        df.attrs["snap_date"] = latest_snap
+        df.attrs["run_date"] = effective_run_date
+        return df
 
     def _get_spot(self, db: Engine, ticker: str) -> float:
         """Get latest spot price for a ticker."""
@@ -1628,17 +2042,27 @@ Respond with ONLY the JSON object."""
             }).fetchone()
         return float(row[0]) if row else 0.0
 
-    def _get_atm_iv(self, db: Engine, ticker: str) -> float | None:
-        """Get ATM implied volatility from latest options signals."""
+    def _get_atm_iv(
+        self, db: Engine, ticker: str, run_date: date | None = None,
+    ) -> float | None:
+        """Get ATM implied volatility from latest fresh options signals."""
+        effective_run_date = run_date or date.today()
+        min_snap = min_fresh_snap_date(effective_run_date)
         with db.connect() as conn:
             row = conn.execute(visible_sql("""
                 SELECT iv_atm
                 FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :ticker
+                  AND signal_date >= :min_snap_date
+                  AND signal_date <= :run_date
                 ORDER BY signal_date DESC
                 LIMIT 1
-            """), {"ticker": ticker}).fetchone()
-        return float(row[0]) if row and row[0] else None
+            """), {
+                "ticker": ticker,
+                "min_snap_date": min_snap,
+                "run_date": effective_run_date,
+            }).fetchone()
+        return _positive_finite(row[0]) if row else None
 
     # ── Formatting ───────────────────────────────────────────────────
 

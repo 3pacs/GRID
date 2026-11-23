@@ -28,23 +28,32 @@ def row(source=1,hours=1,error='SYNTH_NEW',status='FAILED'):
 
 def projection(path):
  tree=ast.parse(path.read_bytes())
- projected=('_normalize_source_key','_classify_pull_failure','_recovered_after','_held_source_names','diagnose_and_fix_pulls')
+ projected=('_normalize_source_key','_classify_pull_failure','_recovered_after','_held_source_names','_report_unrouted_failures','diagnose_and_fix_pulls')
  functions={n.name:n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in projected}
  if set(functions)!=set(projected):raise AssertionError('MISSING_PROJECTED_DIAGNOSTIC_DEPENDENCY')
+ # The actual no-route reason constant (a module-level assignment).
+ constants=[n for n in tree.body if isinstance(n,ast.Assign) and [getattr(t,'id',None) for t in n.targets]==['UNROUTED_GUEST_REASON']]
+ if len(constants)!=1:raise AssertionError('MISSING_UNROUTED_GUEST_REASON')
 
  # The optional-relation probe is the actual hermes_health helper.
  health=ast.parse(HEALTH.read_bytes())
  probe=[n for n in health.body if isinstance(n,ast.FunctionDef) and n.name=='_relation_exists']
  if len(probe)!=1:raise AssertionError('MISSING_RELATION_PROBE')
  future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
- mod=ast.fix_missing_locations(ast.Module(body=[future,*probe,*(functions[name] for name in projected)],type_ignores=[]))
- log=Log();ns={'log':log,'json':json,'re':re,'datetime':dt.datetime,'timezone':dt.timezone,'_REPAIR_SCHEDULE_LOCK':threading.Lock(),'_REPAIR_RECOVERED_AT':{}};exec(compile(mod,str(path),'exec'),ns)
+ mod=ast.fix_missing_locations(ast.Module(body=[future,*probe,*constants,*(functions[name] for name in projected)],type_ignores=[]))
+ # _guest_pull_log_names imports the scheduler registry; this fixture names
+ # the one guest it derives today (tests/test_hermes_fixers_guest_attribution.py
+ # pins the real helper to the same set).
+ log=Log();ns={'log':log,'json':json,'re':re,'datetime':dt.datetime,'timezone':dt.timezone,'_REPAIR_SCHEDULE_LOCK':threading.Lock(),'_REPAIR_RECOVERED_AT':{},
+  '_UNROUTED_FAILURES_REPORTED':{},'_guest_pull_log_names':lambda:GUEST_PULL_LOG_NAMES};exec(compile(mod,str(path),'exec'),ns)
  return ns['diagnose_and_fix_pulls'],log
+
+GUEST_PULL_LOG_NAMES=frozenset({'smart:finra_dix'})
 
 PROBE='SELECT to_regclass(:relation) IS NOT NULL'
 
 class Adapter:
- def __init__(self,db):self.db=db;self.raw_queries=[];self.adapted_queries=[];self.probes=[];self.rows=None;self.value=None
+ def __init__(self,db):self.db=db;self.raw_queries=[];self.adapted_queries=[];self.probes=[];self.params=[];self.rows=None;self.value=None
  def connect(self):return contextlib.nullcontext(self)
  def execute(self,query,params=None):
   if query==PROBE:
@@ -52,16 +61,24 @@ class Adapter:
    self.probes.append(params['relation'])
    self.value=self.db.execute("SELECT COUNT(*)>0 FROM sqlite_master WHERE type='table' AND name=?",(params['relation'],)).fetchone()[0]
    return self
-  if params is not None:raise AssertionError('UNEXPECTED_PARAMS')
-  self.raw_queries.append(query)
-  if not isinstance(query,str) or not query.startswith('SELECT '):raise AssertionError('SELECT_ONLY_INERT_FIXTURE')
+  # The pull_log statement binds exactly the guest pull_log names; the
+  # raw_series-only statement binds nothing.
+  if not isinstance(query,str):raise AssertionError('SELECT_ONLY_INERT_FIXTURE')
+  if params is not None and set(params)!={'guest_pull_log_names'}:raise AssertionError('UNEXPECTED_PARAMS')
+  if ('pull_log' in query)!=(params is not None):raise AssertionError('GUEST_PARAMS_MISMATCH')
+  self.raw_queries.append(query);self.params.append(params)
+  if not query.startswith('SELECT '):raise AssertionError('SELECT_ONLY_INERT_FIXTURE')
   # Sole dialect substitutions: TEXT fixture already represents payload::text;
-  # fixed synthetic window replaces the PostgreSQL current-time expression.
+  # fixed synthetic window replaces the PostgreSQL current-time expression;
+  # SQLite's json_each list stands in for PostgreSQL's = ANY(array).
   if query.count("NOW() - INTERVAL '24 hours'")!=1:raise AssertionError('UNEXPECTED_WINDOW_DIALECT')
-  adapted=query.replace('::text','').replace("NOW() - INTERVAL '24 hours'",':window_start')
-  if '::' in adapted:raise AssertionError('UNSUPPORTED_CAST')
+  adapted=(query.replace('::text','').replace("NOW() - INTERVAL '24 hours'",':window_start')
+           .replace('= ANY(:guest_pull_log_names)','IN (SELECT value FROM json_each(:guest_pull_log_names))'))
+  if '::' in adapted or 'ANY(' in adapted:raise AssertionError('UNSUPPORTED_DIALECT')
   self.adapted_queries.append(adapted)
-  raw=self.db.execute(adapted,{'window_start':WINDOW}).fetchall()
+  binds={'window_start':WINDOW}
+  if params is not None:binds['guest_pull_log_names']=json.dumps(list(params['guest_pull_log_names']))
+  raw=self.db.execute(adapted,binds).fetchall()
   self.rows=[(x[0],x[1],dt.datetime.fromisoformat(x[2]) if x[2] else None,x[3]) for x in raw]
   return self
  def fetchall(self):return self.rows
@@ -273,6 +290,79 @@ class MissingPullLogTests(unittest.TestCase):
   # operator records it), never become "no failed pulls" or a raw-only result.
   with self.assertRaises(sqlite3.OperationalError):
    exercise([row(source=1,hours=1)],pull_log_ddl='CREATE TABLE pull_log(puller_name TEXT,source_id INTEGER,started_at TEXT,completed_at TEXT,status TEXT)')
+
+SV=((4679,'FINRA_SHORT_VOLUME'),(1,'SYNTH_A'))
+
+class GuestPullLogTests(unittest.TestCase):
+ """smart:finra_dix logs its runs under FINRA_SHORT_VOLUME's source_id (2026-11-21).
+
+ Naming a run by its catalog row read a DIX failure as a short-volume failure
+ (repaired by re-running the short-volume puller, 2026-11-18 07:53Z) and let a
+ DIX success mark a short-volume failure recovered.
+ """
+ def test_dix_failure_is_named_by_its_own_pull_log_name(self):
+  a,result,logs=exercise([],catalog=SV,pull_log=[plrow('smart:finra_dix',source=4679,error='DIX_FAIL')])
+  self.assertEqual(a.rows,[('smart:finra_dix',1,NOW-dt.timedelta(hours=1),'DIX_FAIL')])
+  self.assertEqual(a.params,[{'guest_pull_log_names':['smart:finra_dix']}])
+  # Not diagnosed or retried under either name: counted as no handler.
+  self.assertEqual(result['skipped_no_handler'],1)
+  self.assertNotIn('fix_actions',result)
+  self.assertTrue(any(level=='WARNING' and text.startswith('Not repairing smart:finra_dix — no retry handler')
+                      for level,text in logs))
+
+ def test_dix_success_does_not_recover_a_short_volume_failure(self):
+  a,result,_=exercise([],catalog=SV,pull_log=[
+   plrow('smart:finra_short_volume',source=4679,hours=3,error='SV_FAIL'),
+   plrow('smart:finra_dix',source=4679,hours=1,error=None,status='SUCCESS'),
+  ])
+  self.assertEqual(a.rows,[('FINRA_SHORT_VOLUME',1,NOW-dt.timedelta(hours=3),'SV_FAIL')])
+  self.assertEqual(result['fix_actions'],{})
+  self.assertEqual(result['skipped_no_handler'],0)
+
+ def test_dix_success_does_not_recover_a_short_volume_raw_series_failure(self):
+  a,_,_=exercise([row(source=4679,hours=3,error='SV_RAW_FAIL')],catalog=SV,
+                 pull_log=[plrow('smart:finra_dix',source=4679,hours=1,error=None,status='SUCCESS')])
+  self.assertEqual(a.rows,[('FINRA_SHORT_VOLUME',1,NOW-dt.timedelta(hours=3),'SV_RAW_FAIL')])
+
+ def test_short_volume_own_later_success_still_recovers_it(self):
+  a,_,_=exercise([],catalog=SV,pull_log=[
+   plrow('smart:finra_short_volume',source=4679,hours=3,error='SV_FAIL'),
+   plrow('smart:finra_short_volume',source=4679,hours=1,error=None,status='SUCCESS'),
+  ])
+  self.assertEqual(a.rows,[])
+
+ def test_short_volume_success_does_not_recover_a_dix_failure(self):
+  a,_,_=exercise([],catalog=SV,pull_log=[
+   plrow('smart:finra_dix',source=4679,hours=3,error='DIX_FAIL'),
+   plrow('smart:finra_short_volume',source=4679,hours=1,error=None,status='SUCCESS'),
+  ])
+  self.assertEqual(a.rows,[('smart:finra_dix',1,NOW-dt.timedelta(hours=3),'DIX_FAIL')])
+
+ def test_dix_and_short_volume_failures_stay_separate(self):
+  a,result,logs=exercise([],catalog=SV,pull_log=[
+   plrow('smart:finra_short_volume',source=4679,hours=2,error='SV_FAIL'),
+   plrow('smart:finra_dix',source=4679,hours=1,error='DIX_FAIL'),
+   plrow('smart:finra_dix',source=4679,hours=4,error='DIX_OLDER'),
+  ])
+  self.assertEqual(sorted(a.rows),[('FINRA_SHORT_VOLUME',1,NOW-dt.timedelta(hours=2),'SV_FAIL'),
+                                   ('smart:finra_dix',2,NOW-dt.timedelta(hours=1),'DIX_FAIL')])
+  # The short-volume failure still reaches the repair path; DIX does not.
+  self.assertEqual(result['fix_actions'],{})
+  self.assertEqual(result['skipped_no_handler'],1)
+  failed=next(text for level,text in logs if level=='WARNING' and text.startswith('Failed sources'))
+  self.assertIn("'FINRA_SHORT_VOLUME'",failed);self.assertIn("'smart:finra_dix'",failed)
+
+ def test_single_writer_source_is_unchanged(self):
+  # An ordinary source: named by its catalog row, recovered by its own later run.
+  a,_,_=exercise([],catalog=SV,pull_log=[plrow('smart:bis',source=1,hours=1,error='BIS_FAIL')])
+  self.assertEqual(a.rows,[('SYNTH_A',1,NOW-dt.timedelta(hours=1),'BIS_FAIL')])
+  a,_,_=exercise([],catalog=SV,pull_log=[plrow('smart:bis',source=1,hours=3,error='BIS_FAIL'),
+                                         plrow('smart:bis',source=1,hours=1,error=None,status='SUCCESS')])
+  self.assertEqual(a.rows,[])
+
+ def test_guest_name_without_a_source_id_is_still_its_own(self):
+  a,_,_=exercise([],catalog=SV,pull_log=[plrow('smart:finra_dix',source=None,error='DIX_FAIL')])
+  self.assertEqual([r[0] for r in a.rows],['smart:finra_dix'])
 
 if __name__=='__main__':
  parser=argparse.ArgumentParser();parser.add_argument('--source',type=Path,default=SOURCE)
