@@ -11,7 +11,9 @@ those rows a reader may see. The rule:
 * an **admin request** sees every row;
 * the **Oracle forecast engine** sees every row (owner decision 2026-11-23,
   :data:`ORACLE_READS_SCHWAB`): ``oracle/engine.py`` and the entry quote it
-  freezes through ``oracle/entry_price_policy.load_quote_reference``;
+  freezes through ``oracle/entry_price_policy.load_quote_reference``. The
+  predictions it builds from Schwab rows are themselves hidden from
+  non-admin readers (``VISIBLE_ORACLE_PREDICTIONS``, below);
 * every other reader -- a contributor request, and every consumer that is not
   a request at all (e-mail digests, AstroGrid publication in
   ``oracle/publish.py``, chat/LLM context, scanners and engines whose output is
@@ -76,9 +78,9 @@ SCHWAB_PROVIDER = "schwab"
 #: schwab". The Oracle forecast engine passes this as its ``include_schwab``
 #: flag, so it reads Schwab captures as an admin request does: its entry quote
 #: (``oracle/entry_price_policy.load_quote_reference``) and its options signals
-#: (``oracle/engine.py``). Only those two Oracle call sites may pass it. Every
-#: other reader keeps its own flag, and AstroGrid publication
-#: (``oracle/publish.py``) stays filtered.
+#: (``oracle/engine.py``), plus the engine's check that tags what it built from
+#: them. Only those Oracle call sites may pass it. Every other reader keeps its
+#: own flag, and AstroGrid publication (``oracle/publish.py``) stays filtered.
 ORACLE_READS_SCHWAB: bool = True
 # The Schwab options provider was written on this day (#1299). A capture of
 # unknown provenance dated on or after it may have come from Schwab.
@@ -184,6 +186,32 @@ LATEST_DAILY_SIGNALS_ALL = (
     " WHERE schwab_v.signal_date = (SELECT MAX(schwab_m.signal_date) FROM options_daily_signals schwab_m))"
 )
 
+# ── Oracle predictions built from Schwab captures (2026-11-23) ─────────
+#
+# The Oracle reads Schwab rows (ORACLE_READS_SCHWAB), so a prediction it builds
+# from them carries Schwab data: the entry price, the target, the options
+# signal values, and every return computed from the entry. The owner's
+# follow-up decision, the same day: such predictions stay out of contributors'
+# sight. Hiding the prices alone is not enough, because a target, an expected
+# move or a scored return gives the entry back from the public close. The
+# engine tags each one in ``flow_context`` (``ORACLE_PRIVATE_USE_KEY`` =
+# ``ORACLE_PRIVATE_USE_SCHWAB``), abstentions included, since their receipt
+# holds the price. Every reader that serves people reads through
+# ``VISIBLE_ORACLE_PREDICTIONS``, with the alias ``oracle_predictions`` so
+# its column references are unchanged. An admin request gets the plain table,
+# as with the options constants. ``tests/test_oracle_predictions_read_guard.py``
+# fails on a new raw read.
+ORACLE_PRIVATE_USE_KEY = "private_use"
+ORACLE_PRIVATE_USE_SCHWAB = "schwab"
+
+#: ``oracle_predictions`` without the rows the Oracle built from Schwab captures.
+#: No bound value: the tag is a literal. A NULL ``flow_context`` is not tagged.
+VISIBLE_ORACLE_PREDICTIONS = (
+    "(SELECT schwab_o.* FROM oracle_predictions schwab_o"
+    " WHERE COALESCE(schwab_o.flow_context ->> '" + ORACLE_PRIVATE_USE_KEY + "', '')"
+    " <> '" + ORACLE_PRIVATE_USE_SCHWAB + "')"
+)
+
 # What an admin reads instead of each constant. No constant is a substring of
 # another (tests/test_options_provenance.py), so the order does not matter.
 _ADMIN_FORM: dict[str, str] = {
@@ -194,12 +222,24 @@ _ADMIN_FORM: dict[str, str] = {
     VISIBLE_SNAPSHOTS: "options_snapshots",
     VISIBLE_CAPTURE_BATCH_DAYS: "options_capture_batches",
     VISIBLE_CAPTURE_BATCHES: "options_capture_batches",
+    VISIBLE_ORACLE_PREDICTIONS: "oracle_predictions",
 }
 
 
 def include_schwab_rows(flag: Any) -> bool:
     """True only for an explicit ``True`` (an admin request). Anything else excludes."""
     return flag is True
+
+
+def oracle_predictions_from(include_schwab: Any = False) -> str:
+    """The ``FROM`` source of ``oracle_predictions`` for this viewer.
+
+    The plain table for an admin request, ``VISIBLE_ORACLE_PREDICTIONS``
+    otherwise. Callers alias it ``oracle_predictions`` (or their own alias), so
+    the statement's column references do not change. Chosen in Python from two
+    constants; no caller value reaches the SQL text.
+    """
+    return "oracle_predictions" if include_schwab_rows(include_schwab) else VISIBLE_ORACLE_PREDICTIONS
 
 
 def visible_sql_text(sql: str, include_schwab: Any = False) -> str:

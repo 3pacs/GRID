@@ -38,7 +38,21 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.options_provenance import ORACLE_READS_SCHWAB, VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import (
+    ORACLE_PRIVATE_USE_KEY,
+    ORACLE_PRIVATE_USE_SCHWAB,
+    ORACLE_READS_SCHWAB,
+    VISIBLE_CAPTURE_BATCHES,
+    VISIBLE_DAILY_SIGNALS,
+    visible_sql,
+)
+
+# The one options-signal row the Oracle reads per ticker (``_gather_signals``),
+# shared with the Schwab-input check so the two always pick the same row.
+_OPTIONS_SIGNAL_ROW = (
+    " ods WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)"
+    " ORDER BY signal_date DESC LIMIT 1"
+)
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
@@ -1003,10 +1017,8 @@ class OracleEngine:
             opt_row = conn.execute(visible_sql("""
                 SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
                        total_oi, term_structure_slope, oi_concentration
-                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
-                WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)
-                ORDER BY signal_date DESC LIMIT 1
-            """, ORACLE_READS_SCHWAB), {"t": ticker}).fetchone()
+                FROM """ + VISIBLE_DAILY_SIGNALS + _OPTIONS_SIGNAL_ROW,
+                ORACLE_READS_SCHWAB), {"t": ticker}).fetchone()
 
         # Feature z-scores over the trailing window, PIT-correct as of today.
         meta = {int(r[0]): (str(r[1]), str(r[2])) for r in feat_rows}
@@ -1580,6 +1592,10 @@ class OracleEngine:
         reference = self._get_entry_price_reference(ticker)
         spot = reference.get("price") if reference.get("status") == "measured" else None
         flow_ctx = {**(flow_ctx or {}), "entry_price_basis": reference}
+        # Every prediction below (abstentions too: their receipt holds the
+        # price) inherits this tag, which keeps it out of non-admin readers.
+        if self._schwab_private_inputs(ticker, reference):
+            flow_ctx[ORACLE_PRIVATE_USE_KEY] = ORACLE_PRIVATE_USE_SCHWAB
         if not spot:
             log.warning(
                 "Oracle: no spot price for {t} - storing no_data placeholder per model",
@@ -2636,6 +2652,40 @@ class OracleEngine:
             log.warning("Oracle reference unavailable for {t}", t=ticker)
             return {"status": "unavailable", "ticker": ticker, "price": None,
                     "reason": "timestamped reference lookup failed"}
+
+    def _schwab_private_inputs(self, ticker: str, reference: dict[str, Any]) -> bool:
+        """True when this ticker's inputs include a Schwab capture. Fails closed.
+
+        Two inputs can carry Schwab data. One is the frozen entry receipt: its
+        batch is Schwab when a non-admin reader cannot see it, whatever the
+        receipt's status, because an unqualified receipt still holds the price.
+        The other is the options-signal row ``_gather_signals`` reads: it is
+        Schwab when the non-admin view returns a different (earlier) day. Both
+        use the provenance module's own rule, so this tag can never disagree
+        with what a filtered reader would have seen. If the check fails, the
+        prediction is tagged.
+        """
+        try:
+            with self.engine.connect() as conn:
+                batch_id = reference.get("capture_batch_id") if isinstance(reference, dict) else None
+                if batch_id:
+                    public_batch = conn.execute(visible_sql(
+                        "SELECT 1 FROM " + VISIBLE_CAPTURE_BATCHES
+                        + " b WHERE b.capture_batch_id = :id"
+                    ), {"id": batch_id}).fetchone()
+                    if public_batch is None:
+                        return True
+                day_sql = "SELECT signal_date FROM " + VISIBLE_DAILY_SIGNALS + _OPTIONS_SIGNAL_ROW
+                oracle_day = conn.execute(visible_sql(day_sql, ORACLE_READS_SCHWAB), {"t": ticker}).fetchone()
+                if oracle_day is not None:
+                    public_day = conn.execute(visible_sql(day_sql), {"t": ticker}).fetchone()
+                    if public_day is None or public_day[0] != oracle_day[0]:
+                        return True
+        except Exception as exc:  # noqa: BLE001 - fail closed: an unproven input is private
+            log.warning("Oracle: Schwab-input check failed for {t}, tagging private: {e}",
+                        t=ticker, e=str(exc))
+            return True
+        return False
 
     def _get_spot_price(self, ticker: str) -> float | None:
         """Compatibility price-only view of the qualified reference receipt."""

@@ -34,6 +34,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -818,7 +819,7 @@ class EntityResolver:
                 rows = conn.execute(text("""
                     SELECT id, ticker, prediction_type, direction,
                            confidence, created_at, signals
-                    FROM oracle_predictions
+                    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
                     WHERE signals::text ILIKE :pattern
                     LIMIT 100
                 """), {
