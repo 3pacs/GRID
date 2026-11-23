@@ -187,6 +187,29 @@ FRED_SERIES_LIST: list[str] = [
     # ── Money market / liquidity ──
     "MMMFFAQ027S",         # Money market fund total assets (quarterly)
     "WRMFNS",              # Retail money market funds (weekly)
+    # ── Dollar plumbing & reserve scarcity (2026-11-21) ──
+    # Raw data only: the entity_map targets of these ids have no
+    # feature_registry row, so nothing reaches resolved_series or a model
+    # until a registration lands. DTB3 is also pulled by
+    # ingestion/altdata/repo_market.py under its own id (treasury_bill_3m).
+    "IORB",                # Interest Rate on Reserve Balances (daily)
+    "WRESBAL",             # Reserve Balances with Federal Reserve Banks (weekly H.4.1)
+    "WLCFLPCL",            # Loans: Primary Credit, Wednesday level (weekly H.4.1)
+    "RPONTSYD",            # Overnight repo operations, Treasuries purchased (daily; SRF usage)
+    "CPN3M",               # 3-Month AA Nonfinancial Commercial Paper Rate (daily)
+    "DTB3",                # 3-Month Treasury Bill Secondary Market Rate (daily)
+    # ── Regional Fed manufacturing surveys (diffusion indexes, monthly) ──
+    "GACDISA066MSFRBNY",   # Empire State Manufacturing Survey: General Business Conditions
+    "GACDFSA066MSFRBPHI",  # Philadelphia Fed Manufacturing Business Outlook: General Activity
+    "BACTSAMFRBDAL",       # Dallas Fed Texas Manufacturing Outlook: General Business Activity
+    # ── Policy path and foreign official custody (2026-11-22) ──
+    # Raw data only, no entity_map target. DFEDTARU is read by the market-state
+    # record (intelligence/regime/market_state.py, fed_priced_move_next_meeting)
+    # straight from raw_series; WMTSECL1 starts the history Codex's SRLI pilot
+    # (custody/auction stress, GRID-COMPOSITE-TRIAGE-20261122) needs. Nothing
+    # else reads either.
+    "DFEDTARU",            # Federal Funds Target Range - Upper Limit (daily)
+    "WMTSECL1",            # Treasuries held in custody for foreign official accounts, Wednesday level (weekly H.4.1)
 ]
 
 # Minimum delay between FRED API calls (seconds)

@@ -67,3 +67,13 @@ def test_assess_pocket_lining_flags_politician_committee_overlap():
         ),
         "severity": "high",
     }]
+
+
+def test_fund_manager_divergence_reads_no_13f_rows():
+    """13F is non-directional (owner decision 2026-11-23): the fund side of
+    the fund-manager divergence check came from 13F 'institutional'
+    signal_sources rows, so the check no longer reads them."""
+    import pathlib
+
+    src = pathlib.Path("intelligence/pocket_lining.py").read_text()
+    assert "source_type = 'institutional'" not in src

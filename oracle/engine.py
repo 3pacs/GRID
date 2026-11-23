@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import threading
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -36,7 +38,40 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import (
+    ORACLE_PRIVATE_USE_KEY,
+    ORACLE_PRIVATE_USE_SCHWAB,
+    SIGNAL_ROW_IS_SCHWAB,
+    VISIBLE_CAPTURE_BATCHES,
+    VISIBLE_DAILY_SIGNALS,
+    oracle_reads_schwab,
+    provider_is_schwab,
+    visible_sql,
+)
+
+# The one options-signal row the Oracle reads per ticker, values and lineage
+# in one statement (``OracleEngine._read_options_signal``).
+_OPTIONS_SIGNAL_SQL = (
+    "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,"
+    " total_oi, term_structure_slope, oi_concentration, "
+    + SIGNAL_ROW_IS_SCHWAB + " AS schwab_private"
+    " FROM " + VISIBLE_DAILY_SIGNALS
+    + " ods WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)"
+    " ORDER BY signal_date DESC LIMIT 1"
+)
+
+
+@dataclass(frozen=True)
+class OptionsSignalRead:
+    """The options-signal row one Oracle pass consumed, and whether it is Schwab-derived.
+
+    ``values`` is the eight signal columns, or ``None`` when the ticker has no
+    qualifying row. ``schwab_private`` comes from the same statement as the
+    values, so the prediction's tag describes exactly what it used.
+    """
+
+    values: tuple[Any, ...] | None
+    schwab_private: bool
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
@@ -75,6 +110,48 @@ class Signal:
 
 
 MAX_ACTOR_RECEIPT_BYTES = 16_384
+
+# Proportional anti-signal veto threshold: veto a call when opposing
+# directional weighted mass exceeds this fraction of total directional mass.
+OPPOSING_VETO_FRACTION: float = 0.40
+
+# Conversion factor from calendar-day horizon to trading-day horizon when
+# scaling daily trading-session realized volatility via sqrt(h_trading).
+TRADING_DAYS_PER_CALENDAR_DAY: float = 252.0 / 365.0
+
+# External cross-lens / regulatory anti-signal names that retain hard veto power.
+_HARD_VETO_ANTI_SIGNALS: frozenset[str] = frozenset({
+    "cross_lens_supply_shock",
+    "regulatory_threat",
+})
+
+# Process-level daily dedup state for unknown-polarity feature logging so the
+# set of unknown feature names is emitted at INFO once per process per day.
+_UNKNOWN_POLARITY_LOG_LOCK = threading.Lock()
+_UNKNOWN_POLARITY_LOGGED: dict[date, set[str]] = {}
+
+
+def _log_unknown_polarity_features(unknown_names: set[str], today: date) -> None:
+    """Log newly encountered unknown-polarity feature names at INFO once per day."""
+    if not unknown_names:
+        return
+    with _UNKNOWN_POLARITY_LOG_LOCK:
+        seen_today = _UNKNOWN_POLARITY_LOGGED.get(today)
+        if seen_today is None:
+            _UNKNOWN_POLARITY_LOGGED.clear()
+            seen_today = set()
+            _UNKNOWN_POLARITY_LOGGED[today] = seen_today
+        new_names = sorted(unknown_names - seen_today)
+        if new_names:
+            seen_today.update(new_names)
+    if new_names:
+        log.info(
+            "Oracle signal gather: {n} unknown-polarity feature(s) treated as "
+            "non-directional on {day}: {names}",
+            n=len(new_names),
+            day=today.isoformat(),
+            names=", ".join(new_names),
+        )
 
 
 def _inject_actor_evidence(signals: list[Signal], batch: dict[str, Any]) -> dict[str, Any]:
@@ -951,7 +1028,23 @@ class OracleEngine:
             self._pit_store_instance = store
         return store
 
-    def _gather_signals(self, ticker: str, families: list[str]) -> list[Signal]:
+    def _read_options_signal(self, ticker: str) -> OptionsSignalRead:
+        """Read this ticker's options-signal row with its lineage. Raises on a DB error.
+
+        The Oracle is the owner's private use (``oracle_reads_schwab()``), so a
+        Schwab-captured day counts once the operator has turned it on. A NULL
+        lineage reads as Schwab (fail closed).
+        """
+        with self.engine.connect() as conn:
+            row = conn.execute(visible_sql(_OPTIONS_SIGNAL_SQL, oracle_reads_schwab()),
+                               {"t": ticker}).fetchone()
+        if row is None:
+            return OptionsSignalRead(None, False)
+        return OptionsSignalRead(tuple(row[:8]), row[8] is None or bool(row[8]))
+
+    def _gather_signals(
+        self, ticker: str, families: list[str], options_read: OptionsSignalRead | None = None,
+    ) -> list[Signal]:
         """Gather all available signals for a ticker across specified families.
 
         Feature history is read through ``store.pit.PITStore`` so only
@@ -961,7 +1054,9 @@ class OracleEngine:
         ``resolved_series`` directly with no vintage filter — the lookahead
         CLAUDE.md forbids on inference paths (LEVER-PACKAGE.md §4.1 item 3).
         Options signals still come from ``options_daily_signals``, which is
-        same-day data with no revision history.
+        same-day data with no revision history. ``_oracle_one_ticker`` passes
+        the row it already read (and tagged the prediction from); a caller
+        without one gets a fresh read.
         """
         from datetime import timedelta
 
@@ -977,14 +1072,10 @@ class OracleEngine:
                 AND model_eligible = TRUE
             """), {"fams": families}).fetchall()
 
-            # Add options signals if available
-            opt_row = conn.execute(visible_sql("""
-                SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
-                       total_oi, term_structure_slope, oi_concentration
-                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
-                WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)
-                ORDER BY signal_date DESC LIMIT 1
-            """), {"t": ticker}).fetchone()
+        # Add options signals if available: the row the caller tagged from.
+        if options_read is None:
+            options_read = self._read_options_signal(ticker)
+        opt_row = options_read.values
 
         # Feature z-scores over the trailing window, PIT-correct as of today.
         meta = {int(r[0]): (str(r[1]), str(r[2])) for r in feat_rows}
@@ -1002,6 +1093,9 @@ class OracleEngine:
                 matrix = None
 
             if matrix is not None and not matrix.empty:
+                from oracle.feature_polarity import resolve_feature_polarity
+
+                unknown_polarity_names: set[str] = set()
                 for fid in matrix.columns:
                     fname, family = meta.get(int(fid), (None, None))
                     if fname is None:
@@ -1015,10 +1109,17 @@ class OracleEngine:
                     std = float(np.std(values)) if len(values) > 1 else 1.0
                     z = (latest - mean) / std if std > 0 else 0.0
 
-                    # Determine direction
-                    if z > 0.5:
+                    # Explicit equity-direction polarity (+1 bullish, -1 bearish, 0 non-directional).
+                    # Unknown features fail closed as non-directional (excluded from votes & coherence).
+                    polarity, polarity_source = resolve_feature_polarity(fname, family)
+                    if polarity_source == "unknown":
+                        unknown_polarity_names.add(fname)
+                    signed_z = polarity * z
+
+                    # Determine direction from polarity-adjusted z; preserve raw z on Signal for display.
+                    if signed_z > 0.5:
                         direction = "bullish"
-                    elif z < -0.5:
+                    elif signed_z < -0.5:
                         direction = "bearish"
                     else:
                         direction = "neutral"
@@ -1034,19 +1135,27 @@ class OracleEngine:
                         value=latest, z_score=round(z, 3),
                         direction=direction, weight=1.0,
                         freshness_hours=hours_old,
+                        provenance={
+                            "polarity": polarity,
+                            "polarity_source": polarity_source,
+                            "signed_z": round(signed_z, 3),
+                        },
                     ))
+                if unknown_polarity_names:
+                    _log_unknown_polarity_features(unknown_polarity_names, today)
 
         if opt_row:
             pcr, iv, skew, mp, spot, oi, term, conc = opt_row
+            # No >=63-obs PIT history helper exists on options_daily_signals for
+            # pcr or max_pain_gap; keep them as non-directional context (z=0,
+            # direction="neutral") so they cannot skew coherence without a real z.
             if pcr is not None:
-                pcr_dir = "bearish" if pcr > 1.2 else "bullish" if pcr < 0.7 else "neutral"
-                signals.append(Signal("pcr", "sentiment", pcr, 0, pcr_dir, 1.0, 0))
+                signals.append(Signal("pcr", "sentiment", pcr, 0.0, "neutral", 1.0, 0))
             if iv is not None:
-                signals.append(Signal("iv_atm", "vol", iv, 0, "neutral", 1.0, 0))
+                signals.append(Signal("iv_atm", "vol", iv, 0.0, "neutral", 1.0, 0))
             if mp is not None and spot:
                 mp_pct = (spot - mp) / spot * 100
-                mp_dir = "bearish" if mp_pct > 3 else "bullish" if mp_pct < -3 else "neutral"
-                signals.append(Signal("max_pain_gap", "sentiment", mp_pct, 0, mp_dir, 1.0, 0))
+                signals.append(Signal("max_pain_gap", "sentiment", mp_pct, 0.0, "neutral", 1.0, 0))
 
         return signals
 
@@ -1085,8 +1194,15 @@ class OracleEngine:
         signals: list[Signal],
         direction: str,
         ticker: str | None = None,
+        *,
+        external_anti_signals: list[AntiSignal] | None = None,
     ) -> list[AntiSignal]:
-        """Find signals that contradict the predicted direction."""
+        """Find signals that contradict the predicted direction.
+
+        When ``external_anti_signals`` is supplied (cached once per ticker in
+        ``_oracle_one_ticker``), those ticker-level anti-signals are reused
+        instead of re-querying supply-shock and regulatory tables per model.
+        """
         anti = []
         target_dir = "bullish" if direction in ("CALL", "LONG") else "bearish"
         contra_dir = "bearish" if target_dir == "bullish" else "bullish"
@@ -1104,9 +1220,12 @@ class OracleEngine:
                     severity=severity,
                 ))
 
-        if ticker:
+        if external_anti_signals is not None:
+            if direction in ("CALL", "LONG"):
+                anti.extend(external_anti_signals)
+        elif ticker:
             anti.extend(self._cross_lens_anti_signals(ticker, direction))
-            anti.extend(self._regulatory_anti_signals(ticker))
+            anti.extend(self._regulatory_anti_signals(ticker, direction))
 
         return sorted(anti, key=lambda a: -a.severity)
 
@@ -1175,8 +1294,15 @@ class OracleEngine:
         "critical": 1.0,
     }
 
-    def _regulatory_anti_signals(self, ticker: str) -> list[AntiSignal]:
-        """Surface recent high/critical regulatory threats."""
+    def _regulatory_anti_signals(
+        self,
+        ticker: str,
+        direction: str = "CALL",
+    ) -> list[AntiSignal]:
+        """Surface recent high/critical regulatory threats against bullish calls."""
+        if direction not in ("CALL", "LONG"):
+            return []
+
         sql = text(
             """
             SELECT regulator, action_type, event_date, severity, title, url
@@ -1258,12 +1384,18 @@ class OracleEngine:
         }
 
     def _compute_coherence(self, signals: list[Signal], direction: str) -> float:
-        """Measure how aligned signals are with the prediction direction."""
+        """Measure how aligned directional (non-zero z) signals are with direction."""
         if not signals:
             return 0.0
         target = "bullish" if direction in ("CALL", "LONG") else "bearish"
-        aligned = sum(1 for s in signals if s.direction == target)
-        opposed = sum(1 for s in signals if s.direction != target and s.direction != "neutral")
+        directional = [
+            s for s in signals
+            if s.direction in ("bullish", "bearish")
+            and math.isfinite(s.z_score)
+            and s.z_score != 0
+        ]
+        aligned = sum(1 for s in directional if s.direction == target)
+        opposed = sum(1 for s in directional if s.direction != target)
         total = aligned + opposed
         return aligned / total if total > 0 else 0.5
 
@@ -1286,50 +1418,66 @@ class OracleEngine:
             log.warning("Convergence detection failed for {t}: {e}", t=ticker, e=str(e))
             return []
 
-    # ── Credit Cycle → Factor Family Routing ──────────────────────────
+    # ── Realized Volatility (PIT) ─────────────────────────────────────
 
-    def _get_credit_cycle_routing(self) -> dict[str, float]:
-        """
-        Query the latest credit cycle regime signal and return family weight boosts.
+    def _get_realized_daily_vol(
+        self,
+        ticker: str,
+        *,
+        as_of: datetime,
+        window: int = 20,
+    ) -> float | None:
+        """Trailing ``window``-session realized daily log-return vol from PIT closes.
 
-        Contraction → favor vol/alternative signals, penalize equity/flows.
-        Expansion → favor equity/flows, penalize defensive signals.
+        Uses the same settled raw-close source (``load_expiry_closes`` +
+        split rebasing via ``load_split_book`` / ``price_in_basis``) as the
+        scoring loop, bounded strictly by ``as_of``. Fails closed (``None``)
+        when fewer than ``window + 1`` settled closes exist or vol is invalid.
         """
+        from scripts.score_oracle_trades import load_expiry_closes, load_split_book
+        from store.observations import price_in_basis
+
+        as_of_utc = as_of.astimezone(timezone.utc) if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
+        end_date = as_of_utc.date()
+        start_date = end_date - timedelta(days=max(60, window * 3))
         try:
-            if not _USE_SIGNAL_REGISTRY:
-                return {}
             with self.engine.connect() as conn:
-                row = conn.execute(text("""
-                    SELECT metadata->>'state' as state,
-                           confidence
-                    FROM signal_registry
-                    WHERE source_module = 'alpha_research:credit_cycle'
-                    ORDER BY valid_from DESC LIMIT 1
-                """)).fetchone()
-            if not row:
-                return {}
-            state = row[0]
-            confidence = float(row[1]) if row[1] else 0.5
-            scale = 0.3 * confidence  # max ±30% boost at full confidence
-            if state == "contraction":
-                return {
-                    "vol": 1.0 + scale,
-                    "alternative": 1.0 + scale,
-                    "credit": 1.0 + scale,
-                    "equity": 1.0 - scale,
-                    "flows": 1.0 - scale,
-                }
-            elif state == "expansion":
-                return {
-                    "equity": 1.0 + scale,
-                    "flows": 1.0 + scale,
-                    "vol": 1.0 - scale * 0.5,
-                    "alternative": 1.0 - scale * 0.5,
-                }
-            return {}
-        except Exception as e:
-            log.warning("Credit cycle routing failed: {e}", e=str(e))
-            return {}
+                price_book = load_expiry_closes(
+                    conn, [ticker], start_date, end_date, as_of_ts=as_of_utc,
+                )
+                split_book = load_split_book(conn, [ticker], as_of_ts=as_of_utc)
+        except Exception as exc:
+            log.warning("Oracle realized vol lookup failed for {t}: {e}", t=ticker, e=str(exc))
+            return None
+
+        ticker_closes = price_book.get(ticker) or {}
+        if len(ticker_closes) < window + 1:
+            return None
+
+        ordered = sorted(ticker_closes.items())[-(window + 1):]
+        basis_date = ordered[-1][0]
+        splits = split_book.get(ticker) or []
+        prices: list[float] = []
+        for obs_date, obs in ordered:
+            px = price_in_basis(
+                obs.value,
+                obs_date,
+                basis_date=basis_date,
+                splits=splits,
+                source=obs.source,
+                pull_timestamp=obs.pull_timestamp,
+            )
+            if not math.isfinite(px) or px <= 0.0:
+                return None
+            prices.append(float(px))
+
+        log_returns = np.diff(np.log(np.asarray(prices, dtype=float)))
+        if len(log_returns) < window:
+            return None
+        sigma = float(np.std(log_returns, ddof=1))
+        if not math.isfinite(sigma) or sigma <= 0.0:
+            return None
+        return sigma
 
     # ── Decision Journal Feedback ──────────────────────────────────────
 
@@ -1501,6 +1649,18 @@ class OracleEngine:
         reference = self._get_entry_price_reference(ticker)
         spot = reference.get("price") if reference.get("status") == "measured" else None
         flow_ctx = {**(flow_ctx or {}), "entry_price_basis": reference}
+        # The options-signal row is read once here; the tag below and every
+        # model's signal gathering use this same read.
+        options_read: OptionsSignalRead | None
+        try:
+            options_read = self._read_options_signal(ticker)
+        except Exception as exc:  # noqa: BLE001 - tagged below; gathering reads again
+            log.warning("Oracle {t}: options-signal read failed: {e}", t=ticker, e=str(exc))
+            options_read = None
+        # Every prediction below (abstentions too: their receipt holds the
+        # price) inherits this tag, which keeps it out of non-admin readers.
+        if self._schwab_private_inputs(ticker, reference, options_read):
+            flow_ctx[ORACLE_PRIVATE_USE_KEY] = ORACLE_PRIVATE_USE_SCHWAB
         if not spot:
             log.warning(
                 "Oracle: no spot price for {t} - storing no_data placeholder per model",
@@ -1532,10 +1692,6 @@ class OracleEngine:
                 ticker_predictions.append(placeholder)
             return ticker_predictions
         log.info("Oracle {ticker}: spot={spot:.4f}", ticker=ticker, spot=spot)
-
-        # Credit cycle → family weight routing
-        credit_family_boost = self._get_credit_cycle_routing()
-        log.info("Oracle {ticker}: credit routing keys={keys}", ticker=ticker, keys=list(credit_family_boost.keys()))
 
         # Decision journal feedback: learn from recent hits/misses
         journal_bias = self._get_journal_feedback(ticker)
@@ -1636,7 +1792,8 @@ class OracleEngine:
                     family_key = tuple(sorted(str(f) for f in model.signal_families))
                     cache_key = (ticker, family_key)
                     if cache_key not in signal_cache:
-                        signal_cache[cache_key] = self._gather_signals(ticker, model.signal_families)
+                        signal_cache[cache_key] = self._gather_signals(
+                            ticker, model.signal_families, options_read=options_read)
                     signals = [replace(sig) for sig in signal_cache[cache_key]]
 
                 # Actor evidence is selected before any credibility boost or vote.
@@ -1652,13 +1809,6 @@ class OracleEngine:
                 except Exception as exc:
                     log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
 
-                # Apply credit-cycle-based family weighting
-                if credit_family_boost:
-                    for sig in signals:
-                        src = getattr(sig, "source_module", "") or ""
-                        for family_key, boost in credit_family_boost.items():
-                            if family_key in src:
-                                sig = sig._replace(weight=sig.weight * boost) if hasattr(sig, '_replace') else sig
                 if len(signals) < 3:
                     continue  # Not enough data for this model
 
@@ -1710,65 +1860,94 @@ class OracleEngine:
                 except Exception as exc:  # noqa: BLE001
                     log.debug("signal_weight_overrides skipped: {e}", e=str(exc))
 
-                # Compute net direction
-                bull_score = sum(s.z_score * s.weight for s in signals if s.direction == "bullish")
-                bear_score = sum(abs(s.z_score) * s.weight for s in signals if s.direction == "bearish")
+                # Compute net direction using abs(z * weight) symmetrically on both sides.
+                directional_signals = [
+                    s for s in signals
+                    if s.direction in ("bullish", "bearish")
+                    and math.isfinite(s.z_score)
+                    and math.isfinite(s.weight)
+                    and s.z_score != 0
+                    and s.weight > 0
+                ]
+                bull_score = sum(
+                    abs(s.z_score * s.weight) for s in directional_signals if s.direction == "bullish"
+                )
+                bear_score = sum(
+                    abs(s.z_score * s.weight) for s in directional_signals if s.direction == "bearish"
+                )
 
                 if bull_score > bear_score:
                     direction = "CALL"
-                    net_score = bull_score - bear_score
                 elif bear_score > bull_score:
                     direction = "PUT"
-                    net_score = bear_score - bull_score
                 else:
                     continue  # No signal
 
-                # Anti-signals
-                anti_signals = self._find_anti_signals(signals, direction)
-                anti_deduction = sum(a.severity for a in anti_signals) * 0.3
+                # Count-robust signal strength: |sum(w * z_signed)| / sqrt(sum(w^2)).
+                # Opposing signals already net out here; no second anti_deduction subtraction.
+                weight_l2 = math.sqrt(sum(s.weight * s.weight for s in directional_signals))
+                signal_strength = abs(bull_score - bear_score) / weight_l2 if weight_l2 > 0 else 0.0
 
-                # Signal strength = net score - anti-signal deduction
-                signal_strength = max(0, net_score - anti_deduction)
+                # Cache ticker-level external (supply-shock + regulatory) anti-signals
+                # once per ticker instead of re-querying inside the per-model loop.
+                if direction in ("CALL", "LONG"):
+                    if "external_anti_signals" not in per_ticker:
+                        per_ticker["external_anti_signals"] = (
+                            self._cross_lens_anti_signals(ticker, direction)
+                            + self._regulatory_anti_signals(ticker, direction)
+                        )
+                    external_anti = per_ticker["external_anti_signals"]
+                else:
+                    external_anti = []
+                anti_signals = self._find_anti_signals(
+                    signals,
+                    direction,
+                    ticker=ticker,
+                    external_anti_signals=external_anti,
+                )
 
                 # ── Anti-signal VETO ─────────────────────────────────
-                # Per intelligence/postmortem.py:1326-1343, the system
-                # classifies a prediction as "Anti-signals warned but
-                # were overridden" when 2+ anti-signals with severity
-                # > 0.5 fired and the prediction was emitted anyway.
-                # The trade_postmortems table has 29,973 such rows
-                # (top 30%+ of all wrong_signal failures); they
-                # disproportionately cluster on PUT calls for tickers
-                # in long uptrends (V, PYPL, CI, CRM, BLK, MA, PFE...
-                # all went UP after the PUT call).
-                #
-                # Pre-2026-05-13 these only attenuated signal_strength
-                # by ``anti_deduction`` (max 0.3) — not enough to flip
-                # the call. Now: 2+ high-severity anti-signals (>0.5)
-                # OR cumulative severity >= ANTI_SIGNAL_VETO_SUM is a
-                # hard veto. Configurable via env so the operator can
-                # tune; default ON.
+                # Proportional veto: discard if opposing weighted mass exceeds
+                # OPPOSING_VETO_FRACTION of total directional mass. Plus retain
+                # hard vetoes from cross-lens supply-shock and regulatory checks.
                 _veto_min_count = int(os.environ.get("GRID_ANTI_VETO_HIGH_COUNT", "2"))
                 _veto_high_sev = float(os.environ.get("GRID_ANTI_VETO_HIGH_SEVERITY", "0.5"))
                 _veto_sum_threshold = float(os.environ.get("GRID_ANTI_VETO_SUM", "1.2"))
                 _veto_enabled = os.environ.get("GRID_ANTI_VETO_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-                if _veto_enabled and anti_signals:
-                    high_sev_count = sum(
-                        1 for a in anti_signals if a.severity > _veto_high_sev
+                if _veto_enabled:
+                    total_directional_mass = bull_score + bear_score
+                    opposing_mass = bear_score if direction == "CALL" else bull_score
+                    opposing_fraction = (
+                        opposing_mass / total_directional_mass if total_directional_mass > 0 else 0.0
                     )
-                    total_severity = sum(a.severity for a in anti_signals)
-                    if (
-                        high_sev_count >= _veto_min_count
-                        or total_severity >= _veto_sum_threshold
-                    ):
+                    if opposing_fraction > OPPOSING_VETO_FRACTION:
                         log.info(
-                            "oracle: VETO {dir} on {tk} — "
-                            "{hc} high-severity anti-signals (>{thr}), "
-                            "total severity {ts:.2f}",
+                            "oracle: VETO {dir} on {tk} — opposing weighted mass "
+                            "fraction {frac:.2f} exceeds {lim:.2f}",
                             dir=direction, tk=ticker,
-                            hc=high_sev_count, thr=_veto_high_sev,
-                            ts=total_severity,
+                            frac=opposing_fraction, lim=OPPOSING_VETO_FRACTION,
                         )
                         continue  # skip this prediction entirely
+
+                    hard_anti = [a for a in anti_signals if a.name in _HARD_VETO_ANTI_SIGNALS]
+                    if hard_anti:
+                        high_sev_count = sum(
+                            1 for a in hard_anti if a.severity > _veto_high_sev
+                        )
+                        total_severity = sum(a.severity for a in hard_anti)
+                        if (
+                            high_sev_count >= _veto_min_count
+                            or total_severity >= _veto_sum_threshold
+                        ):
+                            log.info(
+                                "oracle: VETO {dir} on {tk} — "
+                                "{hc} high-severity supply/regulatory anti-signals (>{thr}), "
+                                "total severity {ts:.2f}",
+                                dir=direction, tk=ticker,
+                                hc=high_sev_count, thr=_veto_high_sev,
+                                ts=total_severity,
+                            )
+                            continue  # skip this prediction entirely
                 coherence = self._compute_coherence(signals, direction)
 
                 # ── Convergence amplification ──────────────────────
@@ -1801,23 +1980,17 @@ class OracleEngine:
                 except Exception as e:
                     log.debug("Convergence signal skipped for {t}: {e}", t=ticker, e=str(e))
 
-                # Confidence = signal strength × coherence × model weight × convergence
-                raw_confidence = signal_strength * coherence * model.weight * convergence_boost
-
-                # Apply decision journal feedback (learn from recent hit/miss rate)
+                # Count-robust base score before coherence/weight/boost multipliers,
+                # clamped to [0.5, 0.95] before empirical reliability calibration.
+                base_score = 0.5 + 0.45 * math.tanh(signal_strength / 3.0)
                 journal_mult = journal_bias.get("confidence_multiplier", 1.0)
-                raw_confidence *= journal_mult
+                raw_confidence = (
+                    base_score * coherence * model.weight * convergence_boost * journal_mult
+                )
+                raw_capped = max(0.5, min(0.95, raw_confidence))
 
                 # Per-model reliability curve (intelligence.confidence_calibration):
-                # the prior cap was a blanket min(0.95, ...) regardless of how
-                # the model historically performs at this raw range. That produced
-                # the saturated 612-trade cluster pinned at 0.950 with hit-rate
-                # 16.8% that PRs #187/#192/#193 surfaced. Calibrating routes the
-                # raw value through the model's empirical reliability curve so a
-                # model that hits 0% at raw>=0.9 is downgraded to ~0 instead of
-                # being clamped to 0.95. Falls back to the raw value when the
-                # model has no curve data (cold start).
-                raw_capped = max(0.05, min(1.0, raw_confidence / 5.0))
+                # falls back to raw_capped when the model has no curve data (cold start).
                 try:
                     from intelligence.confidence_calibration import calibrate_confidence
                     confidence = calibrate_confidence(raw_capped, model.name, self.engine)
@@ -1825,8 +1998,32 @@ class OracleEngine:
                 except Exception:  # pragma: no cover — defensive fallback
                     confidence = min(0.95, raw_capped)
 
-                # Expected move (conservative estimate)
-                expected_move = min(30.0, signal_strength * 0.5)
+                # Expiry: explicit horizon when requested (long-horizon sweep),
+                # else the next monthly options expiry (3rd Friday).
+                expiry = self._expiry_for_horizon(now, horizon_days)
+                effective_horizon = self._horizon_days_for(now, expiry, horizon_days)
+
+                # Volatility- and horizon-scaled expected move from 20-session PIT vol.
+                # Fail closed with reason "no_vol" rather than guessing a default vol.
+                if "daily_vol" not in per_ticker:
+                    per_ticker["daily_vol"] = self._get_realized_daily_vol(ticker, as_of=now)
+                sigma_daily = per_ticker["daily_vol"]
+                if sigma_daily is None or not math.isfinite(sigma_daily) or sigma_daily <= 0.0:
+                    if not per_ticker.get("no_vol_warned"):
+                        per_ticker["no_vol_warned"] = True
+                        log.warning(
+                            "oracle: reject predictions on {tk} — reason=no_vol",
+                            tk=ticker,
+                        )
+                    continue
+
+                strength_norm = min(1.0, signal_strength / 3.0)
+                vol_scale = max(0.25, min(1.0, strength_norm))
+                trading_horizon = effective_horizon * TRADING_DAYS_PER_CALENDAR_DAY
+                expected_move = min(
+                    30.0,
+                    vol_scale * sigma_daily * math.sqrt(trading_horizon) * 100.0,
+                )
 
                 # Target price
                 if direction == "CALL":
@@ -1834,20 +2031,10 @@ class OracleEngine:
                 else:
                     target = spot * (1 - expected_move / 100)
 
-                # Expiry: explicit horizon when requested (long-horizon sweep),
-                # else the next monthly options expiry (3rd Friday).
-                expiry = self._expiry_for_horizon(now, horizon_days)
-
                 # Create prediction
                 pred_id = hashlib.md5(
                     f"{ticker}:{model.name}:{direction}:{now.isoformat()}".encode()
                 ).hexdigest()[:16]
-
-                # Clamp expected move to ±30%
-                if expected_move < -30.0 or expected_move > 30.0:
-                    log.debug("Clamping expected_move from {orig} to ±30% for {t}",
-                               orig=expected_move, t=ticker)
-                    expected_move = max(-30.0, min(30.0, expected_move))
 
                 pred = OraclePrediction(
                     id=pred_id,
@@ -1870,7 +2057,7 @@ class OracleEngine:
                     model_version=model.version,
                     model_weights={m.name: m.weight for m in self.models},
                     flow_context={**flow_ctx, "actor_evidence": actor_evidence},
-                    horizon_days=self._horizon_days_for(now, expiry, horizon_days),
+                    horizon_days=effective_horizon,
                 )
 
                 ticker_predictions.append(pred)
@@ -2525,11 +2712,50 @@ class OracleEngine:
         as_of = datetime.now(timezone.utc)
         try:
             with self.engine.connect() as conn:
-                return load_quote_reference(conn, ticker, as_of=as_of)
+                return load_quote_reference(conn, ticker, as_of=as_of,
+                                            include_schwab=oracle_reads_schwab())
         except Exception:
             log.warning("Oracle reference unavailable for {t}", t=ticker)
             return {"status": "unavailable", "ticker": ticker, "price": None,
                     "reason": "timestamped reference lookup failed"}
+
+    def _schwab_private_inputs(
+        self, ticker: str, reference: Any, options_read: OptionsSignalRead | None,
+    ) -> bool:
+        """True when this ticker's consumed inputs include a Schwab capture. Fails closed.
+
+        Judged on the inputs the prediction actually used, never on a second
+        read of "the latest". Two inputs can carry Schwab data:
+
+        * the frozen entry receipt: Schwab when it names the Schwab provider,
+          or when a non-admin reader cannot see its capture batch, whatever the
+          receipt's status (an unqualified receipt still holds the price). A
+          price with no capture batch is of unknown origin, so it is private;
+        * the options-signal row (``options_read``), whose lineage was selected
+          in the same statement as its values. No read (it failed) is private.
+
+        If the batch check fails, the prediction is tagged.
+        """
+        if options_read is None or options_read.schwab_private:
+            return True
+        if not isinstance(reference, dict):
+            return True
+        if provider_is_schwab(reference.get("provider")):
+            return True
+        batch_id = reference.get("capture_batch_id")
+        if not batch_id:
+            return reference.get("price") is not None
+        try:
+            with self.engine.connect() as conn:
+                public_batch = conn.execute(visible_sql(
+                    "SELECT 1 FROM " + VISIBLE_CAPTURE_BATCHES
+                    + " b WHERE b.capture_batch_id = :id"
+                ), {"id": batch_id}).fetchone()
+        except Exception as exc:  # noqa: BLE001 - fail closed: an unproven input is private
+            log.warning("Oracle: Schwab-input check failed for {t}, tagging private: {e}",
+                        t=ticker, e=str(exc))
+            return True
+        return public_batch is None
 
     def _get_spot_price(self, ticker: str) -> float | None:
         """Compatibility price-only view of the qualified reference receipt."""

@@ -224,7 +224,7 @@ _DDL = [
     """CREATE TABLE oracle_predictions (
         id TEXT PRIMARY KEY, created_at TIMESTAMP, ticker TEXT, direction TEXT,
         expiry DATE, confidence REAL, model_name TEXT, verdict TEXT,
-        scored_at TIMESTAMP, dedup_keep BOOLEAN, horizon_days INTEGER)""",
+        scored_at TIMESTAMP, dedup_keep BOOLEAN, horizon_days INTEGER, flow_context TEXT)""",
     """CREATE TABLE oracle_prediction_rescores (
         prediction_id TEXT, scoring_version TEXT, score_class TEXT,
         official BOOLEAN, verdict TEXT, rescored_at TIMESTAMP,
@@ -256,7 +256,8 @@ def _seed(engine, *, with_exploratory: bool = True) -> None:
                 verdict = "miss" if rng.uniform() > t else ("hit" if rng.uniform() < 0.5 else "partial")
                 official = k < 10
                 conn.execute(text(
-                    "INSERT INTO oracle_predictions VALUES (:id, :c, 'AAA', 'CALL', :e, :conf, :m, "
+                    "INSERT INTO oracle_predictions (id, created_at, ticker, direction, expiry, confidence, model_name, "
+                    "verdict, scored_at, dedup_keep, horizon_days) VALUES (:id, :c, 'AAA', 'CALL', :e, :conf, :m, "
                     ":v, :s, 1, NULL)"
                 ), {"id": pid, "c": datetime.combine(expiry - timedelta(days=7), datetime.min.time()),
                     "e": expiry, "conf": t * t, "m": "hyp_x" if k % 3 else "options_flow",
@@ -270,19 +271,24 @@ def _seed(engine, *, with_exploratory: bool = True) -> None:
         # Excluded: future expiry, rescored after as_of, dedup dropped, astrogrid,
         # no confidence, other rescore version.
         conn.execute(text(
-            "INSERT INTO oracle_predictions VALUES ('future', '2026-11-01', 'A', 'CALL', '2026-11-20', "
+            "INSERT INTO oracle_predictions (id, created_at, ticker, direction, expiry, confidence, model_name, "
+                    "verdict, scored_at, dedup_keep, horizon_days) VALUES ('future', '2026-11-01', 'A', 'CALL', '2026-11-20', "
             "0.5, 'm', 'hit', '2026-11-01', 1, NULL)"))
         conn.execute(text(
-            "INSERT INTO oracle_predictions VALUES ('dropped', '2026-06-01', 'A', 'CALL', '2026-06-10', "
+            "INSERT INTO oracle_predictions (id, created_at, ticker, direction, expiry, confidence, model_name, "
+                    "verdict, scored_at, dedup_keep, horizon_days) VALUES ('dropped', '2026-06-01', 'A', 'CALL', '2026-06-10', "
             "0.5, 'm', 'hit', '2026-06-11', 0, NULL)"))
         conn.execute(text(
-            "INSERT INTO oracle_predictions VALUES ('astrogrid:1', '2026-06-01', 'A', 'CALL', '2026-06-10', "
+            "INSERT INTO oracle_predictions (id, created_at, ticker, direction, expiry, confidence, model_name, "
+                    "verdict, scored_at, dedup_keep, horizon_days) VALUES ('astrogrid:1', '2026-06-01', 'A', 'CALL', '2026-06-10', "
             "0.5, 'm', 'hit', '2026-06-11', 1, NULL)"))
         conn.execute(text(
-            "INSERT INTO oracle_predictions VALUES ('noconf', '2026-06-01', 'A', 'CALL', '2026-06-10', "
+            "INSERT INTO oracle_predictions (id, created_at, ticker, direction, expiry, confidence, model_name, "
+                    "verdict, scored_at, dedup_keep, horizon_days) VALUES ('noconf', '2026-06-01', 'A', 'CALL', '2026-06-10', "
             "NULL, 'm', 'hit', '2026-06-11', 1, NULL)"))
         conn.execute(text(
-            "INSERT INTO oracle_predictions VALUES ('late', '2026-06-01', 'A', 'CALL', '2026-06-10', "
+            "INSERT INTO oracle_predictions (id, created_at, ticker, direction, expiry, confidence, model_name, "
+                    "verdict, scored_at, dedup_keep, horizon_days) VALUES ('late', '2026-06-01', 'A', 'CALL', '2026-06-10', "
             "0.5, 'm', 'no_data', NULL, 1, NULL)"))
         conn.execute(text(
             "INSERT INTO oracle_prediction_rescores VALUES "

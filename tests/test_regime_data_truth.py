@@ -333,13 +333,23 @@ class TestPersistCarriesTheDataDate:
         assert str(DATA_CLIFF) not in sql
         assert params["data_as_of"] == DATA_CLIFF
 
-    def test_updates_the_column_on_conflict(self):
-        """A re-backfill over rows written before the column existed has to
-        fill it in, not leave the old NULL behind."""
+    def test_an_explicit_replacement_fills_the_column_in(self):
+        """A re-backfill (--overwrite --reason) over rows written before the
+        column existed fills it in; the old version is kept as a revision."""
+        from unittest.mock import MagicMock
+
+        from scripts.auto_regime import REGIME_HISTORY_SOURCE, RegimeReplacement
+
         engine, conn = _engine_returning([])
-        persist_regime_history(engine, AS_OF, "NEUTRAL", 0.5, data_as_of=DATA_CLIFF)
-        sql = str(conn.execute.call_args[0][0])
-        assert "data_as_of = EXCLUDED.data_as_of" in sql
+        lock, archived = MagicMock(), MagicMock()
+        lock.first.return_value = ("NEUTRAL", 0.5, REGIME_HISTORY_SOURCE, None)
+        archived.scalar.return_value = 1
+        conn.execute.side_effect = [lock, MagicMock(), MagicMock(), archived]
+        persist_regime_history(engine, AS_OF, "NEUTRAL", 0.5, data_as_of=DATA_CLIFF,
+                               replace=RegimeReplacement("fill data_as_of", "backfill-1"))
+        update_sql, update_params = conn.execute.call_args_list[2][0]
+        assert "data_as_of = :data_as_of" in str(update_sql)
+        assert update_params["data_as_of"] == DATA_CLIFF
 
     def test_unknown_data_date_is_written_as_null_not_guessed(self):
         engine, conn = _engine_returning([])
@@ -373,7 +383,7 @@ class TestBackfillCarriesTheDataDate:
         with patch("scripts.auto_regime.compute_regime_at", side_effect=fake_compute), \
              patch("scripts.auto_regime.persist_regime_history", return_value=True) as writer:
             backfill_regime_history(
-                engine, date(2026, 9, 1), date(2026, 9, 3), overwrite=True
+                engine, date(2026, 9, 1), date(2026, 9, 3), overwrite=True, reason="test re-backfill"
             )
 
         assert writer.call_count == 3

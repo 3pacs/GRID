@@ -25,6 +25,20 @@ PINS = (
 # PINS lists every part (scripts/prepare_factory_calendars.py normalizes all of them in a deploy
 # candidate); research runs read the first two only. The third is the forward part (#1161).
 RESEARCH_PINS = PINS[:2]
+# The prescreen's XNYS parts (2018-04-02..2022-11-11), equal to analysis/factory_prescreen.PINS
+# (tests/test_factory_calendar_packaging.py keeps them equal). The deployed market-state record counts
+# session ages on PRESCREEN_PINS + PINS (intelligence/regime/market_state.py), so the deploy prepares
+# both; this literal is the one list both read.
+PRESCREEN_PINS = (
+    (
+        "prescreen-xnys-2018-04-02-2020-12-31.json",
+        "88312f9a547c809737a8c94b5d9b51e0e5f38117cb51ecaec2bd639ced7138ba",
+    ),
+    (
+        "prescreen-xnys-2021-01-01-2022-11-11.json",
+        "aee287ed567cf53c072d2378aa6437fe9bfcbbe8b6186fcc8bf4ab6109bc4dc5",
+    ),
+)
 
 
 class FactoryCalendar:

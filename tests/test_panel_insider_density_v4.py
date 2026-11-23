@@ -191,9 +191,23 @@ def test_the_holdout_opens_only_with_a_later_holdout_basis_report(sealed_v4):
                                                                              "snapshot_as_of_ts": "2020-01-01T00:00:00+00:00"}})
     later = "2030-01-01T00:00:00+00:00"
     assert later > sealed["run_at"]
-    _open(log_dir, vault, frozen, inputs, {"sha256": "e" * 64, "report": {"window": "holdout",
-                                                                         "snapshot_as_of_ts": later,
-                                                                         "admitted": ["AAA"]}})
+    valid_report = {
+        "window": "holdout",
+        "snapshot_as_of_ts": later,
+        "prereg": {"study": v4.VERSION, "body_sha256": v4.PREREG_BODY_SHA256},
+        "discovery_frozen": {"sha256": v1._record_sha256(sealed)},
+        "manifest": {"digest": inputs["price_manifest_sha256"]},
+        "admitted": ["AAA"],
+    }
+    for missing_key, match in (
+        ("prereg", "prereg"),
+        ("discovery_frozen", "discovery_frozen"),
+        ("manifest", "manifest"),
+    ):
+        incomplete = {k: v for k, v in valid_report.items() if k != missing_key}
+        with pytest.raises(PermissionError, match=match):
+            _open(log_dir, vault, frozen, inputs, {"sha256": "e" * 64, "report": incomplete})
+    _open(log_dir, vault, frozen, inputs, {"sha256": "e" * 64, "report": valid_report})
     opened = [r for r in v4.registry(log_dir).read_all() if r["kind"] == "holdout_opened"][0]
     assert opened["holdout_probe"]["sha256"] == "e" * 64
 

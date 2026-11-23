@@ -320,13 +320,21 @@ def _before_regular_open(now: datetime) -> bool:
     return (local.hour, local.minute) < REGULAR_SESSION_OPEN_ET
 
 
-def automatic_options_capture_guard(engine: Engine) -> dict[str, Any] | None:
+def automatic_options_capture_guard(engine: Engine, *, writer: str | None = None) -> dict[str, Any] | None:
     """Owner-gated daily-writer policy for automatic secondary callers only.
 
     Batch existence is diagnostic, never proof of complete source coverage or
     scheduler provenance. Secondary writers also defer with no batches: letting
     one start while the daily writer is fetching would recreate the race. The
     daily scheduler and explicit GEM capture do not call this guard.
+
+    ``writer``: only the dedicated options runner passes one
+    (``DEDICATED_CAPTURE_SOURCE``). Under the ``daily_scheduler`` policy it is
+    accepted only while the dedicated hand-off is active
+    (``dedicated_handoff_active``): then it runs the daily scheduler's
+    handed-off slots, so it is that writer's stand-in, not a secondary one.
+    Without the hand-off it is refused like any other writer. Every other
+    caller passes no writer and is judged exactly as before.
     """
     policy = os.getenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "legacy").strip().lower()
     if policy in {"", "legacy"}:
@@ -340,6 +348,8 @@ def automatic_options_capture_guard(engine: Engine) -> dict[str, Any] | None:
     if policy != "daily_scheduler":
         result["reason"] = "invalid_options_writer_policy"
         return result
+    if writer is not None and writer == DEDICATED_CAPTURE_SOURCE and dedicated_handoff_active():
+        return None
     try:
         with engine.connect() as conn:
             conn.execute(text("SET TRANSACTION READ ONLY"))
@@ -819,6 +829,55 @@ def options_primary_provider() -> str:
     return value if value in ("yahoo", "schwab") else "cboe"
 
 
+# Schwab mode only (2026-11-22, pre-open list item 7): the full-universe run (~80 Schwab calls plus
+# ~960 Yahoo requests at >= 1 s, ~19 min) gets its own systemd timer
+# (deploy/systemd/grid-options-dedicated.*, scripts/run_options_dedicated.py) instead of the smart
+# scheduler's 840 s window. The operator declares that timer installed with
+# GRID_OPTIONS_DEDICATED_TIMER=1; only then do the scheduler writers hand their full-universe run
+# to it (``dedicated_timer_handoff``). Without schwab mode and the flag nothing here applies.
+DEDICATED_CAPTURE_SOURCE = "options_dedicated"
+DEDICATED_HANDOFF_REASON = "dedicated_options_timer"
+# GEM's event trigger (scripts/gem_daily_capture.py) waits for the daily scheduler's own "Options
+# daily pull complete" line up to its absolute 10:20 New York deadline. So the daily scheduler keeps
+# its morning pull and hands off only from 10:20 New York (its 16:00Z / 20:00Z / 22:00Z slots).
+GEM_TRIGGER_WINDOW_END_ET = (10, 20)
+
+
+def dedicated_timer_declared() -> bool:
+    """True when GRID_OPTIONS_DEDICATED_TIMER=1: the operator installed the dedicated options timer."""
+    return os.getenv("GRID_OPTIONS_DEDICATED_TIMER", "").strip() == "1"
+
+
+def dedicated_handoff_active() -> bool:
+    """True when the timer is declared and schwab mode is fully on (``options_primary_provider`` chose it)."""
+    if not dedicated_timer_declared():
+        return False
+    # The raw value first, so cboe/yahoo never consult the selector (it logs for schwab without readers).
+    if os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() != "schwab":
+        return False
+    return options_primary_provider() == "schwab"
+
+
+def dedicated_timer_handoff(capture_source: str, now: datetime | None = None) -> str | None:
+    """``DEDICATED_HANDOFF_REASON`` when this writer's full-universe run belongs to the dedicated timer.
+
+    Only with schwab mode fully on (``options_primary_provider`` chose schwab) and the timer
+    declared. Only the two scheduler writers hand off: the smart scheduler always, the daily
+    scheduler from ``GEM_TRIGGER_WINDOW_END_ET`` New York on. Every other writer (the dedicated
+    runner itself, GEM, the oracle forward pass, a manual run) is never handed off, and callers
+    apply this to full-universe runs only.
+    """
+    if not dedicated_handoff_active():
+        return None
+    if capture_source == "smart_scheduler":
+        return DEDICATED_HANDOFF_REASON
+    if capture_source == "daily_scheduler":
+        local = (now if now is not None else _utc_now()).astimezone(_EQUITY_TZ)
+        if (local.hour, local.minute) >= GEM_TRIGGER_WINDOW_END_ET:
+            return DEDICATED_HANDOFF_REASON
+    return None
+
+
 class CboeFirstOptionsClient:
     """Cboe primary, Yahoo fallback, one provider per ticker capture.
 
@@ -893,6 +952,51 @@ class CboeFirstOptionsClient:
         # the capture is refused as undated, exactly as without the retry.
         log.info("{t}: Yahoo did not serve a dated chain either; keeping Cboe", t=ticker)
         return cboe_first
+
+
+_DAILY_SIGNALS_UPSERT_SQL = text(
+    "INSERT INTO options_daily_signals "
+    "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
+    "total_oi, total_volume, near_expiry, spot_price, iv_atm, "
+    "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata, term_structure_slope, oi_concentration) "
+    "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
+    ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
+    "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
+    # created_at is the row's last-write time: it moves to NOW() only when a
+    # stored value actually changes (SET expressions read the existing row).
+    # NOW() is the writing transaction's start, so this is a lower bound on
+    # the write, not a commit-time availability clock; analysis/thesis_scorer
+    # therefore scores options live only and reports a row written after its
+    # decision clock as unavailable.
+    "created_at = CASE WHEN ("
+    "options_daily_signals.put_call_ratio, options_daily_signals.max_pain, "
+    "options_daily_signals.iv_skew, options_daily_signals.total_oi, "
+    "options_daily_signals.total_volume, options_daily_signals.near_expiry, "
+    "options_daily_signals.spot_price, options_daily_signals.iv_atm, "
+    "options_daily_signals.iv_m90_put_v1, options_daily_signals.iv_m110_call_v1, "
+    "options_daily_signals.wing_iv_metadata, options_daily_signals.term_structure_slope, "
+    "options_daily_signals.oi_concentration"
+    ") IS DISTINCT FROM ("
+    "EXCLUDED.put_call_ratio, EXCLUDED.max_pain, EXCLUDED.iv_skew, "
+    "EXCLUDED.total_oi, EXCLUDED.total_volume, EXCLUDED.near_expiry, "
+    "EXCLUDED.spot_price, EXCLUDED.iv_atm, EXCLUDED.iv_m90_put_v1, "
+    "EXCLUDED.iv_m110_call_v1, EXCLUDED.wing_iv_metadata, "
+    "EXCLUDED.term_structure_slope, EXCLUDED.oi_concentration"
+    ") THEN NOW() ELSE options_daily_signals.created_at END, "
+    "put_call_ratio = EXCLUDED.put_call_ratio, "
+    "max_pain = EXCLUDED.max_pain, "
+    "iv_skew = EXCLUDED.iv_skew, "
+    "total_oi = EXCLUDED.total_oi, "
+    "total_volume = EXCLUDED.total_volume, "
+    "near_expiry = EXCLUDED.near_expiry, "
+    "spot_price = EXCLUDED.spot_price, "
+    "iv_atm = EXCLUDED.iv_atm, "
+    "iv_m90_put_v1 = EXCLUDED.iv_m90_put_v1, "
+    "iv_m110_call_v1 = EXCLUDED.iv_m110_call_v1, "
+    "wing_iv_metadata = EXCLUDED.wing_iv_metadata, "
+    "term_structure_slope = EXCLUDED.term_structure_slope, "
+    "oi_concentration = EXCLUDED.oi_concentration"
+)
 
 
 class OptionsPuller(BasePuller):
@@ -990,6 +1094,11 @@ class OptionsPuller(BasePuller):
         within the session's runs, by the run that completes that cycle, which
         then starts the next cycle with nothing covered.
 
+        Schwab mode with GRID_OPTIONS_DEDICATED_TIMER=1: a full-universe run by
+        the smart or daily scheduler writer that ``dedicated_timer_handoff``
+        hands off requests nothing; every core ticker is SKIPPED
+        ``dedicated_options_timer`` (summary SKIPPED).
+
         A 401/403 stops this entire run, including when it first occurs in
         the catalyst tail after every core ticker succeeds. Earlier complete
         captures remain, but coverage is PARTIAL and source freshness is not
@@ -1007,6 +1116,20 @@ class OptionsPuller(BasePuller):
             raise ValueError(f"max_expirations must be between 1 and {MAX_EXPIRATIONS}")
 
         full_universe = tickers is None and include_catalyst_universe and max_expirations == MAX_EXPIRATIONS
+        # Schwab mode with the dedicated timer declared (``dedicated_timer_handoff``): the scheduler
+        # writers leave the full universe to it. The literal flag check comes first, so without
+        # GRID_OPTIONS_DEDICATED_TIMER=1 nothing else here is evaluated and the run is unchanged.
+        if full_universe and os.getenv("GRID_OPTIONS_DEDICATED_TIMER", "").strip() == "1":
+            handoff = dedicated_timer_handoff(capture_source)
+            if handoff is not None:
+                log.info(
+                    "Options pull handed off: the dedicated options timer runs the schwab-mode full "
+                    "universe ({w} writer, GRID_OPTIONS_DEDICATED_TIMER=1)", w=capture_source,
+                )
+                return OptionsPullResults([
+                    {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": handoff}
+                    for ticker in EQUITY_TICKERS
+                ], full_universe=full_universe)
         if tickers is None:
             tickers = list(EQUITY_TICKERS)
             if include_catalyst_universe:
@@ -1584,28 +1707,7 @@ class OptionsPuller(BasePuller):
                 # Insert daily signals
                 _check_budget(should_continue)
                 signal_write = conn.execute(
-                    text(
-                        "INSERT INTO options_daily_signals "
-                        "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
-                        "total_oi, total_volume, near_expiry, spot_price, iv_atm, "
-                        "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata, term_structure_slope, oi_concentration) "
-                        "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
-                        ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
-                        "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
-                        "put_call_ratio = EXCLUDED.put_call_ratio, "
-                        "max_pain = EXCLUDED.max_pain, "
-                        "iv_skew = EXCLUDED.iv_skew, "
-                        "total_oi = EXCLUDED.total_oi, "
-                        "total_volume = EXCLUDED.total_volume, "
-                        "near_expiry = EXCLUDED.near_expiry, "
-                        "spot_price = EXCLUDED.spot_price, "
-                        "iv_atm = EXCLUDED.iv_atm, "
-                        "iv_m90_put_v1 = EXCLUDED.iv_m90_put_v1, "
-                        "iv_m110_call_v1 = EXCLUDED.iv_m110_call_v1, "
-                        "wing_iv_metadata = EXCLUDED.wing_iv_metadata, "
-                        "term_structure_slope = EXCLUDED.term_structure_slope, "
-                        "oi_concentration = EXCLUDED.oi_concentration"
-                    ),
+                    _DAILY_SIGNALS_UPSERT_SQL,
                     {
                         "ticker": ticker, "sd": today_str,
                         "pcr": put_call_ratio, "mp": max_pain, "ivs": iv_skew,

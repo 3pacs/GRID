@@ -258,106 +258,18 @@ def test_smart_money_finviz_retired_compatibility_is_skipped_without_work(
 # ---------------------------------------------------------------------------
 
 
-def test_institutional_flows_fix_uses_real_schema_columns():
-    """Grep-level assertion: the old broken columns must be gone and the
-    correct ones must be present on the new INSERT path.
+def test_institutional_flows_writes_no_signal_sources_rows():
+    """13F is non-directional (owner decision 2026-11-23): the 13F puller no
+    longer writes signal_sources at all. Its old 'institutional' /
+    NET_POSITION_DELTA rows carried a dollar value that wealth_tracker and
+    pocket_lining read as a directional fund flow (Codex HOLD on #1369
+    d304044d). The end-to-end check is
+    tests/test_flows_sentiment_defects.py::test_13f_straddling_cutover_pair_creates_no_spurious_change_event.
     """
     import pathlib
     src = pathlib.Path("ingestion/altdata/institutional_flows.py").read_text()
-
-    # Old broken column names — must be absent
-    assert "signal_payload" not in src, \
-        "institutional_flows.py still references non-existent signal_payload column"
-    # confidence is a common word; narrow the check to the INSERT form
-    assert ":conf" not in src, \
-        "institutional_flows.py still binds to removed :conf param"
-
-    # New correct columns/params
-    assert "source_type" in src
-    assert "INSERT INTO signal_sources " in src
-    assert "ON CONFLICT (source_type, source_id, ticker, " in src
-
-
-def test_institutional_flows_emits_net_position_delta_per_change(monkeypatch):
-    """Exercise the 13F per-change emit directly via a stub conn.
-
-    We bypass all the fetch/parse machinery and call the embedded emit
-    block logic via a tiny script that mirrors what _pull_13f_filings
-    does per-change. This keeps the test hermetic (no network, no DB).
-    """
-
-    conn = _StubConn()
-    cik = "0001067983"
-    manager_name = "BERKSHIRE HATHAWAY INC"
-    curr_acc = "0000000000-26-000001"
-    obs_date = date(2026, 3, 31)
-
-    # Simulated change record matching _compare_holdings output shape.
-    chg = {
-        "cusip": "88160R101",  # TSLA cusip stand-in
-        "name": "TESLA INC",
-        "action": "INCREASED",
-        "value_usd": 12_000_000_000,
-        "prev_value_usd": 8_000_000_000,
-        "pct_change": 0.5,
-        "shares": 50_000_000,
-    }
-
-    # Replicate the embedded emit block in-line (test is a contract
-    # check for the payload shape + upsert key).
-    from sqlalchemy import text
-    chg_ticker = str(chg.get("cusip") or "").strip()
-    conn.execute(
-        text(
-            "INSERT INTO signal_sources "
-            "(source_type, source_id, ticker, signal_date, "
-            "signal_type, signal_value) "
-            "VALUES (:stype, :sid, :ticker, :sdate, :stype2, :sval) "
-            "ON CONFLICT (source_type, source_id, ticker, "
-            "signal_date, signal_type) DO NOTHING"
-        ),
-        {
-            "stype": "institutional",
-            "sid": f"{cik}:{manager_name}"[:200],
-            "ticker": chg_ticker,
-            "sdate": obs_date,
-            "stype2": "NET_POSITION_DELTA",
-            "sval": json.dumps({
-                "manager": manager_name,
-                "cik": cik,
-                "cusip": chg.get("cusip"),
-                "issuer_name": chg.get("name", ""),
-                "action": chg.get("action"),
-                "value_usd": float(chg.get("value_usd", 0) or 0),
-                "prev_value_usd": float(chg.get("prev_value_usd", 0) or 0),
-                "pct_change": chg.get("pct_change"),
-                "shares": chg.get("shares"),
-                "filing_accession": curr_acc,
-            }),
-        },
-    )
-
-    inst_calls = [
-        (sql, p) for sql, p in _find_signal_sources_calls(conn)
-        if p.get("stype") == "institutional"
-    ]
-    assert len(inst_calls) == 1
-    sql, params = inst_calls[0]
-
-    assert params["stype"] == "institutional"
-    assert params["stype2"] == "NET_POSITION_DELTA"
-    assert params["ticker"] == "88160R101"
-    assert params["sdate"] == obs_date
-    assert "signal_payload" not in sql
-    assert ":conf" not in sql
-    assert ("ON CONFLICT (source_type, source_id, ticker, "
-            "signal_date, signal_type)") in sql
-
-    payload = json.loads(params["sval"])
-    assert payload["manager"] == manager_name
-    assert payload["cik"] == cik
-    assert payload["cusip"] == "88160R101"
-    assert payload["action"] == "INCREASED"
+    assert "INSERT INTO signal_sources" not in src
+    assert '"NET_POSITION_DELTA"' not in src  # no signal_type written (the comment may name it)
 
 
 def test_signal_sources_failure_logs_warn_but_continues(caplog):
