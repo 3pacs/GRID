@@ -1022,3 +1022,36 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
 - Remaining review gates: Claude reviews the pushed head; Anik alone decides
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
+
+## 2026-11-23 - Twelve Data dropped from the scheduled path (owner), draft only
+
+Branch `claude/drop-twelvedata-20261123`. Anik: "drop the twelve stuff, get it
+from our other sources instead".
+
+- **What Twelve Data was doing:** two daily units filled
+  `ticker_metrics_daily.close_price` for tickers `sec_xbrl_shares` does not
+  cover: `grid-td-universe-backfill` (the freshness-audit universe) and
+  `grid-td-backfill` (gem-alert tickers). grid-svr, 2026-11-23: 324,949 rows for
+  1,323 tickers carry `twelvedata_universe_backfill`, 1,826 rows carry
+  `twelvedata_backfill`. It was also the third spot-price fallback.
+- **Now:** `scripts/close_backfill_universe.py` fills the same rows from the
+  stored `YF:{TICKER}:close` series (TIINGO or yfinance, one source per ticker,
+  read through `store.observations.read_window`). No external request, no key.
+  `scripts/td_backfill_universe.py` and `scripts/td_backfill_gem_tickers.py` are
+  kept as entry points because the units' ExecStart names them.
+- **Coverage first:** 209 of the 618 freshness-universe tickers had no stored
+  close of their own in 5 days; Twelve Data was their only writer. They join
+  the routine Tiingo list (`TiingoPuller.freshness_universe_tickers`). A ticker
+  Tiingo cannot serve (GLEN, US, WSE, RVI, ANT, AIOK, VFIAX on 11-23) stays
+  stale and is named by the backfill every day.
+- **Not touched:** existing `twelvedata_*` rows; `TWELVEDATA_API_KEY` in
+  `config.py`; the hand-run research scripts that can still call Twelve Data
+  (`analysis/price_admission_*`, `scripts/full_universe_pull.py`,
+  `scripts/backfill_smallcap_coverage.py`, the pre-registered panel code); the
+  policy comment in `ingestion/altdata/sec_xbrl_shares.py`.
+- **For the operator:** rename the two units and point their ExecStart at
+  `scripts/close_backfill_universe.py universe|gem`, then delete the two
+  entry-point files. `TWELVEDATA_API_KEY` can leave the units' environment.
+- **Overlap with #1407:** that PR edits the old Twelve Data fetch and adds
+  `tests/test_td_backfill_universe_skips.py`. Whichever merges second takes this
+  branch's `scripts/td_backfill_universe.py` and drops that test file.

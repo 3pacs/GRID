@@ -97,6 +97,27 @@ SUPPLY_CHAIN_NODE_IDS_SQL = (
     "SELECT upstream_id FROM supply_chain_edges UNION SELECT downstream_id FROM supply_chain_edges"
 )
 INSIDER_MAX_TICKERS = 1000
+# The freshness-audit universe: tickers of the signal_registry modules whose
+# ticker_metrics_daily closes the daily audit grades (the same rule as
+# scripts/freshness_audit_universe.sql). Twelve Data was the only writer
+# keeping those closes current (2026-11-23: 209 of the 618 had no stored close
+# of their own in the last 5 days). Twelve Data is dropped (owner, 2026-11-23),
+# so they get a routine Tiingo close and scripts/close_backfill_universe.py
+# copies it across.
+FRESHNESS_UNIVERSE_MODULES: tuple[str, ...] = (
+    "lever_pullers", "alpha_research:vol_price_divergence", "news_intel",
+    "sector_network", "earnings_intel",
+)
+FRESHNESS_UNIVERSE_MAX_TICKERS = 2000
+FRESHNESS_UNIVERSE_TICKERS_SQL = """
+    SELECT DISTINCT ticker
+    FROM signal_registry
+    WHERE ticker IS NOT NULL
+      AND ticker ~ '^[A-Z]{1,6}$'
+      AND source_module = ANY(:modules)
+    ORDER BY ticker
+    LIMIT :cap
+"""
 INSIDER_BUYER_TICKERS_SQL = """
     SELECT t FROM (
         SELECT upper(trim(ticker)) AS t, source_type,
@@ -665,6 +686,27 @@ class TiingoPuller(BasePuller):
                 if t and not is_placeholder_ticker(t) and is_testable_ticker(t) and is_tiingo_equity(t)]
 
     @staticmethod
+    def freshness_universe_tickers(db_engine: Engine) -> list[str]:
+        """Listed equities in the freshness-audit universe (see FRESHNESS_UNIVERSE_TICKERS_SQL).
+
+        Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.actor_identity import is_placeholder_ticker
+            from intelligence.sleuth_intersections import is_testable_ticker
+
+            with db_engine.connect() as conn:
+                rows = conn.execute(text(FRESHNESS_UNIVERSE_TICKERS_SQL), {
+                    "modules": list(FRESHNESS_UNIVERSE_MODULES),
+                    "cap": FRESHNESS_UNIVERSE_MAX_TICKERS,
+                }).fetchall()
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: freshness universe unavailable: {e}", e=str(exc))
+            return []
+        return [t for (t,) in rows
+                if t and not is_placeholder_ticker(t) and is_testable_ticker(t) and is_tiingo_equity(t)]
+
+    @staticmethod
     def default_tickers(db_engine: Engine | None = None) -> list[str]:
         """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle,
         active-hypothesis and insider-buyer universes.
@@ -679,7 +721,9 @@ class TiingoPuller(BasePuller):
         insider buyers (:meth:`insider_buyer_tickers`; 2026-11-08: 287 of 332
         had no routine close), and so is every listed supply-chain graph node
         (:meth:`supply_chain_tickers`; 2026-11-16: 29 of 203 had no close since
-        April).
+        April), and so is the freshness-audit universe
+        (:meth:`freshness_universe_tickers`; 2026-11-23: 209 of 618 had no
+        stored close in 5 days and were kept current only by Twelve Data).
 
         Sector-map tickers go through ``analysis.sector_map.price_tickers``:
         renamed symbols are swapped for their successor and acquired,
@@ -695,6 +739,7 @@ class TiingoPuller(BasePuller):
             all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
             all_tickers.update(TiingoPuller.insider_buyer_tickers(db_engine))
             all_tickers.update(TiingoPuller.supply_chain_tickers(db_engine))
+            all_tickers.update(TiingoPuller.freshness_universe_tickers(db_engine))
         try:
             from analysis.sector_map import price_ticker, price_tickers
             all_tickers.update(price_tickers())
