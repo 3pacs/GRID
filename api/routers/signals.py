@@ -266,6 +266,7 @@ def _conviction_report_to_dict(report) -> dict:
                 "score": round(layer.score, 2),
                 "max_score": round(layer.max_score, 2),
                 "trust": round(layer.trust, 2),
+                "denominator_trust": round(layer.denominator_trust, 2),
                 "signals": list(layer.signals),
                 "data_available": layer.data_available,
             }

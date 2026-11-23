@@ -70,11 +70,6 @@ DEFAULT_TRUST_WEIGHT: float = 0.5
 #: trust weight would otherwise be zero. Prevents division artefacts.
 _MIN_DENOMINATOR: float = 1.0
 
-#: Neutral streams (e.g. dark pool without a directional tilt) are
-#: counted at HALF weight toward the convergence score — they show
-#: something is moving but not which way.
-_NEUTRAL_DAMPENER: float = 0.5
-
 # ── Conviction multiplier thresholds ──────────────────────────────────────
 #
 # Convergence is rare and orthogonal streams are expensive, so the
@@ -669,9 +664,10 @@ def _scan_darkpool(
 ) -> StreamSignal | None:
     """Dark pool prints: intensity from volume z-score.
 
-    Direction is neutral unless ``short_volume_ratio`` is extreme
-    (>0.6 bearish, <0.3 bullish). Dark pool volume alone does not
-    signal direction.
+    Dark pool volume and FINRA daily ``short_volume_ratio`` are
+    non-directional (FINRA short volume is dominated by market-maker
+    hedging). Emits ``NEUTRAL`` so it stays excluded from the directional
+    vote while preserving ``avg_short_ratio`` as context.
     """
     rows = _fetch_stream_rows(
         engine, STREAM_DARKPOOL, ticker, as_of, window_days
@@ -704,13 +700,10 @@ def _scan_darkpool(
     if intensity <= 0:
         intensity = _clamp(len(rows) / 5.0, 0.0, 1.0)
 
+    # FINRA short_volume_ratio reflects market-maker hedging, not directional
+    # conviction; keep it as context in evidence_line/raw_payload only.
     direction = NEUTRAL
     avg_ratio = sum(ratios) / len(ratios) if ratios else None
-    if avg_ratio is not None:
-        if avg_ratio > 0.6:
-            direction = BEARISH
-        elif avg_ratio < 0.3:
-            direction = BULLISH
 
     evidence = (
         f"{latest_date.isoformat()}  DARK_POOL  "
@@ -867,6 +860,36 @@ def _scan_smart_money(
     )
 
 
+_PERIOD_END_KEYS: tuple[str, ...] = (
+    "period_end",
+    "report_date",
+    "period_of_report",
+    "holdings_period_end",
+    "reportDate",
+)
+
+
+def _extract_holdings_period_end(payload: dict[str, Any]) -> date | None:
+    """Parse a 13F holdings period-end date from ``signal_value``, or None."""
+    for key in _PERIOD_END_KEYS:
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, datetime):
+            return raw.date()
+        if isinstance(raw, date):
+            return raw
+        if isinstance(raw, str):
+            text_val = raw.strip()
+            if not text_val:
+                continue
+            try:
+                return date.fromisoformat(text_val[:10])
+            except ValueError:
+                continue
+    return None
+
+
 def _scan_institutional(
     engine: Engine,
     ticker: str,
@@ -883,6 +906,14 @@ def _scan_institutional(
     ``(new + increased) - (closed + decreased)`` count is not read as bullish
     or bearish. The old count stays behind ``INSTITUTIONAL_13F_DIRECTIONAL``
     for tests only; the flag is not authorization to re-enable it.
+
+    On that test-only path, 13F rows are keyed by SEC filing date (up to 45
+    days after quarter end) and ``ingestion/altdata/institutional_flows.py``
+    does not currently store holdings ``period_end``. To prevent stale
+    quarterly holdings from voting in a short convergence window alongside
+    live flow, only rows whose stored holdings period end lies inside
+    ``[as_of - window_days, as_of]`` are included; rows lacking a period end
+    or with an out-of-window period end are excluded (fail closed).
     """
     if not INSTITUTIONAL_13F_DIRECTIONAL:
         return None
@@ -892,11 +923,26 @@ def _scan_institutional(
     if rows is None or len(rows) == 0:
         return None
 
+    window_start, _ = _window_bounds(as_of, window_days)
     net_positions = 0
-    latest_date = as_of - timedelta(days=window_days)
+    valid_rows = 0
+    skipped_missing_period = 0
+    skipped_out_of_window = 0
+    latest_date = window_start
+    latest_period_end: date | None = None
+
     for r in rows:
         _sid, sdate, _stype, sval, _trust, _created = r
         payload = _parse_signal_value(sval)
+        period_end = _extract_holdings_period_end(payload)
+        if period_end is None:
+            skipped_missing_period += 1
+            continue
+        if period_end < window_start or period_end > as_of:
+            skipped_out_of_window += 1
+            continue
+
+        valid_rows += 1
         new = int(payload.get("new_positions") or 0)
         inc = int(payload.get("increased") or 0)
         closed = int(payload.get("closed_positions") or 0)
@@ -909,6 +955,20 @@ def _scan_institutional(
         net_positions += (new + inc) - (closed + dec)
         if isinstance(sdate, date) and sdate > latest_date:
             latest_date = sdate
+        if latest_period_end is None or period_end > latest_period_end:
+            latest_period_end = period_end
+
+    if valid_rows == 0:
+        log.debug(
+            "13F stream excluded for ticker={t} in {w}d window as_of={a}: "
+            "{m} row(s) missing holdings period_end, {o} row(s) outside window",
+            t=ticker,
+            w=window_days,
+            a=as_of.isoformat(),
+            m=skipped_missing_period,
+            o=skipped_out_of_window,
+        )
+        return None
 
     if net_positions == 0:
         return None
@@ -929,7 +989,8 @@ def _scan_institutional(
         evidence_line=evidence,
         raw_payload={
             "net_positions": net_positions,
-            "n_filings": len(rows),
+            "n_filings": valid_rows,
+            "latest_period_end": latest_period_end.isoformat() if latest_period_end else None,
         },
     )
 
@@ -1008,8 +1069,10 @@ def _scan_prediction_market(
 ) -> StreamSignal | None:
     """Prediction market: aggregate RAPID_SHIFT magnitude + direction.
 
-    Each signal_sources row from the polymarket puller carries
-    ``direction`` (``up`` / ``down``) and ``shift`` (probability delta).
+    Each signal_sources row from ``ingestion/altdata/prediction_odds.py``
+    carries a signed ``shift = current_prob - previous_prob`` (positive for
+    UP, negative for DOWN). Use the stored signed shift directly without
+    re-applying ``direction``.
     """
     rows = _fetch_stream_rows(
         engine, STREAM_PREDICTION_MARKET, ticker, as_of, window_days
@@ -1024,9 +1087,9 @@ def _scan_prediction_market(
         _sid, sdate, _stype, sval, _trust, _created = r
         payload = _parse_signal_value(sval)
         shift = float(payload.get("shift") or 0.0)
-        direction_hint = _normalize_direction(payload.get("direction"))
-        signed = shift if direction_hint != BEARISH else -shift
-        net_shift += signed
+        if math.isnan(shift) or math.isinf(shift):
+            continue
+        net_shift += shift
         max_abs = max(max_abs, abs(shift))
         if isinstance(sdate, date) and sdate > latest_date:
             latest_date = sdate
@@ -1078,11 +1141,11 @@ _STREAM_EXTRACTORS: tuple[
 def _compute_convergence(
     signals: list[StreamSignal],
     target_direction: str,
-) -> tuple[float, int, int, float, float, float]:
+) -> tuple[float, int, int, float, float]:
     """Trust-weighted convergence math. Returns a tuple of
 
         (convergence_score, n_aligned, n_opposed,
-         weighted_alignment, weighted_opposition, weighted_neutral)
+         weighted_alignment, weighted_opposition)
 
     Keeping the intermediates visible in the return tuple is
     deliberate: tests inspect the weighted-opposition branch of the
@@ -1091,24 +1154,25 @@ def _compute_convergence(
     """
     weighted_alignment = 0.0
     weighted_opposition = 0.0
-    weighted_neutral = 0.0
     total_trust = 0.0
     n_aligned = 0
     n_opposed = 0
 
     for s in signals:
         total_trust += s.trust_weight
+        if s.direction == NEUTRAL:
+            # Neutral streams count in the denominator only (they dilute;
+            # they never add directional support to the numerator).
+            continue
         if s.direction == target_direction:
             weighted_alignment += s.intensity * s.trust_weight
             n_aligned += 1
-        elif s.direction == NEUTRAL:
-            weighted_neutral += _NEUTRAL_DAMPENER * s.intensity * s.trust_weight
         else:
             weighted_opposition += s.intensity * s.trust_weight
             n_opposed += 1
 
     denom = max(_MIN_DENOMINATOR, total_trust)
-    raw = (weighted_alignment + weighted_neutral - weighted_opposition) / denom
+    raw = (weighted_alignment - weighted_opposition) / denom
     score = _clamp(raw, 0.0, 1.0)
     return (
         score,
@@ -1116,7 +1180,6 @@ def _compute_convergence(
         n_opposed,
         weighted_alignment,
         weighted_opposition,
-        weighted_neutral,
     )
 
 
@@ -1289,7 +1352,6 @@ def scan_convergence(
         n_opposed,
         w_align,
         w_oppose,
-        _w_neut,
     ) = _compute_convergence(active, tgt)
 
     multiplier = _pick_multiplier(
