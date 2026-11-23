@@ -18,6 +18,7 @@ import json
 import math
 from datetime import date, timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -27,10 +28,12 @@ import pytest
 
 from alpha_research import ensemble
 from alpha_research.validation import gauntlet
-from alpha_research.validation.metrics import long_short_returns, rank_ic
+from alpha_research.validation import metrics as metrics_mod
+from alpha_research.validation.metrics import compute_signal_metrics, long_short_returns, rank_ic
 from contracts.handlers import journal as journal_handler
 from contracts.schemas import SignalFired
 from tests.fixtures.evaluator.fake_pit_store import FakePITStore, Row
+from validation import gates
 from validation.backtest import WalkForwardBacktest
 from validation.gates import GateChecker
 
@@ -107,6 +110,47 @@ def _fast_long_short_with_costs(
 # ===========================================================================
 
 
+def _typed_val_row(
+    evidence: dict[str, Any],
+    *,
+    verdict: str = "PASS",
+    version: Any = 1,
+    extra_gate_detail: dict[str, Any] | None = None,
+) -> tuple:
+    """A validation_results row whose gate_detail carries a typed OOS record.
+
+    Row shape: (overall_verdict, full_period_metrics, baseline_comparison, gate_detail).
+    """
+    record = {"schema": gates.OOS_EVIDENCE_SCHEMA, "version": version, **evidence}
+    gate_detail = {gates.OOS_EVIDENCE_KEY: record, **(extra_gate_detail or {})}
+    return (verdict, json.dumps({}), json.dumps({}), json.dumps(gate_detail))
+
+
+def _production_check(val_row, model_id: int = 10) -> tuple[dict, MagicMock]:
+    engine = _mock_engine()
+    conn = engine._mock_conn
+    conn.execute.side_effect = [
+        _res(("REGIME",)),  # model_registry
+        _res((25,)),        # decision_journal count
+        _res(None),         # existing PRODUCTION
+        _res(val_row),      # validation_results for model_version_id
+    ]
+    return GateChecker(engine).check_staging_to_production(model_id), conn
+
+
+@pytest.fixture
+def stand_in_oos_reader(monkeypatch):
+    """Register a stand-in v1 typed OOS reader. None ships (see validation.gates)."""
+    calls: list[int] = []
+
+    def _reader(record: dict[str, Any], model_id: int) -> dict[str, Any]:
+        calls.append(model_id)
+        return dict(record)
+
+    monkeypatch.setitem(gates._OOS_EVIDENCE_READERS, 1, _reader)
+    return calls
+
+
 class TestGatesStagingToProduction:
     def test_refuses_when_no_oos_evidence_record_exists(self):
         engine = _mock_engine()
@@ -121,100 +165,147 @@ class TestGatesStagingToProduction:
         assert res["passed"] is False
         assert any("missing_oos_evidence" in d for d in res["details"])
 
-    def test_refuses_when_fewer_than_30_scored_forward_predictions(self):
-        engine = _mock_engine()
-        conn = engine._mock_conn
-        val_row = (
-            "PASS",
-            json.dumps({"n_scored": 29, "hit_rate": 0.90}),
-            json.dumps({}),
-            json.dumps({}),
-        )
-        conn.execute.side_effect = [
-            _res(("REGIME",)),
-            _res((25,)),
-            _res(None),
-            _res(val_row),
-        ]
-        res = GateChecker(engine).check_staging_to_production(10)
+    def test_refuses_when_fewer_than_30_scored_forward_predictions(self, stand_in_oos_reader):
+        res, _ = _production_check(_typed_val_row({"n_scored": 29, "hit_rate": 0.90}))
         assert res["passed"] is False
         assert any("insufficient_scored_predictions" in d for d in res["details"])
 
-    def test_refuses_when_wilson_95_lower_bound_at_or_below_half(self):
+    def test_refuses_when_wilson_95_lower_bound_at_or_below_half(self, stand_in_oos_reader):
         # n=30, k=20 -> hit_rate=0.6667, Wilson 95% lower bound = 0.4878 <= 0.5
-        engine = _mock_engine()
-        conn = engine._mock_conn
-        val_row = (
-            "PASS",
-            json.dumps({"n_scored": 30, "n_hits": 20}),
-            json.dumps({}),
-            json.dumps({}),
-        )
-        conn.execute.side_effect = [
-            _res(("REGIME",)),
-            _res((25,)),
-            _res(None),
-            _res(val_row),
-        ]
-        res = GateChecker(engine).check_staging_to_production(10)
+        res, _ = _production_check(_typed_val_row({"n_scored": 30, "n_hits": 20}))
         assert res["passed"] is False
         assert any("oos_skill_below_threshold" in d for d in res["details"])
 
-    def test_passes_when_wilson_95_lower_bound_exceeds_half(self):
+    def test_passes_when_wilson_95_lower_bound_exceeds_half(self, stand_in_oos_reader):
         # n=30, k=21 -> hit_rate=0.70, Wilson 95% lower bound = 0.5212 > 0.5
-        engine = _mock_engine()
-        conn = engine._mock_conn
-        val_row = (
-            "PASS",
-            json.dumps({"n_scored": 30, "n_hits": 21}),
-            json.dumps({}),
-            json.dumps({}),
+        res, _ = _production_check(_typed_val_row({"n_scored": 30, "n_hits": 21}))
+        assert res["passed"] is True
+        assert stand_in_oos_reader == [10]  # the reader saw this model_version_id
+
+    def test_passes_when_brier_strictly_below_climatology(self, stand_in_oos_reader):
+        res, _ = _production_check(
+            _typed_val_row({"n_scored": 40, "brier": 0.19, "climatology_brier": 0.25})
         )
-        conn.execute.side_effect = [
-            _res(("REGIME",)),
-            _res((25,)),
-            _res(None),
-            _res(val_row),
-        ]
-        res = GateChecker(engine).check_staging_to_production(10)
         assert res["passed"] is True
 
-    def test_passes_when_brier_strictly_below_climatology(self):
-        engine = _mock_engine()
-        conn = engine._mock_conn
-        val_row = (
-            "PASS",
-            json.dumps({"n_scored": 40, "brier": 0.19}),
-            json.dumps({"climatology_brier": 0.25}),
-            json.dumps({}),
+    def test_refuses_when_recorded_overfitting_check_failed(self, stand_in_oos_reader):
+        res, _ = _production_check(
+            _typed_val_row(
+                {"n_scored": 50, "hit_rate": 0.76},
+                extra_gate_detail={
+                    "overfit_gate": {"passed": False, "reasons": ["PBO 0.62 >= 0.5"]}
+                },
+            )
         )
-        conn.execute.side_effect = [
-            _res(("REGIME",)),
-            _res((25,)),
-            _res(None),
-            _res(val_row),
-        ]
-        res = GateChecker(engine).check_staging_to_production(10)
-        assert res["passed"] is True
-
-    def test_refuses_when_recorded_overfitting_check_failed(self):
-        engine = _mock_engine()
-        conn = engine._mock_conn
-        val_row = (
-            "PASS",
-            json.dumps({"n_scored": 50, "hit_rate": 0.76}),
-            json.dumps({}),
-            json.dumps({"overfit_gate": {"passed": False, "reasons": ["PBO 0.62 >= 0.5"]}}),
-        )
-        conn.execute.side_effect = [
-            _res(("REGIME",)),
-            _res((25,)),
-            _res(None),
-            _res(val_row),
-        ]
-        res = GateChecker(engine).check_staging_to_production(10)
         assert res["passed"] is False
         assert any("overfitting_check_failed" in d for d in res["details"])
+
+
+class TestGateRefusesUntypedOOSEvidence:
+    """Codex HOLD 6011907730: STAGING -> PRODUCTION must not accept generic
+    recent counts or rates. Only a typed, versioned OOS record read by a
+    registered reader (which proves cohort and clock provenance) counts, and
+    no reader ships, so the gate is fail-closed."""
+
+    _GENERIC_PASSING = {"n_scored": 40, "hit_rate": 0.75, "n_hits": 30,
+                        "brier": 0.10, "climatology_brier": 0.25}
+
+    @pytest.mark.parametrize("where", ["full_period_metrics", "gate_detail"])
+    def test_refuses_generic_counts_without_typed_provenance(self, where):
+        fpm = self._GENERIC_PASSING if where == "full_period_metrics" else {}
+        gd = self._GENERIC_PASSING if where == "gate_detail" else {}
+        res, _ = _production_check(("PASS", json.dumps(fpm), json.dumps({}), json.dumps(gd)))
+        assert res["passed"] is False
+        assert any(d.startswith("untyped_oos_evidence") for d in res["details"])
+        # Generic counts are never read as skill evidence.
+        assert not any("scored forward predictions" in d for d in res["details"])
+
+    def test_generic_counts_refused_even_when_a_reader_is_registered(self, stand_in_oos_reader):
+        res, _ = _production_check(
+            ("PASS", json.dumps(self._GENERIC_PASSING), json.dumps({}), json.dumps({}))
+        )
+        assert res["passed"] is False
+        assert any(d.startswith("untyped_oos_evidence") for d in res["details"])
+        assert stand_in_oos_reader == []
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            {"n_scored": 40, "n_hits": 35},                                   # no schema, no version
+            {"schema": "grid.oos_forward_evidence", "n_scored": 40, "n_hits": 35},  # no version
+            {"schema": "grid.oos_forward_evidence", "version": "1", "n_scored": 40},
+            {"schema": "grid.oos_forward_evidence", "version": True, "n_scored": 40},
+            {"schema": "some.other_schema", "version": 1, "n_scored": 40, "n_hits": 35},
+        ],
+    )
+    def test_refuses_unversioned_typed_record(self, record, stand_in_oos_reader):
+        gd = {"oos_evidence": record}
+        res, _ = _production_check(("PASS", json.dumps({}), json.dumps({}), json.dumps(gd)))
+        assert res["passed"] is False
+        assert any(d.startswith("unversioned_oos_evidence") for d in res["details"])
+        assert stand_in_oos_reader == []
+
+    def test_no_typed_reader_ships_so_a_typed_record_is_still_refused(self):
+        assert gates._OOS_EVIDENCE_READERS == {}
+        res, _ = _production_check(_typed_val_row({"n_scored": 400, "n_hits": 380}))
+        assert res["passed"] is False
+        assert any(d.startswith("unsupported_oos_evidence_version") for d in res["details"])
+
+    def test_reader_refusal_or_bad_output_fails_closed(self, monkeypatch):
+        def _refuses(record, model_id):
+            raise ValueError("cohort predates model_version_id 10")
+
+        monkeypatch.setitem(gates._OOS_EVIDENCE_READERS, 1, _refuses)
+        res, _ = _production_check(_typed_val_row({"n_scored": 400, "n_hits": 380}))
+        assert res["passed"] is False
+        assert any(
+            d.startswith("oos_evidence_rejected") and "cohort predates" in d
+            for d in res["details"]
+        )
+
+        monkeypatch.setitem(gates._OOS_EVIDENCE_READERS, 1, lambda record, mid: None)
+        res, _ = _production_check(_typed_val_row({"n_scored": 400, "n_hits": 380}))
+        assert res["passed"] is False
+        assert any(d.startswith("oos_evidence_rejected") for d in res["details"])
+
+    def test_shipped_backtest_writer_row_is_unversioned_and_refused(self):
+        """The shipped writer stores no model_version_id and no record version.
+
+        The gate already reads only rows bound to this model_version_id (no
+        hypothesis_id fallback), so a shipped-writer row never matches; and
+        even if that payload were attributed to the model, generic counts in
+        it are refused.
+        """
+        write_engine = _mock_engine()
+        bt = WalkForwardBacktest(write_engine, pit_store=None)
+        bt._store_result(
+            {
+                "hypothesis_id": 3,
+                "vintage_policy": "FIRST_RELEASE",
+                "era_results": [{"status": "OK", "return": 0.02}],
+                "full_period_metrics": {"return": 0.05, "sharpe": 1.9, "n_days": 400,
+                                        "n_scored": 40, "hit_rate": 0.75},
+                "baseline_comparison": {"sharpe": 0.4},
+                "simplicity_comparison": {},
+                "walk_forward_splits": 5,
+                "cost_assumption_bps": 10.0,
+                "overall_verdict": "PASS",
+                "gate_detail": {"era_consistency": True, "beats_baseline": True,
+                                "positive_in_all_eras": True},
+            }
+        )
+        ins_sql, params = write_engine._mock_conn.execute.call_args.args
+        assert "INSERT INTO validation_results" in str(ins_sql)
+        assert "model_version_id" not in str(ins_sql)
+
+        res, conn = _production_check((params["ov"], params["fpm"], params["bc"], params["gd"]))
+        val_sql, val_params = conn.execute.call_args_list[3].args
+        assert "FROM validation_results" in str(val_sql)
+        assert "WHERE model_version_id = :mid" in str(val_sql)
+        assert "hypothesis_id" not in str(val_sql)
+        assert val_params == {"mid": 10}
+        assert res["passed"] is False
+        assert any(d.startswith("untyped_oos_evidence") for d in res["details"])
 
 
 class TestGatesShadowToStagingDrift:
@@ -772,6 +863,94 @@ class TestMetricsAlignment:
         np.testing.assert_allclose(ic.to_numpy(), np.ones(6), atol=1e-12)
 
 
+class TestFrozenBookMissingOutcomes:
+    """Codex HOLD 6011907730: the book is picked from the decision-time
+    universe before any forward return is read. A book member whose outcome
+    later goes missing (delisted, halted, data gap) stays in the book, its
+    outcome is counted as missing, and coverage is reported. It is never
+    replaced by the next-ranked name."""
+
+    _COLS = ["A", "B", "C", "D", "E", "F"]
+
+    def _frames(self, signal_rows, fwd_rows):
+        dates = pd.bdate_range("2024-03-01", periods=len(signal_rows))
+        signal = pd.DataFrame(signal_rows, index=dates, columns=self._COLS, dtype=float)
+        fwd = pd.DataFrame(fwd_rows, index=dates, columns=self._COLS, dtype=float)
+        return signal, fwd
+
+    def test_top_ranked_name_with_missing_outcome_is_not_replaced(self):
+        # F is top-ranked at the decision; its outcome later goes missing.
+        # D is the name a reselection would pull in, and it returned +50%.
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6]],
+            [[-0.01, -0.02, 0.0, 0.50, 0.03, np.nan]],
+        )
+        ls = long_short_returns(signal, fwd, top_n=2, cost_bps=0.0)
+        # Frozen book: long {E, F}, short {A, B}. F's outcome is not imputed,
+        # so the long leg is E alone; D never enters the book.
+        assert len(ls) == 1
+        assert ls.iloc[0] == pytest.approx(0.03 - (-0.01 - 0.02) / 2)
+
+    def test_book_reports_missing_name_and_coverage(self):
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6]],
+            [[-0.01, -0.02, 0.0, 0.50, 0.03, np.nan]],
+        )
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=0.0)
+        row = book.iloc[0]
+        assert row["n_book"] == 4
+        assert row["n_observed"] == 3
+        assert row["coverage"] == pytest.approx(0.75)
+        assert tuple(row["missing"]) == ("F",)
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["outcome_coverage"] == pytest.approx(0.75)
+        assert cov["n_missing_outcomes"] == 1
+        assert cov["n_unscored_days"] == 0
+
+    def test_leg_without_any_observed_outcome_leaves_date_unscored(self):
+        # Day 2: both long names (E, F) lose their outcomes. Reselection
+        # would score the day with C and D instead.
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]],
+            [[-0.01, -0.02, 0.0, 0.01, 0.03, 0.02],
+             [-0.01, -0.02, 0.40, 0.50, np.nan, np.nan]],
+        )
+        ls = long_short_returns(signal, fwd, top_n=2, cost_bps=0.0)
+        assert list(ls.index) == [signal.index[0]]
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=0.0)
+        assert len(book) == 2
+        assert np.isnan(book["return"].iloc[1])
+        assert book["coverage"].iloc[1] == pytest.approx(0.5)
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["n_unscored_days"] == 1
+        assert cov["outcome_coverage"] == pytest.approx(6 / 8)
+
+    def test_held_name_with_missing_outcome_costs_no_turnover(self):
+        # Same ranking on both days; F's day-1 outcome is missing. With the
+        # book frozen F is held both days, so day 2 has zero turnover cost.
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]],
+            [[-0.01, -0.02, 0.0, 0.50, 0.03, np.nan],
+             [-0.01, -0.02, 0.0, 0.01, 0.03, 0.05]],
+        )
+        ls = long_short_returns(signal, fwd, top_n=2, cost_bps=10.0)
+        day2_gross = (0.03 + 0.05) / 2 - (-0.01 - 0.02) / 2
+        assert ls.iloc[1] == pytest.approx(day2_gross, rel=1e-9)
+
+    def test_compute_signal_metrics_reports_outcome_coverage(self):
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range("2024-01-02", periods=40)
+        cols = [f"T{i:02d}" for i in range(12)]
+        signal = pd.DataFrame(rng.normal(size=(40, 12)), index=dates, columns=cols)
+        fwd = pd.DataFrame(rng.normal(0, 0.01, size=(40, 12)), index=dates, columns=cols)
+        top = signal.iloc[7].idxmax()
+        fwd.loc[dates[7], top] = np.nan  # a top-ranked name's outcome goes missing
+        m = compute_signal_metrics(signal, fwd, top_n=5, cost_bps=10.0)
+        assert m["n_missing_outcomes"] == 1
+        assert m["outcome_coverage"] == pytest.approx(1 - 1 / (40 * 10))
+        assert m["n_days"] == 40
+
+
 class TestEnsembleEmbargoAndEarlyStopping:
     def _mock_lgb(self, monkeypatch):
         recorded: dict = {"datasets": [], "train_calls": []}
@@ -862,3 +1041,28 @@ class TestEnsembleEmbargoAndEarlyStopping:
 
         with pytest.raises(ValueError, match="embargo"):
             ensemble.train_ensemble(panels, fwd, label_horizon=5, embargo_days=2)
+
+    def test_top_ranked_name_with_missing_outcome_stays_in_decision_universe(self, monkeypatch):
+        recorded = self._mock_lgb(monkeypatch)
+        dates, panels, fwd = self._synthetic_panels(n_dates=100, n_tickers=12)
+        # The fake booster predicts f1, so T00 is top-ranked on validation
+        # date dates[80] (outer val starts at dates[75]); its outcome is missing.
+        val_day = dates[80]
+        panels["f1"].loc[val_day, "T00"] = 50.0
+        fwd = fwd.copy()
+        fwd.loc[val_day, "T00"] = np.nan
+        # A training row with a missing label too: it must not be trained on.
+        fwd.loc[dates[10], "T03"] = np.nan
+
+        res = ensemble.train_ensemble(
+            panels, fwd, train_frac=0.7, label_horizon=5, embargo_days=5,
+            n_rounds=20, early_stopping=5,
+        )
+        # Ranked over the decision-time universe, not dropped for its outcome.
+        assert res.predictions.loc[val_day, "T00"] == pytest.approx(1.0)
+        # Training and early-stopping sets carry no unlabeled row.
+        for ds in recorded["datasets"]:
+            assert not pd.isna(ds.label).any()
+        # Coverage is reported: 25 val dates x 10 book slots, one missing.
+        assert res.val_outcome_coverage == pytest.approx(1 - 1 / 250)
+

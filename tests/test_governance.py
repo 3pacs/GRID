@@ -156,7 +156,26 @@ def _ok_drift_checker(_model_id: int) -> dict:
 
 
 def _passing_oos_row():
-    return _row("PASS", {"n_scored": 40, "hit_rate": 0.75}, {}, {})
+    """validation_results row with a typed OOS record; passes only under a registered reader."""
+    from validation import gates
+
+    record = {
+        "schema": gates.OOS_EVIDENCE_SCHEMA,
+        "version": 1,
+        "n_scored": 40,
+        "hit_rate": 0.75,
+    }
+    return _row("PASS", {}, {}, {gates.OOS_EVIDENCE_KEY: record})
+
+
+@pytest.fixture
+def stand_in_oos_reader(monkeypatch):
+    """Register a stand-in v1 typed OOS reader (none ships; see validation.gates)."""
+    from validation import gates
+
+    monkeypatch.setitem(
+        gates._OOS_EVIDENCE_READERS, 1, lambda record, _model_id: dict(record)
+    )
 
 
 class TestGateCheckerShadowToStaging:
@@ -185,6 +204,7 @@ class TestGateCheckerShadowToStaging:
         assert any("Operator approval" in d for d in result["details"])
 
 
+@pytest.mark.usefixtures("stand_in_oos_reader")
 class TestGateCheckerStagingToProduction:
     """Tests for the STAGING -> PRODUCTION gate check."""
 

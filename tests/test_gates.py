@@ -10,7 +10,10 @@ from __future__ import annotations
 from datetime import timedelta
 from unittest.mock import MagicMock
 
+import pytest
+
 from governance.hypothesis_labels import LEGACY_CUTOFF
+from validation import gates
 from validation.gates import GateChecker
 
 # Hypothesis rows are (state, created_at, label): a validated PASSED row is
@@ -56,9 +59,27 @@ def _ok_drift_checker(_model_id: int) -> dict:
 
 
 def _passing_oos_result():
-    """Passing out-of-sample validation_results row (n=40, hit_rate=0.75 -> Wilson lo > 0.5)."""
+    """validation_results row with a typed OOS record (n=40, hit_rate=0.75 -> Wilson lo > 0.5).
+
+    It passes only while a reader for its version is registered (the
+    ``stand_in_oos_reader`` fixture): no typed OOS reader ships.
+    """
+    record = {
+        "schema": gates.OOS_EVIDENCE_SCHEMA,
+        "version": 1,
+        "n_scored": 40,
+        "hit_rate": 0.75,
+    }
     return _make_result(
-        _make_row("PASS", {"n_scored": 40, "hit_rate": 0.75}, {}, {})
+        _make_row("PASS", {}, {}, {gates.OOS_EVIDENCE_KEY: record})
+    )
+
+
+@pytest.fixture
+def stand_in_oos_reader(monkeypatch):
+    """Register a stand-in v1 typed OOS reader that returns the record as proven."""
+    monkeypatch.setitem(
+        gates._OOS_EVIDENCE_READERS, 1, lambda record, _model_id: dict(record)
     )
 
 
@@ -462,6 +483,7 @@ class TestShadowToStaging:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("stand_in_oos_reader")
 class TestStagingToProduction:
 
     def test_staging_to_production_passes(self, mock_engine):
@@ -675,6 +697,7 @@ class TestCheckAllGates:
         assert result["passed"] is True
         assert any("No gates defined" in d for d in result["details"])
 
+    @pytest.mark.usefixtures("stand_in_oos_reader")
     def test_check_all_gates_production_dispatches_correctly(self, mock_engine):
         """check_all_gates(PRODUCTION) must delegate to check_staging_to_production."""
         conn = _get_mock_conn(mock_engine)
