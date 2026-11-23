@@ -846,18 +846,38 @@ def _make_13f_xml(entries: list[tuple[str, str, int, int]]) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
-def _fake_edgar_get(xml_by_accession: dict[str, bytes]):
-    """Offline mock for ``requests.get`` serving EDGAR index.json + infotable.xml."""
+def _make_13f_cover(period: str, entries: int, value_total: int) -> bytes:
+    """Minimal 13F-HR cover page (primary_doc.xml): period and summary totals."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<edgarSubmission xmlns="http://www.sec.gov/edgar/thirteenffiler">'
+        "<headerData><submissionType>13F-HR</submissionType></headerData>"
+        f"<formData><coverPage><reportCalendarOrQuarter>{period}</reportCalendarOrQuarter>"
+        "<isAmendment>false</isAmendment></coverPage>"
+        f"<summaryPage><tableEntryTotal>{entries}</tableEntryTotal>"
+        f"<tableValueTotal>{value_total}</tableValueTotal></summaryPage></formData>"
+        "</edgarSubmission>"
+    ).encode("utf-8")
+
+
+def _fake_edgar_get(xml_by_accession: dict[str, bytes], cover_by_accession: dict[str, bytes] | None = None):
+    """Offline mock for ``requests.get`` serving EDGAR index.json, the cover
+    page (when given) and infotable.xml."""
+    covers = cover_by_accession or {}
+
     def _get(url: str, **_kwargs):
         resp = MagicMock()
         resp.status_code = 200
         resp.raise_for_status = MagicMock()
         if url.endswith("/index.json"):
-            resp.json.return_value = {"directory": {"item": [{"name": "infotable.xml"}]}}
+            items = [{"name": "infotable.xml"}]
+            if any(acc.replace("-", "") in url for acc in covers):
+                items.insert(0, {"name": "primary_doc.xml"})
+            resp.json.return_value = {"directory": {"item": items}}
             return resp
         for acc, xml_bytes in xml_by_accession.items():
             if acc.replace("-", "") in url:
-                resp.content = xml_bytes
+                resp.content = covers[acc] if url.endswith("/primary_doc.xml") else xml_bytes
                 return resp
         raise AssertionError(f"unexpected URL: {url}")
     return _get
@@ -918,7 +938,13 @@ def test_13f_straddling_cutover_pair_creates_no_spurious_change_event(monkeypatc
     inserted_raw: list[dict] = []
     monkeypatch.setattr(institutional_flows, "TOP_13F_FILERS", {"1067983": "Berkshire Hathaway Inc"})
     monkeypatch.setattr(institutional_flows.time, "sleep", lambda *_a, **_k: None)
-    monkeypatch.setattr(institutional_flows.requests, "get", _fake_edgar_get(xml_by_acc))
+    # Cover pages: the writer compares only filings read in full (entry count
+    # matches tableEntryTotal); the periods come from the cover page here.
+    covers = {
+        curr_acc: _make_13f_cover("12-31-2022", 3, 280_000_000),
+        prev_acc: _make_13f_cover("09-30-2022", 3, 220_000),
+    }
+    monkeypatch.setattr(institutional_flows.requests, "get", _fake_edgar_get(xml_by_acc, covers))
     monkeypatch.setattr(
         puller,
         "_fetch_13f_index",
@@ -944,9 +970,18 @@ def test_13f_straddling_cutover_pair_creates_no_spurious_change_event(monkeypatc
     assert results[0]["status"] == "SUCCESS"
     assert results[0]["changes_detected"] == 3
 
+    # One filing comparison receipt: both sides read in full and compared.
+    receipts = [r for r in inserted_raw if r["series_id"].startswith("13F-FILING:")]
+    assert [r["series_id"] for r in receipts] == ["13F-FILING:1067983:0001067983-23-000010"]
+    receipt = receipts[0]["raw_payload"]
+    assert receipt["comparison_status"] == "compared"
+    assert receipt["curr_snapshot"]["status"] == receipt["prev_snapshot"]["status"] == "complete"
+    assert (receipt["report_date"], receipt["prev_report_date"]) == ("2022-12-31", "2022-09-30")
+    assert receipt["qualified_for_directional_flow"] is False
+
     # AAPL unchanged across cutover -> no spurious event. Every value below is
     # in dollars: a wrong multiplier would read 1000x too small or too large.
-    by_series = {r["series_id"]: r for r in inserted_raw}
+    by_series = {r["series_id"]: r for r in inserted_raw if r["series_id"].startswith("13F:")}
     assert set(by_series) == {
         "13F:1067983:67066G104:NEW",
         "13F:1067983:459200101:CLOSED",
