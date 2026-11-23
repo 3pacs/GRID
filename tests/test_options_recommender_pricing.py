@@ -271,6 +271,38 @@ def _contract_row(
     }
 
 
+# ── Decision instant (Codex review 6030559940 on #1400) ──────────────────────
+
+
+def test_decision_instant_is_generated_at_and_reaches_cross_asset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run's decision instant is stamped on ``generated_at`` and passed to CROSS_ASSET.
+
+    A stored recommendation then records the exact instant its CROSS_ASSET
+    price, split and journal reads were fenced at, so it can be reproduced.
+    """
+    from datetime import datetime, timezone
+
+    _freeze_date(monkeypatch, RUN_WED)
+    db = _FakeDb(_FakeConn(snapshots=[_contract_row(strike=105.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.28)]))
+    rec_engine = OptionsRecommender(db)
+    _disable_llm(rec_engine, monkeypatch)
+    seen: dict[str, Any] = {}
+
+    def _cross_asset(rec, db_, *, run_date=None, decision_ts=None):
+        seen.update(run_date=run_date, decision_ts=decision_ts)
+        return {"status": "PASS", "reason": "stub"}
+
+    monkeypatch.setattr(rec_engine, "_sanity_cross_asset", _cross_asset)
+    decided = datetime(2026, 11, 18, 16, 0, tzinfo=timezone.utc)  # 11:00 New York
+    opp = _make_opp(direction="CALL", spot=100.0, score=8.5)
+    gex = _make_gex_engine({"regime": "SHORT_GAMMA", "call_wall": 110.0, "put_wall": 90.0})
+
+    rec = rec_engine._build_recommendation(opp, gex, db, run_date=RUN_WED, decision_ts=decided)
+    assert rec is not None
+    assert rec.generated_at == "2026-11-18T16:00:00Z"
+    assert seen == {"run_date": RUN_WED, "decision_ts": decided}
+
+
 # ── Defect 1: Target price must reprice via Black-Scholes (not delta=1) ─────
 
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -146,23 +146,58 @@ class UnderlyingMomentum:
     reason: str
 
 
-def momentum_cutoff(run_date: date) -> datetime:
-    """The last instant a run dated ``run_date`` may read: the end of that day in New York.
+#: ``basis`` of a CROSS_ASSET result fenced at the run's decision instant.
+DECISION_TIME_BASIS = "decision_time"
+#: ``basis`` of a result fenced only at the end of ``run_date`` (a replay that
+#: has no decision instant). It is a reconstruction, never a veto (Codex
+#: review 6030559940): its FAIL is reported as SKIP.
+DATE_ONLY_BASIS = "date_only_reconstruction"
 
-    Date-granular, like the DATA_QUALITY snapshot fence (``snap_date <=
-    run_date``): a replay of a day sees that day's close if it was pulled
-    that evening, as a run after the close did.
+
+def _as_utc(ts: datetime) -> datetime:
+    """``ts`` as an aware UTC instant; a naive value is taken as UTC (grid-svr runs Etc/UTC)."""
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+
+
+def decision_time(run_date: date | None, decision_ts: datetime | None) -> datetime | None:
+    """The instant a recommendation is decided at, or None for a date-only replay.
+
+    A given ``decision_ts`` is used as is (UTC). With neither argument the run
+    is live and decides now. A ``run_date`` with no ``decision_ts`` is a
+    replay of that date with no recorded instant: None.
     """
-    return datetime.combine(run_date, time.max, _NEW_YORK)
+    if decision_ts is not None:
+        return _as_utc(decision_ts)
+    if run_date is None:
+        return datetime.now(timezone.utc)
+    return None
 
 
-def underlying_momentum(conn: Any, ticker: str, run_date: date) -> UnderlyingMomentum:
+def momentum_cutoff(run_date: date, decided_at: datetime | None = None) -> datetime:
+    """The last instant a recommendation dated ``run_date`` may read.
+
+    With ``decided_at`` (the run's decision instant) it is that instant,
+    capped at the end of ``run_date`` in New York, so a recommendation at
+    11:00 New York never sees the close pulled at 17:05 or a journal entry
+    written that afternoon. Without it, the end of ``run_date`` in New York:
+    a date-only reconstruction (:data:`DATE_ONLY_BASIS`).
+    """
+    day_end = datetime.combine(run_date, time.max, _NEW_YORK)
+    if decided_at is None:
+        return day_end
+    return min(_as_utc(decided_at), day_end.astimezone(timezone.utc))
+
+
+def underlying_momentum(
+    conn: Any, ticker: str, run_date: date, *, as_of_ts: datetime | None = None,
+) -> UnderlyingMomentum:
     """Return of ``ticker``'s completed close over the last ``MOMENTUM_SESSIONS`` sessions.
 
     Reads ``YF:{TICKER}:close`` through ``store.observations.read_completed_closes``:
     SUCCESS rows from yfinance or TIINGO pulled after 17:00 New York on the
     session day (``evaluation.prices.us_listed_close_boundary``) and by
-    :func:`momentum_cutoff`, labels up to ``run_date``, TIINGO rows of
+    ``momentum_cutoff(run_date, as_of_ts)`` (the decision instant when
+    given), labels up to ``run_date``, TIINGO rows of
     another listing dropped (``tiingo_symbol_contract``). A label whose
     completed vintages disagree is ambiguous and is not used.
 
@@ -190,7 +225,7 @@ def underlying_momentum(conn: Any, ticker: str, run_date: date) -> UnderlyingMom
     symbol = (ticker or "").strip().upper()
     if not symbol:
         return UnderlyingMomentum(None, None, None, "no ticker")
-    cutoff = momentum_cutoff(run_date)
+    cutoff = momentum_cutoff(run_date, as_of_ts)
     start = run_date - timedelta(days=_MOMENTUM_LOOKBACK_DAYS)
     closes = read_completed_closes(
         conn, f"YF:{symbol}:close", start=start, end=run_date,
@@ -836,6 +871,7 @@ class OptionsRecommender:
         engine: Engine | None = None,
         tickers: list[str] | None = None,
         run_date: date | None = None,
+        decision_ts: datetime | None = None,
     ) -> list[OptionsRecommendation]:
         """Generate actionable options trade recommendations.
 
@@ -843,6 +879,11 @@ class OptionsRecommender:
             engine: Optional override SQLAlchemy engine (defaults to self.engine).
             tickers: Restrict scan to these tickers (default: all available).
             run_date: Effective run date for freshness and DTE (default: today).
+            decision_ts: The instant this run decides at. Set once per run
+                (default: now for a live run) and stamped on every
+                recommendation's ``generated_at``; CROSS_ASSET reads nothing
+                pulled or written after it. A past ``run_date`` without it is a
+                date-only reconstruction (``DATE_ONLY_BASIS``).
 
         Returns:
             list[OptionsRecommendation]: Only recommendations passing all required
@@ -851,6 +892,7 @@ class OptionsRecommender:
             ``self.last_rejection_counts`` and ``self.last_run_summary``.
         """
         db = engine or self.engine
+        decided_at = decision_time(run_date, decision_ts)
         effective_run_date = run_date or date.today()
         self.last_rejection_counts = {}
         self.last_run_summary = {}
@@ -869,6 +911,7 @@ class OptionsRecommender:
         if not opportunities:
             self.last_run_summary = {
                 "run_date": effective_run_date.isoformat(),
+            "decided_at": decided_at.isoformat() if decided_at is not None else None,
                 "opportunities": 0,
                 "emitted": 0,
                 "rejected": 0,
@@ -887,6 +930,7 @@ class OptionsRecommender:
             try:
                 rec = self._build_recommendation(
                     opp, gex_engine, db, run_date=effective_run_date,
+                    decision_ts=decided_at,
                 )
                 if rec is not None:
                     recommendations.append(rec)
@@ -898,6 +942,7 @@ class OptionsRecommender:
 
         self.last_run_summary = {
             "run_date": effective_run_date.isoformat(),
+            "decided_at": decided_at.isoformat() if decided_at is not None else None,
             "opportunities": len(opportunities),
             "emitted": len(recommendations),
             "rejected": sum(self.last_rejection_counts.values()),
@@ -987,8 +1032,13 @@ class OptionsRecommender:
         gex_engine,  # DealerGammaEngine
         db: Engine,
         run_date: date | None = None,
+        decision_ts: datetime | None = None,
     ) -> OptionsRecommendation | None:
         """Build a single recommendation from a scanner opportunity.
+
+        ``decision_ts`` is the run's decision instant (see
+        :func:`decision_time`); it becomes ``generated_at``, so a stored
+        recommendation records the instant its CROSS_ASSET reads were fenced at.
 
         Fails closed: returns None and records a rejection reason code whenever
         the contract cannot be priced on a fresh, existing chain row or fails
@@ -996,6 +1046,7 @@ class OptionsRecommender:
         """
         ticker = opp.ticker
         direction = opp.direction
+        decided_at = decision_time(run_date, decision_ts)
         effective_run_date = run_date or date.today()
         min_snap = min_fresh_snap_date(effective_run_date)
 
@@ -1177,12 +1228,16 @@ class OptionsRecommender:
             sanity_status={},
             supporting_signals=supporting,
             opposing_signals=opposing,
-            generated_at=datetime.utcnow().isoformat() + "Z",
+            generated_at=(
+                decided_at.replace(tzinfo=None).isoformat() + "Z" if decided_at is not None
+                else datetime.utcnow().isoformat() + "Z"
+            ),
         )
 
         # Run 5-layer sanity pipeline
         sanity = self._run_sanity_pipeline(
             rec, db, opp, gex_profile, run_date=effective_run_date, resolved_iv=iv,
+            decision_ts=decided_at,
         )
         rec.sanity_status = sanity
 
@@ -1696,6 +1751,7 @@ class OptionsRecommender:
         *,
         run_date: date | None = None,
         resolved_iv: float | None = None,
+        decision_ts: datetime | None = None,
     ) -> dict:
         """Run 5-layer sanity check on a recommendation.
 
@@ -1714,7 +1770,9 @@ class OptionsRecommender:
             rec, db, run_date=run_date, resolved_iv=resolved_iv,
         )
         sanity["DEALER_FLOW"] = self._sanity_dealer_flow(rec, gex_profile)
-        sanity["CROSS_ASSET"] = self._sanity_cross_asset(rec, db, run_date=run_date)
+        sanity["CROSS_ASSET"] = self._sanity_cross_asset(
+            rec, db, run_date=run_date, decision_ts=decision_ts,
+        )
         sanity["LLM_REVIEW"] = self._sanity_llm_review(rec, opp, gex_profile)
         sanity["HISTORICAL_ANALOG"] = self._sanity_historical_analog(rec, db)
 
@@ -1855,7 +1913,8 @@ class OptionsRecommender:
         return {"status": "PASS", "reason": "Neutral gamma regime — no strong headwind or tailwind"}
 
     def _sanity_cross_asset(
-        self, rec: OptionsRecommendation, db: Engine, *, run_date: date | None = None,
+        self, rec: OptionsRecommendation, db: Engine, *,
+        run_date: date | None = None, decision_ts: datetime | None = None,
     ) -> dict[str, str]:
         """Layer 3: Cross-asset alignment (momentum + news energy).
 
@@ -1863,20 +1922,30 @@ class OptionsRecommender:
         to see if they align with the recommended direction.
 
         Momentum is the 5-session return of the option's own underlying,
-        close to completed close (:func:`underlying_momentum`), known by the
-        end of ``run_date``. Until 2026-11-23 it read ``{ticker}_close`` from
-        ``resolved_series``: only CL had one, and that was WTI crude, so
-        every other ticker read +0.00% and passed on a number nobody
-        measured. No measurable momentum is now SKIP (CROSS_ASSET is
-        optional), never 0%. The journal state is the newest entry decided
-        by the same cutoff.
+        close to completed close (:func:`underlying_momentum`). Until
+        2026-11-23 it read ``{ticker}_close`` from ``resolved_series``: only
+        CL had one, and that was WTI crude, so every other ticker read +0.00%
+        and passed on a number nobody measured. No measurable momentum is
+        now SKIP (CROSS_ASSET is optional), never 0%.
+
+        Fence (Codex review 6030559940): the price, split and journal reads
+        all stop at the decision instant (:func:`decision_time`; a live run
+        decides now). Each result carries ``as_of`` (that instant) and
+        ``basis``. A replay given only a past ``run_date`` has no decision
+        instant: it reads to the end of that day in New York, is labelled
+        ``DATE_ONLY_BASIS``, and is never a veto: a FAIL there is reported as
+        SKIP.
         """
         effective_run_date = run_date or date.today()
+        decided_at = decision_time(run_date, decision_ts)
+        cutoff = momentum_cutoff(effective_run_date, decided_at)
+        basis = DATE_ONLY_BASIS if decided_at is None else DECISION_TIME_BASIS
+        stamp = {"as_of": cutoff.astimezone(timezone.utc).isoformat(), "basis": basis}
         try:
             with db.connect() as conn:
-                measured = underlying_momentum(conn, rec.ticker, effective_run_date)
+                measured = underlying_momentum(conn, rec.ticker, effective_run_date, as_of_ts=decided_at)
                 if measured.momentum is None:
-                    return {"status": "SKIP", "reason": f"No momentum: {measured.reason}"}
+                    return {"status": "SKIP", "reason": f"No momentum: {measured.reason}", **stamp}
                 momentum = measured.momentum
 
                 # News energy from decision journal (latest regime known by the cutoff)
@@ -1886,7 +1955,7 @@ class OptionsRecommender:
                     WHERE decision_timestamp <= :cutoff
                     ORDER BY decision_timestamp DESC
                     LIMIT 1
-                """), {"cutoff": momentum_cutoff(effective_run_date)}).fetchone()
+                """), {"cutoff": cutoff}).fetchone()
 
                 news_aligned = True  # default: no contradiction
                 if journal_row:
@@ -1905,21 +1974,28 @@ class OptionsRecommender:
 
             window = measured.reason
             if momentum_aligned and news_aligned:
-                return {
+                result = {
                     "status": "PASS",
                     "reason": f"Momentum ({momentum:+.2%}, {window}) and regime aligned with {rec.direction}",
                 }
             elif not momentum_aligned and not news_aligned:
-                return {
+                result = {
                     "status": "FAIL",
                     "reason": f"Momentum ({momentum:+.2%}, {window}) and regime both contradict {rec.direction}",
                 }
             else:
                 # One aligned, one not — pass with warning
-                return {
+                result = {
                     "status": "PASS",
                     "reason": f"Partial alignment — momentum={momentum:+.2%} ({window}), news_aligned={news_aligned}",
                 }
+            if basis == DATE_ONLY_BASIS and result["status"] == "FAIL":
+                result = {
+                    "status": "SKIP",
+                    "reason": "Date-only reconstruction, not a veto (no decision time): would FAIL: "
+                              + result["reason"],
+                }
+            return {**result, **stamp}
 
         except Exception as exc:
             log.debug("Cross-asset check failed: {e}", e=str(exc))

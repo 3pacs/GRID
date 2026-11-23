@@ -1,4 +1,4 @@
-"""PostgreSQL contract: CROSS_ASSET momentum is the underlying's own completed close, fenced at run_date.
+"""PostgreSQL contract: CROSS_ASSET momentum is the underlying's own completed close, fenced at the decision instant.
 
 ``trading/options_recommender.py::_sanity_cross_asset`` used to read
 ``{ticker}_close`` from ``resolved_series``. Measured on griddb 2026-11-23
@@ -10,10 +10,16 @@ momentum and passed. The read had no point-in-time fence.
 The read is now ``underlying_momentum``: ``YF:{TICKER}:close`` completed
 closes (yfinance + TIINGO, pulled after 17:00 New York on the session day,
 ``store.observations.read_completed_closes``), labels up to ``run_date`` and
-pulls up to the end of ``run_date`` in New York. All 6 consecutive sessions
-ending at the newest (fresh) close need a valid, unambiguous close; momentum
-is newest over first, recorded splits re-based. No measurable momentum is
-SKIP. The journal state is fenced by the same cutoff.
+pulls up to the decision instant. All 6 consecutive sessions ending at the
+newest (fresh) close need a valid, unambiguous close; momentum is newest over
+first, recorded splits re-based. No measurable momentum is SKIP. The split
+and journal reads are fenced at the same instant.
+
+Codex review 6030559940 (#1400 at d63cd12e) asked for the decision instant
+rather than the end of the run date, and an intraday same-day fixture. A
+recommendation at 11:00 New York must not see that day's close pulled at
+17:05 or a regime written that afternoon; one after them must. A replay
+with only a date is a labelled reconstruction and never a veto.
 
 Codex review 6030034930 (#1400 at 344f5d11) asked for tests of: the ticker
 collision (CL the equity vs crude), missing and sparse rows (two rows must
@@ -59,6 +65,15 @@ def _utc(d: date, hh: int, mm: int = 0) -> datetime:
     return datetime(d.year, d.month, d.day, hh, mm, tzinfo=timezone.utc)
 
 
+# Decision instants (EST: New York = UTC-5).
+AT_RUN = _utc(RUN, 21)                  # Mon 11-23 16:00 New York
+AT_REPLAY = _utc(REPLAY, 23, 45)        # Wed 11-18 18:45 New York, after that day's 18:30 close
+FRI_1100 = _utc(FRIDAY, 16)             # Fri 11-20 11:00 New York
+FRI_1704 = _utc(FRIDAY, 22, 4)          # 17:04, one minute before INT's close is pulled
+FRI_1706 = _utc(FRIDAY, 22, 6)          # 17:06, one minute after
+FRI_1730 = _utc(FRIDAY, 22, 30)         # 17:30, after the 14:00 regime entry
+
+
 def _next(d: date) -> date:
     return date.fromordinal(d.toordinal() + 1)
 
@@ -84,12 +99,21 @@ RAW += [
 # after a run dated 11-18 could see it). Seen, the label is ambiguous.
 _tiingo_closes("REV", dict(zip(SESSIONS, (100.0, 101.0, 100.0, 99.0, 98.0, 97.0, 96.0, 95.0), strict=True)))
 RAW.append(("YF:REV:close", "yfinance", date(2026, 11, 18), _utc(date(2026, 11, 19), 6), 97.5, "SUCCESS", None))
+# INT: closes pulled at 17:05 New York (22:05 UTC) each session.
+for d, v in zip(SESSIONS, (100.0, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 110.0), strict=True):
+    RAW.append(("YF:INT:close", "TIINGO", d, _utc(d, 22, 5), v, "SUCCESS", None))
 # PATH: down 15% and back inside the window; momentum is newest over first.
 _tiingo_closes("PATH", dict(zip(SESSIONS, (100.0, 100.0, 100.0, 90.0, 85.0, 90.0, 95.0, 101.0), strict=True)))
 # SPL: 2-for-1 effective 11-18; TIINGO closes are as traded.
 _tiingo_closes("SPL", {SESSIONS[2]: 200.0, SESSIONS[3]: 202.0, SESSIONS[4]: 204.0,
                        SESSIONS[5]: 103.0, SESSIONS[6]: 104.0, SESSIONS[7]: 105.0})
 RAW.append(("YF:SPL:split_factor", "TIINGO", date(2026, 11, 18), _utc(date(2026, 11, 17), 23, 30),
+            2.0, "SUCCESS", None))
+# SPL2: the same 2-for-1, but the split row was recorded at 03:00 UTC 11-24
+# (22:00 New York on 11-23): after a 16:00 decision that day, before its end.
+_tiingo_closes("SPL2", {SESSIONS[2]: 200.0, SESSIONS[3]: 202.0, SESSIONS[4]: 204.0,
+                        SESSIONS[5]: 103.0, SESSIONS[6]: 104.0, SESSIONS[7]: 105.0})
+RAW.append(("YF:SPL2:split_factor", "TIINGO", date(2026, 11, 18), _utc(date(2026, 11, 24), 3),
             2.0, "SUCCESS", None))
 # AMB: a later completed yfinance vintage of 11-20 disagrees with TIINGO.
 _tiingo_closes("AMB", {d: 50.0 for d in SESSIONS})
@@ -131,8 +155,10 @@ CRUDE = {date(2026, 11, 13): 88.92, date(2026, 11, 16): 85.15, date(2026, 11, 17
 
 JOURNAL = [
     (_utc(date(2026, 11, 17), 15), "GROWTH"),
-    (_utc(date(2026, 11, 20), 15), "FRAGILE"),
-    # After the end of 2026-11-23 in New York (05:00 UTC on 11-24): unseen.
+    (_utc(FRIDAY, 15), "FRAGILE"),          # Fri 10:00 New York
+    (_utc(FRIDAY, 19), "GROWTH"),           # Fri 14:00 New York: later the same day
+    (_utc(date(2026, 11, 22), 12), "FRAGILE"),
+    # After the run (and after the end of 2026-11-23 in New York): unseen.
     (_utc(date(2026, 11, 24), 15), "GROWTH"),
 ]
 
@@ -196,18 +222,26 @@ def pg():
     admin.dispose()
 
 
-def _cross_asset(pg, ticker: str, direction: str, run_date: date = RUN) -> dict[str, str]:
+def _check(pg, ticker: str, direction: str, run_date: date = RUN,
+           decision_ts: datetime | None = AT_RUN) -> dict[str, str]:
     from trading.options_recommender import OptionsRecommender
 
     rec = SimpleNamespace(ticker=ticker, direction=direction)
-    return OptionsRecommender._sanity_cross_asset(None, rec, pg, run_date=run_date)
+    return OptionsRecommender._sanity_cross_asset(None, rec, pg, run_date=run_date, decision_ts=decision_ts)
 
 
-def _momentum(pg, ticker: str, run_date: date = RUN):
+def _cross_asset(pg, ticker: str, direction: str, run_date: date = RUN,
+                 decision_ts: datetime | None = AT_RUN) -> dict[str, str]:
+    """Status and reason only; ``as_of`` / ``basis`` are pinned in their own tests."""
+    out = _check(pg, ticker, direction, run_date, decision_ts)
+    return {"status": out["status"], "reason": out["reason"]}
+
+
+def _momentum(pg, ticker: str, run_date: date = RUN, as_of_ts: datetime | None = AT_RUN):
     from trading.options_recommender import underlying_momentum
 
     with pg.connect() as conn:
-        return underlying_momentum(conn, ticker, run_date)
+        return underlying_momentum(conn, ticker, run_date, as_of_ts=as_of_ts)
 
 
 def test_momentum_is_completed_close_five_sessions_back(pg):
@@ -218,8 +252,8 @@ def test_momentum_is_completed_close_five_sessions_back(pg):
 
 
 def test_cross_asset_verdicts_on_the_run_date(pg):
-    # FRAGILE (11-20) is the newest journal state by the cutoff; the GROWTH
-    # entry of 11-24 is after it. -5% is a sharp decline for a CALL.
+    # FRAGILE (11-22) is the newest journal state at the decision instant;
+    # the GROWTH entry of 11-24 is after it. -5% is a sharp decline for a CALL.
     assert _cross_asset(pg, "AAA", "CALL") == {
         "status": "FAIL",
         "reason": "Momentum (-5.00%, AAA close 2026-11-13 to 2026-11-20) and regime both contradict CALL",
@@ -230,41 +264,98 @@ def test_cross_asset_verdicts_on_the_run_date(pg):
     }
 
 
-def test_replay_is_fenced_at_run_date(pg):
-    # Dated 11-18: closes labelled after 11-18 are unseen, and the journal
-    # state is GROWTH (11-17), not the later FRAGILE.
-    m = _momentum(pg, "AAA", REPLAY)
+def test_result_carries_its_decision_instant(pg):
+    out = _check(pg, "AAA", "PUT")
+    assert (out["as_of"], out["basis"]) == ("2026-11-23T21:00:00+00:00", "decision_time")
+    skip = _check(pg, "NONE", "PUT")
+    assert (skip["status"], skip["as_of"], skip["basis"]) == ("SKIP", "2026-11-23T21:00:00+00:00", "decision_time")
+
+
+def test_replay_is_fenced_at_its_decision_instant(pg):
+    # Wed 11-18 18:45 New York: closes labelled after 11-18 are unseen, and
+    # the journal state is GROWTH (11-17), not the later FRAGILE.
+    m = _momentum(pg, "AAA", REPLAY, AT_REPLAY)
     assert m.momentum == pytest.approx(97.0 / 100.0 - 1.0)
     assert (m.start, m.end) == (date(2026, 11, 11), date(2026, 11, 18))
-    assert _cross_asset(pg, "AAA", "CALL", REPLAY) == {
+    assert _cross_asset(pg, "AAA", "CALL", REPLAY, AT_REPLAY) == {
         "status": "PASS",
         "reason": "Partial alignment — momentum=-3.00% (AAA close 2026-11-11 to 2026-11-18), news_aligned=True",
     }
-    assert _cross_asset(pg, "AAA", "PUT", REPLAY) == {
+    assert _cross_asset(pg, "AAA", "PUT", REPLAY, AT_REPLAY) == {
         "status": "PASS",
         "reason": "Partial alignment — momentum=-3.00% (AAA close 2026-11-11 to 2026-11-18), news_aligned=False",
     }
 
 
+def test_intraday_decision_does_not_see_that_days_later_close(pg):
+    # INT's 11-20 close was pulled at 17:05 New York. At 11:00 and at 17:04
+    # the newest close is 11-19 (window 11-12..11-19, 105/100); from 17:06
+    # on it is 11-20 (window 11-13..11-20, 110/101).
+    for at in (FRI_1100, FRI_1704):
+        m = _momentum(pg, "INT", FRIDAY, at)
+        assert (m.start, m.end) == (date(2026, 11, 12), date(2026, 11, 19))
+        assert m.momentum == pytest.approx(105.0 / 100.0 - 1.0)
+    m = _momentum(pg, "INT", FRIDAY, FRI_1706)
+    assert (m.start, m.end) == (date(2026, 11, 13), date(2026, 11, 20))
+    assert m.momentum == pytest.approx(110.0 / 101.0 - 1.0)
+
+
+def test_intraday_decision_does_not_see_a_regime_written_later_that_day(pg):
+    # FRAGILE at 10:00 New York, GROWTH at 14:00. AAA's 11-20 close is pulled
+    # at 18:30, so both decisions read 11-12..11-19 (96/101 = -4.95%).
+    assert _cross_asset(pg, "AAA", "CALL", FRIDAY, FRI_1100) == {
+        "status": "FAIL",
+        "reason": "Momentum (-4.95%, AAA close 2026-11-12 to 2026-11-19) and regime both contradict CALL",
+    }
+    assert _cross_asset(pg, "AAA", "CALL", FRIDAY, FRI_1730) == {
+        "status": "PASS",
+        "reason": "Partial alignment — momentum=-4.95% (AAA close 2026-11-12 to 2026-11-19), news_aligned=True",
+    }
+
+
 def test_later_regime_does_not_lift_a_historical_veto(pg):
-    # The CALL veto decided on Friday 11-20 (FRAGILE, -5%) and on Monday 11-23
-    # stands although a later entry (11-24, GROWTH) would align the regime.
+    # The CALL vetoes decided at Fri 11:00 (FRAGILE) and Mon 16:00 (FRAGILE of
+    # 11-22) stand, although the journal now ends in GROWTH (11-24) and had a
+    # GROWTH entry at Fri 14:00.
     with pg.connect() as conn:
         newest = conn.execute(text(
             "SELECT inferred_state FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1")).scalar()
     assert newest == "GROWTH"
-    for run_date in (FRIDAY, RUN):
-        assert _cross_asset(pg, "AAA", "CALL", run_date) == {
-            "status": "FAIL",
-            "reason": "Momentum (-5.00%, AAA close 2026-11-13 to 2026-11-20) and regime both contradict CALL",
-        }
+    assert _cross_asset(pg, "AAA", "CALL", FRIDAY, FRI_1100)["status"] == "FAIL"
+    assert _cross_asset(pg, "AAA", "CALL", RUN, AT_RUN)["status"] == "FAIL"
+
+
+def test_date_only_replay_is_a_labelled_reconstruction_never_a_veto(pg):
+    # No decision instant: read to the end of the run date in New York,
+    # label it, and report a would-be FAIL as SKIP.
+    call = _check(pg, "AAA", "CALL", RUN, None)
+    assert call == {
+        "status": "SKIP",
+        "reason": "Date-only reconstruction, not a veto (no decision time): would FAIL: "
+                  "Momentum (-5.00%, AAA close 2026-11-13 to 2026-11-20) and regime both contradict CALL",
+        "as_of": "2026-11-24T04:59:59.999999+00:00",
+        "basis": "date_only_reconstruction",
+    }
+    put = _check(pg, "AAA", "PUT", RUN, None)
+    assert (put["status"], put["basis"]) == ("PASS", "date_only_reconstruction")
+
+
+def test_live_call_without_date_or_instant_decides_now():
+    from trading.options_recommender import DECISION_TIME_BASIS, decision_time
+
+    before = datetime.now(timezone.utc)
+    decided = decision_time(None, None)
+    assert decided is not None and before <= decided <= datetime.now(timezone.utc)
+    assert decision_time(RUN, None) is None
+    assert decision_time(RUN, datetime(2026, 11, 23, 16, 0)) == _utc(RUN, 16)  # naive is UTC
+    assert DECISION_TIME_BASIS == "decision_time"
 
 
 def test_revision_pulled_after_the_cutoff_is_unseen_then_ambiguous(pg):
     # Reversal of a stored close: 11-18 is revised 97.0 -> 97.5 at 06:00 UTC
-    # 11-19. A run dated 11-18 never saw the revision; a later run sees two
+    # 11-19. A decision on 11-18 never saw the revision; a later one sees two
     # completed values for one session and does not pick one.
-    m = _momentum(pg, "REV", REPLAY)
+    m = _momentum(pg, "REV", REPLAY, AT_REPLAY)
     assert m.momentum == pytest.approx(97.0 / 100.0 - 1.0)
     assert _cross_asset(pg, "REV", "PUT") == {
         "status": "SKIP",
@@ -320,6 +411,14 @@ def test_split_is_rebased_not_read_as_a_crash(pg):
     }
 
 
+def test_split_read_is_fenced_at_the_decision_instant(pg):
+    # A decision at 16:00 New York did not know the split recorded at 22:00:
+    # it read the as-traded drop (105 / 200). The end-of-day reconstruction
+    # knows it (+5%).
+    assert _momentum(pg, "SPL2", RUN, AT_RUN).momentum == pytest.approx(105.0 / 200.0 - 1.0)
+    assert _momentum(pg, "SPL2", RUN, None).momentum == pytest.approx(0.05)
+
+
 _WINDOW = "(needs all 6 sessions 2026-11-13 to 2026-11-20)"
 
 
@@ -356,10 +455,11 @@ def test_cross_asset_reads_no_feature_and_has_no_zero_fallback():
     assert "momentum = 0" not in src
 
 
-def test_pipeline_passes_run_date_to_cross_asset():
+def test_pipeline_passes_run_date_and_decision_instant_to_cross_asset():
     calls = [n for n in ast.walk(_function("_run_sanity_pipeline"))
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == "_sanity_cross_asset"]
     assert len(calls) == 1
     kw = {k.arg: k.value for k in calls[0].keywords}
     assert isinstance(kw.get("run_date"), ast.Name) and kw["run_date"].id == "run_date"
+    assert isinstance(kw.get("decision_ts"), ast.Name) and kw["decision_ts"].id == "decision_ts"
