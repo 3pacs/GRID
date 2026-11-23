@@ -227,8 +227,9 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     # Underlying spot at decision/entry time (PIT-safe, same price source as
     # the path). options_recommendations.entry_price is the option premium, NOT
     # underlying spot — never mix units when evaluating the underlying path.
-    # Only data known at generated_at may anchor it (Codex HOLD 6011903681);
-    # when none was, the reason is kept with the record instead of a guess.
+    # Only data known at generated_at may anchor it (Codex HOLD 6011903681),
+    # and reconstructed scanner context never does (Codex HOLD 6030815214);
+    # when nothing qualifies, the reason is kept with the record, not a guess.
     underlying_spot, spot_note = _load_underlying_entry_spot(
         engine, ticker, generated_at, data_at_decision, price_source=price_source,
     )
@@ -1410,16 +1411,41 @@ def _finite_positive(val: Any) -> float | None:
 #   revision is invisible, and disagreeing completed vintages abstain;
 # * ``options_daily_signals``: one mutable row per (ticker, signal_date) whose
 #   ``created_at`` is its last-write time (``ingestion/options.py`` upsert).
-#   A row last written by the clock held its current value at the clock (up
-#   to the writing transaction's own duration: ``NOW()`` is its start); a row
-#   written or revised later is never read. The newest row written by the
-#   clock is a value GRID held then; it is not claimed to be the row the
-#   recommender read (that is not reproducible: analysis/thesis_scorer.py).
+#   Only a row last written by the clock is read for its values; a row
+#   written or revised later is read for its date and write time alone, to
+#   say why an older row is shown.
+#
+# What the reconstruction proves (Codex HOLD 6030815214). ``created_at`` is
+# ``NOW()``, the writing transaction's start, so it can precede the commit;
+# an old visible row can hide a gap in the same session; and
+# options_recommendations records no lineage (scanner row id or capture
+# batch) of the values the recommender consumed (analysis/thesis_scorer.py:
+# not reproducible). So the scanner row, and the regime and capital-flow
+# rows read by date only, go under ``descriptive_context`` with
+# DESCRIPTIVE_CONTEXT_LABEL: shown, dated and explained, but never the
+# consumed row, an entry anchor or an attribution input. Scanner values
+# drive attribution only as ``scanner_signals`` carrying recorded
+# ``lineage``, which nothing in GRID writes today.
 
 _ET = ZoneInfo("America/New_York")
 # Calendar days searched back for the last completed close: any weekend plus
 # a holiday run; older than that is not an entry anchor.
 ENTRY_CLOSE_LOOKBACK_DAYS = 7
+
+DESCRIPTIVE_CONTEXT_LABEL = (
+    "descriptive only: not proven known at decision, not the inputs the "
+    "recommendation consumed, never an entry anchor or an attribution input"
+)
+SCANNER_ATTRIBUTION_ABSTAINED = (
+    "scanner-based attribution abstained: no lineage from the recommendation to an "
+    "options_daily_signals row is recorded, and created_at is a write-start proxy"
+)
+_DATE_ONLY_BASIS = "read by date only, not proven known at decision"
+_SCANNER_NOT_AN_ANCHOR = (
+    "the price path is options_daily_signals, whose spot values are descriptive "
+    "context only (no recorded lineage; created_at is a write-start proxy), so none "
+    "is a decision-quality entry anchor"
+)
 
 _SCANNER_ROW_SQL = (
     "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price, "
@@ -1429,10 +1455,10 @@ _SCANNER_ROW_SQL = (
     "ORDER BY signal_date DESC LIMIT 1"
 )
 
-_SCANNER_SPOT_SQL = (
-    "SELECT spot_price, signal_date, created_at FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-    "WHERE ticker = :t AND signal_date <= :d AND created_at <= :decision_ts "
-    "AND spot_price > 0 "
+# Date and write time only: never the values of a row written after the clock.
+_SCANNER_NEWEST_SQL = (
+    "SELECT signal_date, created_at FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+    "WHERE ticker = :t AND signal_date <= :d "
     "ORDER BY signal_date DESC LIMIT 1"
 )
 
@@ -1491,6 +1517,69 @@ def _scanner_row_known_at(conn: Any, ticker: str, clock: datetime) -> Any:
     return row
 
 
+def _scanner_with_lineage(data_at_decision: dict[str, Any]) -> dict[str, Any]:
+    """``scanner_signals`` when it carries recorded lineage to the recommendation, else ``{}``.
+
+    Only such values may anchor or drive attribution (Codex HOLD 6030815214).
+    A reconstructed options_daily_signals row has none: it is descriptive.
+    """
+    scanner = data_at_decision.get("scanner_signals")
+    if not isinstance(scanner, dict):
+        return {}
+    lineage = scanner.get("lineage")
+    return scanner if isinstance(lineage, str) and lineage.strip() else {}
+
+
+def _scanner_context_at(conn: Any, ticker: str, clock: datetime) -> tuple[dict[str, Any] | None, str]:
+    """The newest scanner row written by ``clock`` as labelled context, or why there is none.
+
+    The row carries its ``signal_date``, ``created_at``, ``age_days`` (calendar
+    days to the decision's ET date) and a ``reason``. ``fallback`` is True when
+    a newer row existed but was written after the clock (or at no recorded
+    time); only that row's date and write time are read.
+    """
+    session = _decision_session_date(clock)
+    row = _scanner_row_known_at(conn, ticker, clock)
+    if row is None:
+        return None, (
+            f"no options_daily_signals row for {ticker} dated on or before "
+            f"{session.isoformat()} was last written by the decision clock {clock.isoformat()}"
+        )
+    signal_date = _to_date(row[8])
+    newest = conn.execute(visible_sql(_SCANNER_NEWEST_SQL), {"t": ticker, "d": session}).fetchone()
+    newest_date = _to_date(newest[0]) if newest is not None else None
+    fallback = newest_date is not None and signal_date is not None and newest_date > signal_date
+    if fallback:
+        newest_written = _decision_clock(newest[1])
+        reason = (
+            f"newest row written after decision: options_daily_signals {newest_date.isoformat()} "
+            f"was written {newest_written.isoformat()}, after decision clock {clock.isoformat()}"
+            if newest_written is not None else
+            f"newest row has no recorded write time: options_daily_signals "
+            f"{newest_date.isoformat()} cannot be shown written by decision clock {clock.isoformat()}"
+        ) + "; this older row is context only"
+    else:
+        reason = (
+            f"newest visible row at decision clock {clock.isoformat()}; created_at is a "
+            f"write-start proxy, so its visibility at the decision is not proven"
+        )
+    return {
+        "put_call_ratio": float(row[0]) if row[0] else None,
+        "iv_atm": float(row[1]) if row[1] else None,
+        "iv_skew": float(row[2]) if row[2] else None,
+        "max_pain": float(row[3]) if row[3] else None,
+        "spot_price": float(row[4]) if row[4] else None,
+        "total_oi": float(row[5]) if row[5] else None,
+        "term_structure_slope": float(row[6]) if row[6] else None,
+        "oi_concentration": float(row[7]) if row[7] else None,
+        "signal_date": str(row[8]) if row[8] else None,
+        "created_at": _decision_clock(row[9]).isoformat(),
+        "age_days": (session - signal_date).days if signal_date is not None else None,
+        "fallback": fallback,
+        "reason": reason,
+    }, ""
+
+
 def _reconstruct_decision_data(
     engine: Engine,
     ticker: str,
@@ -1500,14 +1589,20 @@ def _reconstruct_decision_data(
 ) -> dict[str, Any]:
     """Reconstruct the data state at the time a recommendation was made.
 
-    Gathers scanner signals, GEX data, and regime context that were
-    available on the decision date. The scanner row is the newest one
-    written by the decision clock (:func:`_scanner_row_known_at`); with no
-    such row, or no clock, ``scanner_signals_unavailable`` says why.
+    ``sanity_status`` and ``dealer_context`` are the recommendation's own
+    record. The scanner row (:func:`_scanner_context_at`) and the regime and
+    capital-flow rows (read by date only) go under ``descriptive_context``
+    with DESCRIPTIVE_CONTEXT_LABEL: they are not proven known at decision and
+    are never an entry anchor or an attribution input (Codex HOLD 6030815214).
+    ``scanner_attribution_unavailable`` records why scanner-based attribution
+    abstains.
     """
+    context: dict[str, Any] = {"label": DESCRIPTIVE_CONTEXT_LABEL}
     data: dict[str, Any] = {
         "sanity_status": sanity,
         "dealer_context": dealer_context,
+        "descriptive_context": context,
+        "scanner_attribution_unavailable": SCANNER_ATTRIBUTION_ABSTAINED,
     }
 
     as_of = _to_date(decision_date)
@@ -1517,34 +1612,17 @@ def _reconstruct_decision_data(
     clock = _decision_clock(decision_date)
 
     with engine.connect() as conn:
-        # Options scanner signals known at the decision clock
-        opt_row = None
+        # Options scanner row written by the decision clock: context only
         if clock is None:
-            data["scanner_signals_unavailable"] = _no_clock_note(decision_date)
+            context["scanner_unavailable"] = _no_clock_note(decision_date)
         else:
-            opt_row = _scanner_row_known_at(conn, ticker, clock)
-            if opt_row is None:
-                data["scanner_signals_unavailable"] = (
-                    f"no options_daily_signals row for {ticker} dated on or before "
-                    f"{_decision_session_date(clock).isoformat()} was last written by the "
-                    f"decision clock {clock.isoformat()}"
-                )
+            scanner, why_not = _scanner_context_at(conn, ticker, clock)
+            if scanner is None:
+                context["scanner_unavailable"] = why_not
+            else:
+                context["scanner"] = scanner
 
-        if opt_row:
-            data["scanner_signals"] = {
-                "put_call_ratio": float(opt_row[0]) if opt_row[0] else None,
-                "iv_atm": float(opt_row[1]) if opt_row[1] else None,
-                "iv_skew": float(opt_row[2]) if opt_row[2] else None,
-                "max_pain": float(opt_row[3]) if opt_row[3] else None,
-                "spot_price": float(opt_row[4]) if opt_row[4] else None,
-                "total_oi": float(opt_row[5]) if opt_row[5] else None,
-                "term_structure_slope": float(opt_row[6]) if opt_row[6] else None,
-                "oi_concentration": float(opt_row[7]) if opt_row[7] else None,
-                "signal_date": str(opt_row[8]) if opt_row[8] else None,
-                "created_at": _decision_clock(opt_row[9]).isoformat(),
-            }
-
-        # Regime at decision time
+        # Regime on or before the decision date: context only
         regime_row = conn.execute(text("""
             SELECT inferred_state, state_confidence, transition_probability
             FROM decision_journal
@@ -1553,13 +1631,14 @@ def _reconstruct_decision_data(
         """), {"d": as_of}).fetchone()
 
         if regime_row:
-            data["regime"] = {
+            context["regime"] = {
                 "state": regime_row[0],
                 "confidence": float(regime_row[1]) if regime_row[1] else None,
                 "transition_prob": float(regime_row[2]) if regime_row[2] else None,
+                "basis": "decision_journal " + _DATE_ONLY_BASIS,
             }
 
-        # Capital flow context at decision time
+        # Capital flow snapshot on or before the decision date: context only
         flow_row = conn.execute(text("""
             SELECT narrative, snapshot_date
             FROM capital_flow_snapshots
@@ -1568,8 +1647,11 @@ def _reconstruct_decision_data(
         """), {"d": as_of}).fetchone()
 
         if flow_row:
-            data["flow_narrative"] = str(flow_row[0])[:500] if flow_row[0] else None
-            data["flow_date"] = str(flow_row[1]) if flow_row[1] else None
+            context["capital_flow"] = {
+                "narrative": str(flow_row[0])[:500] if flow_row[0] else None,
+                "snapshot_date": str(flow_row[1]) if flow_row[1] else None,
+                "basis": "capital_flow_snapshots " + _DATE_ONLY_BASIS,
+            }
 
     return data
 
@@ -1656,15 +1738,16 @@ def _load_underlying_entry_spot(
 ) -> tuple[float | None, str]:
     """Return ``(spot, note)``: the underlying entry anchor known at ``decision_date``.
 
-    ``decision_date`` is the decision clock (``generated_at``). Reads from the
-    same price source that supplied ``price_path`` so the entry basis and path
-    share units and vendor conventions:
-      - ``"options_daily_signals"``: the reconstructed scanner ``spot_price``
-        (already fenced), else the newest visible row with a spot that was
-        last written by the clock.
-      - ``"raw_series"``: the newest completed ``YF:{ticker}:close`` known at
-        the clock (:class:`evaluation.prices.CompletedCloseAccessor`).
-      - ``None`` (no path loaded): scanner first, then the completed close.
+    ``decision_date`` is the decision clock (``generated_at``). The anchor
+    shares the price source that supplied ``price_path``:
+      - ``"raw_series"`` or ``None`` (no path loaded): the newest completed
+        ``YF:{ticker}:close`` known at the clock
+        (:class:`evaluation.prices.CompletedCloseAccessor`);
+      - ``"options_daily_signals"``: none. Its spot values are descriptive
+        context, not proven known at decision (Codex HOLD 6030815214), and a
+        raw close is not mixed into that path.
+    Scanner values with recorded lineage (:func:`_scanner_with_lineage`) are
+    the one scanner anchor; nothing in GRID records that lineage today.
 
     ``note`` names the basis when a spot is returned, and otherwise why none
     was provably known. Never falls back to option premium, to a close of a
@@ -1673,41 +1756,23 @@ def _load_underlying_entry_spot(
     clock = _decision_clock(decision_date)
     if clock is None:
         return None, _no_clock_note(decision_date)
+    unknown = f"no underlying entry spot for {ticker} was known at decision clock {clock.isoformat()}: "
 
-    scanner = data_at_decision.get("scanner_signals") or {}
-    scanner_spot = _finite_positive(scanner.get("spot_price"))
-    if price_source != "raw_series" and scanner_spot is not None:
-        return scanner_spot, (
-            f"options_daily_signals {scanner.get('signal_date')} written "
-            f"{scanner.get('created_at')}, at or before decision clock {clock.isoformat()}"
+    linked = _scanner_with_lineage(data_at_decision)
+    linked_spot = _finite_positive(linked.get("spot_price"))
+    if price_source != "raw_series" and linked_spot is not None:
+        return linked_spot, (
+            f"options_daily_signals {linked.get('signal_date')} with recorded lineage "
+            f"({linked.get('lineage')})"
         )
+    if price_source == "options_daily_signals":
+        return None, unknown + _SCANNER_NOT_AN_ANCHOR
 
-    missing: list[str] = []
     with engine.connect() as conn:
-        if price_source in ("options_daily_signals", None):
-            row = conn.execute(
-                visible_sql(_SCANNER_SPOT_SQL),
-                {"t": ticker, "d": _decision_session_date(clock), "decision_ts": clock},
-            ).fetchone()
-            written = _decision_clock(row[2]) if row is not None else None
-            spot = _finite_positive(row[0]) if row is not None else None
-            if spot is not None and written is not None and written <= clock:
-                return spot, (
-                    f"options_daily_signals {row[1]} written {written.isoformat()}, "
-                    f"at or before decision clock {clock.isoformat()}"
-                )
-            missing.append("no options_daily_signals spot last written by the clock")
-
-        if price_source in ("raw_series", None):
-            spot, note = _completed_close_known_at(conn, ticker, clock)
-            if spot is not None:
-                return spot, note
-            missing.append(note)
-
-    return None, (
-        f"no underlying entry spot for {ticker} was known at decision clock "
-        f"{clock.isoformat()}: " + "; ".join(missing)
-    )
+        spot, note = _completed_close_known_at(conn, ticker, clock)
+    if spot is not None:
+        return spot, note
+    return None, unknown + note
 
 
 def _completed_close_known_at(conn: Any, ticker: str, clock: datetime) -> tuple[float | None, str]:
@@ -1760,9 +1825,13 @@ def _classify_failure(
 
     ``entry_price`` on ``options_recommendations`` is the OPTION PREMIUM;
     ``price_path`` is UNDERLYING spot. Directional timing is always computed
-    against ``underlying_entry_price`` (or PIT scanner ``spot_price`` in
-    ``data_at_decision``), never against the option premium. If no underlying
+    against ``underlying_entry_price`` (or a lineage-backed scanner
+    ``spot_price``), never against the option premium. If no underlying
     entry spot is available, fails closed with ``"insufficient_data"``.
+
+    Scanner values (signal names, staleness, spot) count only as
+    ``scanner_signals`` with recorded lineage (:func:`_scanner_with_lineage`);
+    ``descriptive_context`` is never read here (Codex HOLD 6030815214).
 
     Returns:
         (failure_category, root_cause, signals_wrong, signals_right, what_we_missed)
@@ -1771,8 +1840,8 @@ def _classify_failure(
     signals_right: list[str] = []
     what_missed = ""
 
-    # Check scanner signals
-    scanner = data_at_decision.get("scanner_signals", {})
+    # Check scanner signals: only those with recorded lineage to the recommendation
+    scanner = _scanner_with_lineage(data_at_decision)
     if scanner:
         pcr = scanner.get("put_call_ratio")
         if pcr is not None:
@@ -1920,7 +1989,7 @@ def _classify_failure(
     # 5. Default: wrong signal
     category = "wrong_signal"
     root_cause = (
-        f"Scanner signals pointed {direction} for {ticker} but the underlying "
+        f"The {direction} recommendation for {ticker} was wrong: the underlying "
         f"moved against the position. Actual return: {actual_return:+.2%}."
     )
     what_missed = "Signal ensemble did not capture the true market direction."
@@ -2153,8 +2222,16 @@ def _get_llm_postmortem(
         price_lines = [f"  {p['date']}: ${p['price']:.2f}" for p in sample if p.get("price")]
         price_summary = "\n".join(price_lines)
 
-    # Compact data_at_decision — no pretty-print, hard cap for local model context
-    data_summary = json.dumps(data_at_decision, separators=(",", ":"), default=str)[:800]
+    # Compact data_at_decision — no pretty-print, hard cap for local model context.
+    # Descriptive context gets its own labelled block (Codex HOLD 6030815214).
+    decision_data = {k: v for k, v in data_at_decision.items() if k != "descriptive_context"}
+    data_summary = json.dumps(decision_data, separators=(",", ":"), default=str)[:800]
+    descriptive = data_at_decision.get("descriptive_context")
+    descriptive_block = (
+        "DESCRIPTIVE CONTEXT (not proven known at decision; not the inputs the "
+        "recommendation consumed; do not attribute the failure to it):\n"
+        + json.dumps(descriptive, separators=(",", ":"), default=str)[:600] + "\n\n"
+    ) if descriptive else ""
 
     # RAG: retrieve historical context — past failures, lessons learned
     rag_context = ""
@@ -2214,6 +2291,7 @@ def _get_llm_postmortem(
         f"{top_contrib_block}"
         f"{opposing_block}"
         f"DATA AT DECISION:\n{data_summary}\n\n"
+        f"{descriptive_block}"
         f"SIGNALS WRONG: {', '.join(signals_wrong) or 'none identified'}\n"
         f"SIGNALS RIGHT: {', '.join(signals_right) or 'none identified'}\n\n"
         f"Provide:\n"
