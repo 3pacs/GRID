@@ -1056,7 +1056,7 @@ def _d8_neutral_data(as_of: date) -> dict[str, Any]:
         # Rows the CROWD / NARRATIVE inputs read through _read_known.
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [100.0] * 40, as_of),        # CROWD data, 0 points
-            "put_call_ratio": _d8_obs("put_call_ratio", [0.9], as_of),  # market-wide, 0 points
+            "put_call_ratio": _d8_obs("put_call_ratio", [0.9], as_of),  # market-wide, shown, not scored
             _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 40, as_of),        # NARRATIVE: shown, not scored
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
@@ -1251,10 +1251,10 @@ class TestDefect8NoLayerPromotesByMissingData:
 # PASS, the same sell on a short window 24 PASS, and SMART_MONEY unavailable
 # 26 WATCH. The alert now comes from score_low (every unknown at its worst
 # attainable value) and total_score stays the neutral point estimate.
-# (2) The current scorers top out at 38.40 of 63.15 = 61 (81 before the
-# inputs with no live writer stopped counting and news became descriptive,
-# 2026-11-23), so CONVICTION (85) and FIRE (70) are unreachable; reports say
-# so instead of implying they are live.
+# (2) The current scorers top out at 36.15 of 63.15 = 57 (81 before the
+# inputs with no live writer stopped counting and news and total put/call
+# became descriptive, 2026-11-23), so CONVICTION (85) and FIRE (70) are
+# unreachable; reports say so instead of implying they are live.
 
 _LEVEL_ORDER = ("PASS", "WATCH", "PILOT", "SCALE", "FIRE", "CONVICTION")
 
@@ -1305,7 +1305,7 @@ def _d9_max_data(as_of: date) -> dict[str, Any]:
         "latest": {"vix_spot": 36.0, "hy_oas_spread": 5.5, "yld_curve_2s10s": -0.25},
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [1_000.0] * 80 + [50_000.0] * 10, as_of),   # FTD surge 5
-            "put_call_ratio": _d8_obs("put_call_ratio", [1.3], as_of),          # PCR 3
+            "put_call_ratio": _d8_obs("put_call_ratio", [1.3], as_of),          # shown, not scored
             _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 60 + [49.0] * 31, as_of),       # shown, not scored
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
@@ -1392,14 +1392,41 @@ class TestDefect9LostEvidenceAndDormantConviction:
         assert {layer.name: layer.score for layer in report.layers} == {
             name: cs.LAYER_ATTAINABLE_SCORE[name] for name in cs.LAYER_FULL_TRUST if name != "COMPANY"
         }
-        # ... earns 38.40 of 63.15 = 61: SCALE is the highest reachable alert.
-        assert (report.total_score, report.score_low, report.score_high) == (61, 61, 61)
+        # ... earns 36.15 of 63.15 = 57: SCALE is the highest reachable alert.
+        assert (report.total_score, report.score_low, report.score_high) == (57, 57, 57)
         assert report.alert_level == "SCALE"
-        assert report.max_attainable_score == 61
+        assert report.max_attainable_score == 57
         assert report.dormant_alert_levels == ("CONVICTION", "FIRE")
         thresholds = dict(cs.ALERT_THRESHOLDS)
         assert min(thresholds["CONVICTION"], thresholds["FIRE"]) > report.max_attainable_score
-        assert all(floor <= 61 for name, floor in cs.ALERT_THRESHOLDS if name not in {"CONVICTION", "FIRE"})
+        assert all(floor <= 57 for name, floor in cs.ALERT_THRESHOLDS if name not in {"CONVICTION", "FIRE"})
+
+    @pytest.mark.parametrize("crowd", ["ftd-surge", "ftd-neutral", "ftd-missing"])
+    def test_total_put_call_never_moves_the_total_or_its_bounds(
+        self, monkeypatch: pytest.MonkeyPatch, crowd: str,
+    ) -> None:
+        # Codex HOLD on #1395 a994e347: total put/call is descriptive, so no
+        # value of it (or its absence) changes total_score, score_low,
+        # score_high, the alert or max_attainable_score.
+        base = _d9_max_data(AS_OF) if crowd == "ftd-surge" else _d8_neutral_data(AS_OF)
+        if crowd == "ftd-missing":
+            base = _d8_drop(base, "CROWD")
+
+        def outcome(pcr: float | None) -> tuple[Any, ...]:
+            known = dict(base["known"])
+            if pcr is None:
+                known.pop("put_call_ratio", None)
+            else:
+                known["put_call_ratio"] = _d8_obs("put_call_ratio", [pcr], AS_OF)
+            r = _d8_score(monkeypatch, {**base, "known": known})
+            crowd_layer = _d8_layer(r, "CROWD")
+            return (
+                r.total_score, r.score_low, r.score_high, r.alert_level, r.max_attainable_score,
+                crowd_layer.score, crowd_layer.data_available,
+            )
+
+        outcomes = {pcr: outcome(pcr) for pcr in (None, 0.5, 1.05, 1.3, 3.0)}
+        assert len(set(outcomes.values())) == 1, outcomes
 
     def test_bound_tables_agree_with_the_scorers(self) -> None:
         assert set(cs.LAYER_MIN_SCORE) == set(cs.LAYER_ATTAINABLE_SCORE) == set(cs.LAYER_MAX_SCORE)
@@ -1441,5 +1468,5 @@ class TestDefect9LostEvidenceAndDormantConviction:
         }
         for body in bodies.values():
             assert body["alert_basis"] == "score_low"
-            assert body["max_attainable_score"] == 61
+            assert body["max_attainable_score"] == 57
             assert body["dormant_alert_levels"] == ["CONVICTION", "FIRE"]

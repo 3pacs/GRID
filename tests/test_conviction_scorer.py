@@ -258,7 +258,7 @@ def _install_known(monkeypatch: pytest.MonkeyPatch, known: dict[str, list[Any]])
     return reads
 
 
-def test_score_crowd_buckets_ftd_and_put_call_extremes(
+def test_score_crowd_scores_ftd_and_shows_put_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ftd_id = "sec:ftd_balance:000000AB1"
@@ -280,14 +280,29 @@ def test_score_crowd_buckets_ftd_and_put_call_extremes(
 
     assert checked == [(ftd_id, "ABC", 40)]  # every selected balance goes to the identity check
     assert result.name == "CROWD"
-    assert result.score == 8  # FTD surge 5 + PCR 3; short interest scores nothing
+    assert result.score == 5  # FTD surge 5; put/call 1.30 is shown, not scored
     assert result.score == cs.LAYER_ATTAINABLE_SCORE["CROWD"]
     assert cs.SHORT_INTEREST_UNAVAILABLE in result.signals
     assert any("SQUEEZE SETUP" in signal for signal in result.signals)
-    assert any("MAX BEARISH" in signal for signal in result.signals)
+    assert cs.PCR_NOT_SCORED in result.signals
+    assert "Total put/call, not scored: 1.30 (2026-05-13)" in result.signals
     assert result.data_available is True
     # Each input is read from its writer's own source.
     assert reads == [(ftd_id, "SEC_FTD", 90), ("put_call_ratio", "CBOE", 5)]
+
+
+@pytest.mark.parametrize("pcr", [None, 0.6, 1.05, 1.30, 2.5])
+def test_score_crowd_put_call_never_scores_or_makes_crowd_available(
+    monkeypatch: pytest.MonkeyPatch, pcr: float | None,
+) -> None:
+    # Codex HOLD on #1395 a994e347: the Cboe puller's pull_timestamp is its
+    # transaction start, not the fetch time, so total put/call is descriptive.
+    _install_known(monkeypatch, {} if pcr is None else {"put_call_ratio": _obs("put_call_ratio", [pcr])})
+
+    result = cs.score_crowd(object(), "ABC", as_of_date=date(2026, 5, 13), ftd_series_ids={})
+
+    assert (result.score, result.data_available) == (0, False)
+    assert cs.PCR_NOT_SCORED in result.signals
 
 
 def test_score_crowd_reads_nothing_for_short_interest(
@@ -440,12 +455,13 @@ def test_score_crowd_reads_ftd_and_put_call_point_in_time() -> None:
     with db.engine.connect() as conn:
         result = cs.score_crowd(conn, "AAPL", as_of_date=_AS_OF)
 
-    assert result.score == 8  # FTD surge 5 + PCR 1.25 -> 3
+    assert result.score == 5  # FTD surge 5; put/call is shown, not scored
     assert result.data_available is True
     assert result.trust == cs.LAYER_FULL_TRUST["CROWD"]
     signals = " | ".join(result.signals)
     assert f"settled to {_AS_OF - timedelta(days=10)}" in signals
-    assert f"PCR=1.25 ({_AS_OF - timedelta(days=1)}) [MAX BEARISH]" in signals
+    # The 0.80 pulled after the as-of date is not known yet.
+    assert f"Total put/call, not scored: 1.25 ({_AS_OF - timedelta(days=1)})" in signals
 
 
 @pytest.mark.parametrize(
@@ -472,7 +488,7 @@ def test_score_crowd_ftd_fails_closed(setup: str, expected: str) -> None:
     assert result.score == 0
     assert result.data_available is False
     assert any(s.startswith(expected) for s in result.signals), result.signals
-    assert any(s.startswith("Total put/call unavailable") for s in result.signals)
+    assert f"No total put/call in the {cs.PCR_FRESH_DAYS} days to {_AS_OF}" in result.signals
 
 
 # ── FTD identity: the scored balance must be filed under the ticker ──────
