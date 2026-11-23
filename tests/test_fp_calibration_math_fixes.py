@@ -13,7 +13,10 @@ Written test-first (no database, no network) covering:
 
 from __future__ import annotations
 
+import copy
 import json
+import sys
+import types
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +33,7 @@ from features.per_signal_brier import (
 from features.regime_conditional_brier import (
     bootstrap_from_oracle_predictions,
     get_regime_conditional_scorecard,
+    get_scorecard_with_regime_fallback,
     get_skipped_live_update_counts as get_regime_live_skip_counts,
     rank_signals_by_regime,
     record_scored_prediction as record_regime_brier,
@@ -180,9 +184,13 @@ class _FakeBrierEngine:
         self.regime: dict[tuple[str, int, str], dict] = {}
         self.oracle_rows: list[tuple] = []
         self.update_calls: int = 0
+        # Failure injection: any statement starting with one of these prefixes
+        # raises, and so does an INSERT for one of these signal sources.
+        self.fail_sql_prefixes: tuple[str, ...] = ()
+        self.fail_insert_sources: set[str] = set()
 
     def begin(self):
-        return _FakeBrierEngine._Ctx(self)
+        return _FakeBrierEngine._Txn(self)
 
     def connect(self):
         return _FakeBrierEngine._Ctx(self)
@@ -202,10 +210,28 @@ class _FakeBrierEngine:
             params = params or {}
             res = MagicMock()
 
+            for prefix in self.parent.fail_sql_prefixes:
+                if sql.startswith(prefix):
+                    raise RuntimeError(f"injected failure on {prefix!r}")
+            if sql.startswith("INSERT INTO") and params.get("s") in self.parent.fail_insert_sources:
+                raise RuntimeError(f"injected insert failure for {params.get('s')!r}")
+
             if sql.startswith("CREATE TABLE") or sql.startswith("CREATE INDEX"):
                 return res
             if sql.startswith("TRUNCATE TABLE per_signal_brier_history"):
                 self.parent.flat.clear()
+                return res
+            if sql.startswith("DELETE FROM per_signal_brier_history"):
+                keys = sorted(self.parent.flat)
+                self.parent.flat.clear()
+                res.fetchall.return_value = keys
+                res.rowcount = len(keys)
+                return res
+            if sql.startswith("DELETE FROM regime_conditional_brier_history"):
+                keys = sorted(self.parent.regime)
+                self.parent.regime.clear()
+                res.fetchall.return_value = keys
+                res.rowcount = len(keys)
                 return res
 
             if sql.startswith("SELECT id, created_at, expiry, confidence"):
@@ -393,6 +419,22 @@ class _FakeBrierEngine:
                 return res
 
             return res
+
+    class _Txn(_Ctx):
+        """``engine.begin()``: keeps its writes on a clean exit, undoes them on an error."""
+
+        def __enter__(self):
+            self._snapshot = (copy.deepcopy(self.parent.flat), copy.deepcopy(self.parent.regime))
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            if exc_type is not None:
+                flat, regime = self._snapshot
+                self.parent.flat.clear()
+                self.parent.flat.update(flat)
+                self.parent.regime.clear()
+                self.parent.regime.update(regime)
+            return False
 
 
 # ── Helpers for Defect 3 ─────────────────────────────────────────────────
@@ -1266,3 +1308,253 @@ class TestFollowup4BootstrapWriteStats:
 
         stats = boot._write_bootstrapped_buckets(_FailCommitEngine(), self._sample_buckets())
         assert stats["written"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CODEX HOLD 6011907767: a replacement bootstrap retires the rows it rejects
+# or no longer produces, so a legacy confidence boost cannot outlive it
+# ══════════════════════════════════════════════════════════════════════════
+
+# The legacy rows below stand for what the old count-diluted formula left in
+# both tables: count >= 20 and a tiny Brier, i.e. a 1.5x conviction boost.
+_LEGACY_STAMP = datetime(2026, 5, 16, tzinfo=timezone.utc)
+
+
+def _legacy_flat_row(source: str, horizon: int, *, count: int = 40, brier: float = 0.02) -> dict:
+    return {
+        "signal_source": source,
+        "horizon_days": horizon,
+        "scored_count": count,
+        "running_brier": brier,
+        "running_ece": 0.1,
+        "hit_count": count,
+        "last_updated": _LEGACY_STAMP,
+    }
+
+
+def _legacy_regime_row(source: str, horizon: int, regime: str, *, count: int = 40, brier: float = 0.02) -> dict:
+    return {**_legacy_flat_row(source, horizon, count=count, brier=brier), "regime": regime}
+
+
+def _lucky_flat_rows(n: int = 25) -> list[dict]:
+    """``n`` hits at 0.9: tiny_lucky carries w=0.05 (Σw = 0.05·n), main_driver w=0.95.
+
+    With n=25, tiny_lucky has 25 scored rows (>= 20) but Σw = 1.25 < 5, so the
+    replacement must find its bucket ineligible; main_driver stays eligible.
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return [
+        {
+            "id": f"lucky-{i}",
+            "ticker": "SPY",
+            "created_at": base + timedelta(days=i),
+            "expiry": base + timedelta(days=i + 7),
+            "confidence": 0.9,
+            "verdict": "hit",
+            "model_name": None,
+            "signals": None,
+            "signal_contributions": {"tiny_lucky": 0.05, "main_driver": 0.95},
+            "model_weights": None,
+            "scored_at": base + timedelta(days=i + 7),
+        }
+        for i in range(n)
+    ]
+
+
+def _lucky_regime_rows(n: int = 25, regime: str = "CRISIS") -> list[tuple]:
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return [
+        (
+            f"lucky-{i}",
+            base + timedelta(days=i),
+            (base + timedelta(days=i + 7)).date(),
+            0.9,
+            "hit",
+            "m",
+            None,
+            '{"tiny_lucky": 0.05, "main_driver": 0.95}',
+            regime,
+        )
+        for i in range(n)
+    ]
+
+
+def _flat_buckets_one_ineligible() -> dict:
+    """The accumulators a replay of ``_lucky_flat_rows(25)`` produces."""
+    stamp = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    return {
+        ("tiny_lucky", 7): {
+            "scored_count": 25,
+            "weight_sum": 1.25,
+            "weighted_brier_sum": 1.25 * 0.01,
+            "weighted_ece_sum": 1.25 * 0.1,
+            "hit_count": 25,
+            "last_updated": stamp,
+        },
+        ("main_driver", 7): {
+            "scored_count": 25,
+            "weight_sum": 23.75,
+            "weighted_brier_sum": 23.75 * 0.01,
+            "weighted_ece_sum": 23.75 * 0.1,
+            "hit_count": 25,
+            "last_updated": stamp,
+        },
+    }
+
+
+def _replay(engine: _FakeBrierEngine, rows: list[dict], **kwargs) -> dict:
+    with patch.object(boot, "_fetch_scored_predictions", return_value=rows), patch.object(
+        boot, "_load_oracle_models_lookup", return_value={}
+    ):
+        return boot.replay_predictions(engine, days=365, **kwargs)
+
+
+def _run_cli(monkeypatch, engine: _FakeBrierEngine, rows: list[dict], argv: list[str]) -> int:
+    monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: engine))
+    with patch.object(boot, "_fetch_scored_predictions", return_value=rows), patch.object(
+        boot, "_load_oracle_models_lookup", return_value={}
+    ):
+        return boot.main(argv)
+
+
+class TestCodexHold6011907767RetireLegacyRows:
+    # ── per-signal table ──────────────────────────────────────────────────
+
+    def test_flat_writer_retires_legacy_boost_when_replacement_bucket_is_ineligible(self):
+        engine = _FakeBrierEngine()
+        engine.flat[("tiny_lucky", 7)] = _legacy_flat_row("tiny_lucky", 7)
+        before = get_signal_scorecard(engine, "tiny_lucky", 7)
+        assert before is not None and before.conviction_weight == 1.5  # the legacy boost
+
+        stats = boot._write_bootstrapped_buckets(engine, _flat_buckets_one_ineligible())
+
+        assert ("tiny_lucky", 7) not in engine.flat
+        assert get_signal_scorecard(engine, "tiny_lucky", 7) is None
+        assert get_scorecard_with_regime_fallback(engine, "tiny_lucky", 7, None) is None  # neutral
+        main = get_signal_scorecard(engine, "main_driver", 7)
+        assert main is not None and main.conviction_weight == 1.5
+        assert stats["replaced"] is True
+        assert stats["written"] == 1
+        assert stats["skipped_low_effective_weight"] == 1
+        assert stats["retired"] == 1
+
+    def test_flat_writer_retires_legacy_rows_absent_from_the_replacement(self):
+        engine = _FakeBrierEngine()
+        engine.flat[("retired_feed", 30)] = _legacy_flat_row("retired_feed", 30)
+        assert get_signal_scorecard(engine, "retired_feed", 30).conviction_weight == 1.5
+
+        stats = boot._write_bootstrapped_buckets(engine, _flat_buckets_one_ineligible())
+
+        assert get_signal_scorecard(engine, "retired_feed", 30) is None
+        assert set(engine.flat) == {("main_driver", 7)}
+        assert stats["retired"] == 1
+
+    def test_flat_replay_retires_legacy_boost_even_when_truncate_is_denied(self):
+        """The old path truncated in its own transaction and carried on if that failed."""
+        engine = _FakeBrierEngine()
+        engine.fail_sql_prefixes = ("TRUNCATE",)  # e.g. no TRUNCATE privilege
+        engine.flat[("tiny_lucky", 7)] = _legacy_flat_row("tiny_lucky", 7)
+
+        summary = _replay(engine, _lucky_flat_rows())
+
+        assert get_signal_scorecard(engine, "tiny_lucky", 7) is None
+        assert get_scorecard_with_regime_fallback(engine, "tiny_lucky", 7, None) is None
+        assert set(engine.flat) == {("main_driver", 7)}
+        assert summary["replaced"] is True
+        assert summary["retired_count"] == 1
+        assert summary["skipped_low_effective_weight"] == 1
+
+    def test_flat_replacement_is_atomic_when_an_insert_fails(self, monkeypatch):
+        engine = _FakeBrierEngine()
+        engine.flat[("tiny_lucky", 7)] = _legacy_flat_row("tiny_lucky", 7)
+        engine.flat[("retired_feed", 30)] = _legacy_flat_row("retired_feed", 30)
+        before = copy.deepcopy(engine.flat)
+        engine.fail_insert_sources = {"main_driver"}
+
+        summary = _replay(engine, _lucky_flat_rows())
+
+        # Nothing half-replaced: the table is exactly what it was, and the run says so.
+        assert engine.flat == before
+        assert summary["replaced"] is False
+        assert summary["retired_count"] == 0
+        assert _run_cli(monkeypatch, engine, _lucky_flat_rows(), []) != 0
+
+    def test_flat_append_is_refused_and_writes_nothing(self, monkeypatch):
+        """--append kept every existing row, so legacy boosts survived it."""
+        engine = _FakeBrierEngine()
+        engine.flat[("tiny_lucky", 7)] = _legacy_flat_row("tiny_lucky", 7)
+        before = copy.deepcopy(engine.flat)
+
+        summary = _replay(engine, _lucky_flat_rows(), append=True)
+
+        assert engine.flat == before
+        assert summary["append_refused"] is True
+        assert summary["replaced"] is False
+        assert _run_cli(monkeypatch, engine, _lucky_flat_rows(), ["--append"]) != 0
+        assert engine.flat == before
+
+    def test_flat_cli_exits_zero_after_a_full_replacement(self, monkeypatch):
+        engine = _FakeBrierEngine()
+        engine.flat[("tiny_lucky", 7)] = _legacy_flat_row("tiny_lucky", 7)
+
+        assert _run_cli(monkeypatch, engine, _lucky_flat_rows(), []) == 0
+        assert set(engine.flat) == {("main_driver", 7)}
+
+    # ── regime table ──────────────────────────────────────────────────────
+
+    def test_regime_bootstrap_retires_legacy_boost_when_bucket_is_ineligible(self):
+        engine = _FakeBrierEngine()
+        engine.regime[("tiny_lucky", 7, "CRISIS")] = _legacy_regime_row("tiny_lucky", 7, "CRISIS")
+        before = get_scorecard_with_regime_fallback(engine, "tiny_lucky", 7, "CRISIS")
+        assert before is not None and before.conviction_weight == 1.5  # the legacy boost
+        engine.oracle_rows = _lucky_regime_rows()
+
+        summary = bootstrap_from_oracle_predictions(engine, days=365)
+
+        assert ("tiny_lucky", 7, "CRISIS") not in engine.regime
+        assert get_regime_conditional_scorecard(engine, "tiny_lucky", 7, "CRISIS") is None
+        # Falls back to the per-signal table, which has no row: neutral.
+        assert get_scorecard_with_regime_fallback(engine, "tiny_lucky", 7, "CRISIS") is None
+        main = get_regime_conditional_scorecard(engine, "main_driver", 7, "CRISIS")
+        assert main is not None and main.conviction_weight == 1.5
+        assert summary["replaced"] is True
+        assert summary["written_count"] == 1
+        assert summary["skipped_low_effective_weight"] == 1
+        assert summary["retired_count"] == 1
+
+    def test_regime_bootstrap_retires_legacy_rows_absent_from_the_replacement(self):
+        engine = _FakeBrierEngine()
+        engine.regime[("retired_feed", 30, "EXPANSION")] = _legacy_regime_row("retired_feed", 30, "EXPANSION")
+        assert get_regime_conditional_scorecard(engine, "retired_feed", 30, "EXPANSION").conviction_weight == 1.5
+        engine.oracle_rows = _lucky_regime_rows()
+
+        summary = bootstrap_from_oracle_predictions(engine, days=365)
+
+        assert get_regime_conditional_scorecard(engine, "retired_feed", 30, "EXPANSION") is None
+        assert set(engine.regime) == {("main_driver", 7, "CRISIS")}
+        assert summary["retired_count"] == 1
+
+    def test_regime_replacement_is_atomic_when_an_insert_fails(self):
+        engine = _FakeBrierEngine()
+        engine.regime[("tiny_lucky", 7, "CRISIS")] = _legacy_regime_row("tiny_lucky", 7, "CRISIS")
+        engine.regime[("retired_feed", 30, "EXPANSION")] = _legacy_regime_row("retired_feed", 30, "EXPANSION")
+        before = copy.deepcopy(engine.regime)
+        engine.oracle_rows = _lucky_regime_rows()
+        engine.fail_insert_sources = {"main_driver"}
+
+        summary = bootstrap_from_oracle_predictions(engine, days=365)
+
+        assert engine.regime == before
+        assert summary["replaced"] is False
+        assert summary["retired_count"] == 0
+
+    def test_regime_read_failure_changes_nothing_and_reports_no_replacement(self):
+        engine = _FakeBrierEngine()
+        engine.regime[("tiny_lucky", 7, "CRISIS")] = _legacy_regime_row("tiny_lucky", 7, "CRISIS")
+        before = copy.deepcopy(engine.regime)
+        engine.fail_sql_prefixes = ("SELECT id, created_at, expiry",)
+
+        summary = bootstrap_from_oracle_predictions(engine, days=365)
+
+        assert engine.regime == before
+        assert summary["replaced"] is False
