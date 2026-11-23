@@ -174,31 +174,30 @@ def test_score_company_returns_none_without_xbrl_writer() -> None:
     assert conn.calls == []
 
 
-def test_score_smart_money_buckets_insider_surge_and_inflow(
+def test_score_smart_money_scores_open_market_form4_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    exact_data = {
-        "FORM4:ABC:OPEN_MKT_NET_VALUE": _series([600_000.0]),
-    }
-    like_data = {
-        "INST_FLOW:ABC:%": _series([-1.0, 2.0]),
-    }
+    sums = {"OPEN_MKT_NET_VALUE": 600_000.0, "OPEN_MKT_TXN_COUNT": 3.0}
+    requested: list[str] = []
 
-    def fake_raw_series(_conn: Any, series_id: str, *_args: Any, **_kwargs: Any) -> pd.Series:
-        return exact_data.get(series_id, pd.Series(dtype=float))
+    def fake_window_sum(_conn: Any, ticker: str, field: str, as_of_date: date | None) -> float | None:
+        assert ticker == "ABC"
+        assert as_of_date == date(2026, 5, 13)
+        requested.append(field)
+        return sums.get(field)
 
-    def fake_raw_series_like(_conn: Any, pattern: str, *_args: Any, **_kwargs: Any) -> pd.Series:
-        return like_data.get(pattern, pd.Series(dtype=float))
-
-    monkeypatch.setattr(cs, "_load_raw_series", fake_raw_series)
-    monkeypatch.setattr(cs, "_load_raw_series_like", fake_raw_series_like)
+    monkeypatch.setattr(cs, "_form4_window_sum", fake_window_sum)
 
     result = cs.score_smart_money(object(), "ABC", as_of_date=date(2026, 5, 13))
 
     assert result.name == "SMART_MONEY"
-    assert result.score == 10
-    assert "Institutional net inflow" in result.signals
+    assert result.score == 5
+    assert "Insider open-market net buy $600,000" in result.signals
+    assert any("Institutional flow unavailable" in s for s in result.signals)
     assert result.data_available is True
+    # All-code series include awards and exercises: never requested.
+    assert "NET_SHARES" not in requested
+    assert "NET_VALUE" not in requested
 
 
 def test_score_crowd_buckets_short_ftd_and_put_call_extremes(

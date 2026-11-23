@@ -20,6 +20,7 @@ Final score = sum(score * trust) / sum(max * trust) * 100
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -29,6 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from alpha_research.data.split_adjuster import adjust_splits
+from store.observations import read_window_known_at
 from store.pit import retraction_cutoff
 
 
@@ -138,33 +140,6 @@ def _load_raw_series(
           AND pull_timestamp::date <= :as_of
         ORDER BY obs_date, pull_timestamp
     """), {"s": series_id, "d": cutoff, "as_of": as_of}).fetchall()
-    if not rows:
-        return pd.Series(dtype=float)
-    return pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
-
-
-def _escape_like(value: str) -> str:
-    """Escape SQL LIKE wildcards (\\, %, _) for ESCAPE '\\' queries."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _load_raw_series_like(
-    conn,
-    series_pattern: str,
-    days: int = 90,
-    as_of_date: date | None = None,
-) -> pd.Series:
-    as_of = _resolve_as_of_date(as_of_date)
-    cutoff = as_of - timedelta(days=days)
-    rows = conn.execute(text("""
-        SELECT obs_date, value FROM raw_series
-        WHERE series_id LIKE :p ESCAPE '\\'
-          AND pull_status = 'SUCCESS'
-          AND obs_date >= :d
-          AND obs_date <= :as_of
-          AND pull_timestamp::date <= :as_of
-        ORDER BY obs_date, pull_timestamp
-    """), {"p": series_pattern, "d": cutoff, "as_of": as_of}).fetchall()
     if not rows:
         return pd.Series(dtype=float)
     return pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
@@ -393,12 +368,42 @@ def score_company(
 #   is mostly routine liquidity / 10b5-1 selling (not strong bearish conviction).
 #   Because of this negative branch, SMART_MONEY layer scores can be negative.
 #   Primary  — FORM4:{ticker}:OPEN_MKT_NET_VALUE (signed USD, open-market P/S):
-#     >= +$500k -> +5,  > $0 -> +2,  == $0 -> 0,  < $0 -> -2
-#   Fallback — FORM4:{ticker}:NET_SHARES (signed shares, when OPEN_MKT_NET_VALUE is empty):
+#     >= +$500k -> +5,  > $0 -> +2,  == $0 -> 0 (buys and sells offset),  < $0 -> -2
+#   Fallback — FORM4:{ticker}:OPEN_MKT_NET_SHARES (open-market P/S only):
 #     >= +10k   -> +5,  > 0  -> +2,  == 0  -> 0,  < 0  -> -2
+#   Never FORM4:{ticker}:NET_SHARES / NET_VALUE: those sum every transaction
+#   code, so grants, awards and option exercises would read as buying (Codex
+#   HOLD on #1353 5c4c7b32). With only those legacy series the Form 4 part is
+#   unavailable. Reads go through store.observations.read_window_known_at with
+#   the explicit writer source (SEC_EDGAR): one row per date, the latest
+#   vintage pulled by the end of the as-of date; another source's rows never
+#   mix in.
+FORM4_SOURCE = "SEC_EDGAR"
 _FORM4_VALUE_STRONG_USD = 500_000.0
 _FORM4_SHARES_STRONG = 10_000.0
 _FORM4_SELL_CAP = -2.0
+
+
+def _form4_window_sum(conn, ticker: str, field: str, as_of_date: date | None) -> float | None:
+    """Sum of ``FORM4:{ticker}:{field}`` over the trailing 90 days, or None.
+
+    One accepted row per date from the EDGAR writer only: the latest vintage
+    pulled by the end of the as-of date (UTC; pull evidence only, no modeled
+    publication lag). None when there is no row.
+    """
+    as_of = _resolve_as_of_date(as_of_date)
+    observations = read_window_known_at(
+        conn,
+        f"FORM4:{ticker}:{field}",
+        as_of=as_of,
+        lag=None,
+        source=FORM4_SOURCE,
+        start=as_of - timedelta(days=90),
+    )
+    values = [o.value for o in observations if o.value is not None and math.isfinite(o.value)]
+    if not values:
+        return None
+    return float(sum(values))
 
 
 def score_smart_money(
@@ -411,56 +416,54 @@ def score_smart_money(
     signals = []
     has_data = False
 
-    # Form 4 signed open-market net dollar value (written by ingestion/edgar.py),
-    # falling back to signed NET_SHARES when OPEN_MKT_NET_VALUE has no rows.
-    f4_val = _load_raw_series(
-        conn, f"FORM4:{ticker}:OPEN_MKT_NET_VALUE", 90, as_of_date=as_of_date
-    ).dropna()
-    if not f4_val.empty:
+    form4_value = _form4_window_sum(conn, ticker, "OPEN_MKT_NET_VALUE", as_of_date)
+    form4_shares = (
+        None if form4_value is not None
+        else _form4_window_sum(conn, ticker, "OPEN_MKT_NET_SHARES", as_of_date)
+    )
+    form4_txns = _form4_window_sum(conn, ticker, "OPEN_MKT_TXN_COUNT", as_of_date)
+    if form4_value is None and form4_shares is None:
+        signals.append(
+            "Insider open-market Form 4 series unavailable "
+            "(all-code NET_SHARES includes awards and exercises; not scored)"
+        )
+    elif form4_txns is not None and form4_txns == 0:
+        # Form 4 days exist but none carried a P/S code: awards/exercises only.
         has_data = True
-        net_val = float(f4_val[~f4_val.index.duplicated(keep="last")].sum())
-        if net_val >= _FORM4_VALUE_STRONG_USD:
+        signals.append("No open-market insider transactions in 90d (awards/exercises only)")
+    elif form4_value is not None:
+        has_data = True
+        if form4_value >= _FORM4_VALUE_STRONG_USD:
             score += 5
-            signals.append(f"Insider open-market net buy ${net_val:,.0f}")
-        elif net_val > 0:
+            signals.append(f"Insider open-market net buy ${form4_value:,.0f}")
+        elif form4_value > 0:
             score += 2
-            signals.append(f"Insider open-market net buy ${net_val:,.0f}")
-        elif net_val < 0:
+            signals.append(f"Insider open-market net buy ${form4_value:,.0f}")
+        elif form4_value < 0:
             # Open-market insider selling is mostly routine liquidity/10b5-1; cap at -2.
             score += _FORM4_SELL_CAP
-            signals.append(f"Insider open-market net sell ${abs(net_val):,.0f}")
+            signals.append(f"Insider open-market net sell ${abs(form4_value):,.0f}")
         else:
-            signals.append("Insider open-market flow flat")
+            signals.append("Insider open-market buys and sells offset (net $0)")
     else:
-        f4_shares = _load_raw_series(
-            conn, f"FORM4:{ticker}:NET_SHARES", 90, as_of_date=as_of_date
-        ).dropna()
-        if not f4_shares.empty:
-            has_data = True
-            net_shares = float(f4_shares[~f4_shares.index.duplicated(keep="last")].sum())
-            if net_shares >= _FORM4_SHARES_STRONG:
-                score += 5
-                signals.append(f"Insider net share buy +{net_shares:,.0f} sh")
-            elif net_shares > 0:
-                score += 2
-                signals.append(f"Insider net share buy +{net_shares:,.0f} sh")
-            elif net_shares < 0:
-                # Open-market insider selling is mostly routine liquidity/10b5-1; cap at -2.
-                score += _FORM4_SELL_CAP
-                signals.append(f"Insider net share sell {net_shares:,.0f} sh")
-            else:
-                signals.append("Insider net shares flat")
-
-    # Institutional flows (if available) — bound LIKE with escaped ticker wildcards.
-    inst_pattern = f"INST_FLOW:{_escape_like(ticker)}:%"
-    inst = _load_raw_series_like(conn, inst_pattern, 90, as_of_date=as_of_date).dropna()
-    if not inst.empty:
         has_data = True
-        if inst.iloc[-1] > 0:
+        if form4_shares >= _FORM4_SHARES_STRONG:
             score += 5
-            signals.append("Institutional net inflow")
+            signals.append(f"Insider open-market net share buy +{form4_shares:,.0f} sh")
+        elif form4_shares > 0:
+            score += 2
+            signals.append(f"Insider open-market net share buy +{form4_shares:,.0f} sh")
+        elif form4_shares < 0:
+            score += _FORM4_SELL_CAP
+            signals.append(f"Insider open-market net share sell {form4_shares:,.0f} sh")
         else:
-            signals.append("Institutional net outflow")
+            signals.append("Insider open-market share buys and sells offset (net 0)")
+
+    # Institutional flow: no code writes INST_FLOW:*, and institutional (13F)
+    # holdings changes are non-directional (owner decision 2026-11-23), so the
+    # layer reads no institutional series instead of whichever pooled row
+    # sorted last (Codex HOLD on #1353 5c4c7b32).
+    signals.append("Institutional flow unavailable (no INST_FLOW writer; 13F is non-directional)")
 
     trust = 0.85 if has_data else 0.15
     return LayerResult(

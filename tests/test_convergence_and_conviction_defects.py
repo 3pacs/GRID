@@ -5,23 +5,39 @@ Covers:
 2. Neutral streams contributing to the directional numerator in _compute_convergence.
 3. FINRA short_volume_ratio treated as directional in _scan_darkpool.
 4. Stale/undated 13F filings mixed into the 7-day convergence window in _scan_institutional.
-5. INST_FLOW:{ticker}:% passed to exact-match SQL (=) in conviction_scorer.
-6. Dead SEC_FORM4:{ticker}:monthly and XBRL:{ticker}:* series in conviction_scorer.
+5. SMART_MONEY pooled whichever INST_FLOW row sorted last; it now reads no
+   institutional series (no INST_FLOW writer; 13F is non-directional).
+6. SMART_MONEY Form 4: only the open-market (P/S) series from SEC_EDGAR, never
+   all-code NET_SHARES (awards/exercises); dead XBRL:{ticker}:* series.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 import pytest
+from sqlalchemy import (
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    event,
+)
 
 from alpha_research import conviction_scorer as cs
 from intelligence import signal_convergence_scanner as scs
-
 
 AS_OF = date(2026, 4, 13)
 T3 = AS_OF - timedelta(days=3)
@@ -106,7 +122,7 @@ class _SQLCall:
 
 
 class _RawSeriesConn:
-    """In-memory raw_series mock supporting exact '=' and escaped LIKE queries."""
+    """In-memory raw_series mock for exact ``series_id = :s`` reads."""
 
     def __init__(self, rows_by_series: dict[str, list[tuple[date, float]]]) -> None:
         self._rows_by_series = rows_by_series
@@ -124,12 +140,7 @@ class _RawSeriesConn:
         as_of = bound.get("as_of")
 
         matched: list[tuple[date, float]] = []
-        if "series_id LIKE" in sql:
-            pattern = str(bound.get("p", ""))
-            for sid, series_rows in self._rows_by_series.items():
-                if _sql_like_match(sid, pattern, escape="\\"):
-                    matched.extend(series_rows)
-        elif "series_id = :s" in sql:
+        if "series_id = :s" in sql:
             sid = str(bound.get("s", ""))
             matched.extend(self._rows_by_series.get(sid, []))
 
@@ -140,30 +151,6 @@ class _RawSeriesConn:
         ]
         filtered.sort(key=lambda r: r[0])
         return _FakeResult(filtered)
-
-
-def _sql_like_match(text_val: str, pattern: str, escape: str = "\\") -> bool:
-    """Minimal SQL LIKE matcher with ESCAPE support for unit tests."""
-    import re
-
-    regex_parts: list[str] = ["^"]
-    i = 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == escape and i + 1 < len(pattern):
-            regex_parts.append(re.escape(pattern[i + 1]))
-            i += 2
-        elif ch == "%":
-            regex_parts.append(".*")
-            i += 1
-        elif ch == "_":
-            regex_parts.append(".")
-            i += 1
-        else:
-            regex_parts.append(re.escape(ch))
-            i += 1
-    regex_parts.append("$")
-    return re.match("".join(regex_parts), text_val) is not None
 
 
 class _DummyEngine:
@@ -398,119 +385,238 @@ class TestDefect4Stale13FExcluded:
         assert scs._scan_institutional(engine, "AAPL", AS_OF, 7, {}) is None
 
 
-# ── Defect 5: INST_FLOW LIKE with bound escaped pattern ───────────────────
+# ── Defects 5/6: SMART_MONEY reads only open-market Form 4 from SEC_EDGAR ──
+#
+# Real SQL against an in-memory SQLite raw_series + source_catalog shaped like
+# production (as in tests/test_store_observations.py), so every read goes
+# through store.observations the way it does on griddb. The writer
+# (ingestion/edgar.py) records six series per filing day: all-code NET_SHARES,
+# NET_VALUE, TXN_COUNT, and the open-market (P/S codes) OPEN_MKT_* trio.
+
+sqlite3.register_adapter(date, lambda d: d.isoformat())
+sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
+
+EDGAR_SRC = 1
+OTHER_SRC = 2
 
 
-class TestDefect5InstFlowLikeQuery:
-    def test_inst_flow_uses_bound_like_and_escapes_ticker_wildcards(self) -> None:
-        conn = _RawSeriesConn({
-            "INST_FLOW:A_B%C:net": [(T3, 250_000.0)],
-            # Wildcard-injection trap: must NOT match A_B%C when _ and % are escaped.
-            "INST_FLOW:AXBZZZC:net": [(T3, -999_999.0)],
-        })
+class _Form4DB:
+    def __init__(self) -> None:
+        self.engine = create_engine("sqlite://")
+        md = MetaData()
+        source_catalog = Table(
+            "source_catalog", md,
+            Column("id", Integer, primary_key=True),
+            Column("name", String, nullable=False),
+        )
+        self._raw = Table(
+            "raw_series", md,
+            Column("series_id", String, nullable=False),
+            Column("source_id", Integer, ForeignKey("source_catalog.id"), nullable=False),
+            Column("obs_date", Date, nullable=False),
+            Column("pull_timestamp", DateTime, nullable=False),
+            Column("value", Float, nullable=False),
+            Column("raw_payload", Text),
+            Column("pull_status", String, nullable=False),
+        )
+        md.create_all(self.engine)
+        with self.engine.begin() as c:
+            c.execute(source_catalog.insert(), [
+                {"id": EDGAR_SRC, "name": "SEC_EDGAR"},
+                {"id": OTHER_SRC, "name": "openinsider"},
+            ])
+        self.series_read: list[str] = []
+        self.sql: list[str] = []
 
-        result = cs.score_smart_money(conn, "A_B%C", as_of_date=AS_OF)
+        @event.listens_for(self.engine, "before_cursor_execute")
+        def _record(_conn, _cursor, statement, parameters, _context, _many):  # type: ignore[no-untyped-def]
+            self.sql.append(statement)
+            values = parameters.values() if isinstance(parameters, dict) else (parameters or ())
+            self.series_read.extend(str(v) for v in values if isinstance(v, str) and ":" in v)
 
-        like_calls = [c for c in conn.calls if "LIKE" in c.sql]
-        assert len(like_calls) == 1
-        call = like_calls[0]
-        assert "ESCAPE" in call.sql
-        assert "A_B%C" not in call.sql  # never interpolated into SQL
-        assert "obs_date <= :as_of" in call.sql
-        assert "pull_timestamp::date <= :as_of" in call.sql
-        assert call.params["p"] == r"INST_FLOW:A\_B\%C:%"
-        assert call.params["as_of"] == AS_OF
-        assert result.data_available is True
-        assert result.score == 5
-        assert "Institutional net inflow" in result.signals
+    def add(
+        self, series_id: str, obs_date: date, value: float, *,
+        pulled: datetime | None = None, source_id: int = EDGAR_SRC, status: str = "SUCCESS",
+    ) -> None:
+        with self.engine.begin() as c:
+            c.execute(self._raw.insert(), [{
+                "series_id": series_id, "source_id": source_id, "obs_date": obs_date,
+                "pull_timestamp": pulled or datetime.combine(obs_date, datetime.min.time()) + timedelta(hours=22),
+                "value": value, "raw_payload": "{}", "pull_status": status,
+            }])
 
-    def test_inst_flow_does_not_match_other_tickers_via_unescaped_underscore(self) -> None:
-        conn = _RawSeriesConn({
-            "INST_FLOW:AXB:net": [(T3, 500_000.0)],
-        })
+    def filing_day(
+        self, obs_date: date, *, net_shares: float, net_value: float, txns: float,
+        open_shares: float, open_value: float, open_txns: float, ticker: str = "AAPL",
+    ) -> None:
+        """One filing day as ingestion/edgar.py writes it (all six series)."""
+        for field, value in (
+            ("NET_SHARES", net_shares), ("NET_VALUE", net_value), ("TXN_COUNT", txns),
+            ("OPEN_MKT_NET_SHARES", open_shares), ("OPEN_MKT_NET_VALUE", open_value),
+            ("OPEN_MKT_TXN_COUNT", open_txns),
+        ):
+            self.add(f"FORM4:{ticker}:{field}", obs_date, value)
 
-        result = cs.score_smart_money(conn, "A_B", as_of_date=AS_OF)
+    def score(self, ticker: str = "AAPL", as_of: date = AS_OF) -> cs.LayerResult:
+        self.series_read.clear()
+        self.sql.clear()
+        with self.engine.connect() as c:
+            return cs.score_smart_money(c, ticker, as_of_date=as_of)
+
+
+class TestDefect5NoPooledInstitutionalRead:
+    def test_no_institutional_series_is_read_and_the_gap_is_named(self) -> None:
+        db = _Form4DB()
+        # A stray INST_FLOW row (no writer exists in GRID) must not be scored.
+        db.add("INST_FLOW:AAPL:net", T3, 9_000_000.0, source_id=OTHER_SRC)
+
+        result = db.score()
 
         assert result.data_available is False
         assert result.score == 0
-
-
-# ── Defect 6: SMART_MONEY Form 4 signed series & COMPANY unavailable ──────
+        assert not any(sid.startswith("INST_FLOW") for sid in db.series_read)
+        assert not any("LIKE" in sql.upper() for sql in db.sql)
+        assert any("Institutional flow unavailable" in s for s in result.signals)
 
 
 class TestDefect6Form4AndCompanyUnavailable:
-    def test_smart_money_reads_signed_open_mkt_net_value_buy_and_sell(self) -> None:
-        buy_conn = _RawSeriesConn({
-            "FORM4:AAPL:OPEN_MKT_NET_VALUE": [(T3, 750_000.0)],
-        })
-        buy_res = cs.score_smart_money(buy_conn, "AAPL", as_of_date=AS_OF)
-        assert buy_res.data_available is True
-        assert buy_res.score == 5
-        assert all(c.params.get("s") != "SEC_FORM4:AAPL:monthly" for c in buy_conn.calls)
-        assert any(
-            c.params.get("s") == "FORM4:AAPL:OPEN_MKT_NET_VALUE"
-            and "obs_date <= :as_of" in c.sql
-            and "pull_timestamp::date <= :as_of" in c.sql
-            for c in buy_conn.calls
+    @pytest.mark.parametrize(
+        ("open_value", "expected_score", "signal"),
+        [
+            (750_000.0, 5, "Insider open-market net buy $750,000"),
+            (100_000.0, 2, "Insider open-market net buy $100,000"),
+            # Open-market insider selling is capped at -2 (routine liquidity / 10b5-1).
+            (-750_000.0, -2, "Insider open-market net sell $750,000"),
+            (-100_000.0, -2, "Insider open-market net sell $100,000"),
+            (0.0, 0, "Insider open-market buys and sells offset (net $0)"),
+        ],
+    )
+    def test_open_market_net_value_buy_sell_and_exact_zero(
+        self, open_value: float, expected_score: int, signal: str,
+    ) -> None:
+        db = _Form4DB()
+        db.filing_day(
+            T3, net_shares=1.0, net_value=open_value, txns=2.0,
+            open_shares=1.0, open_value=open_value, open_txns=2.0,
         )
 
-        mod_buy_res = cs.score_smart_money(
-            _RawSeriesConn({"FORM4:AAPL:OPEN_MKT_NET_VALUE": [(T3, 100_000.0)]}),
-            "AAPL",
-            as_of_date=AS_OF,
-        )
-        assert mod_buy_res.data_available is True
-        assert mod_buy_res.score == 2
+        result = db.score()
 
-        sell_res = cs.score_smart_money(
-            _RawSeriesConn({"FORM4:AAPL:OPEN_MKT_NET_VALUE": [(T3, -750_000.0)]}),
-            "AAPL",
-            as_of_date=AS_OF,
-        )
-        assert sell_res.data_available is True
-        # Open-market insider selling is capped at -2 (routine liquidity / 10b5-1).
-        assert sell_res.score == -2
+        assert result.data_available is True
+        assert result.score == expected_score
+        assert signal in result.signals
+        # Exact zero is a measured offset, never labelled as an outflow.
+        assert not (open_value == 0 and any("net sell" in s for s in result.signals))
 
-        mod_sell_res = cs.score_smart_money(
-            _RawSeriesConn({"FORM4:AAPL:OPEN_MKT_NET_VALUE": [(T3, -100_000.0)]}),
-            "AAPL",
-            as_of_date=AS_OF,
+    def test_award_only_issuer_is_not_scored_as_buying(self) -> None:
+        db = _Form4DB()
+        # Grants and option exercises (codes A/M): all-code NET_SHARES and
+        # NET_VALUE are large and positive, the open-market series are zero.
+        db.filing_day(
+            T3, net_shares=250_000.0, net_value=40_000_000.0, txns=4.0,
+            open_shares=0.0, open_value=0.0, open_txns=0.0,
         )
-        assert mod_sell_res.data_available is True
-        assert mod_sell_res.score == -2
 
-    def test_smart_money_falls_back_to_form4_net_shares(self) -> None:
-        buy_res = cs.score_smart_money(
-            _RawSeriesConn({"FORM4:AAPL:NET_SHARES": [(T3, 25_000.0)]}),
-            "AAPL",
-            as_of_date=AS_OF,
-        )
-        assert buy_res.data_available is True
-        assert buy_res.score == 5
+        result = db.score()
 
-        mod_buy_res = cs.score_smart_money(
-            _RawSeriesConn({"FORM4:AAPL:NET_SHARES": [(T3, 1_000.0)]}),
-            "AAPL",
-            as_of_date=AS_OF,
-        )
-        assert mod_buy_res.data_available is True
-        assert mod_buy_res.score == 2
+        assert result.score == 0
+        assert result.data_available is True
+        assert "No open-market insider transactions in 90d (awards/exercises only)" in result.signals
+        assert "FORM4:AAPL:NET_SHARES" not in db.series_read
+        assert "FORM4:AAPL:NET_VALUE" not in db.series_read
 
-        sell_res = cs.score_smart_money(
-            _RawSeriesConn({"FORM4:AAPL:NET_SHARES": [(T3, -25_000.0)]}),
-            "AAPL",
-            as_of_date=AS_OF,
-        )
-        assert sell_res.data_available is True
-        assert sell_res.score == -2
+    def test_legacy_all_code_series_alone_is_unavailable(self) -> None:
+        db = _Form4DB()
+        # Rows written before the open-market split: only the all-code trio.
+        db.add("FORM4:AAPL:NET_SHARES", T3, 25_000.0)
+        db.add("FORM4:AAPL:NET_VALUE", T3, 4_000_000.0)
+        db.add("FORM4:AAPL:TXN_COUNT", T3, 3.0)
 
-        mod_sell_res = cs.score_smart_money(
-            _RawSeriesConn({"FORM4:AAPL:NET_SHARES": [(T3, -1_000.0)]}),
-            "AAPL",
-            as_of_date=AS_OF,
+        result = db.score()
+
+        assert result.data_available is False
+        assert result.score == 0
+        assert any("open-market Form 4 series unavailable" in s for s in result.signals)
+
+    def test_other_source_rows_on_the_same_series_and_date_are_ignored(self) -> None:
+        db = _Form4DB()
+        db.filing_day(
+            T3, net_shares=500.0, net_value=100_000.0, txns=1.0,
+            open_shares=500.0, open_value=100_000.0, open_txns=1.0,
         )
-        assert mod_sell_res.data_available is True
-        assert mod_sell_res.score == -2
+        # Simultaneous rows from another source for the same series and date,
+        # pulled later: neither summed in nor allowed to replace EDGAR's row.
+        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", T3, 9_000_000.0,
+               pulled=_utc(T3) + timedelta(hours=11), source_id=OTHER_SRC)
+        db.add("FORM4:AAPL:OPEN_MKT_TXN_COUNT", T3, 0.0,
+               pulled=_utc(T3) + timedelta(hours=11), source_id=OTHER_SRC)
+
+        result = db.score()
+
+        assert result.data_available is True
+        assert result.score == 2
+        assert "Insider open-market net buy $100,000" in result.signals
+
+        only_other = _Form4DB()
+        only_other.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", T3, 9_000_000.0, source_id=OTHER_SRC)
+        assert only_other.score().data_available is False
+
+    def test_only_rows_pulled_by_the_end_of_as_of_count(self) -> None:
+        db = _Form4DB()
+        db.filing_day(
+            T3, net_shares=500.0, net_value=100_000.0, txns=1.0,
+            open_shares=500.0, open_value=100_000.0, open_txns=1.0,
+        )
+        # A revision of the same date pulled the day after as_of, a FAILED
+        # marker, and a later filing day pulled after as_of: none counts.
+        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", T3, 900_000.0,
+               pulled=datetime.combine(AS_OF + timedelta(days=1), datetime.min.time()))
+        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", AS_OF, 5_000_000.0, status="FAILED")
+        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", AS_OF, 5_000_000.0,
+               pulled=datetime.combine(AS_OF + timedelta(days=2), datetime.min.time()))
+
+        assert db.score().score == 2
+
+        # A row pulled late on the as-of day itself is known by its end.
+        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", AS_OF - timedelta(days=1), 450_000.0,
+               pulled=datetime.combine(AS_OF, datetime.min.time()) + timedelta(hours=23))
+        assert db.score().score == 5
+
+    def test_window_sums_filing_days_within_90_days(self) -> None:
+        db = _Form4DB()
+        for d in (T3, AS_OF - timedelta(days=60)):
+            db.filing_day(
+                d, net_shares=1_000.0, net_value=300_000.0, txns=1.0,
+                open_shares=1_000.0, open_value=300_000.0, open_txns=1.0,
+            )
+        db.filing_day(
+            AS_OF - timedelta(days=120), net_shares=-90_000.0, net_value=-9_000_000.0, txns=1.0,
+            open_shares=-90_000.0, open_value=-9_000_000.0, open_txns=1.0,
+        )
+
+        result = db.score()
+
+        assert result.score == 5
+        assert "Insider open-market net buy $600,000" in result.signals
+
+    @pytest.mark.parametrize(
+        ("open_shares", "open_txns", "expected_score"),
+        [(25_000.0, 2.0, 5), (1_000.0, 1.0, 2), (-25_000.0, 1.0, -2), (-1_000.0, 1.0, -2), (0.0, 2.0, 0)],
+    )
+    def test_open_market_shares_fallback_when_value_series_absent(
+        self, open_shares: float, open_txns: float, expected_score: int,
+    ) -> None:
+        db = _Form4DB()
+        db.add("FORM4:AAPL:OPEN_MKT_NET_SHARES", T3, open_shares)
+        db.add("FORM4:AAPL:OPEN_MKT_TXN_COUNT", T3, open_txns)
+        # Legacy all-code shares disagree in sign: never read.
+        db.add("FORM4:AAPL:NET_SHARES", T3, 999_999.0)
+
+        result = db.score()
+
+        assert result.data_available is True
+        assert result.score == expected_score
+        assert "FORM4:AAPL:NET_SHARES" not in db.series_read
 
     def test_company_layer_returns_none_because_no_xbrl_writer_exists(self) -> None:
         conn = _RawSeriesConn({})
