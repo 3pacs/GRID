@@ -967,6 +967,27 @@ jobs:
             exit 1
           fi
 
+      # Cboe equity put/call (#1397, Codex review 6026828927): on a fresh
+      # database (schema.sql tables and seeds, no raw rows) the registry
+      # revision registers equity_put_call_ratio, the first pull stores it
+      # with no row stamped before its page was read, and the resolver
+      # resolves it with no ghost mapping. Two overlapping runs on two
+      # connections store one SUCCESS row per session (writer lock, Codex
+      # review 6029448579). A skip must fail this step.
+      - name: Cboe equity put/call fresh-install PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_cboe_equity_pcr_fresh_install_pg.py -q -rA | tee /tmp/grid-cboe-epcr-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-cboe-epcr-pg.txt; then
+            echo "::error::Cboe equity put/call fresh-install PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # E2 forward scoreboard (evals/e2, milestone M2): price resolution is
       # point-in-time against real SQL (no close before its pull or its
       # session close, no revision pulled after the run instant, one named
