@@ -11,6 +11,7 @@ import json
 import math
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import Column, Date, DateTime, Float, ForeignKey, Integer, MetaData, String, Table, Text, create_engine, text
@@ -31,11 +32,16 @@ UTC = timezone.utc
 
 # ── ladders ───────────────────────────────────────────────────────────────
 
-def _strike(k: float, bid: float | None, ask: float | None, *, event: str = "KXFED-26JAN",
-            title: str | None = None) -> dict:
+def _title_date(meeting_iso: str) -> str:
+    m = datetime.fromisoformat(meeting_iso.replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York"))
+    return f"{m:%b} {m.day}, {m.year}"
+
+
+def _strike(k: float, bid: float | None, ask: float | None, *, event: str = "KXFED-26JAN", meeting: str = JAN,
+            title: str | None = None, **extra) -> dict:
     return {"ticker": f"{event}-T{k:.2f}", "yes_bid": bid, "yes_ask": ask, "yes_price": 0.42, "volume": 1.0,
             "title": title or f"Will the upper bound of the federal funds rate be above {k:.2f}% following the "
-                              f"Fed's Jan 28, 2026 meeting?"}
+                              f"Fed's {_title_date(meeting)} meeting?", **extra}
 
 
 def _hand_ladder() -> list[dict]:
@@ -43,65 +49,164 @@ def _hand_ladder() -> list[dict]:
     return [_strike(k, round(m - 0.005, 3), round(m + 0.005, 3)) for k, m in mids.items()]
 
 
-def test_expected_upper_bound_from_bid_ask_mids():
-    lad, why = PP.price_ladder(_hand_ladder())
+def _price(rows):
+    return PP.price_ladder(rows, event="KALSHI:KXFED-26JAN", meeting_at=datetime(2026, 1, 28, 19, tzinfo=UTC))
+
+
+def test_expected_upper_bound_from_quote_bands():
+    lad, why = _price(_hand_ladder())
     assert why is None and lad.strikes == (3.50, 3.75, 4.00, 4.25, 4.50)
-    # 3.50*.005 + 4.00*(.995-.925) + 4.25*(.925-.025) + 4.50*(.025-.005) + 4.75*.005
+    # 3.50*.005 + 4.00*(.995-.925) + 4.25*(.925-.025) + 4.50*(.025-.005) + 4.75*.005 = 3.50 + .25 * sum(P)
     assert lad.expected_upper == pytest.approx(4.23625)
     assert lad.tail_below == pytest.approx(0.005) and lad.tail_above == pytest.approx(0.005)
     assert lad.monotone_adjusted == 0 and lad.max_spread == pytest.approx(0.01)
+    # 3.50 and 3.75 (0.99/1.00: no ask) and 4.50 (0.00/0.01: no bid) are one-sided bands with the same points
+    assert lad.one_sided == 3
+    lo, hi = lad.expected_bounds
+    assert lo == pytest.approx(3.50 + 0.25 * (0.99 + 0.99 + 0.92 + 0.02 + 0.0))
+    assert hi == pytest.approx(3.50 + 0.25 * (1.0 + 1.0 + 0.93 + 0.03 + 0.01))
+    assert lo < lad.expected_upper < hi
+
+
+def test_the_live_december_ladder_shape_prices_from_one_sided_bands():
+    # KXFED-26DEC as pulled 2026-11-23 05:30Z (public market data): five strikes 0.99/1.00, five 0.00/0.01.
+    quotes = {2.75: (0.99, 1.0), 3.00: (0.99, 1.0), 3.25: (0.99, 1.0), 3.50: (0.99, 1.0), 3.75: (0.99, 1.0),
+              4.00: (0.93, 0.94), 4.25: (0.03, 0.04), 4.50: (0.0, 0.01), 4.75: (0.0, 0.01), 5.00: (0.0, 0.01),
+              5.25: (0.0, 0.01)}
+    dec = "2026-12-09T19:00:00Z"
+    rows = [_strike(k, b, a, event="KXFED-26DEC", meeting=dec) for k, (b, a) in quotes.items()]
+    lad, why = PP.price_ladder(rows, event="KALSHI:KXFED-26DEC", meeting_at=datetime(2026, 12, 9, 19, tzinfo=UTC))
+    assert why is None and lad.one_sided == 9
+    assert lad.expected_upper == pytest.approx(2.75 + 0.25 * (5 * 0.995 + 0.935 + 0.035 + 4 * 0.005))
+    assert lad.expected_bounds == pytest.approx((4.2275, 4.255))
+    odds, bounds, withheld = PP.outcome_odds(lad, 4.00)
+    assert withheld is None and odds == {"hike": 0.935, "hold": 0.06, "cut": 0.005}
+    assert bounds["hike"] == [0.93, 0.94] and bounds["cut"] == [0.0, 0.01]
 
 
 def test_last_trade_price_is_never_used():
     a = _hand_ladder()
     b = [{**s, "yes_price": 0.99} for s in a]
-    assert PP.price_ladder(a)[0] == PP.price_ladder(b)[0]
+    assert _price(a)[0] == _price(b)[0]
 
 
-def test_a_crossed_quote_is_clipped_to_keep_the_ladder_non_increasing():
+def test_a_book_no_non_increasing_ladder_fits_is_refused_not_clipped():
     rows = _hand_ladder()
-    rows[3] = _strike(4.25, 0.94, 0.95)            # above the 4.00 strike's 0.925
-    lad, why = PP.price_ladder(rows)
-    assert why is None and lad.monotone_adjusted == 1 and lad.p_above[3] == pytest.approx(0.925)
+    rows[3] = _strike(4.25, 0.94, 0.95)            # its bid is above the 4.00 strike's 0.93 ask
+    lad, why = _price(rows)
+    assert lad is None and "no non-increasing ladder fits" in why and "4.25" in why
+
+
+def test_crossing_mids_are_held_inside_every_quote_band():
+    rows = _hand_ladder()
+    rows[2] = _strike(4.00, 0.90, 0.95)            # mid 0.925
+    rows[3] = _strike(4.25, 0.91, 0.99)            # mid 0.95 crosses it, but 0.91..0.95 fits both
+    rows[4] = _strike(4.50, 0.0, 0.01)
+    rows[1] = _strike(3.75, 0.99, 1.0)
+    rows[0] = _strike(3.50, 0.99, 1.0)
+    rows.append(_strike(4.75, None, 0.01))
+    lad, why = _price(rows)
+    assert why is None and lad.monotone_adjusted == 1
+    assert all(lo - 1e-12 <= p <= hi + 1e-12 for p, lo, hi in zip(lad.p_above, lad.lower, lad.upper))
+    assert all(a >= b for a, b in zip(lad.p_above, lad.p_above[1:]))
+    assert lad.p_above[3] == pytest.approx(0.925) and 0.91 <= lad.p_above[3] <= 0.99
+
+
+def _set(i, row):
+    return lambda r: r.__setitem__(i, row)
 
 
 @pytest.mark.parametrize("mutate, needle", [
-    (lambda r: r.__setitem__(2, _strike(4.00, 0.80, 0.95)), "spread"),
-    (lambda r: r.__setitem__(2, _strike(4.00, None, 0.93)), "two-sided"),
-    (lambda r: r.__setitem__(2, _strike(4.00, 0.93, 0.92)), "two-sided"),
+    (_set(2, _strike(4.00, 0.80, 0.95)), "wider"),
+    (_set(2, _strike(4.00, None, 0.93)), "wider"),                       # no bid: the band is 0..0.93
+    (_set(2, _strike(4.00, 0.93, 0.92)), "crossed"),
+    (_set(2, _strike(4.00, 0.0, 0.0)), "either side"),                   # the old writer's missing-quote zeros
+    (_set(2, _strike(4.00, None, None)), "either side"),
+    (_set(2, _strike(4.00, 0.92, 0.93, yes_bid_size=0, yes_ask_size=0)), "either side"),
     (lambda r: r.pop(2), "contiguous"),
-    (lambda r: r.__setitem__(0, _strike(3.50, 0.80, 0.81)), "does not cover"),
-    (lambda r: r.__setitem__(1, _strike(3.75, 0.99, 1.0, title="Will CPI be above 3.75%?")), "upper bound above"),
-    (lambda r: r.__setitem__(1, {**_strike(3.75, 0.99, 1.0), "ticker": "KXFED-26JAN-T3.80"}), "different strikes"),
+    (lambda r: r.__setitem__(slice(0, 2), [_strike(4.75, None, 0.01)]), "does not cover"),
+    (_set(1, _strike(3.75, 0.99, 1.0, title="Will CPI be above 3.75%?")), "upper bound above"),
+    (_set(1, {**_strike(3.75, 0.99, 1.0), "ticker": "KXFED-26JAN-T3.80"}), "different strikes"),
+    (_set(1, _strike(3.75, 0.99, 1.0, event="KXFED-26MAR")), "not a contract of KXFED-26JAN"),
+    (_set(1, _strike(3.75, 0.99, 1.0, event_ticker="KXFED-26MAR")), "names event"),
+    (_set(1, _strike(3.75, 0.99, 1.0, meeting="2026-03-18T18:00:00Z")), "names the 2026-03-18 meeting"),
+    (_set(1, _strike(3.75, 0.99, 1.0, strike_type="less")), "pays on 'less'"),
+    (_set(1, _strike(3.75, 0.99, 1.0, floor_strike=3.5)), "floor_strike"),
+    (_set(1, _strike(3.75, 0.99, 1.0, cap_strike=4.0)), "cap strike"),
     (lambda r: r[:] and r.__delitem__(slice(3, None)), "need 4"),
 ])
 def test_an_unusable_ladder_is_refused_with_its_reason(mutate, needle):
     rows = _hand_ladder()
     mutate(rows)
-    lad, why = PP.price_ladder(rows)
+    lad, why = _price(rows)
     assert lad is None and needle in why
 
 
+def test_an_off_grid_strike_is_refused():
+    rows = _hand_ladder() + [_strike(4.60, None, 0.01)]
+    assert "off the 0.25 grid" in _price(rows)[1]
+
+
 def test_hike_hold_cut_odds_against_the_current_upper_bound():
-    lad, _ = PP.price_ladder(_hand_ladder())
-    assert PP.outcome_odds(lad, 4.00) == {"hike": 0.925, "hold": 0.07, "cut": 0.005}
-    assert PP.outcome_odds(lad, 4.25) == {"hike": 0.025, "hold": 0.9, "cut": 0.075}
+    lad, _ = _price(_hand_ladder())
+    assert PP.outcome_odds(lad, 4.00)[0] == {"hike": 0.925, "hold": 0.07, "cut": 0.005}
+    assert PP.outcome_odds(lad, 4.25)[0] == {"hike": 0.025, "hold": 0.9, "cut": 0.075}
+
+
+@pytest.mark.parametrize("target", [3.50, 3.25, 4.75, 3.88])
+def test_odds_are_withheld_unless_both_thresholds_are_quoted(target):
+    # 3.50: one step below (3.25) is not on the ladder, whose lowest strike carries a 0.03 tail; the old code printed
+    # an exact 100% hike / 0% cut there. 4.75 is past the top strike; 3.88 is off the grid.
+    rows = [_strike(k, b, a) for k, (b, a) in {3.50: (0.96, 0.98), 3.75: (0.96, 0.97), 4.00: (0.5, 0.52),
+                                                4.25: (0.0, 0.01)}.items()]
+    lad, why = _price(rows)
+    assert why is None
+    odds, bounds, withheld = PP.outcome_odds(lad, target)
+    assert odds is None and bounds is None and withheld
+
+
+# ── clocks ────────────────────────────────────────────────────────────────
+
+def _row_snap(event, meeting, d, pulled, level, *, acquired=None):
+    payload = _payload(event, meeting, level)
+    if acquired is not None:
+        payload["clock"] = {"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": acquired.isoformat()}
+    return PP.snapshot_from_row(f"KALSHI:{event}", d, pulled, json.dumps(payload))
+
+
+def test_a_transaction_start_row_is_known_only_after_the_legacy_span():
+    pulled = datetime(2025, 11, 14, 23, 50, tzinfo=UTC)
+    end_of_day = datetime(2025, 11, 15, tzinfo=UTC)
+    legacy = _row_snap("KXFED-26JAN", JAN, date(2025, 11, 14), pulled, 4.3)
+    assert legacy.clock_basis == "transaction_start" and legacy.acquired_by == pulled + PP.LEGACY_SPAN
+    assert not PP.known_by(legacy, end_of_day, inclusive=False)          # quotes may have arrived after midnight
+    stamped = _row_snap("KXFED-26JAN", JAN, date(2025, 11, 14), pulled, 4.3, acquired=pulled)
+    assert stamped.clock_basis == "acquired" and stamped.available_at == pulled + PP.COMMIT_GRACE
+    assert PP.known_by(stamped, end_of_day, inclusive=False)
+    late = _row_snap("KXFED-26JAN", JAN, date(2025, 11, 14), pulled, 4.3, acquired=pulled + timedelta(minutes=20))
+    assert not PP.known_by(late, end_of_day, inclusive=False)            # response after the cutoff
+
+
+def test_the_writer_and_reader_share_one_clock_rule():
+    from ingestion.altdata import kalshi_markets as K
+
+    assert K.CLOCK_RULE == PP.ACQUIRED_CLOCK_RULE
 
 
 # ── meetings, rolls, same-contract change ─────────────────────────────────
 
 def _payload(event: str, meeting: str, level: float) -> dict:
     return {"event_ticker": event, "strike_date": meeting, "series_ticker": "KXFED",
-            "all_strikes": _ladder_for(level, event)}
+            "all_strikes": _ladder_for(level, event, meeting)}
 
 
-def _ladder_for(level: float, event: str = "KXFED-26JAN") -> list[dict]:
+def _ladder_for(level: float, event: str = "KXFED-26JAN", meeting: str = JAN) -> list[dict]:
     out = []
     for i in range(7):
         k = 3.50 + 0.25 * i
         p = 1.0 / (1.0 + math.exp(-(level - k - 0.125) / 0.04))
         mid = min(0.995, max(0.005, round(p, 3)))
-        out.append(_strike(k, round(mid - 0.005, 4), round(mid + 0.005, 4), event=event))
+        out.append(_strike(k, round(mid - 0.005, 4), round(mid + 0.005, 4), event=event, meeting=meeting))
     return out
 
 
@@ -126,16 +231,37 @@ def test_the_next_meeting_rolls_after_the_decision_and_is_never_substituted():
     assert date(2025, 12, 4) not in readings and "KXFED-25DEC" in missing[date(2025, 12, 4)]
 
 
+def test_a_later_discovery_never_rewrites_an_earlier_day():
+    # Codex's case: GRID first reads the nearer December event on Monday. Friday's reading must be what Friday knew.
+    fri, mon = date(2025, 12, 5), date(2025, 12, 8)
+    days = [d for d in SESS if d <= mon]
+    jan_only = [_snap("KXFED-26JAN", JAN_M, d, 5, 4.40) for d in days]
+    before, _ = PP.next_meeting_readings([s for s in jan_only if s.obs_date <= fri], days)
+    after, _ = PP.next_meeting_readings(jan_only + [_snap("KXFED-25DEC", DEC_M, mon, 5, 4.20)], days)
+    assert after[fri] == before[fri] and after[fri].event == "KALSHI:KXFED-26JAN"
+    assert after[mon].event == "KALSHI:KXFED-25DEC"
+    assert PP.meetings_seen(jan_only, by=datetime(2025, 12, 5, 6, tzinfo=UTC)) == [
+        datetime(2026, 1, 28, 19, tzinfo=UTC)]
+
+
+def test_two_events_naming_one_meeting_give_no_reading():
+    snaps = [_snap("KXFED-26JAN", JAN_M, d, 5, 4.40) for d in SESS]
+    snaps.append(_snap("KXFED-26JANB", JAN_M, SESS[0], 5, 4.40))
+    readings, missing = PP.next_meeting_readings(snaps, SESS)
+    assert SESS[0] not in readings and "2 KXFED events" in missing[SESS[0]]
+
+
 def test_the_five_session_change_never_spans_two_contracts():
     snaps = [_snap("KXFED-25DEC", DEC_M, d, 5, 4.20) for d in SESS]
     snaps += [_snap("KXFED-26JAN", JAN_M, d, 5, 4.40 + 0.01 * i) for i, d in enumerate(SESS)]
-    level, change, readings = PP.path_series(snaps, SESS)
+    path = PP.path_series(snaps, SESS)
     d = date(2025, 12, 11)                         # first January day; five sessions earlier is 12-04
-    assert readings[d].event == "KALSHI:KXFED-26JAN"
+    assert path.readings[d].event == "KALSHI:KXFED-26JAN"
     jan = {s.obs_date: s.ladder.expected_upper for s in snaps if s.event.endswith("26JAN")}
-    assert change[d] == pytest.approx(jan[d] - jan[date(2025, 12, 4)])
-    assert level[d] - level[date(2025, 12, 10)] > 0.15   # the level jumps at the roll; the change does not see it
-    assert abs(change[d]) < 0.10
+    assert path.change[d] == pytest.approx(jan[d] - jan[date(2025, 12, 4)])
+    assert path.change_start[d].obs_date == date(2025, 12, 4) and path.change_start[d].event == path.readings[d].event
+    assert path.level[d] - path.level[date(2025, 12, 10)] > 0.15   # the level jumps at the roll; the change does not
+    assert abs(path.change[d]) < 0.10
 
 
 def test_a_target_printed_before_the_decision_took_effect_is_not_paired():
@@ -151,6 +277,32 @@ def test_a_target_printed_before_the_decision_took_effect_is_not_paired():
     assert PP.target_pairing(readings[date(2025, 12, 9)], old_only, meetings) == (date(2025, 12, 9), 4.00)
     off_grid = pd.Series({date(2025, 12, 9): 3.88})
     assert PP.target_pairing(readings[date(2025, 12, 9)], off_grid, meetings) is None
+
+
+def test_a_snapshot_is_pre_open_only_between_a_close_and_the_next_open():
+    s = _snap("KXFED-26JAN", JAN_M, date(2025, 12, 2), 5, 4.4)             # 05:00Z..05:15Z, EST open 14:30Z
+    r = PP._reading(s.obs_date, s)
+    assert PP.pre_open(r, date(2025, 12, 1))
+    s2 = _snap("KXFED-26JAN", JAN_M, date(2025, 12, 2), 15, 4.4)           # 15:00Z: the session is open
+    assert not PP.pre_open(PP._reading(s2.obs_date, s2), date(2025, 12, 1))
+
+
+def test_the_2y_change_spans_exactly_five_sessions():
+    import pandas as pd
+
+    days = _sessions(date(2025, 10, 1), date(2025, 11, 21))
+    vals = {d: 4.0 + 0.01 * i for i, d in enumerate(days)}
+    holiday = date(2025, 11, 11)                    # Veterans Day: NYSE open, no DGS2 print
+    del vals[holiday]
+    ch, start = M.session_change_parts(pd.Series(vals), 5)
+    t = date(2025, 11, 14)                          # five sessions earlier is 11-07 (the old diff(5) read 11-06)
+    assert start[t] == (date(2025, 11, 7), date(2025, 11, 7))
+    assert ch[t] == pytest.approx(vals[t] - vals[date(2025, 11, 7)])
+    t2 = date(2025, 11, 18)                         # its start session is the holiday: the 11-10 close is carried
+    assert start[t2] == (holiday, date(2025, 11, 10))
+    gap = pd.Series({d: v for d, v in vals.items() if not date(2025, 10, 20) <= d <= date(2025, 10, 22)})
+    ch_gap, _ = M.session_change_parts(gap, 5)
+    assert date(2025, 10, 29) not in ch_gap          # its start (10-22) would be three sessions stale
 
 
 # ── the record ────────────────────────────────────────────────────────────
@@ -219,7 +371,7 @@ def _record(engine, **kw):
     return M.compute_market_state(engine, AS_OF, calendar={}, **kw).to_dict()
 
 
-def test_policy_variables_are_standardized_and_the_put_reads_absent(engine):
+def test_policy_variables_are_standardized_and_stress_reads_without_easing(engine):
     _seed(engine, scenario="absent")
     st = _record(engine)
     v = st["variables"]
@@ -228,19 +380,28 @@ def test_policy_variables_are_standardized_and_the_put_reads_absent(engine):
     assert v["fed_path_next_meeting"]["obs_date"] == AS_OF.isoformat()          # pulled 05:00Z that morning
     assert v["ust_2y_change_5d"]["obs_date"] == "2025-11-13"                    # next-business-day lag
     pr = st["policy_response"]
-    assert pr["status"] == "ok" and pr["label"] == "put_absent" and pr["decision_use"] == "none"
+    assert pr["status"] == "ok" and pr["label"] == "stress_front_end_not_eased" and pr["decision_use"] == "none"
+    assert "does not identify a policy response" in pr["validation"]
     assert pr["controls"]["vix_only_z"] >= M.POLICY_STRESS_Z and pr["controls"]["front_end_easing_z"] <= 0
+    w = pr["windows"]                               # every leg ends at the 11-13 close; both changes start at 11-06
+    assert w["vix"]["end_close"] == w["ust_2y"]["end_close"] == w["fed_path"]["end_close"] == "2025-11-13"
+    assert w["ust_2y"]["start_close"] == w["fed_path"]["start_close"] == "2025-11-06"
+    assert w["fed_path"]["end_snapshot"]["pre_open"] and w["fed_path"]["end_snapshot"]["session"] == "2025-11-14"
     nm = pr["next_meeting"]
     assert nm["event"] == "KALSHI:KXFED-26JAN" and nm["target"]["upper"] == 4.00
+    assert nm["obs_date"] == AS_OF.isoformat() and nm["snapshot"]["clock_basis"] == "transaction_start"
     assert nm["priced_move"] == pytest.approx(nm["expected_upper"] - 4.00)
+    assert nm["expected_bounds"][0] <= nm["expected_upper"] <= nm["expected_bounds"][1]
     assert set(nm["odds"]) == {"hike", "hold", "cut"} and sum(nm["odds"].values()) == pytest.approx(1.0, abs=1e-3)
-    assert st["source_lineage"]["kxfed"]["rows"] > 250 and st["source_lineage"]["kxfed"]["sha256"]
+    assert set(nm["odds_bounds"]) == {"hike", "hold", "cut"}
+    lineage = st["source_lineage"]["kxfed"]
+    assert lineage["rows"] > 250 and lineage["sha256"] and lineage["clock_basis"] == {"transaction_start": lineage["rows"]}
 
 
-def test_a_front_end_that_eases_into_the_stress_reads_put_priced(engine):
+def test_a_front_end_that_eases_into_the_stress_reads_eased(engine):
     _seed(engine, scenario="priced")
     pr = _record(engine)["policy_response"]
-    assert pr["status"] == "ok" and pr["label"] == "put_priced"
+    assert pr["status"] == "ok" and pr["label"] == "stress_front_end_eased"
     assert pr["controls"]["ust_2y_easing_z"] > 0 and pr["controls"]["fed_path_easing_z"] > 0
 
 
@@ -291,7 +452,14 @@ def test_the_provisional_cutoff_drops_a_kalshi_row_pulled_after_it(engine):
     _seed(engine)
     cutoff = datetime(AS_OF.year, AS_OF.month, AS_OF.day, 4, 0, tzinfo=UTC)    # before that morning's 05:00Z pull
     st = _record(engine, known_by=cutoff)
-    assert st["variables"]["fed_path_next_meeting"]["obs_date"] == "2025-11-13"
+    v = st["variables"]["fed_path_next_meeting"]
+    assert v["obs_date"] == "2025-11-13" and v["status"] == "stale"          # the day before's ladder is not reused
+    assert st["policy_response"]["status"] == "unknown"
+    # 05:00Z + the 15-minute legacy span: known at 05:15Z, not at 05:10Z
+    early = _record(engine, known_by=datetime(AS_OF.year, AS_OF.month, AS_OF.day, 5, 10, tzinfo=UTC))
+    late = _record(engine, known_by=datetime(AS_OF.year, AS_OF.month, AS_OF.day, 5, 15, tzinfo=UTC))
+    assert early["variables"]["fed_path_next_meeting"]["obs_date"] == "2025-11-13"
+    assert late["variables"]["fed_path_next_meeting"]["obs_date"] == AS_OF.isoformat()
     assert st["source_lineage"]["kxfed"]["cutoff"] == cutoff.isoformat()
     assert st["source_lineage"]["kxfed"]["cutoff_inclusive"] is True
     assert "kxfed" in M.CUTOFF_READS
@@ -310,8 +478,54 @@ def test_the_desk_brief_shows_the_block_as_research_only(engine):
     _seed(engine)
     lines, _ = _record_lines(_record(engine))
     line = next(x for x in lines if x.startswith("policy response"))
-    assert "research only, decides nothing" in line and "put_absent" in line and "hike" in line
+    assert "research only, decides nothing" in line and "stress_front_end_not_eased" in line and "hike" in line
+    assert "through the 2025-11-13 close" in line
     unknown, _ = _record_lines({"policy_response": {"rule": M.POLICY_RESPONSE_RULE, "status": "unknown",
                                                     "reason": "vix: stale"}})
     assert unknown[-1].endswith("unknown (vix: stale)")
     assert not any(x.startswith("policy response") for x in _record_lines({"variables": {}})[0])
+
+
+def _rewrite_kxfed(engine, d: date, **change):
+    """Replace the session's KXFED row: a new payload (``payload``) and/or pull clock (``ts``)."""
+    with engine.begin() as c:
+        row = c.execute(text("SELECT raw_payload, pull_timestamp FROM raw_series WHERE series_id LIKE 'KALSHI:%' "
+                             "AND obs_date = :d"), {"d": d}).fetchone()
+        c.execute(text("UPDATE raw_series SET raw_payload = :p, pull_timestamp = :ts WHERE series_id LIKE 'KALSHI:%' "
+                       "AND obs_date = :d"),
+                  {"d": d, "p": change.get("payload", row[0]), "ts": change.get("ts", row[1])})
+
+
+def test_an_unusable_current_snapshot_is_never_replaced_by_an_older_ladder(engine):
+    _seed(engine)
+    bad = _payload("KXFED-26JAN", JAN, 4.3)
+    bad["all_strikes"][3] = {**bad["all_strikes"][3], "yes_bid": 0.0, "yes_ask": 0.0}     # missing-quote zeros
+    _rewrite_kxfed(engine, AS_OF, payload=json.dumps(bad))
+    st = _record(engine)
+    assert st["variables"]["fed_path_next_meeting"]["status"] == "stale"
+    nm = st["policy_response"]["next_meeting"]
+    assert nm["status"] == "unavailable" and "either side" in nm["reason"] and nm["newest_usable_session"] == "2025-11-13"
+    pr = st["policy_response"]
+    assert pr["status"] == "unknown" and "next_meeting" in pr["reason"]
+
+
+def test_legs_ending_at_different_closes_are_unknown(engine):
+    _seed(engine)
+    with engine.begin() as c:                     # the 11-13 DGS2 print is missing: the 2y leg ends at 11-12
+        c.execute(text("DELETE FROM raw_series WHERE series_id = 'DGS2' AND obs_date = :d"),
+                  {"d": AS_OF - timedelta(days=1)})
+    st = _record(engine)
+    assert st["variables"]["ust_2y_change_5d"]["status"] == "ok"          # still fresh on its own
+    pr = st["policy_response"]
+    assert pr["status"] == "unknown" and "different closes" in pr["reason"]
+    assert pr["windows"]["ust_2y"]["end_close"] == "2025-11-12"
+
+
+def test_a_snapshot_read_after_the_open_has_no_close(engine):
+    _seed(engine)
+    _rewrite_kxfed(engine, AS_OF, ts=datetime(AS_OF.year, AS_OF.month, AS_OF.day, 15, 0))   # 15:00Z, open 14:30Z
+    st = _record(engine)
+    assert st["variables"]["fed_path_next_meeting"]["status"] == "ok"
+    pr = st["policy_response"]
+    assert pr["status"] == "unknown" and "between a close and the next open" in pr["reason"]
+    assert pr["windows"]["fed_path"]["end_close"] is None

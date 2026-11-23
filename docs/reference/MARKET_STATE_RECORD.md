@@ -138,7 +138,7 @@ display only (owner's decision, bring-up plan rev 100).
 | rates | ust_2y_change_5d (market-state/3) | DGS2, change over 5 sessions | daily fast |
 | policy | fed_path_next_meeting, fed_path_change_5d (market-state/3) | Kalshi KXFED strike ladder for the next FOMC meeting (`intelligence/regime/policy_path.py`); change within one meeting's contract | daily fast |
 | policy | fed_priced_move_next_meeting (market-state/3) | fed_path_next_meeting − DFEDTARU, refused until FRED prints the target after a decision | daily fast |
-| policy_response | put_priced / partial_response / put_absent / no_stress / unknown | VIX z vs. mean easing z of ust_2y_change_5d and fed_path_change_5d | — |
+| policy_response | stress_front_end_eased / _partly_eased / _not_eased / no_stress / unknown | VIX z beside mean easing z of ust_2y_change_5d and fed_path_change_5d, one window of closes; descriptive | — |
 
 Pending (listed in every record as `pending`): release surprise (no consensus source yet), earnings surprise.
 
@@ -204,17 +204,46 @@ daily pull. The row's `value` is the price of whichever strike traded most that 
 strike changes (KXFED-26DEC moved from "above 4.00%" to "above 4.25%" around 2026-11-12). It is never read. Every
 strike's bid and ask are in `raw_payload.all_strikes`, and `policy_path.price_ladder` prices those:
 
-- **Contract check.** Each strike must be titled "upper bound of the federal funds rate be above X%", with X
-  matching its ticker.
-- **Quotes.** Mids are used only when the quote is two-sided and the spread is at most 0.10. Last trades are never
-  used.
-- **Shape.** Strikes must be contiguous in 0.25 steps. The ladder is made non-increasing by a running minimum, and
-  the adjustments are counted.
-- **Coverage.** Either tail above 0.05 makes the snapshot unusable.
+- **Contract check, per strike.** The title must ask about the "upper bound of the federal funds rate" being "above
+  X%". X must match the ticker and sit on the 0.25 grid. A meeting date named in the title must be the event's own
+  (`strike_date`, New York date).
+  - The ticker must belong to the row's event, and so must the strike's own `event_ticker` when stored.
+  - A stored payout must be `strike_type: greater`, with `floor_strike` = X and no cap.
+- **Quotes are bands, and missing stays missing.** Kalshi shows no bid as 0 and no ask as 1. The old writer also
+  stored a missing or malformed quote as 0.0. So a side counts only strictly inside (0, 1), and only with a positive
+  size where the size was stored.
+  - Bands: [bid, ask] for a two-sided quote, [0, ask] with no bid, [bid, 1] with no ask.
+  - Refused: no quote on either side, a crossed quote, or a band wider than 0.10.
+  - Last trades are never used.
+- **Shape.**
+  - Strikes must be contiguous in 0.25 steps.
+  - A book where a higher strike's bid is above a lower strike's ask fits no non-increasing ladder, and is refused.
+  - Each strike's point is its band's mid, lowered by a running minimum where mids cross and held inside the bounds
+    every fitting ladder must respect. The points moved are counted.
+  - E = lowest strike + 0.25 × Σ P(above k).
+  - `expected_bounds` gives the lowest and highest E the quotes allow.
+- **Coverage.** Either tail that the quotes allow above 0.05 makes the snapshot unusable.
+- **Odds.** Hike, hold and cut are given, with their bounds, only when both thresholds are quoted strikes: the
+  current upper bound and one step below it. Otherwise `odds_withheld` says why. Odds are never extrapolated past
+  the ladder.
 
-A snapshot is known from its pull clock only, with no modeled path. The pull runs about 00:00–06:00 UTC, so the row
-dated D is the market overnight before session D. The next meeting is the earliest meeting after that day's newest
-pull. If that event's row is missing or unusable, the day has no reading; a later meeting is never substituted.
+**Clocks (`kalshi-acquired/1`).** There is no modeled path; a row counts for a cutoff only by when it was available.
+
+| Rows | Clock | Available at |
+|---|---|---|
+| Written by the current writer | `clock.requested_at` (before the event's markets request) and `clock.acquired_at` (right after its response, also stored as `pull_timestamp`). The quotes were read between the two. The row is dated by the response's UTC day and commits in its own transaction straight after. | acquired + 1 min |
+| Written earlier | Only `pull_timestamp`: the raw_series default, i.e. the start of one transaction that spanned the whole pull. The quotes came later. | `pull_timestamp` + 15 min |
+
+The 15-minute bound is measured. pull_log 2026-05-27..11-23 has 289 Kalshi runs; the longest took 70 s, and inserting
+runs take about 10 s. `source_lineage.kxfed` counts rows by clock basis.
+
+**Schedule as known that day.** The next meeting is the earliest meeting after the day's newest quotes, among the
+events GRID had read by then. An event first read later never rewrites an earlier day. If that event's row is missing
+or unusable, the day has no reading; a later meeting is never substituted.
+
+**The session's own snapshot.** The three policy variables have a maximum age of 0 sessions. The record reads only the
+as_of session's snapshot. If that snapshot is missing or unusable, the variables read stale and
+`next_meeting.reason` says why. An older ladder is never shown in its place.
 
 The 5-session change is taken inside one contract. The priced move is set against DFEDTARU only when FRED's
 observation postdates the last decision taking effect: right after a meeting the ladder already prices the next one
@@ -222,32 +251,59 @@ while FRED still prints the old target.
 
 **policy_response (policy-response/1)** is Neon's PRFD ("is the Fed put alive?") with only the legs Codex's triage
 admitted first (GRID-COMPOSITE-TRIAGE-20261122): VIX, plus the front end (2-year change, path change). There are no
-EMPS or news-tone legs.
+EMPS or news-tone legs. It is **descriptive**: front-end repricing beside equity stress does not identify a policy
+response or its cause.
 
+- **One window of closes.** `windows` gives each leg's endpoints as XNYS closes, and the block is `unknown` unless
+  they agree:
+  - VIX: its close.
+  - 2-year: DGS2's end close, and its start exactly five XNYS sessions earlier. `ust_2y_change_5d` now spans exactly
+    five sessions; a bond-market holiday carries the previous close, and nothing older is carried.
+  - Kalshi: a snapshot is placed at the close before it only when every instant its quotes can have been read lies
+    after that close and before the next open.
+- **The decision record lines up as published.** For session d: VIX for d−1 arrives about 12Z on d; DGS2 for d−1
+  about 22:02Z on d; the d snapshot is read before d opens. So every leg ends at the d−1 close. The provisional record
+  at d's close does not have the d−1 DGS2 print yet, so it reads `unknown`.
 - stress = VIX robust z.
 - easing = −(z of ust_2y_change_5d + z of fed_path_change_5d) / 2.
 - score = stress − easing.
 - Labels:
   - `no_stress` when stress < 1.5;
-  - otherwise `put_priced` when easing ≥ 1.0;
-  - `put_absent` when easing ≤ 0;
-  - `partial_response` in between.
+  - otherwise `stress_front_end_eased` when easing ≥ 1.0;
+  - `stress_front_end_not_eased` when easing ≤ 0;
+  - `stress_front_end_partly_eased` in between.
 - Equal weights and round thresholds, declared and never fitted.
 - `controls` carries VIX-only and front-end-only readings.
-- The block is `unknown` unless all three legs read `ok` with a finite z. That covers stale, no baseline, zero spread
-  and missing.
+- The block is `unknown` when any of these fails:
+  - all three legs read `ok` with a finite z (not stale, no-baseline, zero-spread or missing);
+  - the session's own next-meeting snapshot is usable;
+  - the windows agree.
 - `decision_use: none`: nothing reads it to decide, and it has no registered test (#1311). The desk brief prints it,
-  labelled research only.
+  labelled descriptive research only.
 
-Read against griddb on 2026-11-22 (dry run, nothing written):
+Read against griddb on 2026-11-23. Dry run, read-only session, nothing written.
 
-| Record | VIX | 2y 5-session | Path 5-session | Reading |
-|---|---|---|---|---|
-| 2026-11-19 | 24.56, z +3.2 | +7 bp | −0.6 bp | `put_absent` |
-| 2026-11-20 | 28.44, z +4.8 | −10 bp | −0.9 bp | `partial_response` |
+| Record | Window (closes) | VIX | 2y 5-session | Path 5-session | Reading |
+|---|---|---|---|---|---|
+| 2026-11-13 | 11-05 → 11-12 | 18.70, z +0.7 | +40 bp | +11.1 bp | `no_stress` |
+| 2026-11-19 | 11-11 → 11-18 | 24.56, z +3.2 | +7 bp | −0.6 bp | `stress_front_end_not_eased` |
+| 2026-11-20 | 11-12 → 11-19 | 28.44, z +4.8 | −10 bp | −0.9 bp | `stress_front_end_partly_eased` |
+| 2026-10-29 | — | 16.91 | −14 bp | stale | `unknown`: the session's own snapshot has no same-contract change |
 
-The 2026-11-20 snapshot priced the 2026-12-09 meeting at 97.5 % hike, 2 % hold and 0.5 % cut, with the upper bound
-at 4.00 %.
+- 11-11 is Veterans Day: NYSE open, no DGS2 print. The 11-19 window carries the 11-10 close.
+- Coverage: 149 of the 160 sessions from 2026-04-07 to 2026-11-20 have a next-meeting reading, the same as before
+  the stricter quote and contract checks. 107 of those snapshots were read pre-open. The rest were pulled after the
+  open, mostly in October, when the pull drifted to 11–15Z. On those days the block reads `unknown`.
+- Every stored KXFED row so far is a transaction-start row.
+
+The 2026-11-23 05:30Z snapshot prices the 2026-12-09 meeting with the upper bound at 4.00%:
+
+| | Hike | Hold | Cut |
+|---|---|---|---|
+| Point | 93.5% | 6% | 0.5% |
+| Bounds within the quotes | 93–94% | — | 0–1% |
+
+E = 4.241 (4.228–4.255). The record shows these odds only once DFEDTARU is pulled.
 
 ## Composite register (Neon and Codex proposals, 2026-11-22)
 

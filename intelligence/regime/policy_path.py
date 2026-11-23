@@ -6,28 +6,46 @@ the yes-price of whichever strike had the most volume that day, so it answers a 
 strike changes (KXFED-26DEC moved from "above 4.00%" to "above 4.25%" around 2026-11-12). It is never read here.
 Every strike's quote is in ``raw_payload['all_strikes']``; this module reads those.
 
-Contract, checked on every strike: the market title asks whether "the upper bound of the federal funds rate" will be
-"above X%" after the meeting, and X equals the ticker's ``-T<X>`` suffix. A strike that does not say exactly that
-makes the whole ladder unusable; a guessed payout is never priced.
+Contract, checked on every strike, or the whole ladder is unusable (a guessed payout is never priced):
 
-Per snapshot (one event's row from one pull):
+* the title asks whether "the upper bound of the federal funds rate" will be "above X%", X equals the ticker's
+  ``-T<X>`` suffix and sits on the 0.25 grid, and a title that names the meeting ("following the Fed's Dec 9, 2026
+  meeting") names the event's own meeting (``strike_date``, New York date);
+* the ticker belongs to the row's event (``<event>-T<X>``), and so does the strike's own ``event_ticker`` when the
+  writer recorded it; a recorded payout must be ``strike_type == 'greater'`` with ``floor_strike == X`` and no cap.
 
-* each strike's probability is the mid of its bid and ask, used only when ``0 <= bid <= ask <= 1`` and
-  ``ask - bid <= MAX_SPREAD``. Last-trade prices are never used (they can be days old).
-* strikes must be contiguous in ``STRIKE_STEP`` steps; probabilities are made non-increasing in the strike by a
-  running minimum (a crossed quote is noise, and the count of adjustments is reported).
-* the expected upper bound after the meeting puts the mass below the lowest strike at that strike and the mass above
-  the highest at one step above it. Either tail above ``MAX_TAIL`` means the ladder does not cover the distribution,
-  and the snapshot is unusable.
+Quotes. Kalshi shows a missing bid as 0 and a missing ask as 1, and before ``kalshi-acquired/1`` GRID's writer also
+stored a missing or malformed quote as 0.0, so a bid or ask counts only strictly inside (0, 1) (and with a positive
+size when the size was recorded). Each strike is a band: [bid, ask], [0, ask] without a bid, [bid, 1] without an
+ask; no quote on either side, a crossed quote, or a band wider than ``MAX_SPREAD`` makes the ladder unusable.
+Last-trade prices are never used (they can be days old).
 
-Availability: a snapshot is known from its ``pull_timestamp``. There is no modeled path: GRID's KXFED rows start
-2026-04-07 and are all live pulls. The puller runs once a day, usually between 00:00 and 06:00 UTC, so the snapshot
-dated D (``obs_date`` is the UTC pull date) reflects the market overnight before session D opens.
+The ladder. Strikes must be contiguous in ``STRIKE_STEP`` steps. P(upper bound > k) must not rise with k, so a book
+where a higher strike's bid is above a lower strike's ask fits no ladder and is refused. Otherwise each strike's
+point is its band's mid, lowered by a running minimum where mids cross and held inside the bands every
+non-increasing ladder must respect (the count of moved strikes is reported); the quotes' own bounds are published
+beside the point. The expected upper bound after the meeting puts the mass below the lowest strike at that strike
+and the mass above the highest at one step above it: E = lowest strike + step x sum of P(above k). Either tail that
+can exceed ``MAX_TAIL`` within the quotes means the ladder does not cover the distribution. Hike / hold / cut odds
+are given only when both thresholds (the current upper bound and one step below) are quoted strikes.
 
-The next meeting for a day is the event with the earliest meeting time (``strike_date``) after that day's newest
-pull, among every KXFED event seen by the cutoff. When that event has no usable row that day, the day has no reading;
-a later meeting is never substituted. The 5-session change is taken within one contract: the next meeting's expected
-upper bound minus the same event's expected upper bound five XNYS sessions earlier.
+Clocks and availability (there is no modeled path; GRID's KXFED rows start 2026-04-07 and are all live pulls):
+
+* rows written under ``kalshi-acquired/1`` carry ``clock.requested_at`` and ``clock.acquired_at``, read before that
+  event's markets request and right after its response (the quotes were read between the two), and are committed
+  in their own transaction straight after: available ``COMMIT_GRACE`` after the response;
+* older rows carry only ``pull_timestamp``, the raw_series default, which is the start of one transaction that
+  spanned the whole pull, so their quotes arrived after it: acquired by, and available, ``LEGACY_SPAN`` later.
+
+A row counts for a cutoff only when it is available by it. The puller runs once a day, usually between 00:00 and
+11:00 UTC, so the snapshot dated D (``obs_date`` is the UTC pull date) normally reflects the market after the close
+before session D and before D opens; :func:`pre_open` checks that for any reading that is set against closes.
+
+The next meeting for a day is the earliest meeting after that day's newest quotes among the KXFED events GRID had
+seen by then (the schedule as known that day, so a later discovery never rewrites an earlier day). When that
+event has no usable row that day, the day has no reading; a later meeting is never substituted. The 5-session
+change is taken within one contract: the next meeting's expected upper bound minus the same event's expected upper
+bound five XNYS sessions earlier.
 """
 
 from __future__ import annotations
@@ -37,8 +55,9 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Sequence
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -46,13 +65,24 @@ POLICY_PATH_RULE = "kalshi-fed-path/1"
 KXFED_PREFIX = "KALSHI:KXFED-"
 KALSHI_SOURCE = "Kalshi"          # source_catalog.name of ingestion/altdata/kalshi_markets.py
 STRIKE_STEP = 0.25                # percentage points between adjacent strikes
-MAX_SPREAD = 0.10                 # widest usable bid/ask on any strike
-MAX_TAIL = 0.05                   # largest probability mass allowed outside the ladder on either side
+MAX_SPREAD = 0.10                 # widest usable quote band on any strike (a missing side counts as 0 or 1)
+MAX_TAIL = 0.05                   # largest probability mass the quotes allow outside the ladder on either side
 MIN_STRIKES = 4
 CHANGE_SESSIONS = 5
 
+# The writer's clock rule (ingestion/altdata/kalshi_markets.py CLOCK_RULE; a test keeps the two equal).
+ACQUIRED_CLOCK_RULE = "kalshi-acquired/1"
+COMMIT_GRACE = timedelta(minutes=1)    # acquired-clock rows: the insert and its commit follow the response at once
+# Transaction-start rows: the whole pull ran in one transaction. pull_log 2026-05-27..2026-11-23 has 289 Kalshi runs
+# (Kalshi_Markets, smart:kalshi, smart:kalshi_markets); the longest took 70 s and inserting runs take about 10 s.
+LEGACY_SPAN = timedelta(minutes=15)
+
+_ET = ZoneInfo("America/New_York")
 _TICKER_STRIKE = re.compile(r"-T(\d+(?:\.\d+)?)$")
 _TITLE_STRIKE = re.compile(r"upper bound of the federal funds rate be above (\d+(?:\.\d+)?)%", re.IGNORECASE)
+_TITLE_MEETING = re.compile(r"following the Fed's ([A-Z][a-z]+)\.? (\d{1,2}), (\d{4}) meeting")
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
+                                       "dec"), 1)}
 
 
 @dataclass(frozen=True)
@@ -60,21 +90,29 @@ class Ladder:
     """One event's strike ladder from one pull, priced."""
 
     expected_upper: float                       # % (expected upper bound of the target range after the meeting)
+    expected_bounds: tuple[float, float]        # the lowest and highest expected upper bound the quotes allow
     strikes: tuple[float, ...]                  # ascending
-    p_above: tuple[float, ...]                  # P(upper bound > strike), non-increasing
+    p_above: tuple[float, ...]                  # P(upper bound > strike), non-increasing, inside the bounds below
+    lower: tuple[float, ...]                    # per strike, the least P(above) any ladder fitting the quotes has
+    upper: tuple[float, ...]                    # per strike, the most
     tail_below: float                           # P(upper bound <= lowest strike)
     tail_above: float                           # P(upper bound > highest strike)
-    monotone_adjusted: int                      # strikes whose mid was lowered to keep the ladder non-increasing
-    max_spread: float
+    monotone_adjusted: int                      # strikes whose point is not their own band's mid
+    one_sided: int                              # strikes quoted on one side only
+    max_spread: float                           # widest quote band
 
 
 @dataclass(frozen=True)
 class Snapshot:
     event: str
     obs_date: date
-    pulled_at: datetime
+    pulled_at: datetime                         # the row's stored pull_timestamp
     meeting_at: datetime | None
     ladder: Ladder | None
+    clock_basis: str                            # 'acquired' (kalshi-acquired/1) | 'transaction_start' (older rows)
+    acquired_from: datetime                     # earliest instant the quotes can have been read
+    acquired_by: datetime                       # latest
+    available_at: datetime                      # when the row is known: compared with a record's cutoff
     reason: str | None = None                   # why the ladder is unusable, when it is
 
 
@@ -101,25 +139,87 @@ def _instant(raw: Any) -> datetime | None:
     return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
 
 
-def price_ladder(strikes: Sequence[dict[str, Any]]) -> tuple[Ladder | None, str | None]:
-    """Price one event's ``all_strikes`` list. Returns (ladder, None) or (None, why it is unusable)."""
-    rows: list[tuple[float, float, float]] = []
+def on_grid(x: float) -> bool:
+    return math.isclose(round(x / STRIKE_STEP) * STRIKE_STEP, x, abs_tol=1e-9)
+
+
+def _side(price: Any, size: Any) -> float | None:
+    """A quote side's price, or None when that side is absent (0, 1, missing, malformed, or a recorded size of 0)."""
+    p = _num(price)
+    if p is None or not 0.0 < p < 1.0:
+        return None
+    s = _num(size)
+    if s is not None and s <= 0:
+        return None
+    return p
+
+
+def _contract_problem(s: dict[str, Any], k: float, event_code: str | None, meeting_at: datetime | None) -> str | None:
+    """Why a strike is not this event's "upper bound above k" contract, or None when it is."""
+    tk = str(s.get("ticker") or "")
+    if not on_grid(k):
+        return f"strike {tk!r} is off the {STRIKE_STEP} grid"
+    if event_code is not None:
+        if not tk.startswith(event_code + "-T"):
+            return f"strike {tk!r} is not a contract of {event_code}"
+        own = s.get("event_ticker")
+        if own is not None and own != event_code:
+            return f"strike {tk!r} names event {own!r}, not {event_code}"
+    kind, floor, cap = s.get("strike_type"), s.get("floor_strike"), s.get("cap_strike")
+    if kind is not None and kind != "greater":
+        return f"strike {tk!r} pays on {kind!r}, not 'greater'"
+    if floor is not None and (_num(floor) is None or not math.isclose(_num(floor), k, abs_tol=1e-9)):
+        return f"strike {tk!r} has floor_strike {floor!r}, not {k}"
+    if cap is not None:
+        return f"strike {tk!r} has a cap strike {cap!r}"
+    named = _TITLE_MEETING.search(str(s.get("title") or ""))
+    if named is not None and meeting_at is not None:
+        month = _MONTHS.get(named.group(1)[:3].lower())
+        try:
+            day = date(int(named.group(3)), month, int(named.group(2))) if month else None
+        except ValueError:
+            day = None
+        if day is None:
+            return f"strike {tk!r}: meeting date in the title is unreadable"
+        if day != meeting_at.astimezone(_ET).date():
+            return f"strike {tk!r} names the {day.isoformat()} meeting, not the event's {meeting_at.isoformat()}"
+    return None
+
+
+def price_ladder(strikes: Sequence[dict[str, Any]], *, event: str | None = None,
+                 meeting_at: datetime | None = None) -> tuple[Ladder | None, str | None]:
+    """Price one event's ``all_strikes`` list. Returns (ladder, None) or (None, why it is unusable).
+
+    ``event`` (``KALSHI:<event>`` or the bare event ticker) and ``meeting_at`` bind every strike to that event's
+    contract; without them only the title and ticker are checked.
+    """
+    event_code = event[len("KALSHI:"):] if event and event.startswith("KALSHI:") else event
+    rows: list[tuple[float, float, float, bool]] = []
     for s in strikes or ():
         if not isinstance(s, dict):
             return None, "strike entry is not an object"
-        m = _TICKER_STRIKE.search(str(s.get("ticker") or ""))
+        tk = str(s.get("ticker") or "")
+        m = _TICKER_STRIKE.search(tk)
         t = _TITLE_STRIKE.search(str(s.get("title") or ""))
         if m is None or t is None:
-            return None, f"strike {s.get('ticker')!r} is not an 'upper bound above X%' contract"
+            return None, f"strike {tk!r} is not an 'upper bound above X%' contract"
         k = float(m.group(1))
         if not math.isclose(k, float(t.group(1)), abs_tol=1e-9):
-            return None, f"strike {s.get('ticker')!r}: ticker and title name different strikes"
-        bid, ask = _num(s.get("yes_bid")), _num(s.get("yes_ask"))
-        if bid is None or ask is None or not 0.0 <= bid <= ask <= 1.0:
-            return None, f"strike {s.get('ticker')!r} has no two-sided quote"
-        if ask - bid > MAX_SPREAD + 1e-12:
-            return None, f"strike {s.get('ticker')!r} spread {ask - bid:.2f} is wider than {MAX_SPREAD}"
-        rows.append((k, (bid + ask) / 2.0, ask - bid))
+            return None, f"strike {tk!r}: ticker and title name different strikes"
+        problem = _contract_problem(s, k, event_code, meeting_at)
+        if problem:
+            return None, problem
+        bid = _side(s.get("yes_bid"), s.get("yes_bid_size"))
+        ask = _side(s.get("yes_ask"), s.get("yes_ask_size"))
+        if bid is None and ask is None:
+            return None, f"strike {tk!r} has no quote on either side"
+        lo = bid if bid is not None else 0.0
+        hi = ask if ask is not None else 1.0
+        if lo > hi + 1e-12:
+            return None, f"strike {tk!r} quote is crossed (bid {lo} above ask {hi})"
+        if hi - lo > MAX_SPREAD + 1e-12:
+            return None, f"strike {tk!r} quote band {hi - lo:.2f} is wider than {MAX_SPREAD}"
+        rows.append((k, lo, hi, bid is None or ask is None))
     if len(rows) < MIN_STRIKES:
         return None, f"{len(rows)} strikes; need {MIN_STRIKES}"
     rows.sort()
@@ -128,19 +228,49 @@ def price_ladder(strikes: Sequence[dict[str, Any]]) -> tuple[Ladder | None, str 
         return None, "duplicate strike"
     if any(not math.isclose(b - a, STRIKE_STEP, abs_tol=1e-9) for a, b in zip(ks, ks[1:])):
         return None, f"strikes are not contiguous in {STRIKE_STEP} steps"
+    lo = [r[1] for r in rows]
+    hi = [r[2] for r in rows]
+    n = len(rows)
+    for b in range(n):                          # P(above) must not rise: a higher strike's bid over a lower ask
+        for a in range(b):
+            if lo[b] > hi[a] + 1e-12:
+                return None, (f"no non-increasing ladder fits the quotes: the {ks[b]:.2f} strike's bid {lo[b]} is "
+                              f"above the {ks[a]:.2f} strike's ask {hi[a]}")
+    upper = list(hi)
+    for i in range(1, n):
+        upper[i] = min(upper[i - 1], hi[i])
+    lower = list(lo)
+    for i in range(n - 2, -1, -1):
+        lower[i] = max(lower[i + 1], lo[i])
+    if 1.0 - lower[0] > MAX_TAIL + 1e-12 or upper[-1] > MAX_TAIL + 1e-12:
+        return None, (f"ladder does not cover the distribution (up to {1.0 - lower[0]:.3f} below, "
+                      f"{upper[-1]:.3f} above)")
     ps, adjusted, running = [], 0, 1.0
-    for _, mid, _ in rows:
-        if mid > running + 1e-12:
-            adjusted += 1
+    for i in range(n):
+        mid = (lo[i] + hi[i]) / 2.0
         running = min(running, mid)
-        ps.append(running)
-    tail_below, tail_above = 1.0 - ps[0], ps[-1]
-    if tail_below > MAX_TAIL or tail_above > MAX_TAIL:
-        return None, f"ladder does not cover the distribution (tails {tail_below:.3f} below, {tail_above:.3f} above)"
-    expected = ks[0] * tail_below + (ks[-1] + STRIKE_STEP) * tail_above
-    expected += sum(ks[i + 1] * (ps[i] - ps[i + 1]) for i in range(len(ks) - 1))
-    return Ladder(expected_upper=expected, strikes=tuple(ks), p_above=tuple(ps), tail_below=tail_below,
-                  tail_above=tail_above, monotone_adjusted=adjusted, max_spread=max(r[2] for r in rows)), None
+        p = min(max(running, lower[i]), upper[i])
+        if abs(p - mid) > 1e-12:
+            adjusted += 1
+        ps.append(p)
+    expected = ks[0] + STRIKE_STEP * sum(ps)
+    bounds = (ks[0] + STRIKE_STEP * sum(lower), ks[0] + STRIKE_STEP * sum(upper))
+    return Ladder(expected_upper=expected, expected_bounds=bounds, strikes=tuple(ks), p_above=tuple(ps),
+                  lower=tuple(lower), upper=tuple(upper), tail_below=1.0 - ps[0], tail_above=ps[-1],
+                  monotone_adjusted=adjusted, one_sided=sum(1 for r in rows if r[3]),
+                  max_spread=max(b - a for a, b in zip(lo, hi))), None
+
+
+def row_clock(pulled_at: datetime, payload: Any) -> tuple[str, datetime, datetime, datetime]:
+    """(basis, acquired_from, acquired_by, available_at) for a row's stored pull clock and payload."""
+    clock = payload.get("clock") if isinstance(payload, dict) else None
+    ours = isinstance(clock, dict) and clock.get("rule") == ACQUIRED_CLOCK_RULE
+    acquired = _instant(clock.get("acquired_at")) if ours else None
+    if acquired is not None:
+        requested = _instant(clock.get("requested_at"))
+        start = requested if requested is not None and requested <= acquired else acquired
+        return "acquired", start, acquired, max(acquired, pulled_at) + COMMIT_GRACE
+    return "transaction_start", pulled_at, pulled_at + LEGACY_SPAN, pulled_at + LEGACY_SPAN
 
 
 def snapshot_from_row(series_id: str, obs_date: date, pulled_at: Any, payload: Any) -> Snapshot:
@@ -152,13 +282,25 @@ def snapshot_from_row(series_id: str, obs_date: date, pulled_at: Any, payload: A
             payload = json.loads(payload)
         except ValueError:
             payload = None
+    basis, a_from, a_by, available = row_clock(pulled, payload)
     if not isinstance(payload, dict):
-        return Snapshot(series_id, obs_date, pulled, None, None, "payload is not a JSON object")
+        return Snapshot(series_id, obs_date, pulled, None, None, basis, a_from, a_by, available,
+                        "payload is not a JSON object")
     meeting = _instant(payload.get("strike_date"))
-    ladder, why = price_ladder(payload.get("all_strikes") or [])
+    code = series_id[len("KALSHI:"):] if series_id.startswith("KALSHI:") else series_id
+    if payload.get("event_ticker") is not None and payload.get("event_ticker") != code:
+        return Snapshot(series_id, obs_date, pulled, meeting, None, basis, a_from, a_by, available,
+                        f"payload event {payload.get('event_ticker')!r} is not the row's {code}")
     if meeting is None:
-        why = why or "payload has no meeting time (strike_date)"
-    return Snapshot(series_id, obs_date, pulled, meeting, ladder if meeting is not None else None, why)
+        return Snapshot(series_id, obs_date, pulled, None, None, basis, a_from, a_by, available,
+                        "payload has no meeting time (strike_date)")
+    ladder, why = price_ladder(payload.get("all_strikes") or [], event=series_id, meeting_at=meeting)
+    return Snapshot(series_id, obs_date, pulled, meeting, ladder, basis, a_from, a_by, available, why)
+
+
+def known_by(s: Snapshot, cutoff: datetime, *, inclusive: bool) -> bool:
+    """Whether a row is available by a record's cutoff (at or before it when ``inclusive``, else strictly before)."""
+    return s.available_at <= cutoff if inclusive else s.available_at < cutoff
 
 
 def latest_per_event_day(snapshots: Iterable[Snapshot]) -> dict[tuple[str, date], Snapshot]:
@@ -166,7 +308,7 @@ def latest_per_event_day(snapshots: Iterable[Snapshot]) -> dict[tuple[str, date]
     out: dict[tuple[str, date], Snapshot] = {}
     for s in snapshots:
         key = (s.event, s.obs_date)
-        if key not in out or s.pulled_at > out[key].pulled_at:
+        if key not in out or s.acquired_by > out[key].acquired_by:
             out[key] = s
     return out
 
@@ -177,100 +319,169 @@ class DayReading:
     event: str
     meeting_at: datetime
     pulled_at: datetime
+    acquired_from: datetime
+    acquired_by: datetime
+    available_at: datetime
+    clock_basis: str
     ladder: Ladder
+
+
+def _reading(d: date, s: Snapshot) -> DayReading:
+    """Only called for a snapshot with a meeting time and a priced ladder."""
+    return DayReading(d, s.event, s.meeting_at, s.pulled_at, s.acquired_from, s.acquired_by, s.available_at,
+                      s.clock_basis, s.ladder)
+
+
+def first_seen(snapshots: Iterable[Snapshot]) -> dict[tuple[datetime, str], datetime]:
+    """(meeting time, event) -> the earliest instant GRID read that event: the schedule as GRID learned it."""
+    out: dict[tuple[datetime, str], datetime] = {}
+    for s in snapshots:
+        if s.meeting_at is not None:
+            key = (s.meeting_at, s.event)
+            if key not in out or s.acquired_from < out[key]:
+                out[key] = s.acquired_from
+    return out
 
 
 def next_meeting_readings(snapshots: Iterable[Snapshot], sessions: Sequence[date]) -> tuple[dict[date, DayReading],
                                                                                             dict[date, str]]:
-    """Per XNYS session date with KXFED rows: the next meeting's priced ladder, or why that day has none."""
-    by_key = latest_per_event_day(snapshots)
-    meetings = sorted({s.meeting_at for s in by_key.values() if s.meeting_at is not None})
-    event_of: dict[datetime, str] = {}
-    for s in by_key.values():
-        if s.meeting_at is not None:
-            event_of.setdefault(s.meeting_at, s.event)
+    """Per XNYS session date with KXFED rows: the next meeting's priced ladder, or why that day has none.
+
+    The next meeting is chosen from the events GRID had read by that day's newest quotes, so adding a later
+    discovery (an event first read on a later day) never changes an earlier day.
+    """
+    snaps = list(snapshots)
+    by_key = latest_per_event_day(snaps)
+    seen = first_seen(snaps)
     session_set = set(sessions)
-    days = sorted({d for (_, d) in by_key if d in session_set})
+    by_day: dict[date, list[Snapshot]] = {}
+    for (_, d), s in by_key.items():
+        if d in session_set:
+            by_day.setdefault(d, []).append(s)
     readings: dict[date, DayReading] = {}
     missing: dict[date, str] = {}
-    for d in days:
-        # The day's newest pull decides which meeting is next: a pull after a decision reads the following meeting.
-        newest = max(s.pulled_at for (_, dd), s in by_key.items() if dd == d)
-        nxt = next((m for m in meetings if m > newest), None)
+    for d in sorted(by_day):
+        # The day's newest quotes decide which meeting is next: a pull after a decision reads the following meeting.
+        newest = max(s.acquired_by for s in by_day[d])
+        known: dict[datetime, list[str]] = {}
+        for (m, ev), t in seen.items():
+            if t <= newest:
+                known.setdefault(m, []).append(ev)
+        nxt = min((m for m in known if m > newest), default=None)
         if nxt is None:
-            missing[d] = "no KXFED meeting after the pull"
+            missing[d] = "no KXFED meeting known after the pull"
             continue
-        snap = by_key.get((event_of[nxt], d))
+        if len(known[nxt]) > 1:
+            missing[d] = f"{len(known[nxt])} KXFED events name the meeting at {nxt.isoformat()}"
+            continue
+        snap = by_key.get((known[nxt][0], d))
         if snap is None:
-            missing[d] = f"no {event_of[nxt]} row for the next meeting"
-        elif snap.meeting_at is None or snap.pulled_at >= snap.meeting_at:
-            missing[d] = f"{snap.event} was pulled after its meeting"
+            missing[d] = f"no {known[nxt][0]} row for the next meeting"
+        elif snap.acquired_by >= nxt:
+            missing[d] = f"{snap.event} may have been read after its meeting"
         elif snap.ladder is None:
             missing[d] = f"{snap.event}: {snap.reason}"
         else:
-            readings[d] = DayReading(d, snap.event, snap.meeting_at, snap.pulled_at, snap.ladder)
+            readings[d] = _reading(d, snap)
     return readings, missing
 
 
-def path_series(snapshots: Iterable[Snapshot], sessions: Sequence[date]) -> tuple[pd.Series, pd.Series,
-                                                                                  dict[date, DayReading]]:
-    """(expected upper bound per session, its same-contract 5-session change, the day readings)."""
+@dataclass(frozen=True, eq=False)
+class PolicyPath:
+    level: pd.Series                            # expected upper bound after the next meeting, per session
+    change: pd.Series                           # its same-contract change over CHANGE_SESSIONS sessions
+    readings: dict[date, DayReading]            # the next-meeting reading per session
+    change_start: dict[date, DayReading]        # per change, the same contract's reading it is taken from
+    missing: dict[date, str]                    # why a session with KXFED rows has no reading
+
+
+def path_series(snapshots: Iterable[Snapshot], sessions: Sequence[date]) -> PolicyPath:
     snaps = list(snapshots)
-    readings, _ = next_meeting_readings(snaps, sessions)
+    readings, missing = next_meeting_readings(snaps, sessions)
     by_key = latest_per_event_day(snaps)
     level = pd.Series({d: r.ladder.expected_upper for d, r in readings.items()}, dtype=float).sort_index()
     pos = {d: i for i, d in enumerate(sessions)}
     change: dict[date, float] = {}
+    start: dict[date, DayReading] = {}
     for d, r in readings.items():
         i = pos.get(d)
         if i is None or i < CHANGE_SESSIONS:
             continue
-        earlier = by_key.get((r.event, sessions[i - CHANGE_SESSIONS]))
-        if earlier is None or earlier.ladder is None or earlier.pulled_at >= r.meeting_at:
+        d0 = sessions[i - CHANGE_SESSIONS]
+        earlier = by_key.get((r.event, d0))
+        if earlier is None or earlier.ladder is None or earlier.acquired_by >= r.meeting_at:
             continue
         change[d] = r.ladder.expected_upper - earlier.ladder.expected_upper
-    return level, pd.Series(change, dtype=float).sort_index(), readings
+        start[d] = _reading(d0, earlier)
+    return PolicyPath(level, pd.Series(change, dtype=float).sort_index(), readings, start, missing)
+
+
+def session_open(d: date) -> datetime:
+    return datetime.combine(d, time(9, 30), tzinfo=_ET).astimezone(timezone.utc)
+
+
+def regular_close(d: date) -> datetime:
+    return datetime.combine(d, time(16, 0), tzinfo=_ET).astimezone(timezone.utc)
+
+
+def pre_open(reading: DayReading, previous_session: date) -> bool:
+    """Whether every instant the reading's quotes can have been read lies after ``previous_session``'s regular close
+    and before its own session opens, so it describes the market between those two sessions."""
+    return regular_close(previous_session) <= reading.acquired_from and \
+        reading.acquired_by < session_open(reading.obs_date)
 
 
 def selection_receipt(snapshots: Sequence[Snapshot], *, as_of: date, cutoff: datetime,
                       inclusive: bool) -> dict[str, Any]:
-    """Fingerprint of exactly the KXFED rows a record read (event, obs_date, pull clock, priced value)."""
+    """Fingerprint of exactly the KXFED rows a record read (event, obs_date, clocks, priced value)."""
     rows = sorted(({"event": s.event, "obs_date": s.obs_date.isoformat(), "pulled_at": s.pulled_at.isoformat(),
+                    "clock_basis": s.clock_basis, "available_at": s.available_at.isoformat(),
                     "expected_upper": round(s.ladder.expected_upper, 6) if s.ladder else None,
                     "unusable": s.reason if s.ladder is None else None} for s in snapshots),
                   key=lambda x: (x["event"], x["obs_date"], x["pulled_at"]))
     encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
-    return {"schema": "market-state-kxfed-selection/1", "rule": POLICY_PATH_RULE, "as_of": as_of.isoformat(),
+    bases = sorted({r["clock_basis"] for r in rows})
+    return {"schema": "market-state-kxfed-selection/2", "rule": POLICY_PATH_RULE, "as_of": as_of.isoformat(),
             "cutoff": cutoff.isoformat(), "cutoff_inclusive": inclusive, "rows": len(rows),
             "unusable_rows": sum(1 for r in rows if r["unusable"]),
-            "sha256": hashlib.sha256(encoded).hexdigest(), "pit_basis": "pull_timestamp only (no modeled path)"}
+            "clock_basis": {b: sum(1 for r in rows if r["clock_basis"] == b) for b in bases},
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "pit_basis": (f"available_at only, no modeled path: {ACQUIRED_CLOCK_RULE} acquisition clock + "
+                          f"{int(COMMIT_GRACE.total_seconds())} s commit grace, or pull_timestamp (transaction "
+                          f"start) + {int(LEGACY_SPAN.total_seconds() // 60)} min for older rows")}
 
 
-def outcome_odds(ladder: Ladder, current_upper: float) -> dict[str, float]:
-    """P(hike), P(hold), P(cut) at the meeting against the current upper bound, when it sits on the ladder grid.
+def outcome_odds(ladder: Ladder, current_upper: float) -> tuple[dict[str, float] | None, dict[str, list[float]] | None,
+                                                               str | None]:
+    """(P(hike), P(hold), P(cut) at the meeting, their bounds within the quotes, None), or (None, None, why).
 
     Strikes are the boundaries "above k"; the current upper bound u is held when the upper bound after the meeting is
-    above u - step and not above u.
+    above u - step and not above u. Both u and u - step must be quoted strikes: odds are never extrapolated past the
+    ladder.
     """
-    def above(k: float) -> float:
-        if k < ladder.strikes[0] - 1e-9:
-            return 1.0
-        if k > ladder.strikes[-1] + 1e-9:
-            return 0.0
-        i = round((k - ladder.strikes[0]) / STRIKE_STEP)
-        return ladder.p_above[i]
+    if not on_grid(current_upper):
+        return None, None, f"current upper bound {current_upper} is off the {STRIKE_STEP} grid"
+    index = {round(k / STRIKE_STEP): i for i, k in enumerate(ladder.strikes)}
+    i_hike = index.get(round(current_upper / STRIKE_STEP))
+    i_cut = index.get(round((current_upper - STRIKE_STEP) / STRIKE_STEP))
+    if i_hike is None or i_cut is None:
+        return None, None, (f"the ladder does not quote both thresholds ({current_upper - STRIKE_STEP:.2f}% and "
+                            f"{current_upper:.2f}%)")
+    p, lo, hi = ladder.p_above, ladder.lower, ladder.upper
+    odds = {"hike": round(p[i_hike], 4), "hold": round(p[i_cut] - p[i_hike], 4), "cut": round(1.0 - p[i_cut], 4)}
+    bounds = {"hike": [round(lo[i_hike], 4), round(hi[i_hike], 4)],
+              "hold": [round(max(0.0, lo[i_cut] - hi[i_hike]), 4), round(hi[i_cut] - lo[i_hike], 4)],
+              "cut": [round(1.0 - hi[i_cut], 4), round(1.0 - lo[i_cut], 4)]}
+    return odds, bounds, None
 
-    hike = above(current_upper)
-    no_cut = above(current_upper - STRIKE_STEP)
-    return {"hike": round(hike, 4), "hold": round(no_cut - hike, 4), "cut": round(1.0 - no_cut, 4)}
+
+def meetings_seen(snapshots: Iterable[Snapshot], *, by: datetime | None = None) -> list[datetime]:
+    """Meeting times of the KXFED events GRID had read (by ``by``, when given)."""
+    return _meetings_known(first_seen(snapshots), by)
 
 
-def on_grid(x: float) -> bool:
-    return math.isclose(round(x / STRIKE_STEP) * STRIKE_STEP, x, abs_tol=1e-9)
-
-
-def meetings_seen(snapshots: Iterable[Snapshot]) -> list[datetime]:
-    return sorted({s.meeting_at for s in snapshots if s.meeting_at is not None})
+def _meetings_known(seen: dict[tuple[datetime, str], datetime], by: datetime | None) -> list[datetime]:
+    return sorted({m for (m, _), t in seen.items() if by is None or t <= by})
 
 
 def target_pairing(reading: DayReading, target: pd.Series, meetings: Sequence[datetime]) -> tuple[date, float] | None:
@@ -287,7 +498,7 @@ def target_pairing(reading: DayReading, target: pd.Series, meetings: Sequence[da
     if known.empty:
         return None
     t_obs, t_val = known.index[-1], float(known.iloc[-1])
-    last = max((m for m in meetings if m < reading.pulled_at), default=None)
+    last = max((m for m in meetings if m < reading.acquired_from), default=None)
     if last is not None and t_obs < last.date() + timedelta(days=1):
         return None
     if not on_grid(t_val):
@@ -296,11 +507,15 @@ def target_pairing(reading: DayReading, target: pd.Series, meetings: Sequence[da
 
 
 def priced_move_series(readings: dict[date, DayReading], target: pd.Series,
-                       meetings: Sequence[datetime]) -> pd.Series:
-    """Expected upper bound after the next meeting minus the current upper bound, per day with a valid pairing."""
+                       snapshots: Sequence[Snapshot]) -> pd.Series:
+    """Expected upper bound after the next meeting minus the current upper bound, per day with a valid pairing.
+
+    Each day's last meeting comes from the schedule GRID had read by that day's quotes.
+    """
     out = {}
+    seen = first_seen(snapshots)
     for d, r in readings.items():
-        pair = target_pairing(r, target, meetings)
+        pair = target_pairing(r, target, _meetings_known(seen, r.acquired_by))
         if pair is not None:
             out[d] = r.ladder.expected_upper - pair[1]
     return pd.Series(out, dtype=float).sort_index()
