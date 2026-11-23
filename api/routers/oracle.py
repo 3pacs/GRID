@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from loguru import logger as log
 
-from api.auth import require_auth, viewer_is_admin
+from api.auth import require_auth, require_role, viewer_is_admin
 from api.dependencies import get_db_engine
 from oracle.engine import EnsemblePredictor, OracleEngine
 from oracle.entry_price_policy import (
@@ -455,9 +455,14 @@ def publish_prediction(
 
 @router.post("/evolve")
 def trigger_evolve(
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_role("admin")),
 ) -> dict[str, Any]:
-    """Manually trigger weight evolution based on scored predictions."""
+    """Manually trigger scoring and weight evolution. Admin only.
+
+    A maintenance write, and its response (per-model weight changes and hit
+    rates, scoring summaries) is built from every scored row, the Oracle's
+    private-use verdicts included (Codex review 6030272662).
+    """
     engine = get_db_engine()
     try:
         oracle = OracleEngine(db_engine=engine)
