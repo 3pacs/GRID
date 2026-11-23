@@ -27,6 +27,16 @@ every run (so the source never finished better than PARTIAL):
   ``totalpc.csv``, and nothing ever wrote the ``CBOE:equitypc`` id the
   conviction scorer read, so this is a new series, not a continuation.
 
+Put/call clock: ``raw_series.pull_timestamp`` is the schema default
+``NOW()``, the insert transaction's start (``_insert_raw`` sends no
+timestamp). ``pull_put_call_ratio`` reads every page before that
+transaction opens, so a row is never stamped before its page was read; the
+stamp can be later than the read, by up to the rest of the run, which makes
+it a proxy for the acquisition time, not that time. Before #1397 the
+transaction opened before the fetches, so a page read after the UTC day-end
+could carry the previous day's stamp; ``put_call_ratio`` rows written then
+keep it. The conviction scorer shows both ratios and scores neither.
+
 ``CBOE:VIX`` is the backup feed for the regime vector's VIX dimensions:
 FRED posts VIXCLS the next business day and its API times out often enough
 that the Sept 23-25 2026 closes only landed on Sept 29. Cboe's CSV has the
@@ -248,9 +258,14 @@ class CBOEIndicesPuller(BasePuller):
         A weekday in the window is requested when any series in
         PUT_CALL_PAGE_SERIES lacks it, once for all of them; each series
         stores only the dates it lacks. obs_date is the session date in the
-        page URL; the pull timestamp is when we read it, as for every other
-        puller. Returns one result per series, so a page that loses one ratio
-        fails that series alone.
+        page URL. Three steps, so no transaction is open while pages are
+        read: look up the stored dates (a read-only connection), read the
+        pages, then insert in one transaction that opens after the last read.
+        The insert transaction looks the dates up again and skips any a
+        concurrent run stored meanwhile. pull_timestamp (DEFAULT NOW()) is
+        that transaction's start: at or after every page's read, a proxy for
+        the acquisition time (module docstring). Returns one result per
+        series, so a page that loses one ratio fails that series alone.
         """
         lookback = days_back if days_back is not None else PUT_CALL_DEFAULT_LOOKBACK_DAYS
         end = date.today()
@@ -261,42 +276,55 @@ class CBOEIndicesPuller(BasePuller):
         refused = dict.fromkeys(series, 0)
         unparsed = dict.fromkeys(series, 0)
         pages_requested = 0
+        read: list[tuple[str, date, float, dict[str, Any]]] = []
         try:
-            with self.engine.begin() as conn:
+            with self.engine.connect() as conn:
                 existing = {
                     sid: self._get_existing_dates(sid, conn, start_date=start, end_date=end)
                     for sid in series
                 }
-                day = start
-                while day <= end:
-                    missing = [sid for sid in series if day not in existing[sid]]
-                    if day.weekday() < 5 and missing:
-                        url = PUT_CALL_URL.format(day=day.isoformat())
-                        pages_requested += 1
-                        page = self._download_json(url)
-                        time.sleep(_PUT_CALL_DELAY)
-                        for sid in missing:
-                            requested[sid] += 1
-                            if page is None:
-                                refused[sid] += 1
-                                continue
-                            name, block = PUT_CALL_PAGE_SERIES[sid]
-                            value = self._page_ratio(page, name)
-                            if value is None:
-                                unparsed[sid] += 1
-                                log.warning(
-                                    "CBOE put/call {d}: page has no valid {n}", d=day, n=name,
-                                )
-                                continue
-                            self._insert_raw(
-                                conn=conn,
-                                series_id=sid,
-                                obs_date=day,
-                                value=value,
-                                raw_payload={"source_url": url, **self._page_volume(page, block)},
+            day = start
+            while day <= end:
+                missing = [sid for sid in series if day not in existing[sid]]
+                if day.weekday() < 5 and missing:
+                    url = PUT_CALL_URL.format(day=day.isoformat())
+                    pages_requested += 1
+                    page = self._download_json(url)
+                    time.sleep(_PUT_CALL_DELAY)
+                    for sid in missing:
+                        requested[sid] += 1
+                        if page is None:
+                            refused[sid] += 1
+                            continue
+                        name, block = PUT_CALL_PAGE_SERIES[sid]
+                        value = self._page_ratio(page, name)
+                        if value is None:
+                            unparsed[sid] += 1
+                            log.warning(
+                                "CBOE put/call {d}: page has no valid {n}", d=day, n=name,
                             )
-                            rows[sid] += 1
-                    day += timedelta(days=1)
+                            continue
+                        read.append((sid, day, value, {"source_url": url, **self._page_volume(page, block)}))
+                day += timedelta(days=1)
+            if read:
+                # Opens after the last page was read: NOW() is at or after
+                # every read below.
+                with self.engine.begin() as conn:
+                    stored = {
+                        sid: self._get_existing_dates(sid, conn, start_date=start, end_date=end)
+                        for sid in {sid for sid, *_ in read}
+                    }
+                    for sid, day, value, payload in read:
+                        if day in stored[sid]:
+                            continue
+                        self._insert_raw(
+                            conn=conn,
+                            series_id=sid,
+                            obs_date=day,
+                            value=value,
+                            raw_payload=payload,
+                        )
+                        rows[sid] += 1
         except Exception as exc:
             log.warning("CBOE put/call pull failed: {e}", e=str(exc))
             return [{"status": "FAILED", "rows_inserted": 0, "feature_name": sid, "error": str(exc)}

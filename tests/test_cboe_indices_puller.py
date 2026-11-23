@@ -319,6 +319,80 @@ class TestPutCallDailyPages:
         assert [(sid, v) for sid, _, v, _ in inserted] == [(EQUITY, 0.70)]
         assert out[TOTAL]["status"] == "FAILED" and out[EQUITY]["status"] == "SUCCESS"
 
+    # Codex HOLD 6026828927 finding 1: pull_timestamp is DEFAULT NOW(), the
+    # insert transaction's start, and that transaction used to open before
+    # the fetches, so a page read after the UTC day-end was stamped the day
+    # before. Every page is now read with no transaction open.
+    def test_every_page_is_read_before_the_insert_transaction_opens(self, monkeypatch):
+        monkeypatch.setattr(cboe_indices, "date", _Today)
+        monkeypatch.setattr(cboe_indices.time, "sleep", lambda *_a: None)
+        events: list[str] = []
+        engine = MagicMock()
+
+        def ctx(label):
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(side_effect=lambda *_a: events.append(f"{label} opens") or MagicMock())
+            cm.__exit__ = MagicMock(side_effect=lambda *_a: events.append(f"{label} closes") or False)
+            return cm
+
+        engine.connect.side_effect = lambda: ctx("read")
+        engine.begin.side_effect = lambda: ctx("write")
+        puller = CBOEIndicesPuller(_engine())
+        puller.engine = engine
+        on_file = {date(2026, 10, d) for d in range(25, 32)}
+        pages = {"2026-11-02": _pcr_page("0.87", "0.61"), "2026-11-03": _pcr_page("0.91", "0.66")}
+
+        def fake_json(url):
+            day = url.rsplit("/", 1)[1][:10]
+            events.append(f"fetch {day}")
+            return pages.get(day)
+
+        with patch.object(puller, "_download_json", side_effect=fake_json), \
+             patch.object(puller, "_get_existing_dates", side_effect=lambda sid, conn, **_: set(on_file)), \
+             patch.object(puller, "_insert_raw",
+                          side_effect=lambda conn, series_id, obs_date, **_: events.append(
+                              f"insert {series_id} {obs_date}")):
+            out = puller.pull_put_call_ratio()
+
+        assert events == [
+            "read opens", "read closes",
+            "fetch 2026-11-02", "fetch 2026-11-03", "fetch 2026-11-04",
+            "write opens",
+            f"insert {TOTAL} 2026-11-02", f"insert {EQUITY} 2026-11-02",
+            f"insert {TOTAL} 2026-11-03", f"insert {EQUITY} 2026-11-03",
+            "write closes",
+        ]
+        assert [r["rows_inserted"] for r in out] == [2, 2]
+
+    def test_insert_skips_a_date_a_concurrent_run_stored_while_pages_were_read(self, puller, monkeypatch):
+        monkeypatch.setattr(cboe_indices, "date", _Today)
+        on_file = {date(2026, 10, d) for d in range(25, 32)}
+        lookups: list[str] = []
+
+        def existing(sid, conn, **_):
+            lookups.append(sid)
+            # The second lookup (inside the insert transaction) sees the
+            # 11-02 total ratio another run stored meanwhile.
+            again = lookups.count(sid) > 1 and sid == TOTAL
+            return on_file | ({date(2026, 11, 2)} if again else set())
+
+        inserted: list[tuple[str, date]] = []
+        pages = {"2026-11-02": _pcr_page("0.87", "0.61")}
+        with patch.object(puller, "_download_json", side_effect=lambda u: pages.get(u.rsplit("/", 1)[1][:10])), \
+             patch.object(puller, "_get_existing_dates", side_effect=existing), \
+             patch.object(puller, "_insert_raw",
+                          side_effect=lambda conn, series_id, obs_date, **_: inserted.append((series_id, obs_date))):
+            out = {r["feature_name"]: r for r in puller.pull_put_call_ratio()}
+
+        assert inserted == [(EQUITY, date(2026, 11, 2))]
+        assert out[TOTAL] == {"status": "SUCCESS", "rows_inserted": 0, "feature_name": TOTAL}
+        assert out[EQUITY]["rows_inserted"] == 1
+
+    def test_no_page_read_opens_no_write_transaction(self, puller, monkeypatch):
+        on_file = {date(2026, 10, 25) + timedelta(days=i) for i in range(10)}
+        self._run(puller, monkeypatch, {}, {TOTAL: on_file, EQUITY: on_file})
+        puller.engine.begin.assert_not_called()
+
     def test_a_database_error_fails_both_series(self, puller, monkeypatch):
         monkeypatch.setattr(cboe_indices, "date", _Today)
         with patch.object(puller, "_get_existing_dates", side_effect=RuntimeError("db down")):
