@@ -98,7 +98,7 @@ def _make_engine(*, preserve_ts_text: bool = False):
         Column("confidence", String),
         Column("evidence", Text),
         Column("flow_date", Date, nullable=False),
-        Column("created_at", DateTime),
+        Column("created_at", DateTime, server_default=text("CURRENT_TIMESTAMP")),
     )
     md.create_all(eng)
     with eng.begin() as conn:
@@ -275,7 +275,11 @@ def test_13f_unchanged_shares_with_price_increase_produces_zero_flow_in_compare_
 
 def test_13f_share_based_estimate_separates_share_delta_from_price_move():
     """Share increase + price jump uses delta_shares * later quarter-end price,
-    and share decrease + price rally still classifies as DECREASED (outflow)."""
+    and share decrease + price rally still classifies as DECREASED, not INCREASED.
+
+    Both are continuing positions: the estimate is recorded, but with no
+    CUSIP-level corporate-action coverage a split cannot be ruled out, so
+    neither is qualified as a directional flow."""
     puller = institutional_flows.InstitutionalFlowsPuller.__new__(
         institutional_flows.InstitutionalFlowsPuller
     )
@@ -330,7 +334,8 @@ def test_13f_share_based_estimate_separates_share_delta_from_price_move():
     assert aapl["value_usd"] == pytest.approx(36_000_000.0)
     assert aapl["estimated_flow_usd"] == pytest.approx(36_000_000.0)
     assert aapl["holdings_value_delta_usd"] == pytest.approx(56_000_000.0)
-    assert aapl["qualified_for_directional_flow"] is True
+    assert aapl["qualified_for_directional_flow"] is False
+    assert aapl["unqualified_reason"] == "no_corporate_action_coverage"
 
     msft = by_cusip["594918104"]
     assert msft["action"] == "DECREASED"
@@ -338,6 +343,8 @@ def test_13f_share_based_estimate_separates_share_delta_from_price_move():
     assert msft["valuation_price_usd"] == pytest.approx(240.0)
     assert msft["value_usd"] == pytest.approx(48_000_000.0)
     assert msft["holdings_value_delta_usd"] == pytest.approx(-28_000_000.0)
+    assert msft["qualified_for_directional_flow"] is False
+    assert msft["unqualified_reason"] == "no_corporate_action_coverage"
 
 
 def test_dollar_flows_13f_unchanged_shares_with_price_change_emits_zero_flow():
@@ -372,7 +379,8 @@ def test_dollar_flows_13f_unchanged_shares_with_price_change_emits_zero_flow():
 
 def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows():
     """Legacy whole-position rows, unknown/mixed units, missing shares, PRN/options,
-    and explicitly disqualified rows are quarantined with logged reasons and counts."""
+    explicitly disqualified rows and continuing-position (INCREASED/DECREASED)
+    rows are quarantined with logged reasons and counts."""
     engine = _make_engine()
     filing_day = YESTERDAY
 
@@ -467,7 +475,8 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
             extra={"qualified_for_directional_flow": False},
         ),
     )
-    # 7. One VALID qualified share-based row -> ONLY this row must survive!
+    # 7. Well-formed share-based INCREASED (continuing position): a split
+    #    cannot be ruled out, so it is quarantined, not an inflow.
     _insert_raw(
         engine,
         "13F:0001067983:037833100:INCREASED",
@@ -483,6 +492,21 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
             filing_date=filing_day.isoformat(),
         ),
     )
+    # 8. One VALID qualified share-based NEW row -> ONLY this row must survive!
+    _insert_raw(
+        engine,
+        "13F:0001067983:594918104:NEW",
+        filing_day,
+        24_000_000.0,
+        payload=_qualified_13f_payload(
+            ticker="MSFT",
+            cusip="594918104",
+            prev_shares=0,
+            curr_shares=100_000,
+            curr_value_usd=24_000_000.0,  # 100k * $240 = $24M
+            filing_date=filing_day.isoformat(),
+        ),
+    )
 
     logged: list[str] = []
     hid = log.add(lambda m: logged.append(m.record["message"]), level="WARNING")
@@ -492,13 +516,15 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
         log.remove(hid)
 
     assert len(summary) == 1
-    assert summary[0]["ticker"] == "AAPL"
+    assert summary[0]["ticker"] == "MSFT"
     assert summary[0]["direction"] == "inflow"
     assert summary[0]["amount_usd"] == pytest.approx(24_000_000.0)
     assert summary[0]["confidence"] == "derived"
-    assert summary.quarantined_13f == 6
-    assert sum(summary.quarantined_13f_reasons.values()) == 6
-    assert summary.to_dict()["quarantined_13f"] == 6
+    assert summary.quarantined_13f == 7
+    assert sum(summary.quarantined_13f_reasons.values()) == 7
+    assert summary.quarantined_13f_reasons["no_corporate_action_coverage"] == 1
+    assert summary.quarantined_13f_reasons["failed_qualification"] == 1
+    assert summary.to_dict()["quarantined_13f"] == 7
     assert any("quarantin" in msg.lower() for msg in logged)
 
 
@@ -622,20 +648,19 @@ def test_13f_amendment_replaces_original_in_dollar_flows_and_respects_pit():
     orig_day = date(2026, 8, 14)
     amend_day = date(2026, 8, 28)
 
-    # Original 13F-HR (filed Aug 14 for Q2 2026-06-30): AAPL +$50M, MSFT +$20M
+    # Original 13F-HR (filed Aug 14 for Q2 2026-06-30): AAPL NEW +$50M, MSFT NEW +$20M
     _insert_raw(
         engine,
-        "13F:0001067983:037833100:INCREASED",
+        "13F:0001067983:037833100:NEW",
         orig_day,
         50_000_000.0,
         pull_ts=datetime(2026, 8, 14, 18, 0, 0),
         payload=_qualified_13f_payload(
             ticker="AAPL",
             cusip="037833100",
-            prev_shares=500_000,
-            curr_shares=750_000,
-            prev_value_usd=100_000_000.0,
-            curr_value_usd=150_000_000.0,
+            prev_shares=0,
+            curr_shares=250_000,
+            curr_value_usd=50_000_000.0,  # 250k x $200
             report_date="2026-06-30",
             filing_date="2026-08-14",
             form_type="13F-HR",
@@ -662,20 +687,19 @@ def test_13f_amendment_replaces_original_in_dollar_flows_and_respects_pit():
             filing_accession="0001067983-26-000010",
         ),
     )
-    # Restated 13F-HR/A (filed Aug 28 for SAME Q2 2026-06-30): AAPL revised to +$30M
+    # Restated 13F-HR/A (filed Aug 28 for SAME Q2 2026-06-30): AAPL NEW revised to +$30M
     _insert_raw(
         engine,
-        "13F:0001067983:037833100:INCREASED",
+        "13F:0001067983:037833100:NEW",
         amend_day,
         30_000_000.0,
         pull_ts=datetime(2026, 8, 28, 18, 0, 0),
         payload=_qualified_13f_payload(
             ticker="AAPL",
             cusip="037833100",
-            prev_shares=500_000,
-            curr_shares=650_000,
-            prev_value_usd=100_000_000.0,
-            curr_value_usd=130_000_000.0,
+            prev_shares=0,
+            curr_shares=150_000,
+            curr_value_usd=30_000_000.0,  # 150k x $200
             report_date="2026-06-30",
             filing_date="2026-08-28",
             form_type="13F-HR/A",
@@ -705,13 +729,20 @@ def test_13f_amendment_replaces_original_in_dollar_flows_and_respects_pit():
 
 
 def test_13f_amendment_flipping_direction_or_restating_to_zero_replaces_original():
-    """An amendment that flips INCREASED -> DECREASED or restates to unchanged shares
-    supersedes the original rather than leaving both rows active."""
+    """An amendment that flips the action (INCREASED -> CLOSED, CLOSED -> a
+    restated unchanged holding) supersedes the original rather than leaving
+    both rows active.
+
+    The directional sides are NEW/CLOSED: a continuing position
+    (INCREASED/DECREASED) is never a verified direction. A failed supersession
+    would show up either as the original's CLOSED outflow leaking through or as
+    the original's INCREASED row being quarantined instead of superseded."""
     engine = _make_engine()
     orig_day = date(2026, 8, 14)
     amend_day = date(2026, 8, 28)
 
-    # Filer 1: original INCREASED $50M, amendment flips to DECREASED $10M
+    # Filer 1: original INCREASED (500k -> 750k); the amendment restates the
+    # quarter-end holding to zero, flipping it to CLOSED: 500k x $200 = $100M out.
     _insert_raw(
         engine,
         "13F:0001067983:037833100:INCREASED",
@@ -728,30 +759,31 @@ def test_13f_amendment_flipping_direction_or_restating_to_zero_replaces_original
     )
     _insert_raw(
         engine,
-        "13F:0001067983:037833100:DECREASED",
+        "13F:0001067983:037833100:CLOSED",
         amend_day,
-        10_000_000.0,
+        100_000_000.0,
         pull_ts=datetime(2026, 8, 28, 18, 0, 0),
         payload=_qualified_13f_payload(
             ticker="AAPL", cusip="037833100",
-            prev_shares=500_000, curr_shares=450_000,
-            prev_value_usd=100_000_000.0, curr_value_usd=90_000_000.0,
+            prev_shares=500_000, curr_shares=0,
+            prev_value_usd=100_000_000.0,
             report_date="2026-06-30", filing_date="2026-08-28",
             form_type="13F-HR/A", is_amendment=True, filing_accession="acc-1-amend",
         ),
     )
 
-    # Filer 2: original INCREASED $40M, amendment restates to unchanged shares (0 flow)
+    # Filer 2: original CLOSED (200k x $400 = $80M out); the amendment restates
+    # the holding as still held with unchanged shares (0 flow).
     _insert_raw(
         engine,
-        "13F:0001336528:594918104:INCREASED",
+        "13F:0001336528:594918104:CLOSED",
         orig_day,
-        40_000_000.0,
+        80_000_000.0,
         pull_ts=datetime(2026, 8, 14, 18, 0, 0),
         payload=_qualified_13f_payload(
             ticker="MSFT", cusip="594918104",
-            prev_shares=200_000, curr_shares=300_000,
-            prev_value_usd=80_000_000.0, curr_value_usd=120_000_000.0,
+            prev_shares=200_000, curr_shares=0,
+            prev_value_usd=80_000_000.0,
             report_date="2026-06-30", filing_date="2026-08-14",
             form_type="13F-HR", is_amendment=False, filing_accession="acc-2-orig",
         ),
@@ -771,13 +803,21 @@ def test_13f_amendment_flipping_direction_or_restating_to_zero_replaces_original
         ),
     )
 
+    skips: dict[str, int] = {}
+    reasons: dict[str, int] = {}
     flows = dollar_flows._normalize_13f_flows(
         engine, days=60, as_of=date(2026, 9, 1), cusip_map=None,
+        skipped_counts=skips, quarantine_reasons=reasons,
     )
     assert len(flows) == 1
     assert flows[0]["ticker"] == "AAPL"
     assert flows[0]["direction"] == "outflow"
-    assert flows[0]["amount_usd"] == pytest.approx(10_000_000.0)
+    assert flows[0]["amount_usd"] == pytest.approx(100_000_000.0)
+    assert flows[0]["evidence"]["is_amendment"] is True
+    # Both originals were superseded (not quarantined, not counted).
+    assert skips.get("superseded_13f_vintages", 0) == 2
+    assert skips.get("zero_share_delta_13f", 0) == 1
+    assert reasons == {}
 
 
 # ── HOLD 4: VIX/VIX3M date-matched pairing & spot term-structure wording ──
@@ -897,10 +937,14 @@ def test_vol_term_structure_scores_matched_dates_with_spot_slope_wording(monkeyp
     assert "backwardation" not in src.lower()
 
 
-# ── Codex HOLD on #1369 head 4b66f327 ──────────────────────────────────────
-# (1) a same-CUSIP split must not read as a trade; (2) every served reader of
-# 13F dollar_flows rows qualifies them, honours the as-of cutoff and keeps no
-# qualified coverage unknown.
+# ── Codex HOLD on #1369 head 4b66f327, REQUEST_CHANGES on 78679e80 ─────────
+# (1) a same-CUSIP split must not read as a trade: with no CUSIP-level
+# corporate-action coverage, a continuing position's share change
+# (INCREASED/DECREASED) is never a verified direction, while NEW/CLOSED
+# (split-invariant) stay directional; (2) every served reader of 13F
+# dollar_flows rows qualifies them, refuses rows with no capture clock
+# (created_at NULL), refuses historical replay, and keeps no qualified
+# coverage unknown.
 
 
 def _holding(value_usd: float, shares: int) -> dict:
@@ -908,41 +952,160 @@ def _holding(value_usd: float, shares: int) -> dict:
             "share_type": "SH", "value_units": "usd"}
 
 
-@pytest.mark.parametrize("prev,curr", [
-    ((10_000, 100), (10_000, 200)),     # 2-for-1 split, no trade: 100 x $100 -> 200 x $50
-    ((5_000, 1_000), (5_000, 100)),     # 1-for-10 reverse split: 1000 x $5 -> 100 x $50
-    ((10_000, 100), (12_500, 250)),     # split plus a buy, no adjustment available
-    ((10_000, 100), (5_000, 100)),      # split plus a sale leaving the share count flat
-], ids=["split_2_for_1", "reverse_1_for_10", "split_plus_buy", "split_flat_shares"])
-def test_13f_split_like_transition_is_quarantined_not_read_as_a_trade(prev, curr):
+def _raw_payload_from_change(chg: dict, filing_day: date) -> dict:
+    """The raw_series payload the 13F puller writes for one _compare_holdings change."""
+    payload = {k: chg.get(k) for k in (
+        "cusip", "action", "estimated_flow_usd", "holdings_value_delta_usd",
+        "curr_value_usd", "prev_value_usd", "pct_change", "shares", "curr_shares",
+        "prev_shares", "delta_shares", "valuation_price_usd", "valuation_price_basis",
+        "flow_estimation_method", "value_units", "share_type",
+        "qualified_for_directional_flow", "unqualified_reason",
+    )}
+    payload.update({
+        "manager_name": "Split Fund", "issuer_name": chg.get("name", ""),
+        "value_multiplier": 1, "filing_accession": "0009999999-26-000001",
+        "filing_date": filing_day.isoformat(), "report_date": "2026-09-30",
+        "form_type": "13F-HR", "is_amendment": False,
+    })
+    return payload
+
+
+_SPLIT_CASES = {
+    # (prev value, prev shares) -> (curr value, curr shares)
+    "split_2_for_1": ((10_000, 100), (10_000, 200)),            # 100 x $100 -> 200 x $50, no trade
+    "reverse_1_for_10": ((5_000, 1_000), (5_000, 100)),         # 1000 x $5 -> 100 x $50, no trade
+    "split_plus_buy": ((10_000, 100), (12_500, 250)),           # 2-for-1 plus a 50-share buy
+    "split_flat_shares": ((10_000, 100), (5_000, 100)),         # 2-for-1 plus a sale leaving shares flat
+    "masked_split_plus_70pct": ((10_000, 100), (17_000, 200)),  # 2-for-1 plus +70%: $100 -> $85
+}
+
+
+@pytest.mark.parametrize("case", list(_SPLIT_CASES), ids=list(_SPLIT_CASES))
+def test_13f_split_like_transition_is_quarantined_not_read_as_a_trade(case):
+    """A split, a reverse split, a split plus a trade, and a split masked by a
+    price move (2-for-1 plus +70% reads $100 -> $85 a share) never yield a
+    qualified directional change from _compare_holdings and never produce a
+    dollar_flows directional flow. The NEW and CLOSED positions in the same
+    filing pair are split-invariant and still flow."""
+    prev, curr = _SPLIT_CASES[case]
     puller = institutional_flows.InstitutionalFlowsPuller.__new__(institutional_flows.InstitutionalFlowsPuller)
     counts: dict[str, int] = {}
-    changes = puller._compare_holdings({"C1": _holding(*prev)}, {"C1": _holding(*curr)}, quarantine_counts=counts)
-    assert changes == []
-    assert counts == {"possible_split_or_corporate_action": 1}
+    changes = puller._compare_holdings(
+        {"C1": _holding(*prev), "CLOSED01": _holding(18_000, 100)},
+        {"C1": _holding(*curr), "NEW00001": _holding(25_000, 200)},
+        quarantine_counts=counts,
+    )
+    by_cusip = {c["cusip"]: c for c in changes}
+    assert counts == {}
+
+    split_chg = by_cusip.get("C1")
+    if case == "split_flat_shares":
+        assert split_chg is None  # zero share delta: no event at all
+    else:
+        assert split_chg is not None
+        assert split_chg["action"] in ("INCREASED", "DECREASED")
+        assert split_chg["qualified_for_directional_flow"] is False
+        assert split_chg["unqualified_reason"] == "no_corporate_action_coverage"
+    assert by_cusip["NEW00001"]["action"] == "NEW"
+    assert by_cusip["NEW00001"]["qualified_for_directional_flow"] is True
+    assert by_cusip["CLOSED01"]["action"] == "CLOSED"
+    assert by_cusip["CLOSED01"]["qualified_for_directional_flow"] is True
+    assert sorted(c["cusip"] for c in changes if c["qualified_for_directional_flow"] is True) == [
+        "CLOSED01", "NEW00001",
+    ]
+
+    # Through raw_series into dollar_flows: only NEW and CLOSED become flows.
+    engine = _make_engine()
+    for chg in changes:
+        _insert_raw(
+            engine, f"13F:0009999999:{chg['cusip']}:{chg['action']}", YESTERDAY,
+            float(chg["value_usd"]), payload=_raw_payload_from_change(chg, YESTERDAY),
+        )
+    reasons: dict[str, int] = {}
+    flows = dollar_flows._normalize_13f_flows(engine, days=30, cusip_map=None, quarantine_reasons=reasons)
+    assert {(f["evidence"]["cusip"], f["direction"], f["amount_usd"]) for f in flows} == {
+        ("NEW00001", "inflow", 25_000.0),
+        ("CLOSED01", "outflow", 18_000.0),
+    }
+    assert reasons == ({} if split_chg is None else {"failed_qualification": 1})
+
+    # A payload that claims qualification (e.g. an older writer) is still refused.
+    if split_chg is not None:
+        forged = _raw_payload_from_change(split_chg, YESTERDAY)
+        forged["qualified_for_directional_flow"] = True
+        forged.pop("unqualified_reason")
+        meta = dollar_flows._extract_13f_vintage_meta(forged, YESTERDAY)
+        estimate, why = dollar_flows._qualify_and_estimate_13f_flow(
+            split_chg["action"], split_chg["value_usd"], forged, YESTERDAY, meta,
+        )
+        assert estimate is None and why == "quarantine:no_corporate_action_coverage"
 
 
-def test_13f_real_trade_at_a_normal_price_move_still_reads():
+def test_13f_continuing_position_trade_keeps_its_estimate_but_is_not_directional():
+    """A genuine 50-share buy at a normal price move (100 x $100 -> 150 x $110)
+    cannot be told apart from a split masked by a price move, so it keeps its
+    share-based estimate for the record but is never qualified as a direction."""
     puller = institutional_flows.InstitutionalFlowsPuller.__new__(institutional_flows.InstitutionalFlowsPuller)
     changes = puller._compare_holdings({"C1": _holding(10_000, 100)}, {"C1": _holding(16_500, 150)})
     assert [(c["action"], c["delta_shares"], c["estimated_flow_usd"]) for c in changes] == [("INCREASED", 50, 5_500.0)]
-    assert institutional_flows.implied_price_suggests_corporate_action(10_000, 100, 12_400, 100) is False
-    for bad in ((0, 100, 1, 1), (1, 0, 1, 1), (float("nan"), 1, 1, 1), ("x", 1, 1, 1)):
-        assert institutional_flows.implied_price_suggests_corporate_action(*bad) is True
+    assert changes[0]["qualified_for_directional_flow"] is False
+    assert changes[0]["unqualified_reason"] == "no_corporate_action_coverage"
 
 
-@pytest.mark.parametrize("prev_value,curr_value,reason", [
-    (10_000.0, 10_000.0, "quarantine:possible_split_or_corporate_action"),
-    (None, 10_000.0, "quarantine:unverifiable_corporate_action"),
-], ids=["split_shaped", "missing_prev_value"])
-def test_dollar_flows_estimate_refuses_split_shaped_and_unverifiable_rows(prev_value, curr_value, reason):
+@pytest.mark.parametrize("action,prev_shares,curr_shares,prev_value,curr_value", [
+    ("INCREASED", 100, 200, 10_000.0, 10_000.0),   # 2-for-1 split, no trade
+    ("INCREASED", 100, 200, 10_000.0, 17_000.0),   # 2-for-1 masked by +70%: $100 -> $85
+    ("INCREASED", 100, 200, None, 10_000.0),       # no prior quarter-end value
+    ("INCREASED", 100, 150, 10_000.0, 16_500.0),   # a real buy at a normal price move
+    ("DECREASED", 1_000, 100, 5_000.0, 5_000.0),   # 1-for-10 reverse split, no trade
+    ("DECREASED", 100, 50, 10_000.0, 5_200.0),     # a real sale at a normal price move
+], ids=["split_shaped", "masked_split_plus_70pct", "missing_prev_value", "real_buy",
+        "reverse_split", "real_sale"])
+def test_dollar_flows_estimate_refuses_split_shaped_and_unverifiable_rows(
+    action, prev_shares, curr_shares, prev_value, curr_value,
+):
     payload = _qualified_13f_payload(
-        ticker="SPLT", cusip="999999999", prev_shares=100, curr_shares=200,
+        ticker="SPLT", cusip="999999999", prev_shares=prev_shares, curr_shares=curr_shares,
         prev_value_usd=prev_value, curr_value_usd=curr_value, filing_date=YESTERDAY.isoformat(),
     )
     meta = dollar_flows._extract_13f_vintage_meta(payload, YESTERDAY)
-    estimate, why = dollar_flows._qualify_and_estimate_13f_flow("INCREASED", 5_000.0, payload, YESTERDAY, meta)
-    assert estimate is None and why == reason
+    raw_val = abs(curr_shares - prev_shares) * curr_value / curr_shares
+    estimate, why = dollar_flows._qualify_and_estimate_13f_flow(action, raw_val, payload, YESTERDAY, meta)
+    assert estimate is None and why == "quarantine:no_corporate_action_coverage"
+
+    # A payload the writer already flagged unqualified quarantines earlier.
+    flagged = dict(payload, qualified_for_directional_flow=False,
+                   unqualified_reason="no_corporate_action_coverage")
+    assert dollar_flows._qualify_and_estimate_13f_flow(action, raw_val, flagged, YESTERDAY, meta) == (
+        None, "quarantine:failed_qualification",
+    )
+
+
+def test_dollar_flows_estimate_still_reads_new_and_closed_positions():
+    """NEW and CLOSED value the whole position at one quarter-end, so a split
+    cannot change them: both still estimate a directional flow."""
+    new = _qualified_13f_payload(
+        ticker="SPLT", cusip="999999999", prev_shares=0, curr_shares=200,
+        curr_value_usd=17_000.0, filing_date=YESTERDAY.isoformat(),
+    )
+    est, why = dollar_flows._qualify_and_estimate_13f_flow(
+        "NEW", 17_000.0, new, YESTERDAY, dollar_flows._extract_13f_vintage_meta(new, YESTERDAY),
+    )
+    assert why is None
+    assert est["direction"] == "inflow"
+    assert est["estimated_flow_usd"] == pytest.approx(17_000.0)
+    assert est["valuation_price_usd"] == pytest.approx(85.0)
+
+    closed = _qualified_13f_payload(
+        ticker="SPLT", cusip="999999999", prev_shares=100, curr_shares=0,
+        prev_value_usd=10_000.0, filing_date=YESTERDAY.isoformat(),
+    )
+    est, why = dollar_flows._qualify_and_estimate_13f_flow(
+        "CLOSED", 10_000.0, closed, YESTERDAY, dollar_flows._extract_13f_vintage_meta(closed, YESTERDAY),
+    )
+    assert why is None
+    assert est["direction"] == "outflow"
+    assert est["estimated_flow_usd"] == pytest.approx(10_000.0)
 
 
 _QUALIFIED_EV = {
@@ -964,56 +1127,115 @@ def _insert_flow_at(engine, amount, direction, *, confidence, evidence, created_
         )
 
 
+def _utc_clock(day: date, hours: int) -> datetime:
+    """A tz-aware UTC capture clock ``hours`` after 00:00 UTC on ``day``."""
+    return datetime.combine(day, datetime.min.time(), timezone.utc) + timedelta(hours=hours)
+
+
 def test_institutional_layer_counts_only_qualified_13f_rows_known_by_as_of():
     from analysis.money_flow_engine import layer_institutional
 
+    today = date.today()
     engine = _make_engine()
-    known = datetime.combine(YESTERDAY, datetime.min.time(), timezone.utc) + timedelta(hours=12)
-    later = known + timedelta(days=3)
+    known = _utc_clock(today, 1)  # written earlier today
+    after_today = _utc_clock(today + timedelta(days=1), 1)  # after the end of the as-of date
     _insert_flow_at(engine, 10_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
     _insert_flow_at(engine, 4_000_000.0, "outflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
     # legacy rows: 'derived' without qualification evidence, and 'confirmed'
     _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"}, created_at=known)
     _insert_flow_at(engine, 800_000_000.0, "inflow", confidence="confirmed", evidence=_QUALIFIED_EV, created_at=known)
-    # qualified, but written after the as-of date
-    _insert_flow_at(engine, 50_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=later)
+    # qualified, but written after the end of the as-of date
+    _insert_flow_at(engine, 50_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=after_today)
+    # qualified, but with no capture clock at all
+    _insert_flow_at(engine, 70_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=None)
 
-    node = layer_institutional._build_13f_aggregate(engine, YESTERDAY)
-    assert node.value == pytest.approx(6_000_000.0)
+    node = layer_institutional._build_13f_aggregate(engine, today)
+    assert node.value == pytest.approx(6_000_000.0)  # 10M inflow - 4M outflow
+    assert node.metadata["coverage"] == "qualified"
     assert node.metadata["qualified"] == 2 and node.metadata["unqualified"] == 2
+    # The late and NULL-clock rows carry the same qualified evidence as the
+    # counted rows: they are excluded by their clock, unread.
+    assert node.metadata["rows_read"] == 4
     assert node.metadata["measure"] == "estimated_holdings_position_change_at_reference_prices"
     assert node.metadata["not_observed_cash_flow"] is True
     assert "Estimated Holdings-Position Change" in node.label and "Net Flows" not in node.label
 
-    later_node = layer_institutional._build_13f_aggregate(engine, (later + timedelta(days=1)).date())
-    assert later_node.value == pytest.approx(56_000_000.0)
+    # dollar_flows is rebuilt on refresh, so a past as-of is refused unread.
+    past = layer_institutional._build_13f_aggregate(engine, today - timedelta(days=1))
+    assert past.value is None and past.change_1m is None
+    assert past.metadata["coverage"] == "historical_replay_unavailable"
+    assert past.metadata["rows_read"] == 0
 
 
 def test_institutional_layer_without_qualified_rows_is_unknown_not_zero():
     from analysis.money_flow_engine import layer_institutional
 
+    today = date.today()
     engine = _make_engine()
-    known = datetime.combine(YESTERDAY, datetime.min.time(), timezone.utc)
-    _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"}, created_at=known)
-    node = layer_institutional._build_13f_aggregate(engine, YESTERDAY)
+    _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"},
+                    created_at=_utc_clock(today, 1))
+    # A qualified row with no capture clock supplies no coverage either.
+    _insert_flow_at(engine, 10_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=None)
+    node = layer_institutional._build_13f_aggregate(engine, today)
     assert node.value is None
     assert node.metadata["coverage"] == "no_qualified_13f_rows"
-    empty = layer_institutional._build_13f_aggregate(_make_engine(), YESTERDAY)
+    assert node.metadata["rows_read"] == 1
+    empty = layer_institutional._build_13f_aggregate(_make_engine(), today)
     assert empty.value is None and empty.metadata["rows_read"] == 0
+    assert empty.metadata["coverage"] == "no_qualified_13f_rows"
+
+
+def test_aggregate_flows_refuses_historical_13f_replay_and_counts_live_rows():
+    """dollar_flows is rebuilt (range delete + re-insert) on each refresh, so
+    the 13F rows visible at a past date are not preserved: a historical as_of
+    counts every 13F row as quarantined, while the live read counts the
+    qualified ones and non-13F rows are read either way. A 13F row with no
+    capture clock is not read at all."""
+    engine = _make_engine()
+    flow_day = date.today() - timedelta(days=5)
+    _insert_flow(engine, "13f", "Q", "AAPL", 10_000_000.0, "inflow", flow_day,
+                 confidence="derived", evidence=_QUALIFIED_EV)
+    _insert_flow(engine, "13f", "Q", "MSFT", 4_000_000.0, "outflow", flow_day,
+                 confidence="derived", evidence=_QUALIFIED_EV)
+    _insert_flow(engine, "insider", "Jane", "AAPL", 1_000_000.0, "inflow", flow_day,
+                 confidence="confirmed", evidence={})
+    _insert_flow_at(engine, 70_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV,
+                    created_at=None, flow_date=flow_day)
+
+    live = dollar_flows.get_aggregate_flows(engine, days=30)
+    assert live["total_inflow"] == pytest.approx(11_000_000.0)
+    assert live["total_outflow"] == pytest.approx(4_000_000.0)
+    assert live["by_source_type"]["13f"]["net"] == pytest.approx(6_000_000.0)
+    assert live["flow_count"] == 3
+    assert live["quarantined_13f"] == 0
+
+    replay = dollar_flows.get_aggregate_flows(engine, days=30, as_of=date.today() - timedelta(days=1))
+    assert replay["quarantined_13f"] == 2
+    assert "13f" not in replay["by_source_type"]
+    assert replay["total_inflow"] == pytest.approx(1_000_000.0)
+    assert replay["total_outflow"] == 0.0
+    assert replay["flow_count"] == 1
 
 
 def test_sentiment_and_momentum_readers_drop_derived_rows_without_evidence():
     """flow_aggregator (both readers) and sentiment_scorer used to keep any
     13F row tagged 'derived'; a legacy row without share-based evidence is
-    now dropped from each, and the qualified row is kept."""
+    now dropped from each, as is a qualified row with no capture clock
+    (created_at NULL), and the qualified row is kept."""
     engine = _make_engine()
     _insert_flow(engine, "13f", "Q", "AAPL", 10_000_000.0, "inflow", YESTERDAY, confidence="derived", evidence=_QUALIFIED_EV)
     _insert_flow(engine, "13f", "L", "AAPL", 900_000_000.0, "outflow", YESTERDAY, confidence="derived", evidence={"cusip": "x"})
+    _insert_flow_at(engine, 50_000_000.0, "outflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=None)
 
     momentum = flow_aggregator.compute_flow_momentum(engine, "AAPL")
     assert momentum["flow_count"] == 1
 
-    flows = flow_aggregator._fetch_flows(engine, 30)
+    # _fetch_flows caches per window across engines; start and end clean.
+    flow_aggregator._flow_cache.clear()
+    try:
+        flows = flow_aggregator._fetch_flows(engine, 30)
+    finally:
+        flow_aggregator._flow_cache.clear()
     assert [f["amount_usd"] for f in flows if f["source_type"] == "13f"] == [10_000_000.0]
 
     component = sentiment_scorer._score_flows(engine, days=7)

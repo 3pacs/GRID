@@ -1200,39 +1200,10 @@ def _qualify_and_estimate_13f_flow(
         if (action == "INCREASED" and delta_shares < 0) or (action == "DECREASED" and delta_shares > 0):
             return None, "quarantine:action_share_direction_mismatch"
 
-        # A split or reverse split changes shares with no trade; without both
-        # quarter-end values the transition cannot be shown free of one.
-        if prev_val is None or curr_val is None:
-            return None, "quarantine:unverifiable_corporate_action"
-        from ingestion.altdata.institutional_flows import implied_price_suggests_corporate_action
-
-        if implied_price_suggests_corporate_action(prev_val, prev_shares, curr_val, curr_shares):
-            return None, "quarantine:possible_split_or_corporate_action"
-
-        if curr_val is not None:
-            price = curr_val / curr_shares
-            if stated_price is not None and abs(price - stated_price) / price > 0.01:
-                return None, "quarantine:inconsistent_valuation_price"
-        elif stated_price is not None:
-            price = stated_price
-        else:
-            return None, "quarantine:missing_valuation_price"
-
-        estimated_flow = abs(delta_shares) * price
-        if not math.isfinite(estimated_flow) or estimated_flow <= 0:
-            return None, "quarantine:invalid_flow_estimate"
-
-        return {
-            "estimated_flow_usd": round(estimated_flow, 2),
-            "direction": "inflow" if delta_shares > 0 else "outflow",
-            "prev_shares": prev_shares,
-            "curr_shares": curr_shares,
-            "delta_shares": delta_shares,
-            "valuation_price_usd": round(price, 6),
-            "valuation_price_basis": "curr_quarter_end_implied",
-            "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
-            "holdings_value_delta_usd": (curr_val - prev_val) if (curr_val is not None and prev_val is not None) else None,
-        }, None
+        # A split or reverse split changes shares with no trade, and a price
+        # move can mask it; with no CUSIP-level corporate-action coverage a
+        # continuing position's share change is not a verified direction.
+        return None, "quarantine:no_corporate_action_coverage"
 
     if action == "NEW":
         curr_shares = _parse_13f_shares(
@@ -1995,6 +1966,17 @@ def _persist_flows(engine: Engine, flows: list[dict]) -> int:
     return inserted
 
 
+def _served_flow_row(source_type: Any, confidence: Any, evidence: Any, created_at: Any) -> bool:
+    """Whether a served list reader may return this row.
+
+    A 13F row is returned only with a known capture clock and documented
+    share-based qualification; every other source passes unchanged.
+    """
+    if source_type != "13f":
+        return True
+    return created_at is not None and _is_qualified_13f_dollar_flow_row(confidence, evidence)
+
+
 def get_flows_by_ticker(engine: Engine, ticker: str, days: int = 30) -> list[dict]:
     """Retrieve normalized dollar flows for a specific ticker.
 
@@ -2036,6 +2018,7 @@ def get_flows_by_ticker(engine: Engine, ticker: str, days: int = 30) -> list[dic
             "created_at": r[9].isoformat() if r[9] else None,
         }
         for r in rows
+        if _served_flow_row(r[1], r[6], r[7], r[9])
     ]
 
 
@@ -2097,6 +2080,7 @@ def get_flows_by_sector(engine: Engine, sector: str, days: int = 30) -> list[dic
             "sector": sector,
         }
         for r in rows
+        if _served_flow_row(r[1], r[6], r[7], r[9])
     ]
 
 
@@ -2124,10 +2108,15 @@ def get_aggregate_flows(
                 "SELECT source_type, actor_name, ticker, amount_usd, direction, "
                 "confidence, CASE WHEN source_type = '13f' THEN evidence ELSE NULL END "
                 "FROM dollar_flows "
-                "WHERE flow_date >= :cutoff AND flow_date <= :as_of"
+                "WHERE flow_date >= :cutoff AND flow_date <= :as_of "
+                "AND NOT (source_type = '13f' AND created_at IS NULL)"
             ),
             {"cutoff": cutoff, "as_of": ref_date},
         ).fetchall()
+    # dollar_flows is rebuilt on each refresh (range delete + re-insert), so the
+    # 13F rows visible at a past date are not preserved: a historical as_of
+    # does not read 13F direction at all.
+    historical_13f = ref_date < date.today()
 
     sector_flows: dict[str, dict[str, float]] = defaultdict(
         lambda: {"inflow": 0.0, "outflow": 0.0}
@@ -2153,7 +2142,9 @@ def get_aggregate_flows(
         confidence = r[5] if len(r) > 5 else None
         raw_evidence = r[6] if len(r) > 6 else None
 
-        if source_type == "13f" and not _is_qualified_13f_dollar_flow_row(confidence, raw_evidence):
+        if source_type == "13f" and (
+            historical_13f or not _is_qualified_13f_dollar_flow_row(confidence, raw_evidence)
+        ):
             quarantined_13f += 1
             continue
         if direction == "quarantined":
@@ -2231,7 +2222,7 @@ def get_biggest_movers(engine: Engine, days: int = 7) -> list[dict]:
         rows = conn.execute(
             text(
                 "SELECT id, source_type, actor_name, ticker, amount_usd, "
-                "direction, confidence, evidence, flow_date "
+                "direction, confidence, evidence, flow_date, created_at "
                 "FROM dollar_flows "
                 "WHERE flow_date >= :cutoff "
                 "ORDER BY amount_usd DESC "
@@ -2254,4 +2245,5 @@ def get_biggest_movers(engine: Engine, days: int = 7) -> list[dict]:
             "sector": _get_sector(r[3]),
         }
         for r in rows
+        if _served_flow_row(r[1], r[6], r[7], r[9])
     ]

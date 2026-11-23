@@ -97,7 +97,7 @@ def _make_engine(*, preserve_ts_text: bool = False):
         Column("confidence", String),
         Column("evidence", Text),
         Column("flow_date", Date, nullable=False),
-        Column("created_at", DateTime),
+        Column("created_at", DateTime, server_default=text("CURRENT_TIMESTAMP")),
     )
     Table(
         "security_identifiers", md,
@@ -175,7 +175,8 @@ def _insert_flow(engine, source_type, actor_name, ticker, amount_usd, direction,
 
 
 def test_13f_skips_3part_metrics_and_unknown_actions():
-    """Only 4-part 13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED} are flows.
+    """Only 4-part 13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED} are flow
+    candidates, and of those only NEW/CLOSED are directional.
 
     Worked synthetic example:
       - 13F:0001067983:TOTAL_VALUE         = $250,000,000,000  (3-part AUM -> skip)
@@ -183,7 +184,9 @@ def test_13f_skips_3part_metrics_and_unknown_actions():
       - 13F:0001067983:TOP5_CONCENTRATION  = 0.72              (3-part ratio -> skip)
       - 13F:0001067983:037833100:UNKNOWN   = $50,000,000       (unknown action -> skip)
       - 13F:0001067983:037833100:NEW       = $120,000,000      (inflow)
-      - 13F:0001067983:594918104:DECREASED = $45,000,000       (outflow)
+      - 13F:0001067983:594918104:CLOSED    = $45,000,000       (outflow)
+      - 13F:0001067983:459200101:DECREASED = $30,000,000       (continuing position:
+        a split cannot be ruled out -> quarantined, not an outflow)
     Expected net 13F flow = +$120M - $45M = +$75M (never +$250.125B).
     """
     engine = _make_engine()
@@ -205,18 +208,32 @@ def test_13f_skips_3part_metrics_and_unknown_actions():
                     "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
                     "qualified_for_directional_flow": True,
                 })
-    _insert_raw(engine, "13F:0001067983:594918104:DECREASED", filing_day, 45_000_000.0,
+    # CLOSED: 300k shares at the prior quarter-end implied $150 = $45M outflow.
+    _insert_raw(engine, "13F:0001067983:594918104:CLOSED", filing_day, 45_000_000.0,
                 payload={
                     "manager_name": "Berkshire", "cusip": "594918104", "issuer_name": "MICROSOFT CORP",
                     "ticker": "MSFT", "value_units": "usd", "value_multiplier": 1,
-                    "share_type": "SH", "prev_shares": 300_000, "curr_shares": 150_000,
-                    "delta_shares": -150_000, "curr_value_usd": 45_000_000.0,
-                    "prev_value_usd": 90_000_000.0,
+                    "share_type": "SH", "prev_shares": 300_000, "curr_shares": 0,
+                    "delta_shares": -300_000, "curr_value_usd": 0.0,
+                    "prev_value_usd": 45_000_000.0,
+                    "flow_estimation_method": "delta_shares_x_prev_quarter_end_price",
+                    "qualified_for_directional_flow": True,
+                })
+    # A well-formed 4-part DECREASED row (continuing position) is a flow
+    # candidate but never a verified direction.
+    _insert_raw(engine, "13F:0001067983:459200101:DECREASED", filing_day, 30_000_000.0,
+                payload={
+                    "manager_name": "Berkshire", "cusip": "459200101", "issuer_name": "IBM",
+                    "ticker": "IBM", "value_units": "usd", "value_multiplier": 1,
+                    "share_type": "SH", "prev_shares": 400_000, "curr_shares": 200_000,
+                    "delta_shares": -200_000, "curr_value_usd": 30_000_000.0,
+                    "prev_value_usd": 60_000_000.0,
                     "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
                     "qualified_for_directional_flow": True,
                 })
 
-    flows = dollar_flows._normalize_13f_flows(engine, days=30)
+    reasons: dict[str, int] = {}
+    flows = dollar_flows._normalize_13f_flows(engine, days=30, quarantine_reasons=reasons)
 
     assert len(flows) == 2
     by_ticker = {f["ticker"]: f for f in flows}
@@ -225,6 +242,9 @@ def test_13f_skips_3part_metrics_and_unknown_actions():
     assert by_ticker["AAPL"]["amount_usd"] == pytest.approx(120_000_000.0)
     assert by_ticker["MSFT"]["direction"] == "outflow"
     assert by_ticker["MSFT"]["amount_usd"] == pytest.approx(45_000_000.0)
+    # The 3-part metrics and UNKNOWN action are skipped, not quarantined; the
+    # DECREASED row is the only quarantine.
+    assert reasons == {"no_corporate_action_coverage": 1}
 
     net = sum(f["amount_usd"] if f["direction"] == "inflow" else -f["amount_usd"] for f in flows)
     assert net == pytest.approx(75_000_000.0)
@@ -236,27 +256,28 @@ def test_13f_dedups_vintages_and_respects_pit_as_of():
     obs1 = date(2026, 11, 10)
     obs2 = date(2026, 11, 18)
 
-    # Older vintage of obs1 pulled Nov 11 ($10M), revision pulled Nov 15 ($12M).
+    # Older vintage of obs1 pulled Nov 11 (NEW 50k sh x $200 = $10M), revision
+    # pulled Nov 15 (NEW 60k sh x $200 = $12M).
     _insert_raw(
-        engine, "13F:0001067983:037833100:INCREASED", obs1, 10_000_000.0,
+        engine, "13F:0001067983:037833100:NEW", obs1, 10_000_000.0,
         pull_ts=datetime(2026, 11, 11, 10, 0, 0),
         payload={
             "manager_name": "Berkshire", "cusip": "037833100", "ticker": "AAPL",
             "value_units": "usd", "value_multiplier": 1, "share_type": "SH",
-            "prev_shares": 100_000, "curr_shares": 150_000, "delta_shares": 50_000,
-            "curr_value_usd": 30_000_000.0, "prev_value_usd": 20_000_000.0,
+            "prev_shares": 0, "curr_shares": 50_000, "delta_shares": 50_000,
+            "curr_value_usd": 10_000_000.0, "prev_value_usd": 0.0,
             "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
             "qualified_for_directional_flow": True,
         },
     )
     _insert_raw(
-        engine, "13F:0001067983:037833100:INCREASED", obs1, 12_000_000.0,
+        engine, "13F:0001067983:037833100:NEW", obs1, 12_000_000.0,
         pull_ts=datetime(2026, 11, 15, 10, 0, 0),
         payload={
             "manager_name": "Berkshire", "cusip": "037833100", "ticker": "AAPL",
             "value_units": "usd", "value_multiplier": 1, "share_type": "SH",
-            "prev_shares": 100_000, "curr_shares": 160_000, "delta_shares": 60_000,
-            "curr_value_usd": 32_000_000.0, "prev_value_usd": 20_000_000.0,
+            "prev_shares": 0, "curr_shares": 60_000, "delta_shares": 60_000,
+            "curr_value_usd": 12_000_000.0, "prev_value_usd": 0.0,
             "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
             "qualified_for_directional_flow": True,
         },
@@ -845,15 +866,19 @@ def test_13f_straddling_cutover_pair_creates_no_spurious_change_event(monkeypatc
     curr_acc = "0001067983-23-000010"
     prev_acc = "0001067983-22-000099"
     # Both filings represent AAPL = $100M unchanged; MSFT moves $100M -> $150M (+50%).
+    # NVDA is opened in the post-cutover filing ($30M) and IBM is closed out of
+    # the pre-cutover filing ($20M, stated as 20,000 thousands).
     # Pre-cutover (2022-11-14) XML is in thousands; post-cutover (2023-02-14) XML is in whole dollars.
     xml_by_acc = {
         curr_acc: _make_13f_xml([
             ("APPLE INC", "037833100", 100_000_000, 500_000),
             ("MICROSOFT CORP", "594918104", 150_000_000, 600_000),
+            ("NVIDIA CORP", "67066G104", 30_000_000, 100_000),
         ]),
         prev_acc: _make_13f_xml([
             ("APPLE INC", "037833100", 100_000, 500_000),
             ("MICROSOFT CORP", "594918104", 100_000, 400_000),
+            ("IBM", "459200101", 20_000, 100_000),
         ]),
     }
 
@@ -884,26 +909,52 @@ def test_13f_straddling_cutover_pair_creates_no_spurious_change_event(monkeypatc
     results = puller._pull_13f_filings()
     assert len(results) == 1
     assert results[0]["status"] == "SUCCESS"
-    assert results[0]["changes_detected"] == 1
+    assert results[0]["changes_detected"] == 3
 
-    # AAPL unchanged across cutover -> no spurious event; MSFT increased by $50M delta.
-    assert len(inserted_raw) == 1
-    row = inserted_raw[0]
-    assert row["series_id"] == "13F:1067983:594918104:INCREASED"
-    assert row["value"] == pytest.approx(50_000_000.0)
-    assert row["raw_payload"]["curr_value_usd"] == 150_000_000
-    assert row["raw_payload"]["prev_value_usd"] == 100_000_000
+    # AAPL unchanged across cutover -> no spurious event. Every value below is
+    # in dollars: a wrong multiplier would read 1000x too small or too large.
+    by_series = {r["series_id"]: r for r in inserted_raw}
+    assert set(by_series) == {
+        "13F:1067983:67066G104:NEW",
+        "13F:1067983:459200101:CLOSED",
+        "13F:1067983:594918104:INCREASED",
+    }
+
+    new_row = by_series["13F:1067983:67066G104:NEW"]
+    assert new_row["value"] == pytest.approx(30_000_000.0)
+    assert new_row["raw_payload"]["curr_value_usd"] == 30_000_000
+    assert new_row["raw_payload"]["value_multiplier"] == 1
+    assert new_row["raw_payload"]["qualified_for_directional_flow"] is True
+
+    closed_row = by_series["13F:1067983:459200101:CLOSED"]
+    assert closed_row["value"] == pytest.approx(20_000_000.0)
+    assert closed_row["raw_payload"]["prev_value_usd"] == 20_000_000
+    assert closed_row["raw_payload"]["prev_value_multiplier"] == 1000
+    assert closed_row["raw_payload"]["qualified_for_directional_flow"] is True
+
+    # MSFT is a continuing position: the $50M share-based estimate (200k x $250)
+    # is recorded, but a split cannot be ruled out, so it is not a direction.
+    incr_row = by_series["13F:1067983:594918104:INCREASED"]
+    assert incr_row["value"] == pytest.approx(50_000_000.0)
+    assert incr_row["raw_payload"]["curr_value_usd"] == 150_000_000
+    assert incr_row["raw_payload"]["prev_value_usd"] == 100_000_000
+    assert incr_row["raw_payload"]["qualified_for_directional_flow"] is False
+    assert incr_row["raw_payload"]["unqualified_reason"] == "no_corporate_action_coverage"
 
     with engine.connect() as conn:
         sig_rows = conn.execute(
-            text("SELECT ticker, signal_value FROM signal_sources WHERE source_type = 'institutional'")
+            text("SELECT ticker, signal_value FROM signal_sources WHERE source_type = :st"),
+            {"st": "institutional"},
         ).fetchall()
-    assert len(sig_rows) == 1
-    assert sig_rows[0][0] == "594918104"
-    sig_payload = json.loads(sig_rows[0][1])
-    assert sig_payload["value_usd"] == pytest.approx(50_000_000.0)
-    assert sig_payload["curr_value_usd"] == pytest.approx(150_000_000.0)
-    assert sig_payload["prev_value_usd"] == pytest.approx(100_000_000.0)
+    # Only the NEW and CLOSED positions become directional signals.
+    sig_by_cusip = {r[0]: json.loads(r[1]) for r in sig_rows}
+    assert set(sig_by_cusip) == {"67066G104", "459200101"}
+    assert sig_by_cusip["67066G104"]["action"] == "NEW"
+    assert sig_by_cusip["67066G104"]["value_usd"] == pytest.approx(30_000_000.0)
+    assert sig_by_cusip["67066G104"]["curr_value_usd"] == pytest.approx(30_000_000.0)
+    assert sig_by_cusip["459200101"]["action"] == "CLOSED"
+    assert sig_by_cusip["459200101"]["value_usd"] == pytest.approx(20_000_000.0)
+    assert sig_by_cusip["459200101"]["prev_value_usd"] == pytest.approx(20_000_000.0)
 
 
 def test_13f_compare_holdings_uses_delta_for_increased_decreased_and_keeps_new_closed():

@@ -109,33 +109,14 @@ _EDGAR_RATE_DELAY: float = 0.15
 _POSITION_CHANGE_THRESHOLD: float = 0.20
 
 # A same-CUSIP split or reverse split between two quarter-ends changes the
-# reported share count with no trade (100 x $100 -> 200 x $50). 13F rows carry
-# CUSIPs, not tickers, so no trustworthy split adjustment is available here.
-# A continuing position whose implied per-share price (value / shares) moved by
-# more than this factor either way between the two quarter-ends is quarantined
-# as a possible split or corporate action instead of being read as a trade.
-# Known limit: a split ratio below this factor (e.g. 5-for-4) offset by a
-# market move can still pass; a ticker-level split source would close that.
-MAX_QUARTER_IMPLIED_PRICE_RATIO: float = 1.25
-
-
-def implied_price_suggests_corporate_action(
-    prev_value: float, prev_shares: float, curr_value: float, curr_shares: float,
-) -> bool:
-    """True when the implied per-share price moved too far for a no-action quarter.
-
-    Also True for any non-finite or non-positive input: the transition cannot
-    be shown to be free of a split, so it is not read as a trade.
-    """
-    try:
-        prev_price = float(prev_value) / float(prev_shares)
-        curr_price = float(curr_value) / float(curr_shares)
-    except (TypeError, ValueError, ZeroDivisionError):
-        return True
-    if not (math.isfinite(prev_price) and math.isfinite(curr_price)) or prev_price <= 0 or curr_price <= 0:
-        return True
-    ratio = curr_price / prev_price
-    return ratio > MAX_QUARTER_IMPLIED_PRICE_RATIO or ratio < 1.0 / MAX_QUARTER_IMPLIED_PRICE_RATIO
+# reported share count with no trade (100 x $100 -> 200 x $50), and a price
+# move can mask it (2-for-1 plus +70% reads $100 -> $85). 13F rows carry
+# CUSIPs, not tickers, and GRID has no CUSIP-level corporate-action coverage,
+# so a continuing position's share change is never a verified direction: it
+# is emitted as an estimated holdings change with
+# qualified_for_directional_flow=False. NEW and CLOSED positions are
+# split-invariant (whole position value at one quarter-end) and stay qualified.
+CONTINUING_POSITION_UNQUALIFIED_REASON = "no_corporate_action_coverage"
 
 # SEC Form 13F XML <value> switched from thousands of dollars to whole dollars
 # for filings made on or after 2023-01-03 (SEC Final Rule, Release No. 34-95148).
@@ -862,12 +843,6 @@ class InstitutionalFlowsPuller(BasePuller):
             if prev_st != curr_st:
                 _quarantine("mixed_share_types")
                 continue
-            # Checked before the zero-delta skip: a split with an offsetting
-            # trade can leave the share count flat, which is not "no change".
-            if implied_price_suggests_corporate_action(prev_val, prev_shares, curr_val, curr_shares):
-                _quarantine("possible_split_or_corporate_action")
-                continue
-
             delta_shares = curr_shares - prev_shares
             if delta_shares == 0:
                 continue  # Constant shares at a new price = 0 estimated cash flow
@@ -902,7 +877,9 @@ class InstitutionalFlowsPuller(BasePuller):
                 "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
                 "value_units": "usd",
                 "share_type": curr_st,
-                "qualified_for_directional_flow": True,
+                # Unverified direction: a split or reverse split cannot be ruled out.
+                "qualified_for_directional_flow": False,
+                "unqualified_reason": CONTINUING_POSITION_UNQUALIFIED_REASON,
             })
 
         return changes
@@ -1065,6 +1042,7 @@ class InstitutionalFlowsPuller(BasePuller):
                                 "prev_value_multiplier": prev_mult,
                                 "share_type": chg.get("share_type", "SH"),
                                 "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
+                                "unqualified_reason": chg.get("unqualified_reason"),
                                 "filing_accession": curr_acc,
                                 "prev_filing_accession": prev_acc,
                                 "filing_date": obs_date.isoformat(),
@@ -1092,6 +1070,10 @@ class InstitutionalFlowsPuller(BasePuller):
                         # still sees each instrument.
                         chg_ticker = str(chg.get("cusip") or "").strip()
                         if not chg_ticker:
+                            continue
+                        if chg.get("qualified_for_directional_flow") is not True:
+                            # INCREASED/DECREASED without corporate-action
+                            # coverage is not a directional signal.
                             continue
                         try:
                             conn.execute(
@@ -1137,6 +1119,7 @@ class InstitutionalFlowsPuller(BasePuller):
                                         "flow_estimation_method": chg.get("flow_estimation_method"),
                                         "value_units": chg.get("value_units", "usd"),
                                         "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
+                                        "unqualified_reason": chg.get("unqualified_reason"),
                                         "filing_accession": curr_acc,
                                         "prev_filing_accession": prev_acc,
                                         "report_date": curr_report_date,

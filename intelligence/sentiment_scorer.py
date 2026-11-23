@@ -326,7 +326,7 @@ def _score_flows(engine: Engine, days: int = 7) -> SentimentComponent:
                 "SELECT direction, amount_usd, confidence, evidence "
                 "FROM dollar_flows "
                 "WHERE flow_date >= :cutoff AND flow_date <= :today "
-                "AND source_type = '13f'"
+                "AND source_type = '13f' AND created_at IS NOT NULL"
             ), {"cutoff": cutoff, "today": today}).fetchall():
                 if is_qualified_13f_dollar_flow_row(confidence, evidence):
                     rows.append((direction, amount))

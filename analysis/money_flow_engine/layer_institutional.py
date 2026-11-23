@@ -7,7 +7,7 @@ Quarterly data with intra-quarter estimates from ETF flow proxies.
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -44,7 +44,7 @@ _13F_ROWS_SQL = text(
     "FROM dollar_flows "
     "WHERE source_type = '13f' "
     "AND flow_date >= :start AND flow_date <= :end "
-    "AND (created_at IS NULL OR created_at < :known_before)"
+    "AND created_at IS NOT NULL AND created_at < :known_before"
 )
 
 
@@ -55,14 +55,42 @@ def _build_13f_aggregate(engine: Engine, as_of: date) -> FlowNode:
     estimated holdings-position change at reference prices, never observed
     cash or transaction flow. Only rows that pass
     ``intelligence.dollar_flows.is_qualified_13f_dollar_flow_row`` count, and
-    only rows written before the end of ``as_of`` (``created_at``); inflows add
+    only rows already written when the live read runs (``created_at``); inflows add
     and outflows subtract. With no qualified row the value is unknown (None),
-    never zero.
+    never zero. A row with no ``created_at`` has no known capture clock and
+    never counts.
+
+    Live only: ``dollar_flows`` is a derived table rebuilt (range delete and
+    re-insert) on each refresh, so the rows visible at a past date are not
+    preserved. An ``as_of`` before today is refused as
+    ``historical_replay_unavailable``, unread, rather than answered from rows
+    written later.
     """
     from intelligence.dollar_flows import is_qualified_13f_dollar_flow_row
 
+    if as_of < date.today():
+        return FlowNode(
+            id="13f_aggregate",
+            label="13F Estimated Holdings-Position Change",
+            layer=LAYER_ID,
+            value=None,
+            change_1m=None,
+            confidence="estimated",
+            source="SEC:13F-HR",
+            metadata={
+                "lookback_days": 90,
+                "measure": "estimated_holdings_position_change_at_reference_prices",
+                "not_observed_cash_flow": True,
+                "coverage": "historical_replay_unavailable",
+                "qualified": 0, "unqualified": 0, "rows_read": 0,
+            },
+        )
+
     lookback = as_of - timedelta(days=90)
-    known_before = datetime.combine(as_of + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    # Live read: a row counts once written, up to this instant (UTC). Using
+    # "now" rather than a date boundary keeps a local as_of date and a UTC
+    # timestamp from disagreeing near midnight.
+    known_before = datetime.now(timezone.utc)
     value: float | None = None
     counts = {"qualified": 0, "unqualified": 0, "rows_read": 0}
 

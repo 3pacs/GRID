@@ -172,6 +172,7 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
                     "CASE WHEN source_type = '13f' THEN evidence ELSE NULL END "
                     "FROM dollar_flows "
                     "WHERE flow_date >= :cutoff AND flow_date <= CURRENT_DATE "
+                    "AND NOT (source_type = '13f' AND created_at IS NULL) "
                     "ORDER BY flow_date DESC"
                 ),
                 {"cutoff": cutoff},
@@ -615,6 +616,7 @@ def compute_flow_momentum(engine: Engine, ticker: str, days: int = 30) -> dict[s
                     "WHERE UPPER(ticker) = :ticker "
                     "AND flow_date >= :cutoff "
                     "AND flow_date <= CURRENT_DATE "
+                    "AND NOT (source_type = '13f' AND created_at IS NULL) "
                     "AND direction != 'quarantined' "
                     "ORDER BY flow_date DESC"
                 ),
