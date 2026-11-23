@@ -7,7 +7,8 @@ Covers:
 4. Stale/undated 13F filings mixed into the 7-day convergence window in _scan_institutional.
 5. SMART_MONEY pooled whichever INST_FLOW row sorted last; it now reads no
    institutional series (no INST_FLOW writer; 13F is non-directional).
-6. SMART_MONEY Form 4: only the open-market (P/S) series from SEC_EDGAR, never
+6. SMART_MONEY Form 4: only the reported P/S family from SEC_EDGAR (venue
+   unknown, priced and share-valid counts matched per vintage), never
    all-code NET_SHARES (awards/exercises); dead XBRL:{ticker}:* series.
 """
 
@@ -34,6 +35,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     event,
+    text,
 )
 
 from alpha_research import conviction_scorer as cs
@@ -385,19 +387,30 @@ class TestDefect4Stale13FExcluded:
         assert scs._scan_institutional(engine, "AAPL", AS_OF, 7, {}) is None
 
 
-# ── Defects 5/6: SMART_MONEY reads only open-market Form 4 from SEC_EDGAR ──
+# ── Defects 5/6: SMART_MONEY reads only reported P/S Form 4 from SEC_EDGAR ──
 #
 # Real SQL against an in-memory SQLite raw_series + source_catalog shaped like
 # production (as in tests/test_store_observations.py), so every read goes
-# through store.observations the way it does on griddb. The writer
-# (ingestion/edgar.py) records six series per filing day: all-code NET_SHARES,
-# NET_VALUE, TXN_COUNT, and the open-market (P/S codes) OPEN_MKT_* trio.
+# through store.observations the way it does on griddb. ingestion/edgar.py
+# writes, per filing date and in one transaction (one pull_timestamp): the
+# all-code NET_SHARES / NET_VALUE / TXN_COUNT, the P/S family PS_NET_SHARES /
+# PS_NET_VALUE / PS_TXN_COUNT / PS_SHARES_VALID_COUNT / PS_PRICED_COUNT, and
+# FILINGS_UNREAD. Writer-to-reader fixtures live in
+# tests/test_form4_writer_to_smart_money.py.
 
 sqlite3.register_adapter(date, lambda d: d.isoformat())
 sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
 
 EDGAR_SRC = 1
 OTHER_SRC = 2
+PS_FIELDS = (
+    "PS_NET_SHARES", "PS_NET_VALUE", "PS_TXN_COUNT",
+    "PS_SHARES_VALID_COUNT", "PS_PRICED_COUNT", "FILINGS_UNREAD",
+)
+
+
+def _evening(d: date) -> datetime:
+    return datetime.combine(d, datetime.min.time()) + timedelta(hours=22)
 
 
 class _Form4DB:
@@ -441,27 +454,37 @@ class _Form4DB:
         with self.engine.begin() as c:
             c.execute(self._raw.insert(), [{
                 "series_id": series_id, "source_id": source_id, "obs_date": obs_date,
-                "pull_timestamp": pulled or datetime.combine(obs_date, datetime.min.time()) + timedelta(hours=22),
+                "pull_timestamp": pulled or _evening(obs_date),
                 "value": value, "raw_payload": "{}", "pull_status": status,
             }])
 
     def filing_day(
-        self, obs_date: date, *, net_shares: float, net_value: float, txns: float,
-        open_shares: float, open_value: float, open_txns: float, ticker: str = "AAPL",
+        self, obs_date: date, *, ps_shares: float, ps_value: float, txns: float,
+        valid: float | None = None, priced: float | None = None, unread: float = 0.0,
+        all_code_shares: float = 0.0, all_code_value: float = 0.0, all_code_txns: float = 0.0,
+        pulled: datetime | None = None, skip: tuple[str, ...] = (), ticker: str = "AAPL",
     ) -> None:
-        """One filing day as ingestion/edgar.py writes it (all six series)."""
-        for field, value in (
-            ("NET_SHARES", net_shares), ("NET_VALUE", net_value), ("TXN_COUNT", txns),
-            ("OPEN_MKT_NET_SHARES", open_shares), ("OPEN_MKT_NET_VALUE", open_value),
-            ("OPEN_MKT_TXN_COUNT", open_txns),
-        ):
-            self.add(f"FORM4:{ticker}:{field}", obs_date, value)
+        """One filing date as ingestion/edgar.py writes it: one vintage for all series."""
+        values = {
+            "NET_SHARES": all_code_shares, "NET_VALUE": all_code_value, "TXN_COUNT": all_code_txns,
+            "PS_NET_SHARES": ps_shares, "PS_NET_VALUE": ps_value, "PS_TXN_COUNT": txns,
+            "PS_SHARES_VALID_COUNT": txns if valid is None else valid,
+            "PS_PRICED_COUNT": txns if priced is None else priced,
+            "FILINGS_UNREAD": unread,
+        }
+        for field, value in values.items():
+            if field not in skip:
+                self.add(f"FORM4:{ticker}:{field}", obs_date, value, pulled=pulled or _evening(obs_date))
 
     def score(self, ticker: str = "AAPL", as_of: date = AS_OF) -> cs.LayerResult:
         self.series_read.clear()
         self.sql.clear()
         with self.engine.connect() as c:
             return cs.score_smart_money(c, ticker, as_of_date=as_of)
+
+
+def _no_venue_claim(result: cs.LayerResult) -> bool:
+    return not any("open-market" in s.lower() or "open market" in s.lower() for s in result.signals)
 
 
 class TestDefect5NoPooledInstitutionalRead:
@@ -481,142 +504,170 @@ class TestDefect5NoPooledInstitutionalRead:
 
 class TestDefect6Form4AndCompanyUnavailable:
     @pytest.mark.parametrize(
-        ("open_value", "expected_score", "signal"),
+        ("ps_value", "expected_score", "signal"),
         [
-            (750_000.0, 5, "Insider open-market net buy $750,000"),
-            (100_000.0, 2, "Insider open-market net buy $100,000"),
-            # Open-market insider selling is capped at -2 (routine liquidity / 10b5-1).
-            (-750_000.0, -2, "Insider open-market net sell $750,000"),
-            (-100_000.0, -2, "Insider open-market net sell $100,000"),
-            (0.0, 0, "Insider open-market buys and sells offset (net $0)"),
+            (750_000.0, 5, "Insider reported P/S (non-derivative, venue unknown) net buy $750,000"),
+            (100_000.0, 2, "Insider reported P/S (non-derivative, venue unknown) net buy $100,000"),
+            # Insider selling is capped at -2 (routine liquidity / 10b5-1).
+            (-750_000.0, -2, "Insider reported P/S (non-derivative, venue unknown) net sell $750,000"),
+            (-100_000.0, -2, "Insider reported P/S (non-derivative, venue unknown) net sell $100,000"),
+            (0.0, 0, "Insider reported P/S (non-derivative, venue unknown) buys and sells "
+                     "offset (fully priced, net $0)"),
         ],
     )
-    def test_open_market_net_value_buy_sell_and_exact_zero(
-        self, open_value: float, expected_score: int, signal: str,
+    def test_fully_priced_window_uses_the_dollar_rule(
+        self, ps_value: float, expected_score: int, signal: str,
     ) -> None:
         db = _Form4DB()
-        db.filing_day(
-            T3, net_shares=1.0, net_value=open_value, txns=2.0,
-            open_shares=1.0, open_value=open_value, open_txns=2.0,
-        )
+        db.filing_day(T3, ps_shares=1.0, ps_value=ps_value, txns=2.0)
 
         result = db.score()
 
         assert result.data_available is True
         assert result.score == expected_score
         assert signal in result.signals
+        assert _no_venue_claim(result)
         # Exact zero is a measured offset, never labelled as an outflow.
-        assert not (open_value == 0 and any("net sell" in s for s in result.signals))
-
-    def test_award_only_issuer_is_not_scored_as_buying(self) -> None:
-        db = _Form4DB()
-        # Grants and option exercises (codes A/M): all-code NET_SHARES and
-        # NET_VALUE are large and positive, the open-market series are zero.
-        db.filing_day(
-            T3, net_shares=250_000.0, net_value=40_000_000.0, txns=4.0,
-            open_shares=0.0, open_value=0.0, open_txns=0.0,
-        )
-
-        result = db.score()
-
-        assert result.score == 0
-        assert result.data_available is True
-        assert "No open-market insider transactions in 90d (awards/exercises only)" in result.signals
-        assert "FORM4:AAPL:NET_SHARES" not in db.series_read
-        assert "FORM4:AAPL:NET_VALUE" not in db.series_read
-
-    def test_legacy_all_code_series_alone_is_unavailable(self) -> None:
-        db = _Form4DB()
-        # Rows written before the open-market split: only the all-code trio.
-        db.add("FORM4:AAPL:NET_SHARES", T3, 25_000.0)
-        db.add("FORM4:AAPL:NET_VALUE", T3, 4_000_000.0)
-        db.add("FORM4:AAPL:TXN_COUNT", T3, 3.0)
-
-        result = db.score()
-
-        assert result.data_available is False
-        assert result.score == 0
-        assert any("open-market Form 4 series unavailable" in s for s in result.signals)
-
-    def test_other_source_rows_on_the_same_series_and_date_are_ignored(self) -> None:
-        db = _Form4DB()
-        db.filing_day(
-            T3, net_shares=500.0, net_value=100_000.0, txns=1.0,
-            open_shares=500.0, open_value=100_000.0, open_txns=1.0,
-        )
-        # Simultaneous rows from another source for the same series and date,
-        # pulled later: neither summed in nor allowed to replace EDGAR's row.
-        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", T3, 9_000_000.0,
-               pulled=_utc(T3) + timedelta(hours=11), source_id=OTHER_SRC)
-        db.add("FORM4:AAPL:OPEN_MKT_TXN_COUNT", T3, 0.0,
-               pulled=_utc(T3) + timedelta(hours=11), source_id=OTHER_SRC)
-
-        result = db.score()
-
-        assert result.data_available is True
-        assert result.score == 2
-        assert "Insider open-market net buy $100,000" in result.signals
-
-        only_other = _Form4DB()
-        only_other.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", T3, 9_000_000.0, source_id=OTHER_SRC)
-        assert only_other.score().data_available is False
-
-    def test_only_rows_pulled_by_the_end_of_as_of_count(self) -> None:
-        db = _Form4DB()
-        db.filing_day(
-            T3, net_shares=500.0, net_value=100_000.0, txns=1.0,
-            open_shares=500.0, open_value=100_000.0, open_txns=1.0,
-        )
-        # A revision of the same date pulled the day after as_of, a FAILED
-        # marker, and a later filing day pulled after as_of: none counts.
-        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", T3, 900_000.0,
-               pulled=datetime.combine(AS_OF + timedelta(days=1), datetime.min.time()))
-        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", AS_OF, 5_000_000.0, status="FAILED")
-        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", AS_OF, 5_000_000.0,
-               pulled=datetime.combine(AS_OF + timedelta(days=2), datetime.min.time()))
-
-        assert db.score().score == 2
-
-        # A row pulled late on the as-of day itself is known by its end.
-        db.add("FORM4:AAPL:OPEN_MKT_NET_VALUE", AS_OF - timedelta(days=1), 450_000.0,
-               pulled=datetime.combine(AS_OF, datetime.min.time()) + timedelta(hours=23))
-        assert db.score().score == 5
-
-    def test_window_sums_filing_days_within_90_days(self) -> None:
-        db = _Form4DB()
-        for d in (T3, AS_OF - timedelta(days=60)):
-            db.filing_day(
-                d, net_shares=1_000.0, net_value=300_000.0, txns=1.0,
-                open_shares=1_000.0, open_value=300_000.0, open_txns=1.0,
-            )
-        db.filing_day(
-            AS_OF - timedelta(days=120), net_shares=-90_000.0, net_value=-9_000_000.0, txns=1.0,
-            open_shares=-90_000.0, open_value=-9_000_000.0, open_txns=1.0,
-        )
-
-        result = db.score()
-
-        assert result.score == 5
-        assert "Insider open-market net buy $600,000" in result.signals
+        assert not (ps_value == 0 and any("net sell" in s for s in result.signals))
 
     @pytest.mark.parametrize(
-        ("open_shares", "open_txns", "expected_score"),
-        [(25_000.0, 2.0, 5), (1_000.0, 1.0, 2), (-25_000.0, 1.0, -2), (-1_000.0, 1.0, -2), (0.0, 2.0, 0)],
+        ("ps_shares", "ps_value", "txns", "priced", "expected_score", "signal"),
+        [
+            # P +100 unpriced and S 10 @ $10: the priced dollars alone read -$100.
+            (90.0, -100.0, 2.0, 1.0, 2, "net share buy +90 sh (dollars unverified: 1 of 2 P/S rows unpriced)"),
+            (60.0, 0.0, 2.0, 0.0, 2, "net share buy +60 sh (dollars unverified: 2 of 2 P/S rows unpriced)"),
+            (-25_000.0, 0.0, 1.0, 0.0, -2, "net share sell -25,000 sh (dollars unverified: 1 of 1"),
+            (0.0, 500.0, 2.0, 1.0, 0, "share buys and sells offset (net 0 sh; dollars unverified"),
+        ],
     )
-    def test_open_market_shares_fallback_when_value_series_absent(
-        self, open_shares: float, open_txns: float, expected_score: int,
+    def test_unpriced_rows_fall_back_to_share_direction_only(
+        self, ps_shares: float, ps_value: float, txns: float, priced: float,
+        expected_score: int, signal: str,
     ) -> None:
         db = _Form4DB()
-        db.add("FORM4:AAPL:OPEN_MKT_NET_SHARES", T3, open_shares)
-        db.add("FORM4:AAPL:OPEN_MKT_TXN_COUNT", T3, open_txns)
-        # Legacy all-code shares disagree in sign: never read.
-        db.add("FORM4:AAPL:NET_SHARES", T3, 999_999.0)
+        db.filing_day(T3, ps_shares=ps_shares, ps_value=ps_value, txns=txns, priced=priced)
 
         result = db.score()
 
         assert result.data_available is True
         assert result.score == expected_score
+        assert any(signal in s for s in result.signals), result.signals
+        assert not any("$" in s for s in result.signals if "P/S" in s)  # no dollar total claimed
+
+    def test_award_only_window_scores_zero_without_claiming_award_codes(self) -> None:
+        db = _Form4DB()
+        # Grants and exercises: all-code sums large and positive, no P/S rows.
+        db.filing_day(
+            T3, ps_shares=0.0, ps_value=0.0, txns=0.0,
+            all_code_shares=250_000.0, all_code_value=40_000_000.0, all_code_txns=4.0,
+        )
+
+        result = db.score()
+
+        assert result.score == 0
+        assert result.data_available is True
+        assert (
+            "No reported non-derivative P/S insider transactions in the observed Form 4 data (90d)"
+            in result.signals
+        )
+        assert not any("award" in s.lower() for s in result.signals if "P/S" in s)
         assert "FORM4:AAPL:NET_SHARES" not in db.series_read
+        assert "FORM4:AAPL:NET_VALUE" not in db.series_read
+
+    def test_legacy_rows_alone_are_unavailable(self) -> None:
+        db = _Form4DB()
+        # Rows the writer stored before 2026-11-23: all-code and OPEN_MKT_*,
+        # with an imputed-$0 price and no validity counts.
+        for field, value in (
+            ("NET_SHARES", 25_000.0), ("NET_VALUE", 4_000_000.0), ("TXN_COUNT", 3.0),
+            ("OPEN_MKT_NET_SHARES", 25_000.0), ("OPEN_MKT_NET_VALUE", 750_000.0),
+            ("OPEN_MKT_TXN_COUNT", 2.0),
+        ):
+            db.add(f"FORM4:AAPL:{field}", T3, value)
+
+        result = db.score()
+
+        assert result.data_available is False
+        assert result.score == 0
+        assert any("P/S series unavailable" in s for s in result.signals)
+        assert not any("OPEN_MKT" in sid for sid in db.series_read)
+
+    @pytest.mark.parametrize(
+        "damage",
+        ["missing_series", "mixed_vintage", "unread_filing", "invalid_share_rows", "priced_over_valid"],
+    )
+    def test_one_incomplete_date_withholds_the_window(self, damage: str) -> None:
+        db = _Form4DB()
+        db.filing_day(T3, ps_shares=10_000.0, ps_value=750_000.0, txns=3.0)
+        d = AS_OF - timedelta(days=20)
+        if damage == "missing_series":
+            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, skip=("PS_PRICED_COUNT",))
+        elif damage == "mixed_vintage":
+            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, skip=("PS_NET_VALUE",))
+            db.add("FORM4:AAPL:PS_NET_VALUE", d, -5_000.0, pulled=_evening(d) + timedelta(hours=1))
+        elif damage == "unread_filing":
+            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, unread=1.0)
+        elif damage == "invalid_share_rows":
+            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=2.0, valid=1.0, priced=1.0)
+        else:
+            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, priced=2.0)
+
+        result = db.score()
+
+        assert result.data_available is False
+        assert result.score == 0
+        assert any("P/S data incomplete on 1 filing date(s)" in s for s in result.signals)
+
+    def test_other_source_rows_on_the_same_series_and_date_are_ignored(self) -> None:
+        db = _Form4DB()
+        db.filing_day(T3, ps_shares=500.0, ps_value=100_000.0, txns=1.0)
+        # Simultaneous rows from another source for the same series and date,
+        # pulled later: neither summed in nor allowed to replace EDGAR's rows.
+        for field, value in (("PS_NET_VALUE", 9_000_000.0), ("PS_PRICED_COUNT", 0.0)):
+            db.add(f"FORM4:AAPL:{field}", T3, value,
+                   pulled=_evening(T3) + timedelta(hours=1), source_id=OTHER_SRC)
+
+        result = db.score()
+
+        assert result.data_available is True
+        assert result.score == 2
+        assert "Insider reported P/S (non-derivative, venue unknown) net buy $100,000" in result.signals
+
+        only_other = _Form4DB()
+        only_other.filing_day(T3, ps_shares=500.0, ps_value=9_000_000.0, txns=1.0)
+        with only_other.engine.begin() as c:
+            c.execute(text("UPDATE raw_series SET source_id = :o"), {"o": OTHER_SRC})
+        assert only_other.score().data_available is False
+
+    def test_only_vintages_pulled_by_the_end_of_as_of_count(self) -> None:
+        db = _Form4DB()
+        db.filing_day(T3, ps_shares=500.0, ps_value=100_000.0, txns=1.0)
+        # A full re-pull of the same date after as_of, a FAILED marker, and a
+        # later filing date pulled after as_of: none counts.
+        db.filing_day(T3, ps_shares=9_000.0, ps_value=900_000.0, txns=2.0,
+                      pulled=_evening(AS_OF + timedelta(days=1)))
+        db.add("FORM4:AAPL:PS_NET_VALUE", AS_OF, 5_000_000.0, status="FAILED")
+        db.filing_day(AS_OF, ps_shares=9_000.0, ps_value=5_000_000.0, txns=1.0,
+                      pulled=_evening(AS_OF + timedelta(days=2)))
+
+        assert db.score().score == 2
+
+        # A filing date pulled late on the as-of day itself is known by its end.
+        db.filing_day(AS_OF - timedelta(days=1), ps_shares=900.0, ps_value=450_000.0, txns=1.0,
+                      pulled=datetime.combine(AS_OF, datetime.min.time()) + timedelta(hours=23))
+        assert db.score().score == 5
+
+    def test_window_sums_filing_days_within_90_days(self) -> None:
+        db = _Form4DB()
+        for d in (T3, AS_OF - timedelta(days=60)):
+            db.filing_day(d, ps_shares=1_000.0, ps_value=300_000.0, txns=1.0)
+        db.filing_day(AS_OF - timedelta(days=120), ps_shares=-90_000.0, ps_value=-9_000_000.0,
+                      txns=1.0, unread=1.0)
+
+        result = db.score()
+
+        assert result.score == 5
+        assert "Insider reported P/S (non-derivative, venue unknown) net buy $600,000" in result.signals
 
     def test_company_layer_returns_none_because_no_xbrl_writer_exists(self) -> None:
         conn = _RawSeriesConn({})

@@ -362,48 +362,143 @@ def score_company(
     return LayerResult("COMPANY", max(score, 0), 15, trust, tuple(signals), has_data)
 
 
-# Signed Form 4 point mapping over the trailing 90d window:
-#   Positive side keeps the +5 / +2 scale for net open-market buying.
-#   Negative side is capped at -2 because open-market net selling by insiders
-#   is mostly routine liquidity / 10b5-1 selling (not strong bearish conviction).
-#   Because of this negative branch, SMART_MONEY layer scores can be negative.
-#   Primary  — FORM4:{ticker}:OPEN_MKT_NET_VALUE (signed USD, open-market P/S):
-#     >= +$500k -> +5,  > $0 -> +2,  == $0 -> 0 (buys and sells offset),  < $0 -> -2
-#   Fallback — FORM4:{ticker}:OPEN_MKT_NET_SHARES (open-market P/S only):
-#     >= +10k   -> +5,  > 0  -> +2,  == 0  -> 0,  < 0  -> -2
-#   Never FORM4:{ticker}:NET_SHARES / NET_VALUE: those sum every transaction
-#   code, so grants, awards and option exercises would read as buying (Codex
-#   HOLD on #1353 5c4c7b32). With only those legacy series the Form 4 part is
-#   unavailable. Reads go through store.observations.read_window_known_at with
-#   the explicit writer source (SEC_EDGAR): one row per date, the latest
-#   vintage pulled by the end of the as-of date; another source's rows never
-#   mix in.
+# SMART_MONEY Form 4 input: reported non-derivative P/S transactions only
+# (ingestion/edgar.py's FORM4:{ticker}:PS_* family), trailing 90 days.
+#
+#   * P/S is "open market or private" (SEC Form 4 codes); the venue is not
+#     reported, so nothing here is labelled open-market (Codex HOLD on #1353
+#     67ce6bdc). Never the all-code NET_SHARES / NET_VALUE: they count awards,
+#     exercises and imputed $0 prices as trades (Codex HOLD on 5c4c7b32).
+#   * Each filing date must carry all of _FORM4_PS_FIELDS from one vintage (one
+#     pull_timestamp: the writer inserts a ticker's series in one transaction),
+#     with every P/S row share-valid and no unread filings. One incomplete
+#     date in the window and the Form 4 part is not scored: a partial window
+#     can flip the sign.
+#   * Dollars count only when every P/S row in the window is priced:
+#       >= +$500k -> +5,  > $0 -> +2,  == $0 -> 0 (fully priced offset),  < $0 -> -2
+#   * With any unpriced row, share direction only (the dollar total is unknown):
+#       > 0 sh -> +2,  == 0 -> 0,  < 0 -> -2
+#   * A window whose P/S count is 0 scores 0: no P/S in the observed Form 4
+#     data (it does not prove the other codes were awards or exercises).
+#   * Legacy rows (OPEN_MKT_*, all-code only) carry no validity counts: unavailable.
+#   Selling is capped at -2 because insider net selling is mostly routine
+#   liquidity / 10b5-1 selling (not strong bearish conviction), so SMART_MONEY
+#   layer scores can be negative.
+#   Reads go through store.observations.read_window_known_at with the explicit
+#   writer source (SEC_EDGAR): per series and date, the latest vintage pulled
+#   by the end of the as-of date (UTC); another source's rows never mix in.
 FORM4_SOURCE = "SEC_EDGAR"
+_FORM4_PS_FIELDS: tuple[str, ...] = (
+    "PS_NET_SHARES", "PS_NET_VALUE", "PS_TXN_COUNT",
+    "PS_SHARES_VALID_COUNT", "PS_PRICED_COUNT", "FILINGS_UNREAD",
+)
+_FORM4_WINDOW_DAYS = 90
+_FORM4_PS_LABEL = "Insider reported P/S (non-derivative, venue unknown)"
 _FORM4_VALUE_STRONG_USD = 500_000.0
-_FORM4_SHARES_STRONG = 10_000.0
 _FORM4_SELL_CAP = -2.0
 
 
-def _form4_window_sum(conn, ticker: str, field: str, as_of_date: date | None) -> float | None:
-    """Sum of ``FORM4:{ticker}:{field}`` over the trailing 90 days, or None.
+@dataclass(frozen=True)
+class Form4PSWindow:
+    """Reported non-derivative P/S Form 4 evidence over the trailing window."""
 
-    One accepted row per date from the EDGAR writer only: the latest vintage
-    pulled by the end of the as-of date (UTC; pull evidence only, no modeled
-    publication lag). None when there is no row.
-    """
+    verified_dates: int = 0
+    incomplete_dates: int = 0
+    txns: float = 0.0
+    shares_valid: float = 0.0
+    priced: float = 0.0
+    net_shares: float = 0.0
+    net_value: float = 0.0  # priced rows only; meaningful iff priced == txns
+
+    @property
+    def dollars_verified(self) -> bool:
+        return self.txns > 0 and self.priced == self.txns
+
+
+def _is_count(value: float) -> bool:
+    return math.isfinite(value) and value >= 0 and value == int(value)
+
+
+def _form4_ps_window(conn, ticker: str, as_of_date: date | None) -> Form4PSWindow:
+    """Match the PS_* series per filing date and check them before summing."""
     as_of = _resolve_as_of_date(as_of_date)
-    observations = read_window_known_at(
-        conn,
-        f"FORM4:{ticker}:{field}",
-        as_of=as_of,
-        lag=None,
-        source=FORM4_SOURCE,
-        start=as_of - timedelta(days=90),
+    by_field = {
+        field: {
+            o.obs_date: o
+            for o in read_window_known_at(
+                conn,
+                f"FORM4:{ticker}:{field}",
+                as_of=as_of,
+                lag=None,
+                source=FORM4_SOURCE,
+                start=as_of - timedelta(days=_FORM4_WINDOW_DAYS),
+            )
+        }
+        for field in _FORM4_PS_FIELDS
+    }
+    dates = sorted({d for rows in by_field.values() for d in rows})
+    verified = incomplete = 0
+    txns = shares_valid = priced = net_shares = net_value = 0.0
+    for d in dates:
+        obs = [by_field[field].get(d) for field in _FORM4_PS_FIELDS]
+        if any(o is None for o in obs) or len({o.pull_timestamp for o in obs}) != 1:
+            incomplete += 1  # a series missing, or the series from different vintages
+            continue
+        d_shares, d_value, d_txns, d_valid, d_priced, d_unread = (o.value for o in obs)
+        if not (
+            math.isfinite(d_shares) and math.isfinite(d_value)
+            and all(_is_count(v) for v in (d_txns, d_valid, d_priced, d_unread))
+            and d_unread == 0 and d_valid == d_txns and d_priced <= d_valid
+        ):
+            incomplete += 1  # unread filings, invalid share rows, or bad counts
+            continue
+        verified += 1
+        txns += d_txns
+        shares_valid += d_valid
+        priced += d_priced
+        net_shares += d_shares
+        net_value += d_value
+    return Form4PSWindow(verified, incomplete, txns, shares_valid, priced, net_shares, net_value)
+
+
+def _score_form4_ps(window: Form4PSWindow) -> tuple[float, str, bool]:
+    """(points, signal, has_data) for SMART_MONEY's Form 4 part."""
+    label = _FORM4_PS_LABEL
+    if window.incomplete_dates:
+        return (0.0, (
+            f"Insider Form 4 P/S data incomplete on {window.incomplete_dates} filing date(s) "
+            f"in {_FORM4_WINDOW_DAYS}d (missing series, mixed vintages, invalid share rows "
+            "or unread filings); not scored"
+        ), False)
+    if window.verified_dates == 0:
+        return (0.0, (
+            "Insider Form 4 P/S series unavailable (legacy OPEN_MKT_* and all-code rows "
+            "carry no price or share validity; not scored)"
+        ), False)
+    if window.txns == 0:
+        return (0.0, (
+            f"No reported non-derivative P/S insider transactions in the observed Form 4 "
+            f"data ({_FORM4_WINDOW_DAYS}d)"
+        ), True)
+    if window.dollars_verified:
+        value = window.net_value
+        if value >= _FORM4_VALUE_STRONG_USD:
+            return 5.0, f"{label} net buy ${value:,.0f}", True
+        if value > 0:
+            return 2.0, f"{label} net buy ${value:,.0f}", True
+        if value < 0:
+            return _FORM4_SELL_CAP, f"{label} net sell ${abs(value):,.0f}", True
+        return 0.0, f"{label} buys and sells offset (fully priced, net $0)", True
+    unpriced = (
+        f"dollars unverified: {window.txns - window.priced:,.0f} of {window.txns:,.0f} "
+        "P/S rows unpriced"
     )
-    values = [o.value for o in observations if o.value is not None and math.isfinite(o.value)]
-    if not values:
-        return None
-    return float(sum(values))
+    shares = window.net_shares
+    if shares > 0:
+        return 2.0, f"{label} net share buy +{shares:,.0f} sh ({unpriced})", True
+    if shares < 0:
+        return _FORM4_SELL_CAP, f"{label} net share sell {shares:,.0f} sh ({unpriced})", True
+    return 0.0, f"{label} share buys and sells offset (net 0 sh; {unpriced})", True
 
 
 def score_smart_money(
@@ -411,53 +506,9 @@ def score_smart_money(
     ticker: str,
     as_of_date: date | None = None,
 ) -> LayerResult:
-    """Layer 3: Are insiders/institutions buying?"""
-    score = 0.0
-    signals = []
-    has_data = False
-
-    form4_value = _form4_window_sum(conn, ticker, "OPEN_MKT_NET_VALUE", as_of_date)
-    form4_shares = (
-        None if form4_value is not None
-        else _form4_window_sum(conn, ticker, "OPEN_MKT_NET_SHARES", as_of_date)
-    )
-    form4_txns = _form4_window_sum(conn, ticker, "OPEN_MKT_TXN_COUNT", as_of_date)
-    if form4_value is None and form4_shares is None:
-        signals.append(
-            "Insider open-market Form 4 series unavailable "
-            "(all-code NET_SHARES includes awards and exercises; not scored)"
-        )
-    elif form4_txns is not None and form4_txns == 0:
-        # Form 4 days exist but none carried a P/S code: awards/exercises only.
-        has_data = True
-        signals.append("No open-market insider transactions in 90d (awards/exercises only)")
-    elif form4_value is not None:
-        has_data = True
-        if form4_value >= _FORM4_VALUE_STRONG_USD:
-            score += 5
-            signals.append(f"Insider open-market net buy ${form4_value:,.0f}")
-        elif form4_value > 0:
-            score += 2
-            signals.append(f"Insider open-market net buy ${form4_value:,.0f}")
-        elif form4_value < 0:
-            # Open-market insider selling is mostly routine liquidity/10b5-1; cap at -2.
-            score += _FORM4_SELL_CAP
-            signals.append(f"Insider open-market net sell ${abs(form4_value):,.0f}")
-        else:
-            signals.append("Insider open-market buys and sells offset (net $0)")
-    else:
-        has_data = True
-        if form4_shares >= _FORM4_SHARES_STRONG:
-            score += 5
-            signals.append(f"Insider open-market net share buy +{form4_shares:,.0f} sh")
-        elif form4_shares > 0:
-            score += 2
-            signals.append(f"Insider open-market net share buy +{form4_shares:,.0f} sh")
-        elif form4_shares < 0:
-            score += _FORM4_SELL_CAP
-            signals.append(f"Insider open-market net share sell {form4_shares:,.0f} sh")
-        else:
-            signals.append("Insider open-market share buys and sells offset (net 0)")
+    """Layer 3: Are insiders buying? (Form 4 P/S only; no institutional input.)"""
+    points, form4_signal, has_data = _score_form4_ps(_form4_ps_window(conn, ticker, as_of_date))
+    signals = [form4_signal]
 
     # Institutional flow: no code writes INST_FLOW:*, and institutional (13F)
     # holdings changes are non-directional (owner decision 2026-11-23), so the
@@ -468,7 +519,7 @@ def score_smart_money(
     trust = 0.85 if has_data else 0.15
     return LayerResult(
         "SMART_MONEY",
-        max(_FORM4_SELL_CAP, min(score, 15.0)),
+        max(_FORM4_SELL_CAP, min(points, 15.0)),
         15,
         trust,
         tuple(signals),

@@ -174,30 +174,33 @@ def test_score_company_returns_none_without_xbrl_writer() -> None:
     assert conn.calls == []
 
 
-def test_score_smart_money_scores_open_market_form4_only(
+def test_score_smart_money_scores_reported_ps_form4_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sums = {"OPEN_MKT_NET_VALUE": 600_000.0, "OPEN_MKT_TXN_COUNT": 3.0}
-    requested: list[str] = []
+    calls: list[tuple[str, date | None]] = []
 
-    def fake_window_sum(_conn: Any, ticker: str, field: str, as_of_date: date | None) -> float | None:
-        assert ticker == "ABC"
-        assert as_of_date == date(2026, 5, 13)
-        requested.append(field)
-        return sums.get(field)
+    def fake_window(_conn: Any, ticker: str, as_of_date: date | None) -> cs.Form4PSWindow:
+        calls.append((ticker, as_of_date))
+        return cs.Form4PSWindow(
+            verified_dates=2, txns=3.0, shares_valid=3.0, priced=3.0,
+            net_shares=12_000.0, net_value=600_000.0,
+        )
 
-    monkeypatch.setattr(cs, "_form4_window_sum", fake_window_sum)
+    monkeypatch.setattr(cs, "_form4_ps_window", fake_window)
 
     result = cs.score_smart_money(object(), "ABC", as_of_date=date(2026, 5, 13))
 
+    assert calls == [("ABC", date(2026, 5, 13))]
     assert result.name == "SMART_MONEY"
     assert result.score == 5
-    assert "Insider open-market net buy $600,000" in result.signals
+    assert "Insider reported P/S (non-derivative, venue unknown) net buy $600,000" in result.signals
     assert any("Institutional flow unavailable" in s for s in result.signals)
     assert result.data_available is True
-    # All-code series include awards and exercises: never requested.
-    assert "NET_SHARES" not in requested
-    assert "NET_VALUE" not in requested
+
+
+def test_form4_ps_fields_never_include_all_code_or_legacy_series() -> None:
+    assert not {"NET_SHARES", "NET_VALUE", "TXN_COUNT"} & set(cs._FORM4_PS_FIELDS)
+    assert not any(f.startswith("OPEN_MKT") for f in cs._FORM4_PS_FIELDS)
 
 
 def test_score_crowd_buckets_short_ftd_and_put_call_extremes(

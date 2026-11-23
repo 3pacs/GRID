@@ -38,15 +38,25 @@ from intelligence import signal_extractor  # noqa: E402
 FIXTURE = Path(__file__).parent / "fixtures" / "form4_synthetic.xml"
 
 # The fixture: P 100 @ 10 (A), S 40 @ 12 (D), A 50 @ 0 (A), F 10 @ 11 (D),
-# plus one derivative option grant that must not be counted.
+# plus one derivative option grant that must not be counted. P and S are
+# "open market or private" (SEC): the PS_* sums do not claim a venue.
 EXPECTED = {
     "net_shares": 100.0 - 40.0 + 50.0 - 10.0,
     "net_value": 1000.0 - 480.0 + 0.0 - 110.0,
     "txn_count": 4.0,
-    "open_mkt_net_shares": 60.0,
-    "open_mkt_net_value": 520.0,
-    "open_mkt_txn_count": 2.0,
+    "ps_net_shares": 60.0,
+    "ps_net_value": 520.0,
+    "ps_txn_count": 2.0,
+    "ps_shares_valid_count": 2.0,
+    "ps_priced_count": 2.0,
 }
+
+# Series written per filing date (FILINGS_UNREAD comes from the pull).
+SERIES = (
+    "NET_SHARES", "NET_VALUE", "TXN_COUNT",
+    "PS_NET_SHARES", "PS_NET_VALUE", "PS_TXN_COUNT",
+    "PS_SHARES_VALID_COUNT", "PS_PRICED_COUNT", "FILINGS_UNREAD",
+)
 
 
 def _real_table() -> NonDerivativeTable:
@@ -114,7 +124,7 @@ def test_real_empty_table_returns_none():
 # ── aggregation ─────────────────────────────────────────────────────────────
 
 
-def test_aggregate_real_table_signs_and_open_market_split():
+def test_aggregate_real_table_signs_and_ps_split():
     data = edgar_mod.form4_nonderivative_transactions(_f4(_real_table()))
     assert edgar_mod.aggregate_form4_transactions(data) == EXPECTED
 
@@ -135,6 +145,32 @@ def test_aggregate_non_numeric_shares_count_as_zero_with_warning(monkeypatch):
     assert agg["net_value"] == -150.0
     assert agg["txn_count"] == 2.0
     assert warnings, "a coerced share value must be logged"
+    # The P/S sums impute nothing: the unreadable P row is not share-valid.
+    assert agg["ps_txn_count"] == 2.0
+    assert agg["ps_shares_valid_count"] == 1.0
+    assert agg["ps_priced_count"] == 1.0
+    assert agg["ps_net_shares"] == -30.0
+    assert agg["ps_net_value"] == -150.0
+
+
+def test_aggregate_ps_counts_impute_no_price_or_direction():
+    data = pd.DataFrame(
+        {
+            "Code": ["P", "S", "P", "S", "P", "A", "M"],
+            "AcquiredDisposed": ["A", "D", "A", "D", "", "A", "A"],
+            "Shares": [100, 10, 5, -3, 7, 1_000, 500],
+            "Price": [float("nan"), 10.0, 0.0, 9.0, 4.0, 0.0, 2.0],
+        }
+    )
+    agg = edgar_mod.aggregate_form4_transactions(data)
+    assert agg["ps_txn_count"] == 5.0
+    # Valid: P 100 (unpriced), S 10 @ 10, P 5 @ $0. Not: negative shares, blank A/D.
+    assert agg["ps_shares_valid_count"] == 3.0
+    assert agg["ps_priced_count"] == 1.0  # only S 10 @ 10; a $0 price is not a price
+    assert agg["ps_net_shares"] == 100.0 - 10.0 + 5.0
+    assert agg["ps_net_value"] == -100.0
+    # The all-code legacy sums still count the award and exercise.
+    assert agg["txn_count"] == 7.0
 
 
 # ── the pull ────────────────────────────────────────────────────────────────
@@ -170,7 +206,7 @@ def _run_pull(monkeypatch, filings, days_back=7):
     return out, inserts
 
 
-def test_pull_writes_six_series_per_filing_date(monkeypatch):
+def test_pull_writes_nine_series_per_filing_date(monkeypatch):
     today = date.today()
     yesterday = today - timedelta(days=1)
     filings = [
@@ -181,7 +217,7 @@ def test_pull_writes_six_series_per_filing_date(monkeypatch):
     out, inserts = _run_pull(monkeypatch, filings)
 
     assert out["errors"] == [] and out["status"] == "SUCCESS"
-    assert out["rows_inserted"] == len(inserts) == 12
+    assert out["rows_inserted"] == len(inserts) == 2 * len(SERIES)
     for sql, _params in inserts:
         assert "'SUCCESS'" in sql and ":od" in sql and ":val" in sql  # bound, not formatted
     by_key = {(p["sid"], p["od"]): p["val"] for _sql, p in inserts}
@@ -189,9 +225,14 @@ def test_pull_writes_six_series_per_filing_date(monkeypatch):
     assert by_key[("FORM4:EXMP:NET_SHARES", today)] == 2 * EXPECTED["net_shares"]
     assert by_key[("FORM4:EXMP:NET_VALUE", today)] == 2 * EXPECTED["net_value"]
     assert by_key[("FORM4:EXMP:TXN_COUNT", today)] == 8.0
-    assert by_key[("FORM4:EXMP:OPEN_MKT_NET_SHARES", today)] == 120.0
-    assert by_key[("FORM4:EXMP:OPEN_MKT_NET_VALUE", today)] == 1040.0
-    assert by_key[("FORM4:EXMP:OPEN_MKT_TXN_COUNT", today)] == 4.0
+    assert by_key[("FORM4:EXMP:PS_NET_SHARES", today)] == 120.0
+    assert by_key[("FORM4:EXMP:PS_NET_VALUE", today)] == 1040.0
+    assert by_key[("FORM4:EXMP:PS_TXN_COUNT", today)] == 4.0
+    assert by_key[("FORM4:EXMP:PS_SHARES_VALID_COUNT", today)] == 4.0
+    assert by_key[("FORM4:EXMP:PS_PRICED_COUNT", today)] == 4.0
+    assert by_key[("FORM4:EXMP:FILINGS_UNREAD", today)] == 0.0
+    assert {sid for sid, od in by_key if od == today} == {f"FORM4:EXMP:{s}" for s in SERIES}
+    assert not any("OPEN_MKT" in sid for sid, _od in by_key)
     assert by_key[("FORM4:EXMP:NET_SHARES", yesterday)] == EXPECTED["net_shares"]
     # obs_date is the filing date (when it became public), never later.
     assert {od for _sid, od in by_key} == {today, yesterday}
@@ -206,7 +247,7 @@ def test_pull_stops_at_days_back_cutoff(monkeypatch):
 
     assert old.calls["n"] == 0 and after_old.calls["n"] == 0  # break, not continue
     assert {p["od"] for _s, p in inserts} == {today}
-    assert out["rows_inserted"] == 6
+    assert out["rows_inserted"] == len(SERIES)
 
 
 def test_pull_reads_at_most_20_filings(monkeypatch):
@@ -217,6 +258,51 @@ def test_pull_reads_at_most_20_filings(monkeypatch):
     assert sum(f.calls["n"] for f in filings) == 20
     by_sid = {p["sid"]: p["val"] for _s, p in inserts}
     assert by_sid["FORM4:EXMP:TXN_COUNT"] == 20 * EXPECTED["txn_count"]
+    # Five same-day filings were never read: the date is marked incomplete.
+    assert by_sid["FORM4:EXMP:FILINGS_UNREAD"] == 1.0
+    assert sum(f.calls["n"] for f in filings[20:]) == 0  # inspected by date only
+
+
+def test_pull_cap_marks_an_older_unread_date_in_the_window(monkeypatch):
+    today = date.today()
+    older = today - timedelta(days=2)
+    filings = [_filing(today, _f4(_real_table())) for _ in range(20)]
+    filings += [_filing(older, _f4(_real_table())) for _ in range(3)]
+    _out, inserts = _run_pull(monkeypatch, filings)
+
+    by_key = {(p["sid"], p["od"]): p["val"] for _s, p in inserts}
+    assert by_key[("FORM4:EXMP:FILINGS_UNREAD", today)] == 0.0
+    assert by_key[("FORM4:EXMP:FILINGS_UNREAD", older)] == 1.0
+    assert by_key[("FORM4:EXMP:PS_TXN_COUNT", older)] == 0.0
+
+
+def test_pull_cap_ignores_a_next_filing_older_than_the_window(monkeypatch):
+    today = date.today()
+    filings = [_filing(today, _f4(_real_table())) for _ in range(20)]
+    filings.append(_filing(today - timedelta(days=30), _f4(_real_table())))
+    _out, inserts = _run_pull(monkeypatch, filings, days_back=7)
+
+    by_key = {(p["sid"], p["od"]): p["val"] for _s, p in inserts}
+    assert by_key[("FORM4:EXMP:FILINGS_UNREAD", today)] == 0.0
+    assert {od for _sid, od in by_key} == {today}
+
+
+def test_pull_marks_a_filing_that_failed_to_parse(monkeypatch):
+    today = date.today()
+
+    def broken():
+        raise ValueError("malformed ownership XML")
+
+    filings = [
+        _filing(today, _f4(_real_table())),
+        SimpleNamespace(filing_date=today, obj=broken, calls={"n": 0}),
+    ]
+    out, inserts = _run_pull(monkeypatch, filings)
+
+    by_key = {(p["sid"], p["od"]): p["val"] for _s, p in inserts}
+    assert out["errors"] == []
+    assert by_key[("FORM4:EXMP:FILINGS_UNREAD", today)] == 1.0
+    assert by_key[("FORM4:EXMP:PS_TXN_COUNT", today)] == EXPECTED["ps_txn_count"]
 
 
 @pytest.mark.parametrize(
@@ -235,7 +321,9 @@ def test_pull_writes_nothing_for_filings_without_transactions(monkeypatch, f4):
 @pytest.mark.parametrize(
     "metric",
     ["NET_SHARES", "NET_VALUE", "TXN_COUNT",
-     "OPEN_MKT_NET_SHARES", "OPEN_MKT_NET_VALUE", "OPEN_MKT_TXN_COUNT"],
+     "OPEN_MKT_NET_SHARES", "OPEN_MKT_NET_VALUE", "OPEN_MKT_TXN_COUNT",
+     "PS_NET_SHARES", "PS_NET_VALUE", "PS_TXN_COUNT",
+     "PS_SHARES_VALID_COUNT", "PS_PRICED_COUNT", "FILINGS_UNREAD"],
 )
 def test_signal_extractor_skips_form4_aggregates(metric):
     entry = next(e for e in signal_extractor.EXTRACTORS if e["pattern"] == "FORM4:%")

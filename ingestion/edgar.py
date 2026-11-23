@@ -76,11 +76,26 @@ def resolve_sec_identity(identity: str | None = None) -> str:
     return DEFAULT_SEC_IDENTITY
 
 
-# Form 4 transaction codes for open-market trades (P = purchase, S = sale).
-# Everything else (A award, M exercise, F tax withholding, G gift, ...) is a
-# non-market transaction that moves share counts without an insider choosing
-# to trade at the market price.
-FORM4_OPEN_MARKET_CODES: frozenset[str] = frozenset({"P", "S"})
+# Form 4 transaction codes P and S. The SEC defines them as an "open market
+# or private" purchase (P) or sale (S)
+# (https://www.sec.gov/edgar/searchedgar/ownershipformcodes.html), so the code
+# does not say where a trade happened: a private P purchase carries the same
+# code as an exchange buy. The PS_* series below are "reported non-derivative
+# P/S, venue unknown". Everything else (A award, M exercise, F tax
+# withholding, G gift, ...) moves share counts without an insider buying or
+# selling.
+FORM4_PS_CODES: frozenset[str] = frozenset({"P", "S"})
+
+# At most this many recent Form 4 filings are read per ticker and pull.
+_FORM4_FILING_CAP = 20
+
+# Per-filing-date keys of one ticker's Form 4 aggregate (see
+# aggregate_form4_transactions); ``filings_unread`` is added by the pull.
+_FORM4_DAY_KEYS: tuple[str, ...] = (
+    "net_shares", "net_value", "txn_count",
+    "ps_net_shares", "ps_net_value", "ps_txn_count",
+    "ps_shares_valid_count", "ps_priced_count", "filings_unread",
+)
 
 
 def form4_nonderivative_transactions(f4: Any) -> pd.DataFrame | None:
@@ -103,12 +118,25 @@ def form4_nonderivative_transactions(f4: Any) -> pd.DataFrame | None:
 
 
 def aggregate_form4_transactions(data: pd.DataFrame) -> dict[str, float]:
-    """Net shares, net value and count for one filing's transactions.
+    """Sums and counts over one filing's non-derivative transactions.
 
-    Sign convention: ``AcquiredDisposed == "D"`` is negative, anything else
-    is positive. Value is signed shares times price, with a missing price
-    counted as 0. ``open_mkt_*`` repeats the sums over open-market trades only
-    (codes P and S).
+    All-code (legacy convention, kept as written since 2026-11): ``net_shares``,
+    ``net_value`` and ``txn_count`` over every code. ``AcquiredDisposed == "D"``
+    is negative and anything else positive; a non-numeric share count and a
+    missing price are counted as 0, so these include awards, exercises and
+    imputed $0 prices.
+
+    P/S only, nothing imputed:
+
+    - ``ps_txn_count``: rows coded P or S.
+    - ``ps_shares_valid_count``: P/S rows with a finite, non-negative share
+      count and an ``A``/``D`` code. ``ps_net_shares`` sums only these rows
+      (``D`` negative).
+    - ``ps_priced_count``: share-valid P/S rows with a reported price above 0.
+      ``ps_net_value`` sums signed shares times price over only these rows.
+
+    A reader can trust ``ps_net_shares`` only when every P/S row is
+    share-valid, and ``ps_net_value`` only when every P/S row is priced.
     """
     def column(name: str) -> pd.Series:
         if name in data.columns:
@@ -116,27 +144,42 @@ def aggregate_form4_transactions(data: pd.DataFrame) -> dict[str, float]:
         return pd.Series([None] * len(data), index=data.index, dtype=object)
 
     raw_shares = column("Shares")
-    shares = pd.to_numeric(raw_shares, errors="coerce")
-    coerced = int((shares.isna() & raw_shares.notna()).sum())
+    num_shares = pd.to_numeric(raw_shares, errors="coerce")
+    coerced = int((num_shares.isna() & raw_shares.notna()).sum())
     if coerced:
         log.warning(
             "Form 4: {n} transaction share value(s) not numeric, counted as 0",
             n=coerced,
         )
-    shares = shares.fillna(0.0).astype(float)
-    price = pd.to_numeric(column("Price"), errors="coerce").fillna(0.0).astype(float)
-    sign = column("AcquiredDisposed").astype(str).str.strip().str.upper().eq("D")
+    shares = num_shares.fillna(0.0).astype(float)
+    num_price = pd.to_numeric(column("Price"), errors="coerce")
+    price = num_price.fillna(0.0).astype(float)
+    acq_disp = column("AcquiredDisposed").astype(str).str.strip().str.upper()
+    sign = acq_disp.eq("D")
     signed = shares.where(~sign, -shares)
     value = signed * price
-    open_mkt = column("Code").astype(str).str.strip().str.upper().isin(FORM4_OPEN_MARKET_CODES)
+    ps = column("Code").astype(str).str.strip().str.upper().isin(FORM4_PS_CODES)
+    share_valid = (
+        ps
+        & num_shares.ge(0)
+        & num_shares.lt(float("inf"))
+        & acq_disp.isin(("A", "D"))
+    )
+    priced = share_valid & num_price.gt(0) & num_price.lt(float("inf"))
     return {
         "net_shares": float(signed.sum()),
         "net_value": float(value.sum()),
         "txn_count": float(len(data)),
-        "open_mkt_net_shares": float(signed[open_mkt].sum()),
-        "open_mkt_net_value": float(value[open_mkt].sum()),
-        "open_mkt_txn_count": float(open_mkt.sum()),
+        "ps_net_shares": float(signed[share_valid].sum()),
+        "ps_net_value": float(value[priced].sum()),
+        "ps_txn_count": float(ps.sum()),
+        "ps_shares_valid_count": float(share_valid.sum()),
+        "ps_priced_count": float(priced.sum()),
     }
+
+
+def _empty_form4_day() -> dict[str, float]:
+    return {key: 0.0 for key in _FORM4_DAY_KEYS}
 
 
 class EDGARPuller(BasePuller):
@@ -198,6 +241,29 @@ class EDGARPuller(BasePuller):
             if isinstance(filing.filing_date, date)
             else pd.Timestamp(filing.filing_date).date()
         )
+
+    @classmethod
+    def _first_unread_form4_date(
+        cls, filings: Any, cutoff: date, fallback: date | None,
+    ) -> date | None:
+        """Date of the first filing past the Form 4 cap, if it is in the window.
+
+        Filings arrive newest first, so the filings the cap left unread are
+        dated at or before the last one read. ``None`` when there is no such
+        filing or it is older than ``cutoff``; ``fallback`` (the last date
+        read) when the next filing cannot be inspected.
+        """
+        try:
+            nxt = filings[_FORM4_FILING_CAP]
+        except IndexError:
+            return None
+        except Exception:  # noqa: BLE001 — unknown container: assume a cut-off date
+            return fallback
+        try:
+            nxt_date = cls._filing_date(nxt)
+        except Exception:  # noqa: BLE001
+            return fallback
+        return nxt_date if nxt_date >= cutoff else None
 
     def _stored_13f_dates(self, cik: str) -> set[date]:
         """Filing dates whose 13F metrics this source already stored for ``cik``.
@@ -380,11 +446,19 @@ class EDGARPuller(BasePuller):
         Stores insider activity aggregated by filing date (``obs_date`` is
         the date the Form 4 was filed, when it became public), over each
         filing's non-derivative transactions:
-        - FORM4:{ticker}:NET_SHARES — net shares acquired (+) / disposed (-)
-        - FORM4:{ticker}:NET_VALUE — net signed shares x price
-        - FORM4:{ticker}:TXN_COUNT — number of transactions
-        - FORM4:{ticker}:OPEN_MKT_NET_SHARES / _NET_VALUE / _TXN_COUNT — the
-          same over open-market trades only (codes P and S)
+        - FORM4:{ticker}:NET_SHARES / NET_VALUE / TXN_COUNT — every code,
+          legacy convention (awards, exercises and imputed $0 prices included)
+        - FORM4:{ticker}:PS_NET_SHARES / PS_NET_VALUE / PS_TXN_COUNT /
+          PS_SHARES_VALID_COUNT / PS_PRICED_COUNT — reported P/S rows only,
+          venue unknown, nothing imputed (see aggregate_form4_transactions)
+        - FORM4:{ticker}:FILINGS_UNREAD — filings of that date the pull saw
+          but did not read: a parse failure, or the per-pull filing cap cut
+          the date off. A reader must treat such a date as incomplete.
+
+        Every series of one ticker is written in one transaction, so a
+        date's series share one ``pull_timestamp`` (one vintage). The
+        OPEN_MKT_* series written before 2026-11-23 imputed a missing price
+        as 0 and carried no validity counts; they are no longer written.
 
         Parameters:
             tickers: Company tickers to track. Defaults to major indices components.
@@ -415,18 +489,21 @@ class EDGARPuller(BasePuller):
 
                 # Aggregate transactions by date
                 daily_agg: dict[date, dict[str, float]] = {}
+                cutoff = date.today() - timedelta(days=days_back)
+                hit_cutoff = False
+                seen = 0
+                last_date: date | None = None
 
-                for filing in form4_filings[:20]:  # Limit to recent filings
+                for filing in form4_filings[:_FORM4_FILING_CAP]:  # Limit to recent filings
+                    seen += 1
+                    filing_date: date | None = None
                     try:
-                        filing_date = (
-                            filing.filing_date
-                            if isinstance(filing.filing_date, date)
-                            else pd.Timestamp(filing.filing_date).date()
-                        )
+                        filing_date = self._filing_date(filing)
 
-                        cutoff = date.today() - timedelta(days=days_back)
                         if filing_date < cutoff:
+                            hit_cutoff = True
                             break
+                        last_date = filing_date
 
                         f4 = filing.obj()
                         # Form4 never had a ``transactions`` attribute, so the
@@ -437,9 +514,7 @@ class EDGARPuller(BasePuller):
                             continue
 
                         agg = aggregate_form4_transactions(txns)
-                        day = daily_agg.setdefault(
-                            filing_date, {key: 0.0 for key in agg}
-                        )
+                        day = daily_agg.setdefault(filing_date, _empty_form4_day())
                         for key, val in agg.items():
                             day[key] += val
 
@@ -448,19 +523,26 @@ class EDGARPuller(BasePuller):
                             "Could not parse Form 4 for {t}: {e}",
                             t=ticker, e=str(exc),
                         )
+                        if filing_date is not None:
+                            daily_agg.setdefault(
+                                filing_date, _empty_form4_day()
+                            )["filings_unread"] += 1
 
                     time.sleep(_RATE_LIMIT_DELAY)
+
+                if not hit_cutoff and seen == _FORM4_FILING_CAP:
+                    unread = self._first_unread_form4_date(
+                        form4_filings, cutoff, last_date,
+                    )
+                    if unread is not None:
+                        daily_agg.setdefault(unread, _empty_form4_day())["filings_unread"] += 1
 
                 # Insert aggregated daily data
                 with self.engine.begin() as conn:
                     for fdate, agg in daily_agg.items():
                         metrics = {
-                            f"FORM4:{ticker}:NET_SHARES": agg["net_shares"],
-                            f"FORM4:{ticker}:NET_VALUE": agg["net_value"],
-                            f"FORM4:{ticker}:TXN_COUNT": agg["txn_count"],
-                            f"FORM4:{ticker}:OPEN_MKT_NET_SHARES": agg["open_mkt_net_shares"],
-                            f"FORM4:{ticker}:OPEN_MKT_NET_VALUE": agg["open_mkt_net_value"],
-                            f"FORM4:{ticker}:OPEN_MKT_TXN_COUNT": agg["open_mkt_txn_count"],
+                            f"FORM4:{ticker}:{key.upper()}": agg[key]
+                            for key in _FORM4_DAY_KEYS
                         }
                         for sid, val in metrics.items():
                             if not self._row_exists(sid, fdate, conn):
