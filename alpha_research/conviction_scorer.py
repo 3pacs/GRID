@@ -13,10 +13,10 @@ Layers (weight; inputs read today, then inputs reported unavailable):
   3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4); institutional flow unavailable
   4. CROWD      (15 pts) — SEC fails-to-deliver balance; total put/call shown, not scored; short interest unavailable
   5. NARRATIVE  (10 pts) — nothing scored: Tiingo news count shown, not scored; wiki and GDELT unavailable
-  6. FLOW       (15 pts) — Volatility spike; unusual options not scored, equity put/call unavailable
+  6. FLOW       (15 pts) — Volatility spike; equity put/call shown, not scored; unusual options not scored
   7. CONFIRM    (10 pts) — Price momentum turning, higher low formed
 
-CROWD and NARRATIVE read raw_series through
+CROWD, NARRATIVE and FLOW's equity put/call read raw_series through
 store.observations.read_window_known_at with each writer's own source: a row
 counts only if it was pulled by the end of the as-of date (UTC), and only the
 latest vintage pulled by then. An FTD balance scores only when every row of
@@ -49,7 +49,9 @@ fire for every covered ticker (unusual options), whose counts cannot tell an
 empty fetch from a missing one (Tiingo news), or whose pull clock is not the
 acquisition time (Cboe total put/call). In production those inputs
 had added only wiki's +2, to GOLD and SP500, from series last updated
-2026-04-03. Each report says so (max_attainable_score,
+2026-04-03. The equity put/call ratio the CBOE puller stores since #1397
+(equity_put_call_ratio) is shown in FLOW on the same terms as the total
+ratio and scores nothing. Each report says so (max_attainable_score,
 dormant_alert_levels); raising it needs a separately approved recalibration,
 not a quiet threshold change.
 """
@@ -267,7 +269,8 @@ LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
 # SMART_MONEY goes below zero (the Form 4 sell cap, -2); the others top out
 # where their scored components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4,
 # SMART_MONEY the +5 strong-buy tier, CROWD 5 (FTD; put/call is
-# descriptive), NARRATIVE 0 (news is descriptive), FLOW 5 (volatility),
+# descriptive), NARRATIVE 0 (news is descriptive), FLOW 5 (volatility;
+# equity put/call is descriptive),
 # CONFIRM 3+4+3. The inputs reported unavailable or not scored score nothing,
 # so they add nothing here (CROWD was 13 with short interest and put/call,
 # NARRATIVE 8 with news, wiki and GDELT, FLOW 13 with unusual options and
@@ -716,7 +719,8 @@ def score_smart_money(
 #     CUSIP, sec:ftd_balance:<CUSIP>, with the file's SYMBOL in raw_payload.
 #   * CBOE:totalpc stopped with Cboe's totalpc.csv; the CBOE puller (24 h)
 #     stores the total exchange ratio as put_call_ratio since 2026-11-04.
-#     CBOE:equitypc has no writer.
+#     CBOE:equitypc never had a writer; since #1397 the same daily page's
+#     equity ratio is stored as equity_put_call_ratio (shown, not scored).
 #   * News is written as TIINGO_NEWS:{t}:daily_count (6 h), not
 #     NEWS:{t}:daily_count. wiki_{t} was a one-off topic load ending
 #     2026-04-03, and gdelt_article_count was deleted by the 2026-11-16 GDELT
@@ -742,9 +746,6 @@ WHALE_NOT_SCORED = (
     "Unusual options activity not scored (the WHALE:* detector flags every covered "
     "ticker every day, so a flag is not unusual)"
 )
-EQUITY_PCR_UNAVAILABLE = (
-    "Equity put/call unavailable (no writer; the CBOE puller stores the total ratio only)"
-)
 # Read and shown, never scored (Codex HOLD on #1395 f821c50c): the writer
 # stores a count only when a fetch returns articles, so an empty fetch and a
 # failed or skipped one look alike; it counts every article returned, repeats
@@ -754,13 +755,23 @@ NEWS_NOT_SCORED = (
     "articles, and each count overlaps the last 7 days)"
 )
 # Read and shown, never scored (Codex HOLD on #1395 a994e347): the CBOE
-# puller opens one transaction before its HTTP fetches and leaves
+# puller opened one transaction before its HTTP fetches and leaves
 # pull_timestamp to DEFAULT NOW(), the transaction start, so a session
-# fetched late can carry an earlier pull time and pass an as-of cutoff it did
-# not meet. Scoring it waits for a qualified clock and an approved policy.
+# fetched late could carry an earlier pull time and pass an as-of cutoff it
+# did not meet. Since #1397 it reads every page before the insert
+# transaction opens, so a new row's stamp is at or after the read, but it is
+# still a proxy, and rows stored before that keep the early stamp. Scoring
+# it waits for a qualified clock and an approved policy.
 PCR_NOT_SCORED = (
     "Total put/call not scored (the Cboe puller stamps rows with its transaction start, "
     "not the fetch time)"
+)
+# The equity ratio comes from the same page and writer, so it carries the
+# same proxy clock (Codex HOLD on #1397 cd0b24b1 / 4e30ed90). Shown, adds no
+# points, never makes FLOW available; scoring it needs a qualified clock, a
+# same-tape ablation against the total ratio and an approved policy.
+EQUITY_PCR_NOT_SCORED = (
+    "Equity put/call not scored (same Cboe page and pull-time proxy as the total ratio)"
 )
 
 # CROWD: SEC fails-to-deliver balances (ingestion/altdata/sec_ftd.py).
@@ -812,6 +823,14 @@ _FTD_FILED_AS_SQL = text("""
 PCR_SERIES = "put_call_ratio"
 PCR_SOURCE = "CBOE"
 PCR_FRESH_DAYS = 5
+
+# FLOW: Cboe equity put/call ratio, same page and writer
+# (ingestion/altdata/cboe_indices.py), one value per trading day,
+# market-wide, shown, not scored (EQUITY_PCR_NOT_SCORED). The newest within
+# EQUITY_PCR_FRESH_DAYS is shown.
+EQUITY_PCR_SERIES = "equity_put_call_ratio"
+EQUITY_PCR_SOURCE = "CBOE"
+EQUITY_PCR_FRESH_DAYS = 5
 
 # NARRATIVE: Tiingo news (ingestion/tiingo_news_pull.py), shown, not scored
 # (NEWS_NOT_SCORED). Each day's value is the number of articles a trailing
@@ -1013,15 +1032,28 @@ def score_narrative(
     return _layer_result("NARRATIVE", 0.0, 0.10, signals, False)
 
 
+def _describe_equity_pcr(conn, as_of: date) -> str:
+    """FLOW's equity put/call as a signal; it never scores (EQUITY_PCR_NOT_SCORED)."""
+    obs = _read_known(conn, EQUITY_PCR_SERIES, EQUITY_PCR_SOURCE, as_of, EQUITY_PCR_FRESH_DAYS)
+    if not obs:
+        return f"No equity put/call in the {EQUITY_PCR_FRESH_DAYS} days to {as_of}"
+    return f"Equity put/call, not scored: {obs[-1].value:.2f} ({obs[-1].obs_date})"
+
+
 def score_flow(
     conn,
     ticker: str,
     price: pd.Series,
     as_of_date: date | None = None,
 ) -> LayerResult:
-    """Layer 6: Is money actually moving? Volatility spike (options inputs not scored)."""
+    """Layer 6: Is money actually moving? Volatility spike; options inputs not scored.
+
+    The equity put/call ratio (market-wide) is shown with its date, adds no
+    points and never makes FLOW available (EQUITY_PCR_NOT_SCORED).
+    """
+    as_of = _resolve_as_of_date(as_of_date)
     score = 0.0
-    signals = [WHALE_NOT_SCORED, EQUITY_PCR_UNAVAILABLE]
+    signals = [WHALE_NOT_SCORED, EQUITY_PCR_NOT_SCORED, _describe_equity_pcr(conn, as_of)]
     has_data = False
 
     if price.empty or len(price) < 20:
