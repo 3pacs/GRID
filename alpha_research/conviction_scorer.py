@@ -11,12 +11,12 @@ Layers (weight; inputs read today, then inputs reported unavailable):
   1. SETUP      (17 pts) — VIX, HY spread, curve, drawdown severity
   2. COMPANY    (15 pts) — unavailable: no XBRL:* writer
   3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4); institutional flow unavailable
-  4. CROWD      (15 pts) — SEC fails-to-deliver balance, total put/call; short interest unavailable
+  4. CROWD      (15 pts) — SEC fails-to-deliver balance; total put/call shown, not scored; short interest unavailable
   5. NARRATIVE  (10 pts) — nothing scored: Tiingo news count shown, not scored; wiki and GDELT unavailable
-  6. FLOW       (15 pts) — Volatility spike, equity put/call (market-wide); unusual options not scored
+  6. FLOW       (15 pts) — Volatility spike; unusual options not scored, equity put/call unavailable
   7. CONFIRM    (10 pts) — Price momentum turning, higher low formed
 
-CROWD, NARRATIVE and FLOW's equity put/call read raw_series through
+CROWD and NARRATIVE read raw_series through
 store.observations.read_window_known_at with each writer's own source: a row
 counts only if it was pulled by the end of the as-of date (UTC), and only the
 latest vintage pulled by then. An FTD balance scores only when every row of
@@ -42,16 +42,16 @@ minimum is at or below anything it could have measured. score_high is the
 same with every unknown at its best attainable value (LAYER_ATTAINABLE_SCORE).
 
 CONVICTION (85) and FIRE (70) are dormant: with the current scorers the best
-attainable total is 64 (40.20 of 63.15), so the ladder tops out at SCALE. It
+attainable total is 57 (36.15 of 63.15), so the ladder tops out at SCALE. It
 was 81 (50.95) while CROWD, NARRATIVE and FLOW still counted points from inputs
 that no live writer feeds (short interest, wiki, GDELT, equity put/call), that
-fire for every covered ticker (unusual options), or whose counts cannot tell
-an empty fetch from a missing one (Tiingo news). In production those inputs
+fire for every covered ticker (unusual options), whose counts cannot tell an
+empty fetch from a missing one (Tiingo news), or whose pull clock is not the
+acquisition time (Cboe total put/call). In production those inputs
 had added only wiki's +2, to GOLD and SP500, from series last updated
-2026-04-03. It was 61 until the CBOE puller began storing the equity put/call
-ratio (equity_put_call_ratio, 2026-11-23), which FLOW reads again. Each report
-says so (max_attainable_score, dormant_alert_levels); raising it needs a
-separately approved recalibration, not a quiet threshold change.
+2026-04-03. Each report says so (max_attainable_score,
+dormant_alert_levels); raising it needs a separately approved recalibration,
+not a quiet threshold change.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ class ConvictionReport:
     score_low: int | None = None
     score_high: int | None = None
     # Best total the current scorers can produce over the present layers,
-    # and the alert levels it cannot reach (CONVICTION and FIRE while it is 64).
+    # and the alert levels it cannot reach (CONVICTION while it is 81).
     max_attainable_score: int | None = None
     dormant_alert_levels: tuple[str, ...] = ()
 
@@ -266,13 +266,14 @@ LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
 # Each layer's lowest and highest points its current scorer can produce. Only
 # SMART_MONEY goes below zero (the Form 4 sell cap, -2); the others top out
 # where their scored components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4,
-# SMART_MONEY the +5 strong-buy tier, CROWD 5 (FTD) + 3 (put/call), NARRATIVE
-# 0 (news is descriptive), FLOW 5 (volatility) + 3 (equity put/call), CONFIRM
-# 3+4+3. The inputs reported unavailable or not scored score nothing, so they
-# add nothing here (CROWD was 13 with short interest, NARRATIVE 8 with news,
-# wiki and GDELT, FLOW 13 with unusual options). They bound what an unknown
-# could have been (score_low / score_high) and which alert levels are
-# reachable at all; max_score stays the weight.
+# SMART_MONEY the +5 strong-buy tier, CROWD 5 (FTD; put/call is
+# descriptive), NARRATIVE 0 (news is descriptive), FLOW 5 (volatility),
+# CONFIRM 3+4+3. The inputs reported unavailable or not scored score nothing,
+# so they add nothing here (CROWD was 13 with short interest and put/call,
+# NARRATIVE 8 with news, wiki and GDELT, FLOW 13 with unusual options and
+# equity put/call). They bound what an unknown could have been (score_low /
+# score_high) and which alert levels are reachable at all; max_score stays
+# the weight.
 LAYER_MIN_SCORE: Mapping[str, float] = MappingProxyType({
     "SETUP": 0.0,
     "COMPANY": 0.0,
@@ -286,9 +287,9 @@ LAYER_ATTAINABLE_SCORE: Mapping[str, float] = MappingProxyType({
     "SETUP": 17.0,
     "COMPANY": 15.0,
     "SMART_MONEY": 5.0,
-    "CROWD": 8.0,
+    "CROWD": 5.0,
     "NARRATIVE": 0.0,
-    "FLOW": 8.0,
+    "FLOW": 5.0,
     "CONFIRM": 10.0,
 })
 
@@ -715,9 +716,7 @@ def score_smart_money(
 #     CUSIP, sec:ftd_balance:<CUSIP>, with the file's SYMBOL in raw_payload.
 #   * CBOE:totalpc stopped with Cboe's totalpc.csv; the CBOE puller (24 h)
 #     stores the total exchange ratio as put_call_ratio since 2026-11-04.
-#     CBOE:equitypc never had a writer; since 2026-11-23 the same puller
-#     stores the equity ratio from the same daily page as
-#     equity_put_call_ratio.
+#     CBOE:equitypc has no writer.
 #   * News is written as TIINGO_NEWS:{t}:daily_count (6 h), not
 #     NEWS:{t}:daily_count. wiki_{t} was a one-off topic load ending
 #     2026-04-03, and gdelt_article_count was deleted by the 2026-11-16 GDELT
@@ -743,6 +742,9 @@ WHALE_NOT_SCORED = (
     "Unusual options activity not scored (the WHALE:* detector flags every covered "
     "ticker every day, so a flag is not unusual)"
 )
+EQUITY_PCR_UNAVAILABLE = (
+    "Equity put/call unavailable (no writer; the CBOE puller stores the total ratio only)"
+)
 # Read and shown, never scored (Codex HOLD on #1395 f821c50c): the writer
 # stores a count only when a fetch returns articles, so an empty fetch and a
 # failed or skipped one look alike; it counts every article returned, repeats
@@ -750,6 +752,15 @@ WHALE_NOT_SCORED = (
 NEWS_NOT_SCORED = (
     "News count not scored (Tiingo stores no row for an empty fetch, counts repeated "
     "articles, and each count overlaps the last 7 days)"
+)
+# Read and shown, never scored (Codex HOLD on #1395 a994e347): the CBOE
+# puller opens one transaction before its HTTP fetches and leaves
+# pull_timestamp to DEFAULT NOW(), the transaction start, so a session
+# fetched late can carry an earlier pull time and pass an as-of cutoff it did
+# not meet. Scoring it waits for a qualified clock and an approved policy.
+PCR_NOT_SCORED = (
+    "Total put/call not scored (the Cboe puller stamps rows with its transaction start, "
+    "not the fetch time)"
 )
 
 # CROWD: SEC fails-to-deliver balances (ingestion/altdata/sec_ftd.py).
@@ -796,8 +807,8 @@ _FTD_FILED_AS_SQL = text("""
 """)
 
 # CROWD: Cboe total exchange put/call ratio (ingestion/altdata/cboe_indices.py),
-# one value per trading day, market-wide. The newest must be at most
-# PCR_FRESH_DAYS old (covers a long weekend).
+# one value per trading day, market-wide, shown, not scored (PCR_NOT_SCORED).
+# The newest within PCR_FRESH_DAYS (covers a long weekend) is shown.
 PCR_SERIES = "put_call_ratio"
 PCR_SOURCE = "CBOE"
 PCR_FRESH_DAYS = 5
@@ -815,23 +826,6 @@ NEWS_FETCH_CAP = 50
 
 # FLOW: a volatility spike needs a 60-day baseline of daily returns.
 FLOW_BASELINE_RETURNS = 60
-
-# FLOW: Cboe equity put/call ratio (ingestion/altdata/cboe_indices.py, the
-# "EQUITY PUT/CALL RATIO" of the daily options page CROWD's total ratio comes
-# from), one value per trading day, market-wide. The newest must be at most
-# EQUITY_PCR_FRESH_DAYS old. Above EQUITY_PCR_CONTRARIAN it scores +3 (the
-# legacy CBOE:equitypc rule, unchanged).
-#
-# Like CROWD's total ratio it adds points but never makes FLOW available. The
-# legacy rule set has_data on any value, but the value is the same for every
-# ticker: it would lift FLOW's trust from 0.15 to 0.60 for a ticker with no
-# 60-day price baseline, on no evidence about that ticker, and score_low would
-# then count FLOW's ticker part as measured (_layer_bound keeps market-wide
-# points out of a missing layer's bound).
-EQUITY_PCR_SERIES = "equity_put_call_ratio"
-EQUITY_PCR_SOURCE = "CBOE"
-EQUITY_PCR_FRESH_DAYS = 5
-EQUITY_PCR_CONTRARIAN = 0.8
 
 
 def _panel_instrument_conflict(ticker: str) -> str | None:
@@ -961,7 +955,9 @@ def score_crowd(
     as_of_date: date | None = None,
     ftd_series_ids: Mapping[str, tuple[str, ...]] | None = None,
 ) -> LayerResult:
-    """Layer 4: Is the crowd wrong? FTD balance, total put/call (short interest unavailable).
+    """Layer 4: Is the crowd wrong? FTD balance scored; total put/call shown, not scored.
+
+    Short interest is unavailable.
 
     ``ftd_series_ids`` is _ftd_series_ids for the scan (looked up for this
     ticker when None).
@@ -972,18 +968,14 @@ def score_crowd(
     score, ftd_signal, has_data = _score_ftd(conn, ticker, as_of, ftd_series_ids)
     signals.append(ftd_signal)
 
-    # Put/Call ratio (market-wide: adds points, never makes the layer available)
+    # Total put/call (market-wide): shown, adds no points, never makes the
+    # layer available (PCR_NOT_SCORED).
+    signals.append(PCR_NOT_SCORED)
     pcr_obs = _read_known(conn, PCR_SERIES, PCR_SOURCE, as_of, PCR_FRESH_DAYS)
     if pcr_obs:
-        pcr, pcr_date = pcr_obs[-1].value, pcr_obs[-1].obs_date
-        if pcr > 1.2:
-            score += 3
-            signals.append(f"PCR={pcr:.2f} ({pcr_date}) [MAX BEARISH]")
-        elif pcr > 1.0:
-            score += 1
-            signals.append(f"PCR={pcr:.2f} ({pcr_date}) [BEARISH]")
+        signals.append(f"Total put/call, not scored: {pcr_obs[-1].value:.2f} ({pcr_obs[-1].obs_date})")
     else:
-        signals.append(f"Total put/call unavailable (no {PCR_SERIES} in the {PCR_FRESH_DAYS} days to {as_of})")
+        signals.append(f"No total put/call in the {PCR_FRESH_DAYS} days to {as_of}")
 
     trust = LAYER_FULL_TRUST["CROWD"] if has_data else 0.15
     return _layer_result("CROWD", min(score, 15), trust, signals, has_data)
@@ -1027,10 +1019,9 @@ def score_flow(
     price: pd.Series,
     as_of_date: date | None = None,
 ) -> LayerResult:
-    """Layer 6: Is money actually moving? Volatility spike, equity put/call (unusual options not scored)."""
-    as_of = _resolve_as_of_date(as_of_date)
+    """Layer 6: Is money actually moving? Volatility spike (options inputs not scored)."""
     score = 0.0
-    signals = [WHALE_NOT_SCORED]
+    signals = [WHALE_NOT_SCORED, EQUITY_PCR_UNAVAILABLE]
     has_data = False
 
     if price.empty or len(price) < 20:
@@ -1055,20 +1046,6 @@ def score_flow(
         signals.append(f"Elevated activity ({recent_vol/avg_vol:.1f}x)")
     elif has_data:
         signals.append(f"No volatility spike ({recent_vol/avg_vol:.1f}x the 60d mean)")
-
-    # Equity put/call (market-wide: adds points, never makes the layer available)
-    epcr_obs = _read_known(conn, EQUITY_PCR_SERIES, EQUITY_PCR_SOURCE, as_of, EQUITY_PCR_FRESH_DAYS)
-    if epcr_obs:
-        epcr, epcr_date = epcr_obs[-1].value, epcr_obs[-1].obs_date
-        if epcr > EQUITY_PCR_CONTRARIAN:
-            score += 3
-            signals.append(f"Equity PCR={epcr:.2f} ({epcr_date}) [BEARISH - contrarian buy]")
-        else:
-            signals.append(f"Equity PCR={epcr:.2f} ({epcr_date})")
-    else:
-        signals.append(
-            f"Equity put/call unavailable (no {EQUITY_PCR_SERIES} in the {EQUITY_PCR_FRESH_DAYS} days to {as_of})"
-        )
 
     trust = LAYER_FULL_TRUST["FLOW"] if has_data else 0.15
     return _layer_result("FLOW", min(score, 15), trust, signals, has_data)
