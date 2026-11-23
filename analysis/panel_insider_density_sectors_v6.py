@@ -12,10 +12,11 @@ a STOP or ``discovery_opened``) is witnessed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,7 +25,7 @@ from analysis import panel_insider_density_sectors_v4 as s4
 from analysis import panel_insider_density_v2 as v2
 from analysis import panel_insider_density_v7 as v7
 from analysis import panel_insider_density_v8 as v8
-from analysis.research_forward_log import ForwardLog
+from analysis.research_forward_log import ForwardLog, canonical
 
 VERSION = "vs1-sectors-v6"
 REGISTRY_ID = v8.SECTORS_V6  # "sectors-v6"
@@ -188,4 +189,325 @@ def register(log_dir: Path, now: datetime, code_sha: str, *, v8_log_dir: Path, w
 
 
 def check_open() -> None:
-    raise PermissionError("no reviewed sectors-v6 joint-run harness exists; v8 must be terminal first")
+    raise PermissionError(
+        "no reviewed sectors-v6 joint-run harness exists; sectors-v6 is superseded by vs1-sectors-v7 and can never open"
+    )
+
+
+# --- terminal STOP: superseded unopened by sectors-v7 after v8 terminal STOP ----------------
+
+SUPERSEDED_BY: Mapping[str, Any] | None = {"version": "vs1-sectors-v7"}
+WITNESS_REMOTE_URL = v1.WITNESS_REMOTE_URL
+WITNESS_BRANCH = v1.WITNESS_BRANCH
+WITNESS_REF = "refs/vs1-sectors-v6-witness/main"
+
+STOP_STATUS = "STOP_SUPERSEDED_BY_SECTORS_V7_UNOPENED"
+STOP_SUCCESSOR = "vs1-sectors-v7"
+STOP_RECORDS = 3
+STOP_REASON = (
+    "VS1 v8 ended in witnessed terminal STOP (STOP_SUPERSEDED_BY_V9_UNOPENED) after the XLK benchmark "
+    "failed the TwelveData cross-check under owner ruling R9; sectors-v6 is bound to v8 and is stopped "
+    "unopened, superseded by vs1-sectors-v7 bound to vs1-v9, with no sector probe, Stage-0 or outcome read"
+)
+STOP_BASIS = (
+    "witnessed v8 terminal STOP (owner ruling R9, 2026-10-07, and owner decision 2026-11-22 to proceed "
+    "with vs1-v9); no sectors-v6 probe, Stage-0, freeze, discovery or holdout ran"
+)
+_V8_TERMINAL_KEYS = frozenset({"version", "head_sha256", "records", "status", "witness_path", "witness_tip"})
+
+
+def _is_hex40(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{40}", value))
+
+
+def _stop_required() -> dict[str, Any]:
+    return {
+        "kind": "status",
+        "version": VERSION,
+        "registry_id": REGISTRY_ID,
+        "status": STOP_STATUS,
+        "superseded_by": STOP_SUCCESSOR,
+        "stage0_run": False,
+        "prereg_gate_evaluated": False,
+        "inputs_frozen": False,
+        "discovery_opened": False,
+        "holdout_opened": False,
+        "prereg_sha256": PREREG_BODY_SHA256,
+        "reason": STOP_REASON,
+        "basis": STOP_BASIS,
+        "promotion_allowed": False,
+    }
+
+
+def _chain(log: ForwardLog) -> list[dict]:
+    check = log.verify_chain()
+    if not check["ok"]:
+        raise PermissionError(f"sectors-v6 registry chain is broken: {check['detail']}")
+    records = log.read_all()
+    heads = v1._line_sha256(log)
+    if (
+        len(records) < 2
+        or records[0].get("kind") != "header"
+        or records[1].get("kind") != "preregistration"
+        or REGISTERED_RECORD_SHA256 is None
+        or tuple(heads[:2]) != REGISTERED_RECORD_SHA256
+    ):
+        raise PermissionError("sectors-v6 registry does not start with its pinned two-record registration")
+    return records
+
+
+def check_offhost(vault_repo: Path, *, remote_url: str | None = None) -> v2.OffhostWitness:
+    """Fetch vault main and verify append-only histories of sectors-v6 and v8 witnesses at one tip."""
+    if REGISTERED_ANCHOR_LINE is None:
+        raise PermissionError("sectors-v6 is not registered yet (no pinned anchor line in code)")
+    if v8.REGISTERED_ANCHOR_LINE is None:
+        raise PermissionError("v8 registration anchor is not pinned in code")
+    url = WITNESS_REMOTE_URL if remote_url is None else remote_url
+    repo = Path(vault_repo)
+    v1._git(repo, "rev-parse", "--git-dir")
+    v1._git(
+        repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", url,
+        f"+refs/heads/{WITNESS_BRANCH}:{WITNESS_REF}",
+    )
+    tip = v1._git(repo, "rev-parse", "--verify", f"{WITNESS_REF}^{{commit}}").strip()
+    versions, previous = v2._walk_witness(repo, WITNESS_REF, WITNESS_PATH, REGISTERED_ANCHOR_LINE, url)
+    at_tip = v1._git(repo, "show", f"{tip}:{WITNESS_PATH}", binary=True).replace(b"\r\n", b"\n")
+    if [line for line in at_tip.split(b"\n") if line] != previous:
+        raise PermissionError("sectors-v6 witness at fetched tip is not its last walked version")
+    v8_versions, _ = v2._walk_witness(repo, WITNESS_REF, v8.WITNESS_PATH, v8.REGISTERED_ANCHOR_LINE, url)
+    census = v1.vs1_witness_census(repo, tip)
+    return v2.OffhostWitness(
+        v2._WITNESS_TOKEN,
+        repo,
+        tip,
+        b"\n".join(previous) + b"\n",
+        versions,
+        url,
+        path=WITNESS_PATH,
+        branch=WITNESS_BRANCH,
+        earlier={v8.VERSION: v8_versions[-1]["covered_records"]},
+        census=census,
+    )
+
+
+def require_witness(log_dir: Path, witness: v2.OffhostWitness | None, records_needed: int) -> dict:
+    """Confirm the off-host sectors-v6 witness covers the local chain through ``records_needed``."""
+    if not isinstance(witness, v2.OffhostWitness) or witness.path != WITNESS_PATH:
+        raise PermissionError("sectors-v6 requires its pinned off-host witness (sectors_v6.check_offhost)")
+    log = registry(log_dir)
+    with tempfile.TemporaryDirectory() as scratch:
+        path = Path(scratch) / Path(WITNESS_PATH).name
+        path.write_bytes(witness.content)
+        with log.locked():
+            records = _chain(log)
+            check = log.verify_chain(external_anchors=path)
+    if not check["ok"]:
+        raise PermissionError(f"off-host anchor log does not witness the sectors-v6 registry: {check['detail']}")
+    covered = json.loads(witness.lines[-1])["records"]
+    if covered < records_needed:
+        raise PermissionError(
+            f"off-host anchor log covers {covered} records; it must cover {records_needed} records"
+        )
+    return {"records": len(records), "witnessed_records": covered, "tip": witness.tip}
+
+
+def _check_stop_census(witness: v2.OffhostWitness) -> None:
+    """Ordering guard: v8 must be terminal (3 records) and vs1-v9 / sectors-v7 must not exist yet."""
+    census = witness.census
+    if census.get("unknown"):
+        raise PermissionError(f"unknown VS1 witnesses: {census['unknown']}")
+    files, counts = census.get("files") or {}, census.get("records") or {}
+    if "vs1-v9" in files or "vs1-v9" in counts:
+        raise PermissionError("sectors-v6 STOP must precede vs1-v9 registration (vs1-v9 already witnessed)")
+    if "sectors-v7" in files or "sectors-v7" in counts:
+        raise PermissionError("sectors-v6 STOP must precede sectors-v7 registration (sectors-v7 already witnessed)")
+    expected = v8.BASELINE_REGISTRIES | {v8.REGISTRY_ID, REGISTRY_ID}
+    if set(files) != expected or set(counts) != expected:
+        raise PermissionError("sectors-v6 STOP witness census has missing or extra registries")
+    for key, path in files.items():
+        if path != v1.canonical_witness_path(key):
+            raise PermissionError(f"{key} is not at its canonical witness path")
+    if any(counts[key] != 2 for key in v8.FROZEN_REGISTRIES):
+        raise PermissionError("an older Technology or sectors registry grew past two records")
+    for key, records in v8.TERMINAL_REGISTRIES.items():
+        if counts[key] != records:
+            raise PermissionError(f"{key} witness must cover exactly its terminal STOP")
+    if counts.get(v8.REGISTRY_ID) != v8.STOP_RECORDS:
+        raise PermissionError("sectors-v6 STOP requires a witnessed v8 terminal STOP (3 records)")
+    if counts.get(REGISTRY_ID) != 2 or json.loads(witness.lines[-1]).get("records") != 2:
+        raise PermissionError("sectors-v6's canonical witness is not at the two-record baseline")
+    v7._v6_anchor_at_tip(witness.repo, witness.tip, v7.V6_STOP_HEAD_SHA256)
+    v8._v7_anchor_at_tip(witness.repo, witness.tip, v8.V7_STOP_HEAD_SHA256)
+
+
+def _verify_v8_terminal_at_tip(v8_log_dir: Path, witness: v2.OffhostWitness) -> dict[str, Any]:
+    """Verify v8's 3-record STOP_SUPERSEDED_BY_V9_UNOPENED locally and at ``witness.tip``."""
+    content = v1._git(witness.repo, "show", f"{witness.tip}:{v8.WITNESS_PATH}", binary=True)
+    if b"\r" in content or not content.endswith(b"\n"):
+        raise PermissionError("v8 witness must have canonical LF line endings")
+    lines = content.splitlines()
+    if len(lines) != 2 or lines[0] != v8.REGISTERED_ANCHOR_LINE:
+        raise PermissionError("v8 witness at tip is not an exact two-anchor terminal STOP")
+    try:
+        last_anchor = json.loads(lines[1])
+    except ValueError as exc:
+        raise PermissionError("v8 STOP anchor is not JSON") from exc
+    if (
+        lines[1] != canonical(last_anchor)
+        or last_anchor.get("records") != v8.STOP_RECORDS
+        or last_anchor.get("prev_anchor_sha256") != hashlib.sha256(lines[0]).hexdigest()
+        or not v1._is_hex64(last_anchor.get("head_sha256"))
+    ):
+        raise PermissionError("v8 STOP anchor at tip is malformed")
+    log8 = v8.registry(Path(v8_log_dir))
+    with tempfile.TemporaryDirectory() as scratch:
+        ext = Path(scratch) / Path(v8.WITNESS_PATH).name
+        ext.write_bytes(content)
+        with log8.locked():
+            records8 = v8.V8._chain(log8)
+            check8 = log8.verify_chain(external_anchors=ext)
+            heads8 = v1._line_sha256(log8)
+    if not check8["ok"]:
+        raise PermissionError(f"off-host anchor log does not witness the v8 registry: {check8['detail']}")
+    if len(records8) != v8.STOP_RECORDS or heads8[-1] != last_anchor["head_sha256"]:
+        raise PermissionError("v8 local STOP differs from its witnessed terminal STOP")
+    v8._check_stop_record(records8[-1])
+    if records8[-1].get("status") != v8.STOP_SUPERSEDED_STATUS:
+        raise PermissionError(f"v8 terminal STOP status must be {v8.STOP_SUPERSEDED_STATUS}")
+    return {
+        "version": v8.VERSION,
+        "head_sha256": heads8[-1],
+        "records": v8.STOP_RECORDS,
+        "status": records8[-1]["status"],
+        "witness_path": v8.WITNESS_PATH,
+        "witness_tip": witness.tip,
+    }
+
+
+def _check_stop_record(record: Mapping[str, Any]) -> None:
+    """Accept exactly one STOP kind: STOP_SUPERSEDED_BY_SECTORS_V7_UNOPENED."""
+    if record.get("status") != STOP_STATUS:
+        raise PermissionError(f"sectors-v6 terminal record accepts only {STOP_STATUS}")
+    if any(k.startswith(("v9_", "sectors_v7_")) for k in record):
+        raise PermissionError("sectors-v6 STOP must not contain a v9 or sectors-v7 hash")
+    required = _stop_required()
+    allowed = frozenset(required) | {"run_at", "decision_ref", "prev_sha256", "v8_terminal"}
+    if set(record) != allowed:
+        raise PermissionError("sectors-v6 terminal STOP record has missing or extra fields")
+    if any(record.get(key) != value for key, value in required.items()):
+        raise PermissionError("sectors-v6 terminal record is not the exact superseded STOP status")
+    if not str(record.get("decision_ref") or "").strip():
+        raise PermissionError("sectors-v6 STOP needs a decision reference")
+    if not v1._is_hex64(record.get("prev_sha256")) or (
+        REGISTERED_RECORD_SHA256 is not None and record.get("prev_sha256") != REGISTERED_RECORD_SHA256[1]
+    ):
+        raise PermissionError("sectors-v6 STOP needs the exact sectors-v6 registration head as prev_sha256")
+    try:
+        ts = datetime.fromisoformat(str(record.get("run_at") or ""))
+    except ValueError as exc:
+        raise PermissionError("sectors-v6 STOP needs a valid UTC run_at") from exc
+    if ts.tzinfo is None or ts.utcoffset() != timedelta(0):
+        raise PermissionError("sectors-v6 STOP needs a UTC run_at")
+    v8_term = record.get("v8_terminal")
+    if (
+        not isinstance(v8_term, Mapping)
+        or set(v8_term) != _V8_TERMINAL_KEYS
+        or v8_term.get("version") != v8.VERSION
+        or not v1._is_hex64(v8_term.get("head_sha256"))
+        or v8_term.get("records") != v8.STOP_RECORDS
+        or v8_term.get("status") != v8.STOP_SUPERSEDED_STATUS
+        or v8_term.get("witness_path") != v8.WITNESS_PATH
+        or not _is_hex40(v8_term.get("witness_tip"))
+    ):
+        raise PermissionError("sectors-v6 STOP v8_terminal proof is missing or malformed")
+
+
+def append_superseded_stop(
+    log_dir: Path,
+    now: datetime,
+    *,
+    v8_log_dir: Path,
+    decision_ref: str,
+    expected_prev_sha256: str,
+    witness: v2.OffhostWitness,
+    dry_run: bool = True,
+) -> dict:
+    """Append sectors-v6's one STOP_SUPERSEDED_BY_SECTORS_V7_UNOPENED record (dry-run by default).
+
+    Refuses unless v8 is at its witnessed 3-record STOP_SUPERSEDED_BY_V9_UNOPENED, vs1-v9 is not
+    yet registered on vault main, and both local and off-host sectors-v6 chains sit at exactly
+    their two-record registration baseline. A second execution refuses.
+    """
+    _bound()
+    if REGISTERED_RECORD_SHA256 is None or REGISTERED_ANCHOR_LINE is None:
+        raise PermissionError("sectors-v6 is not registered yet (no pinned registration in code)")
+    if now.tzinfo is None or now.utcoffset() != timedelta(0):
+        raise ValueError("STOP needs a UTC time")
+    if not str(decision_ref or "").strip():
+        raise ValueError("STOP needs a non-empty decision reference")
+    if expected_prev_sha256 != REGISTERED_RECORD_SHA256[1]:
+        raise ValueError("STOP needs the exact sectors-v6 registration head")
+    if not isinstance(witness, v2.OffhostWitness) or witness.path != WITNESS_PATH:
+        raise PermissionError("sectors-v6 requires its pinned off-host witness (sectors_v6.check_offhost)")
+    _check_stop_census(witness)
+    v8_proof = _verify_v8_terminal_at_tip(v8_log_dir, witness)
+    proof = require_witness(log_dir, witness, 2)
+    if proof["witnessed_records"] != 2:
+        raise PermissionError("sectors-v6's canonical witness is not at the two-record baseline")
+    log = registry(log_dir)
+    with log.locked():
+        records = _chain(log)
+        if len(records) != 2:
+            raise PermissionError("sectors-v6 registry differs from its two-record baseline; reconcile before STOP")
+        if v1._record_sha256(records[-1]) != expected_prev_sha256:
+            raise PermissionError("sectors-v6 prior head differs from the expected head")
+        candidate = {
+            **_stop_required(),
+            "run_at": now.isoformat(),
+            "decision_ref": str(decision_ref).strip(),
+            "prev_sha256": v1._record_sha256(records[-1]),
+            "v8_terminal": v8_proof,
+        }
+        _check_stop_record(candidate)
+        if dry_run:
+            return {
+                "dry_run": True,
+                "would_append": candidate,
+                "would_be_head_sha256": v1._record_sha256(candidate),
+            }
+        return log.append_locked([candidate])[0]
+
+
+def verify_terminal_stop(log_dir: Path, witness: v2.OffhostWitness) -> dict:
+    """Verify sectors-v6's exact 3-record STOP_SUPERSEDED_BY_SECTORS_V7_UNOPENED after witnessing."""
+    _bound()
+    proof = require_witness(log_dir, witness, STOP_RECORDS)
+    log = registry(log_dir)
+    with log.locked():
+        records = _chain(log)
+    if len(records) != STOP_RECORDS or proof["witnessed_records"] != STOP_RECORDS:
+        raise PermissionError("sectors-v6 STOP witness must end at exactly three records")
+    _check_stop_record(records[-1])
+    if (witness.census.get("records") or {}).get(REGISTRY_ID) != STOP_RECORDS:
+        raise PermissionError("sectors-v6 census does not cover exactly the STOP record")
+    # Confirm v8's witnessed STOP anchor at witness.tip agrees with the carried v8_terminal proof.
+    v8_term = records[-1]["v8_terminal"]
+    if not witness.descends_from(v8_term["witness_tip"]):
+        raise PermissionError("sectors-v6 witness does not descend from the carried v8_terminal witness_tip")
+    v8_content = v1._git(witness.repo, "show", f"{witness.tip}:{v8.WITNESS_PATH}", binary=True)
+    v8_lines = v8_content.splitlines()
+    v8_last = json.loads(v8_lines[1]) if len(v8_lines) == 2 else {}
+    if (
+        len(v8_lines) != 2
+        or v8_last.get("records") != v8.STOP_RECORDS
+        or v8_last.get("head_sha256") != v8_term["head_sha256"]
+    ):
+        raise PermissionError("v8 STOP anchor at witness tip disagrees with sectors-v6 v8_terminal proof")
+    return {
+        "records": STOP_RECORDS,
+        "head_sha256": v1._record_sha256(records[-1]),
+        "status": records[-1]["status"],
+        "witness_path": WITNESS_PATH,
+        "witness_tip": witness.tip,
+        "v8_terminal": dict(v8_term),
+    }

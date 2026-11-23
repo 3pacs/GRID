@@ -63,6 +63,7 @@ from features.per_signal_brier import (
     ensure_tables,
     record_scored_prediction,
 )
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -91,7 +92,7 @@ _ORACLE_QUERY = text(
     SELECT id, ticker, created_at, expiry, confidence, verdict,
            model_name, signals, signal_contributions, model_weights,
            COALESCE(scored_at, expiry, created_at) AS scored_at
-    FROM oracle_predictions
+    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND dedup_keep = TRUE
@@ -366,7 +367,7 @@ def _fetch_scored_predictions(
                    model_name, signals, NULL::text AS signal_contributions,
                    model_weights,
                    COALESCE(scored_at, expiry, created_at) AS scored_at
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict IN ('hit', 'miss', 'partial')
               AND created_at >= NOW() - (:days || ' days')::interval
               AND dedup_keep = TRUE
@@ -519,7 +520,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         prog="bootstrap_per_signal_brier",
         description=(
             "One-shot historical replay that seeds per_signal_brier_history "
-            "from oracle_predictions so the conviction dial isn't cold-start."
+            "from " + VISIBLE_ORACLE_PREDICTIONS + " so the conviction dial isn't cold-start."
         ),
     )
     parser.add_argument(

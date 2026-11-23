@@ -35,6 +35,7 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 MIN_WINDOWS = 30
 MIN_OUTCOMES_SHOWN = 5
@@ -46,6 +47,12 @@ VERDICT_RELATIVE_ADVANTAGE = "relative_advantage"
 VERDICT_NO_RELATIVE_ADVANTAGE = "no_relative_advantage"
 VERDICT_INSUFFICIENT = "insufficient_windows"
 EVIDENCE_CLASS = "exploratory_relative_comparison"
+#: Which predictions the evidence is built from. ``load_outcomes`` reads the
+#: public cohort (``VISIBLE_ORACLE_PREDICTIONS``: no prediction the Oracle
+#: built from Schwab captures), because the result is shared with every
+#: viewer. The route serves a stored or cached result only with this label,
+#: so a snapshot from a worker that predates the filter is rebuilt.
+EVIDENCE_COHORT = "public"
 
 _SPLIT_ADJUSTED = "oracle_rescore_split_adjusted_v1"
 
@@ -63,7 +70,7 @@ SELECT p.model_name,
        p.expiry,
        p.created_at,
        COALESCE(r.scoring_version, 'official') AS basis
-FROM oracle_predictions p
+FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ p
 LEFT JOIN r ON r.prediction_id = p.id
 WHERE p.dedup_keep = TRUE
   AND p.expiry IS NOT NULL
@@ -84,7 +91,7 @@ class Outcome:
 
 
 def load_outcomes(engine: Engine) -> list[Outcome]:
-    """One corrected outcome per scored ``dedup_keep`` prediction."""
+    """One corrected outcome per scored ``dedup_keep`` prediction of the public cohort."""
     with engine.connect() as conn:
         rows = conn.execute(text(_OUTCOMES_SQL), {"split_adjusted": _SPLIT_ADJUSTED}).fetchall()
     return [Outcome(str(r[0]), float(r[1]), str(r[2]), str(r[3]), r[4], r[5], str(r[6])) for r in rows]
@@ -176,6 +183,7 @@ def build_evidence(
     corrected = [o for o in plausible if o.basis != "official"]
     return {
         "evidence_class": EVIDENCE_CLASS,
+        "cohort": EVIDENCE_COHORT,
         "financial_edge_demonstrated": False,
         "method": {
             "outcome_basis": "split-adjusted rescore > hindsight rescore > official verdict",

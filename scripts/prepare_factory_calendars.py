@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Normalize only pinned factory manifest modes in a private build candidate.
+"""Normalize only pinned XNYS manifest modes in a private build candidate.
 
+The pins are the literal PINS and PRESCREEN_PINS in analysis/factory_session_calendar.py: every
+hash-pinned XNYS part a deployed reader opens (the factory calendar, and the market-state record's
+session ages, which also read the prescreen parts).
 No GRID imports or source execution. All files are checked before any mode change.
 Absent factory feature is a no-op for older candidates. Never call on a live tree.
 """
@@ -27,23 +30,31 @@ def prepare(candidate: Path) -> dict:
     if source.resolve(strict=True) != source or not source.is_file():
         raise ValueError("factory source must be a regular non-symlink file")
     tree = ast.parse(source.read_text())
-    assignments = [n.value for n in tree.body if isinstance(n, ast.Assign)
-                   and any(isinstance(t, ast.Name) and t.id == "PINS" for t in n.targets)]
-    if len(assignments) != 1:
-        raise ValueError("exactly one literal PINS assignment required")
-    pins = ast.literal_eval(assignments[0])
-    if not isinstance(pins, tuple) or not 1 <= len(pins) <= 16:
-        raise ValueError("invalid PINS collection")
+    # PINS (factory-xnys-*) is required. PRESCREEN_PINS (prescreen-xnys-*, which the deployed market-state record
+    # counts session ages on) is optional, so a candidate from before it existed prepares PINS alone.
+    pins = []
     names = set()
-    for pair in pins:
-        if not isinstance(pair, tuple) or len(pair) != 2:
-            raise ValueError("invalid pin pair")
-        name, digest = pair
-        if (not isinstance(name, str) or not re.fullmatch(r"factory-xnys-[0-9-]+\.json", name)
-                or name in names or not isinstance(digest, str)
-                or not re.fullmatch(r"[a-f0-9]{64}", digest)):
-            raise ValueError("invalid pin name/hash")
-        names.add(name)
+    for collection, pattern, required in (("PINS", r"factory-xnys-[0-9-]+\.json", True),
+                                          ("PRESCREEN_PINS", r"prescreen-xnys-[0-9-]+\.json", False)):
+        assignments = [n.value for n in tree.body if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == collection for t in n.targets)]
+        if not assignments and not required:
+            continue
+        if len(assignments) != 1:
+            raise ValueError(f"exactly one literal {collection} assignment required")
+        found = ast.literal_eval(assignments[0])
+        if not isinstance(found, tuple) or not 1 <= len(found) <= 16:
+            raise ValueError(f"invalid {collection} collection")
+        for pair in found:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise ValueError("invalid pin pair")
+            name, digest = pair
+            if (not isinstance(name, str) or not re.fullmatch(pattern, name)
+                    or name in names or not isinstance(digest, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", digest)):
+                raise ValueError("invalid pin name/hash")
+            names.add(name)
+            pins.append(pair)
     pending = []
     with ExitStack() as stack:
         for name, expected in pins:

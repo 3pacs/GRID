@@ -37,6 +37,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import ProgrammingError as SAProgrammingError
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -706,7 +707,7 @@ class AnomalyHunter:
                    ARRAY_AGG(DISTINCT model_name) AS models,
                    AVG(confidence) AS avg_conf,
                    MAX(created_at) AS latest
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE created_at >= (NOW() - :window * INTERVAL '1 day')
               AND verdict = 'pending'
             GROUP BY ticker, direction
@@ -1312,7 +1313,7 @@ class HypothesisGenerator:
 
         q = text("""
             SELECT actual_move_pct, direction AS pred_dir
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE ticker = :ticker
               AND scored_at IS NOT NULL
               AND created_at >= :since

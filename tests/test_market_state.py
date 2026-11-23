@@ -1,4 +1,4 @@
-"""intelligence.regime.market_state: the standardized daily market-state record (market-state/1).
+"""intelligence.regime.market_state: the standardized daily market-state record (market-state/3).
 
 Fixture: real ``raw_series`` + ``source_catalog`` on in-memory SQLite, every row backfilled by one pull (the way
 griddb looks), plus a few rows pulled later to prove a later publication never changes an earlier record.
@@ -90,12 +90,16 @@ CAL = {"cpi": [date(2025, 6, 11), date(2025, 7, 15)], "fomc": [date(2025, 6, 18)
 def test_record_is_complete_and_every_reading_is_standardized(engine):
     _seed(engine)
     st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
-    assert st["rule"] == "market-state/1" and st["baseline_rule"] == "trailing-robust/1"
+    assert st["rule"] == "market-state/3" and st["baseline_rule"] == "trailing-robust/1"
+    assert st["freshness_rule"] == "max-age/1" and st["coverage"]["stale"] == 0
     missing = {k: v.get("reason") for k, v in st["variables"].items() if v["status"] != "ok"}
-    # No vintages stored in this fixture: the three news variables are unavailable, not guessed.
+    # No vintages stored in this fixture: the three news variables are unavailable, not guessed. No DGS2 or KXFED
+    # rows either (tests/test_market_state_policy.py seeds those), so the policy-path variables are unavailable too.
     assert set(missing) == {"short_volume_ratio", "news_uncertainty", "equity_news_uncertainty", "news_first_print",
-                            "dix", "dix_change_5d", "dealer_gamma", "spot_vs_gamma_flip"}
+                            "dix", "dix_change_5d", "dealer_gamma", "spot_vs_gamma_flip", "ust_2y_change_5d",
+                            "fed_path_next_meeting", "fed_path_change_5d", "fed_priced_move_next_meeting"}
     assert st["news_shock"]["status"] == "unavailable" and st["gamma_state"]["status"] == "unavailable"
+    assert st["policy_response"]["status"] == "unknown" and st["policy_response"]["decision_use"] == "none"
     for k, v in st["variables"].items():
         if v["status"] == "ok":
             assert {"value", "median", "robust_z", "percentile", "label", "n", "obs_date"} <= set(v), k
@@ -161,7 +165,7 @@ def test_storage_is_insert_only_unless_replace(engine):
     assert M.store_market_state(engine, st, replace=True) is True
     with engine.connect() as c:
         rows = c.execute(text("SELECT as_of_date, rule, record FROM market_state_daily")).fetchall()
-    assert len(rows) == 1 and rows[0][1] == "market-state/1"
+    assert len(rows) == 1 and rows[0][1] == "market-state/3"
     assert json.loads(rows[0][2])["as_of"] == AS_OF.isoformat()
 
 
@@ -304,3 +308,116 @@ def test_gamma_row_after_as_of_is_never_read(engine):
     _gex_table(engine, [{"d": AS_OF + timedelta(days=1), "s": 1.0, "n": 1.0, "p": 1.0, "f": 1.0, "r": "x"}])
     st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
     assert st["gamma_state"]["status"] == "unavailable"
+
+
+# ── freshness (max-age/1, #1303) ──────────────────────────────────────────
+
+def _drop(engine, series_ids, after: date) -> None:
+    """Remove observations after ``after``: the input stopped arriving."""
+    with engine.begin() as c:
+        for sid in series_ids:
+            c.execute(text("DELETE FROM raw_series WHERE series_id = :s AND obs_date > :d"), {"s": sid, "d": after})
+
+
+def test_every_variable_has_a_max_age_and_slow_limits_follow_declared_lags():
+    assert set(M.MAX_AGE) == set(M.VAR_NAMES)
+    # One period plus the declared publication lag, minus a day: the measured maximum of every stored record
+    # outside the 2025 shutdown (cpi 80, industrial production 80, sentiment 90, labor 72, claims 12, net liquidity 9).
+    want = {"cpi_yoy": 80, "industrial_production_yoy": 80, "consumer_sentiment": 90, "unemployment": 72,
+            "payrolls_3m": 72, "initial_claims": 12, "net_liquidity": 9, "net_liquidity_4w": 9}
+    assert {k: M.MAX_AGE[k].limit for k in want} == want
+    assert all(M.MAX_AGE[k].unit == "days" for k in want)
+    assert M.MAX_AGE["vix"] == M.MAX_AGE["hy_spread"] == M.MAX_AGE["dix"]
+    assert (M.MAX_AGE["vix"].limit, M.MAX_AGE["spy_vs_50d"].limit, M.MAX_AGE["dealer_gamma"].limit) == (2, 1, 0)
+
+
+def test_daily_age_counts_trading_sessions_not_calendar_days():
+    nxt = M.MAX_AGE["vix"]
+    assert M.freshness(date(2025, 6, 6), date(2025, 6, 9), nxt)["age"] == 1           # Friday -> Monday
+    # Columbus Day 2020: NYSE open, bond market and FRED closed; Thursday's close is the newest known on Monday.
+    assert M.freshness(date(2020, 10, 8), date(2020, 10, 12), nxt) | {"basis": ""} == {
+        "status": "fresh", "age": 2, "unit": "sessions", "limit": 2, "basis": ""}
+    # Thanksgiving: Wednesday -> Monday is Friday's half day plus Monday.
+    assert M.freshness(date(2025, 11, 26), date(2025, 12, 1), nxt)["age"] == 2
+    assert M.freshness(date(2025, 6, 4), date(2025, 6, 9), nxt)["status"] == "stale"   # Wed -> Mon: 3 sessions
+    assert M.freshness(date(2025, 4, 1), date(2025, 6, 21), M.MAX_AGE["cpi_yoy"])["age"] == 81
+
+
+def test_session_ages_use_the_pinned_calendar_not_the_scheduler_helpers():
+    """ingestion.market_calendar's helpers close Juneteenth before it existed and miss one-off closures; ages must
+    come from the pinned XNYS manifests (docs/reference/calendar-manifests)."""
+    from ingestion.market_calendar import trading_days_between
+
+    nxt = M.MAX_AGE["vix"]
+    # Juneteenth became an NYSE holiday in 2022: Friday 2020-06-19 was a session, so Wed -> Mon is 3 sessions.
+    assert len(trading_days_between(date(2020, 6, 18), date(2020, 6, 22))) == 2          # the helper's wrong count
+    assert M.freshness(date(2020, 6, 17), date(2020, 6, 22), nxt) | {"basis": ""} == {
+        "status": "stale", "age": 3, "unit": "sessions", "limit": 2, "basis": ""}
+    assert M.sessions_after(date(2021, 6, 17), date(2021, 6, 18)) == (1, False)          # 2021-06-18 traded
+    # 2025-01-09 (national day of mourning) and 2018-12-05 were one-off closures the helper treats as sessions.
+    assert len(trading_days_between(date(2025, 1, 8), date(2025, 1, 10))) == 3
+    assert M.freshness(date(2025, 1, 7), date(2025, 1, 10), nxt)["status"] == "fresh"   # 01-08, 01-10
+    assert M.sessions_after(date(2018, 12, 4), date(2018, 12, 6)) == (1, False)
+    start, end, days, version = M.xnys_sessions()
+    assert (start, end) == (date(2018, 4, 2), date(2027, 12, 31)) and version.startswith("pinned XNYS: ")
+    assert date(2022, 11, 11) in days and date(2022, 11, 24) not in days                # prescreen/factory seam
+
+
+def test_gamma_freshness_is_the_same_date_rule_not_a_zero_session_count():
+    g = M.MAX_AGE["dealer_gamma"]
+    assert M.freshness(date(2021, 6, 17), date(2021, 6, 18), g)["status"] == "stale"     # 06-18 was a session
+    assert M.freshness(date(2025, 6, 9), date(2025, 6, 9), g)["status"] == "fresh"
+    # A Friday row read on Saturday is 0 sessions old but is still not that day's capture.
+    assert M.freshness(date(2025, 6, 6), date(2025, 6, 7), g) | {"basis": ""} == {
+        "status": "stale", "age": 0, "unit": "sessions", "limit": 0, "basis": ""}
+
+
+def test_session_ages_outside_the_pinned_calendar_never_guess():
+    with pytest.raises(ValueError, match="outside the pinned XNYS calendar"):
+        M.sessions_after(date(2027, 12, 30), date(2028, 1, 3))
+    age, lower_bound = M.sessions_after(date(2017, 12, 29), date(2018, 4, 5))
+    assert (age, lower_bound) == (4, True)                                               # 04-02..04-05, at least
+    fresh = M.freshness(date(2017, 12, 29), date(2018, 4, 5), M.MAX_AGE["vix"])
+    assert fresh["status"] == "stale" and fresh["age_is_lower_bound"] is True
+    with pytest.raises(ValueError, match="before the pinned XNYS calendar"):
+        M.freshness(date(2018, 3, 29), date(2018, 4, 2), M.MAX_AGE["vix"])               # 1 known session, maybe more
+    with pytest.raises(ValueError, match="outside the pinned XNYS calendar"):
+        M.compute_market_state(None, date(2028, 1, 3))                                   # refused before any read
+
+
+
+def test_a_daily_input_that_stops_arriving_reads_stale_with_its_reading_kept(engine):
+    _seed(engine)
+    _drop(engine, ["CBOE:VIX", "CBOE:VIX3M"], date(2025, 6, 3))
+    st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
+    vix = st["variables"]["vix"]
+    assert vix["status"] == "stale" and vix["obs_date"] == "2025-06-03"
+    assert vix["freshness"]["age"] == 5 and vix["freshness"]["limit"] == 2       # 06-04, 05, 06, 09, 10
+    assert {"value", "robust_z", "label"} <= set(vix) and "2025-06-03 is 5 sessions old; limit 2" in vix["reason"]
+    assert st["variables"]["vix_term"]["status"] == "stale"
+    assert st["variables"]["hy_spread"]["status"] == "ok"
+    assert st["variables"]["hy_spread"]["freshness"]["status"] == "fresh"
+    assert st["coverage"]["stale"] == 2 and st["coverage"]["ok"] == st["coverage"]["total"] - 14
+
+
+def test_a_monthly_input_past_its_next_release_reads_stale(engine):
+    _seed(engine)
+    _drop(engine, ["CPIAUCSL"], date(2025, 2, 1))     # March and April 2025 never arrive
+    cpi = M.compute_market_state(engine, AS_OF, calendar=CAL).variables["cpi_yoy"]
+    assert cpi["status"] == "stale" and cpi["obs_date"] == "2025-02-01"
+    assert (cpi["freshness"]["age"], cpi["freshness"]["unit"], cpi["freshness"]["limit"]) == (129, "days", 80)
+
+
+def test_gamma_from_an_earlier_session_is_stale_not_current(engine):
+    _seed(engine)
+    days = list(_bdays(date(2025, 4, 1), AS_OF - timedelta(days=1)))[-35:]          # last row 06-09, not 06-10
+    _gex_table(engine, [{"d": d, "s": 560.0 + i, "n": 8000.0 - 100 * i, "p": -0.5, "f": 565.0 + i,
+                         "r": "negative_gamma"} for i, d in enumerate(days)])
+    st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
+    gs = st["gamma_state"]
+    assert gs["status"] == "stale" and gs["obs_date"] == "2025-06-09" and gs["regime"] == "negative_gamma"
+    assert gs["freshness"]["age"] == 1 and gs["freshness"]["limit"] == 0 and "limit 0" in gs["reason"]
+    assert st["freshness_calendar"] == M.xnys_sessions()[3]
+    g = st["variables"]["dealer_gamma"]
+    # No baseline and stale: stale wins, and the reason keeps both facts.
+    assert g["status"] == "stale" and "baseline needs 120" in g["reason"] and "robust_z" not in g

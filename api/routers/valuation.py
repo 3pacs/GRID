@@ -23,8 +23,9 @@ from loguru import logger as log
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, viewer_is_admin
 from api.dependencies import get_db_engine
+from store.options_provenance import oracle_predictions_from
 
 router = APIRouter(
     prefix="/api/v1/valuation",
@@ -292,6 +293,7 @@ def catalyst_timeline(
     months_forward: int = Query(default=12, ge=1, le=36),
     months_back: int = Query(default=6, ge=0, le=24),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Return a unified catalyst timeline for a ticker.
 
@@ -412,7 +414,7 @@ def catalyst_timeline(
                        expiry, confidence, expected_move_pct, model_name,
                        verdict, actual_price, actual_move_pct, score_notes,
                        created_at
-                FROM oracle_predictions
+                FROM """ + oracle_predictions_from(include_schwab) + """ oracle_predictions
                 WHERE UPPER(ticker) = :ticker
                 AND (expiry BETWEEN :start AND :end
                      OR created_at::date BETWEEN :start AND :end)

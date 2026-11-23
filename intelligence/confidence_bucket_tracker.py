@@ -64,6 +64,7 @@ from features.per_signal_brier import (
 # Reuse verdict mapping from the bootstrap script — same math keeps the
 # two bootstrap paths in lock-step.
 from scripts.bootstrap_per_signal_brier import verdict_to_outcome
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Bucket definitions ────────────────────────────────────────────────────
@@ -591,7 +592,7 @@ def rank_buckets_by_calibration(
 _BOOTSTRAP_QUERY = text(
     """
     SELECT confidence, verdict, created_at, expiry
-    FROM oracle_predictions
+    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND dedup_keep = TRUE

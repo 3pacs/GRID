@@ -133,22 +133,27 @@ class AISSnapshot:
     Attributes:
         timestamp: UTC datetime of observation (rounded to 4h bucket).
         port_slug: The ``PortSpec.slug`` this observation belongs to.
-        ships_at_berth: Count of vessels currently berthed / loading.
-        ships_at_anchor: Count of vessels at anchor / waiting.
-        ships_expected: Count of vessels with an ETA for this port.
-        ships_departed_24h: Count of vessels departed in last 24 hours.
+        ships_at_berth: Count of vessels currently berthed / loading, or
+            ``None`` (UNKNOWN) when absent / unparsed.
+        ships_at_anchor: Count of vessels at anchor / waiting, or ``None``
+            (UNKNOWN) when absent / unparsed.
+        ships_expected: Count of vessels with an ETA for this port, or
+            ``None`` (UNKNOWN) when absent / unparsed.
+        ships_departed_24h: Count of vessels departed in last 24 hours, or
+            ``None`` (UNKNOWN) when absent / unparsed.
         capacity_utilization: ``at_berth / (at_berth + at_anchor)``,
-            clamped to ``[0, 1]``, or ``None`` when both are zero.
+            clamped to ``[0, 1]``, or ``None`` when either count is unknown
+            or both are zero.
         source: Provenance label — ``"vesselfinder"``, ``"aishub"``,
             or ``"none"``.
     """
 
     timestamp: datetime
     port_slug: str
-    ships_at_berth: int
-    ships_at_anchor: int
-    ships_expected: int
-    ships_departed_24h: int
+    ships_at_berth: int | None
+    ships_at_anchor: int | None
+    ships_expected: int | None
+    ships_departed_24h: int | None
     capacity_utilization: float | None
     source: str
 
@@ -183,19 +188,25 @@ AIS_PORTS: tuple[PortSpec, ...] = (
 # ── Pure helpers ─────────────────────────────────────────────────────
 
 
-def compute_capacity_utilization(at_berth: int, at_anchor: int) -> float | None:
+def compute_capacity_utilization(
+    at_berth: int | None,
+    at_anchor: int | None,
+) -> float | None:
     """Return the ratio of berthed ships to total (berthed + anchored).
 
-    Returns ``None`` when both counts are zero (no observation possible).
-    Otherwise returns a float in ``[0, 1]``.
+    Returns ``None`` when either count is unknown (``None``), negative, or
+    when both counts are zero (no observation possible). Otherwise returns
+    a float in ``[0, 1]``.
 
     Parameters:
-        at_berth: Number of vessels currently at berth.
-        at_anchor: Number of vessels currently at anchor.
+        at_berth: Number of vessels currently at berth, or ``None`` if unknown.
+        at_anchor: Number of vessels currently at anchor, or ``None`` if unknown.
 
     Returns:
-        Utilization ratio in ``[0, 1]`` or ``None`` if no vessels.
+        Utilization ratio in ``[0, 1]`` or ``None`` if unknown / no vessels.
     """
+    if at_berth is None or at_anchor is None:
+        return None
     if at_berth < 0 or at_anchor < 0:
         return None
     total = at_berth + at_anchor
@@ -225,30 +236,30 @@ def _round_to_bucket(ts: datetime, bucket_hours: int = _BUCKET_HOURS) -> datetim
 
 _SECTION_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "at_berth": (
-        re.compile(r"in\s*port[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
-        re.compile(r"(\d{1,5})\s*vessels?\s*in\s*port", re.IGNORECASE),
-        re.compile(r"currently\s*in\s*port[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
+        re.compile(r"\bin\s*port[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,5})\s*(?:vessels?|ships?)\s*in\s*port\b", re.IGNORECASE),
+        re.compile(r"\bcurrently\s*in\s*port[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
     ),
     "at_anchor": (
-        re.compile(r"at\s*anchor[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
-        re.compile(r"(\d{1,5})\s*vessels?\s*at\s*anchor", re.IGNORECASE),
-        re.compile(r"anchored[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
+        re.compile(r"\bat\s*anchor[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,5})\s*(?:vessels?|ships?)\s*at\s*anchor\b", re.IGNORECASE),
+        re.compile(r"\banchored[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
     ),
     "expected": (
-        re.compile(r"expected\s*arrivals?[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
-        re.compile(r"(\d{1,5})\s*vessels?\s*expected", re.IGNORECASE),
-        re.compile(r"arrivals?[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
+        re.compile(r"\bexpected\s*arrivals?[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,5})\s*(?:vessels?|ships?)\s*expected\b", re.IGNORECASE),
+        re.compile(r"\barrivals?[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
     ),
     "departed": (
-        re.compile(r"departed[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
-        re.compile(r"(\d{1,5})\s*vessels?\s*departed", re.IGNORECASE),
-        re.compile(r"departures?[^0-9]{0,40}(\d{1,5})", re.IGNORECASE),
+        re.compile(r"\bdeparted[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,5})\s*(?:vessels?|ships?)\s*departed\b", re.IGNORECASE),
+        re.compile(r"\bdepartures?[\s:()–—|-]{0,12}\b(\d{1,5})\b", re.IGNORECASE),
     ),
 }
 
 
-def _extract_count(text_blob: str, keys: tuple[re.Pattern[str], ...]) -> int:
-    """Return the first integer match from a list of regex patterns."""
+def _extract_count(text_blob: str, keys: tuple[re.Pattern[str], ...]) -> int | None:
+    """Return the first integer match from a list of regex patterns, or ``None``."""
     for pattern in keys:
         match = pattern.search(text_blob)
         if match:
@@ -256,14 +267,16 @@ def _extract_count(text_blob: str, keys: tuple[re.Pattern[str], ...]) -> int:
                 return int(match.group(1))
             except (ValueError, IndexError):
                 continue
-    return 0
+    return None
 
 
 def _parse_vesselfinder_html(html: str, port: PortSpec) -> AISSnapshot | None:
     """Parse a VesselFinder port page into an ``AISSnapshot``.
 
-    Returns ``None`` on empty / malformed input or when no section counts
-    could be extracted (all zero). Never raises.
+    Returns ``None`` on empty / malformed input, BeautifulSoup failure, or
+    when structured section parsing extracts no vessel counts (fail closed).
+    Unparsed sections stay ``None`` (UNKNOWN) and are never coerced to 0.
+    Never runs regexes over raw unstripped HTML and never raises.
 
     The VesselFinder port page structure we target looks like:
 
@@ -271,12 +284,6 @@ def _parse_vesselfinder_html(html: str, port: PortSpec) -> AISSnapshot | None:
             <h2>In Port</h2>
             <span class="count">12 vessels</span>
             ...
-
-    We're permissive: we find ``<section>``, ``<div>``, ``<article>``,
-    or ``<h2>`` elements whose text contains one of the labels
-    ("in port", "at anchor", "expected arrivals", "departed") and then
-    extract the first integer in that block. Falls back to whole-page
-    regex scan when section tags are missing.
 
     Parameters:
         html: Raw HTML string from VesselFinder.
@@ -291,68 +298,75 @@ def _parse_vesselfinder_html(html: str, port: PortSpec) -> AISSnapshot | None:
     try:
         from bs4 import BeautifulSoup
     except ImportError:
-        log.warning("BeautifulSoup not installed — falling back to regex only")
-        soup = None
-    else:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception as exc:  # noqa: BLE001 — parser may throw anything
-            log.warning(
-                "BeautifulSoup parse failed for {slug}: {e}",
-                slug=port.slug,
-                e=str(exc),
-            )
-            soup = None
-
-    at_berth = 0
-    at_anchor = 0
-    expected = 0
-    departed = 0
-
-    # Section-level extraction via BS4 if available
-    if soup is not None:
-        section_tags = soup.find_all(
-            ["section", "div", "article", "h2", "h3", "header"]
+        log.warning(
+            "BeautifulSoup not installed — refusing raw-HTML fallback for {slug}",
+            slug=port.slug,
         )
-        for tag in section_tags:
-            try:
-                block_text = tag.get_text(separator=" ", strip=True)
-            except Exception:  # noqa: BLE001
-                continue
-            if not block_text:
-                continue
-            block_lower = block_text.lower()
+        return None
 
-            # "In Port" section
-            if at_berth == 0 and "in port" in block_lower:
-                at_berth = _extract_count(block_text, _SECTION_PATTERNS["at_berth"])
-            # "At Anchor" section (often nested inside "in port")
-            if at_anchor == 0 and (
-                "at anchor" in block_lower or "anchored" in block_lower
-            ):
-                at_anchor = _extract_count(block_text, _SECTION_PATTERNS["at_anchor"])
-            # "Expected Arrivals"
-            if expected == 0 and (
-                "expected" in block_lower or "arrivals" in block_lower
-            ):
-                expected = _extract_count(block_text, _SECTION_PATTERNS["expected"])
-            # "Departed"
-            if departed == 0 and (
-                "departed" in block_lower or "departures" in block_lower
-            ):
-                departed = _extract_count(block_text, _SECTION_PATTERNS["departed"])
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception as exc:  # noqa: BLE001 — parser may throw anything
+        log.warning(
+            "BeautifulSoup parse failed for {slug}: {e} — skipping (fail closed)",
+            slug=port.slug,
+            e=str(exc),
+        )
+        return None
 
-    # Whole-page fallback regex scan (catches pages without structural tags)
-    if at_berth == 0:
-        at_berth = _extract_count(html, _SECTION_PATTERNS["at_berth"])
-    if at_anchor == 0:
-        at_anchor = _extract_count(html, _SECTION_PATTERNS["at_anchor"])
-    if expected == 0:
-        expected = _extract_count(html, _SECTION_PATTERNS["expected"])
-    if departed == 0:
-        departed = _extract_count(html, _SECTION_PATTERNS["departed"])
+    for noise in soup.find_all(["script", "style", "noscript"]):
+        noise.decompose()
 
-    if at_berth == 0 and at_anchor == 0 and expected == 0 and departed == 0:
+    at_berth: int | None = None
+    at_anchor: int | None = None
+    expected: int | None = None
+    departed: int | None = None
+
+    # Structured section-level extraction only (innermost-first; skip outer
+    # page wrappers that contain nested section/article blocks).
+    section_tags = soup.find_all(
+        ["section", "div", "article", "h2", "h3", "header"]
+    )
+    for tag in reversed(section_tags):
+        if tag.find(["section", "article"]) is not None:
+            continue
+        try:
+            block_text = tag.get_text(separator=" ", strip=True)
+        except Exception:  # noqa: BLE001
+            continue
+        if not block_text:
+            continue
+        block_lower = block_text.lower()
+
+        # "In Port" section
+        if at_berth is None and "in port" in block_lower:
+            at_berth = _extract_count(block_text, _SECTION_PATTERNS["at_berth"])
+        # "At Anchor" section (often nested inside "in port")
+        if at_anchor is None and (
+            "at anchor" in block_lower or "anchored" in block_lower
+        ):
+            at_anchor = _extract_count(block_text, _SECTION_PATTERNS["at_anchor"])
+        # "Expected Arrivals"
+        if expected is None and (
+            "expected" in block_lower or "arrivals" in block_lower
+        ):
+            expected = _extract_count(block_text, _SECTION_PATTERNS["expected"])
+        # "Departed"
+        if departed is None and (
+            "departed" in block_lower or "departures" in block_lower
+        ):
+            departed = _extract_count(block_text, _SECTION_PATTERNS["departed"])
+
+    if (
+        at_berth is None
+        and at_anchor is None
+        and expected is None
+        and departed is None
+    ):
+        log.warning(
+            "vesselfinder structured parse found no vessel counts for {slug} — skipping (fail closed)",
+            slug=port.slug,
+        )
         return None
 
     util = compute_capacity_utilization(at_berth, at_anchor)
@@ -546,8 +560,8 @@ class AISGroundTruthPuller(BasePuller):
             port_slug=port.slug,
             ships_at_berth=at_berth,
             ships_at_anchor=at_anchor,
-            ships_expected=0,
-            ships_departed_24h=0,
+            ships_expected=None,
+            ships_departed_24h=None,
             capacity_utilization=util,
             source="aishub",
         )
@@ -605,16 +619,19 @@ class AISGroundTruthPuller(BasePuller):
         inserted = 0
         with self.engine.begin() as conn:
             for snap in snapshots:
-                series_map = {
+                raw_series_map: dict[str, int | float | None] = {
                     f"ais:ships_at_berth:{snap.port_slug}": snap.ships_at_berth,
                     f"ais:ships_at_anchor:{snap.port_slug}": snap.ships_at_anchor,
                     f"ais:ships_expected:{snap.port_slug}": snap.ships_expected,
                     f"ais:ships_departed_24h:{snap.port_slug}": snap.ships_departed_24h,
+                    f"ais:capacity_utilization:{snap.port_slug}": snap.capacity_utilization,
                 }
-                if snap.capacity_utilization is not None:
-                    series_map[f"ais:capacity_utilization:{snap.port_slug}"] = (
-                        float(snap.capacity_utilization)
-                    )
+                # Never write absent/UNKNOWN (None) fields as 0.
+                series_map = {
+                    sid: float(val)
+                    for sid, val in raw_series_map.items()
+                    if val is not None
+                }
 
                 obs_date: date = snap.timestamp.date()
 

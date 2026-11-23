@@ -55,6 +55,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -644,7 +645,7 @@ def get_lift_multiplier(
 
 _ORACLE_REPLAY_SQL: str = """
 SELECT id, verdict, signals, signal_strength, confidence, model_weights
-FROM oracle_predictions
+FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
 WHERE verdict IN ('hit', 'miss', 'partial')
   AND created_at >= NOW() - (:days || ' days')::INTERVAL
   AND dedup_keep = TRUE

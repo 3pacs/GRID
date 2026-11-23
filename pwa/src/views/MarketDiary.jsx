@@ -106,6 +106,7 @@ const verdictConfig = {
     correct: { label: 'CORRECT', color: colors.green, bg: colors.greenBg },
     wrong:   { label: 'WRONG',   color: colors.red,   bg: colors.redBg },
     partial: { label: 'PARTIAL', color: colors.yellow, bg: colors.yellowBg },
+    missed:  { label: 'MISSED',  color: '#F97316',    bg: '#431407' },
     unknown: { label: 'N/A',     color: colors.textMuted, bg: '#1A2840' },
 };
 
@@ -207,7 +208,7 @@ function CalendarGrid({ entries, selectedDate, onSelect }) {
                     );
                 })}
             </div>
-            <div style={{ display: 'flex', gap: '12px', marginTop: '10px', justifyContent: 'center' }}>
+            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '10px', justifyContent: 'center' }}>
                 {Object.entries(verdictConfig).filter(([k]) => k !== 'unknown').map(([k, v]) => (
                     <div key={k} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                         <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: v.color }} />
@@ -437,7 +438,7 @@ export default function MarketDiary() {
     const helpContent = [
         'Automated daily market diary generated after US market close (10 PM UTC).',
         'Each entry includes LLM narrative, thesis accuracy scoring, and data appendix.',
-        'Calendar dots show thesis accuracy: green = correct, red = wrong, yellow = partial.',
+        'Calendar dots show thesis accuracy: green = correct, red = wrong, yellow = partial, orange = missed.',
         'Use search to find entries by keyword across all diary content.',
         'Click "Generate Today" to manually trigger the current day\'s diary.',
     ];

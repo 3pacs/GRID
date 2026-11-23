@@ -53,6 +53,7 @@ class OllamaClient:
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.is_available: bool = False
+        self.last_done_reason: str | None = None
         self._knowledge_cache: dict[str, str] = {}
 
         # Health check
@@ -121,6 +122,7 @@ class OllamaClient:
         Returns:
             str: The assistant's response text, or None if unavailable.
         """
+        self.last_done_reason = None
         if not self.is_available:
             return None
 
@@ -147,6 +149,12 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
 
+            raw_done_reason = data.get("done_reason")
+            self.last_done_reason = (
+                raw_done_reason.strip()
+                if isinstance(raw_done_reason, str) and raw_done_reason.strip()
+                else None
+            )
             content = data.get("message", {}).get("content", "")
             model_used = data.get("model", model or self.model)
             log.debug(
@@ -215,6 +223,7 @@ class OllamaClient:
         Returns:
             str: Generated text, or None if unavailable.
         """
+        self.last_done_reason = None
         if not self.is_available:
             return None
 
@@ -240,6 +249,12 @@ class OllamaClient:
             latency_ms = (time.monotonic() - start) * 1000
             resp.raise_for_status()
             data = resp.json()
+            raw_done_reason = data.get("done_reason")
+            self.last_done_reason = (
+                raw_done_reason.strip()
+                if isinstance(raw_done_reason, str) and raw_done_reason.strip()
+                else None
+            )
             log.debug("Ollama generate — latency={l:.0f}ms", l=latency_ms)
             response_text = data.get("response", "") or ""
 
@@ -418,6 +433,7 @@ class OpenAIClient:
         self.embed_model = embed_model
         self.timeout = timeout
         self.is_available: bool = False
+        self.last_finish_reason: str | None = None
         self._knowledge_cache: dict[str, str] = {}
 
         if not self.api_key:
@@ -451,6 +467,7 @@ class OpenAIClient:
         num_predict: int = 2000,
         system_knowledge: list[str] | None = None,
     ) -> str | None:
+        self.last_finish_reason = None
         if not self.is_available:
             return None
 
@@ -473,7 +490,14 @@ class OpenAIClient:
             latency_ms = (time.monotonic() - start) * 1000
             resp.raise_for_status()
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            raw_finish = choice.get("finish_reason")
+            self.last_finish_reason = (
+                raw_finish.strip()
+                if isinstance(raw_finish, str) and raw_finish.strip()
+                else None
+            )
+            content = choice["message"]["content"]
             log.debug(
                 "OpenAI chat — model={m}, latency={l:.0f}ms",
                 m=data.get("model", model or self.model),
