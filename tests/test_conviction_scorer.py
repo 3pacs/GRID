@@ -65,7 +65,7 @@ def _series(values: list[float], end: date = date(2026, 5, 13)) -> pd.Series:
     return pd.Series(values, index=idx)
 
 
-def test_load_latest_uses_release_date_as_of_filter() -> None:
+def test_load_latest_uses_release_and_vintage_as_of_filter() -> None:
     as_of = date(2026, 5, 13)
     conn = _RecordingConn(rows=[(19.5,)])
 
@@ -73,6 +73,7 @@ def test_load_latest_uses_release_date_as_of_filter() -> None:
 
     call = conn.calls[0]
     assert "rs.release_date <= :as_of" in call.sql
+    assert "rs.vintage_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
     assert "resolved_series_retractions" in call.sql
     assert "rr.retracted_at <= :retraction_cutoff" in call.sql
@@ -119,7 +120,7 @@ def test_load_raw_series_uses_as_of_window_and_pull_timestamp_release_proxy() ->
     assert list(out) == [10.0, 11.0]
 
 
-def test_load_price_uses_release_date_as_of_filter() -> None:
+def test_load_price_uses_release_and_vintage_as_of_filter() -> None:
     as_of = date(2026, 5, 13)
     conn = _RecordingConn(
         rows=[
@@ -132,6 +133,7 @@ def test_load_price_uses_release_date_as_of_filter() -> None:
 
     call = conn.calls[0]
     assert "rs.release_date <= :as_of" in call.sql
+    assert "rs.vintage_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
     assert "resolved_series_retractions" in call.sql
     assert call.params == {
@@ -426,6 +428,7 @@ def test_scan_all_filters_ticker_universe_as_of_and_scores_same_date(
 
     call = conn.calls[0]
     assert "rs.release_date <= :as_of" in call.sql
+    assert "rs.vintage_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
     assert call.params == {"as_of": as_of}
     assert seen == [("BBB", as_of), ("AAA", as_of)]

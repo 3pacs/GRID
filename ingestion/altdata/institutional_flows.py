@@ -28,16 +28,15 @@ Data stored:
 
 from __future__ import annotations
 
-import json
 import logging
+import math
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
 import requests
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
@@ -105,6 +104,223 @@ _EDGAR_RATE_DELAY: float = 0.15
 
 # Minimum position change threshold to flag as INCREASED/DECREASED (20%)
 _POSITION_CHANGE_THRESHOLD: float = 0.20
+
+# A same-CUSIP split or reverse split between two quarter-ends changes the
+# reported share count with no trade (100 x $100 -> 200 x $50), and a price
+# move can mask it (2-for-1 plus +70% reads $100 -> $85). 13F rows carry
+# CUSIPs, not tickers, and GRID has no CUSIP-level corporate-action coverage,
+# so a continuing position's share change is never a verified direction: it
+# is emitted as an estimated holdings change with
+# qualified_for_directional_flow=False. NEW and CLOSED positions are
+# split-invariant (whole position value at one quarter-end) and stay qualified.
+CONTINUING_POSITION_UNQUALIFIED_REASON = "no_corporate_action_coverage"
+# A NEW or CLOSED CUSIP is not a verified trade either: a CUSIP rekey, merger or
+# exchange can show as one CUSIP disappearing and another appearing with no
+# trade, and GRID has no CUSIP identity/filing coverage to rule that out.
+NEW_CLOSED_UNQUALIFIED_REASON = "no_identity_coverage"
+# Owner decision 2026-11-23 (Anik, "Yes, non-directional"): until identity and
+# split coverage exist, every 13F change is an observed filing change at
+# reference prices, recorded for holdings graphs and never read as direction.
+OBSERVATION_MEASURE = "observed_filing_holdings_change_at_reference_prices"
+
+# SEC Form 13F XML <value> switched from thousands of dollars to whole dollars
+# for filings made on or after 2023-01-03 (SEC Final Rule, Release No. 34-95148).
+_13F_DOLLAR_CUTOVER_DATE: date = date(2023, 1, 3)
+
+
+def _parse_13f_date(value: date | str | None) -> date | None:
+    """Parse a date / datetime / ISO string to ``date``, or ``None``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_share_count(raw: Any) -> int | float | None:
+    """Parse a non-negative finite 13F share count, or ``None`` if invalid."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, float):
+        if not math.isfinite(raw) or raw < 0:
+            return None
+        return int(raw) if raw.is_integer() else raw
+    if isinstance(raw, str):
+        cleaned = raw.replace(",", "").strip()
+        if not cleaned:
+            return None
+        try:
+            val = float(cleaned)
+        except ValueError:
+            return None
+        if not math.isfinite(val) or val < 0:
+            return None
+        return int(val) if val.is_integer() else val
+    return None
+
+
+def _parse_positive_float(raw: Any) -> float | None:
+    """Parse a strictly positive finite float, or ``None``."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val <= 0:
+        return None
+    return val
+
+
+def _13f_value_multiplier(filing_date: date | str | None) -> int | None:
+    """Return USD multiplier for Form 13F ``<value>`` based on filing date.
+
+    Filings made on or after 2023-01-03 report ``<value>`` in whole dollars
+    (multiplier 1); earlier filings report in thousands of dollars (1000).
+    Fails closed (returns ``None``) when ``filing_date`` is missing or
+    unparseable so unknown-unit rows are quarantined rather than guessed.
+    """
+    parsed = _parse_13f_date(filing_date)
+    if parsed is None:
+        log.warning(
+            "13F filing_date missing/unparseable ({d!r}); value units unknown — failing closed",
+            d=filing_date,
+        )
+        return None
+    return 1 if parsed >= _13F_DOLLAR_CUTOVER_DATE else 1000
+
+
+def _select_latest_filings_by_report_date(
+    filings: list[dict[str, Any]],
+    *,
+    count: int | None = None,
+) -> list[dict[str, Any]]:
+    """Collapse 13F-HR / 13F-HR/A filings so a RESTATEMENT replaces its original.
+
+    Only an amendment whose ``amendment_type`` is verified as ``RESTATEMENT``
+    may replace the original. A "NEW HOLDINGS" amendment lists only added
+    positions, so treating it as the quarter's full holdings would turn every
+    omitted position into a false CLOSED outflow. EDGAR's submissions index
+    does not carry the amendment type, so unverified amendments are skipped
+    (logged) and the original 13F-HR stands, as before amendments were read.
+
+    Filings that share a valid ``report_date`` collapse to the single latest
+    eligible filing ranked by ``(filing_date, is_amendment, accession)``.
+    Filings with no ``report_date`` (e.g. legacy callers/tests) remain
+    distinct by ``(accession, filing_date)``. Returned newest quarter first.
+    """
+    by_report_date: dict[date, tuple[tuple[date, int, str], dict[str, Any]]] = {}
+    without_report_date: list[tuple[tuple[date, int, str], dict[str, Any]]] = []
+    seen_no_rd: set[tuple[str | None, date | None]] = set()
+
+    for raw in filings:
+        entry = dict(raw)
+        form = str(entry.get("form") or entry.get("form_type") or "").strip().upper()
+        is_amend = bool(entry.get("is_amendment")) or form.endswith("/A") or form == "13F-A"
+        entry["is_amendment"] = is_amend
+        if form:
+            entry["form"] = form
+        if is_amend and str(entry.get("amendment_type") or "").strip().upper() != "RESTATEMENT":
+            log.warning(
+                "13F: skipping amendment {acc} ({form}, report_date={rd}): amendment type "
+                "{t!r} is not a verified RESTATEMENT; the original filing stands",
+                acc=entry.get("accession"),
+                form=form,
+                rd=entry.get("report_date"),
+                t=entry.get("amendment_type"),
+            )
+            continue
+        fdate = _parse_13f_date(entry.get("filing_date"))
+        rdate = _parse_13f_date(entry.get("report_date"))
+        acc = str(entry.get("accession") or "").strip()
+        rank = (fdate or date.min, 1 if is_amend else 0, acc)
+
+        if rdate is not None:
+            prev = by_report_date.get(rdate)
+            if prev is None:
+                by_report_date[rdate] = (rank, entry)
+            elif rank > prev[0]:
+                prev_acc = str(prev[1].get("accession") or "").strip()
+                if prev_acc and prev_acc != acc:
+                    entry["replaces_accession"] = prev_acc
+                by_report_date[rdate] = (rank, entry)
+            else:
+                prev_entry = prev[1]
+                if acc and acc != str(prev_entry.get("accession") or "").strip():
+                    prev_entry.setdefault("replaces_accession", acc)
+        else:
+            key = (acc or None, fdate)
+            if key in seen_no_rd:
+                continue
+            seen_no_rd.add(key)
+            without_report_date.append((rank, entry))
+
+    combined: list[tuple[tuple[date, date, int, str], dict[str, Any]]] = []
+    for rdate, (rank, entry) in by_report_date.items():
+        combined.append(((rdate, rank[0], rank[1], rank[2]), entry))
+    for rank, entry in without_report_date:
+        combined.append(((rank[0], rank[0], rank[1], rank[2]), entry))
+
+    combined.sort(key=lambda item: item[0], reverse=True)
+    ordered = [entry for _, entry in combined]
+    return ordered[:count] if count is not None else ordered
+
+
+def _aggregate_holdings_by_cusip(
+    holdings: list[dict[str, Any]],
+    *,
+    quarantine_counts: dict[str, int] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Aggregate parsed 13F infotable entries per CUSIP within a single filing.
+
+    Excludes put/call option rows (which share the underlying CUSIP and are not
+    cash equity share holdings) and sums duplicate equity sub-manager lines
+    while flagging unit or share-type mismatches as ``mixed``.
+    """
+    by_cusip: dict[str, dict[str, Any]] = {}
+    for h in holdings:
+        cusip = str(h.get("cusip") or "").strip().upper()
+        if not cusip:
+            continue
+        if h.get("put_call"):
+            if quarantine_counts is not None:
+                quarantine_counts["non_equity_option"] = quarantine_counts.get("non_equity_option", 0) + 1
+            continue
+
+        row = dict(h)
+        row["cusip"] = cusip
+        if cusip not in by_cusip:
+            by_cusip[cusip] = row
+            continue
+
+        agg = by_cusip[cusip]
+        # Flag unit or share-type disagreements across lines for the same CUSIP
+        if agg.get("value_units") != row.get("value_units"):
+            agg["value_units"] = "mixed"
+        agg_st = str(agg.get("share_type") or "").strip().upper()
+        row_st = str(row.get("share_type") or "").strip().upper()
+        if agg_st and row_st and agg_st != row_st:
+            agg["share_type"] = "MIXED"
+
+        v1 = _parse_positive_float(agg.get("value_usd"))
+        v2 = _parse_positive_float(row.get("value_usd"))
+        agg["value_usd"] = (v1 + v2) if (v1 is not None and v2 is not None) else None
+
+        s1 = _parse_share_count(agg.get("shares"))
+        s2 = _parse_share_count(row.get("shares"))
+        if s1 is not None and s2 is not None:
+            agg["shares"] = s1 + s2
+        else:
+            agg["shares"] = None
+
+    return by_cusip
 
 # Request timeout
 _REQUEST_TIMEOUT: int = 30
@@ -346,22 +562,30 @@ class InstitutionalFlowsPuller(BasePuller):
         resp.raise_for_status()
         data = resp.json()
 
-        filings: list[dict[str, Any]] = []
+        raw_filings: list[dict[str, Any]] = []
         recent = data.get("filings", {}).get("recent", {})
         forms = recent.get("form", [])
         accessions = recent.get("accessionNumber", [])
         dates = recent.get("filingDate", [])
+        report_dates = recent.get("reportDate", [])
         primary_docs = recent.get("primaryDocument", [])
 
+        accepted_forms = {filing_type}
+        if not filing_type.endswith("/A"):
+            accepted_forms.add(f"{filing_type}/A")
+
         for i, form in enumerate(forms):
-            if form == filing_type and len(filings) < count:
-                filings.append({
+            if form in accepted_forms:
+                raw_filings.append({
                     "accession": accessions[i] if i < len(accessions) else None,
                     "filing_date": dates[i] if i < len(dates) else None,
+                    "report_date": report_dates[i] if i < len(report_dates) else None,
+                    "form": form,
+                    "is_amendment": form.endswith("/A"),
                     "primary_doc": primary_docs[i] if i < len(primary_docs) else None,
                 })
 
-        return filings
+        return _select_latest_filings_by_report_date(raw_filings, count=count)
 
     @retry_on_failure(
         max_attempts=2,
@@ -369,7 +593,10 @@ class InstitutionalFlowsPuller(BasePuller):
         retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_13f_holdings(
-        self, cik: str, accession: str
+        self,
+        cik: str,
+        accession: str,
+        filing_date: date | str | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch parsed holdings from a specific 13F filing.
 
@@ -379,10 +606,14 @@ class InstitutionalFlowsPuller(BasePuller):
         Parameters:
             cik: SEC CIK of the filer.
             accession: Accession number (e.g., '0001067983-24-000019').
+            filing_date: Filing date (``date`` or ISO string) used to determine
+                whether ``<value>`` is reported in whole dollars (>= 2023-01-03)
+                or thousands of dollars (< 2023-01-03).
 
         Returns:
             List of holding dicts.
         """
+        value_mult = _13f_value_multiplier(filing_date)
         # Build the filing directory URL
         acc_clean = accession.replace("-", "")
         base_url = f"{_EDGAR_13F_XML_BASE}/{cik}/{acc_clean}"
@@ -440,9 +671,10 @@ class InstitutionalFlowsPuller(BasePuller):
                 for field, tag in [
                     ("name", "nameOfIssuer"),
                     ("cusip", "cusip"),
-                    ("value", "value"),  # in thousands
+                    ("value", "value"),  # whole dollars >= 2023-01-03; thousands earlier
                     ("shares", "sshPrnamt"),
                     ("share_type", "sshPrnamtType"),
+                    ("put_call", "putCall"),
                     ("investment_discretion", "investmentDiscretion"),
                     ("voting_sole", "Sole"),
                     ("voting_shared", "Shared"),
@@ -452,12 +684,29 @@ class InstitutionalFlowsPuller(BasePuller):
                     if el is not None and el.text:
                         holding[field] = el.text.strip()
                 if holding.get("name") and holding.get("cusip"):
-                    # Convert value from thousands to actual
-                    if "value" in holding:
-                        try:
-                            holding["value_usd"] = int(holding["value"]) * 1000
-                        except (ValueError, TypeError):
-                            holding["value_usd"] = 0
+                    if "share_type" in holding:
+                        holding["share_type"] = holding["share_type"].upper()
+                    # Normalize <value> to whole USD per filing date cutover;
+                    # fail closed (value_units='unknown', value_usd=None) when
+                    # filing_date is missing/unparseable.
+                    holding["value_multiplier"] = value_mult
+                    if value_mult is None:
+                        holding["value_units"] = "unknown"
+                        holding["value_usd"] = None
+                    else:
+                        holding["value_units"] = "usd"
+                        holding["reported_value_units"] = (
+                            "usd" if value_mult == 1 else "thousands_usd"
+                        )
+                        if "value" in holding:
+                            try:
+                                raw_v = float(holding["value"].replace(",", ""))
+                                if math.isfinite(raw_v) and raw_v >= 0:
+                                    holding["value_usd"] = int(round(raw_v)) * value_mult
+                                else:
+                                    holding["value_usd"] = None
+                            except (ValueError, TypeError):
+                                holding["value_usd"] = None
                     holdings.append(holding)
 
         except ET.ParseError as exc:
@@ -471,63 +720,179 @@ class InstitutionalFlowsPuller(BasePuller):
         self,
         prev_holdings: dict[str, dict[str, Any]],
         curr_holdings: dict[str, dict[str, Any]],
+        *,
+        quarantine_counts: dict[str, int] | None = None,
     ) -> list[dict[str, Any]]:
-        """Compare two quarterly snapshots to detect position changes.
+        """Compare two quarterly snapshots using share-based flow estimates.
+
+        Uses option (a) — ``|delta_shares| * stated quarter-end implied price``:
+        - ``NEW`` / ``INCREASED`` / ``DECREASED``: later (current) quarter-end
+          implied price ``curr_value_usd / curr_shares``.
+        - ``CLOSED``: prior quarter-end implied price ``prev_value_usd / prev_shares``.
+
+        Constant shares at a different price yield ``delta_shares == 0`` (zero
+        estimated flow, no event emitted). Rows missing share counts, carrying
+        unknown/mixed value units, non-``SH`` share types, or options
+        (``putCall``) are quarantined (excluded with reason count).
 
         Parameters:
             prev_holdings: Previous quarter holdings keyed by CUSIP.
             curr_holdings: Current quarter holdings keyed by CUSIP.
+            quarantine_counts: Optional dict updated in place with per-reason
+                quarantine counts.
 
         Returns:
             List of change dicts with action (NEW/CLOSED/INCREASED/DECREASED).
         """
+        def _quarantine(reason: str) -> None:
+            if quarantine_counts is not None:
+                quarantine_counts[reason] = quarantine_counts.get(reason, 0) + 1
+
+        def _qualify(h: dict[str, Any]) -> tuple[float, int | float, str] | tuple[None, None, str]:
+            if h.get("put_call"):
+                return None, None, "non_equity_option"
+            units = h.get("value_units")
+            if units is not None and str(units).strip().lower() != "usd":
+                return None, None, "unknown_or_mixed_units"
+            if "value_multiplier" in h and (
+                isinstance(h["value_multiplier"], bool) or h["value_multiplier"] not in (1, 1000)
+            ):
+                return None, None, "unknown_or_mixed_units"
+            st = str(h.get("share_type") or "").strip().upper()
+            if st and st != "SH":
+                return None, None, "non_share_unit"
+            val = _parse_positive_float(h.get("value_usd"))
+            if val is None:
+                return None, None, "invalid_value_usd"
+            shares = _parse_share_count(h.get("shares"))
+            if shares is None or shares <= 0:
+                return None, None, "missing_share_counts"
+            return val, shares, st or "SH"
+
         changes: list[dict[str, Any]] = []
         prev_cusips = set(prev_holdings.keys())
         curr_cusips = set(curr_holdings.keys())
 
-        # New positions
+        # New positions (valued at current quarter-end implied price)
         for cusip in curr_cusips - prev_cusips:
             h = curr_holdings[cusip]
+            curr_val, curr_shares, share_type = _qualify(h)
+            if curr_val is None or curr_shares is None:
+                _quarantine(share_type)
+                continue
+            curr_price = curr_val / curr_shares
+            est_flow = round(curr_shares * curr_price, 2)
             changes.append({
                 "cusip": cusip,
                 "name": h.get("name", ""),
                 "action": "NEW",
-                "value_usd": h.get("value_usd", 0),
-                "shares": h.get("shares"),
+                "observation_kind": "filing_appearance",
+                "measure": OBSERVATION_MEASURE,
+                "value_usd": est_flow,
+                "estimated_flow_usd": est_flow,
+                "holdings_value_delta_usd": curr_val,
+                "curr_value_usd": curr_val,
+                "prev_value_usd": 0.0,
+                "shares": curr_shares,
+                "curr_shares": curr_shares,
+                "prev_shares": 0,
+                "delta_shares": curr_shares,
+                "valuation_price_usd": round(curr_price, 6),
+                "valuation_price_basis": "curr_quarter_end_implied",
+                "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+                "value_units": "usd",
+                "share_type": share_type,
+                "qualified_for_directional_flow": False,
+                "unqualified_reason": NEW_CLOSED_UNQUALIFIED_REASON,
             })
 
-        # Closed positions
+        # Closed positions (valued at prior quarter-end implied price)
         for cusip in prev_cusips - curr_cusips:
             h = prev_holdings[cusip]
+            prev_val, prev_shares, share_type = _qualify(h)
+            if prev_val is None or prev_shares is None:
+                _quarantine(share_type)
+                continue
+            prev_price = prev_val / prev_shares
+            est_flow = round(prev_shares * prev_price, 2)
             changes.append({
                 "cusip": cusip,
                 "name": h.get("name", ""),
                 "action": "CLOSED",
-                "value_usd": h.get("value_usd", 0),
-                "shares": h.get("shares"),
+                "observation_kind": "filing_disappearance",
+                "measure": OBSERVATION_MEASURE,
+                "value_usd": est_flow,
+                "estimated_flow_usd": est_flow,
+                "holdings_value_delta_usd": -prev_val,
+                "curr_value_usd": 0.0,
+                "prev_value_usd": prev_val,
+                "shares": prev_shares,
+                "curr_shares": 0,
+                "prev_shares": prev_shares,
+                "delta_shares": -prev_shares,
+                "valuation_price_usd": round(prev_price, 6),
+                "valuation_price_basis": "prev_quarter_end_implied",
+                "flow_estimation_method": "delta_shares_x_prev_quarter_end_price",
+                "value_units": "usd",
+                "share_type": share_type,
+                "qualified_for_directional_flow": False,
+                "unqualified_reason": NEW_CLOSED_UNQUALIFIED_REASON,
             })
 
-        # Changed positions
+        # Continuing positions: share-based delta * later quarter-end implied price
         for cusip in prev_cusips & curr_cusips:
-            prev_val = prev_holdings[cusip].get("value_usd", 0)
-            curr_val = curr_holdings[cusip].get("value_usd", 0)
-            if prev_val == 0:
+            prev_h = prev_holdings[cusip]
+            curr_h = curr_holdings[cusip]
+            prev_val, prev_shares, prev_st = _qualify(prev_h)
+            if prev_val is None or prev_shares is None:
+                _quarantine(prev_st)
                 continue
-            pct_change = (curr_val - prev_val) / prev_val
-            if pct_change > _POSITION_CHANGE_THRESHOLD:
+            curr_val, curr_shares, curr_st = _qualify(curr_h)
+            if curr_val is None or curr_shares is None:
+                _quarantine(curr_st)
+                continue
+            if prev_st != curr_st:
+                _quarantine("mixed_share_types")
+                continue
+            delta_shares = curr_shares - prev_shares
+            if delta_shares == 0:
+                continue  # Constant shares at a new price = 0 estimated cash flow
+
+            share_pct_change = delta_shares / prev_shares
+            if share_pct_change > _POSITION_CHANGE_THRESHOLD:
                 action = "INCREASED"
-            elif pct_change < -_POSITION_CHANGE_THRESHOLD:
+            elif share_pct_change < -_POSITION_CHANGE_THRESHOLD:
                 action = "DECREASED"
             else:
-                continue  # Skip small changes
+                continue  # Skip small share changes
+
+            curr_price = curr_val / curr_shares
+            est_flow = round(abs(delta_shares) * curr_price, 2)
             changes.append({
                 "cusip": cusip,
-                "name": curr_holdings[cusip].get("name", ""),
+                "name": curr_h.get("name", ""),
                 "action": action,
-                "value_usd": curr_val,
+                "value_usd": est_flow,
+                "estimated_flow_usd": est_flow,
+                "holdings_value_delta_usd": curr_val - prev_val,
+                "curr_value_usd": curr_val,
                 "prev_value_usd": prev_val,
-                "pct_change": round(pct_change, 4),
-                "shares": curr_holdings[cusip].get("shares"),
+                "pct_change": round(share_pct_change, 4),
+                "share_pct_change": round(share_pct_change, 4),
+                "shares": curr_shares,
+                "curr_shares": curr_shares,
+                "prev_shares": prev_shares,
+                "delta_shares": delta_shares,
+                "valuation_price_usd": round(curr_price, 6),
+                "valuation_price_basis": "curr_quarter_end_implied",
+                "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+                "value_units": "usd",
+                "share_type": curr_st,
+                # Unverified direction: a split or reverse split cannot be ruled out.
+                "observation_kind": "filing_holding_change",
+                "measure": OBSERVATION_MEASURE,
+                "qualified_for_directional_flow": False,
+                "unqualified_reason": CONTINUING_POSITION_UNQUALIFIED_REASON,
             })
 
         return changes
@@ -555,8 +920,11 @@ class InstitutionalFlowsPuller(BasePuller):
                     c=cik,
                 )
 
-                # Fetch two most recent filings for comparison
-                filings = self._fetch_13f_index(cik, count=2)
+                # Fetch two most recent quarter filings (amendments replace originals)
+                filings = _select_latest_filings_by_report_date(
+                    self._fetch_13f_index(cik, count=2),
+                    count=2,
+                )
                 time.sleep(_EDGAR_RATE_DELAY)
 
                 if len(filings) < 2:
@@ -568,7 +936,11 @@ class InstitutionalFlowsPuller(BasePuller):
                         # Still store current holdings
                         accession = filings[0]["accession"]
                         if accession:
-                            holdings = self._fetch_13f_holdings(cik, accession)
+                            holdings = self._fetch_13f_holdings(
+                                cik,
+                                accession,
+                                filing_date=filings[0].get("filing_date"),
+                            )
                             time.sleep(_EDGAR_RATE_DELAY)
                             results.append({
                                 "feature": f"13F:{cik}",
@@ -580,34 +952,67 @@ class InstitutionalFlowsPuller(BasePuller):
                     continue
 
                 # Parse both filings
-                curr_acc = filings[0]["accession"]
-                prev_acc = filings[1]["accession"]
-                curr_date_str = filings[0].get("filing_date", "")
+                curr_filing = filings[0]
+                prev_filing = filings[1]
+                curr_acc = curr_filing.get("accession")
+                prev_acc = prev_filing.get("accession")
+                curr_date_str = curr_filing.get("filing_date", "")
+                prev_date_str = prev_filing.get("filing_date", "")
+                curr_report_date = curr_filing.get("report_date")
+                prev_report_date = prev_filing.get("report_date")
+                curr_form = str(curr_filing.get("form") or "13F-HR").strip().upper()
+                curr_is_amendment = bool(curr_filing.get("is_amendment")) or curr_form.endswith("/A")
+                replaces_acc = curr_filing.get("replaces_accession")
 
                 if not curr_acc or not prev_acc:
                     continue
 
-                curr_holdings_list = self._fetch_13f_holdings(cik, curr_acc)
+                curr_mult = _13f_value_multiplier(curr_date_str)
+                prev_mult = _13f_value_multiplier(prev_date_str)
+                obs_date = _parse_13f_date(curr_date_str)
+                if curr_mult is None or prev_mult is None or obs_date is None:
+                    log.warning(
+                        "13F {m} (CIK={c}): missing/unparseable filing_date "
+                        "(curr={cd!r}, prev={pd!r}) — quarantining filing pair",
+                        m=manager_name, c=cik, cd=curr_date_str, pd=prev_date_str,
+                    )
+                    results.append({
+                        "feature": f"13F:{cik}",
+                        "manager": manager_name,
+                        "status": "QUARANTINED",
+                        "reason": "unknown_filing_date_or_units",
+                        "rows_inserted": 0,
+                    })
+                    continue
+
+                curr_holdings_list = self._fetch_13f_holdings(
+                    cik, curr_acc, filing_date=curr_date_str
+                )
                 time.sleep(_EDGAR_RATE_DELAY)
-                prev_holdings_list = self._fetch_13f_holdings(cik, prev_acc)
+                prev_holdings_list = self._fetch_13f_holdings(
+                    cik, prev_acc, filing_date=prev_date_str
+                )
                 time.sleep(_EDGAR_RATE_DELAY)
 
-                # Index by CUSIP
-                curr_by_cusip = {
-                    h["cusip"]: h for h in curr_holdings_list if "cusip" in h
-                }
-                prev_by_cusip = {
-                    h["cusip"]: h for h in prev_holdings_list if "cusip" in h
-                }
+                # Aggregate by CUSIP (excluding put/call options, summing sub-managers)
+                quarantine_counts: dict[str, int] = {}
+                curr_by_cusip = _aggregate_holdings_by_cusip(
+                    curr_holdings_list, quarantine_counts=quarantine_counts
+                )
+                prev_by_cusip = _aggregate_holdings_by_cusip(
+                    prev_holdings_list, quarantine_counts=quarantine_counts
+                )
 
-                # Detect changes
-                changes = self._compare_holdings(prev_by_cusip, curr_by_cusip)
-
-                # Determine obs_date from filing
-                try:
-                    obs_date = date.fromisoformat(curr_date_str) if curr_date_str else date.today()
-                except ValueError:
-                    obs_date = date.today()
+                # Detect share-based position changes
+                changes = self._compare_holdings(
+                    prev_by_cusip, curr_by_cusip, quarantine_counts=quarantine_counts
+                )
+                quarantined_total = sum(quarantine_counts.values())
+                if quarantined_total:
+                    log.warning(
+                        "13F {m} (CIK={c}): quarantined {q} non-qualified holdings ({reasons})",
+                        m=manager_name, c=cik, q=quarantined_total, reasons=quarantine_counts,
+                    )
 
                 # Store changes
                 rows_inserted = 0
@@ -632,71 +1037,49 @@ class InstitutionalFlowsPuller(BasePuller):
                                 "cusip": chg["cusip"],
                                 "issuer_name": chg.get("name", ""),
                                 "action": chg["action"],
+                                "estimated_flow_usd": chg.get("estimated_flow_usd"),
+                                "holdings_value_delta_usd": chg.get("holdings_value_delta_usd"),
+                                "curr_value_usd": chg.get("curr_value_usd"),
+                                "prev_value_usd": chg.get("prev_value_usd"),
                                 "pct_change": chg.get("pct_change"),
+                                "share_pct_change": chg.get("share_pct_change"),
                                 "shares": chg.get("shares"),
+                                "curr_shares": chg.get("curr_shares"),
+                                "prev_shares": chg.get("prev_shares"),
+                                "delta_shares": chg.get("delta_shares"),
+                                "valuation_price_usd": chg.get("valuation_price_usd"),
+                                "valuation_price_basis": chg.get("valuation_price_basis"),
+                                "flow_estimation_method": chg.get("flow_estimation_method"),
+                                "value_units": chg.get("value_units", "usd"),
+                                "value_multiplier": curr_mult,
+                                "prev_value_multiplier": prev_mult,
+                                "share_type": chg.get("share_type", "SH"),
+                                "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
+                                "unqualified_reason": chg.get("unqualified_reason"),
+                                "observation_kind": chg.get("observation_kind"),
+                                "measure": chg.get("measure"),
                                 "filing_accession": curr_acc,
+                                "prev_filing_accession": prev_acc,
+                                "filing_date": obs_date.isoformat(),
+                                "prev_filing_date": _parse_13f_date(prev_date_str).isoformat() if _parse_13f_date(prev_date_str) else None,
+                                "report_date": curr_report_date,
+                                "prev_report_date": prev_report_date,
+                                "form_type": curr_form,
+                                "is_amendment": curr_is_amendment,
+                                "replaces_accession": replaces_acc,
                             },
                         )
                         rows_inserted += 1
 
-                    # Emit one signal_sources row per position change for
-                    # trust scoring + downstream convergence detection.
-                    # Schema (schema.sql ~803):
-                    #   (source_type, source_id, ticker, signal_date,
-                    #    signal_type, signal_value JSONB, ...)
-                    # Matches working pullers: congressional / insider / dark_pool.
-                    for chg in changes:
-                        # 13F filings carry CUSIP only — use it as the ticker
-                        # slot so the UNIQUE(source_type, source_id, ticker,
-                        # signal_date, signal_type) key stays stable and the
-                        # convergence scanner (which filters ticker IS NOT NULL)
-                        # still sees each instrument.
-                        chg_ticker = str(chg.get("cusip") or "").strip()
-                        if not chg_ticker:
-                            continue
-                        try:
-                            conn.execute(
-                                text(
-                                    "INSERT INTO signal_sources "
-                                    "(source_type, source_id, ticker, signal_date, "
-                                    "signal_type, signal_value) "
-                                    "VALUES (:stype, :sid, :ticker, :sdate, "
-                                    ":stype2, :sval) "
-                                    "ON CONFLICT (source_type, source_id, ticker, "
-                                    "signal_date, signal_type) DO NOTHING"
-                                ),
-                                {
-                                    "stype": "institutional",
-                                    "sid": f"{cik}:{manager_name}"[:200],
-                                    "ticker": chg_ticker,
-                                    "sdate": obs_date,
-                                    "stype2": "NET_POSITION_DELTA",
-                                    "sval": json.dumps({
-                                        "manager": manager_name,
-                                        "cik": cik,
-                                        "cusip": chg.get("cusip"),
-                                        "issuer_name": chg.get("name", ""),
-                                        "action": chg.get("action"),
-                                        "value_usd": float(chg.get("value_usd", 0) or 0),
-                                        "prev_value_usd": float(
-                                            chg.get("prev_value_usd", 0) or 0
-                                        ),
-                                        "pct_change": chg.get("pct_change"),
-                                        "shares": chg.get("shares"),
-                                        "filing_accession": curr_acc,
-                                    }),
-                                },
-                            )
-                        except Exception as sig_exc:
-                            # Never break raw_series ingestion because of a
-                            # signal_sources write — log loudly and continue.
-                            log.warning(
-                                "institutional_flows: signal_sources write "
-                                "failed for {m}/{c}: {e}",
-                                m=manager_name,
-                                c=chg_ticker,
-                                e=str(sig_exc),
-                            )
+                    # No 13F row goes to signal_sources (owner decision
+                    # 2026-11-23: 13F is non-directional until CUSIP identity
+                    # and split coverage exist). The old writer emitted
+                    # source_type 'institutional' / NET_POSITION_DELTA with a
+                    # dollar value, which wealth_tracker and pocket_lining read
+                    # as directional fund flows; its CUSIP-keyed rows never
+                    # matched the ticker-keyed holdings graph either. The
+                    # observations stay in raw_series (labelled above) and in
+                    # dollar_flows as direction "observed".
 
                 results.append({
                     "feature": f"13F:{cik}",
@@ -704,6 +1087,7 @@ class InstitutionalFlowsPuller(BasePuller):
                     "status": "SUCCESS",
                     "changes_detected": len(changes),
                     "rows_inserted": rows_inserted,
+                    "quarantined": quarantined_total,
                 })
 
                 log.info(

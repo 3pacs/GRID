@@ -111,6 +111,7 @@ def test_parse_weekly_stocks_response_documented_envelope():
         "period": date(2026, 9, 5),
         "value": 24531.0,
         "units": "MBBL",
+        "units_verified": True,
         "series": "W_EPC0_SAX_YCUOK_MBBL",
     }
     assert rows[1]["period"] == date(2026, 8, 29)
@@ -121,10 +122,10 @@ def test_parse_weekly_stocks_response_skips_missing_period_or_value():
     payload = {
         "response": {
             "data": [
-                {"period": "2026-09-05", "value": "24531", "units": "MBBL"},
-                {"period": None, "value": "1", "units": "MBBL"},
-                {"period": "2026-08-29", "value": None, "units": "MBBL"},
-                {"period": "2026-08-22", "value": "not-a-number", "units": "MBBL"},
+                {"period": "2026-09-05", "series": DEFAULT_WEEKLY_STOCKS_SERIES, "value": "24531", "units": "MBBL"},
+                {"period": None, "series": DEFAULT_WEEKLY_STOCKS_SERIES, "value": "1", "units": "MBBL"},
+                {"period": "2026-08-29", "series": DEFAULT_WEEKLY_STOCKS_SERIES, "value": None, "units": "MBBL"},
+                {"period": "2026-08-22", "series": DEFAULT_WEEKLY_STOCKS_SERIES, "value": "not-a-number", "units": "MBBL"},
             ],
         }
     }

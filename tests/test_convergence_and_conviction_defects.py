@@ -328,6 +328,14 @@ class TestDefect3FinraShortVolumeNonDirectional:
 
 
 class TestDefect4Stale13FExcluded:
+    @pytest.fixture(autouse=True)
+    def _test_only_directional_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """These cases test the period-end filter, which sits on the test-only
+        re-enable path: 13F is non-directional by default (owner decision
+        2026-11-23), and the default abstention is tested in
+        tests/test_signal_convergence_scanner.py::TestExtractorInstitutional."""
+        monkeypatch.setattr(scs, "INSTITUTIONAL_13F_DIRECTIONAL", True)
+
     def test_13f_without_period_end_is_excluded_from_7d_window(self) -> None:
         """institutional_flows.py writes filing date only (no holdings period_end)."""
         payload = json.dumps({

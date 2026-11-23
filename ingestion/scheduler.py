@@ -1897,8 +1897,9 @@ def run_daily_pulls(
             "data_as_of={da} ({age} days old)",
             s=result.get("regime", "?"),
             c=result.get("confidence", "?"),
+            # False without an error: the day's row already held these values (#1302).
             rh=result.get("regime", "?") if result.get("regime_history_written")
-            else "NOT WRITTEN",
+            else "NOT WRITTEN" if result.get("regime_history_error") else "unchanged",
             da=result.get("data_as_of") or "unknown",
             age=result.get("data_staleness_days") if result.get("data_staleness_days") is not None
             else "?",
@@ -2294,17 +2295,26 @@ def _run_equity_pulls(
     # Options chain pull
     try:
         from db import get_engine
-        from ingestion.options import OptionsPuller
+        from ingestion.options import DEDICATED_HANDOFF_REASON, OptionsPuller
 
         engine = get_engine()
         puller = OptionsPuller(db_engine=engine)
         results = puller.pull_all(capture_source="daily_scheduler")
-        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
-        total_snaps = sum(r.get("snapshots", 0) for r in results)
-        log.info(
-            "Options daily pull complete — {ok}/{total} tickers, {snaps} snapshots",
-            ok=succeeded, total=len(results), snaps=total_snaps,
-        )
+        if results and all(r.get("reason") == DEDICATED_HANDOFF_REASON for r in results):
+            # Schwab mode with GRID_OPTIONS_DEDICATED_TIMER=1, from 10:20 New York: the dedicated
+            # options timer runs this slot's full universe. Not the "complete" line, which
+            # scripts/gem_daily_capture.py reads (ingestion/options.py dedicated_timer_handoff).
+            log.info(
+                "Options daily pull handed off to the dedicated options timer ({n} tickers not requested here)",
+                n=len(results),
+            )
+        else:
+            succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+            total_snaps = sum(r.get("snapshots", 0) for r in results)
+            log.info(
+                "Options daily pull complete — {ok}/{total} tickers, {snaps} snapshots",
+                ok=succeeded, total=len(results), snaps=total_snaps,
+            )
     except Exception as exc:
         log.error("Options daily pull failed: {err}", err=str(exc))
         try:

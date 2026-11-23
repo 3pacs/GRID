@@ -191,9 +191,10 @@ def listing_bound(tiingo_start: str | None, first_naming: str | None) -> str | N
     return max(str(tiingo_start)[:10], str(first_naming)[:10])
 
 
-def build_trial_panels(events, admission, universe, prices, window):
+def build_trial_panels(events, admission, universe, prices, window, *, abstain_tickers=None):
     """v2's trial panels with closes before each ticker's ``listed_from`` (L_T) blanked first (v5 §2.3)."""
-    return v2.build_trial_panels(events, admission, universe, prices, window, blank_before_listing=True)
+    return v2.build_trial_panels(events, admission, universe, prices, window, blank_before_listing=True,
+                                 abstain_tickers=abstain_tickers)
 
 
 # --- pins ---------------------------------------------------------------------------------

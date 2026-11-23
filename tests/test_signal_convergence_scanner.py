@@ -480,7 +480,35 @@ class TestExtractorSmartMoney:
 
 
 class TestExtractorInstitutional:
-    def test_net_buying(self) -> None:
+    """13F is non-directional until CUSIP identity and split coverage exist
+    (owner decision 2026-11-23): the extractor abstains by default. The
+    ``INSTITUTIONAL_13F_DIRECTIONAL`` re-enable path keeps the old net count."""
+
+    @pytest.mark.parametrize("new_positions,closed_positions", [(5, 1), (0, 6)],
+                             ids=["net_buying", "net_selling"])
+    def test_abstains_by_default(self, new_positions: int, closed_positions: int) -> None:
+        assert scs.INSTITUTIONAL_13F_DIRECTIONAL is False
+        rows = [_institutional_row(T3, new_positions=new_positions, closed_positions=closed_positions)]
+        conn = FakeConnection(stream_rows={STREAM_INSTITUTIONAL: rows})
+        assert scs._scan_institutional(FakeEngine(conn), "AAPL", AS_OF, WINDOW, {}) is None
+        assert conn.calls == []  # abstains without reading signal_sources
+
+    def test_qualified_looking_payload_still_abstains(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        payload = json.dumps({
+            "action": "NEW", "new_positions": 9, "increased": 4,
+            "qualified_for_directional_flow": True, "period_end": T3.isoformat(),
+        })
+        rows = [("BLACKROCK_CIK", T3, "NET_POSITION_DELTA", payload, 0.9,
+                 _as_utc(T3.year, T3.month, T3.day))]
+        engine = FakeEngine(FakeConnection(stream_rows={STREAM_INSTITUTIONAL: rows}))
+        assert scs._scan_institutional(engine, "AAPL", AS_OF, WINDOW, {}) is None
+        # Control: the same rows do score once the re-enable flag is set.
+        monkeypatch.setattr(scs, "INSTITUTIONAL_13F_DIRECTIONAL", True)
+        sig = scs._scan_institutional(engine, "AAPL", AS_OF, WINDOW, {})
+        assert sig is not None and sig.direction == BULLISH
+
+    def test_net_buying(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scs, "INSTITUTIONAL_13F_DIRECTIONAL", True)
         rows = [_institutional_row(T3, new_positions=5, closed_positions=1, period_end=T3)]
         engine = FakeEngine(
             FakeConnection(stream_rows={STREAM_INSTITUTIONAL: rows})
@@ -489,7 +517,8 @@ class TestExtractorInstitutional:
         assert sig is not None
         assert sig.direction == BULLISH
 
-    def test_net_selling(self) -> None:
+    def test_net_selling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scs, "INSTITUTIONAL_13F_DIRECTIONAL", True)
         rows = [_institutional_row(T3, new_positions=0, closed_positions=6, period_end=T3)]
         engine = FakeEngine(
             FakeConnection(stream_rows={STREAM_INSTITUTIONAL: rows})
@@ -498,7 +527,8 @@ class TestExtractorInstitutional:
         assert sig is not None
         assert sig.direction == BEARISH
 
-    def test_missing_table(self) -> None:
+    def test_missing_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scs, "INSTITUTIONAL_13F_DIRECTIONAL", True)
         engine = FakeEngine(FakeConnection(missing_streams={STREAM_INSTITUTIONAL}))
         assert scs._scan_institutional(engine, "AAPL", AS_OF, WINDOW, {}) is None
 

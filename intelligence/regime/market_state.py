@@ -30,15 +30,21 @@ DIX is GRID's ``finra:dix_sp500`` series (``ingestion/altdata/finra_dix.py``). D
 ``dealer_gex_daily`` (``physics/dealer_gex_daily.py``), whose SPY history starts with registered option captures on
 2026-09-26; until it has a baseline's worth of sessions it is reported ``no_baseline`` with its value, and
 ``gamma_state`` gives the regime and flip. Release and earnings surprises are listed in :data:`PENDING`.
+
+A provisional record computed at the session's close (#1312) is display only and has its own table and store
+functions at the end of this module; :func:`store_market_state` refuses one. It is computed with ``known_by`` (the
+session's close): every read is cut at that instant instead of the end of ``as_of``. Without ``known_by`` nothing
+changes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_right
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -51,7 +57,9 @@ from sqlalchemy.engine import Engine
 from intelligence.regime.baseline import BASELINE_RULE, standardize_last, window_for
 from store.observations import MixedSourceError, PublicationLag, read_window_known_at
 
-RECORD_RULE = "market-state/1"
+# market-state/2 = market-state/1 plus freshness (#1303): an input older than its maximum age reads ``stale``, not ok.
+RECORD_RULE = "market-state/2"
+FRESHNESS_RULE = "max-age/1"
 
 # ── Publication lags (modeled availability for backfilled history; late on purpose) ──
 _NEXT_BD = PublicationLag(1, "business", "posted the next business day (FRED daily / Cboe close / FINRA evening file)")
@@ -115,11 +123,13 @@ class VarSpec:
 
 
 def raw_selection_receipt(observations: list, selected: pd.Series, *, series_id: str,
-                          as_of: date, start: date, status: str = "read") -> dict[str, Any]:
+                          as_of: date, start: date, status: str = "read",
+                          as_of_ts: datetime | None = None) -> dict[str, Any]:
     """Hash exactly the finite, date-collapsed raw inputs consumed, including their clocks.
 
     This is a selection fingerprint, not immutable byte custody or PIT qualification.
     No arbitrary raw_payload is copied. Modeled publication dates remain modeled.
+    ``as_of_ts`` (the provisional record's cutoff, #1312) is recorded only when the read was cut at an instant.
     """
     by_date = {o.obs_date: o for o in observations if o.value is not None}
     rows = []
@@ -132,8 +142,9 @@ def raw_selection_receipt(observations: list, selected: pd.Series, *, series_id:
                      "known_at_basis": o.known_at_basis})
     encoded = json.dumps(rows, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     bases = Counter(row["known_at_basis"] or "unknown" for row in rows)
+    cut = {"as_of_ts": as_of_ts.isoformat()} if as_of_ts is not None else {}
     return {"schema": "market-state-raw-selection/1", "status": status,
-            "series_id": series_id, "as_of": as_of.isoformat(), "start": start.isoformat(),
+            "series_id": series_id, "as_of": as_of.isoformat(), **cut, "start": start.isoformat(),
             "source_filter": SOURCES.get(series_id),
             "publication_policy": {**asdict(LAGS[series_id]),
                 "release_overrides": [[a.isoformat(), b.isoformat()] for a, b in LAGS[series_id].release_overrides],
@@ -152,10 +163,19 @@ def raw_selection_receipt(observations: list, selected: pd.Series, *, series_id:
 
 
 class _Reads:
-    """Known-at reads for one ``as_of``, memoized per series."""
+    """Known-at reads for one ``as_of``, memoized per series.
 
-    def __init__(self, engine: Engine, as_of: date, lookback_days: int) -> None:
+    ``known_by`` (the provisional record's availability cutoff, #1312) cuts every read at that instant, each on the
+    clock its store keeps: raw_series ``pull_timestamp`` (no modeled path), fred_vintages ``fetched_at``
+    (intervals rebuilt from the versions known then, since ``realtime_end`` is extended in place) and
+    dealer_gex_daily ``created_at``. Resolved ``spy_full`` is not read, because ``resolved_series`` has no write
+    clock; SPY comes from ``YF:SPY:close``. Without ``known_by`` every read is the decision record's own
+    end-of-``as_of`` read, unchanged.
+    """
+
+    def __init__(self, engine: Engine, as_of: date, lookback_days: int, known_by: datetime | None = None) -> None:
         self.engine, self.as_of, self.lookback_days = engine, as_of, lookback_days
+        self.known_by = known_by.astimezone(timezone.utc) if known_by is not None else None
         self._memo: dict[str, Any] = {}
         self.spy_basis: str | None = None
         self.first_print_obs: dict[str, date | None] = {}
@@ -168,7 +188,7 @@ class _Reads:
             try:
                 with self.engine.connect() as conn:
                     obs = read_window_known_at(conn, series_id, as_of=self.as_of, lag=LAGS.get(series_id),
-                                               source=SOURCES.get(series_id), start=start)
+                                               source=SOURCES.get(series_id), start=start, **self._cut_kw())
             except MixedSourceError as exc:
                 log.warning("market_state: {s} is mixed-source, skipped: {e}", s=series_id, e=str(exc))
                 obs = []
@@ -176,8 +196,13 @@ class _Reads:
             s = pd.Series({o.obs_date: o.value for o in obs if o.value is not None}, dtype=float).sort_index()
             self._memo[series_id] = s[np.isfinite(s.to_numpy())] if len(s) else s
             self.raw_lineage[series_id] = raw_selection_receipt(
-                obs, self._memo[series_id], series_id=series_id, as_of=self.as_of, start=start, status=status)
+                obs, self._memo[series_id], series_id=series_id, as_of=self.as_of, start=start, status=status,
+                **self._cut_kw())
         return self._memo[series_id]
+
+    def _cut_kw(self) -> dict[str, datetime]:
+        """``as_of_ts`` only when the reads are cut, so the decision record's calls stay exactly as they were."""
+        return {"as_of_ts": self.known_by} if self.known_by is not None else {}
 
     def vintages(self, series_id: str) -> pd.DataFrame:
         """ALFRED vintage rows (store/fred_vintages.py) for observations in the lookback, published by as_of."""
@@ -185,8 +210,10 @@ class _Reads:
         if key not in self._memo:
             from store import fred_vintages as FV
 
+            cut = {"fetched_by": self.known_by} if self.known_by is not None else {}
             try:
-                df = FV.load(self.engine, series_id, self.as_of - timedelta(days=NEWS_LOOKBACK_DAYS), self.as_of, self.as_of)
+                df = FV.load(self.engine, series_id, self.as_of - timedelta(days=NEWS_LOOKBACK_DAYS), self.as_of,
+                             self.as_of, **cut)
             except Exception as exc:  # table absent before the first fetch
                 log.warning("market_state: no vintages for {s}: {e}", s=series_id, e=str(exc))
                 df = pd.DataFrame(columns=["obs_date", "realtime_start", "realtime_end", "value"])
@@ -197,10 +224,15 @@ class _Reads:
         """``dealer_gex_daily`` SPY rows up to as_of. A row for day d comes from a capture completed by the end of d
         (``physics/dealer_gex_daily.py``), so it is known at the end of d."""
         if "__gex__" not in self._memo:
+            params = {"t": "SPY", "a": self.as_of - timedelta(days=self.lookback_days), "b": self.as_of}
             try:
                 with self.engine.connect() as conn:
-                    rows = conn.execute(_GEX_SQL, {"t": "SPY", "a": self.as_of - timedelta(days=self.lookback_days),
-                                                   "b": self.as_of}).fetchall()
+                    if self.known_by is None:
+                        rows = conn.execute(_GEX_SQL, params).fetchall()
+                    else:
+                        # A row without a creation clock is not known at the cutoff.
+                        rows = [r[:6] for r in conn.execute(_GEX_CREATED_SQL, params).fetchall()
+                                if (t := _instant(r[6])) is not None and t <= self.known_by]
             except Exception as exc:
                 log.warning("market_state: dealer_gex_daily unreadable: {e}", e=str(exc))
                 rows = []
@@ -222,14 +254,17 @@ class _Reads:
             from intelligence.regime.state_vector import SPY_CLOSE_LAG, _fetch_resolved_spy_full
 
             start = self.as_of - timedelta(days=self.lookback_days)
-            resolved = _fetch_resolved_spy_full(self.engine, self.as_of, start)
+            # Under a cutoff the resolved feature is not read: resolved_series has no write clock, and the resolver
+            # stamps release_date with the raw pull date, so a row it wrote after the cutoff looks the same as one
+            # written before. YF:SPY:close below has pull timestamps.
+            resolved = None if self.known_by is not None else _fetch_resolved_spy_full(self.engine, self.as_of, start)
             resolved = resolved if resolved is not None else pd.Series(dtype=float)
             prices, basis = resolved, ("spy_full" if len(resolved) else None)
             if len(resolved) < SPY_NEED_OBS:
                 try:
                     with self.engine.connect() as conn:
                         obs = read_window_known_at(conn, "YF:SPY:close", as_of=self.as_of, lag=SPY_CLOSE_LAG,
-                                                   source="yfinance", start=start)
+                                                   source="yfinance", start=start, **self._cut_kw())
                     raw = pd.Series({o.obs_date: o.value for o in obs if o.value is not None}, dtype=float).sort_index()
                 except Exception as exc:
                     log.debug("market_state: raw SPY read failed: {e}", e=str(exc))
@@ -400,6 +435,19 @@ _GEX_SQL = text(
     "SELECT obs_date, net_gex_usd_m, spot_to_flip_pct, gamma_flip_strike, gex_regime, spot_price "
     "FROM dealer_gex_daily WHERE ticker = :t AND obs_date >= :a AND obs_date <= :b ORDER BY obs_date"
 )
+# The same read with each row's creation clock, for a read cut at an instant (#1312).
+_GEX_CREATED_SQL = text(
+    "SELECT obs_date, net_gex_usd_m, spot_to_flip_pct, gamma_flip_strike, gex_regime, spot_price, created_at "
+    "FROM dealer_gex_daily WHERE ticker = :t AND obs_date >= :a AND obs_date <= :b ORDER BY obs_date"
+)
+
+
+def _instant(raw: Any) -> datetime | None:
+    """A stored clock as an aware UTC instant (naive taken as UTC, as griddb runs Etc/UTC); None when absent."""
+    if raw is None:
+        return None
+    ts = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
 
 
 def _gex_col(col: str) -> Callable[["_Reads"], pd.Series]:
@@ -414,14 +462,22 @@ def _change(series_id: str, periods: int) -> Callable[["_Reads"], pd.Series]:
 
 
 def gamma_state(df: pd.DataFrame, as_of: date) -> dict[str, Any]:
-    """The latest dealer-gamma row's categorical read (regime, flip), or unavailable."""
+    """The latest dealer-gamma row's categorical read (regime, flip), or unavailable.
+
+    ``stale`` (with the read kept) when that row is not from the ``as_of`` session itself (:data:`MAX_AGE`).
+    """
     if df is None or df.empty:
         return {"status": "unavailable", "reason": "no dealer_gex_daily row at or before as_of"}
     d = df.index[-1]
     row = df.iloc[-1]
-    return {"status": "ok", "obs_date": str(d), "age_days": (as_of - d).days, "regime": row["gex_regime"],
-            "gamma_flip": float(row["gamma_flip_strike"]), "spot": float(row["spot_price"]),
-            "spot_vs_flip": "above" if float(row["spot_to_flip_pct"]) >= 0 else "below"}
+    fresh = freshness(d, as_of, MAX_AGE["dealer_gamma"])
+    out = {"status": "ok" if fresh["status"] == "fresh" else "stale", "obs_date": str(d),
+           "age_days": (as_of - d).days, "regime": row["gex_regime"],
+           "gamma_flip": float(row["gamma_flip_strike"]), "spot": float(row["spot_price"]),
+           "spot_vs_flip": "above" if float(row["spot_to_flip_pct"]) >= 0 else "below", "freshness": fresh}
+    if out["status"] == "stale":
+        out["reason"] = _stale_reason(d, fresh)
+    return out
 
 
 VARIABLES: list[VarSpec] = [
@@ -460,6 +516,157 @@ VARIABLES: list[VarSpec] = [
             "EPU index, newest weekday first print", "timely but noisy: compared only with past first prints"),
 ]
 VAR_NAMES = [v.name for v in VARIABLES]
+
+
+# ── Freshness (max-age/1) ─────────────────────────────────────────────────
+#
+# A reading is ``stale`` when its newest observation is older than that variable normally is. Measured over every
+# stored record (2019-01-02..2026-11-19): next-business-day series are 1 session old (2 when a federal holiday falls
+# on a trading day), same-session reads are 0, and each weekly or monthly series peaks at exactly one period plus its
+# declared publication lag, minus a day. Older readings were real gaps: news vintages up to 23 sessions old
+# (2022-03), SPY 5 sessions (2026-04), claims 18 days (2026-08), dealer gamma 4 sessions (2026-10), the 2025
+# shutdown releases. Before this rule every one of them read ``ok``.
+
+@dataclass(frozen=True)
+class MaxAge:
+    """How old a variable's newest observation may be before its reading is ``stale``."""
+
+    limit: int
+    unit: str          # 'sessions': NYSE sessions after the observation, up to and including as_of | 'days'
+    basis: str
+
+
+def _after_next_release(series_id: str, period_days: int) -> MaxAge:
+    """Calendar-day limit for a weekly or monthly input: one period plus its declared publication lag, minus a day.
+
+    Under the declared (deliberately late) lag the next observation is public ``period + lag`` days after the current
+    one, so the current one is normally at most ``period + lag - 1`` days old. Older means the next observation is
+    overdue or was never published (documented shutdown releases read stale, which is what they are).
+    """
+    lag = LAGS[series_id]
+    if lag is None or lag.unit != "calendar":
+        raise ValueError(f"{series_id}: a calendar-day publication lag is required for a day limit")
+    return MaxAge(period_days + lag.days - 1, "days",
+                  f"{series_id}: {period_days}-day period + {lag.days}-day publication lag - 1")
+
+
+_NEXT_SESSION = MaxAge(2, "sessions", "posted the next business day: 1 session old, 2 when a federal holiday "
+                                      "falls on a trading day")
+_SAME_SESSION = MaxAge(1, "sessions", "read for the session itself: one missed session allowed")
+_EXACT_SESSION = MaxAge(0, "sessions", "dealer positioning changes every session with open interest and expiries: "
+                                       "only the session's own capture describes it")
+_WEEK, _LONGEST_MONTH = 7, 31
+
+MAX_AGE: dict[str, MaxAge] = {
+    "vix": _NEXT_SESSION,
+    "vix_term": _NEXT_SESSION,
+    "hy_spread": _NEXT_SESSION,
+    "ig_spread": _NEXT_SESSION,
+    "yield_curve": _NEXT_SESSION,
+    "fed_funds": _NEXT_SESSION,
+    "real_fed_funds": _NEXT_SESSION,
+    "net_liquidity": _after_next_release("WALCL", _WEEK),
+    "net_liquidity_4w": _after_next_release("WALCL", _WEEK),
+    "initial_claims": _after_next_release("ICSA", _WEEK),
+    "unemployment": _after_next_release("UNRATE", _LONGEST_MONTH),
+    "payrolls_3m": _after_next_release("PAYEMS", _LONGEST_MONTH),
+    "cpi_yoy": _after_next_release("CPIAUCSL", _LONGEST_MONTH),
+    "industrial_production_yoy": _after_next_release("INDPRO", _LONGEST_MONTH),
+    "consumer_sentiment": _after_next_release("UMCSENT", _LONGEST_MONTH),
+    "spy_vs_50d": _SAME_SESSION,
+    "spy_vs_200d": _SAME_SESSION,
+    "short_volume_ratio": _NEXT_SESSION,
+    "dix": _NEXT_SESSION,
+    "dix_change_5d": _NEXT_SESSION,
+    "dealer_gamma": _EXACT_SESSION,
+    "spot_vs_gamma_flip": _EXACT_SESSION,
+    "news_uncertainty": _SAME_SESSION,
+    "equity_news_uncertainty": _SAME_SESSION,
+    "news_first_print": _SAME_SESSION,
+}
+if set(MAX_AGE) != set(VAR_NAMES):
+    raise RuntimeError(f"MAX_AGE must cover exactly VARIABLES: {sorted(set(MAX_AGE) ^ set(VAR_NAMES))}")
+
+
+# Session ages count real NYSE sessions from the hash-pinned XNYS manifests in docs/reference/calendar-manifests,
+# never the approximate scheduler helpers in ingestion.market_calendar. Those close Juneteenth before it existed
+# (2020, 2021) and miss one-off closures such as 2025-01-09, so they misjudge ages both ways. The parts are
+# analysis/factory_session_calendar.PRESCREEN_PINS then PINS: the same lists the deploy's
+# scripts/prepare_factory_calendars.py normalizes, so a deployed tree can always open them. Prescreen ends
+# 2022-11-11 and the factory parts start 2022-11-01: the overlap must agree.
+_MANIFEST_ROOT = Path(__file__).resolve().parents[2] / "docs/reference/calendar-manifests"
+_xnys_cache: tuple[date, date, tuple[date, ...], str] | None = None
+
+
+def xnys_sessions() -> tuple[date, date, tuple[date, ...], str]:
+    """(first covered day, last covered day, every session in order, version) from the pinned manifests.
+
+    Raises ValueError when a manifest fails its pin or permission check, the parts leave a gap, or two parts
+    disagree on a day both cover: an age is never counted on a calendar that is not the pinned one.
+    """
+    global _xnys_cache
+    if _xnys_cache is None:
+        from analysis.factory_session_calendar import PINS, PRESCREEN_PINS
+        from ingestion.market_calendar import ManifestCalendar
+
+        pins = tuple(PRESCREEN_PINS) + tuple(PINS)
+        days: set[date] = set()
+        start = end = None
+        for name, sha in pins:
+            part = ManifestCalendar(_MANIFEST_ROOT / name, sha)
+            own = {date.fromisoformat(s.key.split(":")[1]) for s in part.sessions}
+            if end is not None:
+                if part.start > end + timedelta(days=1):
+                    raise ValueError(f"XNYS calendar gap between {end} and {part.start}")
+                if {d for d in days if d >= part.start} != {d for d in own if d <= end}:
+                    raise ValueError(f"XNYS calendar parts disagree between {part.start} and {end}")
+            days |= own
+            start = part.start if start is None else start
+            end = part.end if end is None else max(end, part.end)
+        _xnys_cache = (start, end, tuple(sorted(days)), "pinned XNYS: " + ",".join(sha for _, sha in pins))
+    return _xnys_cache
+
+
+def sessions_after(obs_date: date, as_of: date) -> tuple[int, bool]:
+    """NYSE sessions strictly after ``obs_date`` up to and including ``as_of``, and whether that is a lower bound.
+
+    An ``obs_date`` before the calendar's first day counts from that day, so the count is a lower bound. An ``as_of``
+    past its last day raises: extend the manifests rather than guess.
+    """
+    start, end, days, _ = xnys_sessions()
+    if not start <= as_of <= end:
+        raise ValueError(f"as_of {as_of} is outside the pinned XNYS calendar ({start}..{end}); extend the manifests")
+    lower_bound = obs_date < start
+    first = bisect_right(days, max(obs_date, start - timedelta(days=1)))
+    return bisect_right(days, as_of) - first, lower_bound
+
+
+def freshness(obs_date: date, as_of: date, max_age: MaxAge) -> dict[str, Any]:
+    """Age of ``obs_date`` at ``as_of`` in ``max_age``'s unit, and whether it is past the limit.
+
+    A limit of 0 sessions is the same-date rule: fresh only when ``obs_date`` is ``as_of`` itself.
+    """
+    out: dict[str, Any] = {"unit": max_age.unit, "limit": max_age.limit, "basis": max_age.basis}
+    if max_age.unit == "sessions":
+        age, lower_bound = sessions_after(obs_date, as_of)
+        if lower_bound:
+            out["age_is_lower_bound"] = True
+        if max_age.limit == 0:
+            stale = obs_date != as_of
+        elif lower_bound and age <= max_age.limit:
+            raise ValueError(f"cannot establish the age of {obs_date}: it is before the pinned XNYS calendar")
+        else:
+            stale = age > max_age.limit
+    else:
+        age = (as_of - obs_date).days
+        stale = age > max_age.limit
+    return {"status": "stale" if stale else "fresh", "age": age, **out}
+
+
+def _stale_reason(obs_date: date, fresh: dict[str, Any]) -> str:
+    return (f"newest observation {obs_date.isoformat()} is {fresh['age']} {fresh['unit']} old; "
+            f"limit {fresh['limit']} ({fresh['basis']})")
+
 
 # Five years of the slowest cadence plus transform warm-up (12-month change, 200-day average).
 LOOKBACK_DAYS = 365 * 7
@@ -517,12 +724,15 @@ class MarketState:
     spy_basis: str | None = None
     writer_provenance: dict[str, Any] | None = None
     source_lineage: dict[str, Any] | None = None
+    freshness_calendar: str | None = None   # the pinned XNYS manifests session ages were counted on
 
     def to_dict(self) -> dict[str, Any]:
         ok = [k for k, v in self.variables.items() if v.get("status") == "ok"]
         return {
             "rule": RECORD_RULE,
             "baseline_rule": BASELINE_RULE,
+            "freshness_rule": FRESHNESS_RULE,
+            "freshness_calendar": self.freshness_calendar,
             "as_of": self.as_of.isoformat(),
             "availability": "date-bounded with source-specific availability rules; modeled-lag backfills may use revised vintages",
             "variables": self.variables,
@@ -532,6 +742,7 @@ class MarketState:
             "pending": PENDING,
             "coverage": {"ok": len(ok), "no_baseline": sum(1 for v in self.variables.values()
                                                            if v.get("status") == "no_baseline"),
+                         "stale": sum(1 for v in self.variables.values() if v.get("status") == "stale"),
                          "total": len(self.variables)},
             "spy_basis": self.spy_basis,
             "writer_provenance": self.writer_provenance,
@@ -539,10 +750,22 @@ class MarketState:
         }
 
 
-def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, list[date]] | None = None) -> MarketState:
-    """Every variable in :data:`VARIABLES` at ``as_of``, standardized against its own trailing baseline."""
-    reads = _Reads(engine, as_of, LOOKBACK_DAYS)
-    state = MarketState(as_of=as_of)
+def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, list[date]] | None = None,
+                         known_by: datetime | None = None) -> MarketState:
+    """Every variable in :data:`VARIABLES` at ``as_of``, standardized against its own trailing baseline.
+
+    ``known_by`` (timezone-aware, before the end of ``as_of``'s UTC day) is an exact availability cutoff: only inputs
+    GRID held by that instant count (:class:`_Reads`). The provisional record passes the session's close (#1312);
+    the decision record passes nothing and reads to the end of ``as_of``, as before.
+    """
+    if known_by is not None:
+        if known_by.utcoffset() is None:
+            raise ValueError("known_by must be timezone-aware")
+        if known_by.astimezone(timezone.utc) >= datetime.combine(as_of + timedelta(days=1), time(0), tzinfo=timezone.utc):
+            raise ValueError(f"known_by {known_by.isoformat()} must be before the end of as_of {as_of}")
+    sessions_after(as_of, as_of)  # fail before any read when as_of is outside the pinned XNYS calendar
+    reads = _Reads(engine, as_of, LOOKBACK_DAYS, known_by=known_by)
+    state = MarketState(as_of=as_of, freshness_calendar=xnys_sessions()[3])
     for spec in VARIABLES:
         window, min_obs = window_for(spec.cadence)
         base = {"group": spec.group, "unit": spec.unit, "cadence": spec.cadence}
@@ -561,13 +784,22 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
         last_obs = hist.index[-1]
         if reading is None:
             # Known value, too little history to say what normal is: report the value, no z or label.
-            state.variables[spec.name] = {**base, "status": "no_baseline", "obs_date": str(last_obs),
-                                          "value": round(float(hist.iloc[-1]), 6), "n": int(len(hist) - 1),
-                                          "reason": f"{len(hist) - 1} prior observations known; baseline needs {min_obs}"}
-            continue
-        state.variables[spec.name] = {**base, "status": "ok", "obs_date": str(last_obs),
-                                      "age_days": (as_of - last_obs).days if isinstance(last_obs, date) else None,
-                                      **reading.to_dict()}
+            entry = {**base, "status": "no_baseline", "obs_date": str(last_obs),
+                     "value": round(float(hist.iloc[-1]), 6), "n": int(len(hist) - 1),
+                     "reason": f"{len(hist) - 1} prior observations known; baseline needs {min_obs}"}
+        else:
+            entry = {**base, "status": "ok", "obs_date": str(last_obs),
+                     "age_days": (as_of - last_obs).days if isinstance(last_obs, date) else None,
+                     **reading.to_dict()}
+        if isinstance(last_obs, date):
+            # Too old outranks both ok and no_baseline; the reading is kept so a reader can see what was stale.
+            fresh = freshness(last_obs, as_of, MAX_AGE[spec.name])
+            entry["freshness"] = fresh
+            if fresh["status"] == "stale":
+                stale = _stale_reason(last_obs, fresh)
+                entry["reason"] = stale if entry["status"] == "ok" else f"{stale}; {entry['reason']}"
+                entry["status"] = "stale"
+        state.variables[spec.name] = entry
     state.spy_basis = reads.spy_basis
     cal = load_calendar() if calendar is None else calendar
     state.events = events_state(as_of, cal)
@@ -581,6 +813,8 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
                                    "SPY resolved/raw selected window", "calendar publication/capture"],
         "limitation": "selected raw-input fingerprints only; not full immutable custody or scheduled-run evidence",
     }
+    if reads.known_by is not None:
+        state.source_lineage["availability_cutoff"] = {"at": reads.known_by.isoformat(), "reads": dict(CUTOFF_READS)}
     return state
 
 
@@ -616,10 +850,130 @@ _INSERT_SQL = {
 
 
 def store_market_state(engine: Engine, state: MarketState, *, replace: bool = False) -> bool:
-    """Write one record. Returns False when a row for that date exists and ``replace`` is False."""
+    """Write one record. Returns False when a row for that date exists and ``replace`` is False.
+
+    A provisional record (writer mode ``provisional``, #1312) is refused before the table is touched: it goes to
+    its own table through :func:`store_provisional_market_state`, never here.
+    """
+    if is_provisional(state):
+        raise ValueError("market_state_daily takes decision records only; a provisional record goes to "
+                         "market_state_provisional (#1312)")
     ensure_table(engine)
     with engine.begin() as conn:
         dialect = "postgresql" if conn.dialect.name == "postgresql" else "other"
         res = conn.execute(_INSERT_SQL[(dialect, bool(replace))],
                            {"d": state.as_of, "r": RECORD_RULE, "rec": json.dumps(state.to_dict())})
+    return bool(res.rowcount)
+
+
+# ── Provisional record at the close (#1312): display only ─────────────────
+#
+# Owner's decision (bring-up plan rev 100): #1191's previous-session rule stays for anything that decides. A record
+# computed at the session's close is for display only, labelled provisional, and kept in its own table, so no reader
+# of market_state_daily can pick one up by accident. Same record rule, earlier clock: the writer
+# (scripts/run_market_state.py --provisional) runs only at or after the session's close in the pinned XNYS calendar
+# and computes with compute_market_state(known_by=that close), an exact availability cutoff (CUTOFF_READS). A rerun
+# hours later reads the same inputs, so nothing that reached GRID after the close can appear in it, and it never
+# refreshes the FRED vintages. The only reader is the post-close desk brief (analysis/desk_brief_sources.market_state).
+# tests/test_market_state_provisional_guard.py keeps it that way.
+
+PROVISIONAL_TABLE = "market_state_provisional"
+PROVISIONAL_MODE = "provisional"            # writer_provenance["mode"] of every provisional record
+PROVISIONAL_DECISION_USE = "display_only"
+PROVISIONAL_LABEL = ("Provisional, display only: computed from the inputs GRID held at the close of session {day} "
+                     "({cutoff}); nothing that arrived later is in it. The session's decision record is written to "
+                     "market_state_daily the next evening (#1191); nothing that decides reads this one.")
+# How each read is cut at the provisional record's availability cutoff (compute_market_state(known_by=...)).
+CUTOFF_READS = {
+    "raw_series": "pull_timestamp at or before the cutoff only: a modeled known-at date never admits a row first "
+                  "pulled later; a release override still delays one until its UTC day has ended",
+    "fred_vintages": "fetched_at at or before the cutoff; each version's interval rebuilt from the versions known "
+                     "then (the stored realtime_end is extended in place by later refreshes and is not read)",
+    "dealer_gex_daily": "created_at at or before the cutoff; a row without one is not known",
+    "resolved_series": "not read: it keeps no write clock (the resolver stamps release_date with the raw pull "
+                       "date), so SPY comes from YF:SPY:close by pull_timestamp, the record's own fallback basis",
+}
+# The table is created by the reviewed migration migrations/versions/market_state_prov_20261122.py; production
+# never runs CREATE TABLE for it. This copy exists for SQLite tests only and keeps the same columns
+# (tests/test_market_state_provisional_migration.py). record is TEXT here because a JSONB column would get numeric
+# affinity on SQLite.
+_PROVISIONAL_TABLE_SQL = text(
+    "CREATE TABLE IF NOT EXISTS market_state_provisional ("
+    " as_of_date DATE PRIMARY KEY,"
+    " rule TEXT NOT NULL,"
+    " record TEXT NOT NULL,"
+    " computed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    " provisional BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional))"
+)
+PROVISIONAL_MIGRATION = "market_state_prov_20261122"
+
+_PROVISIONAL_INSERT_SQL = {
+    ("postgresql", False): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                                "VALUES (:d, :r, CAST(:rec AS JSONB), TRUE) ON CONFLICT (as_of_date) DO NOTHING"),
+    ("postgresql", True): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                               "VALUES (:d, :r, CAST(:rec AS JSONB), TRUE) ON CONFLICT (as_of_date) DO UPDATE SET "
+                               "rule = EXCLUDED.rule, record = EXCLUDED.record, computed_at = CURRENT_TIMESTAMP"),
+    ("other", False): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                           "VALUES (:d, :r, :rec, TRUE) ON CONFLICT (as_of_date) DO NOTHING"),
+    ("other", True): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                          "VALUES (:d, :r, :rec, TRUE) ON CONFLICT (as_of_date) DO UPDATE SET "
+                          "rule = EXCLUDED.rule, record = EXCLUDED.record, computed_at = CURRENT_TIMESTAMP"),
+}
+
+
+def is_provisional(state: MarketState) -> bool:
+    """True for a record the provisional writer made (its provenance says mode ``provisional``)."""
+    return (state.writer_provenance or {}).get("mode") == PROVISIONAL_MODE
+
+
+def provisional_record(state: MarketState) -> dict[str, Any]:
+    """The stored form of a provisional record: the record itself plus its display-only label and clocks.
+
+    Raises ValueError unless the provisional writer made it (provenance mode ``provisional``) and it was computed
+    with the availability cutoff its provenance names, so neither the label nor a cutoff can be claimed by a record
+    that does not have them.
+    """
+    prov = state.writer_provenance or {}
+    if prov.get("mode") != PROVISIONAL_MODE:
+        raise ValueError("a provisional record needs writer provenance with mode 'provisional' "
+                         "(scripts/run_market_state.py --provisional)")
+    cutoff = ((state.source_lineage or {}).get("availability_cutoff") or {}).get("at")
+    if cutoff is None or cutoff != prov.get("availability_cutoff"):
+        raise ValueError("a provisional record must be computed with the availability cutoff its provenance names "
+                         "(compute_market_state(known_by=the session's close))")
+    computed = prov.get("started_at")
+    after = (datetime.fromisoformat(computed) - datetime.fromisoformat(cutoff)).total_seconds() / 60 if computed else None
+    return {**state.to_dict(), "provisional": True, "decision_use": PROVISIONAL_DECISION_USE,
+            "label": PROVISIONAL_LABEL.format(day=state.as_of.isoformat(), cutoff=cutoff),
+            "availability": f"inputs GRID held at {cutoff}, each read cut on its own stored clock (CUTOFF_READS)",
+            "availability_cutoff": cutoff, "computed_at": computed,
+            "minutes_after_close": round(after, 1) if after is not None else None}
+
+
+def ensure_provisional_table(engine: Engine) -> None:
+    """SQLite (tests) only. Elsewhere the table comes from migration ``market_state_prov_20261122``."""
+    if engine.dialect.name != "sqlite":
+        raise RuntimeError(f"{PROVISIONAL_TABLE} is created by alembic migration {PROVISIONAL_MIGRATION}; "
+                           "production never creates it at runtime")
+    with engine.begin() as conn:
+        conn.execute(_PROVISIONAL_TABLE_SQL)
+
+
+def store_provisional_market_state(engine: Engine, state: MarketState, *, replace: bool = False) -> bool:
+    """Write one provisional record (insert-only per date; ``replace`` rewrites it). False when one exists.
+
+    Never creates the table outside SQLite: on Postgres a missing table is an error naming the migration.
+    """
+    rec = provisional_record(state)
+    if engine.dialect.name == "sqlite":
+        ensure_provisional_table(engine)
+    else:
+        from sqlalchemy import inspect
+
+        if not inspect(engine).has_table(PROVISIONAL_TABLE):
+            raise RuntimeError(f"{PROVISIONAL_TABLE} is missing: apply alembic migration {PROVISIONAL_MIGRATION}")
+    with engine.begin() as conn:
+        dialect = "postgresql" if conn.dialect.name == "postgresql" else "other"
+        res = conn.execute(_PROVISIONAL_INSERT_SQL[(dialect, bool(replace))],
+                           {"d": state.as_of, "r": RECORD_RULE, "rec": json.dumps(rec)})
     return bool(res.rowcount)

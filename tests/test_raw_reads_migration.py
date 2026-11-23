@@ -153,71 +153,128 @@ def test_sentiment_yield_curve_with_only_failed_rows_reports_no_data():
     assert comp.detail == "No data available" and comp.score == 0.0
 
 
-def test_sentiment_volatility_ignores_failed_zero_vix():
+def _policy_yf_rows(sid, n, start_value=100.0, step=1.0, end_date=date(2026, 11, 20)):
+    """``n`` policy-eligible NYSE trading-day rows ending on/before ``end_date``."""
+    import json
+    from datetime import timezone
+    from ingestion.market_calendar import trading_days_between
+    from price_close_contract import daily_capture_payload
+
+    ticker, field = sid.split(":")[1], sid.split(":")[2]
+    all_days = trading_days_between(date(2026, 1, 2), end_date)
+    days = all_days[-n:]
+    out = []
+    for i, d in enumerate(days):
+        captured_at = datetime(d.year, d.month, d.day, 6, tzinfo=timezone.utc) + timedelta(days=1)
+        row = _row(sid, d, start_value + i * step, h=i)
+        row["pull_timestamp"] = captured_at.isoformat(sep=" ")
+        row["raw_payload"] = json.dumps(daily_capture_payload(ticker, field, d, captured_at))
+        out.append(row)
+    return out
+
+
+def _pin_sentiment_now(monkeypatch, now_utc):
+    from intelligence import sentiment_scorer
+
+    class _FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now_utc if tz is not None else now_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(sentiment_scorer, "datetime", _FrozenDT)
+
+
+def test_sentiment_volatility_ignores_failed_zero_vix(monkeypatch):
+    import json
+    from datetime import timezone
+    from price_close_contract import daily_capture_payload
     from intelligence.sentiment_scorer import _score_volatility
 
-    rows = _daily("YF:^VIX:close", 3, start_value=18.0, step=0.5, days_back=1)
-    rows.append(_row("YF:^VIX:close", TODAY, 0.0, status="FAILED", h=50))
-    comp = _score_volatility(_engine(rows))
+    ref = date(2026, 11, 20)
+    _pin_sentiment_now(monkeypatch, datetime(2026, 11, 21, 12, tzinfo=timezone.utc))
+    rows = _policy_yf_rows("YF:^VIX:close", 3, start_value=18.0, step=0.5, end_date=date(2026, 11, 19))
+    failed_at = datetime(2026, 11, 21, 6, tzinfo=timezone.utc)
+    failed = _row("YF:^VIX:close", ref, 0.0, status="FAILED", h=50)
+    failed["pull_timestamp"] = failed_at.isoformat(sep=" ")
+    failed["raw_payload"] = json.dumps(daily_capture_payload("^VIX", "close", ref, failed_at))
+    rows.append(failed)
+    comp = _score_volatility(_engine(rows, preserve_capture_offsets=True))
 
     assert comp.raw_value == pytest.approx(19.0)
     assert "VIX=19.0" in comp.detail
 
 
-def test_sentiment_momentum_uses_distinct_dates_not_rows():
+def test_sentiment_momentum_uses_distinct_dates_not_rows(monkeypatch):
     """Two vintages of one close must not count as two trading days."""
+    import json
+    from datetime import timezone
+    from price_close_contract import daily_capture_payload
     from intelligence.sentiment_scorer import _score_momentum
 
     sid = "YF:^GSPC:close"
-    rows = _daily(sid, 30, start_value=100.0, step=1.0, days_back=0)
-    # duplicate vintage for the newest date with the same value
-    rows.append(_row(sid, TODAY, 129.0, h=200))
-    comp = _score_momentum(_engine(rows))
+    _pin_sentiment_now(monkeypatch, datetime(2026, 11, 21, 12, tzinfo=timezone.utc))
+    rows = _policy_yf_rows(sid, 30, start_value=100.0, step=1.0, end_date=date(2026, 11, 20))
+    # duplicate policy-eligible vintage for the newest date with the same value
+    newest_d = rows[-1]["obs_date"]
+    dup_ts = datetime(newest_d.year, newest_d.month, newest_d.day, 10, tzinfo=timezone.utc) + timedelta(days=1)
+    dup = _row(sid, newest_d, 129.0, h=200)
+    dup["pull_timestamp"] = dup_ts.isoformat(sep=" ")
+    dup["raw_payload"] = json.dumps(daily_capture_payload("^GSPC", "close", newest_d, dup_ts))
+    rows.append(dup)
+    comp = _score_momentum(_engine(rows, preserve_capture_offsets=True))
 
-    # 5 distinct days back from 129 is 124 -> +4.03%; a row-based read would
+    # 5 distinct trading days back from 129 is 124 -> +4.03%; a row-based read would
     # have used 125 (only 4 real days back).
     assert "5d=+4.03%" in comp.detail
 
 
 def test_sentiment_reads_are_bounded_by_a_start_date(monkeypatch):
     """Every price read passes a start bound (no full-history scan)."""
+    from datetime import timezone
     from intelligence import sentiment_scorer
 
+    _pin_sentiment_now(monkeypatch, datetime(2026, 11, 21, 12, tzinfo=timezone.utc))
     seen = []
-    real = sentiment_scorer.read_latest_n
+    real = sentiment_scorer.read_daily_policy_n
 
     def spy(conn, series_id, n, **kw):
         seen.append((series_id, n, kw.get("start")))
         return real(conn, series_id, n, **kw)
 
-    monkeypatch.setattr(sentiment_scorer, "read_latest_n", spy)
-    engine = _engine(_daily("YF:^GSPC:close", 30))
+    monkeypatch.setattr(sentiment_scorer, "read_daily_policy_n", spy)
+    engine = _engine(_policy_yf_rows("YF:^GSPC:close", 30), preserve_capture_offsets=True)
     sentiment_scorer._score_momentum(engine)
     sentiment_scorer._score_trend(engine)
     sentiment_scorer._score_breadth(engine)
     sentiment_scorer._score_credit_spread(engine)
 
     assert seen and all(start is not None for _, _, start in seen)
-    today = sentiment_scorer.datetime.now(sentiment_scorer.timezone.utc).date()
+    today = sentiment_scorer.datetime.now(timezone.utc).date()
     for _, n, start in seen:
         assert (today - start).days >= n  # window always spans >= n calendar days
 
 
-def test_sentiment_trend_still_sees_200_sessions_inside_the_bound():
+def test_sentiment_trend_still_sees_200_sessions_inside_the_bound(monkeypatch):
+    from datetime import timezone
     from intelligence.sentiment_scorer import _recent_closes
 
     sid = "YF:^GSPC:close"
-    engine = _engine(_daily(sid, 220))
+    _pin_sentiment_now(monkeypatch, datetime(2026, 11, 21, 12, tzinfo=timezone.utc))
+    engine = _engine(_policy_yf_rows(sid, 204, end_date=date(2026, 11, 20)), preserve_capture_offsets=True)
     with engine.connect() as conn:
         assert len(_recent_closes(conn, sid, 200)) == 200
 
 
-def test_sentiment_bound_excludes_closes_older_than_the_window():
+def test_sentiment_bound_excludes_closes_older_than_the_window(monkeypatch):
+    from datetime import timezone
     from intelligence.sentiment_scorer import _recent_closes
 
     sid = "YF:HYG:close"
-    rows = _daily(sid, 3) + [_row(sid, TODAY - timedelta(days=400), 50.0, h=500)]
-    with _engine(rows).connect() as conn:
+    _pin_sentiment_now(monkeypatch, datetime(2026, 11, 21, 12, tzinfo=timezone.utc))
+    rows = _policy_yf_rows(sid, 3, end_date=date(2026, 11, 20))
+    # Old 2026 policy-eligible close well outside the 21-session window.
+    old_rows = _policy_yf_rows(sid, 1, start_value=50.0, end_date=date(2026, 1, 5))
+    with _engine(rows + old_rows, preserve_capture_offsets=True).connect() as conn:
         got = _recent_closes(conn, sid, 21)
     assert len(got) == 3 and 50.0 not in [o.value for o in got]
 

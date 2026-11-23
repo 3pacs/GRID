@@ -1,0 +1,37 @@
+# TEMPLATE — NOT INSTALLED. Installing this unit (and its .timer) gives the schwab-mode
+# full-universe options run its own timer (scripts/run_options_dedicated.py). It does nothing
+# until schwab mode is on AND GRID_OPTIONS_DEDICATED_TIMER=1 is set in the env file below; each
+# run exits 0 with an OPTIONS_DEDICATED REFUSED line otherwise. Install steps: deploy/systemd/README.md
+# ("grid-options-dedicated").
+#   sudo install -m 0644 deploy/systemd/grid-options-dedicated.service.template /etc/systemd/system/grid-options-dedicated.service
+#   sudo install -m 0644 deploy/systemd/grid-options-dedicated.timer.template   /etc/systemd/system/grid-options-dedicated.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-options-dedicated.timer
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
+[Unit]
+Description=GRID options, schwab-mode full universe on its own timer (Schwab core + paced Yahoo tail)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+# The deployed release tree (same tree grid-api and grid-scheduler run from).
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-scheduler and grid-hermes use: the GRID_OPTIONS_* switches, the Schwab token
+# path and the DB settings. HOME is grid's, so the Yahoo hold marker, the tail cursors and the
+# lock file share ~/.local/state/grid with the scheduler writers.
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# Same interpreter grid-scheduler runs under (deploy/python314). The runner takes its own
+# non-blocking flock (~/.local/state/grid/options_dedicated.lock), so a manual run and the timer
+# cannot overlap; a second one exits 0.
+ExecStart=/data/grid_v4/grid_venv-314/bin/python /data/grid_v4/grid_release/scripts/run_options_dedicated.py
+# Type=oneshot: TimeoutStartSec bounds the WHOLE run (RuntimeMaxSec has no effect on oneshot).
+# The runner's cooperative wall budget is 25 min (at most 30 via --budget-seconds); 35 min is the
+# backstop for a request stuck past it.
+TimeoutStartSec=35min
+TimeoutStopSec=60s
+KillMode=control-group
+Nice=10
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal

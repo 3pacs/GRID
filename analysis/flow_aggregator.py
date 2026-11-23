@@ -33,6 +33,7 @@ from sqlalchemy.engine import Engine
 from analysis.sector_map import SECTOR_MAP, get_all_sectors
 
 
+
 # ── Actor tier classification ────────────────────────────────────────────
 
 # Source types map to actor tiers.  Congressional and insider are
@@ -164,6 +165,9 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
                     "direction, confidence, flow_date "
                     "FROM dollar_flows "
                     "WHERE flow_date >= :cutoff AND flow_date <= CURRENT_DATE "
+                    # 13F is non-directional (owner decision 2026-11-23): no
+                    # 13F row is a flow until identity/split coverage exists.
+                    "AND source_type <> '13f' "
                     "ORDER BY flow_date DESC"
                 ),
                 {"cutoff": cutoff},
@@ -172,19 +176,32 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
         log.warning("Failed to fetch dollar_flows: {e}", e=str(exc))
         return []
 
-    result = [
-        {
-            "source_type": r[0],
+    result: list[dict] = []
+    quarantined_13f = 0
+    for r in rows:
+        source_type = r[0]
+        direction = r[4]
+        confidence = r[5] or "estimated"
+        if direction == "quarantined":
+            quarantined_13f += 1
+            continue
+        result.append({
+            "source_type": source_type,
             "actor_name": r[1],
             "ticker": r[2],
             "amount_usd": float(r[3]) if r[3] else 0.0,
-            "direction": r[4],
-            "confidence": r[5] or "estimated",
+            "direction": direction,
+            "confidence": confidence,
             "flow_date": r[6],
             "evidence": {},
-        }
-        for r in rows
-    ]
+        })
+
+    if quarantined_13f:
+        log.warning(
+            "flow_aggregator: quarantined {n} legacy/unqualified 13f rows from dollar_flows "
+            "(excluded from directional totals)",
+            n=quarantined_13f,
+        )
 
     with _flow_cache_lock:
         if len(_flow_cache) >= _FLOW_CACHE_MAX_WINDOWS and days not in _flow_cache:
@@ -215,9 +232,14 @@ _DUMB_MONEY_SOURCES = {"prediction_market", "etf_flow"}
 
 
 def _signed_amount(flow: dict) -> float:
-    """Return positive for inflow, negative for outflow."""
+    """Return positive for inflow, negative for outflow, 0 for neutral/unsigned."""
     amt = flow["amount_usd"]
-    return amt if flow["direction"] == "inflow" else -amt
+    direction = flow.get("direction")
+    if direction == "inflow":
+        return amt
+    if direction == "outflow":
+        return -amt
+    return 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -262,14 +284,18 @@ def aggregate_by_sector(engine: Engine, days: int = 30) -> dict[str, Any]:
     })
 
     for f in flows:
+        if f["direction"] not in ("inflow", "outflow"):
+            continue
         sector = _get_sector(f["ticker"])
+        if sector == "Unknown":
+            continue
         amt = f["amount_usd"]
         signed = _signed_amount(f)
         sd = sector_data[sector]
 
         if f["direction"] == "inflow":
             sd["inflow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             sd["outflow"] += amt
 
         # Actor accumulation (net signed)
@@ -328,7 +354,7 @@ def aggregate_by_sector(engine: Engine, days: int = 30) -> dict[str, Any]:
 
         result[sector] = {
             "net_flow": round(net, 2),
-            "direction": "inflow" if net >= 0 else "outflow",
+            "direction": "inflow" if net > 0 else ("outflow" if net < 0 else "neutral"),
             "acceleration": acceleration,
             "acceleration_pct": round(accel_pct, 4),
             "this_week_flow": round(tw, 2),
@@ -431,7 +457,7 @@ def aggregate_by_time(
         if f["direction"] == "inflow":
             b["inflows"] += amt
             b["net_flow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             b["outflows"] += amt
             b["net_flow"] -= amt
 
@@ -490,10 +516,11 @@ def aggregate_by_actor_tier(engine: Engine, days: int = 30) -> dict[str, Any]:
 
         if f["direction"] == "inflow":
             td["inflow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             td["outflow"] += amt
 
-        td["sectors"][sector] += signed
+        if sector != "Unknown":
+            td["sectors"][sector] += signed
         actor = f["actor_name"] or "Unknown"
         td["actors"][actor] += signed
 
@@ -540,7 +567,7 @@ def aggregate_by_actor_tier(engine: Engine, days: int = 30) -> dict[str, Any]:
             "net_flow": round(net, 2),
             "inflow": round(td["inflow"], 2),
             "outflow": round(td["outflow"], 2),
-            "direction": "inflow" if net >= 0 else "outflow",
+            "direction": "inflow" if net > 0 else ("outflow" if net < 0 else "neutral"),
             "weekly_rate": round(weekly_rate, 2),
             "sector_breakdown": sector_bd,
             "top_actors": top_actors,
@@ -578,6 +605,8 @@ def compute_flow_momentum(engine: Engine, ticker: str, days: int = 30) -> dict[s
                     "WHERE UPPER(ticker) = :ticker "
                     "AND flow_date >= :cutoff "
                     "AND flow_date <= CURRENT_DATE "
+                    "AND source_type <> '13f' "
+                    "AND direction != 'quarantined' "
                     "ORDER BY flow_date DESC"
                 ),
                 {"ticker": ticker.upper(), "cutoff": cutoff},
@@ -617,7 +646,7 @@ def compute_flow_momentum(engine: Engine, ticker: str, days: int = 30) -> dict[s
         direction = r[1]
         fdate = r[2]
 
-        signed = amt if direction == "inflow" else -amt
+        signed = amt if direction == "inflow" else (-amt if direction == "outflow" else 0.0)
 
         if isinstance(fdate, date):
             if fdate >= five_ago:
@@ -786,7 +815,7 @@ def aggregate_smart_vs_dumb(engine: Engine, days: int = 30) -> dict[str, Any]:
         bucket["sectors"][sector] += signed
         if f["direction"] == "inflow":
             bucket["inflow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             bucket["outflow"] += amt
 
     # Divergence: when smart and dumb money disagree
@@ -803,7 +832,7 @@ def aggregate_smart_vs_dumb(engine: Engine, days: int = 30) -> dict[str, Any]:
     def _format_bucket(b: dict) -> dict:
         return {
             "net_flow": round(b["net"], 2),
-            "direction": "inflow" if b["net"] >= 0 else "outflow",
+            "direction": "inflow" if b["net"] > 0 else ("outflow" if b["net"] < 0 else "neutral"),
             "inflow": round(b["inflow"], 2),
             "outflow": round(b["outflow"], 2),
             "flow_count": b["count"],
@@ -842,7 +871,11 @@ def compute_sector_conviction(engine: Engine, days: int = 30) -> dict[str, dict]
 
     sector_flows: dict[str, list[dict]] = defaultdict(list)
     for f in flows:
+        if f["direction"] not in ("inflow", "outflow"):
+            continue
         sector = _get_sector(f["ticker"])
+        if sector == "Unknown":
+            continue
         sector_flows[sector].append(f)
 
     result = {}
@@ -879,10 +912,13 @@ def compute_sector_conviction(engine: Engine, days: int = 30) -> dict[str, dict]
 
         # 3. Source diversity (0-20 pts)
         net_flow = sum(_signed_amount(f) for f in sflows)
-        majority_dir = "inflow" if net_flow >= 0 else "outflow"
+        majority_dir = "inflow" if net_flow > 0 else ("outflow" if net_flow < 0 else "neutral")
         agreeing_sources = set()
         for f in sflows:
-            f_dir = "inflow" if _signed_amount(f) >= 0 else "outflow"
+            signed_val = _signed_amount(f)
+            if signed_val == 0:
+                continue
+            f_dir = "inflow" if signed_val > 0 else "outflow"
             if f_dir == majority_dir:
                 agreeing_sources.add(f["source_type"])
         diversity_score = min(20, len(agreeing_sources) * 5)
@@ -1045,8 +1081,8 @@ def aggregate_confidence_weighted(engine: Engine, days: int = 30) -> dict[str, A
             "confirmed_net": round(sd["confirmed_net"], 2),
             "estimated_net": round(sd["estimated_net"], 2),
             "conviction_gap": conviction_gap,
-            "direction_raw": "inflow" if raw >= 0 else "outflow",
-            "direction_weighted": "inflow" if weighted >= 0 else "outflow",
+            "direction_raw": "inflow" if raw > 0 else ("outflow" if raw < 0 else "neutral"),
+            "direction_weighted": "inflow" if weighted > 0 else ("outflow" if weighted < 0 else "neutral"),
             "directions_agree": (raw >= 0) == (weighted >= 0),
         }
 

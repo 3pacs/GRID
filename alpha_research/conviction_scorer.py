@@ -69,6 +69,7 @@ def _load_latest(
         WHERE fr.name = :n
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
+          AND rs.vintage_date <= :as_of
           AND NOT EXISTS (
               SELECT 1 FROM resolved_series_retractions rr
               WHERE rr.feature_id = rs.feature_id
@@ -182,6 +183,7 @@ def _load_price(
         WHERE fr.name = :n
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
+          AND rs.vintage_date <= :as_of
           AND NOT EXISTS (
               SELECT 1 FROM resolved_series_retractions rr
               WHERE rr.feature_id = rs.feature_id
@@ -751,6 +753,7 @@ def scan_all(
             WHERE fr.name LIKE '%%_full'
               AND rs.obs_date <= :as_of
               AND rs.release_date <= :as_of
+              AND rs.vintage_date <= :as_of
             GROUP BY fr.name HAVING COUNT(*) > 50
         """), {"as_of": as_of}).fetchall()
 

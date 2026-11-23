@@ -1,4 +1,4 @@
-# Market-state record (market-state/1)
+# Market-state record (market-state/2)
 
 One machine-readable row per session in `market_state_daily`: every state variable reported against its own trailing
 baseline, so each reads as "this far above or below its normal". Code: `intelligence/regime/market_state.py`
@@ -15,6 +15,107 @@ baseline, so each reads as "this far above or below its normal". Code: `intellig
 | Percentile | mid-rank in the window, 0..1 |
 | Label | normal \|z\|<1 · above/below 1–2 · high/low ≥2 (from the percentile when there is no z) |
 | Too little history | `unavailable` with the reason, never a guess |
+
+## Freshness (max-age/1)
+
+market-state/2 adds one rule to market-state/1. An input whose newest observation is older than its maximum age reads
+`stale`, not `ok` (#1303). The reading (value, z, label) is kept so a reader can see what was stale, and `freshness`
+gives the age, unit, limit and basis. `stale` outranks both `ok` and `no_baseline`, and `coverage.stale` counts it.
+`gamma_state` is `stale` when its row is not from the record's own session. Code: `MAX_AGE` in
+`intelligence/regime/market_state.py`.
+
+| Inputs | Max age | Why |
+|---|---|---|
+| VIX, VIX/VIX3M, HY, IG, curve, fed funds, real fed funds, DIX, short volume | 2 sessions | posted the next business day: 1 session old, 2 when a federal holiday falls on a trading day |
+| SPY trend, the three news readings | 1 session | read for the session itself; one missed session allowed |
+| dealer gamma, spot vs flip, `gamma_state` | 0 sessions | positioning changes every session with open interest and expiries |
+| weekly and monthly inputs | period + declared lag − 1 days | claims 12, net liquidity 9, labor 72, CPI and industrial production 80, sentiment 90 |
+
+Sessions are NYSE sessions after the observation, up to and including `as_of`. They are counted on the hash-pinned
+XNYS manifests in `docs/reference/calendar-manifests` (the prescreen parts, then `factory_session_calendar.PINS`:
+2018-04-02 to 2027-12-31), never on the approximate scheduler helpers in `ingestion/market_calendar.py`. Those
+helpers close Juneteenth in 2018–2021, before it existed, and keep 2018-12-05 and 2025-01-09 open, so they miscount
+ages in both directions. Each record names the calendar it used in `freshness_calendar`.
+- A record for a day after 2027-12-31 is refused until the manifests are extended.
+- An observation from before 2018-04-02 gets a lower-bound age (`age_is_lower_bound`).
+- The 0-session limit is a same-date rule: dealer gamma is fresh only when its row's date is the record's own date.
+
+The weekly and monthly limits come from
+`LAGS`: the next observation is public one period plus its declared lag after the current one, so anything older means
+it is overdue or was never published. Documented shutdown releases therefore read `stale`, which is what they are.
+
+The limits were measured on every stored record from 2019-01-02 to 2026-11-19, and no normal reading exceeds them.
+Counting on the pinned calendar instead of the scheduler helpers changes the status of none of those stored readings.
+Dry runs of the new rule against griddb (2026-11-21, read-only) flag only real gaps:
+- 2022-03-28: the news readings, 23 sessions old.
+- 2025-12-19: CPI, 109 days old (shutdown).
+- 2026-04-08: SPY, 5 sessions old.
+- 2026-08-05: claims, 18 days old.
+- 2026-10-19: dealer gamma, 4 sessions old.
+- 2026-11-20: dealer gamma (the Cboe 403 day) and FINRA short volume, 3 sessions old.
+
+Rows written before market-state/2 carry `rule = market-state/1` and no `freshness`; in them, `ok` never meant fresh.
+
+## Provisional record at the close (#1312, display only)
+
+The decision record for session D is written the evening after D (`grid-market-state.timer`, 23:15Z on D+1), under
+#1191's previous-session rule. Anything that decides keeps reading that record. The post-close desk brief (22:20
+America/New_York on D) runs before it exists, so a second record, computed at D's close, fills that gap. It is for
+display only (owner's decision, bring-up plan rev 100).
+
+- **Table**: `market_state_provisional` (as_of_date PK, rule, record JSONB, computed_at TIMESTAMPTZ, `provisional
+  BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional)`). It comes from the alembic migration
+  `migrations/versions/market_state_prov_20261122.py`, with the GRANT footer, and `schema.sql` declares the same
+  statement. Production never creates it at runtime: the module's ensure runs on SQLite (tests) only, and on
+  Postgres the store refuses to write while the table is missing. `store_market_state` refuses a provisional
+  record, so one never lands in `market_state_daily`.
+- **Availability cutoff**: the session's close, exactly. The record is `compute_market_state(..., known_by=close)`:
+  the same record rule, with every read cut at that instant instead of the end of the UTC day. A rerun hours
+  later reads the same inputs, so nothing that reached GRID after the close can appear in it (Codex HOLD on
+  #1360). The decision record passes no cutoff and is unchanged. Each read is cut on the clock its store keeps:
+
+  | Read | Cut |
+  |---|---|
+  | `raw_series` (`read_window_known_at(as_of_ts=)`) | `pull_timestamp` at or before the cutoff, and nothing else. There is no modeled path: a modeled known-at date never admits a row GRID first pulled later. A release override still delays a row until its UTC day has ended. |
+  | `fred_vintages` (`load(fetched_by=)`) | `fetched_at` at or before the cutoff. Each version's live interval is rebuilt from the versions known then: it ends the day before the next one, or is open. The stored `realtime_end` is never read, because a later refresh extends it in place. |
+  | `dealer_gex_daily` | `created_at` at or before the cutoff; a row without one is not known |
+  | resolved `spy_full` | not read. `resolved_series` has no write clock (the resolver stamps `release_date` with the raw pull date), so SPY comes from `YF:SPY:close` by `pull_timestamp`. That is the record's own fallback basis, and `spy_basis` names it. |
+
+  A read with no clock that can prove GRID held a row by the cutoff is not used. A later quarantine
+  (`pull_status`) still removes a row; it adds nothing that arrived after the close.
+- **Record**: each stored record adds the following:
+  - `"provisional": true` and `"decision_use": "display_only"`.
+  - A `label`: computed from the inputs GRID held at the close, with nothing that arrived later; the decision
+    record is written the next evening.
+  - `availability_cutoff`, the writer's clock `computed_at`, and `minutes_after_close`.
+  - `source_lineage.availability_cutoff`, which names each read's cut.
+
+  A late run is labelled, not refused. With the cutoff in place it cannot change the inputs, and a fixed limit
+  would mark every early-close day late (21:15Z is 195 minutes after an 18:00Z close).
+- **Writer**: `scripts/run_market_state.py --provisional`. It targets today's UTC session, and only at or after
+  that session's `closes` in the pinned XNYS parts (`factory_session_calendar.PINS`). That close is 21:00Z, 20:00Z
+  in summer, or 18:00Z on an early close.
+  - Before the close, or on a day that is not a session, it refuses with exit 2.
+  - It never takes `--from/--to`, `--as-of` or `--require-target-dealer`.
+  - It never refreshes the FRED vintages, whatever flags are passed. `--no-refresh` is accepted and changes
+    nothing, and no flag turns a refresh on (`--refresh` is an argparse usage error).
+  - It is insert-only; `--replace` rewrites.
+  - Its provenance says `mode: provisional`, `decision_use: display_only`, the cutoff, the minutes after the
+    close, `vintage_refresh: never` and the calendar version.
+  - Timer: `deploy/systemd/grid-market-state-provisional.*.template`, weekdays 21:15Z, `Persistent=false`, with its
+    own lock. Installed on grid-svr 2026-11-22 (first run 2026-11-23), with the Python 3.14 drop-in
+    `deploy/python314/dropins/grid-market-state-provisional.service.d-py314.conf`.
+- **Reader**: only the post-close desk brief, and only while the session's decision record is not there yet
+  (`docs/reference/DESK_BRIEF.md`). Every line starts with `PROVISIONAL (display only)` and states the cutoff and
+  how long after the close the record was computed. A record whose cutoff is not the session's close is not shown.
+- **Guard**: `tests/test_market_state_provisional_guard.py`.
+  - Only the writer, this module, `analysis/desk_brief_sources.py` and the migration may name the table (docs aside).
+  - Inside those files, only reviewed definitions may name it.
+  - No reader of `market_state_daily` names it.
+  - The provisional path has no refresh and always passes the cutoff.
+  - Only the migration creates the table outside SQLite.
+  - The decision writer still refuses today and targets the prior session.
+  - `tests/test_market_state_provisional_cutoff.py` holds the delayed-input test.
 
 ## Variables (v1)
 

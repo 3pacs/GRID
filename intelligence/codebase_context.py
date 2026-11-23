@@ -256,12 +256,17 @@ def _get_dollar_flows_summary() -> str:
         from sqlalchemy import text
         with engine.connect() as conn:
             # Try the dollar_flows table
+            # amount_usd is stored positive with the sign in ``direction``, so
+            # the totals read ``direction``. 13F is non-directional (owner
+            # decision 2026-11-23) and never counts as a flow.
             row = conn.execute(text(
                 "SELECT COUNT(*), "
-                "       SUM(CASE WHEN amount_usd > 0 THEN amount_usd ELSE 0 END) AS inflows, "
-                "       SUM(CASE WHEN amount_usd < 0 THEN ABS(amount_usd) ELSE 0 END) AS outflows "
+                "       SUM(CASE WHEN direction = 'inflow' THEN amount_usd ELSE 0 END) AS inflows, "
+                "       SUM(CASE WHEN direction = 'outflow' THEN amount_usd ELSE 0 END) AS outflows "
                 "FROM dollar_flows "
-                "WHERE created_at >= NOW() - INTERVAL '7 days'"
+                "WHERE created_at >= NOW() - INTERVAL '7 days' "
+                "AND source_type <> '13f' "
+                "AND direction IN ('inflow', 'outflow')"
             )).fetchone()
             if row and row[0] and row[0] > 0:
                 count = row[0]

@@ -181,6 +181,12 @@ STREAM_DARKPOOL: str = "darkpool"
 STREAM_OPTIONS_FLOW: str = "options_flow"
 STREAM_SMART_MONEY: str = "smart_money"
 STREAM_INSTITUTIONAL: str = "13f"
+# 13F gives no direction until CUSIP identity and split coverage exist
+# (owner decision 2026-11-23); see _scan_institutional. Flipping this flag is
+# not authorization and not evidence of eligibility: re-enabling needs the
+# coverage implemented, a reviewed change, and the owner's word. The puller no
+# longer writes 13F signal_sources rows at all.
+INSTITUTIONAL_13F_DIRECTIONAL: bool = False
 STREAM_SOCIAL: str = "social"
 STREAM_PREDICTION_MARKET: str = "prediction_market"
 
@@ -891,16 +897,26 @@ def _scan_institutional(
     window_days: int,
     trust_cache: dict[str, float],
 ) -> StreamSignal | None:
-    """13F institutional delta: net NEW + INCREASED vs CLOSED + DECREASED.
+    """13F institutional stream: abstains (returns None).
 
-    13F rows are keyed by SEC filing date (up to 45 days after quarter end)
-    and ``ingestion/altdata/institutional_flows.py`` does not currently store
-    holdings ``period_end``. To prevent stale quarterly holdings from voting
-    in a short convergence window alongside live flow, only rows whose stored
-    holdings period end lies inside ``[as_of - window_days, as_of]`` are
-    included; rows lacking a period end or with an out-of-window period end
-    are excluded (fail closed).
+    Owner decision 2026-11-23 (Anik, "Yes, non-directional"): no 13F change is
+    a verified direction until CUSIP identity and corporate-action coverage
+    exist. A NEW/CLOSED CUSIP can be a rekey, merger or exchange with no
+    trade, and an INCREASED/DECREASED share count can be a split, so the old
+    ``(new + increased) - (closed + decreased)`` count is not read as bullish
+    or bearish. The old count stays behind ``INSTITUTIONAL_13F_DIRECTIONAL``
+    for tests only; the flag is not authorization to re-enable it.
+
+    On that test-only path, 13F rows are keyed by SEC filing date (up to 45
+    days after quarter end) and ``ingestion/altdata/institutional_flows.py``
+    does not currently store holdings ``period_end``. To prevent stale
+    quarterly holdings from voting in a short convergence window alongside
+    live flow, only rows whose stored holdings period end lies inside
+    ``[as_of - window_days, as_of]`` are included; rows lacking a period end
+    or with an out-of-window period end are excluded (fail closed).
     """
+    if not INSTITUTIONAL_13F_DIRECTIONAL:
+        return None
     rows = _fetch_stream_rows(
         engine, STREAM_INSTITUTIONAL, ticker, as_of, window_days
     )
