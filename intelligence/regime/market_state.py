@@ -225,8 +225,8 @@ class _Reads:
         """Every Kalshi KXFED row available before the end of ``as_of`` (or by ``known_by``), priced from its ladder.
 
         Known-at is the row's availability clock only (``PP.row_clock``: the writer's acquisition clock plus a commit
-        grace, or pull_timestamp plus the legacy span for rows written in one long transaction); the row's ``value``
-        column is never read. The clock is compared here rather than in SQL so SQLite tests and Postgres agree.
+        grace, or pull_timestamp plus the legacy span for rows written in one long transaction; a proxy, since no row
+        records its commit, so the lineage lists it as unqualified); the row's ``value`` column is never read. The clock is compared here rather than in SQL so SQLite tests and Postgres agree.
         """
         if "__kxfed__" not in self._memo:
             cutoff = self.known_by or datetime.combine(self.as_of + timedelta(days=1), time(0), tzinfo=timezone.utc)
@@ -583,7 +583,7 @@ def _snapshot_clock(rd: PP.DayReading) -> dict[str, Any]:
     prev = _previous_session(rd.obs_date)
     return {"session": rd.obs_date.isoformat(), "pulled_at": rd.pulled_at.isoformat(),
             "acquired_from": rd.acquired_from.isoformat(), "acquired_by": rd.acquired_by.isoformat(),
-            "available_at": rd.available_at.isoformat(), "clock_basis": rd.clock_basis,
+            "available_at": rd.available_at.isoformat(), "availability": "proxy", "clock_basis": rd.clock_basis,
             "pre_open": prev is not None and PP.pre_open(rd, prev),
             "after_close": prev.isoformat() if prev is not None else None}
 
@@ -612,7 +612,7 @@ def next_meeting_detail(r: "_Reads") -> dict[str, Any]:
         "monotone_adjusted": lad.monotone_adjusted, "one_sided": lad.one_sided, "max_spread": round(lad.max_spread, 4),
         "tails": {"below": round(lad.tail_below, 4), "above": round(lad.tail_above, 4)},
     }
-    pair = PP.target_pairing(rd, r.series("DFEDTARU"), PP.meetings_seen(r.kxfed(), by=rd.acquired_by))
+    pair = PP.target_pairing(rd, r.series("DFEDTARU"), PP.meetings_seen(r.kxfed(), on=rd.obs_date))
     if pair is None:
         out["target"] = {"status": "unavailable",
                          "reason": "no DFEDTARU observation known after the last meeting's decision took effect"}
@@ -699,8 +699,9 @@ def policy_response(variables: dict[str, dict[str, Any]], next_meeting: dict[str
     base: dict[str, Any] = {
         "rule": POLICY_RESPONSE_RULE, "decision_use": "none",
         "validation": ("descriptive only: equity stress beside front-end repricing over one window of closes; it does "
-                       "not identify a policy response or its cause. Unvalidated research tracking for #1311; no "
-                       "registered test"),
+                       "not identify a policy response or its cause. Kalshi availability is a proxy (no row records "
+                       "its commit), so a historical comparison is not exact point-in-time evidence. Unvalidated "
+                       "research tracking for #1311; no registered test"),
         "thresholds": {"stress_z": POLICY_STRESS_Z, "eased_z": POLICY_PUT_Z},
         "windows": windows or {},
         "next_meeting": next_meeting,
@@ -1120,7 +1121,8 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
         "raw_series": reads.raw_lineage,
         "kxfed": reads.kxfed_lineage,
         "unqualified_read_paths": ["ALFRED vintage selection/capture", "dealer-gamma capture",
-                                   "SPY resolved/raw selected window", "calendar publication/capture"],
+                                   "SPY resolved/raw selected window", "calendar publication/capture",
+                                   "KXFED row availability (a proxy: no row records when its commit became visible)"],
         "limitation": "selected raw-input fingerprints only; not full immutable custody or scheduled-run evidence",
     }
     if reads.known_by is not None:
@@ -1201,8 +1203,9 @@ CUTOFF_READS = {
                      "then (the stored realtime_end is extended in place by later refreshes and is not read)",
     "dealer_gex_daily": "created_at at or before the cutoff; a row without one is not known",
     "kxfed": "raw_series KALSHI:KXFED-* rows (source Kalshi) available at or before the cutoff: the writer's "
-             "acquisition clock + 1 min, or pull_timestamp (transaction start) + 15 min for older rows; no modeled "
-             "path; priced from raw_payload all_strikes, never the value column (intelligence/regime/policy_path.py)",
+             "acquisition clock + 1 min, or pull_timestamp (transaction start) + 15 min for older rows, a proxy and "
+             "not a persistence receipt; no modeled path; the schedule from rows dated up to each day; priced from "
+             "raw_payload all_strikes, never the value column (intelligence/regime/policy_path.py)",
     "resolved_series": "not read: it keeps no write clock (the resolver stamps release_date with the raw pull "
                        "date), so SPY comes from YF:SPY:close by pull_timestamp, the record's own fallback basis",
 }

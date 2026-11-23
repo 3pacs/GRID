@@ -29,23 +29,33 @@ and the mass above the highest at one step above it: E = lowest strike + step x 
 can exceed ``MAX_TAIL`` within the quotes means the ladder does not cover the distribution. Hike / hold / cut odds
 are given only when both thresholds (the current upper bound and one step below) are quoted strikes.
 
-Clocks and availability (there is no modeled path; GRID's KXFED rows start 2026-04-07 and are all live pulls):
+Clocks and availability (there is no modeled path; GRID's KXFED rows start 2026-04-07 and are all live pulls). No
+row records when its commit became visible, so each availability below is a proxy that bounds the commit by the
+writer's own discipline, not a persistence receipt (:data:`AVAILABILITY_NOTE`). The record therefore lists KXFED
+among its unqualified read paths, and a historical comparison built on these rows is not exact point-in-time evidence:
 
 * rows written under ``kalshi-acquired/1`` carry ``clock.requested_at`` and ``clock.acquired_at``, read before that
-  event's markets request and right after its response (the quotes were read between the two), and are committed
-  in their own transaction straight after: available ``COMMIT_GRACE`` after the response;
+  event's markets request and right after its response (the quotes were read between the two), and their
+  ``pull_timestamp`` is ``acquired_at``. The writer commits each row in its own transaction under lock and statement
+  timeouts and rolls it back unless it is ready to commit within ``kalshi_markets.COMMIT_FENCE`` (30 s) of the
+  response; the commit itself is not timestamped. Available ``COMMIT_GRACE`` (1 min) after the response;
+* a row whose payload carries a clock that cannot be trusted (another rule, an unreadable or missing instant,
+  ``requested_at`` after ``acquired_at``, or a ``pull_timestamp`` that is not ``acquired_at``) is unusable;
 * older rows carry only ``pull_timestamp``, the raw_series default, which is the start of one transaction that
-  spanned the whole pull, so their quotes arrived after it: acquired by, and available, ``LEGACY_SPAN`` later.
+  spanned the whole pull, so their quotes arrived after it: acquired by, and available, ``LEGACY_SPAN`` later
+  (pull_log 2026-05-27..11-23: 289 Kalshi runs, the longest 70 s).
 
 A row counts for a cutoff only when it is available by it. The puller runs once a day, usually between 00:00 and
 11:00 UTC, so the snapshot dated D (``obs_date`` is the UTC pull date) normally reflects the market after the close
 before session D and before D opens; :func:`pre_open` checks that for any reading that is set against closes.
 
-The next meeting for a day is the earliest meeting after that day's newest quotes among the KXFED events GRID had
-seen by then (the schedule as known that day, so a later discovery never rewrites an earlier day). When that
-event has no usable row that day, the day has no reading; a later meeting is never substituted. The 5-session
-change is taken within one contract: the next meeting's expected upper bound minus the same event's expected upper
-bound five XNYS sessions earlier.
+The next meeting for a day is the earliest meeting after that day's newest quotes among the KXFED events with a
+stored row dated that day or earlier (a row is dated by the UTC day of its response, or for older rows the UTC day its
+pull began). A day's reading therefore depends only on rows dated up to that day, cut at the record's availability
+cutoff: a row dated later, even one whose request began earlier, never changes it. When that event has no usable
+row that day, the day has no reading; a later meeting is never substituted. The 5-session change is taken within one
+contract: the next meeting's expected upper bound minus the same event's expected upper bound five XNYS sessions
+earlier.
 """
 
 from __future__ import annotations
@@ -72,11 +82,18 @@ CHANGE_SESSIONS = 5
 
 # The writer's clock rule (ingestion/altdata/kalshi_markets.py CLOCK_RULE; a test keeps the two equal).
 ACQUIRED_CLOCK_RULE = "kalshi-acquired/1"
-COMMIT_GRACE = timedelta(minutes=1)    # acquired-clock rows: the insert and its commit follow the response at once
+# Acquired-clock rows: the writer rolls a row back unless it is ready to commit within kalshi_markets.COMMIT_FENCE
+# (30 s) of the response; the grace leaves the commit itself 30 s more (a test keeps the fence inside the grace).
+COMMIT_GRACE = timedelta(minutes=1)
 # Transaction-start rows: the whole pull ran in one transaction. pull_log 2026-05-27..2026-11-23 has 289 Kalshi runs
 # (Kalshi_Markets, smart:kalshi, smart:kalshi_markets); the longest took 70 s and inserting runs take about 10 s.
 LEGACY_SPAN = timedelta(minutes=15)
 
+_CLOCK_TOLERANCE = timedelta(milliseconds=1)   # pull_timestamp must be the acquisition clock (storage rounding only)
+AVAILABILITY_NOTE = ("proxy, not a persistence receipt: no KXFED row records when its commit became visible (acquired "
+                     "rows: response + 1 min, the writer rolls back any row not ready to commit within 30 s of the "
+                     "response; older rows: transaction start + 15 min), so these readings are not exact "
+                     "point-in-time evidence, for a decision or for a historical comparison")
 _ET = ZoneInfo("America/New_York")
 _TICKER_STRIKE = re.compile(r"-T(\d+(?:\.\d+)?)$")
 _TITLE_STRIKE = re.compile(r"upper bound of the federal funds rate be above (\d+(?:\.\d+)?)%", re.IGNORECASE)
@@ -109,7 +126,7 @@ class Snapshot:
     pulled_at: datetime                         # the row's stored pull_timestamp
     meeting_at: datetime | None
     ladder: Ladder | None
-    clock_basis: str                            # 'acquired' (kalshi-acquired/1) | 'transaction_start' (older rows)
+    clock_basis: str                            # 'acquired' | 'transaction_start' (older rows) | 'clock_unreadable'
     acquired_from: datetime                     # earliest instant the quotes can have been read
     acquired_by: datetime                       # latest
     available_at: datetime                      # when the row is known: compared with a record's cutoff
@@ -261,16 +278,31 @@ def price_ladder(strikes: Sequence[dict[str, Any]], *, event: str | None = None,
                   max_spread=max(b - a for a, b in zip(lo, hi))), None
 
 
-def row_clock(pulled_at: datetime, payload: Any) -> tuple[str, datetime, datetime, datetime]:
-    """(basis, acquired_from, acquired_by, available_at) for a row's stored pull clock and payload."""
+def row_clock(pulled_at: datetime, payload: Any) -> tuple[str, datetime, datetime, datetime, str | None]:
+    """(basis, acquired_from, acquired_by, available_at, problem) for a row's stored pull clock and payload.
+
+    ``problem`` is set when the payload carries a clock that cannot be trusted; the row is then unusable and keeps
+    the conservative legacy bounds (basis ``clock_unreadable``).
+    """
+    legacy = (pulled_at, pulled_at + LEGACY_SPAN, pulled_at + LEGACY_SPAN)
     clock = payload.get("clock") if isinstance(payload, dict) else None
-    ours = isinstance(clock, dict) and clock.get("rule") == ACQUIRED_CLOCK_RULE
-    acquired = _instant(clock.get("acquired_at")) if ours else None
-    if acquired is not None:
-        requested = _instant(clock.get("requested_at"))
-        start = requested if requested is not None and requested <= acquired else acquired
-        return "acquired", start, acquired, max(acquired, pulled_at) + COMMIT_GRACE
-    return "transaction_start", pulled_at, pulled_at + LEGACY_SPAN, pulled_at + LEGACY_SPAN
+    if clock is None:
+        return ("transaction_start", *legacy, None)
+    if not isinstance(clock, dict) or clock.get("rule") != ACQUIRED_CLOCK_RULE:
+        rule = clock.get("rule") if isinstance(clock, dict) else clock
+        return ("clock_unreadable", *legacy, f"unrecognised clock {rule!r}")
+    acquired, requested = _instant(clock.get("acquired_at")), _instant(clock.get("requested_at"))
+    if acquired is None:
+        problem = "clock.acquired_at is missing or unreadable"
+    elif requested is None:
+        problem = "clock.requested_at is missing or unreadable"
+    elif requested > acquired:
+        problem = "clock.requested_at is after clock.acquired_at"
+    elif abs(pulled_at - acquired) > _CLOCK_TOLERANCE:
+        problem = "pull_timestamp is not clock.acquired_at"
+    else:
+        return "acquired", requested, acquired, acquired + COMMIT_GRACE, None
+    return ("clock_unreadable", *legacy, problem)
 
 
 def snapshot_from_row(series_id: str, obs_date: date, pulled_at: Any, payload: Any) -> Snapshot:
@@ -282,7 +314,7 @@ def snapshot_from_row(series_id: str, obs_date: date, pulled_at: Any, payload: A
             payload = json.loads(payload)
         except ValueError:
             payload = None
-    basis, a_from, a_by, available = row_clock(pulled, payload)
+    basis, a_from, a_by, available, clock_problem = row_clock(pulled, payload)
     if not isinstance(payload, dict):
         return Snapshot(series_id, obs_date, pulled, None, None, basis, a_from, a_by, available,
                         "payload is not a JSON object")
@@ -294,6 +326,9 @@ def snapshot_from_row(series_id: str, obs_date: date, pulled_at: Any, payload: A
     if meeting is None:
         return Snapshot(series_id, obs_date, pulled, None, None, basis, a_from, a_by, available,
                         "payload has no meeting time (strike_date)")
+    if clock_problem is not None:
+        return Snapshot(series_id, obs_date, pulled, meeting, None, basis, a_from, a_by, available,
+                        f"clock: {clock_problem}")
     ladder, why = price_ladder(payload.get("all_strikes") or [], event=series_id, meeting_at=meeting)
     return Snapshot(series_id, obs_date, pulled, meeting, ladder, basis, a_from, a_by, available, why)
 
@@ -332,14 +367,18 @@ def _reading(d: date, s: Snapshot) -> DayReading:
                       s.clock_basis, s.ladder)
 
 
-def first_seen(snapshots: Iterable[Snapshot]) -> dict[tuple[datetime, str], datetime]:
-    """(meeting time, event) -> the earliest instant GRID read that event: the schedule as GRID learned it."""
-    out: dict[tuple[datetime, str], datetime] = {}
+def first_seen(snapshots: Iterable[Snapshot]) -> dict[tuple[datetime, str], date]:
+    """(meeting time, event) -> the date of the event's first stored row: the schedule as GRID had stored it.
+
+    A date, not an instant: a row is dated by its response's UTC day (older rows: the UTC day the pull began), so
+    knowledge taken this way can only come from rows dated up to the day being read.
+    """
+    out: dict[tuple[datetime, str], date] = {}
     for s in snapshots:
         if s.meeting_at is not None:
             key = (s.meeting_at, s.event)
-            if key not in out or s.acquired_from < out[key]:
-                out[key] = s.acquired_from
+            if key not in out or s.obs_date < out[key]:
+                out[key] = s.obs_date
     return out
 
 
@@ -347,8 +386,9 @@ def next_meeting_readings(snapshots: Iterable[Snapshot], sessions: Sequence[date
                                                                                             dict[date, str]]:
     """Per XNYS session date with KXFED rows: the next meeting's priced ladder, or why that day has none.
 
-    The next meeting is chosen from the events GRID had read by that day's newest quotes, so adding a later
-    discovery (an event first read on a later day) never changes an earlier day.
+    The next meeting is chosen from the events with a stored row dated that day or earlier, so a row dated later
+    (an event first stored on a later day, even one whose request began the day before) never changes an earlier
+    day.
     """
     snaps = list(snapshots)
     by_key = latest_per_event_day(snaps)
@@ -364,8 +404,8 @@ def next_meeting_readings(snapshots: Iterable[Snapshot], sessions: Sequence[date
         # The day's newest quotes decide which meeting is next: a pull after a decision reads the following meeting.
         newest = max(s.acquired_by for s in by_day[d])
         known: dict[datetime, list[str]] = {}
-        for (m, ev), t in seen.items():
-            if t <= newest:
+        for (m, ev), first in seen.items():
+            if first <= d:
                 known.setdefault(m, []).append(ev)
         nxt = min((m for m in known if m > newest), default=None)
         if nxt is None:
@@ -441,14 +481,16 @@ def selection_receipt(snapshots: Sequence[Snapshot], *, as_of: date, cutoff: dat
                   key=lambda x: (x["event"], x["obs_date"], x["pulled_at"]))
     encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
     bases = sorted({r["clock_basis"] for r in rows})
-    return {"schema": "market-state-kxfed-selection/2", "rule": POLICY_PATH_RULE, "as_of": as_of.isoformat(),
+    return {"schema": "market-state-kxfed-selection/3", "rule": POLICY_PATH_RULE, "as_of": as_of.isoformat(),
             "cutoff": cutoff.isoformat(), "cutoff_inclusive": inclusive, "rows": len(rows),
             "unusable_rows": sum(1 for r in rows if r["unusable"]),
             "clock_basis": {b: sum(1 for r in rows if r["clock_basis"] == b) for b in bases},
             "sha256": hashlib.sha256(encoded).hexdigest(),
+            "pit_qualified": False, "availability": AVAILABILITY_NOTE,
             "pit_basis": (f"available_at only, no modeled path: {ACQUIRED_CLOCK_RULE} acquisition clock + "
                           f"{int(COMMIT_GRACE.total_seconds())} s commit grace, or pull_timestamp (transaction "
-                          f"start) + {int(LEGACY_SPAN.total_seconds() // 60)} min for older rows")}
+                          f"start) + {int(LEGACY_SPAN.total_seconds() // 60)} min for older rows; the schedule "
+                          f"from rows dated up to each day")}
 
 
 def outcome_odds(ladder: Ladder, current_upper: float) -> tuple[dict[str, float] | None, dict[str, list[float]] | None,
@@ -475,13 +517,13 @@ def outcome_odds(ladder: Ladder, current_upper: float) -> tuple[dict[str, float]
     return odds, bounds, None
 
 
-def meetings_seen(snapshots: Iterable[Snapshot], *, by: datetime | None = None) -> list[datetime]:
-    """Meeting times of the KXFED events GRID had read (by ``by``, when given)."""
-    return _meetings_known(first_seen(snapshots), by)
+def meetings_seen(snapshots: Iterable[Snapshot], *, on: date | None = None) -> list[datetime]:
+    """Meeting times of the KXFED events with a stored row (dated ``on`` or earlier, when given)."""
+    return _meetings_known(first_seen(snapshots), on)
 
 
-def _meetings_known(seen: dict[tuple[datetime, str], datetime], by: datetime | None) -> list[datetime]:
-    return sorted({m for (m, _), t in seen.items() if by is None or t <= by})
+def _meetings_known(seen: dict[tuple[datetime, str], date], on: date | None) -> list[datetime]:
+    return sorted({m for (m, _), first in seen.items() if on is None or first <= on})
 
 
 def target_pairing(reading: DayReading, target: pd.Series, meetings: Sequence[datetime]) -> tuple[date, float] | None:
@@ -510,12 +552,12 @@ def priced_move_series(readings: dict[date, DayReading], target: pd.Series,
                        snapshots: Sequence[Snapshot]) -> pd.Series:
     """Expected upper bound after the next meeting minus the current upper bound, per day with a valid pairing.
 
-    Each day's last meeting comes from the schedule GRID had read by that day's quotes.
+    Each day's last meeting comes from the schedule GRID had stored by that day.
     """
     out = {}
     seen = first_seen(snapshots)
     for d, r in readings.items():
-        pair = target_pairing(r, target, _meetings_known(seen, r.acquired_by))
+        pair = target_pairing(r, target, _meetings_known(seen, r.obs_date))
         if pair is not None:
             out[d] = r.ladder.expected_upper - pair[1]
     return pd.Series(out, dtype=float).sort_index()

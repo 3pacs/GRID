@@ -167,10 +167,13 @@ def test_odds_are_withheld_unless_both_thresholds_are_quoted(target):
 
 # ── clocks ────────────────────────────────────────────────────────────────
 
-def _row_snap(event, meeting, d, pulled, level, *, acquired=None):
+def _row_snap(event, meeting, d, pulled, level, *, acquired=None, requested=None, clock=None):
     payload = _payload(event, meeting, level)
     if acquired is not None:
-        payload["clock"] = {"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": acquired.isoformat()}
+        payload["clock"] = {"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": acquired.isoformat(),
+                            "requested_at": (requested or acquired - timedelta(seconds=5)).isoformat()}
+    if clock is not None:
+        payload["clock"] = clock
     return PP.snapshot_from_row(f"KALSHI:{event}", d, pulled, json.dumps(payload))
 
 
@@ -182,15 +185,40 @@ def test_a_transaction_start_row_is_known_only_after_the_legacy_span():
     assert not PP.known_by(legacy, end_of_day, inclusive=False)          # quotes may have arrived after midnight
     stamped = _row_snap("KXFED-26JAN", JAN, date(2025, 11, 14), pulled, 4.3, acquired=pulled)
     assert stamped.clock_basis == "acquired" and stamped.available_at == pulled + PP.COMMIT_GRACE
-    assert PP.known_by(stamped, end_of_day, inclusive=False)
-    late = _row_snap("KXFED-26JAN", JAN, date(2025, 11, 14), pulled, 4.3, acquired=pulled + timedelta(minutes=20))
+    assert stamped.ladder is not None and PP.known_by(stamped, end_of_day, inclusive=False)
+    later = pulled + timedelta(minutes=20)
+    late = _row_snap("KXFED-26JAN", JAN, date(2025, 11, 14), later, 4.3, acquired=later)
     assert not PP.known_by(late, end_of_day, inclusive=False)            # response after the cutoff
+
+
+_T = "2025-11-14T23:50:00Z"
+
+
+@pytest.mark.parametrize("clock, why", [
+    ({"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": "not a time", "requested_at": "2025-11-14T23:49:55Z"},
+     "acquired_at is missing or unreadable"),
+    ({"rule": PP.ACQUIRED_CLOCK_RULE, "requested_at": "2025-11-14T23:49:55Z"}, "acquired_at is missing or unreadable"),
+    ({"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": _T}, "requested_at is missing or unreadable"),
+    ({"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": _T, "requested_at": 17}, "requested_at is missing or unreadable"),
+    ({"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": _T, "requested_at": "2025-11-14T23:51:00Z"},
+     "requested_at is after clock.acquired_at"),
+    ({"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": "2025-11-14T23:40:00Z", "requested_at": "2025-11-14T23:39:55Z"},
+     "pull_timestamp is not clock.acquired_at"),         # stored clock and payload clock disagree
+    ({"rule": "kalshi-acquired/0", "acquired_at": _T, "requested_at": _T}, "unrecognised clock"),
+    (_T, "unrecognised clock"),
+])
+def test_an_explicit_clock_that_cannot_be_trusted_makes_the_row_unusable(clock, why):
+    pulled = datetime(2025, 11, 14, 23, 50, tzinfo=UTC)
+    s = _row_snap("KXFED-26JAN", JAN, date(2025, 11, 14), pulled, 4.3, clock=clock)
+    assert s.ladder is None and why in s.reason and s.clock_basis == "clock_unreadable"
+    assert s.available_at == pulled + PP.LEGACY_SPAN          # never earlier than an older row would be
 
 
 def test_the_writer_and_reader_share_one_clock_rule():
     from ingestion.altdata import kalshi_markets as K
 
     assert K.CLOCK_RULE == PP.ACQUIRED_CLOCK_RULE
+    assert timedelta(0) < K.COMMIT_FENCE < PP.COMMIT_GRACE           # the commit keeps part of the grace
 
 
 # ── meetings, rolls, same-contract change ─────────────────────────────────
@@ -240,8 +268,70 @@ def test_a_later_discovery_never_rewrites_an_earlier_day():
     after, _ = PP.next_meeting_readings(jan_only + [_snap("KXFED-25DEC", DEC_M, mon, 5, 4.20)], days)
     assert after[fri] == before[fri] and after[fri].event == "KALSHI:KXFED-26JAN"
     assert after[mon].event == "KALSHI:KXFED-25DEC"
-    assert PP.meetings_seen(jan_only, by=datetime(2025, 12, 5, 6, tzinfo=UTC)) == [
-        datetime(2026, 1, 28, 19, tzinfo=UTC)]
+    assert PP.meetings_seen(jan_only, on=fri) == [datetime(2026, 1, 28, 19, tzinfo=UTC)]
+
+
+def _at(d: date, h: int, m: int, sec: int) -> datetime:
+    return datetime(d.year, d.month, d.day, h, m, sec, tzinfo=UTC)
+
+
+def test_a_row_dated_the_next_day_never_changes_the_day_before():
+    # Codex's synthetic (review 6017948338): two pulls overlap across midnight. The nearer event's request starts
+    # 23:59:00Z on D, the farther event is read 23:59:20Z on D, and the nearer response lands 00:00:05Z on D + 1.
+    d, d1 = date(2025, 12, 4), date(2025, 12, 5)
+    far = _row_snap("KXFED-26JAN", JAN_M, d, _at(d, 23, 59, 20), 4.40, acquired=_at(d, 23, 59, 20),
+                    requested=_at(d, 23, 59, 10))
+    near = _row_snap("KXFED-25DEC", DEC_M, d1, _at(d1, 0, 0, 5), 4.20, acquired=_at(d1, 0, 0, 5),
+                     requested=_at(d, 23, 59, 0))
+    assert near.acquired_from < far.acquired_by                   # its request began before the farther row's read
+    before, _ = PP.next_meeting_readings([far], [d, d1])
+    after, _ = PP.next_meeting_readings([far, near], [d, d1])
+    assert after[d] == before[d] and after[d].event == "KALSHI:KXFED-26JAN"
+    assert after[d1].event == "KALSHI:KXFED-25DEC"
+    assert PP.meetings_seen([far, near], on=d) == [datetime(2026, 1, 28, 19, tzinfo=UTC)]
+    # A later row for a third, nearer-still event dated D + 1 never reaches D either.
+    nov = _row_snap("KXFED-25NOV", "2025-12-06T19:00:00Z", d1, _at(d1, 0, 0, 6), 4.0, acquired=_at(d1, 0, 0, 6),
+                    requested=_at(d, 23, 58, 0))
+    again, _ = PP.next_meeting_readings([far, near, nov], [d, d1])
+    assert again[d] == before[d]
+
+
+def test_an_older_row_begun_before_midnight_counts_for_its_own_day_once_available():
+    # Legacy control: a pull began 23:59:00Z on D in one transaction, so its row is dated D and its quotes may have
+    # been read up to 15 min later. At D's end it is not available, and neither is what it teaches about the
+    # schedule; once available it is D's own row.
+    d, d1 = date(2025, 12, 4), date(2025, 12, 5)
+    far = _row_snap("KXFED-26JAN", JAN_M, d, _at(d, 5, 0, 0), 4.40)
+    near = _row_snap("KXFED-25DEC", DEC_M, d, _at(d, 23, 59, 0), 4.20)
+    end_of_d = datetime(2025, 12, 5, tzinfo=UTC)
+    cut = [s for s in (far, near) if PP.known_by(s, end_of_d, inclusive=False)]
+    at_end, _ = PP.next_meeting_readings(cut, [d])
+    assert cut == [far] and at_end[d].event == "KALSHI:KXFED-26JAN"
+    later, _ = PP.next_meeting_readings([far, near], [d, d1])
+    assert later[d].event == "KALSHI:KXFED-25DEC" and later[d].acquired_by == _at(d1, 0, 14, 0)
+
+
+def test_overlapping_pulls_of_one_event_on_one_day_read_the_later_response_known_by_the_cutoff():
+    d = date(2025, 12, 4)
+    first = _row_snap("KXFED-25DEC", DEC_M, d, _at(d, 5, 0, 8), 4.20, acquired=_at(d, 5, 0, 8),
+                      requested=_at(d, 5, 0, 1))
+    second = _row_snap("KXFED-25DEC", DEC_M, d, _at(d, 5, 0, 40), 4.25, acquired=_at(d, 5, 0, 40),
+                       requested=_at(d, 5, 0, 0))
+    both, _ = PP.next_meeting_readings([second, first], [d])
+    assert both[d].acquired_by == second.acquired_by
+    cutoff = _at(d, 5, 1, 30)                                     # first available 05:01:08, second 05:01:40
+    cut = [s for s in (first, second) if PP.known_by(s, cutoff, inclusive=True)]
+    early, _ = PP.next_meeting_readings(cut, [d])
+    assert early[d].acquired_by == first.acquired_by
+
+
+def test_an_untrusted_clock_still_teaches_the_schedule_so_it_refuses_rather_than_substitutes():
+    d = date(2025, 12, 4)
+    far = _row_snap("KXFED-26JAN", JAN_M, d, _at(d, 5, 0, 0), 4.40, acquired=_at(d, 5, 0, 0))
+    bad = _row_snap("KXFED-25DEC", DEC_M, d, _at(d, 5, 0, 0), 4.20,
+                    clock={"rule": PP.ACQUIRED_CLOCK_RULE, "acquired_at": "garbage"})
+    readings, missing = PP.next_meeting_readings([far, bad], [d])
+    assert d not in readings and "clock: clock.acquired_at" in missing[d]
 
 
 def test_two_events_naming_one_meeting_give_no_reading():
@@ -390,12 +480,16 @@ def test_policy_variables_are_standardized_and_stress_reads_without_easing(engin
     nm = pr["next_meeting"]
     assert nm["event"] == "KALSHI:KXFED-26JAN" and nm["target"]["upper"] == 4.00
     assert nm["obs_date"] == AS_OF.isoformat() and nm["snapshot"]["clock_basis"] == "transaction_start"
+    assert nm["snapshot"]["availability"] == "proxy" and "not exact point-in-time evidence" in pr["validation"]
     assert nm["priced_move"] == pytest.approx(nm["expected_upper"] - 4.00)
     assert nm["expected_bounds"][0] <= nm["expected_upper"] <= nm["expected_bounds"][1]
     assert set(nm["odds"]) == {"hike", "hold", "cut"} and sum(nm["odds"].values()) == pytest.approx(1.0, abs=1e-3)
     assert set(nm["odds_bounds"]) == {"hike", "hold", "cut"}
     lineage = st["source_lineage"]["kxfed"]
     assert lineage["rows"] > 250 and lineage["sha256"] and lineage["clock_basis"] == {"transaction_start": lineage["rows"]}
+    assert lineage["schema"] == "market-state-kxfed-selection/3" and lineage["pit_qualified"] is False
+    assert lineage["availability"].startswith("proxy, not a persistence receipt")
+    assert any(x.startswith("KXFED row availability") for x in st["source_lineage"]["unqualified_read_paths"])
 
 
 def test_a_front_end_that_eases_into_the_stress_reads_eased(engine):

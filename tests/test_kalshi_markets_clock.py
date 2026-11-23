@@ -25,6 +25,7 @@ RUN = datetime(2026, 11, 23, 20, 59, 30, tzinfo=UTC)          # the pull starts 
 RESPONSE = datetime(2026, 11, 23, 21, 0, 30, tzinfo=UTC)      # and its markets response lands 30 s after it
 CUTOFF = datetime(2026, 11, 23, 21, 0, 0, tzinfo=UTC)
 EVENT = "KXFED-26DEC"
+_REAL_EXISTS = K._raw_series_success_exists
 
 
 def _market(k: float, bid, ask, **extra) -> dict:
@@ -56,10 +57,16 @@ def engine():
     return eng
 
 
-def _run(engine, monkeypatch, markets=MARKETS):
+def _run(engine, monkeypatch, markets=MARKETS, stall=None):
     clock = {"now": RUN}
     monkeypatch.setattr(K, "_now", lambda: clock["now"])
     puller = K.KalshiMarketsPuller(engine)
+    if stall is not None:
+        def stalled(conn, **kw):                  # a lock or connection stall inside the event's transaction
+            clock["now"] = clock["now"] + stall
+            return _REAL_EXISTS(conn, **kw)
+
+        monkeypatch.setattr(K, "_raw_series_success_exists", stalled)
 
     def events(series):
         return [{"event_ticker": EVENT, "title": "Fed Dec 9", "series_ticker": "KXFED",
@@ -156,3 +163,30 @@ def test_a_response_after_utc_midnight_is_dated_by_its_own_day(engine, monkeypat
     puller.pull_all()
     with engine.connect() as c:
         assert str(c.execute(text("SELECT obs_date FROM raw_series")).scalar())[:10] == "2026-11-24"
+
+
+def test_a_row_not_ready_to_commit_within_the_fence_is_rolled_back(engine, monkeypatch):
+    out = _run(engine, monkeypatch, stall=K.COMMIT_FENCE + timedelta(seconds=1))
+    assert out["status"] == "SUCCESS" and out["rows_inserted"] == 0 and out["late_rolled_back"] == 1
+    with engine.connect() as c:
+        assert c.execute(text("SELECT count(*) FROM raw_series")).scalar() == 0
+    assert _kxfed(engine, RESPONSE + timedelta(hours=2)) == []
+    out = _run(engine, monkeypatch, stall=K.COMMIT_FENCE)          # at the fence it still commits
+    assert out["rows_inserted"] == 1 and out["late_rolled_back"] == 0
+    snaps = _kxfed(engine, RESPONSE + PP.COMMIT_GRACE)
+    assert len(snaps) == 1 and snaps[0].available_at == RESPONSE + PP.COMMIT_GRACE
+
+
+def test_a_stored_row_whose_clocks_disagree_is_unusable(engine, monkeypatch):
+    # The payload's acquisition clock says 21:00:30Z, the stored pull clock says 20:30Z: neither can be trusted.
+    _run(engine, monkeypatch)
+    with engine.begin() as c:
+        payload = c.execute(text("SELECT raw_payload FROM raw_series")).scalar()
+        c.execute(text("DELETE FROM raw_series"))
+        c.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, "
+                       "pull_status) VALUES (:s, 3, :d, :ts, 0.93, :p, 'SUCCESS')"),
+                  {"s": f"KALSHI:{EVENT}", "d": RUN.date(), "ts": RUN - timedelta(minutes=29, seconds=30),
+                   "p": payload})
+    snaps = _kxfed(engine, RESPONSE + timedelta(hours=1))
+    assert len(snaps) == 1 and snaps[0].ladder is None and snaps[0].clock_basis == "clock_unreadable"
+    assert "pull_timestamp is not clock.acquired_at" in snaps[0].reason

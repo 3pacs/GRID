@@ -232,15 +232,28 @@ strike's bid and ask are in `raw_payload.all_strikes`, and `policy_path.price_la
 
 | Rows | Clock | Available at |
 |---|---|---|
-| Written by the current writer | `clock.requested_at` (before the event's markets request) and `clock.acquired_at` (right after its response, also stored as `pull_timestamp`). The quotes were read between the two. The row is dated by the response's UTC day and commits in its own transaction straight after. | acquired + 1 min |
+| Written by the current writer | `clock.requested_at` (before the event's markets request) and `clock.acquired_at` (right after its response, also stored as `pull_timestamp`). The quotes were read between the two. The row is dated by the response's UTC day and commits in its own transaction straight after, under Postgres lock and statement timeouts. The writer rolls the row back, and skips the event for that pull (`late_rolled_back`), unless the transaction is ready to commit within 30 s of the response. | acquired + 1 min |
 | Written earlier | Only `pull_timestamp`: the raw_series default, i.e. the start of one transaction that spanned the whole pull. The quotes came later. | `pull_timestamp` + 15 min |
+| Clock present but untrusted | Another rule, an unreadable or missing instant, `requested_at` after `acquired_at`, or a `pull_timestamp` that is not `acquired_at`. | unusable (`clock_unreadable`), kept at `pull_timestamp` + 15 min |
 
 The 15-minute bound is measured. pull_log 2026-05-27..11-23 has 289 Kalshi runs; the longest took 70 s, and inserting
 runs take about 10 s. `source_lineage.kxfed` counts rows by clock basis.
 
-**Schedule as known that day.** The next meeting is the earliest meeting after the day's newest quotes, among the
-events GRID had read by then. An event first read later never rewrites an earlier day. If that event's row is missing
-or unusable, the day has no reading; a later meeting is never substituted.
+**Availability is a proxy.** No row records when its commit became visible. The bounds above come from how the
+writer behaves; they are not a persistence receipt, and the commit itself is not timestamped. So
+`source_lineage.kxfed` says `pit_qualified: false` and gives the proxy in `availability`. KXFED row availability is
+listed among `source_lineage.unqualified_read_paths`, and every next-meeting snapshot says `availability: proxy`. A
+historical comparison built on these rows is not exact point-in-time evidence, whether for a decision or for
+description.
+
+**Schedule as stored up to that day.** The next meeting is the earliest meeting after the day's newest quotes. It is
+chosen among the events with a stored row dated that day or earlier. A row is dated by its response's UTC day; an
+older row is dated by the UTC day its pull began. A day's reading therefore depends only on rows dated up to it, cut
+at the record's availability cutoff. A row dated later never changes it, even one whose request began the day before.
+Codex's cross-midnight case is a test: a nearer event's request starts 23:59:00Z, a farther event is read 23:59:20Z,
+and the nearer response lands 00:00:05Z. Overlapping pulls and legacy rows have their own controls. If the next
+meeting's row is missing or unusable that day, including an untrusted clock, the day has no reading. A later meeting
+is never substituted.
 
 **The session's own snapshot.** The three policy variables have a maximum age of 0 sessions. The record reads only the
 as_of session's snapshot. If that snapshot is missing or unusable, the variables read stale and

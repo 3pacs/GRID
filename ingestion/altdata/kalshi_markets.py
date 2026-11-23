@@ -13,10 +13,13 @@ the highest-volume contract's yes-probability plus metadata into
 Clock (``kalshi-acquired/1``): each event's row records ``clock.requested_at`` (read before that
 event's markets request) and ``clock.acquired_at`` (read right after its response, and stored as
 ``pull_timestamp`` too), is dated by the UTC day of that response, and is committed in its own
-short transaction straight after. Before this rule the whole pull ran in one transaction and
-``pull_timestamp`` was the raw_series default (that transaction's start, before any response),
-so readers give those older rows a conservative availability bound
-(``intelligence/regime/policy_path.py``).
+short transaction straight after. That transaction runs under lock and statement timeouts
+(Postgres) and is rolled back, and the event skipped for the pull, unless it is ready to commit
+within ``COMMIT_FENCE`` of the response; the commit itself is not timestamped, so readers treat
+availability as a proxy (response + ``policy_path.COMMIT_GRACE``), not a persistence receipt.
+Before this rule the whole pull ran in one transaction and ``pull_timestamp`` was the raw_series
+default (that transaction's start, before any response), so readers give those older rows a
+conservative availability bound (``intelligence/regime/policy_path.py``).
 
 Every strike in ``all_strikes`` keeps the source's missingness: a missing or malformed quote is
 stored as null, never 0.0, beside its quote sizes, its own event ticker and its payout terms
@@ -31,7 +34,7 @@ from __future__ import annotations
 import json as _json
 import math
 import time as _time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -43,6 +46,11 @@ from ingestion.base import BasePuller, retry_on_failure
 
 _API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 CLOCK_RULE = "kalshi-acquired/1"
+# An event's row is rolled back unless its transaction is ready to commit within this of the response
+# (policy_path.COMMIT_GRACE, the readers' availability proxy, leaves the commit itself the rest).
+COMMIT_FENCE = timedelta(seconds=30)
+_LOCK_TIMEOUT = "10s"        # Postgres lock_timeout / statement_timeout for that transaction
+_STATEMENT_TIMEOUT = "15s"
 _REQUEST_TIMEOUT = 30
 
 # Economic / financial series we care about.
@@ -87,6 +95,10 @@ def _parse_quote(raw: Any) -> float | None:
 def _now() -> datetime:
     """UTC wall clock (a seam for tests)."""
     return datetime.now(timezone.utc)
+
+
+class _LateCommit(RuntimeError):
+    """An event's transaction was not ready to commit within COMMIT_FENCE of its response."""
 
 
 def _raw_series_success_exists(
@@ -245,6 +257,7 @@ class KalshiMarketsPuller(BasePuller):
         }
 
         inserted = 0
+        late = 0
         total_events = 0
 
         try:
@@ -309,39 +322,59 @@ class KalshiMarketsPuller(BasePuller):
                     # fall back to volume as a proxy signal.
                     value = yes_price if yes_price > 0 else volume
 
-                    with self.engine.begin() as conn:
-                        if _raw_series_success_exists(
-                            conn,
-                            series_id=series_id,
-                            source_id=self.source_id,
-                            obs_date=today,
-                        ):
-                            continue
+                    try:
+                        with self.engine.begin() as conn:
+                            if conn.dialect.name == "postgresql":
+                                # A lock or statement stall fails this transaction instead of committing late.
+                                conn.execute(
+                                    text("SELECT set_config('lock_timeout', :lt, true), "
+                                         "set_config('statement_timeout', :st, true)"),
+                                    {"lt": _LOCK_TIMEOUT, "st": _STATEMENT_TIMEOUT},
+                                )
+                            if _raw_series_success_exists(
+                                conn,
+                                series_id=series_id,
+                                source_id=self.source_id,
+                                obs_date=today,
+                            ):
+                                continue
 
-                        conn.execute(
-                            text(
-                                "INSERT INTO raw_series "
-                                "(series_id, source_id, obs_date, value, "
-                                " raw_payload, pull_status, pull_timestamp) "
-                                "VALUES (:sid, :src, :od, :val, "
-                                " :payload, 'SUCCESS', :ts)"
-                            ),
-                            {
-                                "sid": series_id,
-                                "src": self.source_id,
-                                "od": today,
-                                "val": float(value),
-                                "payload": _json.dumps(payload),
-                                "ts": acquired_at,
-                            },
+                            conn.execute(
+                                text(
+                                    "INSERT INTO raw_series "
+                                    "(series_id, source_id, obs_date, value, "
+                                    " raw_payload, pull_status, pull_timestamp) "
+                                    "VALUES (:sid, :src, :od, :val, "
+                                    " :payload, 'SUCCESS', :ts)"
+                                ),
+                                {
+                                    "sid": series_id,
+                                    "src": self.source_id,
+                                    "od": today,
+                                    "val": float(value),
+                                    "payload": _json.dumps(payload),
+                                    "ts": acquired_at,
+                                },
+                            )
+                            ready = _now()
+                            if ready - acquired_at > COMMIT_FENCE:
+                                raise _LateCommit(f"{(ready - acquired_at).total_seconds():.1f} s")
+                    except _LateCommit as exc:
+                        late += 1
+                        log.warning(
+                            "Kalshi: {e} rolled back, not ready to commit until {s} after its response "
+                            "(fence {f:.0f} s)",
+                            e=event_ticker, s=str(exc), f=COMMIT_FENCE.total_seconds(),
                         )
+                        continue
                     inserted += 1
 
             result["rows_inserted"] = inserted
+            result["late_rolled_back"] = late
             result["events_found"] = total_events
             log.info(
-                "Kalshi: {s} series, {e} events, {i} rows inserted",
-                s=result["series_checked"], e=total_events, i=inserted,
+                "Kalshi: {s} series, {e} events, {i} rows inserted, {n} rolled back late",
+                s=result["series_checked"], e=total_events, i=inserted, n=late,
             )
 
         except Exception as exc:
@@ -350,6 +383,7 @@ class KalshiMarketsPuller(BasePuller):
             result["error"] = str(exc)
             # Rows already committed (one transaction per event) stay; report them.
             result["rows_inserted"] = inserted
+            result["late_rolled_back"] = late
             result["events_found"] = total_events
 
         return [result]
