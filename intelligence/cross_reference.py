@@ -31,6 +31,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.feature_ids import feature_id
+
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -135,16 +137,24 @@ def _get_latest_value(engine: Engine, series_id: str) -> tuple[float | None, dat
 
 
 def _get_feature_value(engine: Engine, feature_name: str) -> tuple[float | None, date | None]:
-    """Fetch the most recent resolved value for a feature by name."""
+    """Fetch the most recent resolved value for a feature by name.
+
+    The id is looked up first and bound (store.feature_ids): through a
+    feature_registry name join the planner walked every vintage of a large
+    feature (china_indpro_yoy, 75k rows: 70 ms on griddb, 2026-11-23; < 1 ms
+    with the id bound).
+    """
     with engine.connect() as conn:
+        fid = feature_id(conn, feature_name)
+        if fid is None:
+            return None, None
         row = conn.execute(
             text(
                 "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                "WHERE fr.name = :name "
-                "ORDER BY rs.obs_date DESC LIMIT 1"
+                "WHERE rs.feature_id = :fid "
+                "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
             ),
-            {"name": feature_name},
+            {"fid": fid},
         ).fetchone()
     if row is None:
         return None, None
@@ -1319,12 +1329,38 @@ _LIQUIDITY_CHECKS: list[dict[str, str]] = [
         "relationship": "positive_correlation",
         "implication": (
             "When the 10Y-2Y spread disagrees with the Fed Funds Rate direction, "
-            "the bond market is calling the Fed's bluff. Persistent inversion "
-            "while Fed holds rates = the market expects forced cuts. Steepening "
-            "while Fed holds = inflation re-acceleration priced in."
+            "the bond market is calling the Fed's bluff."
         ),
     },
 ]
+
+
+def _yield_curve_implication(t10y2y_value: float | None) -> str:
+    """Build sign-accurate yield-curve implication text from the latest T10Y2Y reading.
+
+    'Persistent inversion' is emitted only when T10Y2Y < 0 (fail-closed when
+    missing, non-finite, or non-negative).
+    """
+    base = (
+        "When the 10Y-2Y spread disagrees with the Fed Funds Rate direction, "
+        "the bond market is calling the Fed's bluff. "
+    )
+    if t10y2y_value is None or not math.isfinite(t10y2y_value):
+        return (
+            base
+            + "Current 10Y-2Y spread value is unavailable; curve slope regime cannot be determined."
+        )
+    if t10y2y_value < 0:
+        return (
+            base
+            + f"Persistent inversion (T10Y2Y={t10y2y_value:+.2f}%) while Fed holds rates "
+            "= the market expects forced cuts."
+        )
+    return (
+        base
+        + f"Positive/steepening spread (T10Y2Y={t10y2y_value:+.2f}%) while Fed holds "
+        "= inflation re-acceleration or term-premium repricing priced in."
+    )
 
 
 def check_liquidity_reality(engine: Engine) -> list[CrossRefCheck]:
@@ -1357,6 +1393,12 @@ def check_liquidity_reality(engine: Engine) -> list[CrossRefCheck]:
                 len(off_hist), len(phys_hist), staleness,
             )
 
+            implication = (
+                _yield_curve_implication(phys_val)
+                if cfg["physical"] == "T10Y2Y"
+                else cfg["implication"]
+            )
+
             check = _make_check(
                 name=cfg["name"],
                 category="liquidity",
@@ -1366,7 +1408,7 @@ def check_liquidity_reality(engine: Engine) -> list[CrossRefCheck]:
                 physical_value=phys_val,
                 expected_relationship=cfg["relationship"],
                 zscore=zscore,
-                implication=cfg["implication"],
+                implication=implication,
                 confidence=confidence,
             )
             checks.append(check)

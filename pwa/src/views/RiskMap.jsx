@@ -392,8 +392,10 @@ function RiskTreemap({ data, selectedCategory, onSelect }) {
                 if (d.data.key === 'correlation_risk') return `Avg: ${num(m.avg_cross_correlation) ?? '?'}`;
                 if (d.data.key === 'credit_risk') return `HY: ${num(m.hy_spread) ?? '?'}bp`;
                 if (d.data.key === 'liquidity_risk') {
-                    const c = num(m.fed_net_liquidity_change_1m);
-                    return `Fed: ${c === null ? '?' : formatMetric('', c)}`;
+                    // Change in Fed total assets (WALCL), in USD. Not net
+                    // liquidity: TGA and RRP are separate trends.
+                    const c = num(m.fed_total_assets_change_1m_usd);
+                    return `Fed assets 1m: ${c === null ? '?' : `${c < 0 ? '-' : '+'}$${formatMetric('', Math.abs(c))}`}`;
                 }
                 return '';
             })

@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dc_replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -467,10 +467,84 @@ class TrialPanel(v1.TrialPanel):
     groups: list[str] = field(default_factory=list)
 
 
+def holdout_abstaining(holdout_probe: Mapping[str, Any] | None, entities: Iterable[str]) -> list[str]:
+    """Tickers in ``entities`` that failed the witnessed holdout-period basis check (v6 §8)."""
+    if not holdout_probe:
+        return []
+    explicit = {str(t) for t in (holdout_probe.get("abstaining") or ())}
+    admitted = {str(t) for t in (holdout_probe.get("admitted") or ())}
+    return sorted({str(t) for t in entities if str(t) in explicit or str(t) not in admitted})
+
+
+def apply_close_masks(
+    closes: pd.DataFrame,
+    universe: pd.DataFrame,
+    *,
+    benchmark: str,
+    window: str,
+    listed_from: Mapping[str, str] | None = None,
+    blank_before_listing: bool = False,
+    close_mask: Any = None,
+    abstain_tickers: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Apply pre-listing, C1 interval, and holdout-only abstention masks to closes."""
+    abstain = {str(t) for t in (abstain_tickers or ())}
+    if abstain and window != "holdout":
+        raise ValueError("abstain_tickers applies only to the holdout window")
+    out = closes
+    if blank_before_listing and listed_from:
+        out = out.copy()
+        for ticker, start in listed_from.items():
+            if ticker in out.columns and ticker != benchmark:
+                out.loc[out.index < pd.Timestamp(start), ticker] = np.nan
+    if close_mask is not None:
+        keep = close_mask(out, universe)
+        out = out.copy()
+        for ticker in keep.columns:
+            if ticker in out.columns and ticker != benchmark:
+                out.loc[~keep[ticker].reindex(out.index, fill_value=False).to_numpy(), ticker] = np.nan
+    if abstain:
+        out = out.copy()
+        for ticker in abstain:
+            if ticker in out.columns and ticker != benchmark:
+                out.loc[:, ticker] = np.nan
+    return out
+
+
+def _mask_abstaining_panel(panel: v1.TrialPanel, abstain: Iterable[str]) -> v1.TrialPanel:
+    """Blank abstaining entity columns on a TrialPanel copy, preserving subclass fields (e.g. v9 benchmark)."""
+    abstain_set = [t for t in abstain if t in panel.entities]
+    if not abstain_set:
+        return panel
+    abstain_cols = {panel.entities.index(t) for t in abstain_set}
+    label = panel.label.copy()
+    feature = panel.feature.copy()
+    momentum = panel.momentum.copy() if panel.momentum is not None else None
+    largest = panel.largest.copy() if panel.largest is not None else None
+    for j in abstain_cols:
+        label[:, j] = np.nan
+        feature[:, j] = np.nan
+        if momentum is not None:
+            momentum[:, j] = np.nan
+        if largest is not None:
+            largest[:, j] = np.nan
+    return dc_replace(
+        panel,
+        decision_at=list(panel.decision_at),
+        label_end=list(panel.label_end),
+        entities=list(panel.entities),
+        feature=feature,
+        label=label,
+        momentum=momentum,
+        largest=largest,
+    )
+
+
 def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: pd.DataFrame,
                        prices: v1.PricePanel, window: str, *,
                        blank_before_listing: bool = False,
-                       close_mask: Any = None) -> dict[str, TrialPanel]:
+                       close_mask: Any = None,
+                       abstain_tickers: Iterable[str] | None = None) -> dict[str, TrialPanel]:
     """Every declared trial's panel for one window (v1 construction, v2 admission).
 
     ``blank_before_listing`` (v5 §2.3): closes of a ticker before its manifest
@@ -478,10 +552,16 @@ def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: p
     is computed (a reused symbol's earlier history is never used).
     ``close_mask`` (v6 §2.3): a callable ``(closes, universe) -> DataFrame[bool]``
     (session dates x tickers); closes where it is False are blanked first too.
+    ``abstain_tickers`` (v6 §8): holdout-only tickers that failed the holdout-period
+    basis check; their closes are blanked before labelling so they abstain in the
+    holdout (NaN labels, no holdout label) while remaining listed in the panel.
     """
     prices.verify()
     if prices.window != window:
         raise ValueError("price panel window differs")
+    abstain = {str(t) for t in (abstain_tickers or ())}
+    if abstain and window != "holdout":
+        raise ValueError("abstain_tickers applies only to the holdout window")
     closes = prices.closes()
     benchmark = prices.manifest.benchmark
     universe = universe[universe["ticker"].isin(closes.columns)]
@@ -489,17 +569,16 @@ def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: p
     ciks = list(universe["cik"].astype(int))
     groups = list(universe["sic_group"])
     listed = dict(getattr(prices.manifest, "listed_from", ()) or ())
-    if blank_before_listing:
-        closes = closes.copy()
-        for ticker, start in listed.items():
-            if ticker in closes.columns and ticker != benchmark:
-                closes.loc[closes.index < pd.Timestamp(start), ticker] = np.nan
-    if close_mask is not None:
-        keep = close_mask(closes, universe)
-        closes = closes.copy()
-        for ticker in keep.columns:
-            if ticker in closes.columns and ticker != benchmark:
-                closes.loc[~keep[ticker].reindex(closes.index, fill_value=False).to_numpy(), ticker] = np.nan
+    closes = apply_close_masks(
+        closes,
+        universe,
+        benchmark=benchmark,
+        window=window,
+        listed_from=listed,
+        blank_before_listing=blank_before_listing,
+        close_mask=close_mask,
+        abstain_tickers=abstain,
+    )
     panels = {}
     for h in v1.HORIZONS:
         positions, labels, momentum = v1.relative_labels(closes, benchmark, tickers, h, window)
@@ -830,7 +909,8 @@ class HoldoutKey:
     window = "holdout"
 
     def __init__(self, token: object, frozen_sha256: str, inputs: dict, *, version: str | None = None,
-                 log_dir: Path | None = None, witness_tip: str | None = None, census: dict | None = None) -> None:
+                 log_dir: Path | None = None, witness_tip: str | None = None, census: dict | None = None,
+                 holdout_probe: Mapping[str, Any] | None = None) -> None:
         if token is not _HOLDOUT_TOKEN:
             raise TypeError("a HoldoutKey is issued only by resume_holdout")
         if log_dir is None or witness_tip is None or version is None:
@@ -842,6 +922,7 @@ class HoldoutKey:
         self.as_of_ts = stamp(inputs["as_of_ts"])
         self.log_dir = Path(log_dir)
         self.witness_tip = witness_tip
+        self.holdout_probe = dict(holdout_probe) if holdout_probe is not None else None
 
 
 class OffhostWitness:
@@ -1119,11 +1200,18 @@ class Harness:
         selected = [t for t in payload["ledger"] if t["selected"]]
         evaluated = sorted({t["trial"] for t in selected} | {self.primary})
         checks = []
+        effective_panels: dict[str, v1.TrialPanel] = {}
+        all_abstaining: set[str] = set()
         for trial in evaluated:
             panel = panels[trial]
             if panel.window != "holdout":
                 raise ValueError("holdout received a non-holdout panel")
             v1.validate_panel(panel)
+            abstain = holdout_abstaining(key.holdout_probe, panel.entities)
+            if abstain:
+                all_abstaining.update(abstain)
+                panel = _mask_abstaining_panel(panel, abstain)
+            effective_panels[trial] = panel
             ic, _ = v1.rank_ic_series(panel.feature, panel.label)
             n = int(np.isfinite(ic).sum())
             block = max(1, min(ledger[trial]["block"] or 1, max(1, n // MIN_BLOCKS)))
@@ -1136,8 +1224,11 @@ class Harness:
                            **result, "bonferroni_p": adjusted, "retrospective_survivor": survives,
                            "primary_one_sided_p": result["p_one_sided_positive"] if trial == self.primary else None})
         result = {"discovery_manifest": frozen["sha256"], "prereg_sha256": payload["prereg_sha256"],
-                  "holdout_sha256": digest({t: panels[t].as_record() for t in evaluated}),
+                  "holdout_sha256": digest({t: effective_panels[t].as_record() for t in evaluated}),
                   "holdout_checks": checks, "promotion_allowed": False}
+        if key.holdout_probe is not None:
+            result["holdout_probe_sha256"] = key.holdout_probe["sha256"]
+            result["holdout_abstaining_tickers"] = sorted(all_abstaining)
         result["contamination"] = self.run_contamination(key)
         result["verdict"] = self.verdict(payload, checks, power, result["contamination"])
         return result
@@ -1527,7 +1618,7 @@ class Harness:
         return {"kind": "holdout_opened", "records": len(heads), "head_sha256": heads[-1]}
 
     def _holdout_probe(self, records: list[dict], holdout_probe: Mapping[str, Any] | None) -> dict | None:
-        """The holdout-period basis report (v4 §8): only at open-holdout, after the discovery is sealed.
+        """The holdout-period basis report (v4/v6 §8): only at open-holdout, after the discovery is sealed.
 
         ``holdout_probe`` = ``{"sha256": <report file sha256>, "report": <parsed report>}``; the
         report must declare ``window == "holdout"`` and a ``snapshot_as_of_ts`` later than the
@@ -1544,8 +1635,48 @@ class Harness:
         snapshot = stamp(report["snapshot_as_of_ts"]) if report.get("snapshot_as_of_ts") else None
         if not sealed or snapshot is None or snapshot <= stamp(sealed[-1]["run_at"]):
             raise PermissionError("the holdout basis report must be produced after the discovery was sealed")
-        return {"sha256": holdout_probe["sha256"], "snapshot_as_of_ts": report["snapshot_as_of_ts"],
-                "admitted": sorted(report.get("admitted") or [])}
+        prereg = report.get("prereg")
+        prereg_body_sha = prereg.get("body_sha256") if isinstance(prereg, Mapping) else None
+        if not v1._is_hex64(prereg_body_sha):
+            raise PermissionError(f"the holdout basis report must carry prereg.body_sha256 for {self.version}")
+        if prereg_body_sha != self.prereg_sha256:
+            raise PermissionError(f"the holdout basis report prereg hash does not match {self.version}")
+        df_info = report.get("discovery_frozen")
+        df_sha = df_info.get("sha256") if isinstance(df_info, Mapping) else None
+        if not v1._is_hex64(df_sha):
+            raise PermissionError("the holdout basis report must carry discovery_frozen.sha256")
+        if df_sha != v1._record_sha256(sealed[-1]):
+            raise PermissionError("the holdout basis report names a different discovery_frozen record")
+        manifest_info = report.get("manifest")
+        manifest_digest = manifest_info.get("digest") if isinstance(manifest_info, Mapping) else None
+        if not v1._is_hex64(manifest_digest):
+            raise PermissionError("the holdout basis report must carry manifest.digest")
+        inputs_sha = sealed[-1].get("inputs_frozen_sha256")
+        frozen_in = [r for r in v1._kind(records, "inputs_frozen") if v1._record_sha256(r) == inputs_sha]
+        if len(frozen_in) != 1 or manifest_digest != frozen_in[0]["inputs"].get("price_manifest_sha256"):
+            raise PermissionError("the holdout basis report names a different price manifest")
+        admitted = sorted({str(t) for t in (report.get("admitted") or ())})
+        abstaining_set = {str(t) for t in (report.get("abstaining") or ())}
+        tickers_map = report.get("tickers")
+        if isinstance(tickers_map, Mapping):
+            from_tickers = {
+                str(t) for t, rec in tickers_map.items()
+                if isinstance(rec, Mapping) and rec.get("abstains")
+            }
+            if "abstaining" in report and abstaining_set != from_tickers:
+                raise PermissionError("holdout basis report abstaining list disagrees with per-ticker abstains flags")
+            abstaining_set |= from_tickers
+        if set(admitted) & abstaining_set:
+            raise PermissionError("holdout basis report lists a ticker as both admitted and abstaining")
+        out = {
+            "sha256": holdout_probe["sha256"],
+            "snapshot_as_of_ts": report["snapshot_as_of_ts"],
+            "admitted": admitted,
+            "abstaining": sorted(abstaining_set),
+        }
+        if "xlk_admitted_for_magnitudes" in report:
+            out["xlk_admitted_for_magnitudes"] = bool(report["xlk_admitted_for_magnitudes"])
+        return out
 
     def resume_holdout(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path,
                        observed: Mapping[str, Any], witness: OffhostWitness | None,
@@ -1560,14 +1691,16 @@ class Harness:
         if v1._kind(records, "holdout_result"):
             raise PermissionError("a holdout result is already recorded (evaluated once)")
         position = v1._position(records, "holdout_opened")
-        if records[position - 1]["discovery_sha256"] != frozen["sha256"]:
+        opened = records[position - 1]
+        if opened["discovery_sha256"] != frozen["sha256"]:
             raise PermissionError("holdout_opened names another discovery")
-        if self.pins.holdout_probe_required and not records[position - 1].get("holdout_probe"):
+        if self.pins.holdout_probe_required and not opened.get("holdout_probe"):
             raise PermissionError("holdout_opened carries no holdout-period basis report")
         _check_observed(inputs, observed)
         self.require_witness(log_dir, witness, position)
         return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs, version=self.version, log_dir=log_dir,
-                          witness_tip=witness.tip, census=witness.census)
+                          witness_tip=witness.tip, census=witness.census,
+                          holdout_probe=opened.get("holdout_probe"))
 
     def seal_holdout(self, log_dir: Path, now: datetime, key: HoldoutKey, result: dict) -> dict:
         if not isinstance(key, HoldoutKey) or key.version != self.version or (

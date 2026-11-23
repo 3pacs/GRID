@@ -494,10 +494,10 @@ class TestOraclePublish:
         raw.execute(
             "CREATE TABLE oracle_predictions ("
             "id TEXT, confidence REAL, verdict TEXT, dedup_keep INTEGER, "
-            "model_name TEXT, ticker TEXT)"
+            "model_name TEXT, ticker TEXT, flow_context TEXT)"
         )
         raw.executemany(
-            "INSERT INTO oracle_predictions VALUES (?,?,?,?,?,?)",
+            "INSERT INTO oracle_predictions VALUES (?,?,?,?,?,?,NULL)",
             [
                 ("p1", 0.8, "hit", 1, "m", "SPY"),
                 ("p2", 0.4, "miss", 1, "m", "SPY"),

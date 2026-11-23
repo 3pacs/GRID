@@ -113,6 +113,10 @@ def is_divisible_entry_price(entry_price: Any) -> bool:
 # never admitted by inferring a quote clock from their date or capture rows.
 QUOTE_REFERENCE_POLICY = "oracle_observed_reference_v1"
 QUOTE_MAX_AGE_SECONDS = 20 * 60
+# Providers whose capture spot is a qualified observed reference. Schwab joined
+# on 2026-11-23: its batches carry the same exact provider/capture clocks. Who
+# may *read* a Schwab batch is decided by ``store.options_provenance``, not here.
+QUALIFIED_QUOTE_PROVIDERS = frozenset({"cboe", "yahoo", "schwab"})
 _NY = ZoneInfo("America/New_York")
 
 
@@ -152,7 +156,7 @@ def validate_quote_reference(
     if ticker is not None and receipt.get("ticker") != ticker:
         return "quote ticker does not match prediction"
     if (receipt.get("source") != "options_capture_batches"
-            or receipt.get("provider") not in {"cboe", "yahoo"}
+            or receipt.get("provider") not in QUALIFIED_QUOTE_PROVIDERS
             or receipt.get("basis") != "raw_spot"
             or not receipt.get("capture_batch_id") or not receipt.get("capture_source")
             or receipt.get("backfilled") is not False):
@@ -182,13 +186,19 @@ def validate_quote_reference(
     return None
 
 
-def load_quote_reference(conn: Any, ticker: str, *, as_of: datetime) -> dict[str, Any]:
+def load_quote_reference(
+    conn: Any, ticker: str, *, as_of: datetime, include_schwab: Any = False,
+) -> dict[str, Any]:
     """Load the latest exact first-quote receipt visible by ``as_of``.
 
     The batch's registered_at is only a lower bound on availability, not its
     commit time. The live post-fetch read clock proves observation by the
     final decision; final admission must revalidate this returned receipt.
     A missing migration/lookup fails closed at the caller, never to daily spot.
+
+    ``include_schwab`` is the viewer flag of ``store.options_provenance``:
+    Schwab batches are read only when it is exactly ``True`` (the Oracle engine
+    passes ``ORACLE_READS_SCHWAB``). The API's tracking read keeps the default.
     """
     receipt: dict[str, Any] = {
         "status": "unavailable", "policy": QUOTE_REFERENCE_POLICY,
@@ -208,7 +218,7 @@ def load_quote_reference(conn: Any, ticker: str, *, as_of: datetime) -> dict[str
         WHERE ticker = :ticker AND capture_completed_at <= :as_of
           AND registered_at <= :as_of
         ORDER BY capture_ordinal DESC LIMIT 1
-    """), {"ticker": ticker, "as_of": cutoff}).fetchone()
+    """, include_schwab), {"ticker": ticker, "as_of": cutoff}).fetchone()
     read_observed_at = datetime.now(timezone.utc)
     if row is None:
         return receipt | {"reason": "no timestamped options quote was available at decision time"}

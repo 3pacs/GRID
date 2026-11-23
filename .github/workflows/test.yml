@@ -136,6 +136,20 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      # 13F holdings observations (intelligence/holdings_observations_13f.py):
+      # the real 13F writer -> reader -> deep_graph layer 9 -> served route on
+      # PostgreSQL types (JSONB payloads, TIMESTAMPTZ receipts, the window-
+      # function vintage read, graph_overlaps' real DDL). The test fails
+      # instead of skipping when REQUIRE_13F_HOLDINGS_PG=1.
+      - name: 13F holdings observations PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_13F_HOLDINGS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_13f_holdings_graph_pg.py -q -rA
+
       - name: Pipeline health PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -144,6 +158,36 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
+
+      # scripts/hermes_health.py::check_db_health's stale_sources feeds the
+      # db.stale_sources alert and Hermes's stale-refresh. It reads through a
+      # PostgreSQL-only LATERAL join and savepoints, so these tests skip in
+      # the general run above. Includes the FINRA_SHORT_VOLUME DIX-only-day
+      # case (ingestion/source_freshness.py::SERIES_ANCHORS).
+      - name: Hermes stale-sources PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_HERMES_STALE_SOURCES_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_hermes_health_stale_sources_pg.py -q -rA
+
+      # scripts/hermes_fixers.py::diagnose_and_fix_pulls's failed-pull query
+      # (window functions, = ANY(array) binds, JSONB text). The file is
+      # opt-in and bound to an isolated target, so it never ran and its
+      # fixture went stale unnoticed after the 2026-11-05 recovery clause.
+      # Includes the smart:finra_dix guest-name cases (a DIX run is not a
+      # FINRA_SHORT_VOLUME run, on either side of the query).
+      - name: Hermes failed-pull PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          GRID_HERMES_FAILURE_PG_OPT_IN: "1"
+          GRID_HERMES_FAILURE_PG_TARGET_BINDING: '{"host": "localhost", "port": 5432, "database": "griddb_test", "username": "grid", "isolated": true, "purpose": "hermes-latest-failure-regression"}'
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_hermes_latest_failure_diagnostic_pg.py -q -rA
 
       # astrogrid.backtest_run_invalidation (ag_backtest_invalid_20261110):
       # the migration marks only rotation_variant_* runs, the marks are
@@ -232,6 +276,70 @@ jobs:
             exit 1
           fi
 
+      # regime_history keeps every version (#1302, regime_history_revs_20261122):
+      # proves on real PostgreSQL that a second default write leaves the row
+      # unchanged, every change keeps the superseded version in
+      # regime_history_revisions (an unattributed one, like the pinned
+      # scheduler's upsert, is archived as such), TRUNCATE and obs_date changes
+      # are refused, revisions are append-only, the readers see the current
+      # label, and downgrade refuses while revisions exist. A skip must fail.
+      - name: regime_history revisions PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_regime_history_revisions.py -q -rA | tee /tmp/grid-regime-history-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-regime-history-pg.txt; then
+            echo "::error::regime_history revisions PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # model_eligible dry-run audit (#1301): the health half reads
+      # resolved_series point-in-time (obs/release/vintage <= as_of,
+      # retractions by the end of as_of removed before the latest-vintage
+      # pick, equal to PITStore.get_pit on resolver-shaped rows); future-dated
+      # rows appear only in the separate contamination report; NaN/inf/overflow
+      # values fail variance without aborting the scan. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Eligibility audit point-in-time PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_eligibility_audit_pg.py -q -rA | tee /tmp/grid-eligibility-audit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-eligibility-audit-pg.txt; then
+            echo "::error::Eligibility audit point-in-time PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Eligibility change log (eligibility_core_20261122, #1301): proves on
+      # real PostgreSQL that the migration creates only the append-only log
+      # and flips no flag, that the application role can read it but never
+      # write a pre-image, that its constraints refuse a malformed change,
+      # that downgrade refuses once a change is recorded, and that an
+      # app-role deploy warns with the ownership statements. Nothing in this
+      # release writes to the log. A skip must fail.
+      - name: Eligibility change log PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_eligibility_core_migration_pg.py -q -rA \
+            | tee /tmp/grid-eligibility-migration-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-eligibility-migration-pg.txt; then
+            echo "::error::Eligibility change log PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Each database fixture uses a private schema. Run the competing
       # writers, scorers and hourly advisory-lock tests serially.
       - name: Oracle forward measurement PostgreSQL contracts
@@ -269,6 +377,33 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
+
+      # The bound-id resolved_series readers (store/feature_ids.py) run next
+      # to the legacy feature_registry name-join statements on one seeded
+      # schema. REQUIRE_BOUND_ID_READS_PG turns a missing DB URL into a
+      # failure, so this step cannot pass without running the comparisons.
+      - name: Bound-id resolved_series reads PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BOUND_ID_READS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_resolved_series_bound_id_reads_pg.py -q -rA
+
+      # #1344: scripts/bulk_resolve.py (run by scripts/server_startup.sh)
+      # writes resolved_series in SQL, outside normalization/resolver.py, so
+      # its obs_date guard is SQL too. Run it on real PostgreSQL with the
+      # session TimeZone west of UTC; a missing DB URL fails instead of
+      # skipping.
+      - name: Bulk resolver obs_date guard PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BULK_RESOLVE_GUARD_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_bulk_resolve_future_guard_pg.py -q -rA
 
       # #1322: Schwab-captured options rows reach admin requests only. The
       # LATERAL fragments and the GEX batch-then-chain read run on real
@@ -829,6 +964,27 @@ jobs:
           python -m pytest tests/test_e1_writer_provenance_pg.py -q -rA | tee /tmp/grid-e1-writers-pg.txt
           if grep -qE "^SKIPPED \[" /tmp/grid-e1-writers-pg.txt; then
             echo "::error::E1 writer provenance PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Cboe equity put/call (#1397, Codex review 6026828927): on a fresh
+      # database (schema.sql tables and seeds, no raw rows) the registry
+      # revision registers equity_put_call_ratio, the first pull stores it
+      # with no row stamped before its page was read, and the resolver
+      # resolves it with no ghost mapping. Two overlapping runs on two
+      # connections store one SUCCESS row per session (writer lock, Codex
+      # review 6029448579). A skip must fail this step.
+      - name: Cboe equity put/call fresh-install PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_cboe_equity_pcr_fresh_install_pg.py -q -rA | tee /tmp/grid-cboe-epcr-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-cboe-epcr-pg.txt; then
+            echo "::error::Cboe equity put/call fresh-install PostgreSQL contract was skipped"
             exit 1
           fi
 

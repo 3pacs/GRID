@@ -218,7 +218,8 @@ def test_selector_choices_without_outcomes(tmp_path):
     con.close()
     t = S.selector({"id": "selector/1", "name": "Sel", "db": str(p)}, "post_close", SESSION, POST)
     assert t.today == "default: no_trade" and t.have == 1
-    assert "42" not in json.dumps(t.to_dict(POST))
+    shown = {k: v for k, v in t.to_dict(POST).items() if k not in ("source", "registration")}
+    assert "42" not in json.dumps(shown)
 
 
 def test_plays_names_only(tmp_path):
@@ -233,7 +234,8 @@ def test_plays_names_only(tmp_path):
     con.close()
     t = S.plays({"id": "desk-plays", "name": "Plays", "db": str(p)}, "post_close", SESSION, PREV, POST)
     assert t.today == "night of 2026-11-20: on reversal_5d" and "held back" in t.withheld
-    assert "15.76" not in json.dumps(t.to_dict(POST)) and "0.99" not in json.dumps(t.to_dict(POST))
+    shown = json.dumps({k: v for k, v in t.to_dict(POST).items() if k not in ("source", "registration")})
+    assert "15.76" not in shown and "0.99" not in shown
 
 
 # ── records, files, live state ───────────────────────────────────────────────
@@ -328,7 +330,7 @@ def test_paper_record_follows_its_disclosure(tmp_path):
     assert "outcomes withheld (registration: one look at 100)" in text_ and "9.9" not in text_   # no gross-only
     assert "mean +0.125 vs null -0.050" in text_                     # stats copied only where supplied
     assert "the owner runs the registered look once (not a pass)" in text_
-    assert "description, not evidence" in text_
+    assert "description, not evidence" in text_ and "of None" not in text_
     assert any("selector: ledger locked" in p for p in sec.problems)
 
 
@@ -386,6 +388,140 @@ def test_market_state_2_stale_inputs_are_not_usable(tmp_path):
     assert sec.status == "ok" and "rule market-state/2" in sec.lines[0]
     assert "away from normal: none" in sec.lines and "not usable: vix (stale)" in sec.lines
     assert "dealer gamma: stale" in sec.lines and any("stale 1" in line for line in sec.lines)
+
+
+# ── provisional market state at the close (#1312, display only) ──────────────
+
+_DECISION = {"variables": {"vix": {"status": "ok", "label": "high", "robust_z": 3.1, "obs_date": "2026-11-18"}},
+             "events": {"within_14d": [{"date": "2026-11-25", "event": "gdp"}]}, "coverage": {"ok": 1},
+             "pending": {"release_surprise": "x"}}
+
+
+def _provisional_rec(day="2026-11-20", **over):
+    closes = {"2026-11-20": "2026-11-20T21:00:00+00:00", "2026-11-19": "2026-11-19T21:00:00+00:00"}[day]
+    rec = {"as_of": day, "rule": "market-state/2", "provisional": True, "decision_use": "display_only",
+           "label": MS.PROVISIONAL_LABEL.format(day=day, cutoff=closes), "availability_cutoff": closes,
+           "variables": {"hy_spread": {"status": "ok", "label": "low", "robust_z": -2.2, "obs_date": "2026-11-19"},
+                         "dealer_gamma": {"status": "stale"}},
+           "gamma_state": {"status": "stale", "obs_date": "2026-11-19"},
+           "events": {"within_14d": [{"date": "2026-11-27", "event": "provisional-only-event"}]},
+           "coverage": {"ok": 1, "stale": 1}}
+    rec.update(over)
+    return rec
+
+
+def _ms_engine(tmp_path, decision=(), provisional=()):
+    """decision / provisional: (session, computed_at as stored, record) rows."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    eng = create_engine(f"sqlite:///{tmp_path / 'ms.db'}")
+    MS.ensure_table(eng)
+    with eng.begin() as c:
+        for day, at, rec in decision:
+            c.execute(text("INSERT INTO market_state_daily (as_of_date, rule, record, computed_at) VALUES "
+                           "(:d, 'market-state/2', :r, :at)"), {"d": day, "r": json.dumps(rec), "at": at})
+    if provisional:
+        MS.ensure_provisional_table(eng)
+        with eng.begin() as c:
+            for day, at, rec in provisional:
+                c.execute(text("INSERT INTO market_state_provisional (as_of_date, rule, record, computed_at) VALUES "
+                               "(:d, 'market-state/2', :r, :at)"), {"d": day, "r": json.dumps(rec), "at": at})
+    return eng
+
+
+def test_post_close_shows_the_provisional_record_apart_from_the_decision_record(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)],
+                     provisional=[("2026-11-20", "2026-11-20 21:15:30", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.status == "ok" and sec.problems == ()
+    assert "market_state_provisional" in sec.source and sec.source.startswith("griddb market_state_daily")
+    # The decision record's lines come first, exactly as without a provisional record; every line the
+    # provisional record adds is prefixed.
+    assert sec.lines == (
+        "record for session 2026-11-19 (rule market-state/2), computed 2026-11-20T23:15:41Z",
+        "coverage: ok 1",
+        "away from normal: vix high (z +3.10, observed 2026-11-18)",
+        ("PROVISIONAL (display only): record for session 2026-11-20 (rule market-state/2), from the inputs GRID "
+         "held at the close (2026-11-20T21:00:00Z); computed 2026-11-20T21:15:30Z, 16 min after the close. The "
+         "session's decision record is written the next evening (#1191) and nothing that decides reads this one"),
+        "PROVISIONAL (display only): coverage: ok 1, stale 1",
+        "PROVISIONAL (display only): away from normal: hy_spread low (z -2.20, observed 2026-11-19)",
+        "PROVISIONAL (display only): not usable: dealer_gamma (stale)",
+        "PROVISIONAL (display only): dealer gamma: stale",
+    )
+    alone = S.market_state(_ms_engine(tmp_path / "alone", decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)]),
+                           "post_close", SESSION, POST, PREV)
+    assert sec.lines[:3] == alone.lines and alone.source == "griddb market_state_daily"
+    # The decision record's facts are its own; the provisional record's sit under their own key.
+    assert sec.facts["record_date"] == "2026-11-19" and sec.source_clock == z("2026-11-20T23:15:41Z")
+    assert sec.facts["notable"] == ["vix high (z +3.10, observed 2026-11-18)"]
+    assert sec.facts["events"] == _DECISION["events"] and sec.facts["pending"] == ["release_surprise"]
+    p = sec.facts["provisional"]
+    assert p["record_date"] == "2026-11-20" and p["decision_use"] == "display_only"
+    assert p["table"] == "market_state_provisional" and p["computed_at"] == "2026-11-20T21:15:30Z"
+    assert p["availability_cutoff"] == "2026-11-20T21:00:00Z" and p["minutes_after_close"] == 16
+    assert p["notable"] == ["hy_spread low (z -2.20, observed 2026-11-19)"]
+    assert p["label"].startswith("Provisional, display only")
+    assert "provisional-only-event" not in json.dumps({k: v for k, v in sec.facts.items() if k != "provisional"})
+    # The calendar section copies the decision record's release list, never the provisional one's.
+    cal = S.calendar(SESSION, POST, market_events=sec.facts.get("events"))
+    assert not any("provisional-only-event" in ln for ln in cal.lines)
+    md = B.render_markdown(B.build_brief("post_close", SESSION, POST, [sec], [], as_of_registered=True,
+                                         generated_at=POST))
+    assert "- PROVISIONAL (display only): record for session 2026-11-20" in md
+
+
+def test_provisional_record_not_shown_once_the_decision_record_is_there(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION),
+                                         ("2026-11-20", "2026-11-21 01:00:00", _DECISION)],
+                     provisional=[("2026-11-20", "2026-11-20 21:15:30", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.facts["record_date"] == "2026-11-20" and "provisional" not in sec.facts
+    assert not any("PROVISIONAL" in ln for ln in sec.lines) and sec.source == "griddb market_state_daily"
+
+
+def test_pre_open_never_shows_a_provisional_record(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-18", "2026-11-19 23:15:41", _DECISION)],
+                     provisional=[("2026-11-19", "2026-11-19 21:15:30", _provisional_rec("2026-11-19")),
+                                  ("2026-11-20", "2026-11-20 13:00:00", _provisional_rec())])
+    sec = S.market_state(eng, "pre_open", SESSION, PRE)
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-18"
+    assert "provisional" not in sec.facts and not any("PROVISIONAL" in ln for ln in sec.lines)
+    assert sec.source == "griddb market_state_daily" and sec.problems == ()
+
+
+def test_provisional_after_the_brief_clock_is_not_shown(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)],
+                     provisional=[("2026-11-20", "2026-11-21 03:20:01", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert "provisional" not in sec.facts and not any("PROVISIONAL" in ln for ln in sec.lines)
+    assert sec.problems == ()
+
+
+@pytest.mark.parametrize("at, rec, why", [
+    ("2026-11-20 20:59:00", _provisional_rec(), "before the session's close 2026-11-20T21:00:00Z"),
+    ("2026-11-20 21:15:30", _provisional_rec(provisional=False), "does not declare itself provisional"),
+    ("2026-11-20 21:15:30", _provisional_rec(decision_use="decision"), "does not declare itself provisional"),
+    ("2026-11-20 21:15:30", _provisional_rec(as_of="2026-11-19"), "for that session"),
+    # Written by a writer that read to the end of the day (no cutoff), or cut somewhere other than the close.
+    ("2026-11-20 21:15:30", _provisional_rec(availability_cutoff=None), "not the session's close"),
+    ("2026-11-20 23:30:00", _provisional_rec(availability_cutoff="2026-11-20T23:30:00+00:00"),
+     "not the session's close 2026-11-20T21:00:00Z"),
+])
+def test_provisional_record_that_breaks_its_rules_is_a_problem_not_a_line(tmp_path, at, rec, why):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)],
+                     provisional=[("2026-11-20", at, rec)])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-19" and "provisional" not in sec.facts
+    assert not any("PROVISIONAL" in ln for ln in sec.lines)
+    assert len(sec.problems) == 1 and why in sec.problems[0] and "not shown" in sec.problems[0]
+
+
+def test_provisional_without_any_decision_record_keeps_the_section_empty(tmp_path):
+    eng = _ms_engine(tmp_path, provisional=[("2026-11-20", "2026-11-20 21:15:30", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.status == "empty" and sec.problems == ("no record computed before the brief's clock",)
+    assert sec.lines and all(ln.startswith("PROVISIONAL (display only): ") for ln in sec.lines)
+    assert set(sec.facts) == {"provisional"}
 
 
 # ── event calendar (the pinned parts in the repo) ────────────────────────────
@@ -459,3 +595,101 @@ def test_sources_config_is_valid():
         for k in ("table", "day", "clock", "status"):
             assert S.IDENT.match(spec[k]), (spec["id"], k)
         assert spec.get("need") is None or isinstance(spec["need"], int)
+
+
+# ── factory slots (panel-factory/1) ──────────────────────────────────────────
+
+def _panel(tmp_path, slots, generated_at="2026-11-21T03:19:00+00:00", **block):
+    p = tmp_path / "panel.json"
+    p.write_text(json.dumps({"generated_at": generated_at, "factory": {
+        "version": "panel-factory/1", "status": "ok", "family": {"k": 10, "used": 0},
+        "features": {"z_history_have_min": 1, "z_history_needed": 60}, "slots": slots, **block}}))
+    db = tmp_path / "signals.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE factory_fires (trial_id TEXT, day TEXT, decision TEXT, z REAL, fired INTEGER, side INTEGER, "
+                "abstain TEXT, recorded_at TEXT)")
+    con.execute("CREATE TABLE factory_feature_values (day TEXT, decision TEXT, feature TEXT, raw REAL, eligible INTEGER, "
+                "reasons TEXT, recorded_at TEXT)")
+    con.execute("INSERT INTO factory_fires VALUES ('s1', '2026-11-20', '14:00', 0.4, 0, 0, 'z_history_short', "
+                "'2026-11-20T19:00:01+00:00')")
+    con.execute("INSERT INTO factory_fires VALUES ('s2', '2026-11-20', '11:00', 2.4, 1, -1, NULL, '2026-11-20T16:00:01+00:00')")
+    con.executemany("INSERT INTO factory_feature_values VALUES ('2026-11-20', '10:00', ?, 1.0, ?, '[]', "
+                    "'2026-11-20T15:00:01+00:00')", [("a", 1), ("b", 0), ("c", 1)])
+    con.commit()
+    con.close()
+    return str(p), str(db)
+
+
+def test_no_slot_registered_is_said_plainly(tmp_path):
+    panel, db = _panel(tmp_path, [])
+    sec, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert sec.status == "ok" and trials == []
+    assert sec.lines[0] == "no slot registered (0 of 10)"
+    assert "feature history: 1 of 60 sessions" in sec.lines[1]
+    assert "2 of 3 eligible" in sec.lines[2]
+
+
+def test_slots_say_fire_or_abstain_and_stay_unproven(tmp_path):
+    slots = [{"trial_id": "s1", "name": "Slot one", "state": "collecting", "resolved_fires": 3, "min_n": 100,
+              "citable": False},
+             {"trial_id": "s2", "name": "Slot two", "state": "collecting", "resolved_fires": 7, "min_n": 100,
+              "citable": False}]
+    panel, db = _panel(tmp_path, slots)
+    sec, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    by = {t.trial_id: t for t in trials}
+    assert by["s1"].withheld == "no fire at 14:00: z_history_short" and by["s1"].today is None
+    assert by["s2"].today == "fired at 11:00 (side -1)"
+    assert by["s2"].card(POST)["label"] == "unproven, 7 of 100"
+    cit = B.Trial(**{**by["s2"].__dict__, "citable": True})
+    assert cit.card(POST)["label"].startswith("citable per its owner's record")
+
+
+def test_slot_fire_after_clock_not_shown(tmp_path):
+    slots = [{"trial_id": "s1", "name": "Slot one", "state": "collecting", "resolved_fires": 3, "min_n": 100}]
+    panel, db = _panel(tmp_path, slots)
+    sec, trials = S.factory_slots(panel, db, "pre_open", SESSION, PRE)
+    assert trials[0].today is None and trials[0].withheld is None    # recorded 19:00Z, after 09:00 ET
+
+
+def _slot(tid, state, **kw):
+    return {"trial_id": tid, "name": tid, "state": state, "resolved_fires": 100, "min_n": 100, **kw}
+
+
+def test_slot_states_never_read_as_a_plain_pass(tmp_path):
+    slots = [_slot("p", "pass", citable=True), _slot("r", "retirement_check_due", citable=False),
+             _slot("l", "lapsed", citable=False), _slot("d", "look_due", citable=False),
+             _slot("u", "underpowered_due", resolved_fires=40, citable=False)]
+    panel, db = _panel(tmp_path, slots)
+    _, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    lab = {t.trial_id: t.card(POST)["label"] for t in trials}
+    st = {t.trial_id: t.status for t in trials}
+    assert lab["p"].startswith("citable per its owner's record")
+    assert lab["r"] == "passed, re-check owed; not citable"
+    assert lab["l"] == "passed, then lapsed; not citable"
+    assert lab["d"] == "unproven, 100 of 100; sample requirement met, validation pending"
+    assert st["d"] == "look due: the owner runs the one look"
+    assert lab["u"] == "unproven, 40 of 100" and "owner's look is owed" in st["u"]
+
+
+def test_citable_only_for_pass(tmp_path):
+    panel, db = _panel(tmp_path, [_slot("x", "retirement_check_due", citable=True)])
+    _, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert not trials[0].citable and "re-check owed" in trials[0].card(POST)["label"]
+
+
+def test_panel_factory_2_and_calendar_exhausted(tmp_path):
+    slots = [_slot("p", "pass", citable=True, citable_withheld="the calendar ended; re-pin first")]
+    panel, db = _panel(tmp_path, slots, version="panel-factory/2", status="calendar_exhausted",
+                       calendar={"first_day": "2026-11-11", "last_day": "2027-12-31", "exhausted": True})
+    sec, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert sec.status == "ok"
+    assert "calendar ended 2027-12-31: nothing recorded since, nothing citable" in sec.lines
+    assert any("calendar ended 2027-12-31" in p for p in sec.problems)
+    assert not trials[0].citable
+    assert trials[0].card(POST)["label"] == "passed its look; not citable (the calendar ended; re-pin first)"
+
+
+def test_factory_block_error_is_a_problem(tmp_path):
+    panel, db = _panel(tmp_path, [], status="error", error="signals.db locked")
+    sec, _ = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert sec.problems == ("factory block status error: signals.db locked",)

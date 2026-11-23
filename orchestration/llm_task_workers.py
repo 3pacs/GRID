@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger as log
 from pydantic import BaseModel, Field
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_ORACLE_PREDICTIONS, visible_sql
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +497,7 @@ def _gen_prediction_refinement(
             rows = conn.execute(text(
                 "SELECT id, prediction_text, predicted_value, confidence, "
                 "       target_date, created_at "
-                "FROM oracle_predictions "
+                "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                 "WHERE status = 'ACTIVE' "
                 "AND target_date > CURRENT_DATE "
                 "ORDER BY target_date ASC LIMIT 3"

@@ -551,7 +551,7 @@ Utility and operational scripts in `scripts/`:
 - `export_astrogrid_local_data.py` — [[AstroGrid]] data export
 - `activate_v2_mappings.py` — Activate V2 [[Entity Map|entity mappings]]
 - `assimilator.py** — Human LLM response assimilation
-- `fix_model_eligible.py` — Fix model_eligible flags
+- `fix_model_eligible.py` — RETIRED (refuses to run); use `normalization/eligibility_audit.py` (dry-run report) and a reviewed migration
 - `scrape_missing_features.py` — Background feature scraper
 - `pull_intraday.py` — Intraday price bar puller
 - `pull_options.py` — Daily options chain puller
