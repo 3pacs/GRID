@@ -1,4 +1,4 @@
-"""PostgreSQL contract: the bound-id ``resolved_series`` reads return what the name joins did.
+"""PostgreSQL contract: the bound-id ``resolved_series`` reads and their tie policy.
 
 2026-11-23 (griddb, read-only): reads that matched the feature through
 ``JOIN feature_registry fr ... WHERE fr.name = :n`` were planned for an
@@ -7,8 +7,9 @@ average feature and read every vintage of a large one before keeping a row
 it (``store/feature_ids.py``). Reads across several features take each
 feature's newest row with a LATERAL subquery over the bound ids, and the
 ``LIKE`` related-feature reads compute each feature's ``MAX(obs_date)``
-once (LATERAL) instead of once per row. Every PIT fence and ORDER BY of
-the old statements is kept.
+once (LATERAL) instead of once per row. Every PIT fence of the old
+statements is kept; every ORDER BY keeps its keys and gains a tie-break
+(below).
 
 Each test seeds a disposable schema and runs the frozen legacy statement
 next to the new code on the same rows. Where the function is cheap to call
@@ -18,11 +19,19 @@ briefing), the production function is called. For statements embedded in
 large endpoints, the new SQL is taken from the module's source (the string
 literal inside the named function), so the test runs exactly what ships.
 
-Ties: the legacy plain ``ORDER BY obs_date DESC LIMIT n`` reads do not order
-vintages of one date, so which vintage they return depends on the plan. The
-seed gives every vintage of a date the same value wherever such a read
-looks, so the comparison is exact; the DISTINCT ON reads, which do order
-vintages, get distinct vintage values.
+Ties. The legacy ``ORDER BY obs_date DESC LIMIT n`` reads left the row to
+the plan when a date had several vintages or two candidate features shared
+the newest date. The new reads fix it (store/feature_ids.py): a date's newest
+``vintage_date`` wins, then the caller's candidate order (``WITH
+ORDINALITY``); a read of the last *n* observations takes one row per date,
+and a list of features one row per feature. The legacy comparisons run where
+the legacy read had one answer (every vintage of a date carries the same
+value, no two candidates share a newest date). The policy tests run on rows
+built to break a plan-chosen answer: candidate features registered and
+inserted in the reverse of the caller's order with conflicting values on the
+same date, and a newest date whose older vintage is inserted first with a
+different value. Their expectations come from :func:`_series`, a Python
+reading of the raw rows, not from SQL ordering.
 
 Skips without ``GRID_TEST_DB_URL`` (a local throwaway database); fails
 instead when ``REQUIRE_BOUND_ID_READS_PG=1`` (CI).
@@ -33,6 +42,7 @@ from __future__ import annotations
 import ast
 import os
 import pathlib
+import re
 from datetime import date, timedelta
 from uuid import uuid4
 
@@ -162,6 +172,18 @@ def _seed(engine) -> None:
               [(TODAY + timedelta(days=20), 0.9), (_d(0), 0.4), (_d(1), 0.3)], vintages=2)
         _rows(conn, _feature(conn, "mercury_retro_t", "celestial"), [(_d(3), 1.0), (_d(4), 0.0)])
         _rows(conn, _feature(conn, "solar_cycle_t", "celestial", eligible=False), [(_d(0), 7.0)])
+        # Same-date conflicts across candidates: registered (and inserted) in
+        # the reverse of every caller's candidate order, so neither id order
+        # nor physical order gives the caller's first choice.
+        for name, value in (("tie", 1.0), ("tie_usd_full", 2.0), ("tie_full", 3.0), ("tie_close", 4.0)):
+            _rows(conn, _feature(conn, name), [(_d(0), value), (_d(1), value - 0.5), (_d(31), value - 0.9)])
+        # Competing vintages with different values on the newest dates; the
+        # older vintage of each date is inserted first.
+        for name, base in (("rev_close", 20.0), ("rev_full", 10.0)):
+            _rows(conn, _feature(conn, name), [(_d(i), base + i) for i in range(3)] + [(_d(31), base - 5)],
+                  vintages=2, vintage_values=True)
+        _rows(conn, _feature(conn, "eclipse_rev_t", "celestial"), [(_d(0), 0.5), (_d(1), 0.4)], vintages=3,
+              vintage_values=True)
 
 
 def _q(conn, sql: str, params: dict) -> list[tuple]:
@@ -172,6 +194,36 @@ def _ids(conn, names: list[str]) -> list[int]:
     from store.feature_ids import feature_ids
 
     return feature_ids(conn, names)
+
+
+def _series(conn, name: str, *, le: date | None = None, nonnull: bool = False,
+            with_vintage: bool = False) -> list[tuple]:
+    """(obs_date, value) per date, newest date first, each date's newest vintage.
+
+    Computed in Python from the raw rows (the policy, independent of any SQL
+    ordering). *le* and *nonnull* apply the read's own filters first.
+    """
+    rows = conn.execute(text(
+        "SELECT rs.obs_date, rs.vintage_date, rs.value FROM resolved_series rs "
+        "JOIN feature_registry fr ON fr.id = rs.feature_id WHERE fr.name = :n"), {"n": name}).fetchall()
+    best: dict[date, tuple[date, float | None]] = {}
+    for obs, vintage, value in rows:
+        if (le is not None and obs > le) or (nonnull and value is None):
+            continue
+        if obs not in best or vintage > best[obs][0]:
+            best[obs] = (vintage, value)
+    return [(obs, best[obs][1], best[obs][0]) if with_vintage else (obs, best[obs][1])
+            for obs in sorted(best, reverse=True)]
+
+
+def _pick(conn, names: list[str], **filters) -> tuple | None:
+    """(name, obs_date, value): the newest date across *names*; a tie goes to the first listed."""
+    best = None
+    for name in names:
+        series = _series(conn, name, **filters)
+        if series and (best is None or series[0][0] > best[1]):
+            best = (name, series[0][0], series[0][1])
+    return best
 
 
 # ── the new statements, as they ship ──────────────────────────────────────
@@ -325,30 +377,68 @@ def test_single_name_latest_readers_match_legacy(pg, name):
     assert verifier._get_latest_value(name, _d(3)) == (legacy_le_d[0][0] if legacy_le_d else None)
 
 
-@pytest.mark.parametrize("ticker", ["spy", "btc", "aapl", "zzz"])
-def test_claim_verifier_ticker_reads_match_legacy(pg, ticker):
+@pytest.mark.parametrize("name", ["rev_full", "xle_full"])
+def test_single_name_readers_take_the_newest_vintage(pg, name):
+    """A newest date with competing vintages (the older one inserted first): the newest vintage."""
+    from intelligence.cross_reference import _get_feature_value
+    from oracle.claim_verifier import _lookup_feature_value
+    from oracle.psi_model import _load_latest_value
+    from physics.verify import MarketPhysicsVerifier
+
+    research = _shipped_sql("analysis/research_agent.py", "research_actor", ":fid")
+    with pg.connect() as conn:
+        newest = _series(conn, name)[0]
+        newest_le_today = _series(conn, name, le=TODAY)[0]
+        newest_le_d = _series(conn, name, le=_d(1))[0]
+        (fid,) = _ids(conn, [name])
+        assert _q(conn, research, {"fid": fid}) == [newest[::-1]]
+    assert newest[1] == pytest.approx({"rev_full": 10.1, "xle_full": 90.2}[name])
+    assert _get_feature_value(pg, name) == (newest[1], newest[0])
+    assert _lookup_feature_value(pg, name) == (newest[1], str(newest[0]))
+    assert _load_latest_value(pg, name) == newest_le_today[1]
+    assert MarketPhysicsVerifier(pg, pit_store=None)._get_latest_value(name, _d(1)) == newest_le_d[1]
+
+
+@pytest.mark.parametrize("ticker", ["spy", "btc", "aapl", "zzz", "tie", "rev"])
+def test_claim_verifier_ticker_reads(pg, ticker):
     from oracle.claim_verifier import _lookup_latest_value, _lookup_price_change
 
     candidates = [ticker, f"{ticker}_full", f"{ticker}_usd_full"]
     with pg.connect() as conn:
+        # Policy: the first candidate with rows; its newest date's newest vintage.
         latest, change = (None, None, None), (None, None)
+        for name in candidates:
+            series = _series(conn, name)
+            if series and series[0][1] is not None:
+                latest = (float(series[0][1]), str(series[0][0]), name)
+                break
+        for name in candidates:
+            series = _series(conn, name)[:2]
+            if len(series) >= 2:
+                values = [v for _, v in series]
+                # A NULL among the two (btc_usd_full's newest row): the function's except.
+                change = (None, None) if None in values else (float(values[0]), float(values[-1]))
+                break
+        legacy_latest = (None, None, None)
         for name in candidates:
             row = _q(conn, LEGACY_LATEST_BY_NAME, {"name": name})
             if row and row[0][0] is not None:
-                latest = (float(row[0][0]), str(row[0][1]), name)
+                legacy_latest = (float(row[0][0]), str(row[0][1]), name)
                 break
-        try:
-            for name in candidates:
-                rows = _q(conn, LEGACY_LATEST_N_BY_NAME, {"name": name, "n": 2})
-                if len(rows) >= 2:
-                    change = (float(rows[0][0]), float(rows[-1][0]))
-                    break
-        except TypeError:
-            # A NULL value among the two rows: the function's except returns
-            # (None, None) (btc_usd_full's newest row is NULL in the seed).
-            change = (None, None)
+        legacy_change = _q(conn, LEGACY_LATEST_N_BY_NAME, {"name": "spy_full", "n": 2})
     assert _lookup_latest_value(pg, ticker) == latest
     assert _lookup_price_change(pg, ticker, periods=2) == change
+    if ticker != "rev":
+        # Every vintage of the chosen date carries one value: the legacy read agrees.
+        assert legacy_latest == latest
+    if ticker == "rev":
+        assert latest[0] == pytest.approx(10.1) and change == (pytest.approx(10.1), pytest.approx(11.1))
+    if ticker == "spy":
+        # spy_full has three vintages a date: LIMIT 2 alone returned two
+        # vintages of the newest day (no change); one row per date compares
+        # the newest day with the one before.
+        assert [r[0] for r in legacy_change] == [400.0, 400.0]
+        assert change == (400.0, 401.0)
 
 
 @pytest.mark.parametrize("name, n", [("xle_full", 2), ("xle_full", 1), ("spy_full", 2), ("missing", 2)])
@@ -375,6 +465,24 @@ def test_two_name_spot_reads_match_legacy(pg, ticker):
     assert OptionsRecommender._get_spot(None, pg, ticker) == (float(legacy[0][0]) if legacy else 0.0)
     expected = float(legacy_le_d[0][0]) if legacy_le_d else 0.0
     assert VolSurfaceEngine(pg)._get_spot_price(ticker.upper(), _d(2)) == expected
+
+
+@pytest.mark.parametrize("ticker", ["tie", "rev"])
+def test_two_name_spot_reads_follow_the_policy(pg, ticker):
+    """{t}_close before {t} on the same date (tie: registered the other way round); newest vintage."""
+    from analysis.vol_surface import VolSurfaceEngine
+    from trading.options_recommender import OptionsRecommender
+
+    names = [f"{ticker}_close", ticker]
+    with pg.connect() as conn:
+        latest = _pick(conn, names)
+        latest_le_d = _pick(conn, names, le=_d(2))
+    assert OptionsRecommender._get_spot(None, pg, ticker) == latest[2]
+    assert VolSurfaceEngine(pg)._get_spot_price(ticker.upper(), _d(2)) == latest_le_d[2]
+    if ticker == "tie":
+        assert latest == ("tie_close", _d(0), 4.0) and latest_le_d[2] == pytest.approx(3.1)
+    else:
+        assert latest == ("rev_close", _d(0), pytest.approx(20.1))
 
 
 def test_research_agent_actor_read_matches_legacy(pg):
@@ -419,6 +527,60 @@ def test_multi_feature_latest_reads_match_legacy(pg, ticker):
         assert legacy_latest[0][0] == 230.0 and legacy_prev[0][0] == 201.0
 
 
+def _multi_name_sites() -> dict[str, str]:
+    return {
+        "core_latest": _shipped_sql("api/routers/watchlist_core.py", "list_watchlist_enriched", "x.value, x.obs_date"),
+        "core_prev": _shipped_sql("api/routers/watchlist_core.py", "list_watchlist_enriched", ":d30"),
+        "overview": _shipped_sql("api/routers/watchlist_overview.py", "get_ticker_overview", "unnest("),
+        "alerts": _shipped_sql("api/routers/price_alerts.py", "_from_grid", "unnest("),
+    }
+
+
+@pytest.mark.parametrize("ticker", ["TIE", "REV"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["caller-order", "reversed"])
+def test_multi_feature_latest_reads_follow_caller_order(pg, ticker, reverse):
+    """Same newest date, conflicting values: the first candidate listed wins, whatever the registry order."""
+    names = _watchlist_names(ticker)
+    if reverse:
+        names = names[::-1]
+    d30 = TODAY - timedelta(days=30)
+    sites = _multi_name_sites()
+    with pg.connect() as conn:
+        fids = _ids(conn, names)
+        latest = _pick(conn, names)
+        prev = _pick(conn, names, le=d30)
+        assert _q(conn, sites["core_latest"], {"fids": fids}) == [latest[2:0:-1]]
+        assert _q(conn, sites["overview"], {"fids": fids}) == [latest[2:0:-1]]
+        assert _q(conn, sites["alerts"], {"fids": fids}) == [latest[2:]]
+        assert _q(conn, sites["core_prev"], {"fids": fids, "d30": d30}) == [prev[2:]]
+    if ticker == "TIE":
+        assert names[0] in {"tie_close", "tie"} and latest[0] == names[0]  # caller's first choice
+        assert latest[2] == {"tie_close": 4.0, "tie": 1.0}[names[0]]
+    else:
+        assert latest[2] == pytest.approx({"rev_close": 20.1, "rev": None, "rev_full": 10.1}.get(latest[0]))
+
+
+@pytest.mark.parametrize("ticker", ["TIE", "REV"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["caller-order", "reversed"])
+def test_quote_winner_follows_the_policy(pg, ticker, reverse):
+    """Winner: newest (obs_date, vintage_date) across candidates, then the first listed."""
+    names = _watchlist_names(ticker)
+    if reverse:
+        names = names[::-1]
+    quote = _shipped_sql("api/routers/watchlist_overview.py", "get_ticker_quote", "WITH winner AS")
+    with pg.connect() as conn:
+        fids = _ids(conn, names)
+        winner, best = None, None
+        for name in names:
+            series = _series(conn, name, with_vintage=True)
+            if series and (best is None or series[0][::2] > best):
+                winner, best = name, series[0][::2]
+        expected = [(v, obs) for obs, v in _series(conn, winner)[:2]]
+        assert _q(conn, quote, {"fids": fids}) == expected
+    if ticker == "TIE":
+        assert winner == names[0]
+
+
 @pytest.mark.parametrize("ticker", ["SPY", "AAPL", "XLE", "BTC", "ZZZ"])
 def test_quote_winner_read_matches_legacy(pg, ticker):
     # DISTINCT ON ... vintage_date DESC orders vintages, so xle_full's distinct
@@ -445,41 +607,75 @@ def test_chat_price_check_read_matches_legacy(pg, ticker):
         assert legacy == [(50.0,)]  # the NULL newest row is skipped
 
 
+@pytest.mark.parametrize("ticker", ["tie", "rev"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["caller-order", "reversed"])
+def test_chat_price_check_read_follows_the_policy(pg, ticker, reverse):
+    sql = _shipped_sql("api/routers/chat.py", "_sanity_check_llm_response", "unnest(")
+    names = [f"{ticker}_full", f"{ticker}_usd_full", ticker]
+    if reverse:
+        names = names[::-1]
+    with pg.connect() as conn:
+        expected = _pick(conn, names, nonnull=True)
+        assert _q(conn, sql, {"fids": _ids(conn, names)}) == [expected[2:]]
+    if ticker == "tie":
+        assert expected[2] == (1.0 if reverse else 3.0)
+
+
 # ── LIKE related features: MAX(obs_date) per feature, once ───────────────
 
 
 _LIKE_SITES = [
-    # module, function, tail literal marker, legacy columns, legacy ORDER BY tail
-    ("api/routers/watchlist_overview.py", "get_ticker_overview", "ORDER BY fr.name LIMIT 10",
-     "fr.name, rs.value, rs.obs_date", "ORDER BY fr.name LIMIT 10"),
+    # module, function, tail literal marker, legacy columns, legacy ORDER BY tail, limit
+    ("api/routers/watchlist_overview.py", "get_ticker_overview", "rs.vintage_date DESC LIMIT 10",
+     "fr.name, rs.value, rs.obs_date", "ORDER BY fr.name LIMIT 10", 10),
     ("api/routers/watchlist_analysis.py", "get_ticker_analysis", ") ORDER BY fr.name",
-     "fr.name, fr.family, rs.value, rs.obs_date", "ORDER BY fr.name"),
+     "fr.name, fr.family, rs.value, rs.obs_date", "ORDER BY fr.name", None),
     ("api/routers/watchlist_helpers.py", "_preload_one", ") ORDER BY fr.name",
-     "fr.name, fr.family, rs.value, rs.obs_date", "ORDER BY fr.name"),
+     "fr.name, fr.family, rs.value, rs.obs_date", "ORDER BY fr.name", None),
 ]
 
 
+def _like_expected(conn, patterns: list[str], with_family: bool, order: str = "name") -> list[tuple]:
+    """One row per matched feature with rows: its newest date's newest vintage (Python policy)."""
+    feats = conn.execute(text(
+        "SELECT name, family FROM feature_registry WHERE name LIKE ANY(:p)"), {"p": patterns}).fetchall()
+    out = []
+    for name, family in feats:
+        series = _series(conn, name)
+        if series:
+            obs, value = series[0]
+            out.append((name, family, value, obs) if with_family else (name, value, obs))
+    key = (lambda r: (r[1] or "", r[0])) if order == "family" else (lambda r: r[0])
+    return sorted(out, key=key)
+
+
 @pytest.mark.parametrize("site", _LIKE_SITES, ids=lambda s: s[0].rsplit("/", 1)[-1])
-@pytest.mark.parametrize("patterns", [["spy%"], ["aapl%"], ["xle%", "lunar%"], ["zzz%"]])
-def test_like_related_feature_reads_match_legacy(pg, site, patterns):
-    module, function, tail_marker, columns, legacy_tail = site
+@pytest.mark.parametrize("patterns", [["spy%"], ["aapl%"], ["xle%", "lunar%"], ["rev%"], ["zzz%"]])
+def test_like_related_feature_reads(pg, site, patterns):
+    module, function, tail_marker, columns, legacy_tail, limit = site
     params = {f"p{i}": p for i, p in enumerate(patterns)}
     new_sql = _like_sql(module, function, tail_marker, len(patterns))
     with pg.connect() as conn:
         legacy = _q(conn, _legacy_like(columns, len(patterns), legacy_tail), params)
         new = _q(conn, new_sql, params)
-    # ORDER BY fr.name leaves the vintages of one name unordered: same rows,
-    # and the same name order.
-    assert sorted(new, key=repr) == sorted(legacy, key=repr)
-    assert [r[0] for r in new] == [r[0] for r in legacy]
+        expected = _like_expected(conn, patterns, with_family="fr.family" in columns)[:limit]
+    # One row per feature, its newest vintage, in name order.
+    assert new == expected
+    # Every row is one the legacy read could return, and no feature is lost
+    # (the legacy read returned each vintage of the newest date, in no set order).
+    assert set(new) <= set(legacy)
+    if limit is None:
+        assert {r[0] for r in new} == {r[0] for r in legacy}
     if patterns == ["spy%"]:
         # spy_empty has no rows; spy_rsi's newest date has two vintages.
-        assert {r[0] for r in legacy} == {"spy_full", "spy_pcr", "spy_rsi"}
+        assert [r[0] for r in new] == ["spy_full", "spy_pcr", "spy_rsi"]
         assert sum(r[0] == "spy_rsi" for r in legacy) == 2
+    if patterns == ["xle%", "lunar%"]:
+        assert new[[r[0] for r in new].index("xle_full")][-2] == pytest.approx(90.2)
 
 
-@pytest.mark.parametrize("ticker", ["SPY", "XLE", "ZZZ"])
-def test_dad_market_context_features_match_legacy(pg, ticker):
+@pytest.mark.parametrize("ticker", ["SPY", "XLE", "REV", "ZZZ"])
+def test_dad_market_context_features(pg, ticker):
     from api.routers.dad import _grid_market_context
 
     like = [f"{ticker.lower()}%"]
@@ -493,9 +689,13 @@ def test_dad_market_context_features_match_legacy(pg, ticker):
         legacy = _q(conn, _legacy_like("fr.name, fr.family, rs.value, rs.obs_date", len(like),
                                        "ORDER BY fr.family, fr.name LIMIT :feature_limit"),
                     {**params, "feature_limit": 20})
+        expected = _like_expected(conn, like, with_family=True, order="family")[:20]
     ctx = _grid_market_context(pg, ticker, feature_limit=20)
     got = [(f["name"], f["family"], f["value"]) for f in ctx["features"]]
-    assert sorted(got, key=repr) == sorted([(r[0], r[1], r[2]) for r in legacy], key=repr)
+    assert sorted(got, key=repr) == sorted([(r[0], r[1], r[2]) for r in expected], key=repr)
+    assert {r[:3] for r in expected} <= {r[:3] for r in legacy}
+    if ticker == "REV":
+        assert dict((n, v) for n, _, v in got) == {"rev_close": pytest.approx(20.1), "rev_full": pytest.approx(10.1)}
 
 
 def test_celestial_briefing_matches_legacy(pg):
@@ -503,13 +703,57 @@ def test_celestial_briefing_matches_legacy(pg):
 
     with pg.connect() as conn:
         legacy = _q(conn, LEGACY_CELESTIAL, {})
+        expected = {}
+        for name in sorted({r[0] for r in legacy}):
+            obs, value = _series(conn, name, le=TODAY)[0]
+            expected[name] = {"value": round(float(value), 4), "obs_date": str(obs)}
     state = _gather_celestial_state(pg)
-    expected = {name: {"value": round(float(v), 4), "obs_date": str(d)} for name, v, d in legacy}
     got = state["features"]
     assert got == expected
+    # eclipse_rev_t: three vintages of the newest date, different values: the newest.
+    assert got["eclipse_rev_t"] == {"value": 0.7, "obs_date": str(_d(0))}
     assert {"lunar_phase_t", "mercury_retro_t", "planetary_stress_index"} <= set(got)
     assert got["lunar_phase_t"]["obs_date"] == str(_d(0))  # the future row is not served
     assert "solar_cycle_t" not in got  # not model-eligible
+
+
+# ── every shipped statement states its tie-break ─────────────────────────
+
+
+_TIE_BREAK_SITES = [
+    # module, function, marker, required fragments
+    ("oracle/claim_verifier.py", "_lookup_latest_value", ":fid", ["rs.vintage_date DESC LIMIT 1"]),
+    ("oracle/claim_verifier.py", "_lookup_feature_value", ":fid", ["rs.vintage_date DESC LIMIT 1"]),
+    ("oracle/claim_verifier.py", "_lookup_price_change", ":fid",
+     ["DISTINCT ON (rs.obs_date)", "rs.vintage_date DESC LIMIT :n"]),
+    ("intelligence/cross_reference.py", "_get_feature_value", ":fid", ["rs.vintage_date DESC LIMIT 1"]),
+    ("analysis/research_agent.py", "research_actor", ":fid", ["rs.vintage_date DESC LIMIT 1"]),
+    ("physics/verify.py", "_get_latest_value", ":fid", ["rs.vintage_date DESC LIMIT 1"]),
+    ("oracle/psi_model.py", "_load_latest_value", ":fid", ["rs.vintage_date DESC"]),
+    ("trading/signal_executor.py", "_get_latest_prices", ":fid", ["DISTINCT ON (obs_date)", "vintage_date DESC"]),
+    ("trading/options_recommender.py", "_get_spot", "unnest(", ["WITH ORDINALITY", "f.ord"]),
+    ("analysis/vol_surface.py", "_get_spot_price", "unnest(", ["WITH ORDINALITY", "f.ord"]),
+    ("api/routers/chat.py", "_sanity_check_llm_response", "unnest(", ["WITH ORDINALITY", "f.ord"]),
+    ("api/routers/price_alerts.py", "_from_grid", "unnest(", ["WITH ORDINALITY", "f.ord"]),
+    ("api/routers/watchlist_overview.py", "get_ticker_overview", "unnest(", ["WITH ORDINALITY", "f.ord"]),
+    ("api/routers/watchlist_overview.py", "get_ticker_quote", "WITH winner AS", ["WITH ORDINALITY", "f.ord"]),
+    ("api/routers/watchlist_core.py", "list_watchlist_enriched", "x.value, x.obs_date", ["WITH ORDINALITY", "f.ord"]),
+    ("api/routers/watchlist_core.py", "list_watchlist_enriched", ":d30", ["WITH ORDINALITY", "f.ord"]),
+    ("api/routers/dad.py", "_grid_market_context", "DISTINCT ON", ["DISTINCT ON (fr.family, fr.name)"]),
+    ("api/routers/dad.py", "_grid_market_context", "ORDER BY fr.family", ["rs.vintage_date DESC"]),
+    ("ollama/celestial_briefing.py", "_gather_celestial_state", "ORDER BY fr.name", ["rs.vintage_date DESC"]),
+]
+
+
+@pytest.mark.parametrize("site", _TIE_BREAK_SITES, ids=lambda s: f"{s[0].rsplit('/', 1)[-1]}::{s[1]}:{s[2]}")
+def test_shipped_statements_carry_their_tie_break(site):
+    """Runs without a database: a statement that loses its tie-break fails here even if a plan hides it."""
+    module, function, marker, fragments = site
+    sql = " ".join(_shipped_sql(module, function, marker).split())
+    for fragment in fragments:
+        assert fragment in sql, f"{module}::{function}: {fragment!r} missing"
+    bare = re.search(r"ORDER BY (?:rs\.|x\.)?obs_date DESC(?!,)", sql)
+    assert bare is None, f"{module}::{function}: an ORDER BY on obs_date alone"
 
 
 # ── the id lookup itself ──────────────────────────────────────────────────

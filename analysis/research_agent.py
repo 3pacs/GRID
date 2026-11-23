@@ -205,7 +205,7 @@ def research_actor(actor: dict, sector: str, engine: Engine) -> dict[str, Any]:
                 row = c.execute(text(
                     "SELECT rs.value, rs.obs_date FROM resolved_series rs "
                     "WHERE rs.feature_id = :fid "
-                    "ORDER BY rs.obs_date DESC LIMIT 1"
+                    "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                 ), {"fid": fid}).fetchone()
                 if row:
                     data_context.append(f"{feat}: {row[0]} (as of {row[1]})")

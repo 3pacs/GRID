@@ -96,7 +96,7 @@ def test_real_generation_uses_decision_clock_and_persists_audit(monkeypatch, bas
     monkeypatch.setitem(sys.modules, "intelligence.confidence_calibration", SimpleNamespace(calibrate_confidence=lambda value, *args: value))
     # Three neutral context observations ensure the standard model data gate
     # does not itself suppress the synthetic actor-only scoring comparison.
-    monkeypatch.setattr(oracle, "_gather_signals", lambda *args: [
+    monkeypatch.setattr(oracle, "_gather_signals", lambda *args, **kwargs: [
         oe.Signal(f"context{i}", "equity", 0, 0, "neutral", 1, 1) for i in range(base_count)])
     calls = []
     def read(engine, ticker, days, *, as_of):

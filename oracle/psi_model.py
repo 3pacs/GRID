@@ -125,7 +125,7 @@ def _load_latest_value(engine: Engine, feature_name: str) -> float | None:
                 FROM resolved_series rs
                 WHERE rs.feature_id = :fid
                 AND rs.obs_date <= CURRENT_DATE
-                ORDER BY rs.obs_date DESC
+                ORDER BY rs.obs_date DESC, rs.vintage_date DESC
                 LIMIT 1
             """),
             {"fid": fid},

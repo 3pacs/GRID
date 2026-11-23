@@ -134,17 +134,19 @@ def get_ticker_overview(
         # row is read through LATERAL (store.feature_ids): matched through a
         # feature_registry name join, spy_full's 225k vintages were read and
         # sorted per request (182 ms on griddb, 2026-11-23; 0.7 ms bound).
+        # Same-date ties: the newest vintage, then the first candidate listed
+        # (store.feature_ids).
         try:
             fids = feature_ids(conn, feature_names)
             price_row = None if not fids else conn.execute(text(
                 "SELECT x.value, x.obs_date "
-                "FROM unnest(CAST(:fids AS integer[])) AS f(id) "
+                "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
                 "CROSS JOIN LATERAL ("
                 "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
                 "  WHERE rs.feature_id = f.id "
-                "  ORDER BY rs.obs_date DESC LIMIT 1"
+                "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                 ") x "
-                "ORDER BY x.obs_date DESC LIMIT 1"
+                "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
             ), {"fids": fids}).fetchone()
             if price_row:
                 price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
@@ -226,10 +228,12 @@ def get_ticker_overview(
             # Each matched feature's newest obs_date is computed once (LATERAL),
             # not once per resolved_series row: the correlated MAX ran for every
             # vintage of every matched feature (1.1-3.9 s for spy%, aapl%, xle% on griddb,
-            # 2026-11-23); this form returns the same rows in ~2 ms.
+            # 2026-11-23); this form takes ~2 ms. One row per feature: the newest
+            # vintage of its newest date (the old read returned every vintage of
+            # that date, in no set order).
             feat_rows = conn.execute(
                 text(
-                    "SELECT fr.name, rs.value, rs.obs_date "
+                    "SELECT DISTINCT ON (fr.name) fr.name, rs.value, rs.obs_date "
                     "FROM feature_registry fr "
                     "CROSS JOIN LATERAL ("
                     "  SELECT MAX(rs2.obs_date) AS max_obs FROM resolved_series rs2 "
@@ -240,7 +244,7 @@ def get_ticker_overview(
                     "WHERE (" + " OR ".join(
                         f"fr.name LIKE :p{i}" for i in range(len(like_patterns))
                     ) + ") "
-                    "ORDER BY fr.name LIMIT 10"
+                    "ORDER BY fr.name, rs.vintage_date DESC LIMIT 10"
                 ),
                 {f"p{i}": p for i, p in enumerate(like_patterns)},
             ).fetchall()
@@ -531,17 +535,19 @@ def get_ticker_quote(
             # over the bound ids, store.feature_ids); matched through a
             # feature_registry name join it sorted every vintage first
             # (spy_full: 144 ms on griddb, 2026-11-23, max 29 s; 0.9 ms bound).
+            # Candidates whose newest row has the same date and vintage: the
+            # first one listed wins (WITH ORDINALITY).
             fids = feature_ids(conn, feature_names)
             rows = [] if not fids else conn.execute(text(
                 "WITH winner AS ("
                 "  SELECT f.id AS feature_id "
-                "  FROM unnest(CAST(:fids AS integer[])) AS f(id) "
+                "  FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
                 "  CROSS JOIN LATERAL ("
                 "    SELECT rs.obs_date, rs.vintage_date FROM resolved_series rs "
                 "    WHERE rs.feature_id = f.id "
                 "    ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                 "  ) x "
-                "  ORDER BY x.obs_date DESC, x.vintage_date DESC LIMIT 1"
+                "  ORDER BY x.obs_date DESC, x.vintage_date DESC, f.ord LIMIT 1"
                 ") "
                 "SELECT DISTINCT ON (rs.obs_date) rs.value, rs.obs_date "
                 "FROM resolved_series rs "

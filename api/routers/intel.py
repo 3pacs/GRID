@@ -19,8 +19,9 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from loguru import logger as log
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, viewer_is_admin
 from api.dependencies import get_db_engine
+from store.options_provenance import oracle_predictions_from
 from intelligence.actors.provenance import stamp_actor_node
 
 router = APIRouter(prefix="/api/v1/intel", tags=["intel-product"])
@@ -149,6 +150,7 @@ def intel_search(
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Search across actors, entities, tickers. Returns matches with confidence labels.
 
@@ -247,7 +249,7 @@ def intel_search(
                     text(
                         "SELECT COUNT(DISTINCT (ticker, model_name, direction, "
                         "confidence, verdict, created_at)) "
-                        "FROM oracle_predictions WHERE UPPER(ticker) = :q"
+                        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE UPPER(ticker) = :q"
                     ),
                     {"q": query_upper},
                 ).fetchone()
@@ -256,7 +258,7 @@ def intel_search(
                     text(
                         "SELECT DISTINCT ticker, model_name, direction, confidence, "
                         "verdict, created_at "
-                        "FROM oracle_predictions "
+                        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
                         "WHERE UPPER(ticker) = :q "
                         "ORDER BY created_at DESC "
                         "LIMIT :lim OFFSET :off"
@@ -555,6 +557,7 @@ def intel_ticker(
     symbol: str = Path(..., description="Ticker symbol"),
     days: int = Query(30, ge=1, le=365, description="Lookback window"),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Everything GRID knows about a ticker: active signals, actor exposure,
     insider activity, dark pool data, options flow, predictions, dealer gamma,
@@ -586,7 +589,7 @@ def intel_ticker(
                     "SELECT id, model_name, direction, target_price, entry_price, "
                     "confidence, expected_move_pct, expiry, verdict, created_at, "
                     "signals, anti_signals "
-                    "FROM oracle_predictions "
+                    "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
                     "WHERE ticker = :t AND created_at >= :cutoff "
                     "ORDER BY created_at DESC "
                     "LIMIT 20"
@@ -1227,6 +1230,7 @@ def intel_network(
 @router.get("/market-brief")
 def intel_market_brief(
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Current market summary: regime, top signals, active predictions,
     notable flows. The daily intelligence briefing.
@@ -1305,7 +1309,7 @@ def intel_market_brief(
                 text(
                     "SELECT id, ticker, model_name, direction, confidence, "
                     "target_price, entry_price, expiry, created_at "
-                    "FROM oracle_predictions "
+                    "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
                     "WHERE verdict = 'pending' AND expiry > :today "
                     "ORDER BY confidence DESC NULLS LAST "
                     "LIMIT 10"
@@ -1358,7 +1362,7 @@ def intel_market_brief(
             stats_row = conn.execute(
                 text(
                     "SELECT "
-                    "  (SELECT COUNT(*) FROM oracle_predictions "
+                    "  (SELECT COUNT(*) FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
                     "   WHERE verdict = 'pending' AND expiry > :today) AS active_preds, "
                     "  (SELECT COUNT(*) FROM signal_data "
                     "   WHERE signal_date >= :cutoff) AS signals_7d, "
@@ -1394,6 +1398,7 @@ def intel_predictions_active(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Active predictions with scores, confidence, lever/condition breakdown."""
     t0 = time.time()
@@ -1423,7 +1428,7 @@ def intel_predictions_active(
     # named :bind params. Concatenation (not f-strings) is used to keep the
     # SQL-injection regression guard clean.
     count_sql = (
-        "SELECT COUNT(*) FROM oracle_predictions WHERE " + where_sql
+        "SELECT COUNT(*) FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql
     )
     active_sql = (
         "SELECT id, created_at, ticker, prediction_type, direction, "
@@ -1431,7 +1436,7 @@ def intel_predictions_active(
         "expected_move_pct, signal_strength, coherence, "
         "model_name, model_version, signals, anti_signals, "
         "flow_context "
-        "FROM oracle_predictions WHERE " + where_sql + " "
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql + " "
         "ORDER BY confidence DESC NULLS LAST, created_at DESC "
         "LIMIT :lim OFFSET :off"
     )
@@ -1514,6 +1519,7 @@ def intel_predictions_track_record(
         None, description="day | week | month | quarter | all"
     ),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Historical prediction accuracy by model, ticker, timeframe.
     This is the 'proof we're worth paying for' endpoint.
@@ -1572,7 +1578,7 @@ def intel_predictions_track_record(
         "  AVG(confidence) AS avg_confidence, "
         "  MIN(scored_at) AS first_scored, "
         "  MAX(scored_at) AS last_scored "
-        "FROM oracle_predictions WHERE " + where_sql
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql
     )
     by_model_sql = (
         "SELECT model_name, "
@@ -1581,7 +1587,7 @@ def intel_predictions_track_record(
         "  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
         "  AVG(pnl_pct) AS avg_pnl, "
         "  AVG(confidence) AS avg_conf "
-        "FROM oracle_predictions WHERE " + where_sql + " "
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql + " "
         "GROUP BY model_name "
         "ORDER BY COUNT(*) FILTER (WHERE verdict = 'hit')::float "
         "  / NULLIF(COUNT(*), 0) DESC"
@@ -1592,7 +1598,7 @@ def intel_predictions_track_record(
         "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
         "  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
         "  AVG(pnl_pct) AS avg_pnl "
-        "FROM oracle_predictions WHERE " + where_sql + " "
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql + " "
         "GROUP BY ticker "
         "HAVING COUNT(*) >= 3 "
         "ORDER BY AVG(pnl_pct) DESC NULLS LAST "
@@ -1603,14 +1609,14 @@ def intel_predictions_track_record(
         "  COUNT(*) AS total, "
         "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
         "  AVG(pnl_pct) AS avg_pnl "
-        "FROM oracle_predictions WHERE " + where_sql + " "
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql + " "
         "GROUP BY direction "
         "ORDER BY direction"
     )
     recent_sql = (
         "SELECT id, ticker, model_name, direction, confidence, "
         "verdict, pnl_pct, actual_move_pct, scored_at, score_notes "
-        "FROM oracle_predictions WHERE " + where_sql + " "
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql + " "
         "ORDER BY scored_at DESC "
         "LIMIT 20"
     )
@@ -1626,7 +1632,7 @@ def intel_predictions_track_record(
         "  COUNT(*) AS total, "
         "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
         "  AVG(confidence) AS avg_stated_confidence "
-        "FROM oracle_predictions WHERE " + where_sql + " "
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions WHERE " + where_sql + " "
         "  AND confidence IS NOT NULL "
         "GROUP BY bucket "
         "ORDER BY AVG(confidence)"
@@ -1768,6 +1774,7 @@ def intel_briefing(
         description="ISO timestamp — only return signals newer than this (delta mode)",
     ),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Single-call situation report. This is the product.
 
@@ -2124,7 +2131,7 @@ def intel_briefing(
             rows = conn.execute(text(
                 "SELECT id, ticker, model_name, direction, confidence, "
                 "target_price, entry_price, expiry, created_at "
-                "FROM oracle_predictions "
+                "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
                 "WHERE verdict = 'pending' AND expiry > :today "
                 "ORDER BY confidence DESC NULLS LAST "
                 "LIMIT 10"
@@ -2143,7 +2150,7 @@ def intel_briefing(
                         "COUNT(*) AS total, "
                         "COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
                         "AVG(pnl_pct) AS avg_pnl "
-                        "FROM oracle_predictions "
+                        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
                         "WHERE verdict IN ('hit','miss','partial') "
                         "AND (model_name, ticker) IN "
                         "  (SELECT unnest(CAST(:models AS text[])), "
@@ -2189,7 +2196,7 @@ def intel_briefing(
                 "COUNT(*) FILTER (WHERE verdict = 'miss') as misses, "
                 "COUNT(*) FILTER (WHERE verdict = 'partial') as partials, "
                 "AVG(pnl_pct) as avg_pnl "
-                "FROM oracle_predictions "
+                "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
                 "WHERE verdict IN ('hit','miss','partial')"
             )).fetchone()
             if row and row[0] > 0:

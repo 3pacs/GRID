@@ -434,18 +434,20 @@ def list_watchlist_enriched(
                 # (store.feature_ids): matched through a feature_registry name
                 # join, every vintage was read and sorted per ticker (spy_full:
                 # 176-182 ms on griddb, 2026-11-23; 0.7 ms bound).
+                # Same-date ties: the newest vintage, then the first candidate
+                # listed (store.feature_ids).
                 price_row = None
                 fids = feature_ids(conn, feature_names) if feature_names else []
                 if fids:
                     price_row = conn.execute(text(
                         "SELECT x.value, x.obs_date "
-                        "FROM unnest(CAST(:fids AS integer[])) AS f(id) "
+                        "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
                         "CROSS JOIN LATERAL ("
                         "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
                         "  WHERE rs.feature_id = f.id "
-                        "  ORDER BY rs.obs_date DESC LIMIT 1"
+                        "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                         ") x "
-                        "ORDER BY x.obs_date DESC LIMIT 1"
+                        "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
                     ), {"fids": fids}).fetchone()
 
                 db_stale = (
@@ -457,14 +459,14 @@ def list_watchlist_enriched(
                     latest = float(price_row[0])
                     prev_row = conn.execute(text(
                         "SELECT x.value "
-                        "FROM unnest(CAST(:fids AS integer[])) AS f(id) "
+                        "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
                         "CROSS JOIN LATERAL ("
                         "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
                         "  WHERE rs.feature_id = f.id "
                         "  AND rs.obs_date <= :d30 "
-                        "  ORDER BY rs.obs_date DESC LIMIT 1"
+                        "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                         ") x "
-                        "ORDER BY x.obs_date DESC LIMIT 1"
+                        "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
                     ), {"fids": fids,
                         "d30": today - timedelta(days=30)}).fetchone()
 

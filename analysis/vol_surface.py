@@ -1041,18 +1041,19 @@ class VolSurfaceEngine:
             # feature's newest row is read through LATERAL (store.feature_ids):
             # matched through a feature_registry name join, smh_close (241k
             # rows) took 195 ms per read on griddb (2026-11-23); < 1 ms bound.
+            # Same-date ties: the newest vintage, then {t}_close before {t}.
             fids = feature_ids(conn, [f"{ticker.lower()}_close", ticker.lower()])
             row = None if not fids else conn.execute(
                 text("""
                     SELECT x.value
-                    FROM unnest(CAST(:fids AS integer[])) AS f(id)
+                    FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord)
                     CROSS JOIN LATERAL (
                         SELECT rs.value, rs.obs_date FROM resolved_series rs
                         WHERE rs.feature_id = f.id
                         AND rs.obs_date <= :d
-                        ORDER BY rs.obs_date DESC LIMIT 1
+                        ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1
                     ) x
-                    ORDER BY x.obs_date DESC LIMIT 1
+                    ORDER BY x.obs_date DESC, f.ord LIMIT 1
                 """),
                 {"fids": fids, "d": as_of_date},
             ).fetchone()

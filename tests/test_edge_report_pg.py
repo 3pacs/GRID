@@ -38,7 +38,8 @@ DDL = [
     """CREATE TABLE oracle_predictions (
         id TEXT PRIMARY KEY, created_at TIMESTAMPTZ, ticker TEXT NOT NULL, direction TEXT NOT NULL,
         expiry DATE NOT NULL, confidence DOUBLE PRECISION, model_name TEXT NOT NULL,
-        verdict TEXT DEFAULT 'pending', scored_at TIMESTAMPTZ, dedup_keep BOOLEAN NOT NULL DEFAULT TRUE)""",
+        verdict TEXT DEFAULT 'pending', scored_at TIMESTAMPTZ, dedup_keep BOOLEAN NOT NULL DEFAULT TRUE,
+        flow_context JSONB)""",
     """CREATE TABLE oracle_prediction_rescores (
         prediction_id TEXT NOT NULL, scoring_version TEXT NOT NULL, verdict TEXT NOT NULL,
         PRIMARY KEY (prediction_id, scoring_version))""",

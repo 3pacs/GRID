@@ -830,7 +830,7 @@ class MarketPhysicsVerifier:
                     text(
                         "SELECT rs.value FROM resolved_series rs "
                         "WHERE rs.feature_id = :fid AND rs.obs_date <= :d "
-                        "ORDER BY rs.obs_date DESC LIMIT 1"
+                        "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                     ),
                     {"fid": fid, "d": as_of_date},
                 ).fetchone()

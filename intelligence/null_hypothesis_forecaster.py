@@ -79,6 +79,7 @@ from features.regime_conditional_brier import (  # noqa: F401
     CANONICAL_REGIMES,
     _canonical_regime,
 )
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -213,7 +214,7 @@ def _verdict_to_outcome(verdict: str | None) -> float:
 _SELECT_SCORED_ROWS = text(
     """
     SELECT id, created_at, confidence, verdict, signals, horizon_days, ticker
-    FROM oracle_predictions
+    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::INTERVAL
       AND horizon_days = :h
@@ -228,7 +229,7 @@ _SELECT_SCORED_ROWS = text(
 _SELECT_SCORED_ROWS_TICKER = text(
     """
     SELECT id, created_at, confidence, verdict, signals, horizon_days, ticker
-    FROM oracle_predictions
+    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::INTERVAL
       AND horizon_days = :h

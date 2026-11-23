@@ -25,7 +25,9 @@ def _engine_with(feat_rows, opt_row=None) -> MagicMock:
         if "feature_registry" in sql and "resolved_series" not in sql:
             result.fetchall.return_value = feat_rows
         elif "options_daily_signals" in sql:
-            result.fetchone.return_value = opt_row
+            # The Oracle selects the row's lineage beside its eight values
+            # (False: a public row).
+            result.fetchone.return_value = None if opt_row is None else (*opt_row, False)
         else:
             raise AssertionError(f"unexpected SQL on the live predictor path: {sql}")
         return result

@@ -75,16 +75,17 @@ def current_price(ticker: str, *, prefer_live: bool = False) -> tuple[float | No
                 # Bound ids, each feature's newest row through LATERAL
                 # (store.feature_ids): the feature_registry name join read and
                 # sorted every vintage (spy_full: 182 ms on griddb, 2026-11-23).
+                # Same-date ties: the newest vintage, then the first name listed.
                 fids = feature_ids(conn, names)
                 row = None if not fids else conn.execute(text(
                     "SELECT x.value "
-                    "FROM unnest(CAST(:fids AS integer[])) AS f(id) "
+                    "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
                     "CROSS JOIN LATERAL ("
                     "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
                     "  WHERE rs.feature_id = f.id "
-                    "  ORDER BY rs.obs_date DESC LIMIT 1"
+                    "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                     ") x "
-                    "ORDER BY x.obs_date DESC LIMIT 1"
+                    "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
                 ), {"fids": fids}).fetchone()
             return float(row[0]) if row and row[0] is not None else None
         except Exception as exc:

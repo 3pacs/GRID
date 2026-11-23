@@ -63,7 +63,7 @@ def _lookup_latest_value(
                     "SELECT rs.value, rs.obs_date "
                     "FROM resolved_series rs "
                     "WHERE rs.feature_id = :fid "
-                    "ORDER BY rs.obs_date DESC LIMIT 1"
+                    "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
                 ), {"fid": fid}).fetchone()
                 if row and row[0] is not None:
                     return (float(row[0]), str(row[1]), name)
@@ -84,7 +84,7 @@ def _lookup_feature_value(
                 "SELECT rs.value, rs.obs_date "
                 "FROM resolved_series rs "
                 "WHERE rs.feature_id = :fid "
-                "ORDER BY rs.obs_date DESC LIMIT 1"
+                "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
             ), {"fid": fid}).fetchone()
             if row and row[0] is not None:
                 return (float(row[0]), str(row[1]))
@@ -98,7 +98,12 @@ def _lookup_price_change(
     ticker: str,
     periods: int = 2,
 ) -> tuple[float | None, float | None]:
-    """Return (latest_value, previous_value) for computing direction / pct change."""
+    """Return (latest_value, previous_value) for computing direction / pct change.
+
+    One value per obs_date (its newest vintage): with ``LIMIT n`` alone, two
+    vintages of the newest date could fill both rows and make "previous" a
+    revision of the same day.
+    """
     t_lower = ticker.lower()
     candidates = [t_lower, f"{t_lower}_full", f"{t_lower}_usd_full"]
     try:
@@ -108,10 +113,10 @@ def _lookup_price_change(
                 if fid is None:
                     continue
                 rows = conn.execute(sql_text(
-                    "SELECT rs.value "
+                    "SELECT DISTINCT ON (rs.obs_date) rs.value "
                     "FROM resolved_series rs "
                     "WHERE rs.feature_id = :fid "
-                    "ORDER BY rs.obs_date DESC LIMIT :n"
+                    "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT :n"
                 ), {"fid": fid, "n": periods}).fetchall()
                 if rows and len(rows) >= 2:
                     return (float(rows[0][0]), float(rows[-1][0]))

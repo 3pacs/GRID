@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
 
 from db import get_engine
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 UNIVERSE_CSV = ROOT / "data" / "tiingo_universe_tiered.csv"
@@ -244,7 +245,7 @@ def _materialize_ticker_calibration(conn: Any) -> int:
                 CASE op.verdict WHEN 'hit' THEN 1.0 WHEN 'partial' THEN 0.5 ELSE 0.0 END AS outcome,
                 tv.volume_rank,
                 tv.dollar_volume
-            FROM oracle_predictions op
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ op
             JOIN surfacer_top_volume_universe tv ON tv.ticker = UPPER(op.ticker)
             WHERE op.verdict IN ('hit', 'miss', 'partial')
         )
@@ -311,7 +312,7 @@ def _materialize_signal_calibration(conn: Any) -> int:
                 CASE op.verdict WHEN 'hit' THEN 1.0 WHEN 'partial' THEN 0.5 ELSE 0.0 END AS outcome,
                 tv.volume_rank,
                 tv.dollar_volume
-            FROM oracle_predictions op
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ op
             JOIN surfacer_top_volume_universe tv ON tv.ticker = UPPER(op.ticker)
             JOIN LATERAL jsonb_each_text(
                 CASE
