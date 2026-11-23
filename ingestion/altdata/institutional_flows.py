@@ -32,7 +32,6 @@ import json
 import logging
 import math
 import time
-from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -117,6 +116,14 @@ _POSITION_CHANGE_THRESHOLD: float = 0.20
 # qualified_for_directional_flow=False. NEW and CLOSED positions are
 # split-invariant (whole position value at one quarter-end) and stay qualified.
 CONTINUING_POSITION_UNQUALIFIED_REASON = "no_corporate_action_coverage"
+# A NEW or CLOSED CUSIP is not a verified trade either: a CUSIP rekey, merger or
+# exchange can show as one CUSIP disappearing and another appearing with no
+# trade, and GRID has no CUSIP identity/filing coverage to rule that out.
+NEW_CLOSED_UNQUALIFIED_REASON = "no_identity_coverage"
+# Owner decision 2026-11-23 (Anik, "Yes, non-directional"): until identity and
+# split coverage exist, every 13F change is an observed filing change at
+# reference prices, recorded for holdings graphs and never read as direction.
+OBSERVATION_MEASURE = "observed_filing_holdings_change_at_reference_prices"
 
 # SEC Form 13F XML <value> switched from thousands of dollars to whole dollars
 # for filings made on or after 2023-01-03 (SEC Final Rule, Release No. 34-95148).
@@ -781,6 +788,8 @@ class InstitutionalFlowsPuller(BasePuller):
                 "cusip": cusip,
                 "name": h.get("name", ""),
                 "action": "NEW",
+                "observation_kind": "filing_appearance",
+                "measure": OBSERVATION_MEASURE,
                 "value_usd": est_flow,
                 "estimated_flow_usd": est_flow,
                 "holdings_value_delta_usd": curr_val,
@@ -795,7 +804,8 @@ class InstitutionalFlowsPuller(BasePuller):
                 "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
                 "value_units": "usd",
                 "share_type": share_type,
-                "qualified_for_directional_flow": True,
+                "qualified_for_directional_flow": False,
+                "unqualified_reason": NEW_CLOSED_UNQUALIFIED_REASON,
             })
 
         # Closed positions (valued at prior quarter-end implied price)
@@ -811,6 +821,8 @@ class InstitutionalFlowsPuller(BasePuller):
                 "cusip": cusip,
                 "name": h.get("name", ""),
                 "action": "CLOSED",
+                "observation_kind": "filing_disappearance",
+                "measure": OBSERVATION_MEASURE,
                 "value_usd": est_flow,
                 "estimated_flow_usd": est_flow,
                 "holdings_value_delta_usd": -prev_val,
@@ -825,7 +837,8 @@ class InstitutionalFlowsPuller(BasePuller):
                 "flow_estimation_method": "delta_shares_x_prev_quarter_end_price",
                 "value_units": "usd",
                 "share_type": share_type,
-                "qualified_for_directional_flow": True,
+                "qualified_for_directional_flow": False,
+                "unqualified_reason": NEW_CLOSED_UNQUALIFIED_REASON,
             })
 
         # Continuing positions: share-based delta * later quarter-end implied price
@@ -878,6 +891,8 @@ class InstitutionalFlowsPuller(BasePuller):
                 "value_units": "usd",
                 "share_type": curr_st,
                 # Unverified direction: a split or reverse split cannot be ruled out.
+                "observation_kind": "filing_holding_change",
+                "measure": OBSERVATION_MEASURE,
                 "qualified_for_directional_flow": False,
                 "unqualified_reason": CONTINUING_POSITION_UNQUALIFIED_REASON,
             })
@@ -1043,6 +1058,8 @@ class InstitutionalFlowsPuller(BasePuller):
                                 "share_type": chg.get("share_type", "SH"),
                                 "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
                                 "unqualified_reason": chg.get("unqualified_reason"),
+                                "observation_kind": chg.get("observation_kind"),
+                                "measure": chg.get("measure"),
                                 "filing_accession": curr_acc,
                                 "prev_filing_accession": prev_acc,
                                 "filing_date": obs_date.isoformat(),
@@ -1070,10 +1087,6 @@ class InstitutionalFlowsPuller(BasePuller):
                         # still sees each instrument.
                         chg_ticker = str(chg.get("cusip") or "").strip()
                         if not chg_ticker:
-                            continue
-                        if chg.get("qualified_for_directional_flow") is not True:
-                            # INCREASED/DECREASED without corporate-action
-                            # coverage is not a directional signal.
                             continue
                         try:
                             conn.execute(
@@ -1120,6 +1133,8 @@ class InstitutionalFlowsPuller(BasePuller):
                                         "value_units": chg.get("value_units", "usd"),
                                         "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
                                         "unqualified_reason": chg.get("unqualified_reason"),
+                                        "observation_kind": chg.get("observation_kind"),
+                                        "measure": chg.get("measure"),
                                         "filing_accession": curr_acc,
                                         "prev_filing_accession": prev_acc,
                                         "report_date": curr_report_date,

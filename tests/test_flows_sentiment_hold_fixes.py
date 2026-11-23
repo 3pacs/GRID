@@ -53,13 +53,21 @@ from price_close_contract import daily_capture_payload
 
 sqlite3.register_adapter(date, lambda d: d.isoformat())
 sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
+# Used only by engines opened with typed_dates=True (PARSE_DECLTYPES): the
+# dollar_flows list readers call .isoformat() on flow_date / created_at, which
+# raw SQLite text() reads would otherwise return as str.
+sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
+sqlite3.register_converter("DATETIME", lambda b: datetime.fromisoformat(b.decode()))
 
 TODAY = date.today()
 YESTERDAY = TODAY - timedelta(days=1)
 
 
-def _make_engine(*, preserve_ts_text: bool = False):
-    eng = create_engine("sqlite://")
+def _make_engine(*, preserve_ts_text: bool = False, typed_dates: bool = False):
+    eng = create_engine(
+        "sqlite://",
+        connect_args={"detect_types": sqlite3.PARSE_DECLTYPES} if typed_dates else {},
+    )
     md = MetaData()
     Table(
         "source_catalog", md,
@@ -492,7 +500,10 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
             filing_date=filing_day.isoformat(),
         ),
     )
-    # 8. One VALID qualified share-based NEW row -> ONLY this row must survive!
+    # 8. One VALID share-based NEW row, flagged as the puller now writes it
+    #    (unqualified only for missing CUSIP identity coverage) -> ONLY this
+    #    row survives, as a non-directional observation. Row 6 (flagged
+    #    unqualified with no reason) is still quarantined.
     _insert_raw(
         engine,
         "13F:0001067983:594918104:NEW",
@@ -505,6 +516,7 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
             curr_shares=100_000,
             curr_value_usd=24_000_000.0,  # 100k * $240 = $24M
             filing_date=filing_day.isoformat(),
+            extra={"qualified_for_directional_flow": False, "unqualified_reason": "no_identity_coverage"},
         ),
     )
 
@@ -517,9 +529,13 @@ def test_13f_quarantines_legacy_mixed_units_missing_shares_and_unqualified_rows(
 
     assert len(summary) == 1
     assert summary[0]["ticker"] == "MSFT"
-    assert summary[0]["direction"] == "inflow"
+    assert summary[0]["direction"] == "observed"
     assert summary[0]["amount_usd"] == pytest.approx(24_000_000.0)
     assert summary[0]["confidence"] == "derived"
+    assert summary[0]["evidence"]["qualified_for_directional_flow"] is False
+    assert summary[0]["evidence"]["unqualified_reason"] == "no_identity_coverage"
+    assert summary[0]["evidence"]["observation_kind"] == "filing_appearance"
+    assert summary[0]["evidence"]["measure"] == "observed_filing_holdings_change_at_reference_prices"
     assert summary.quarantined_13f == 7
     assert sum(summary.quarantined_13f_reasons.values()) == 7
     assert summary.quarantined_13f_reasons["no_corporate_action_coverage"] == 1
@@ -537,8 +553,15 @@ def test_13f_missing_filing_date_fails_closed_instead_of_defaulting_multiplier()
 def test_aggregators_quarantine_legacy_unrebuilt_13f_rows_in_dollar_flows():
     """Legacy pre-fix 13f rows sitting in dollar_flows (confidence='confirmed',
     unqualified evidence) must be excluded from directional totals in both
-    dollar_flows.get_aggregate_flows and flow_aggregator."""
+    dollar_flows.get_aggregate_flows and flow_aggregator. Since 13F became
+    non-directional, a share-based row whose evidence claims qualification
+    is excluded too; a non-13F institutional row still counts."""
     engine = _make_engine()
+    # Non-13F institutional-tier row: the only directional money here.
+    _insert_flow(
+        engine, "etf_flow", "ETF:XLK", "XLK", 5_000_000.0, "inflow", YESTERDAY,
+        confidence="estimated", evidence={"net_flow": 5_000_000.0},
+    )
     # Legacy un-rebuilt 13F row in dollar_flows (confirmed, empty evidence)
     _insert_flow(
         engine, "13f", "Legacy Fund", "AAPL", 999_000_000.0, "inflow", YESTERDAY,
@@ -562,15 +585,16 @@ def test_aggregators_quarantine_legacy_unrebuilt_13f_rows_in_dollar_flows():
     )
 
     agg = dollar_flows.get_aggregate_flows(engine, days=30)
-    assert agg["total_inflow"] == pytest.approx(25_000_000.0)
-    assert agg["net_flow"] == pytest.approx(25_000_000.0)
-    assert agg["quarantined_13f"] == 1
+    assert agg["total_inflow"] == pytest.approx(5_000_000.0)
+    assert agg["net_flow"] == pytest.approx(5_000_000.0)
+    assert agg["quarantined_13f"] == 2
+    assert "13f" not in agg["by_source_type"]
 
     flow_aggregator._flow_cache.clear()
     try:
         tiers = flow_aggregator.aggregate_by_actor_tier(engine, days=30)
-        assert tiers["institutional"]["inflow"] == pytest.approx(25_000_000.0)
-        assert tiers["institutional"]["net_flow"] == pytest.approx(25_000_000.0)
+        assert tiers["institutional"]["inflow"] == pytest.approx(5_000_000.0)
+        assert tiers["institutional"]["net_flow"] == pytest.approx(5_000_000.0)
     finally:
         flow_aggregator._flow_cache.clear()
 
@@ -726,6 +750,8 @@ def test_13f_amendment_replaces_original_in_dollar_flows_and_respects_pit():
     assert len(flows_before) == 2
     by_ticker = {f["ticker"]: f["amount_usd"] for f in flows_before}
     assert by_ticker == {"AAPL": pytest.approx(50_000_000.0), "MSFT": pytest.approx(20_000_000.0)}
+    # 13F is non-directional: both sides of the vintage are observations.
+    assert {f["direction"] for f in flows_after + flows_before} == {"observed"}
 
 
 def test_13f_amendment_flipping_direction_or_restating_to_zero_replaces_original():
@@ -733,10 +759,11 @@ def test_13f_amendment_flipping_direction_or_restating_to_zero_replaces_original
     restated unchanged holding) supersedes the original rather than leaving
     both rows active.
 
-    The directional sides are NEW/CLOSED: a continuing position
-    (INCREASED/DECREASED) is never a verified direction. A failed supersession
-    would show up either as the original's CLOSED outflow leaking through or as
-    the original's INCREASED row being quarantined instead of superseded."""
+    13F is non-directional: the surviving side is a NEW/CLOSED observation
+    (a continuing INCREASED/DECREASED row is quarantined). A failed
+    supersession would show up either as the original's CLOSED observation
+    leaking through or as the original's INCREASED row being quarantined
+    instead of superseded."""
     engine = _make_engine()
     orig_day = date(2026, 8, 14)
     amend_day = date(2026, 8, 28)
@@ -811,7 +838,10 @@ def test_13f_amendment_flipping_direction_or_restating_to_zero_replaces_original
     )
     assert len(flows) == 1
     assert flows[0]["ticker"] == "AAPL"
-    assert flows[0]["direction"] == "outflow"
+    assert flows[0]["direction"] == "observed"
+    assert flows[0]["evidence"]["action"] == "CLOSED"
+    assert flows[0]["evidence"]["observation_kind"] == "filing_disappearance"
+    assert flows[0]["evidence"]["qualified_for_directional_flow"] is False
     assert flows[0]["amount_usd"] == pytest.approx(100_000_000.0)
     assert flows[0]["evidence"]["is_amendment"] is True
     # Both originals were superseded (not quarantined, not counted).
@@ -937,14 +967,15 @@ def test_vol_term_structure_scores_matched_dates_with_spot_slope_wording(monkeyp
     assert "backwardation" not in src.lower()
 
 
-# ── Codex HOLD on #1369 head 4b66f327, REQUEST_CHANGES on 78679e80 ─────────
-# (1) a same-CUSIP split must not read as a trade: with no CUSIP-level
-# corporate-action coverage, a continuing position's share change
-# (INCREASED/DECREASED) is never a verified direction, while NEW/CLOSED
-# (split-invariant) stay directional; (2) every served reader of 13F
-# dollar_flows rows qualifies them, refuses rows with no capture clock
-# (created_at NULL), refuses historical replay, and keeps no qualified
-# coverage unknown.
+# ── 13F is non-directional (owner decision 2026-11-23) ────────────────────
+# Codex HOLD on #1369 head 4b66f327 and REQUEST_CHANGES on 78679e80, then the
+# owner's decision: no 13F change is a verified direction until CUSIP identity
+# and split coverage exist. A continuing position (INCREASED/DECREASED) can
+# hide a split; a NEW/CLOSED CUSIP can be a rekey, merger or exchange with no
+# trade. NEW/CLOSED are kept as observed filing appearances/disappearances at
+# reference prices; every served directional reader excludes 13F.
+
+_OBSERVED_MEASURE = "observed_filing_holdings_change_at_reference_prices"
 
 
 def _holding(value_usd: float, shares: int) -> dict:
@@ -959,7 +990,7 @@ def _raw_payload_from_change(chg: dict, filing_day: date) -> dict:
         "curr_value_usd", "prev_value_usd", "pct_change", "shares", "curr_shares",
         "prev_shares", "delta_shares", "valuation_price_usd", "valuation_price_basis",
         "flow_estimation_method", "value_units", "share_type",
-        "qualified_for_directional_flow", "unqualified_reason",
+        "qualified_for_directional_flow", "unqualified_reason", "observation_kind", "measure",
     )}
     payload.update({
         "manager_name": "Split Fund", "issuer_name": chg.get("name", ""),
@@ -984,9 +1015,9 @@ _SPLIT_CASES = {
 def test_13f_split_like_transition_is_quarantined_not_read_as_a_trade(case):
     """A split, a reverse split, a split plus a trade, and a split masked by a
     price move (2-for-1 plus +70% reads $100 -> $85 a share) never yield a
-    qualified directional change from _compare_holdings and never produce a
-    dollar_flows directional flow. The NEW and CLOSED positions in the same
-    filing pair are split-invariant and still flow."""
+    qualified change from _compare_holdings and never produce a directional
+    flow anywhere. The NEW and CLOSED positions in the same filing pair appear
+    only as observed rows (filing appearance / disappearance)."""
     prev, curr = _SPLIT_CASES[case]
     puller = institutional_flows.InstitutionalFlowsPuller.__new__(institutional_flows.InstitutionalFlowsPuller)
     counts: dict[str, int] = {}
@@ -998,23 +1029,26 @@ def test_13f_split_like_transition_is_quarantined_not_read_as_a_trade(case):
     by_cusip = {c["cusip"]: c for c in changes}
     assert counts == {}
 
+    # No change of any kind is qualified as a direction.
+    assert changes and all(c["qualified_for_directional_flow"] is False for c in changes)
+    assert all(c["measure"] == _OBSERVED_MEASURE for c in changes)
+
     split_chg = by_cusip.get("C1")
     if case == "split_flat_shares":
         assert split_chg is None  # zero share delta: no event at all
     else:
         assert split_chg is not None
         assert split_chg["action"] in ("INCREASED", "DECREASED")
-        assert split_chg["qualified_for_directional_flow"] is False
         assert split_chg["unqualified_reason"] == "no_corporate_action_coverage"
+        assert split_chg["observation_kind"] == "filing_holding_change"
     assert by_cusip["NEW00001"]["action"] == "NEW"
-    assert by_cusip["NEW00001"]["qualified_for_directional_flow"] is True
+    assert by_cusip["NEW00001"]["unqualified_reason"] == "no_identity_coverage"
+    assert by_cusip["NEW00001"]["observation_kind"] == "filing_appearance"
     assert by_cusip["CLOSED01"]["action"] == "CLOSED"
-    assert by_cusip["CLOSED01"]["qualified_for_directional_flow"] is True
-    assert sorted(c["cusip"] for c in changes if c["qualified_for_directional_flow"] is True) == [
-        "CLOSED01", "NEW00001",
-    ]
+    assert by_cusip["CLOSED01"]["unqualified_reason"] == "no_identity_coverage"
+    assert by_cusip["CLOSED01"]["observation_kind"] == "filing_disappearance"
 
-    # Through raw_series into dollar_flows: only NEW and CLOSED become flows.
+    # Through raw_series into dollar_flows: NEW and CLOSED only as observations.
     engine = _make_engine()
     for chg in changes:
         _insert_raw(
@@ -1024,10 +1058,21 @@ def test_13f_split_like_transition_is_quarantined_not_read_as_a_trade(case):
     reasons: dict[str, int] = {}
     flows = dollar_flows._normalize_13f_flows(engine, days=30, cusip_map=None, quarantine_reasons=reasons)
     assert {(f["evidence"]["cusip"], f["direction"], f["amount_usd"]) for f in flows} == {
-        ("NEW00001", "inflow", 25_000.0),
-        ("CLOSED01", "outflow", 18_000.0),
+        ("NEW00001", "observed", 25_000.0),
+        ("CLOSED01", "observed", 18_000.0),
     }
+    assert {f["evidence"]["cusip"]: f["evidence"]["observation_kind"] for f in flows} == {
+        "NEW00001": "filing_appearance",
+        "CLOSED01": "filing_disappearance",
+    }
+    assert all(f["evidence"]["qualified_for_directional_flow"] is False for f in flows)
     assert reasons == ({} if split_chg is None else {"failed_qualification": 1})
+
+    # ...and no served reader turns the observations into a direction.
+    dollar_flows._persist_flows(engine, flows)
+    agg = dollar_flows.get_aggregate_flows(engine, days=30)
+    assert agg["total_inflow"] == 0.0 and agg["total_outflow"] == 0.0
+    assert agg["quarantined_13f"] == 2
 
     # A payload that claims qualification (e.g. an older writer) is still refused.
     if split_chg is not None:
@@ -1083,29 +1128,42 @@ def test_dollar_flows_estimate_refuses_split_shaped_and_unverifiable_rows(
 
 def test_dollar_flows_estimate_still_reads_new_and_closed_positions():
     """NEW and CLOSED value the whole position at one quarter-end, so a split
-    cannot change them: both still estimate a directional flow."""
+    cannot change them. Flagged unqualified only for missing CUSIP identity
+    coverage (as the puller now writes them), they are still estimated, to be
+    stored as observations; any other unqualified flag is quarantined."""
+    identity_only = {"qualified_for_directional_flow": False, "unqualified_reason": "no_identity_coverage"}
     new = _qualified_13f_payload(
         ticker="SPLT", cusip="999999999", prev_shares=0, curr_shares=200,
-        curr_value_usd=17_000.0, filing_date=YESTERDAY.isoformat(),
+        curr_value_usd=17_000.0, filing_date=YESTERDAY.isoformat(), extra=identity_only,
     )
     est, why = dollar_flows._qualify_and_estimate_13f_flow(
         "NEW", 17_000.0, new, YESTERDAY, dollar_flows._extract_13f_vintage_meta(new, YESTERDAY),
     )
     assert why is None
-    assert est["direction"] == "inflow"
     assert est["estimated_flow_usd"] == pytest.approx(17_000.0)
     assert est["valuation_price_usd"] == pytest.approx(85.0)
+    assert est["delta_shares"] == 200
 
     closed = _qualified_13f_payload(
         ticker="SPLT", cusip="999999999", prev_shares=100, curr_shares=0,
-        prev_value_usd=10_000.0, filing_date=YESTERDAY.isoformat(),
+        prev_value_usd=10_000.0, filing_date=YESTERDAY.isoformat(), extra=identity_only,
     )
     est, why = dollar_flows._qualify_and_estimate_13f_flow(
         "CLOSED", 10_000.0, closed, YESTERDAY, dollar_flows._extract_13f_vintage_meta(closed, YESTERDAY),
     )
     assert why is None
-    assert est["direction"] == "outflow"
     assert est["estimated_flow_usd"] == pytest.approx(10_000.0)
+    assert est["delta_shares"] == -100
+
+    for action, payload in (("NEW", new), ("CLOSED", closed)):
+        meta = dollar_flows._extract_13f_vintage_meta(payload, YESTERDAY)
+        for bad in (
+            dict(payload, unqualified_reason="no_corporate_action_coverage"),
+            {k: v for k, v in payload.items() if k != "unqualified_reason"},
+        ):
+            assert dollar_flows._qualify_and_estimate_13f_flow(action, 1.0, bad, YESTERDAY, meta) == (
+                None, "quarantine:failed_qualification",
+            ), action
 
 
 _QUALIFIED_EV = {
@@ -1128,73 +1186,45 @@ def _insert_flow_at(engine, amount, direction, *, confidence, evidence, created_
 
 
 def _written_before_now() -> datetime:
-    """A tz-aware UTC capture clock a minute before the live read.
-
-    Relative to now, not to a fixed hour: just after 00:00 UTC a fixed
-    "01:00 today" is still in the future, and the layer's live cutoff is now.
-    """
+    """A tz-aware UTC capture clock a minute before the read."""
     return datetime.now(timezone.utc) - timedelta(minutes=1)
 
 
-def test_institutional_layer_counts_only_qualified_13f_rows_known_by_as_of():
+def test_institutional_layer_13f_node_is_non_directional_and_reads_nothing():
+    """The 13F node carries no value until CUSIP identity and split coverage
+    exist: value None for a live and a past as-of, even with rows whose
+    evidence claims qualification, and the engine is never read."""
     from analysis.money_flow_engine import layer_institutional
 
-    today = date.today()
+    class _NoReadEngine:
+        def connect(self):
+            raise AssertionError("the 13F node must not read dollar_flows")
+
+        begin = connect
+
     engine = _make_engine()
-    known = _written_before_now()
-    after_today = datetime.now(timezone.utc) + timedelta(days=1)  # written after the read
-    _insert_flow_at(engine, 10_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
-    _insert_flow_at(engine, 4_000_000.0, "outflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=known)
-    # legacy rows: 'derived' without qualification evidence, and 'confirmed'
-    _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"}, created_at=known)
-    _insert_flow_at(engine, 800_000_000.0, "inflow", confidence="confirmed", evidence=_QUALIFIED_EV, created_at=known)
-    # qualified, but written after the end of the as-of date
-    _insert_flow_at(engine, 50_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=after_today)
-    # qualified, but with no capture clock at all
-    _insert_flow_at(engine, 70_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=None)
-
-    node = layer_institutional._build_13f_aggregate(engine, today)
-    assert node.value == pytest.approx(6_000_000.0)  # 10M inflow - 4M outflow
-    assert node.metadata["coverage"] == "qualified"
-    assert node.metadata["qualified"] == 2 and node.metadata["unqualified"] == 2
-    # The late and NULL-clock rows carry the same qualified evidence as the
-    # counted rows: they are excluded by their clock, unread.
-    assert node.metadata["rows_read"] == 4
-    assert node.metadata["measure"] == "estimated_holdings_position_change_at_reference_prices"
-    assert node.metadata["not_observed_cash_flow"] is True
-    assert "Estimated Holdings-Position Change" in node.label and "Net Flows" not in node.label
-
-    # dollar_flows is rebuilt on refresh, so a past as-of is refused unread.
-    past = layer_institutional._build_13f_aggregate(engine, today - timedelta(days=1))
-    assert past.value is None and past.change_1m is None
-    assert past.metadata["coverage"] == "historical_replay_unavailable"
-    assert past.metadata["rows_read"] == 0
-
-
-def test_institutional_layer_without_qualified_rows_is_unknown_not_zero():
-    from analysis.money_flow_engine import layer_institutional
+    for amount, direction in ((10_000_000.0, "inflow"), (4_000_000.0, "outflow")):
+        _insert_flow_at(engine, amount, direction, confidence="derived", evidence=_QUALIFIED_EV,
+                        created_at=_written_before_now())
 
     today = date.today()
-    engine = _make_engine()
-    _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence={"cusip": "x"},
-                    created_at=_written_before_now())
-    # A qualified row with no capture clock supplies no coverage either.
-    _insert_flow_at(engine, 10_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=None)
-    node = layer_institutional._build_13f_aggregate(engine, today)
-    assert node.value is None
-    assert node.metadata["coverage"] == "no_qualified_13f_rows"
-    assert node.metadata["rows_read"] == 1
-    empty = layer_institutional._build_13f_aggregate(_make_engine(), today)
-    assert empty.value is None and empty.metadata["rows_read"] == 0
-    assert empty.metadata["coverage"] == "no_qualified_13f_rows"
+    for eng in (engine, _NoReadEngine()):
+        for as_of in (today, today - timedelta(days=1)):
+            node = layer_institutional._build_13f_aggregate(eng, as_of)
+            assert node.value is None and node.change_1m is None
+            assert node.label == "13F Holdings Changes (non-directional)"
+            assert node.metadata["coverage"] == "13f_non_directional_until_identity_and_split_coverage"
+            assert node.metadata["measure"] == _OBSERVED_MEASURE
+            assert node.metadata["not_observed_cash_flow"] is True
+            assert node.metadata["as_of"] == as_of.isoformat()
+            assert "rows_read" not in node.metadata
 
 
-def test_aggregate_flows_refuses_historical_13f_replay_and_counts_live_rows():
-    """dollar_flows is rebuilt (range delete + re-insert) on each refresh, so
-    the 13F rows visible at a past date are not preserved: a historical as_of
-    counts every 13F row as quarantined, while the live read counts the
-    qualified ones and non-13F rows are read either way. A 13F row with no
-    capture clock is not read at all."""
+def test_aggregate_flows_counts_every_13f_row_as_excluded_live_and_historical():
+    """get_aggregate_flows counts every 13F row in quarantined_13f and never in
+    a directional total, for a live and a historical as-of alike, including
+    rows whose evidence claims qualification and a row with no capture clock.
+    Non-13F rows are read either way."""
     engine = _make_engine()
     flow_day = date.today() - timedelta(days=5)
     _insert_flow(engine, "13f", "Q", "AAPL", 10_000_000.0, "inflow", flow_day,
@@ -1206,30 +1236,85 @@ def test_aggregate_flows_refuses_historical_13f_replay_and_counts_live_rows():
     _insert_flow_at(engine, 70_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV,
                     created_at=None, flow_date=flow_day)
 
-    live = dollar_flows.get_aggregate_flows(engine, days=30)
-    assert live["total_inflow"] == pytest.approx(11_000_000.0)
-    assert live["total_outflow"] == pytest.approx(4_000_000.0)
-    assert live["by_source_type"]["13f"]["net"] == pytest.approx(6_000_000.0)
-    assert live["flow_count"] == 3
-    assert live["quarantined_13f"] == 0
-
-    replay = dollar_flows.get_aggregate_flows(engine, days=30, as_of=date.today() - timedelta(days=1))
-    assert replay["quarantined_13f"] == 2
-    assert "13f" not in replay["by_source_type"]
-    assert replay["total_inflow"] == pytest.approx(1_000_000.0)
-    assert replay["total_outflow"] == 0.0
-    assert replay["flow_count"] == 1
+    for as_of in (None, date.today() - timedelta(days=1)):
+        agg = dollar_flows.get_aggregate_flows(engine, days=30, as_of=as_of)
+        assert agg["quarantined_13f"] == 3, as_of
+        assert "13f" not in agg["by_source_type"], as_of
+        assert agg["total_inflow"] == pytest.approx(1_000_000.0), as_of
+        assert agg["total_outflow"] == 0.0, as_of
+        assert agg["by_source_type"]["insider"]["net"] == pytest.approx(1_000_000.0), as_of
+        assert agg["flow_count"] == 1, as_of
 
 
-def test_sentiment_and_momentum_readers_drop_derived_rows_without_evidence():
-    """flow_aggregator (both readers) and sentiment_scorer used to keep any
-    13F row tagged 'derived'; a legacy row without share-based evidence is
-    now dropped from each, as is a qualified row with no capture clock
-    (created_at NULL), and the qualified row is kept."""
+def test_qualified_looking_13f_rows_are_excluded_by_every_served_reader():
+    """A 13F row whose evidence claims qualification (forged
+    qualified_for_directional_flow=True, confidence 'derived', a known capture
+    clock, a mapped ticker), and an observed NEW row as normalization now
+    writes it, are excluded by every served reader. A non-13F row on the same
+    ticker is still read by each, so each exclusion is the 13F rule alone."""
+    from analysis.money_flow_engine import layer_institutional
+
+    engine = _make_engine(typed_dates=True)
+    sector = dollar_flows._get_sector("AAPL")
+    assert sector != "Unknown"
+    forged = dict(_QUALIFIED_EV, cusip="037833100", action="NEW")
+    observed = dict(
+        _QUALIFIED_EV, cusip="037833100", action="NEW", qualified_for_directional_flow=False,
+        unqualified_reason="no_identity_coverage", observation_kind="filing_appearance",
+        measure=_OBSERVED_MEASURE,
+    )
+    _insert_flow_at(engine, 900_000_000.0, "inflow", confidence="derived", evidence=forged,
+                    created_at=_written_before_now())
+    _insert_flow_at(engine, 800_000_000.0, "outflow", confidence="derived", evidence=forged,
+                    created_at=_written_before_now())
+    _insert_flow_at(engine, 700_000_000.0, "observed", confidence="derived", evidence=observed,
+                    created_at=_written_before_now())
+    _insert_flow(engine, "darkpool", "finra_ats", "AAPL", 1_000_000.0, "inflow", YESTERDAY,
+                 confidence="estimated", evidence={"buy_volume": 10_000, "sell_volume": 5_000})
+    only_darkpool = [("darkpool", 1_000_000.0)]
+
+    agg = dollar_flows.get_aggregate_flows(engine, days=30)
+    assert agg["quarantined_13f"] == 3
+    assert set(agg["by_source_type"]) == {"darkpool"}
+    assert agg["total_inflow"] == pytest.approx(1_000_000.0) and agg["total_outflow"] == 0.0
+
+    for rows in (
+        dollar_flows.get_flows_by_ticker(engine, "AAPL"),
+        dollar_flows.get_flows_by_sector(engine, sector),
+        dollar_flows.get_biggest_movers(engine, days=7),
+    ):
+        assert [(r["source_type"], r["amount_usd"]) for r in rows] == only_darkpool
+
+    flow_aggregator._flow_cache.clear()
+    try:
+        fetched = flow_aggregator._fetch_flows(engine, 30)
+        tiers = flow_aggregator.aggregate_by_actor_tier(engine, days=30)
+        sectors = flow_aggregator.aggregate_by_sector(engine, days=30)
+    finally:
+        flow_aggregator._flow_cache.clear()
+    assert [(f["source_type"], f["amount_usd"]) for f in fetched] == only_darkpool
+    assert tiers["institutional"]["inflow"] == pytest.approx(1_000_000.0)
+    assert tiers["institutional"]["outflow"] == 0.0
+    assert sectors[sector]["inflow"] == pytest.approx(1_000_000.0)
+    assert sectors[sector]["outflow"] == 0.0
+    assert flow_aggregator.compute_flow_momentum(engine, "AAPL")["flow_count"] == 1
+
+    component = sentiment_scorer._score_flows(engine, days=7)
+    assert component.raw_value == pytest.approx(1.0)  # the darkpool inflow alone
+    assert "$0.0B out" in component.detail
+
+    assert layer_institutional._build_13f_aggregate(engine, date.today()).value is None
+
+
+def test_sentiment_and_momentum_readers_exclude_every_13f_row():
+    """flow_aggregator (both readers) and sentiment_scorer exclude every 13F
+    row: one with share-based evidence, a legacy row without it, and one with
+    no capture clock. The non-13F row on the same ticker is kept."""
     engine = _make_engine()
     _insert_flow(engine, "13f", "Q", "AAPL", 10_000_000.0, "inflow", YESTERDAY, confidence="derived", evidence=_QUALIFIED_EV)
     _insert_flow(engine, "13f", "L", "AAPL", 900_000_000.0, "outflow", YESTERDAY, confidence="derived", evidence={"cusip": "x"})
     _insert_flow_at(engine, 50_000_000.0, "outflow", confidence="derived", evidence=_QUALIFIED_EV, created_at=None)
+    _insert_flow(engine, "insider", "Jane", "AAPL", 2_000_000.0, "inflow", YESTERDAY, confidence="confirmed", evidence={})
 
     momentum = flow_aggregator.compute_flow_momentum(engine, "AAPL")
     assert momentum["flow_count"] == 1
@@ -1240,8 +1325,8 @@ def test_sentiment_and_momentum_readers_drop_derived_rows_without_evidence():
         flows = flow_aggregator._fetch_flows(engine, 30)
     finally:
         flow_aggregator._flow_cache.clear()
-    assert [f["amount_usd"] for f in flows if f["source_type"] == "13f"] == [10_000_000.0]
+    assert [(f["source_type"], f["amount_usd"]) for f in flows] == [("insider", 2_000_000.0)]
 
     component = sentiment_scorer._score_flows(engine, days=7)
-    assert component.raw_value == pytest.approx(1.0)  # only the qualified inflow counts
+    assert component.raw_value == pytest.approx(1.0)  # only the insider inflow counts
     assert "$0.0B out" in component.detail

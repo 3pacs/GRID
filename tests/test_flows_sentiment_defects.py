@@ -175,19 +175,21 @@ def _insert_flow(engine, source_type, actor_name, ticker, amount_usd, direction,
 
 
 def test_13f_skips_3part_metrics_and_unknown_actions():
-    """Only 4-part 13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED} are flow
-    candidates, and of those only NEW/CLOSED are directional.
+    """Only 4-part 13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED} are
+    candidates, and of those only NEW/CLOSED are kept, as non-directional
+    observations (13F is non-directional until CUSIP identity and split
+    coverage exist).
 
     Worked synthetic example:
       - 13F:0001067983:TOTAL_VALUE         = $250,000,000,000  (3-part AUM -> skip)
       - 13F:0001067983:NUM_POSITIONS       = 45                (3-part count -> skip)
       - 13F:0001067983:TOP5_CONCENTRATION  = 0.72              (3-part ratio -> skip)
       - 13F:0001067983:037833100:UNKNOWN   = $50,000,000       (unknown action -> skip)
-      - 13F:0001067983:037833100:NEW       = $120,000,000      (inflow)
-      - 13F:0001067983:594918104:CLOSED    = $45,000,000       (outflow)
+      - 13F:0001067983:037833100:NEW       = $120,000,000      (observed appearance)
+      - 13F:0001067983:594918104:CLOSED    = $45,000,000       (observed disappearance)
       - 13F:0001067983:459200101:DECREASED = $30,000,000       (continuing position:
-        a split cannot be ruled out -> quarantined, not an outflow)
-    Expected net 13F flow = +$120M - $45M = +$75M (never +$250.125B).
+        a split cannot be ruled out -> quarantined)
+    Expected observed total = $120M + $45M = $165M (never +$250.125B).
     """
     engine = _make_engine()
     filing_day = YESTERDAY
@@ -238,16 +240,25 @@ def test_13f_skips_3part_metrics_and_unknown_actions():
     assert len(flows) == 2
     by_ticker = {f["ticker"]: f for f in flows}
     assert set(by_ticker) == {"AAPL", "MSFT"}
-    assert by_ticker["AAPL"]["direction"] == "inflow"
+    # 13F is non-directional (owner decision 2026-11-23): NEW/CLOSED are
+    # observed filing appearances/disappearances at reference prices.
+    assert by_ticker["AAPL"]["direction"] == "observed"
     assert by_ticker["AAPL"]["amount_usd"] == pytest.approx(120_000_000.0)
-    assert by_ticker["MSFT"]["direction"] == "outflow"
+    assert by_ticker["AAPL"]["evidence"]["observation_kind"] == "filing_appearance"
+    assert by_ticker["MSFT"]["direction"] == "observed"
     assert by_ticker["MSFT"]["amount_usd"] == pytest.approx(45_000_000.0)
+    assert by_ticker["MSFT"]["evidence"]["observation_kind"] == "filing_disappearance"
+    for f in flows:
+        assert f["evidence"]["qualified_for_directional_flow"] is False
+        assert f["evidence"]["unqualified_reason"] == "no_identity_coverage"
+        assert f["evidence"]["measure"] == "observed_filing_holdings_change_at_reference_prices"
     # The 3-part metrics and UNKNOWN action are skipped, not quarantined; the
     # DECREASED row is the only quarantine.
     assert reasons == {"no_corporate_action_coverage": 1}
 
-    net = sum(f["amount_usd"] if f["direction"] == "inflow" else -f["amount_usd"] for f in flows)
-    assert net == pytest.approx(75_000_000.0)
+    # Only the two 4-part NEW/CLOSED rows are observed: $165M in total, never
+    # the $250B 3-part AUM, the position count, the ratio or the UNKNOWN row.
+    assert sum(f["amount_usd"] for f in flows) == pytest.approx(165_000_000.0)
 
 
 def test_13f_dedups_vintages_and_respects_pit_as_of():
@@ -309,6 +320,8 @@ def test_13f_dedups_vintages_and_respects_pit_as_of():
     assert len(flows_nov13) == 1
     assert flows_nov13[0]["ticker"] == "AAPL"
     assert flows_nov13[0]["amount_usd"] == pytest.approx(10_000_000.0)
+    # 13F is non-directional: every surviving vintage is an observation.
+    assert {f["direction"] for f in flows_nov20 + flows_nov13} == {"observed"}
 
 
 def test_13f_resolves_cusip_to_ticker_and_requires_real_ticker_for_sector_agg():
@@ -367,19 +380,39 @@ def test_13f_resolves_cusip_to_ticker_and_requires_real_ticker_for_sector_agg():
     flows_via_map = dollar_flows._normalize_13f_flows(engine, days=30, cusip_map=_StubCusipMap())
     assert {f["ticker"] for f in flows_via_map} == {"AAPL", "MSFT"}
 
-    # Persist and aggregate: sector aggregation must NOT contain 'Unknown'.
+    # Persist: the 13F rows are recorded as observations, not flows.
     expected_sector = dollar_flows._get_sector("AAPL")
     assert expected_sector != "Unknown"
     dollar_flows._persist_flows(engine, flows)
+    with engine.connect() as conn:
+        persisted = conn.execute(
+            text("SELECT ticker, direction FROM dollar_flows WHERE source_type = :st"),
+            {"st": "13f"},
+        ).fetchall()
+    assert sorted((t or "", d) for t, d in persisted) == [("", "observed"), ("AAPL", "observed")]
+
+    # Non-13F rows: one on a mapped ticker, one with no ticker at all.
+    _insert_flow(engine, "insider", "Jane Doe", "AAPL", 1_000_000.0, "inflow", filing_day)
+    _insert_flow(engine, "insider", "John Roe", None, 2_000_000.0, "inflow", filing_day)
+
+    # Sector aggregation needs a real ticker (never 'Unknown'), and 13F
+    # (non-directional) contributes nothing to any directional total.
     agg = dollar_flows.get_aggregate_flows(engine, days=30)
     assert "Unknown" not in agg["by_sector"]
     assert list(agg["by_sector"].keys()) == [expected_sector]
-    assert agg["by_sector"][expected_sector]["inflow"] == pytest.approx(120_000_000.0)
+    assert agg["by_sector"][expected_sector]["inflow"] == pytest.approx(1_000_000.0)
+    assert agg["total_inflow"] == pytest.approx(3_000_000.0)
+    assert "13f" not in agg["by_source_type"]
+    assert agg["quarantined_13f"] == 2
 
     flow_aggregator._flow_cache.clear()
-    sec_agg = flow_aggregator.aggregate_by_sector(engine, days=30)
+    try:
+        sec_agg = flow_aggregator.aggregate_by_sector(engine, days=30)
+    finally:
+        flow_aggregator._flow_cache.clear()
     assert "Unknown" not in sec_agg
     assert list(sec_agg.keys()) == [expected_sector]
+    assert sec_agg[expected_sector]["inflow"] == pytest.approx(1_000_000.0)
 
 
 # ── Defect 2: Unsigned dark-pool & ETF volume -> neutral; no +1.00 pegs ───
@@ -924,37 +957,62 @@ def test_13f_straddling_cutover_pair_creates_no_spurious_change_event(monkeypatc
     assert new_row["value"] == pytest.approx(30_000_000.0)
     assert new_row["raw_payload"]["curr_value_usd"] == 30_000_000
     assert new_row["raw_payload"]["value_multiplier"] == 1
-    assert new_row["raw_payload"]["qualified_for_directional_flow"] is True
 
     closed_row = by_series["13F:1067983:459200101:CLOSED"]
     assert closed_row["value"] == pytest.approx(20_000_000.0)
     assert closed_row["raw_payload"]["prev_value_usd"] == 20_000_000
     assert closed_row["raw_payload"]["prev_value_multiplier"] == 1000
-    assert closed_row["raw_payload"]["qualified_for_directional_flow"] is True
 
-    # MSFT is a continuing position: the $50M share-based estimate (200k x $250)
-    # is recorded, but a split cannot be ruled out, so it is not a direction.
+    # MSFT is a continuing position: the $50M share-based estimate (200k x $250).
     incr_row = by_series["13F:1067983:594918104:INCREASED"]
     assert incr_row["value"] == pytest.approx(50_000_000.0)
     assert incr_row["raw_payload"]["curr_value_usd"] == 150_000_000
     assert incr_row["raw_payload"]["prev_value_usd"] == 100_000_000
-    assert incr_row["raw_payload"]["qualified_for_directional_flow"] is False
-    assert incr_row["raw_payload"]["unqualified_reason"] == "no_corporate_action_coverage"
+
+    # 13F is non-directional (owner decision 2026-11-23): every change is an
+    # observed filing holdings change, none is qualified as a direction.
+    expected_labels = {
+        "13F:1067983:67066G104:NEW": ("no_identity_coverage", "filing_appearance"),
+        "13F:1067983:459200101:CLOSED": ("no_identity_coverage", "filing_disappearance"),
+        "13F:1067983:594918104:INCREASED": ("no_corporate_action_coverage", "filing_holding_change"),
+    }
+    for series_id, (reason, kind) in expected_labels.items():
+        payload = by_series[series_id]["raw_payload"]
+        assert payload["qualified_for_directional_flow"] is False, series_id
+        assert payload["unqualified_reason"] == reason, series_id
+        assert payload["observation_kind"] == kind, series_id
+        assert payload["measure"] == "observed_filing_holdings_change_at_reference_prices", series_id
 
     with engine.connect() as conn:
         sig_rows = conn.execute(
             text("SELECT ticker, signal_value FROM signal_sources WHERE source_type = :st"),
             {"st": "institutional"},
         ).fetchall()
-    # Only the NEW and CLOSED positions become directional signals.
+    # Every change is written to signal_sources as an observation (holdings
+    # graphs), carrying the same labels and dollar values.
     sig_by_cusip = {r[0]: json.loads(r[1]) for r in sig_rows}
-    assert set(sig_by_cusip) == {"67066G104", "459200101"}
+    assert set(sig_by_cusip) == {"67066G104", "459200101", "594918104"}
     assert sig_by_cusip["67066G104"]["action"] == "NEW"
     assert sig_by_cusip["67066G104"]["value_usd"] == pytest.approx(30_000_000.0)
     assert sig_by_cusip["67066G104"]["curr_value_usd"] == pytest.approx(30_000_000.0)
     assert sig_by_cusip["459200101"]["action"] == "CLOSED"
     assert sig_by_cusip["459200101"]["value_usd"] == pytest.approx(20_000_000.0)
     assert sig_by_cusip["459200101"]["prev_value_usd"] == pytest.approx(20_000_000.0)
+    assert sig_by_cusip["594918104"]["action"] == "INCREASED"
+    assert sig_by_cusip["594918104"]["value_usd"] == pytest.approx(50_000_000.0)
+    assert sig_by_cusip["594918104"]["curr_value_usd"] == pytest.approx(150_000_000.0)
+    assert sig_by_cusip["594918104"]["prev_value_usd"] == pytest.approx(100_000_000.0)
+    sig_series = {
+        "67066G104": "13F:1067983:67066G104:NEW",
+        "459200101": "13F:1067983:459200101:CLOSED",
+        "594918104": "13F:1067983:594918104:INCREASED",
+    }
+    for cusip, sig in sig_by_cusip.items():
+        reason, kind = expected_labels[sig_series[cusip]]
+        assert sig["qualified_for_directional_flow"] is False, cusip
+        assert sig["unqualified_reason"] == reason, cusip
+        assert sig["observation_kind"] == kind, cusip
+        assert sig["measure"] == "observed_filing_holdings_change_at_reference_prices", cusip
 
 
 def test_13f_compare_holdings_uses_delta_for_increased_decreased_and_keeps_new_closed():

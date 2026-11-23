@@ -186,6 +186,9 @@ STREAM_DARKPOOL: str = "darkpool"
 STREAM_OPTIONS_FLOW: str = "options_flow"
 STREAM_SMART_MONEY: str = "smart_money"
 STREAM_INSTITUTIONAL: str = "13f"
+# 13F gives no direction until CUSIP identity and split coverage exist
+# (owner decision 2026-11-23); see _scan_institutional.
+INSTITUTIONAL_13F_DIRECTIONAL: bool = False
 STREAM_SOCIAL: str = "social"
 STREAM_PREDICTION_MARKET: str = "prediction_market"
 
@@ -868,12 +871,18 @@ def _scan_institutional(
     window_days: int,
     trust_cache: dict[str, float],
 ) -> StreamSignal | None:
-    """13F institutional delta: net NEW + INCREASED vs CLOSED + DECREASED.
+    """13F institutional stream: abstains (returns None).
 
-    The institutional_flows puller stores position change counts in
-    the JSONB payload. We compute ``(new + increased) - (closed +
-    decreased)`` to get signed net action count.
+    Owner decision 2026-11-23 (Anik, "Yes, non-directional"): no 13F change is
+    a verified direction until CUSIP identity and corporate-action coverage
+    exist. A NEW/CLOSED CUSIP can be a rekey, merger or exchange with no
+    trade, and an INCREASED/DECREASED share count can be a split, so the old
+    ``(new + increased) - (closed + decreased)`` count is not read as bullish
+    or bearish. ``INSTITUTIONAL_13F_DIRECTIONAL`` re-enables the count once
+    coverage exists.
     """
+    if not INSTITUTIONAL_13F_DIRECTIONAL:
+        return None
     rows = _fetch_stream_rows(
         engine, STREAM_INSTITUTIONAL, ticker, as_of, window_days
     )

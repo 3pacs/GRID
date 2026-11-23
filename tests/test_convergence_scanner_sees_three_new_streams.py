@@ -152,30 +152,8 @@ def _scanner_module():
         return None
 
 
-def test_convergence_scanner_sees_three_new_streams(seeded_engine):
-    scanner = _scanner_module()
-    if scanner is None:
-        pytest.skip(
-            "UPSTREAM DEPENDENCY MISSING: "
-            "intelligence/signal_convergence_scanner.py does not exist "
-            "on this branch. The puller write-path fixes are "
-            "independently verified by "
-            "tests/test_signal_sources_write_path.py. Once the "
-            "convergence scanner module lands, this test will run "
-            "end-to-end."
-        )
-
-    # Preferred call signature per the task brief:
-    #   scan_convergence(engine, ticker='TSLA', as_of=today,
-    #                    target_direction='bullish', window_days=7)
-    result = scanner.scan_convergence(
-        seeded_engine,
-        ticker="TSLA",
-        as_of=date.today(),
-        target_direction="bullish",
-        window_days=7,
-    )
-
+def _active_stream_types(result: Any) -> tuple[Any, set]:
+    """``n_active_streams`` and the source_types seen, from a dict or an object."""
     # The scanner is expected to return either a dict with
     # ``n_active_streams`` + ``stream_signals`` OR a namedtuple-like
     # object with those fields. Handle both.
@@ -189,18 +167,71 @@ def test_convergence_scanner_sees_three_new_streams(seeded_engine):
         if isinstance(result, dict)
         else getattr(result, "stream_signals", None)
     )
+    return n_active, {
+        s.get("source_type") if isinstance(s, dict) else getattr(s, "source_type", None)
+        for s in (stream_signals or [])
+    }
+
+
+def _scan_tsla(scanner, engine):
+    # Preferred call signature per the task brief:
+    #   scan_convergence(engine, ticker='TSLA', as_of=today,
+    #                    target_direction='bullish', window_days=7)
+    return scanner.scan_convergence(
+        engine,
+        ticker="TSLA",
+        as_of=date.today(),
+        target_direction="bullish",
+        window_days=7,
+    )
+
+
+def test_convergence_scanner_sees_three_new_streams(seeded_engine):
+    """The smart_money and social streams are seen. The 13F institutional
+    stream is seeded too but abstains: 13F is non-directional until CUSIP
+    identity and split coverage exist (owner decision 2026-11-23)."""
+    scanner = _scanner_module()
+    if scanner is None:
+        pytest.skip(
+            "UPSTREAM DEPENDENCY MISSING: "
+            "intelligence/signal_convergence_scanner.py does not exist "
+            "on this branch. The puller write-path fixes are "
+            "independently verified by "
+            "tests/test_signal_sources_write_path.py. Once the "
+            "convergence scanner module lands, this test will run "
+            "end-to-end."
+        )
+    assert scanner.INSTITUTIONAL_13F_DIRECTIONAL is False
+
+    n_active, stream_types = _active_stream_types(_scan_tsla(scanner, seeded_engine))
+
+    assert n_active is not None, "scanner must return n_active_streams"
+    assert n_active >= 2, f"expected >=2 active streams, got {n_active}"
+    for expected in ("smart_money", "social"):
+        assert expected in stream_types, (
+            f"stream '{expected}' missing from scanner output "
+            f"(got {stream_types})"
+        )
+    assert "institutional" not in stream_types, (
+        f"13F is non-directional and must abstain (got {stream_types})"
+    )
+
+
+def test_convergence_scanner_sees_institutional_stream_when_re_enabled(seeded_engine, monkeypatch):
+    """With INSTITUTIONAL_13F_DIRECTIONAL set (the re-enable path, once
+    coverage exists) all three newly-wired streams are seen again."""
+    scanner = _scanner_module()
+    if scanner is None:
+        pytest.skip("intelligence/signal_convergence_scanner.py does not exist on this branch.")
+    monkeypatch.setattr(scanner, "INSTITUTIONAL_13F_DIRECTIONAL", True)
+
+    n_active, stream_types = _active_stream_types(_scan_tsla(scanner, seeded_engine))
 
     assert n_active is not None, "scanner must return n_active_streams"
     assert n_active >= 3, (
         f"expected >=3 active streams from the 3 newly-wired source types, "
         f"got {n_active}"
     )
-
-    # Each of the three new streams must appear by source_type.
-    stream_types = {
-        s.get("source_type") if isinstance(s, dict) else getattr(s, "source_type", None)
-        for s in (stream_signals or [])
-    }
     for expected in ("smart_money", "institutional", "social"):
         assert expected in stream_types, (
             f"stream '{expected}' missing from scanner output "

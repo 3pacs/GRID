@@ -77,6 +77,15 @@ _VALID_13F_ACTIONS: frozenset[str] = frozenset({"NEW", "INCREASED", "DECREASED",
 _13F_DOLLAR_CUTOVER_DATE: date = date(2023, 1, 3)
 
 # Documented share-based flow estimation methods accepted for 13F directional flows.
+# Owner decision 2026-11-23 (Anik, "Yes, non-directional"): no 13F row is a
+# verified direction until CUSIP identity and corporate-action coverage exist.
+# A NEW/CLOSED position is stored as an observed filing appearance or
+# disappearance at reference prices (direction "observed"); every served
+# directional reader excludes source_type '13f'.
+OBSERVED_13F_DIRECTION = "observed"
+OBSERVED_13F_MEASURE = "observed_filing_holdings_change_at_reference_prices"
+_13F_OBSERVATION_REASONS: frozenset[str] = frozenset({"no_identity_coverage"})
+
 _QUALIFIED_13F_FLOW_METHODS: frozenset[str] = frozenset({
     "delta_shares_x_curr_quarter_end_price",
     "delta_shares_x_prev_quarter_end_price",
@@ -1121,7 +1130,12 @@ def _qualify_and_estimate_13f_flow(
       - ``(None, "quarantine:<reason>")`` for legacy whole-position, mixed or
         unknown units, missing share counts, non-equity/PRN, or disqualified rows.
     """
-    if payload.get("qualified_for_directional_flow") is False:
+    if payload.get("qualified_for_directional_flow") is False and (
+        payload.get("unqualified_reason") not in _13F_OBSERVATION_REASONS
+        or action not in ("NEW", "CLOSED")
+    ):
+        # NEW/CLOSED flagged only for missing identity coverage continue as
+        # observations; anything else unqualified is quarantined.
         return None, "quarantine:failed_qualification"
     if payload.get("put_call"):
         return None, "quarantine:non_equity_option"
@@ -1496,7 +1510,7 @@ def _normalize_13f_flows(
                     "actor_name": manager_name,
                     "ticker": resolved_ticker,
                     "amount_usd": estimate["estimated_flow_usd"],
-                    "direction": estimate["direction"],
+                    "direction": OBSERVED_13F_DIRECTION,
                     "confidence": "derived",
                     "evidence": {
                         "cusip": payload.get("cusip") or cusip,
@@ -1512,7 +1526,10 @@ def _normalize_13f_flows(
                         "flow_estimation_method": estimate["flow_estimation_method"],
                         "holdings_value_delta_usd": estimate["holdings_value_delta_usd"],
                         "value_units": "usd",
-                        "qualified_for_directional_flow": True,
+                        "qualified_for_directional_flow": False,
+                        "unqualified_reason": "no_identity_coverage",
+                        "observation_kind": "filing_appearance" if action == "NEW" else "filing_disappearance",
+                        "measure": OBSERVED_13F_MEASURE,
                         "filing_accession": meta["filing_accession"] or payload.get("filing_accession"),
                         "report_date": meta["report_date"].isoformat() if meta["report_date"] else None,
                         "form_type": meta["form_type"] or None,
@@ -1966,17 +1983,6 @@ def _persist_flows(engine: Engine, flows: list[dict]) -> int:
     return inserted
 
 
-def _served_flow_row(source_type: Any, confidence: Any, evidence: Any, created_at: Any) -> bool:
-    """Whether a served list reader may return this row.
-
-    A 13F row is returned only with a known capture clock and documented
-    share-based qualification; every other source passes unchanged.
-    """
-    if source_type != "13f":
-        return True
-    return created_at is not None and _is_qualified_13f_dollar_flow_row(confidence, evidence)
-
-
 def get_flows_by_ticker(engine: Engine, ticker: str, days: int = 30) -> list[dict]:
     """Retrieve normalized dollar flows for a specific ticker.
 
@@ -1998,10 +2004,11 @@ def get_flows_by_ticker(engine: Engine, ticker: str, days: int = 30) -> list[dic
                 "direction, confidence, evidence, flow_date, created_at "
                 "FROM dollar_flows "
                 "WHERE UPPER(ticker) = :ticker "
-                "AND flow_date >= :cutoff "
+                "AND source_type <> '13f' "
+                "AND flow_date >= :cutoff AND flow_date <= :today "
                 "ORDER BY flow_date DESC"
             ),
-            {"ticker": ticker.upper(), "cutoff": cutoff},
+            {"ticker": ticker.upper(), "cutoff": cutoff, "today": date.today()},
         ).fetchall()
 
     return [
@@ -2018,7 +2025,6 @@ def get_flows_by_ticker(engine: Engine, ticker: str, days: int = 30) -> list[dic
             "created_at": r[9].isoformat() if r[9] else None,
         }
         for r in rows
-        if _served_flow_row(r[1], r[6], r[7], r[9])
     ]
 
 
@@ -2049,7 +2055,7 @@ def get_flows_by_sector(engine: Engine, sector: str, days: int = 30) -> list[dic
 
     # Use parameterized IN clause
     placeholders = ", ".join(f":t{i}" for i in range(len(sector_tickers)))
-    params: dict[str, Any] = {"cutoff": cutoff}
+    params: dict[str, Any] = {"cutoff": cutoff, "today": date.today()}
     for i, t in enumerate(sector_tickers):
         params[f"t{i}"] = t
 
@@ -2059,7 +2065,8 @@ def get_flows_by_sector(engine: Engine, sector: str, days: int = 30) -> list[dic
         "direction, confidence, evidence, flow_date, created_at "
         "FROM dollar_flows "
         "WHERE UPPER(ticker) IN (" + placeholders + ") "
-        "AND flow_date >= :cutoff "
+        "AND source_type <> '13f' "
+        "AND flow_date >= :cutoff AND flow_date <= :today "
         "ORDER BY flow_date DESC"
     )
     with engine.connect() as conn:
@@ -2080,7 +2087,6 @@ def get_flows_by_sector(engine: Engine, sector: str, days: int = 30) -> list[dic
             "sector": sector,
         }
         for r in rows
-        if _served_flow_row(r[1], r[6], r[7], r[9])
     ]
 
 
@@ -2108,15 +2114,10 @@ def get_aggregate_flows(
                 "SELECT source_type, actor_name, ticker, amount_usd, direction, "
                 "confidence, CASE WHEN source_type = '13f' THEN evidence ELSE NULL END "
                 "FROM dollar_flows "
-                "WHERE flow_date >= :cutoff AND flow_date <= :as_of "
-                "AND NOT (source_type = '13f' AND created_at IS NULL)"
+                "WHERE flow_date >= :cutoff AND flow_date <= :as_of"
             ),
             {"cutoff": cutoff, "as_of": ref_date},
         ).fetchall()
-    # dollar_flows is rebuilt on each refresh (range delete + re-insert), so the
-    # 13F rows visible at a past date are not preserved: a historical as_of
-    # does not read 13F direction at all.
-    historical_13f = ref_date < date.today()
 
     sector_flows: dict[str, dict[str, float]] = defaultdict(
         lambda: {"inflow": 0.0, "outflow": 0.0}
@@ -2139,12 +2140,9 @@ def get_aggregate_flows(
         ticker = r[2]
         amount = float(r[3]) if r[3] else 0.0
         direction = r[4]
-        confidence = r[5] if len(r) > 5 else None
-        raw_evidence = r[6] if len(r) > 6 else None
 
-        if source_type == "13f" and (
-            historical_13f or not _is_qualified_13f_dollar_flow_row(confidence, raw_evidence)
-        ):
+        if source_type == "13f":
+            # No 13F row is a verified direction (see OBSERVED_13F_DIRECTION).
             quarantined_13f += 1
             continue
         if direction == "quarantined":
@@ -2173,7 +2171,7 @@ def get_aggregate_flows(
 
     if quarantined_13f:
         log.warning(
-            "get_aggregate_flows: quarantined {n} legacy/unqualified 13f rows from directional totals",
+            "get_aggregate_flows: excluded {n} 13f rows from directional totals (13F is non-directional)",
             n=quarantined_13f,
         )
 
@@ -2222,13 +2220,14 @@ def get_biggest_movers(engine: Engine, days: int = 7) -> list[dict]:
         rows = conn.execute(
             text(
                 "SELECT id, source_type, actor_name, ticker, amount_usd, "
-                "direction, confidence, evidence, flow_date, created_at "
+                "direction, confidence, evidence, flow_date "
                 "FROM dollar_flows "
-                "WHERE flow_date >= :cutoff "
+                "WHERE source_type <> '13f' "
+                "AND flow_date >= :cutoff AND flow_date <= :today "
                 "ORDER BY amount_usd DESC "
                 "LIMIT 10"
             ),
-            {"cutoff": cutoff},
+            {"cutoff": cutoff, "today": date.today()},
         ).fetchall()
 
     return [
@@ -2245,5 +2244,4 @@ def get_biggest_movers(engine: Engine, days: int = 7) -> list[dict]:
             "sector": _get_sector(r[3]),
         }
         for r in rows
-        if _served_flow_row(r[1], r[6], r[7], r[9])
     ]

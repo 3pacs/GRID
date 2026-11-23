@@ -360,7 +360,7 @@ def test_flow_fetch_caches_each_window_and_skips_evidence(monkeypatch):
         def execute(self, stmt, params):
             queries.append((str(stmt), params["cutoff"]))
             return SimpleNamespace(fetchall=lambda: [
-                ("insider", "Jane", "AAPL", 1000.0, "inflow", None, "2026-11-01", None),
+                ("insider", "Jane", "AAPL", 1000.0, "inflow", None, "2026-11-01"),
             ])
 
     engine = SimpleNamespace(connect=_Conn)
@@ -370,12 +370,7 @@ def test_flow_fetch_caches_each_window_and_skips_evidence(monkeypatch):
         b = fa._fetch_flows(engine, 60)
         assert fa._fetch_flows(engine, 30) is a and fa._fetch_flows(engine, 60) is b
         assert len(queries) == 2, "each window fetched once within the TTL"
-        # Evidence is read only where 13F qualification needs it: the one
-        # allowed reference is the 13F-only CASE; every other row gets NULL.
-        thirteen_f_only = "CASE WHEN source_type = '13f' THEN evidence ELSE NULL END"
-        for sql, _ in queries:
-            assert sql.count(thirteen_f_only) == 1
-            assert "evidence" not in sql.replace(thirteen_f_only, "")
+        assert all("evidence" not in sql for sql, _ in queries)
         assert a[0]["confidence"] == "estimated" and a[0]["evidence"] == {}
     finally:
         fa._flow_cache.clear()
