@@ -16,6 +16,7 @@ import hashlib
 import math
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,12 @@ from typing import Any, Callable
 import schedule
 from loguru import logger as log
 from outputs.path_utils import ensure_output_dir
+from store.snapshots import (
+    InvalidFeatureFilter,
+    canonical_payload_sha256,
+    producer_feature_filters,
+    strip_binding_flags,
+)
 
 # Output directory for saved briefings
 _BRIEFING_DIR = Path(__file__).parent.parent / "outputs" / "market_briefings"
@@ -616,6 +623,10 @@ def _publication_guard(role: str, content: str | None, verdict: dict[str, Any] |
 
 _YF_SNAPSHOT_LOOKBACK_DAYS = 14
 
+# Raw series whose snapshot label differs from their raw_series id. The live
+# 10-year yield is stored as "yc_10y"; briefings and grounding call it DGS10.
+_RAW_SERIES_LABEL_ALIASES: dict[str, str] = {"yc_10y": "DGS10"}
+
 
 def _read_yf_snapshot_value(conn: Any, sid: str, now: datetime) -> dict[str, Any] | None:
     """Latest Yahoo daily value for ``sid`` without serving an in-progress capture.
@@ -640,18 +651,37 @@ def _read_yf_snapshot_value(conn: Any, sid: str, now: datetime) -> dict[str, Any
     import price_close_contract
     from store.observations import read_daily_policy_n, read_latest
 
+    now_utc = now.astimezone(timezone.utc) if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     qualified = read_daily_policy_n(
         conn, sid, 1, source="yfinance",
-        start=now.date() - timedelta(days=_YF_SNAPSHOT_LOOKBACK_DAYS), as_of_ts=now,
+        start=now_utc.date() - timedelta(days=_YF_SNAPSHOT_LOOKBACK_DAYS), as_of_ts=now_utc,
     )
     if qualified:
         obs, basis, finality = qualified[0], "policy_eligible_daily_capture", "policy_eligible_not_provider_final"
     else:
-        obs = read_latest(conn, sid, source="yfinance", as_of_ts=now)
+        obs = read_latest(conn, sid, source="yfinance", as_of_ts=now_utc)
         ticker = sid.split(":")[1] if sid.count(":") >= 2 else ""
         if obs is None or ticker not in price_close_contract.UNKNOWN_DAILY_TICKERS:
             return None
         basis, finality = "unqualified_latest_pull", "unknown"
+    if obs.obs_date > now_utc.date():
+        log.warning(
+            "Market briefing rejected future YF observation for {sid}: obs_date={d} > {asof}",
+            sid=sid, d=obs.obs_date, asof=now_utc.date(),
+        )
+        return None
+    if obs.pull_timestamp is not None:
+        pull_utc = (
+            obs.pull_timestamp.astimezone(timezone.utc)
+            if obs.pull_timestamp.tzinfo is not None
+            else obs.pull_timestamp.replace(tzinfo=timezone.utc)
+        )
+        if pull_utc > now_utc:
+            log.warning(
+                "Market briefing rejected future YF pull_timestamp for {sid}: pull={p} > {asof}",
+                sid=sid, p=pull_utc.isoformat(), asof=now_utc.isoformat(),
+            )
+            return None
     return {
         "value": round(obs.value, 4),
         "date": str(obs.obs_date),
@@ -709,6 +739,343 @@ class MarketBriefingEngine:
         "contains them is withheld and replaced by a data-only summary."
     )
 
+    _UNASSERTED_REGIME_LABELS = frozenset({"", "UNKNOWN", "UNCALIBRATED", "NONE", "N/A"})
+    _INVALID_FEATURE_ID_STRINGS = frozenset({
+        "", "null", "none", "n/a", "na", "unknown", "missing", "unavailable", "-",
+    })
+    _INELIGIBLE_FEATURE_STATUSES = frozenset({
+        "ineligible", "stale", "missing", "unavailable", "rejected",
+        "invalid", "unverified", "future", "withheld", "excluded",
+    })
+    _CLOCK_TIMESTAMP_KEYS = (
+        "data_as_of", "obs_date", "date", "as_of_date", "as_of",
+        "available_at", "snapshot_available_at", "created_at",
+        "trained_at", "model_updated_at", "updated_at", "timestamp",
+        "collected_at", "checked_at",
+    )
+    _CLOCK_AGE_KEYS = ("age_seconds", "age_hours", "age_days", "data_staleness_days")
+    _SNAPSHOT_ID_KEYS = ("snapshot_id", "producer_snapshot_id", "analytical_snapshot_id")
+    _SNAPSHOT_HASH_KEYS = ("snapshot_hash", "producer_snapshot_hash", "snapshot_sha256", "payload_sha256")
+
+    @staticmethod
+    def _row_values(row: Any) -> tuple[Any, ...] | None:
+        """A database result row as a plain tuple, or ``None`` if *row* is not one.
+
+        SQLAlchemy 2.0's ``Row`` is a ``collections.abc.Sequence`` but not a
+        ``tuple`` subclass, so a bare ``isinstance(row, tuple)`` check rejects
+        every real result row (tuple-shaped test doubles hide that).
+        """
+        if row is None or isinstance(row, (str, bytes, bytearray)):
+            return None
+        if isinstance(row, (tuple, list, Sequence)):
+            return tuple(row)
+        return None
+
+    @staticmethod
+    def _parse_utc_clock(value: Any) -> tuple[date | None, datetime | None, bool]:
+        """Parse an ISO date/datetime into ``(date, utc_datetime, is_date_only)``."""
+        if isinstance(value, datetime):
+            dt = value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return dt.date(), dt, False
+        if isinstance(value, date):
+            return value, datetime(value.year, value.month, value.day, tzinfo=timezone.utc), True
+        if not isinstance(value, str) or not value.strip():
+            return None, None, False
+        raw = value.strip()
+        if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+            try:
+                d = date.fromisoformat(raw)
+                return d, datetime(d.year, d.month, d.day, tzinfo=timezone.utc), True
+            except ValueError:
+                return None, None, False
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.date(), dt, False
+        except ValueError:
+            return None, None, False
+
+    @staticmethod
+    def _parse_qualified_utc_clock(value: Any) -> tuple[date | None, datetime | None]:
+        """Parse an explicitly offset-aware (qualified) timestamp into UTC ``(date, datetime)``."""
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                return None, None
+            dt = value.astimezone(timezone.utc)
+            return dt.date(), dt
+        if type(value) is not str or not value.strip():
+            return None, None
+        raw = value.strip()
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None, None
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            return None, None
+        dt_utc = dt.astimezone(timezone.utc)
+        return dt_utc.date(), dt_utc
+
+    @classmethod
+    def _resolve_decision_clock(cls, snapshot: dict[str, Any]) -> tuple[date | None, datetime | None]:
+        """Resolve the UTC decision clock for clock-sanity checks on *snapshot*.
+
+        Uses an explicit ``decision_clock`` or a timezone-qualified
+        ``timestamp`` when supplied (every ``_gather_market_snapshot`` output
+        carries a UTC-aware ``timestamp``). Returns ``(None, None)`` when no
+        qualified clock is present (e.g. ``timestamp='SYNTHETIC'``) rather than
+        substituting the host clock; negative ages are still rejected
+        unconditionally.
+        """
+        if "decision_clock" in snapshot and snapshot["decision_clock"] is not None:
+            d, dt, _ = cls._parse_utc_clock(snapshot["decision_clock"])
+            if d is not None and dt is not None:
+                return d, dt
+        return cls._parse_qualified_utc_clock(snapshot.get("timestamp"))
+
+    @classmethod
+    def _clock_sanity_error(
+        cls,
+        item: Any,
+        as_of_dt: datetime | None,
+        as_of_date: date | None = None,
+    ) -> str | None:
+        """Return a reason string if *item* carries a future timestamp or negative/invalid age."""
+        if as_of_date is None and as_of_dt is not None:
+            as_of_date = as_of_dt.date()
+        if not isinstance(item, dict):
+            return None
+
+        fresh = item.get("freshness")
+        if isinstance(fresh, dict) and "age" in fresh and fresh["age"] is not None:
+            f_age = fresh["age"]
+            if (
+                isinstance(f_age, bool)
+                or not isinstance(f_age, (int, float))
+                or not math.isfinite(f_age)
+                or f_age < 0
+            ):
+                return "negative_or_invalid_freshness_age"
+
+        for age_key in cls._CLOCK_AGE_KEYS:
+            if age_key in item and item[age_key] is not None:
+                raw_age = item[age_key]
+                if (
+                    isinstance(raw_age, bool)
+                    or not isinstance(raw_age, (int, float))
+                    or not math.isfinite(raw_age)
+                    or raw_age < 0
+                ):
+                    return f"negative_or_invalid_{age_key}"
+
+        stale_feats = item.get("stale_features")
+        if isinstance(stale_feats, dict):
+            for fname, age_val in stale_feats.items():
+                if age_val is not None and (
+                    isinstance(age_val, bool)
+                    or not isinstance(age_val, (int, float))
+                    or not math.isfinite(age_val)
+                    or age_val < 0
+                ):
+                    return f"negative_stale_feature_age:{fname}"
+
+        for ts_key in cls._CLOCK_TIMESTAMP_KEYS:
+            if ts_key not in item or item[ts_key] is None:
+                continue
+            raw_ts = item[ts_key]
+            if isinstance(raw_ts, str) and raw_ts.strip().lower() in cls._INVALID_FEATURE_ID_STRINGS:
+                continue
+            obs_d, obs_dt, is_date_only = cls._parse_utc_clock(raw_ts)
+            if obs_d is None:
+                continue
+            if is_date_only:
+                if as_of_date is not None and obs_d > as_of_date:
+                    return f"future_{ts_key}:{obs_d.isoformat()}"
+            else:
+                if as_of_dt is not None and obs_dt is not None and obs_dt > as_of_dt:
+                    return f"future_{ts_key}:{obs_dt.isoformat()}"
+                if as_of_dt is None and as_of_date is not None and obs_d > as_of_date:
+                    return f"future_{ts_key}:{obs_d.isoformat()}"
+        return None
+
+    @staticmethod
+    def _canonical_snapshot_hash(payload: dict[str, Any]) -> str:
+        # One helper for producer and reader, so the binding hash can't drift.
+        return canonical_payload_sha256(payload)
+
+    @classmethod
+    def _snapshot_hash_matches(cls, payload: dict[str, Any], expected_hash: Any) -> bool:
+        if type(expected_hash) is not str or not expected_hash.strip():
+            return False
+        exp = expected_hash.strip().lower()
+        if exp.startswith("sha256:"):
+            exp = exp[7:]
+        if not exp:
+            return False
+
+        declared_hashes: list[str] = []
+        for hkey in cls._SNAPSHOT_HASH_KEYS:
+            val = payload.get(hkey)
+            if type(val) is str and val.strip():
+                norm = val.strip().lower()
+                if norm.startswith("sha256:"):
+                    norm = norm[7:]
+                if norm != exp:
+                    return False
+                declared_hashes.append(norm)
+
+        is_sha256_hex = len(exp) == 64 and all(c in "0123456789abcdef" for c in exp)
+        if is_sha256_hex:
+            if cls._canonical_snapshot_hash(payload) == exp:
+                return True
+            stripped = {k: v for k, v in payload.items() if k not in cls._SNAPSHOT_HASH_KEYS}
+            if len(stripped) != len(payload) and cls._canonical_snapshot_hash(stripped) == exp:
+                return True
+            if declared_hashes and all(h == exp for h in declared_hashes) and set(payload.keys()) <= {
+                "snapshot_id", "snapshot_hash", "available_at", "regime", "state",
+                "producer_snapshot_id", "producer_snapshot_hash", "snapshot_sha256",
+            }:
+                return True
+            return False
+        return bool(declared_hashes) and all(h == exp for h in declared_hashes)
+
+    @classmethod
+    def _extract_asserted_regime_label(cls, mapping: dict[str, Any]) -> str | None:
+        for key in ("regime", "state", "inferred_state", "regime_label"):
+            val = mapping.get(key)
+            if type(val) is str and val.strip().upper() not in cls._UNASSERTED_REGIME_LABELS:
+                return val.strip()
+        return None
+
+    @classmethod
+    def _normalize_typed_feature_id(cls, val: Any) -> tuple[tuple[str, Any], str | int] | None:
+        if val is None or isinstance(val, bool):
+            return None
+        if type(val) is int:
+            if val < 0:
+                return None
+            return ("int", val), val
+        if type(val) is str:
+            cleaned = val.strip()
+            if cleaned.lower() in cls._INVALID_FEATURE_ID_STRINGS:
+                return None
+            return ("str", cleaned.casefold()), cleaned
+        return None
+
+    @classmethod
+    def _extract_distinct_eligible_feature_ids(
+        cls,
+        raw_features: Any,
+        *,
+        eligible_ids: set[tuple[str, Any]] | None = None,
+        eligible_int_ids: set[int] | None = None,
+        excluded_ids: set[tuple[str, Any]] | None = None,
+        as_of_dt: datetime | None = None,
+    ) -> list[str | int] | None:
+        """Extract sorted distinct, non-null, typed, eligible feature IDs from a collection."""
+        if not isinstance(raw_features, (dict, list, tuple, set)):
+            return None
+
+        def _entry_eligible(entry: dict[str, Any]) -> bool:
+            if "eligible" in entry and entry["eligible"] is not True:
+                return False
+            if "model_eligible" in entry and entry["model_eligible"] is not True:
+                return False
+            if entry.get("stale") is True:
+                return False
+            if "status" in entry:
+                status_val = entry["status"]
+                if type(status_val) is not str or status_val.strip().lower() in cls._INELIGIBLE_FEATURE_STATUSES:
+                    return False
+            if as_of_dt is not None and cls._clock_sanity_error(entry, as_of_dt) is not None:
+                return False
+            return True
+
+        def _extract_dict_entry_id(entry: dict[str, Any], fallback_key: Any = None) -> tuple[tuple[str, Any], str | int] | None:
+            for id_key in ("feature_id", "id", "feature", "series_id", "name"):
+                if id_key in entry:
+                    return cls._normalize_typed_feature_id(entry[id_key])
+            if fallback_key is not None:
+                return cls._normalize_typed_feature_id(fallback_key)
+            return None
+
+        seen: dict[tuple[str, Any], str | int] = {}
+
+        def _consider(norm_pair: tuple[tuple[str, Any], str | int] | None, alias_key: tuple[str, Any] | None = None) -> None:
+            if norm_pair is None:
+                return
+            norm_key, display_val = norm_pair
+            if excluded_ids and (norm_key in excluded_ids or (alias_key is not None and alias_key in excluded_ids)):
+                return
+            if eligible_ids is not None and norm_key not in eligible_ids and (alias_key is None or alias_key not in eligible_ids):
+                return
+            if eligible_int_ids is not None and norm_key[0] == "int" and norm_key[1] not in eligible_int_ids:
+                return
+            seen.setdefault(norm_key, display_val)
+
+        if isinstance(raw_features, dict):
+            for k, v in raw_features.items():
+                key_pair = cls._normalize_typed_feature_id(k)
+                if key_pair is None:
+                    continue
+                if isinstance(v, dict):
+                    if not _entry_eligible(v):
+                        continue
+                    _consider(_extract_dict_entry_id(v, fallback_key=k), alias_key=key_pair[0])
+                else:
+                    _consider(cls._normalize_typed_feature_id(v), alias_key=key_pair[0])
+        else:
+            for item in raw_features:
+                if isinstance(item, dict):
+                    if not _entry_eligible(item):
+                        continue
+                    _consider(_extract_dict_entry_id(item))
+                else:
+                    _consider(cls._normalize_typed_feature_id(item))
+
+        return [val for _, val in sorted(seen.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))]
+
+    @classmethod
+    def _validate_carried_regime(
+        cls,
+        regime: Any,
+        as_of_dt: datetime | None,
+        as_of_date: date | None = None,
+    ) -> tuple[bool, str | None]:
+        """Validate a carried ``latest_regime`` dict before rendering."""
+        if not isinstance(regime, dict):
+            return False, "invalid_regime_container"
+        label = cls._extract_asserted_regime_label(regime)
+        if label is None:
+            return False, "missing_regime_label"
+        clock_err = cls._clock_sanity_error(regime, as_of_dt, as_of_date)
+        if clock_err is not None:
+            return False, clock_err
+        for snap_key in ("producer_snapshot", "analytical_snapshot"):
+            if snap_key not in regime or regime[snap_key] is None:
+                continue
+            psnap = regime[snap_key]
+            if not isinstance(psnap, dict):
+                return False, f"invalid_{snap_key}"
+            p_err = cls._clock_sanity_error(psnap, as_of_dt, as_of_date)
+            if p_err is not None:
+                return False, f"{snap_key}_{p_err}"
+            p_label = cls._extract_asserted_regime_label(psnap)
+            if p_label is None:
+                return False, f"{snap_key}_missing_regime_label"
+            if p_label.upper() != label.upper():
+                return False, f"{snap_key}_regime_mismatch"
+            expected_id = next((regime[k] for k in cls._SNAPSHOT_ID_KEYS if regime.get(k) is not None), None)
+            actual_id = next((psnap[k] for k in ("id", *cls._SNAPSHOT_ID_KEYS) if psnap.get(k) is not None), None)
+            if expected_id is not None and actual_id is not None and actual_id != expected_id:
+                return False, f"{snap_key}_id_mismatch"
+            expected_hash = next((regime[k] for k in cls._SNAPSHOT_HASH_KEYS if regime.get(k) is not None), None)
+            if expected_hash is not None and not cls._snapshot_hash_matches(psnap, expected_hash):
+                return False, f"{snap_key}_hash_mismatch"
+        return True, None
+
     def __init__(
         self,
         ollama_client: Any = None,
@@ -733,9 +1100,10 @@ class MarketBriefingEngine:
         Returns:
             dict: Structured market data snapshot.
         """
+        now_utc = datetime.now(timezone.utc)
         snapshot: dict[str, Any] = {
-            "timestamp": datetime.now().isoformat(),
-            "date": date.today().isoformat(),
+            "timestamp": now_utc.isoformat(),
+            "date": now_utc.date().isoformat(),
             "equities": {},
             "equity_volume": {},
             "rates": {},
@@ -764,9 +1132,14 @@ class MarketBriefingEngine:
                     ],
                     # FRED series are stored bare in raw_series (fred.py
                     # writes the FRED id as series_id), never "FRED:<id>".
-                    # DGS10 is not in FRED_SERIES_LIST, so DGS5 stands in.
+                    # The 10-year yield is read from raw "yc_10y" (written
+                    # by ingestion/altdata/yield_curve_full.py from FRED
+                    # DGS10; entity_map maps it to treasury_10y) and shown
+                    # under the "DGS10" label grounding uses. Bare raw
+                    # "DGS10" has had no pull since 2026-04, so it is never
+                    # read here (it would publish a stale 10-year).
                     "rates": [
-                        "DFF", "T10Y2Y", "T10Y3M", "DGS2", "DGS5",
+                        "DFF", "T10Y2Y", "T10Y3M", "DGS2", "DGS5", "yc_10y",
                     ],
                     "credit": [
                         "YF:HYG:close", "YF:LQD:close", "YF:JNK:close",
@@ -791,12 +1164,13 @@ class MarketBriefingEngine:
                     ],
                 }
 
-                now_utc = datetime.now(timezone.utc)
+                as_of_date = now_utc.date()
                 for category, series_ids in key_series.items():
                     for sid in series_ids:
                         # Extract a clean label
                         parts = sid.split(":")
                         label = parts[1] if len(parts) > 1 else sid
+                        label = _RAW_SERIES_LABEL_ALIASES.get(sid, label)
                         if sid.startswith("YF:"):
                             entry = _read_yf_snapshot_value(conn, sid, now_utc)
                             if entry:
@@ -806,11 +1180,20 @@ class MarketBriefingEngine:
                             text(
                                 "SELECT value, obs_date FROM raw_series "
                                 "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                                "AND obs_date <= :as_of_date "
                                 "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                             ),
-                            {"sid": sid},
+                            {"sid": sid, "as_of_date": as_of_date},
                         ).fetchone()
                         if row:
+                            obs_d, _, _ = self._parse_utc_clock(row[1])
+                            if obs_d is None or obs_d > as_of_date:
+                                log.warning(
+                                    "Market briefing rejected future/invalid raw_series row "
+                                    "for {sid}: obs_date={d} > {asof}",
+                                    sid=sid, d=row[1], asof=as_of_date,
+                                )
+                                continue
                             snapshot[category][label] = {
                                 "value": round(row[0], 4),
                                 "date": str(row[1]),
@@ -868,19 +1251,28 @@ class MarketBriefingEngine:
                             "  FROM resolved_series rs "
                             "  WHERE rs.feature_id = fr.id "
                             "  AND rs.release_date IS NOT NULL "
-                            "  ORDER BY rs.obs_date DESC, rs.release_date DESC "
+                            "  AND rs.obs_date <= :as_of_date "
+                            "  AND rs.release_date <= :as_of_date "
+                            "  AND rs.vintage_date <= :as_of_date "
+                            "  ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC "
                             "  LIMIT 1"
                             ") latest ON TRUE "
                             "WHERE fr.id = ANY(:fids) "
                             "ORDER BY fr.name"
                         ),
-                        {"fids": feature_ids},
+                        {"fids": feature_ids, "as_of_date": as_of_date},
                     ).fetchall()
 
-                snapshot["features"] = {
-                    row[0]: {"value": round(row[1], 4), "date": str(row[2])}
-                    for row in feature_rows
-                }
+                snapshot["features"] = {}
+                for row in feature_rows:
+                    obs_d, _, _ = self._parse_utc_clock(row[2])
+                    if obs_d is None or obs_d > as_of_date:
+                        log.warning(
+                            "Market briefing rejected future/invalid feature row {name}: obs_date={d} > {asof}",
+                            name=row[0], d=row[2], asof=as_of_date,
+                        )
+                        continue
+                    snapshot["features"][row[0]] = {"value": round(row[1], 4), "date": str(row[2])}
 
                 # SPY put/call ratio — explicit lookup so the briefing writer
                 # has a real number to cite. On 2026-09-23 the LLM published
@@ -888,28 +1280,246 @@ class MarketBriefingEngine:
                 # input anywhere; number_grounding.py now catches an invented
                 # figure like that, but the better fix is to also give the
                 # model the real one to cite instead. See _fetch_spy_put_call.
-                snapshot["options"] = {"spy_put_call": self._fetch_spy_put_call(conn)}
+                snapshot["options"] = {"spy_put_call": self._fetch_spy_put_call(conn, as_of_date=as_of_date)}
 
-                # Get latest regime inference if available
+                # Get latest regime inference bound to decision clock and exact producer snapshot
                 regime_row = conn.execute(
                     text(
                         "SELECT inferred_state, state_confidence, "
                         "transition_probability, contradiction_flags, "
                         "grid_recommendation, decision_timestamp "
                         "FROM decision_journal "
+                        "WHERE decision_timestamp <= :as_of "
                         "ORDER BY decision_timestamp DESC LIMIT 1"
-                    )
+                    ),
+                    {"as_of": now_utc},
                 ).fetchone()
 
                 if regime_row:
-                    snapshot["latest_regime"] = {
-                        "state": regime_row[0],
-                        "confidence": round(regime_row[1], 4),
-                        "transition_prob": round(regime_row[2], 4),
-                        "contradictions": regime_row[3],
-                        "recommendation": regime_row[4],
-                        "timestamp": str(regime_row[5]),
-                    }
+                    def _withhold_regime(reason: str, **details: Any) -> None:
+                        log.warning(
+                            "Market briefing withheld latest_regime: reason={r} details={d}",
+                            r=reason, d=details,
+                        )
+                        snapshot["latest_regime_withheld"] = {"reason": reason, **details}
+
+                    raw_state = regime_row[0]
+                    state_label = (
+                        raw_state.strip()
+                        if type(raw_state) is str
+                        and raw_state.strip().upper() not in self._UNASSERTED_REGIME_LABELS
+                        else None
+                    )
+                    dec_date, dec_dt, dec_date_only = self._parse_utc_clock(regime_row[5])
+                    if state_label is None:
+                        _withhold_regime("missing_regime_label", raw_state=raw_state)
+                    elif dec_date is None or dec_dt is None:
+                        _withhold_regime("invalid_regime_timestamp", timestamp=str(regime_row[5]))
+                    elif (dec_date_only and dec_date > as_of_date) or (not dec_date_only and dec_dt > now_utc):
+                        _withhold_regime(
+                            "future_regime_timestamp",
+                            timestamp=str(regime_row[5]),
+                            decision_clock=now_utc.isoformat(),
+                        )
+                    else:
+                        raw_flags = regime_row[3]
+                        if isinstance(raw_flags, str):
+                            try:
+                                raw_flags = json.loads(raw_flags)
+                            except ValueError:
+                                raw_flags = None
+                        flags_dict = raw_flags if isinstance(raw_flags, dict) else {}
+                        flags_clock_err = self._clock_sanity_error(flags_dict, now_utc, as_of_date)
+                        if flags_clock_err is not None:
+                            _withhold_regime(f"invalid_regime_flags_clock:{flags_clock_err}")
+                        else:
+                            eligible_int_ids = {
+                                fid for fid in feature_ids if type(fid) is int and fid >= 0
+                            } or None
+                            expected_snap_id: int | str | None = None
+                            invalid_binding_ref = False
+                            for sid_key in self._SNAPSHOT_ID_KEYS:
+                                if sid_key in flags_dict:
+                                    raw_sid = flags_dict[sid_key]
+                                    if (type(raw_sid) is int and raw_sid >= 0) or (type(raw_sid) is str and raw_sid.strip()):
+                                        expected_snap_id = raw_sid.strip() if type(raw_sid) is str else raw_sid
+                                        break
+                                    invalid_binding_ref = True
+                                    break
+                            expected_snap_hash: str | None = None
+                            for h_key in self._SNAPSHOT_HASH_KEYS:
+                                if h_key in flags_dict:
+                                    raw_h = flags_dict[h_key]
+                                    if type(raw_h) is str and raw_h.strip():
+                                        expected_snap_hash = raw_h.strip()
+                                        break
+                                    invalid_binding_ref = True
+                                    break
+
+                            if invalid_binding_ref:
+                                _withhold_regime("invalid_producer_snapshot_reference")
+                            elif expected_snap_id is not None or expected_snap_hash is not None:
+                                try:
+                                    if expected_snap_id is not None:
+                                        res = conn.execute(
+                                            text(
+                                                "SELECT id, payload, created_at, as_of_date "
+                                                "FROM analytical_snapshots "
+                                                "WHERE category = :category AND id = :snapshot_id "
+                                                "AND created_at <= :as_of "
+                                                "LIMIT 1"
+                                            ),
+                                            {
+                                                "category": "regime_detection",
+                                                "snapshot_id": expected_snap_id,
+                                                "as_of": now_utc,
+                                            },
+                                        )
+                                        one = res.fetchone()
+                                        candidate_rows = [one] if one is not None else []
+                                    else:
+                                        res = conn.execute(
+                                            text(
+                                                "SELECT id, payload, created_at, as_of_date "
+                                                "FROM analytical_snapshots "
+                                                "WHERE category = :category AND created_at <= :as_of "
+                                                "ORDER BY created_at DESC, id DESC LIMIT 20"
+                                            ),
+                                            {"category": "regime_detection", "as_of": now_utc},
+                                        )
+                                        candidate_rows = list(res.fetchall())
+                                        if not candidate_rows:
+                                            one = res.fetchone()
+                                            if one is not None:
+                                                candidate_rows = [one]
+                                except Exception as snap_exc:
+                                    candidate_rows = []
+                                    log.warning(
+                                        "Market briefing producer snapshot lookup failed: {e}",
+                                        e=str(snap_exc),
+                                    )
+
+                                matched_row: tuple[Any, dict[str, Any], datetime, date | None] | None = None
+                                mismatch_reason = "producer_snapshot_not_found"
+                                for raw_srow in candidate_rows:
+                                    srow = self._row_values(raw_srow)
+                                    if srow is None or len(srow) < 3:
+                                        mismatch_reason = "producer_snapshot_incomplete_columns"
+                                        continue
+                                    s_id = srow[0]
+                                    s_payload = srow[1]
+                                    s_created = srow[2]
+                                    s_asof = srow[3] if len(srow) >= 4 else None
+                                    if isinstance(s_payload, str):
+                                        try:
+                                            s_payload = json.loads(s_payload)
+                                        except ValueError:
+                                            mismatch_reason = "producer_snapshot_malformed_payload"
+                                            continue
+                                    if not isinstance(s_payload, dict):
+                                        mismatch_reason = "producer_snapshot_malformed_payload"
+                                        continue
+                                    if expected_snap_id is not None and s_id != expected_snap_id:
+                                        mismatch_reason = "producer_snapshot_id_mismatch"
+                                        continue
+                                    if expected_snap_hash is not None and not self._snapshot_hash_matches(s_payload, expected_snap_hash):
+                                        mismatch_reason = "producer_snapshot_hash_mismatch"
+                                        continue
+                                    c_date, c_dt, c_date_only = self._parse_utc_clock(s_created)
+                                    if c_date is None or c_dt is None:
+                                        mismatch_reason = "producer_snapshot_missing_availability_clock"
+                                        continue
+                                    if (c_date_only and c_date > as_of_date) or (not c_date_only and c_dt > now_utc):
+                                        mismatch_reason = "producer_snapshot_future_clock"
+                                        continue
+                                    asof_d: date | None = None
+                                    if s_asof is not None:
+                                        asof_d, _, _ = self._parse_utc_clock(s_asof)
+                                        if asof_d is None or asof_d > as_of_date:
+                                            mismatch_reason = "producer_snapshot_future_as_of_date"
+                                            continue
+                                    p_clock_err = self._clock_sanity_error(s_payload, now_utc, as_of_date)
+                                    if p_clock_err is not None:
+                                        mismatch_reason = f"producer_snapshot_{p_clock_err}"
+                                        continue
+                                    snap_regime = self._extract_asserted_regime_label(s_payload)
+                                    if snap_regime is None:
+                                        mismatch_reason = "producer_snapshot_missing_regime_label"
+                                        continue
+                                    if snap_regime.upper() != state_label.upper():
+                                        mismatch_reason = "producer_snapshot_regime_mismatch"
+                                        continue
+                                    matched_row = (s_id, s_payload, c_dt, asof_d)
+                                    break
+
+                                if matched_row is None:
+                                    _withhold_regime(
+                                        mismatch_reason,
+                                        snapshot_id=expected_snap_id,
+                                        snapshot_hash=expected_snap_hash,
+                                    )
+                                else:
+                                    s_id, s_payload, c_dt, _ = matched_row
+                                    actual_hash = self._canonical_snapshot_hash(s_payload)
+                                    try:
+                                        elig_items, excl_items = producer_feature_filters(s_payload)
+                                    except InvalidFeatureFilter as filter_exc:
+                                        elig_items, excl_items = None, None
+                                        _withhold_regime(
+                                            "producer_snapshot_invalid_feature_filter",
+                                            snapshot_id=s_id,
+                                            detail=str(filter_exc),
+                                        )
+                                    if excl_items is not None:
+                                        excluded_set: set[tuple[str, Any]] | None = {
+                                            pair[0]
+                                            for item in excl_items
+                                            if (pair := self._normalize_typed_feature_id(item)) is not None
+                                        } or None
+                                        # A declared empty eligibility list means nothing is eligible.
+                                        eligible_set: set[tuple[str, Any]] | None = None if elig_items is None else {
+                                            pair[0]
+                                            for item in elig_items
+                                            if (pair := self._normalize_typed_feature_id(item)) is not None
+                                        }
+                                        distinct_ids = self._extract_distinct_eligible_feature_ids(
+                                            s_payload.get("features_used"),
+                                            eligible_ids=eligible_set,
+                                            eligible_int_ids=eligible_int_ids,
+                                            excluded_ids=excluded_set,
+                                            as_of_dt=now_utc,
+                                        )
+                                        avail_iso = c_dt.isoformat()
+                                        latest_regime: dict[str, Any] = {
+                                            "state": state_label,
+                                            "confidence": round(regime_row[1], 4),
+                                            "transition_prob": round(regime_row[2], 4),
+                                            "contradictions": strip_binding_flags(regime_row[3]),
+                                            "recommendation": regime_row[4],
+                                            "timestamp": str(regime_row[5]),
+                                            "snapshot_id": s_id,
+                                            "snapshot_hash": actual_hash,
+                                            "snapshot_available_at": avail_iso,
+                                            "producer_snapshot": {
+                                                "snapshot_id": s_id,
+                                                "snapshot_hash": actual_hash,
+                                                "available_at": avail_iso,
+                                                "regime": self._extract_asserted_regime_label(s_payload),
+                                            },
+                                        }
+                                        if distinct_ids is not None:
+                                            latest_regime["bound_inputs"] = len(distinct_ids)
+                                            latest_regime["eligible_feature_ids"] = distinct_ids
+                                        snapshot["latest_regime"] = latest_regime
+                            elif "features_used" in flags_dict:
+                                # Legacy journal rows list features inline, with no producer
+                                # snapshot to prove them: a hash of the journal row itself
+                                # proves nothing. The regime stays unverified and is withheld.
+                                _withhold_regime("unverified_inline_binding")
+                            else:
+                                # Fail closed: never select an unbound latest analytical_snapshots
+                                # row to lend its feature count to this regime.
+                                _withhold_regime("missing_producer_snapshot_binding")
 
                 # Convergence signals from trust scorer
                 try:
@@ -955,7 +1565,7 @@ class MarketBriefingEngine:
 
         return snapshot
 
-    def _fetch_spy_put_call(self, conn: Any) -> dict[str, Any] | None:
+    def _fetch_spy_put_call(self, conn: Any, *, as_of_date: date | None = None) -> dict[str, Any] | None:
         """Fetch the latest SPY put/call ratio (open interest, all expiries).
 
         Tries the resolved feature ``spy_pcr`` first — the PIT-correct
@@ -998,11 +1608,15 @@ class MarketBriefingEngine:
                 {"name": "spy_pcr"},
             ).fetchone()
             if row and row[0] is not None and float(row[0]) > 0:
-                return {
-                    "value": round(float(row[0]), 4),
-                    "date": str(row[1]),
-                    "source": "spy_pcr",
-                }
+                obs_d, _, _ = self._parse_utc_clock(row[1])
+                if as_of_date is not None and (obs_d is None or obs_d > as_of_date):
+                    log.warning("Market briefing rejected future/invalid spy_pcr date: {d}", d=row[1])
+                else:
+                    return {
+                        "value": round(float(row[0]), 4),
+                        "date": str(row[1]),
+                        "source": "spy_pcr",
+                    }
 
             from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
@@ -1016,11 +1630,15 @@ class MarketBriefingEngine:
                 {"ticker": "SPY"},
             ).fetchone()
             if row and row[0] is not None and float(row[0]) > 0:
-                return {
-                    "value": round(float(row[0]), 4),
-                    "date": str(row[1]),
-                    "source": "options_daily_signals",
-                }
+                obs_d, _, _ = self._parse_utc_clock(row[1])
+                if as_of_date is not None and (obs_d is None or obs_d > as_of_date):
+                    log.warning("Market briefing rejected future/invalid options_daily_signals date: {d}", d=row[1])
+                else:
+                    return {
+                        "value": round(float(row[0]), 4),
+                        "date": str(row[1]),
+                        "source": "options_daily_signals",
+                    }
         except Exception as exc:
             log.warning("Could not fetch SPY put/call ratio: {e}", e=str(exc))
 
@@ -1104,6 +1722,8 @@ class MarketBriefingEngine:
                      "a same-civil-date mismatch is conditional until a common basis is declared.")
         lines.append("")
 
+        snap_date, snap_dt = self._resolve_decision_clock(snapshot)
+
         for category, data in self._publication_display_categories(snapshot):
             if data:
                 heading = "EQUITY ETF PROXIES" if category == "equity_etf_proxies" else category.upper()
@@ -1113,6 +1733,14 @@ class MarketBriefingEngine:
                     if category == "volatility" and tenor in facts['vix_observation_dates'] and facts['vix_observation_dates'][tenor] is None:
                         lines.append(f"- {label}: unavailable at snapshot cutoff {facts['snapshot_cutoff_date']} "
                                      f"(source observation date: {(info or {}).get('date')})")
+                        continue
+                    clock_err = self._clock_sanity_error(info, snap_dt, snap_date)
+                    if clock_err is not None:
+                        log.warning(
+                            "Market briefing withheld {cat}:{lbl} from data_context: {err}",
+                            cat=category, lbl=label, err=clock_err,
+                        )
+                        lines.append(f"- {category}:{label}: unavailable ({clock_err})")
                         continue
                     lines.append(self._format_evidence_value(category, label, info))
                 lines.append("")
@@ -1161,35 +1789,25 @@ class MarketBriefingEngine:
                          + json.dumps(declared, sort_keys=True, ensure_ascii=True))
         lines.append("")
 
-        # Feature values — select most informative via orthogonality
+        # Feature values — select most informative via orthogonality (shared with fallback)
         features = snapshot.get("features", {})
-        if features:
-            try:
-                from analysis.prompt_optimizer import select_prompt_features
-
-                # Preserve the existing selector inputs/ordering. Its z field is
-                # a raw-value ranking proxy here, never displayed as measured z.
-                feat_list = [
-                    {"name": name, "z": info["value"], "value": info["value"]}
-                    for name, info in features.items()
-                    if info.get("value") is not None
-                ]
-                selected = select_prompt_features(feat_list, max_count=20, corr_threshold=0.7)
-                lines.append(f"### GRID FEATURES ({len(features)} total, {len(selected)} selected by orthogonality)")
-                lines.append("Selection uses absolute raw-value ranking proxies, not measured z-scores.")
-                for feature in selected:
-                    name = feature["name"]
-                    lines.append(self._format_evidence_value("features", name, features[name]))
-                lines.append("")
-            except Exception:
-                # Fallback to simple truncation
-                lines.append(f"### GRID FEATURES ({len(features)} total, showing top 20)")
-                shown = 0
-                for name, info in features.items():
-                    if shown >= 20:
-                        break
-                    lines.append(self._format_evidence_value("features", name, info))
-                    shown += 1
+        if isinstance(features, dict) and features:
+            valid_features: dict[str, Any] = {}
+            for fname, finfo in features.items():
+                f_err = self._clock_sanity_error(finfo, snap_dt, snap_date)
+                if f_err is not None:
+                    log.warning("Market briefing withheld feature {name} from data_context: {err}", name=fname, err=f_err)
+                    continue
+                valid_features[fname] = finfo
+            if valid_features:
+                selected_names, used_selector = self._select_display_features(valid_features, max_count=20)
+                if used_selector:
+                    lines.append(f"### GRID FEATURES ({len(valid_features)} total, {len(selected_names)} selected by orthogonality)")
+                    lines.append("Selection uses absolute raw-value ranking proxies, not measured z-scores.")
+                else:
+                    lines.append(f"### GRID FEATURES ({len(valid_features)} total, showing top 20)")
+                for name in selected_names:
+                    lines.append(self._format_evidence_value("features", name, valid_features[name]))
                 lines.append("")
 
         # SPY put/call ratio — explicit, clearly-labeled section so the
@@ -1197,6 +1815,11 @@ class MarketBriefingEngine:
         # the 2026-09-23 "P/C ratio of 8.96" incident — this section did
         # not exist and no put/call input reached the prompt at all).
         pcr = snapshot.get("options", {}).get("spy_put_call")
+        if pcr is not None:
+            pcr_err = self._clock_sanity_error(pcr, snap_dt, snap_date)
+            if pcr_err is not None:
+                log.warning("Market briefing withheld options.spy_put_call: {err}", err=pcr_err)
+                pcr = None
         lines.append("### OPTIONS — SPY PUT/CALL RATIO")
         if pcr:
             typed_options = ("metric_contract" in pcr or "metric_assertion" in pcr)
@@ -1232,15 +1855,19 @@ class MarketBriefingEngine:
         # Latest regime
         regime = snapshot.get("latest_regime")
         if regime:
-            lines.append("### LATEST REGIME INFERENCE")
-            lines.append(f"- State: {regime['state']}")
-            lines.append(f"- Reported classifier confidence (calibration unverified): {regime['confidence']}")
-            lines.append(f"- Reported transition score (calibration unverified): {regime['transition_prob']}")
-            lines.append(f"- Journal recommendation (unvalidated policy): {regime['recommendation']}")
-            lines.append(f"- Timestamp: {regime['timestamp']}")
-            if regime.get("contradictions"):
-                lines.append(f"- Contradictions: {json.dumps(regime['contradictions'])}")
-            lines.append("")
+            regime_ok, regime_err = self._validate_carried_regime(regime, snap_dt, snap_date)
+            if not regime_ok:
+                log.warning("Market briefing withheld latest_regime from data_context: {err}", err=regime_err)
+            else:
+                lines.append("### LATEST REGIME INFERENCE")
+                lines.append(f"- State: {regime['state']}")
+                lines.append(f"- Reported classifier confidence (calibration unverified): {regime['confidence']}")
+                lines.append(f"- Reported transition score (calibration unverified): {regime['transition_prob']}")
+                lines.append(f"- Journal recommendation (unvalidated policy): {regime['recommendation']}")
+                lines.append(f"- Timestamp: {regime['timestamp']}")
+                if regime.get("contradictions"):
+                    lines.append(f"- Contradictions: {json.dumps(regime['contradictions'])}")
+                lines.append("")
 
         # Convergence signals
         convergence = snapshot.get("convergence")
@@ -1479,6 +2106,17 @@ class MarketBriefingEngine:
 
         from ollama.number_grounding import annotate_publication_context, check_publication_claims
 
+        # ── Truncation guard (raw model output, before context annotation) ──
+        # Inspect the backend stop reason (primary signal) or fallback text
+        # heuristic on the raw candidate BEFORE annotate_publication_context can
+        # replace or append clauses. On non-receipted calls retry once with a
+        # larger token budget; if still truncated, withhold and emit summary.
+        raw_truncation = (
+            self._detect_truncation(candidate, self.ollama)
+            if candidate is not None
+            else None
+        )
+
         claim_guard = check_publication_claims(content, actor_evidence=snapshot.get("actor_evidence"))
         rejected = content if not claim_guard["passed"] else None
         if receipt_callback is not None:
@@ -1487,8 +2125,51 @@ class MarketBriefingEngine:
             else:
                 candidate_guard = _publication_guard("CANDIDATE", candidate, claim_guard)
         snapshot["publication_claim_guard"] = claim_guard
+
+        truncation = (
+            raw_truncation
+            if candidate is not None and claim_guard["passed"]
+            else None
+        )
+        if truncation is not None and receipt_callback is None:
+            log.warning(
+                "Briefing response appeared truncated ({r}); retrying once with num_predict=1600",
+                r=truncation["reason"],
+            )
+            retry_content = self.ollama.chat(
+                messages=messages,
+                temperature=0.4,
+                num_predict=1600,
+            )
+            if retry_content is not None:
+                retry_truncation = self._detect_truncation(retry_content, self.ollama)
+                retry_claim_guard = check_publication_claims(
+                    retry_content, actor_evidence=snapshot.get("actor_evidence"),
+                )
+                if retry_claim_guard["passed"] and retry_truncation is None:
+                    candidate = retry_content
+                    content = retry_content
+                    claim_guard = retry_claim_guard
+                    snapshot["publication_claim_guard"] = claim_guard
+                    snapshot["truncation_guard"] = {
+                        "passed": True,
+                        "retried": True,
+                        "initial_reason": truncation["reason"],
+                    }
+                    truncation = None
+                elif not retry_claim_guard["passed"]:
+                    candidate = retry_content
+                    content = retry_content
+                    rejected = retry_content
+                    claim_guard = retry_claim_guard
+                    snapshot["publication_claim_guard"] = claim_guard
+                    truncation = None
+                else:
+                    truncation = retry_truncation
+
         content, context_guard = annotate_publication_context(content, snapshot)
         snapshot["publication_context_guard"] = context_guard
+
         if not claim_guard["passed"]:
             # Replace the whole candidate instead of leaving its causal story
             # intact with a numeric footnote. Only future generations change.
@@ -1517,22 +2198,44 @@ class MarketBriefingEngine:
             )
             # Existing PR844 internal retention; never input to the summary.
             claim_guard["rejected_candidate"] = rejected
+        elif truncation is not None:
+            log.warning(
+                "Briefing truncation guard withheld {t} narrative: reason={r}",
+                t=briefing_type, r=truncation["reason"],
+            )
+            snapshot["truncation_guard"] = {"passed": False, **truncation}
+            publication_status.update(content_kind="data_summary", reason="truncated_response")
+            summary = self._generate_fallback_briefing(snapshot, reason="truncated_response")
+            fallback_source_text = summary
+            summary_guard = check_publication_claims(summary, actor_evidence=snapshot.get("actor_evidence"))
+            if receipt_callback is not None:
+                fallback_guards.append(_publication_guard("DATA_SUMMARY", summary, summary_guard))
+            claim_guard["fallback"] = summary_guard
+            summary, fallback_context_guard = annotate_publication_context(summary, snapshot)
+            context_guard["fallback"] = fallback_context_guard
+            if not summary_guard["passed"]:
+                emit_receipt(None, "guard_withheld")
+                raise ValueError("Data summary withheld: unsupported source interpretation.")
+            content = (
+                "**AI narrative withheld: response truncated before completion. Data summary only.**\n\n"
+                + summary
+            )
+        elif "truncation_guard" not in snapshot:
+            snapshot["truncation_guard"] = {"passed": True, "reason": None}
 
         snapshot["publication_status"] = publication_status
 
         # ── Number-grounding gate ──
         # Runs on every generated briefing before it is written: numeric
         # claims (decimals, percents, $ amounts, ratios) must be backed by
-        # a number actually present in `data_context` — the same text
-        # handed to the LLM above. Catches invented figures with no basis
-        # at all (the 2026-09-23 "P/C ratio of 8.96" incident) that a
-        # prompt instruction alone did not stop. See ollama/number_grounding.py.
+        # a matching (instrument, value) pair in `data_context` when an
+        # instrument is named, or by a value in `data_context` otherwise.
         from ollama.number_grounding import (
-            check_numbers_grounded, _annotate_inline, _BANNER_TEMPLATE, _FOOTER_TEMPLATE,
+            _annotate_inline, _BANNER_TEMPLATE, _FOOTER_TEMPLATE,
         )
 
         grounding_input = content
-        grounding = check_numbers_grounded(content, data_context)
+        grounding = self._check_numbers_grounded_by_instrument(content, data_context)
         content = grounding.annotated_text
         grounding_stats = grounding.to_dict()
         ungrounded_count = grounding_stats.get("ungrounded_count")
@@ -1787,6 +2490,636 @@ class MarketBriefingEngine:
         )
 
     @staticmethod
+    def _select_display_features(
+        features: dict[str, Any], max_count: int = 20,
+    ) -> tuple[list[str], bool]:
+        """Select the same feature names for both data_context and fallback summary."""
+        if not features:
+            return [], False
+        try:
+            from analysis.prompt_optimizer import select_prompt_features
+
+            # Preserve the existing selector inputs/ordering. Its z field is
+            # a raw-value ranking proxy here, never displayed as measured z.
+            feat_list = [
+                {"name": name, "z": info["value"], "value": info["value"]}
+                for name, info in features.items()
+                if isinstance(info, dict) and info.get("value") is not None
+            ]
+            selected = select_prompt_features(feat_list, max_count=max_count, corr_threshold=0.7)
+            return [feature["name"] for feature in selected], True
+        except Exception:
+            return list(features.keys())[:max_count], False
+
+    @staticmethod
+    def _detect_truncation(text: str | None, client: Any = None) -> dict[str, Any] | None:
+        """Detect LLM output truncation via client stop reason (primary) or mid-sentence fallback.
+
+        When the client exposes a non-empty stop reason (Ollama ``done_reason`` or
+        OpenAI/llama.cpp ``finish_reason``), that signal is authoritative: ``'length'``
+        (or ``'max_tokens'`` / ``'max_output_tokens'``) flags truncation regardless of
+        text, while any other stop reason (e.g. ``'stop'``) passes without invoking
+        the text heuristic.
+
+        Only when no stop reason is available does the fallback text heuristic run,
+        flagging unclosed code fences/bold or a last line that ends mid-sentence
+        (lowercase word or trailing comma/connector with no terminal punctuation)
+        while allowing numbers/%, parentheticals, bold/italic footers, ``---``,
+        list items, headings, and table rows.
+        """
+        import re
+
+        for attr in ("last_finish_reason", "last_done_reason", "finish_reason", "done_reason"):
+            raw_reason = getattr(client, attr, None)
+            if isinstance(raw_reason, str) and raw_reason.strip():
+                normalized = raw_reason.strip().lower()
+                if normalized in {"length", "max_tokens", "max_output_tokens"}:
+                    return {"reason": "finish_reason_length", "finish_reason": normalized}
+                return None
+
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        stripped = text.rstrip()
+        if stripped.count("```") % 2 == 1:
+            return {"reason": "unclosed_code_fence", "finish_reason": None}
+        last_line = stripped.splitlines()[-1].strip()
+        if last_line.count("**") % 2 == 1:
+            return {"reason": "unclosed_markdown", "finish_reason": None}
+
+        # Legitimate non-sentence endings: headings, horizontal rules, list items,
+        # table rows, code fences, terminal punctuation, digits, %, ), ], *, _, `.
+        if (
+            last_line.startswith("#")
+            or re.fullmatch(r"[-*_]{3,}", last_line)
+            or re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)", last_line)
+            or last_line.endswith("|")
+            or last_line.endswith("```")
+            or re.search(r'[.!?…]["\'”’)\]*_`]*$', last_line)
+            or re.search(r'[\d%)\]*_`]$', last_line)
+        ):
+            return None
+
+        # Only flag mid-sentence truncation: trailing comma/connector or lowercase word.
+        if (
+            re.search(r"[,;:—–/&]$", last_line)
+            or re.search(r"(?:\s+-|--)$", last_line)
+            or re.search(r"(?:^|[\s(\[/—–-])([a-z][a-z'-]*)$", last_line)
+        ):
+            return {"reason": "mid_sentence_truncation", "finish_reason": None}
+        return None
+
+    @staticmethod
+    def _instrument_patterns() -> tuple[tuple[str, str], ...]:
+        """Ordered (canonical_instrument, regex) table — specific spans before broad ones."""
+        bare_tenor_ahead = (
+            r"(?="
+            r"(?:\s*(?:[:,=(]\s*|\s+))"
+            r"(?:(?:is|was|are|were|at|near|around|about|roughly|currently|now|still|"
+            r"stands?|standing|sits?|sitting|holds?|holding|remains?|remaining|"
+            r"trades?|trading|prints?|printed|closed?|closing|settled?|settling|"
+            r"hovers?|hovering|yields?|yielding|of|to|in|above|below|"
+            r"rose|fell|dropped|climbed|edged|ticked|moved)\s+){0,3}"
+            r"\(?\s*(?!\d{4}(?:-\d{2}|\b))[+\-\u2212]?\d+(?:\.\d+)?"
+            r")"
+        )
+        return (
+            (
+                "T10Y2Y",
+                r"\b(?:T10Y2Y|"
+                r"(?:10Y[\s/-]*2Y|2Y[\s/-]*10Y)(?:\s+(?:yield\s+curve\s+|Treasury\s+)?spread)?|"
+                r"2s10s|10s2s|"
+                r"10[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s*(?:minus|/|-|and|vs\.?|versus|to)\s*2[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s+(?:yield\s+curve\s+|Treasury\s+)?spread|"
+                r"2[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s*(?:minus|/|-|and|vs\.?|versus|to)\s*10[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s+(?:yield\s+curve\s+|Treasury\s+)?spread|"
+                r"10[- ]?(?:year|yr)\s*(?:minus|/|-)\s*2[- ]?(?:year|yr)(?:\s+spread)?)\b",
+            ),
+            (
+                "T10Y3M",
+                r"\b(?:T10Y3M|"
+                r"(?:10Y[\s/-]*3M|3M[\s/-]*10Y)(?:\s+(?:yield\s+curve\s+|Treasury\s+)?spread)?|"
+                r"3m10y|"
+                r"10[- ]?(?:year|yr)(?:\s+(?:Treasury\s+)?yields?)?\s*(?:minus|/|-|and|vs\.?|versus|to)\s*3[- ]?(?:month|mo)(?:\s+(?:Treasury\s+)?yields?)?\s+(?:yield\s+curve\s+|Treasury\s+)?spread|"
+                r"10[- ]?(?:year|yr)\s*(?:minus|/|-)\s*3[- ]?(?:month|mo)(?:\s+spread)?)\b",
+            ),
+            ("T5YIE", r"\b(?:T5YIE|5[- ]?(?:year|yr)\s+breakevens?(?:\s+inflation)?|5Y\s+breakevens?)\b"),
+            ("T10YIE", r"\b(?:T10YIE|10[- ]?(?:year|yr)\s+breakevens?(?:\s+inflation)?|10Y\s+breakevens?)\b"),
+            ("DFII10", r"\b(?:DFII10|10[- ]?(?:year|yr)\s+TIPS(?:\s+yields?)?|10Y\s+TIPS(?:\s+yields?)?)\b"),
+            (
+                "DGS10",
+                r"\b(?:DGS10|"
+                r"(?:10|ten)[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|notes?|bonds?|Treasur(?:y|ies)|rates?)|"
+                r"10Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|notes?|bonds?|rates?)|"
+                r"UST\s*10Y|US10Y|"
+                r"(?:(?:10|ten)[- ]?(?:year|yr)|10Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS2",
+                r"\b(?:DGS2|"
+                r"(?:2|two)[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|notes?|Treasur(?:y|ies)|rates?)|"
+                r"2Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|notes?|rates?)|"
+                r"UST\s*2Y|US2Y|"
+                r"(?:(?:2|two)[- ]?(?:year|yr)|2Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS5",
+                r"\b(?:DGS5|"
+                r"(?:5|five)[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|notes?|Treasur(?:y|ies)|rates?)|"
+                r"5Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|notes?|rates?)|"
+                r"UST\s*5Y|US5Y|"
+                r"(?:(?:5|five)[- ]?(?:year|yr)|5Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS30",
+                r"\b(?:DGS30|"
+                r"(?:30|thirty)[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|bonds?|Treasur(?:y|ies)|rates?)|"
+                r"30Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|bonds?|rates?)|"
+                r"UST\s*30Y|US30Y|"
+                r"(?:(?:30|thirty)[- ]?(?:year|yr)|30Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            (
+                "DGS3MO",
+                r"\b(?:DGS3MO|"
+                r"(?:3|three)[- ]?(?:month|mo)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|bills?|Treasur(?:y|ies)|rates?)|"
+                r"3M\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|bills?|rates?)|"
+                r"UST\s*3M|US3M)\b",
+            ),
+            (
+                "DGS1",
+                r"\b(?:DGS1|"
+                r"(?:1|one)[- ]?(?:year|yr)\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|bills?|Treasur(?:y|ies)|rates?)|"
+                r"1Y\s+(?:U\.?S\.?\s+)?(?:Treasury\s+)?(?:yields?|Treasur(?:y|ies)|bills?|rates?)|"
+                r"UST\s*1Y|US1Y|"
+                r"(?:(?:1|one)[- ]?(?:year|yr)|1Y)\b" + bare_tenor_ahead + r")\b",
+            ),
+            ("DFF", r"\b(?:DFF|(?:effective\s+)?fed(?:eral)?\s+funds(?:\s+rates?)?)\b"),
+            ("SPY_PCR", r"\b(?:spy_put_call|spy_pcr|SPY\s+(?:put/call|P/C|PCR)(?:\s+(?:open[- ]interest\s+)?ratio)?|(?:aggregate\s+)?(?:put/call|P/C)\s+(?:open[- ]interest\s+)?ratio|(?:put/call|P/C|PCR))\b"),
+            ("HYG/LQD", r"\bHYG\s*/\s*LQD\b"),
+            ("^VIX9D", r"(?<!\w)(?:\^VIX9D|VIX9D|9[- ]?day\s+VIX|VIX\s+9[- ]?day|9D\s+VIX)\b"),
+            ("^VIX3M", r"(?<!\w)(?:\^VIX3M|VIX3M|3[- ]?month\s+VIX|VIX\s+3[- ]?month|3M\s+VIX)\b"),
+            ("^VIX", r"(?<!\w)(?:\^VIX|VIX)(?![ -]?(?:9D|3M|9[- ]?day|3[- ]?month))\b"),
+            ("^GSPC", r"(?<!\w)(?:\^GSPC|S\s*(?:[&＆]|&amp;)\s*P\s+500|SPX|GSPC)\b"),
+            ("SPY", r"\bSPY\b"),
+            ("^DJI", r"(?<!\w)(?:\^DJI|Dow\s+Jones|DJIA|Dow)\b"),
+            ("^IXIC", r"(?<!\w)(?:\^IXIC|Nasdaq(?:\s+Composite)?|IXIC)\b"),
+            ("^RUT", r"(?<!\w)(?:\^RUT|Russell\s+2000|RUT)\b"),
+            ("HYG", r"\bHYG\b"),
+            ("LQD", r"\bLQD\b"),
+            ("JNK", r"\bJNK\b"),
+            ("EMB", r"\bEMB\b"),
+            ("GC=F", r"(?<!\w)(?:GC=F|gold\s+futures)\b"),
+            ("GLD", r"\bGLD\b"),
+            ("SI=F", r"(?<!\w)(?:SI=F|silver\s+futures)\b"),
+            ("CL=F", r"(?<!\w)(?:CL=F|WTI|crude\s+oil)\b"),
+            ("HG=F", r"(?<!\w)(?:HG=F|copper\s+futures)\b"),
+            ("UUP", r"\bUUP\b"),
+            ("FXE", r"\bFXE\b"),
+            ("FXY", r"\bFXY\b"),
+            ("EEM", r"\bEEM\b"),
+            ("CPIAUCSL", r"\b(?:CPIAUCSL|CPI)\b"),
+            ("PCEPILFE", r"\b(?:PCEPILFE|core\s+PCE)\b"),
+            ("UNRATE", r"\b(?:UNRATE|unemployment(?:\s+rate)?)\b"),
+            ("RSAFS", r"\b(?:RSAFS|retail\s+sales)\b"),
+            ("UMCSENT", r"\b(?:UMCSENT|consumer\s+sentiment|UMich)\b"),
+        )
+
+    @staticmethod
+    def _canonical_instrument_label(label: str) -> str:
+        upper = label.strip().upper()
+        if upper == "YC_10Y":
+            return "DGS10"
+        if upper in {"VIX", "^VIX"}:
+            return "^VIX"
+        if upper in {"VIX3M", "^VIX3M"}:
+            return "^VIX3M"
+        if upper in {"VIX9D", "^VIX9D"}:
+            return "^VIX9D"
+        if upper in {"GSPC", "^GSPC", "SPX"}:
+            return "^GSPC"
+        if upper in {"DJI", "^DJI"}:
+            return "^DJI"
+        if upper in {"IXIC", "^IXIC"}:
+            return "^IXIC"
+        if upper in {"RUT", "^RUT"}:
+            return "^RUT"
+        return upper
+
+    @staticmethod
+    def _extract_instrument_spans(
+        text: str,
+        compiled_patterns: list[tuple[str, Any]],
+        feature_patterns: list[tuple[str, Any]] | None = None,
+    ) -> list[tuple[int, int, str]]:
+        """Non-overlapping (start, end, instrument_id) spans in priority order."""
+        claimed: list[tuple[int, int]] = []
+        spans: list[tuple[int, int, str]] = []
+        for inst, pat in compiled_patterns:
+            for match in pat.finditer(text):
+                s, e = match.start(), match.end()
+                if any(s < ce and cs < e for cs, ce in claimed):
+                    continue
+                claimed.append((s, e))
+                spans.append((s, e, inst))
+        for inst, pat in (feature_patterns or ()):
+            for match in pat.finditer(text):
+                s, e = match.start(), match.end()
+                if any(s < ce and cs < e for cs, ce in claimed):
+                    continue
+                claimed.append((s, e))
+                spans.append((s, e, inst))
+        spans.sort(key=lambda item: item[0])
+        return spans
+
+    @classmethod
+    def _check_numbers_grounded_by_instrument(
+        cls,
+        text: str,
+        data_context: str,
+        *,
+        threshold: float | None = None,
+    ) -> Any:
+        """Verify numeric claims against (instrument, value) pairs in data_context.
+
+        When a numeric claim is attributed to a recognized instrument (e.g.
+        '10-year Treasury yield at 4.80%' -> DGS10), it must match a value
+        bound to that same instrument in data_context rather than any bare
+        number anywhere in the prompt (such as DGS2=4.80). Claims without a
+        named instrument retain standard context-pool numeric grounding.
+        """
+        import re
+        from ollama.number_grounding import (
+            DEFAULT_BANNER_THRESHOLD,
+            GroundingResult,
+            NumericMention,
+            _BANNER_TEMPLATE,
+            _FOOTER_TEMPLATE,
+            _annotate_inline,
+            _is_grounded,
+            extract_numeric_mentions,
+        )
+
+        if threshold is None:
+            threshold = DEFAULT_BANNER_THRESHOLD
+
+        if not text or not text.strip():
+            return GroundingResult(
+                annotated_text=text or "",
+                total_numbers=0,
+                grounded_count=0,
+                ungrounded=(),
+                ungrounded_ratio=0.0,
+                banner_triggered=False,
+                threshold=threshold,
+            )
+
+        compiled = [(inst, re.compile(pat, re.IGNORECASE)) for inst, pat in cls._instrument_patterns()]
+        structured_re = re.compile(r"^\s*-\s+([A-Za-z0-9_]+):([^:\s]+):\s*raw value=([^|\n]+)")
+        structured_claim_re = re.compile(r"^\s*-\s+([A-Za-z0-9_]+):([^:\s]+):")
+        z_reported_re = re.compile(r"source-reported z=([+-]?\d+(?:\.\d+)?)")
+        header_clock_re = re.compile(r"^##\s+Market Data Snapshot\s+[—-]\s+(\S+)")
+        inline_clock_re = re.compile(r"\b(asof|availability|collected_at|as_of|obs_date|date)=([^|\s,)]+)", re.IGNORECASE)
+        inline_age_re = re.compile(r"\b(age_days|age_hours|age_seconds|data_staleness_days)=([+-]?\d+(?:\.\d+)?)\b", re.IGNORECASE)
+        pcr_asof_re = re.compile(r"\bas of\s+([^,)\s]+)", re.IGNORECASE)
+
+        header_dt: datetime | None = None
+        header_date: date | None = None
+        for line in (data_context or "").splitlines():
+            hm = header_clock_re.match(line.strip())
+            if hm:
+                header_date, header_dt = cls._parse_qualified_utc_clock(hm.group(1))
+                break
+
+        def _line_clock_invalid(line_str: str) -> bool:
+            for _, age_str in inline_age_re.findall(line_str):
+                try:
+                    if float(age_str) < 0:
+                        return True
+                except ValueError:
+                    return True
+            if header_dt is None and header_date is None:
+                return False
+            for _, ts_str in inline_clock_re.findall(line_str):
+                if ts_str.strip().lower() in cls._INVALID_FEATURE_ID_STRINGS:
+                    continue
+                obs_d, obs_dt, is_date_only = cls._parse_utc_clock(ts_str)
+                if obs_d is None:
+                    continue
+                if is_date_only:
+                    if header_date is not None and obs_d > header_date:
+                        return True
+                else:
+                    if header_dt is not None and obs_dt is not None and obs_dt > header_dt:
+                        return True
+                    if header_dt is None and header_date is not None and obs_d > header_date:
+                        return True
+            pm = pcr_asof_re.search(line_str)
+            if pm:
+                ts_str = pm.group(1)
+                if ts_str.strip().lower() not in cls._INVALID_FEATURE_ID_STRINGS:
+                    obs_d, obs_dt, is_date_only = cls._parse_utc_clock(ts_str)
+                    if obs_d is not None:
+                        if is_date_only and header_date is not None and obs_d > header_date:
+                            return True
+                        if not is_date_only and header_dt is not None and obs_dt is not None and obs_dt > header_dt:
+                            return True
+            return False
+
+        # 1. Build instrument -> [NumericMention] bindings from clock-sane data_context lines
+        context_by_instrument: dict[str, list[Any]] = {}
+        valid_context_lines: list[str] = []
+        in_pcr_section = False
+        in_limits_section = False
+        for line in (data_context or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("### "):
+                upper_hdr = stripped.upper()
+                in_pcr_section = "SPY PUT/CALL" in upper_hdr
+                in_limits_section = "PUBLICATION CONTEXT LIMITS" in upper_hdr
+                valid_context_lines.append(line)
+                continue
+            if in_limits_section or stripped.startswith("DECLARED ACTION CALENDAR"):
+                valid_context_lines.append(line)
+                continue
+
+            if _line_clock_invalid(line):
+                continue
+
+            m = structured_re.match(line)
+            if m:
+                valid_context_lines.append(line)
+                cat, label, raw_val = m.group(1), m.group(2), m.group(3)
+                if cat == "features":
+                    inst = f"feature:{label}"
+                elif cat == "options" and label == "spy_put_call":
+                    inst = "SPY_PCR"
+                else:
+                    inst = cls._canonical_instrument_label(label)
+                val_mentions = extract_numeric_mentions(raw_val, include_small_integers=True)
+                z_match = z_reported_re.search(line)
+                if z_match:
+                    val_mentions.extend(extract_numeric_mentions(z_match.group(1), include_small_integers=True))
+                context_by_instrument.setdefault(inst, []).extend(val_mentions)
+                continue
+
+            if stripped.startswith("- ") and ": unavailable" in stripped.lower():
+                continue
+
+            valid_context_lines.append(line)
+
+            if in_pcr_section and stripped.startswith("- Value:"):
+                val_part = stripped.split("(", 1)[0]
+                context_by_instrument.setdefault("SPY_PCR", []).extend(
+                    extract_numeric_mentions(val_part, include_small_integers=True)
+                )
+                continue
+
+            line_mentions = extract_numeric_mentions(line)
+            if not line_mentions:
+                continue
+            line_spans = cls._extract_instrument_spans(line, compiled)
+            if not line_spans:
+                continue
+            for idx, lm in enumerate(line_mentions):
+                prev_spans = [sp for sp in line_spans if sp[1] <= lm.start]
+                if prev_spans:
+                    bound_inst = prev_spans[-1][2]
+                else:
+                    next_limit = line_mentions[idx + 1].start if idx + 1 < len(line_mentions) else len(line)
+                    next_spans = [sp for sp in line_spans if lm.end <= sp[0] < next_limit]
+                    bound_inst = next_spans[0][2] if next_spans else None
+                if bound_inst is not None:
+                    context_by_instrument.setdefault(bound_inst, []).append(lm)
+
+        feature_patterns = [
+            (k, re.compile(r"(?<!\w)" + re.escape(k[len("feature:"):]) + r"(?!\w)"))
+            for k in sorted(
+                (key for key in context_by_instrument if key.startswith("feature:") and len(key) >= len("feature:") + 3),
+                key=len,
+                reverse=True,
+            )
+        ]
+
+        pool = extract_numeric_mentions("\n".join(valid_context_lines))
+        claims = extract_numeric_mentions(text)
+
+        # Pre-compute line spans and clause spans for claim attribution
+        line_ranges: list[tuple[int, int]] = []
+        pos = 0
+        for raw_line in text.splitlines(keepends=True):
+            line_ranges.append((pos, pos + len(raw_line)))
+            pos += len(raw_line)
+        if not line_ranges:
+            line_ranges.append((0, len(text)))
+
+        clause_split_re = re.compile(r"\n+|;\s*|\s*\|\s*|(?<=[.!?])(?<!vs\.)\s+")
+        clause_ranges: list[tuple[int, int]] = []
+        cpos = 0
+        for sep in clause_split_re.finditer(text):
+            clause_ranges.append((cpos, sep.start()))
+            cpos = sep.end()
+        clause_ranges.append((cpos, len(text)))
+
+        def _range_for(offset: int, ranges: list[tuple[int, int]]) -> tuple[int, int]:
+            for rs, re_ in ranges:
+                if rs <= offset < re_:
+                    return rs, re_
+            return 0, len(text)
+
+        spread_clause_re = re.compile(
+            r"\b(?:spread|inversion|inverted|gap|diff(?:erence)?|steepen\w*|flatten\w*|"
+            r"percentage\s+points?|bps|basis\s+points?|wide(?:r|ned|ning)?|narrow(?:er|ed|ing)?|"
+            r"above|below|premium|discount)\b",
+            re.IGNORECASE,
+        )
+        post_sep_re = re.compile(
+            r",|\b(?:versus|vs\.?|above|below|while|whereas|and|but|relative\s+to)\b",
+            re.IGNORECASE,
+        )
+        spread_leg_pairs = (
+            ("T10Y2Y", ("DGS10", "DGS2")),
+            ("T10Y3M", ("DGS10", "DGS3MO")),
+        )
+
+        def _derived_spread_pool_for_spread(spread_inst: str) -> list[NumericMention]:
+            """Unsigned magnitude of a named spread or exact difference of its own two legs."""
+            derived: list[NumericMention] = []
+            for m in context_by_instrument.get(spread_inst, []):
+                if m.value < 0:
+                    derived.append(NumericMention(
+                        raw=m.raw, value=abs(m.value), kind=m.kind,
+                        decimals=m.decimals, start=0, end=0,
+                    ))
+            for spread_key, legs in spread_leg_pairs:
+                if spread_key != spread_inst:
+                    continue
+                if legs[0] in context_by_instrument and legs[1] in context_by_instrument:
+                    for a in context_by_instrument[legs[0]]:
+                        for b in context_by_instrument[legs[1]]:
+                            dp = max(a.decimals, b.decimals)
+                            diff = round(a.value - b.value, dp)
+                            for val in (diff, abs(diff)):
+                                derived.append(NumericMention(
+                                    raw=f"{val:.{dp}f}", value=val, kind="decimal",
+                                    decimals=dp, start=0, end=0,
+                                ))
+            return derived
+
+        def _derived_spread_pool(
+            clause_insts: set[str], target_inst: str | None,
+        ) -> list[NumericMention]:
+            """Derived spread/difference values for unnamed spread claims."""
+            derived: list[NumericMention] = []
+            for spread_key, legs in spread_leg_pairs:
+                if target_inst is not None and target_inst != spread_key:
+                    continue
+                derived.extend(_derived_spread_pool_for_spread(spread_key))
+            mentioned = sorted(i for i in clause_insts if i in context_by_instrument)
+            for i in range(len(mentioned)):
+                for j in range(i + 1, len(mentioned)):
+                    for a in context_by_instrument[mentioned[i]]:
+                        for b in context_by_instrument[mentioned[j]]:
+                            dp = max(a.decimals, b.decimals)
+                            diff = round(a.value - b.value, dp)
+                            for val in (diff, -diff, abs(diff)):
+                                derived.append(NumericMention(
+                                    raw=f"{val:.{dp}f}", value=val, kind="decimal",
+                                    decimals=dp, start=0, end=0,
+                                ))
+            return derived
+
+        ungrounded: list[Any] = []
+        for idx, claim in enumerate(claims):
+            # Preserve Unicode minus sign (U+2212) immediately before an extracted mention.
+            effective_claim = claim
+            if (
+                claim.start > 0
+                and text[claim.start - 1] == "\u2212"
+                and not claim.raw.startswith(("+", "-"))
+                and claim.value > 0
+            ):
+                effective_claim = NumericMention(
+                    raw=claim.raw, value=-claim.value, kind=claim.kind,
+                    decimals=claim.decimals, start=claim.start, end=claim.end,
+                )
+
+            ls, le = _range_for(claim.start, line_ranges)
+            line_text = text[ls:le]
+            sm = structured_claim_re.match(line_text)
+            if sm:
+                cat, label = sm.group(1), sm.group(2)
+                if cat == "features":
+                    inst: str | None = f"feature:{label}"
+                elif cat == "options" and label == "spy_put_call":
+                    inst = "SPY_PCR"
+                else:
+                    inst = cls._canonical_instrument_label(label)
+                if not _is_grounded(effective_claim, context_by_instrument.get(inst, [])):
+                    ungrounded.append(claim)
+                continue
+
+            cs, ce = _range_for(claim.start, clause_ranges)
+            clause = text[cs:ce]
+            c_start = claim.start - cs
+            c_end = claim.end - cs
+            c_spans = cls._extract_instrument_spans(clause, compiled, feature_patterns)
+
+            prev_claim_rel = (
+                claims[idx - 1].end - cs
+                if idx > 0 and claims[idx - 1].end > cs
+                else 0
+            )
+            next_claim_rel = (
+                claims[idx + 1].start - cs
+                if idx + 1 < len(claims) and claims[idx + 1].start < ce
+                else len(clause)
+            )
+
+            inst = None
+            prev_spans = [sp for sp in c_spans if prev_claim_rel <= sp[0] and sp[1] <= c_start]
+            if prev_spans:
+                inst = prev_spans[-1][2]
+            else:
+                post_limit = min(c_end + 40, next_claim_rel)
+                post_spans = [sp for sp in c_spans if c_end <= sp[0] <= post_limit]
+                if post_spans:
+                    cand = post_spans[0]
+                    # Do not steal a span that directly introduces the next claim or
+                    # lies across a comparative/clause separator.
+                    has_next_claim = idx + 1 < len(claims) and claims[idx + 1].start < ce
+                    introduces_next = has_next_claim and not any(
+                        sp[0] >= cand[1] and sp[1] <= next_claim_rel for sp in c_spans
+                    )
+                    if not introduces_next and not post_sep_re.search(clause[c_end:cand[0]]):
+                        inst = cand[2]
+
+            clause_insts = {sp[2] for sp in c_spans}
+            is_spread_ctx = bool(
+                inst in {"T10Y2Y", "T10Y3M"} or spread_clause_re.search(clause)
+            )
+            explicit_plus = effective_claim.raw.startswith("+")
+
+            if inst is not None:
+                # Positive instrument binding: a named instrument must match its
+                # own source series in data_context (never falling back to
+                # unrelated unit-compatible numbers in other series or the global
+                # context pool). Spread instruments may match their own spread
+                # magnitude or the exact difference of their own two legs.
+                if inst == "SPY" and "SPY" not in context_by_instrument and "^GSPC" in context_by_instrument:
+                    inst = "^GSPC"
+                own_vals = list(context_by_instrument.get(inst, []))
+                if _is_grounded(effective_claim, own_vals):
+                    continue
+                if inst in {"T10Y2Y", "T10Y3M"} and not explicit_plus:
+                    if _is_grounded(effective_claim, _derived_spread_pool_for_spread(inst)):
+                        continue
+                ungrounded.append(claim)
+            else:
+                if _is_grounded(effective_claim, pool):
+                    continue
+                if is_spread_ctx and not explicit_plus and _is_grounded(
+                    effective_claim, _derived_spread_pool(clause_insts, None),
+                ):
+                    continue
+                ungrounded.append(claim)
+
+        total = len(claims)
+        ungrounded_count = len(ungrounded)
+        ratio = (ungrounded_count / total) if total else 0.0
+
+        annotated = _annotate_inline(text, ungrounded)
+        if ungrounded:
+            unique_raw = list(dict.fromkeys(m.raw for m in ungrounded))
+            annotated += _FOOTER_TEMPLATE.format(values=", ".join(unique_raw))
+
+        banner_triggered = total > 0 and ratio > threshold
+        if banner_triggered:
+            annotated = _BANNER_TEMPLATE.format(
+                ungrounded=ungrounded_count, total=total, ratio=ratio,
+            ) + annotated
+
+        if ungrounded_count:
+            log.warning(
+                "Briefing number grounding: {u}/{t} numeric claims ungrounded "
+                "({r:.0%}): {vals}",
+                u=ungrounded_count, t=total, r=ratio,
+                vals=", ".join(dict.fromkeys(m.raw for m in ungrounded)),
+            )
+        else:
+            log.debug(
+                "Briefing number grounding: {t} numeric claims, all grounded",
+                t=total,
+            )
+
+        return GroundingResult(
+            annotated_text=annotated,
+            total_numbers=total,
+            grounded_count=total - ungrounded_count,
+            ungrounded=tuple(ungrounded),
+            ungrounded_ratio=ratio,
+            banner_triggered=banner_triggered,
+            threshold=threshold,
+        )
+
+    @staticmethod
     def _publication_display_categories(snapshot: dict[str, Any]) -> list[tuple[str, Any]]:
         """Display legacy fx.EEM as equity, retaining original input custody."""
         rows = []
@@ -1818,6 +3151,7 @@ class MarketBriefingEngine:
         notes = {
             "model_unavailable": "Model response unavailable. Data summary only.",
             "claim_guard_withheld": "AI narrative withheld by publication claim guard. Data summary only.",
+            "truncated_response": "AI narrative withheld due to truncated model response. Data summary only.",
             "source_evidence_unknown": "Source evidence unavailable or unknown. Data summary only.",
         }
         note = notes.get(reason, notes["source_evidence_unknown"])
@@ -1827,6 +3161,8 @@ class MarketBriefingEngine:
             f"**Note: {note}**",
             "",
         ]
+
+        snap_date, snap_dt = self._resolve_decision_clock(snapshot)
 
         for category, data in self._publication_display_categories(snapshot):
             if data:
@@ -1838,27 +3174,49 @@ class MarketBriefingEngine:
                         lines.append(f"- {label}: unavailable at snapshot cutoff {facts['snapshot_cutoff_date']} "
                                      f"(source observation date: {(info or {}).get('date')})")
                         continue
+                    clock_err = self._clock_sanity_error(info, snap_dt, snap_date)
+                    if clock_err is not None:
+                        log.warning(
+                            "Market briefing fallback withheld {cat}:{lbl}: {err}",
+                            cat=category, lbl=label, err=clock_err,
+                        )
+                        lines.append(f"- {category}:{label}: unavailable ({clock_err})")
+                        continue
                     lines.append(self._format_evidence_value(category, label, info))
                 lines.append("")
 
         features = snapshot.get("features", {})
-        if features:
-            lines.append("## Retained Feature Evidence (first 20; freshness unknown)")
-            for name, info in list(features.items())[:20]:
-                lines.append(self._format_evidence_value("features", name, info))
-            lines.append("")
+        if isinstance(features, dict) and features:
+            valid_features = {
+                fname: finfo
+                for fname, finfo in features.items()
+                if self._clock_sanity_error(finfo, snap_dt, snap_date) is None
+            }
+            if valid_features:
+                selected_names, used_selector = self._select_display_features(valid_features, max_count=20)
+                if used_selector:
+                    lines.append(f"## Retained Feature Evidence ({len(selected_names)} selected; freshness unknown)")
+                else:
+                    lines.append("## Retained Feature Evidence (first 20; freshness unknown)")
+                for name in selected_names:
+                    lines.append(self._format_evidence_value("features", name, valid_features[name]))
+                lines.append("")
 
         regime = snapshot.get("latest_regime")
         if regime:
-            lines.append("## Latest Regime")
-            state_display = " ".join(str(regime['state']).splitlines())
-            lines.append(f"- Reported state: **{state_display}**")
-            lines.append(f"- Reported model confidence (calibration unverified): {regime['confidence']}")
-            lines.append(f"- Journal record timestamp: {regime['timestamp']}")
-            lines.append("- Prior regime comparator unavailable; trend unmeasured.")
-            # Preserve the original recommendation in the audit snapshot,
-            # not in the deterministic publication's factual data summary.
-            lines.append("")
+            regime_ok, regime_err = self._validate_carried_regime(regime, snap_dt, snap_date)
+            if not regime_ok:
+                log.warning("Market briefing fallback withheld latest_regime: {err}", err=regime_err)
+            else:
+                lines.append("## Latest Regime")
+                state_display = " ".join(str(regime['state']).splitlines())
+                lines.append(f"- Reported state: **{state_display}**")
+                lines.append(f"- Reported model confidence (calibration unverified): {regime['confidence']}")
+                lines.append(f"- Journal record timestamp: {regime['timestamp']}")
+                lines.append("- Prior regime comparator unavailable; trend unmeasured.")
+                # Preserve the original recommendation in the audit snapshot,
+                # not in the deterministic publication's factual data summary.
+                lines.append("")
 
         lines.append("---")
         lines.append("*Data summary only; no AI narrative is published.*")

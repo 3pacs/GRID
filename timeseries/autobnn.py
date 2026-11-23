@@ -70,6 +70,11 @@ class RegimeChangeSignal:
         post_regime: Description of the regime after the change.
         confidence: Confidence in the changepoint (0-1).
         magnitude: Size of the structural break.
+        confirm_index: Causal detector only: index of the last observation
+            the decision used. The break cannot be known before that
+            observation is. ``None`` for the curvature detector.
+        statistic: Causal detector only: the signed two-sample statistic of
+            the drift change (positive = the series' drift moved up).
     """
 
     series_id: str
@@ -79,6 +84,62 @@ class RegimeChangeSignal:
     post_regime: str
     confidence: float
     magnitude: float
+    confirm_index: int | None = None
+    statistic: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Causal drift-break test (the fallback when AutoBNN/JAX is absent)
+# ---------------------------------------------------------------------------
+#
+# A break at observation i means the series' drift (mean increment) after i
+# differs from its drift before i, judged against the noise of the increments
+# before i:
+#
+#     t(i) = (mean(d[i:i+k]) - mean(d[i-w:i])) / (sd(d[i-w:i]) * sqrt(1/k + 1/w))
+#
+# with d the first differences: the change lies in the k observations after
+# i. i is a break when |t(i)| >= CAUSAL_BREAK_T and |t(i)| is
+#   * larger than every |t| over the k candidates before it (a tie goes to the
+#     earliest),
+#   * larger than every same-signed |t| over the w candidates before it (one
+#     sustained shift is one break, not a plateau of them; a reversal is not
+#     suppressed by the shift it reverses), and
+#   * not beaten by any |t| over the m candidates after it.
+# The decision therefore reads observations i-2w .. i+m+k only: it never
+# depends on where the window starts or ends, on data after the confirming
+# observation i+m+k, or on any filled value. Candidates without that full
+# context on either side are never evaluated, which is what keeps the old
+# edge artifacts out (a centred rolling mean with its NaN ends filled by the
+# series mean manufactured full-confidence "breaks" at index ~w/2 and n-w/2
+# of every window).
+CAUSAL_PRE_WINDOW = 60
+CAUSAL_POST_WINDOW = 10
+CAUSAL_PEAK_WINDOW = 3
+CAUSAL_BREAK_T = 3.0
+# confidence = min(1, |t| / CAUSAL_FULL_CONFIDENCE_T): |t| = 3 reads 0.5.
+CAUSAL_FULL_CONFIDENCE_T = 6.0
+# A drift is "rising"/"falling" when its own t against the pre-window noise
+# exceeds this; otherwise "flat".
+CAUSAL_DRIFT_T = 2.0
+# Relative floor on the noise scale, so a noiseless synthetic series does not
+# divide by zero (real series never get near it).
+_SCALE_FLOOR = 1e-9
+
+
+def causal_context_start(change_index: int, pre_window: int = CAUSAL_PRE_WINDOW) -> int:
+    """First observation index a causal break decision at ``change_index`` read."""
+    return max(0, change_index - 2 * pre_window)
+
+
+def _drift_label(mean_increment: float, scale: float, n: int) -> str:
+    """'rising' / 'falling' / 'flat' for a mean increment over ``n`` steps."""
+    z = mean_increment / (scale / np.sqrt(n))
+    if z > CAUSAL_DRIFT_T:
+        return "rising"
+    if z < -CAUSAL_DRIFT_T:
+        return "falling"
+    return "flat"
 
 
 class AutoBNNDecomposer:
@@ -253,9 +314,13 @@ class AutoBNNDecomposer:
     ) -> list[RegimeChangeSignal]:
         """Detect structural regime changes in a time series.
 
-        Uses trend decomposition to find significant structural breaks
-        without requiring the full AutoBNN model (falls back to
-        second-derivative analysis if AutoBNN is unavailable).
+        With AutoBNN installed this decomposes the whole series and reads
+        breaks off the trend's curvature (``_detect_changepoints``). That fit
+        uses every observation in the window, so its breaks are not
+        point-in-time. Without AutoBNN it runs the causal drift-break test
+        (``detect_causal_breaks``). The fallback used to smooth with a
+        centred rolling mean and fill its NaN ends with the series mean,
+        which invented full-confidence breaks near both ends of every window.
 
         Parameters:
             series: Historical values.
@@ -269,56 +334,165 @@ class AutoBNNDecomposer:
         if isinstance(series, pd.Series):
             series = series.values
 
-        series = series.astype(np.float64)
+        series = np.asarray(series, dtype=np.float64)
 
-        # Use simple trend extraction if AutoBNN unavailable
         if not self.is_available:
-            log.debug("AutoBNN unavailable — using moving average trend extraction")
-            window = min(30, len(series) // 4)
-            if window < 3:
-                return []
-            trend = pd.Series(series).rolling(window, center=True).mean().values
-            trend = np.nan_to_num(trend, nan=series.mean())
-        else:
-            result = self.decompose(series, dates, series_id)
-            trend = np.array(result.trend)
+            log.debug("AutoBNN unavailable — using the causal drift-break test")
+            return self.detect_causal_breaks(
+                series, dates, series_id, min_confidence=min_confidence,
+            )
 
+        result = self.decompose(series, dates, series_id)
+        trend = np.array(result.trend)
         changepoints = self._detect_changepoints(trend, dates, series_id)
         return [cp for cp in changepoints if cp.confidence >= min_confidence]
+
+    def detect_causal_breaks(
+        self,
+        series: np.ndarray | pd.Series,
+        dates: list[date] | None = None,
+        series_id: str = "unknown",
+        min_confidence: float = 0.5,
+        *,
+        pre_window: int = CAUSAL_PRE_WINDOW,
+        post_window: int = CAUSAL_POST_WINDOW,
+        peak_window: int = CAUSAL_PEAK_WINDOW,
+    ) -> list[RegimeChangeSignal]:
+        """Point-in-time drift breaks (see the CAUSAL_* constants above).
+
+        Every returned break carries ``confirm_index`` (= change_index +
+        peak_window + post_window): the decision read no observation after
+        it, and none before ``change_index - 2 * pre_window``
+        (``causal_context_start``).
+        Non-finite values are never filled; a window that touches one is not
+        evaluated.
+
+        Parameters:
+            series: Historical values in time order.
+            dates: Corresponding dates (same length), or None.
+            series_id: Identifier copied onto each signal.
+            min_confidence: Minimum confidence (0-1) of a returned break.
+            pre_window: Increments before a candidate that set its baseline
+                drift and noise (w).
+            post_window: Increments after a candidate that set its new
+                drift (k).
+            peak_window: Candidates after a break that must not beat it (m).
+
+        Returns:
+            list[RegimeChangeSignal]: Breaks in time order.
+        """
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        if isinstance(series, pd.Series):
+            series = series.values
+        x = np.asarray(series, dtype=np.float64)
+        w, k, m = int(pre_window), int(post_window), int(peak_window)
+        if w < 2 or k < 1 or m < 0:
+            raise ValueError("need pre_window >= 2, post_window >= 1, peak_window >= 0")
+        n = len(x)
+        # Candidate i needs d[i-w : i+k], so i runs from w to n-1-k; a break
+        # also needs w candidates before it (k <= w) and m after it.
+        n_candidates = n - k - w
+        if k > w:
+            raise ValueError("post_window must not exceed pre_window")
+        if n_candidates < w + m + 1:
+            return []
+
+        d = np.diff(x)
+        pre = sliding_window_view(d, w)[:n_candidates]        # row j: d[j : j+w], candidate i = j + w
+        post = sliding_window_view(d, k)[w:w + n_candidates]  # row j: d[j+w : j+w+k]
+        finite_x = x[np.isfinite(x)]
+        level = float(np.median(np.abs(finite_x))) if len(finite_x) else 1.0
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            pre_mean = pre.mean(axis=1)
+            pre_sd = pre.std(axis=1, ddof=1)
+            post_mean = post.mean(axis=1)
+            scale = np.maximum(pre_sd, _SCALE_FLOOR * max(1.0, level))
+            t = (post_mean - pre_mean) / (scale * np.sqrt(1.0 / k + 1.0 / w))
+        t = np.where(np.isfinite(t), t, np.nan)
+        abs_t = np.abs(t)
+
+        breaks: list[RegimeChangeSignal] = []
+        for j in range(w, n_candidates - m):
+            here = abs_t[j]
+            if not np.isfinite(here) or here < CAUSAL_BREAK_T:
+                continue
+            near = abs_t[j - k:j]
+            same_sign = t[j - w:j]
+            same_sign = np.abs(same_sign[np.isfinite(same_sign) & (np.sign(same_sign) == np.sign(t[j]))])
+            after = abs_t[j + 1:j + 1 + m]
+            if np.any(near[np.isfinite(near)] >= here) or np.any(same_sign >= here):
+                continue
+            if np.any(after[np.isfinite(after)] > here):
+                continue
+            confidence = min(1.0, float(here) / CAUSAL_FULL_CONFIDENCE_T)
+            if confidence < min_confidence:
+                continue
+            i = j + w
+            change_date = dates[i] if dates is not None and i < len(dates) else None
+            breaks.append(
+                RegimeChangeSignal(
+                    series_id=series_id,
+                    change_index=i,
+                    change_date=change_date,
+                    pre_regime=_drift_label(float(pre_mean[j]), float(scale[j]), w),
+                    post_regime=_drift_label(float(post_mean[j]), float(scale[j]), k),
+                    confidence=confidence,
+                    magnitude=abs(float(post_mean[j] - pre_mean[j])),
+                    confirm_index=i + m + k,
+                    statistic=float(t[j]),
+                )
+            )
+        return breaks
 
     def _detect_changepoints(
         self,
         trend: np.ndarray,
         dates: list[date] | None,
         series_id: str,
+        edge_guard: int = 10,
     ) -> list[RegimeChangeSignal]:
         """Detect changepoints from trend curvature.
 
         Uses the second derivative of the trend to identify points
         where the structural regime changes significantly.
 
+        Non-finite trend values are never filled: curvature is taken only
+        where all three neighbours are finite, and a break within
+        ``edge_guard`` points of either end of the finite span is dropped
+        (its pre/post characterisation window would run off the data, and a
+        smoother's ends are where it is least reliable).
+
         Parameters:
             trend: Extracted trend component.
             dates: Corresponding dates.
             series_id: Series identifier.
+            edge_guard: Points at either end of the finite span that cannot
+                hold a break.
 
         Returns:
             list[RegimeChangeSignal]: Detected regime changes.
         """
+        trend = np.asarray(trend, dtype=np.float64)
         if len(trend) < 10:
             return []
+        finite_idx = np.flatnonzero(np.isfinite(trend))
+        if len(finite_idx) < 10:
+            return []
+        first, last = int(finite_idx[0]), int(finite_idx[-1])
 
-        # Compute second derivative (curvature)
+        # Compute second derivative (curvature); NaN wherever a neighbour is.
         d2 = np.diff(trend, n=2)
-        if len(d2) == 0:
+        valid = np.isfinite(d2)
+        if not valid.any():
             return []
 
         # Z-score the curvature to find significant changes
-        d2_std = np.std(d2)
+        d2_std = float(np.std(d2[valid]))
         if d2_std < 1e-10:
             return []
 
-        d2_z = np.abs(d2) / d2_std
+        d2_z = np.where(valid, np.abs(d2) / d2_std, 0.0)
 
         # Find peaks above threshold (2 sigma)
         threshold = 2.0
@@ -336,15 +510,17 @@ class AutoBNNDecomposer:
         changepoints: list[RegimeChangeSignal] = []
         for idx in merged:
             idx = int(idx)
-            if idx >= len(trend) - 1:
+            if idx < first + edge_guard or idx > last - edge_guard:
                 continue
 
             # Characterise pre/post regimes
-            pre_window = trend[max(0, idx - 10) : idx]
-            post_window = trend[idx : min(len(trend), idx + 10)]
+            pre_steps = np.diff(trend[max(0, idx - 10) : idx])
+            post_steps = np.diff(trend[idx : min(len(trend), idx + 10)])
+            pre_steps = pre_steps[np.isfinite(pre_steps)]
+            post_steps = post_steps[np.isfinite(post_steps)]
 
-            pre_slope = np.mean(np.diff(pre_window)) if len(pre_window) > 1 else 0
-            post_slope = np.mean(np.diff(post_window)) if len(post_window) > 1 else 0
+            pre_slope = float(np.mean(pre_steps)) if len(pre_steps) else 0.0
+            post_slope = float(np.mean(post_steps)) if len(post_steps) else 0.0
 
             pre_regime = "rising" if pre_slope > 0 else "falling" if pre_slope < 0 else "flat"
             post_regime = "rising" if post_slope > 0 else "falling" if post_slope < 0 else "flat"

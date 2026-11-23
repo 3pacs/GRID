@@ -44,6 +44,7 @@ from sqlalchemy import text
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db import get_engine  # noqa: E402
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 SCORING_DOC = Path(__file__).resolve().parents[1] / "docs" / "scoring" / "boost_log_scoring_v1.md"
 
@@ -216,7 +217,7 @@ def _fetch_batch(engine, batch_size: int) -> list[dict[str, Any]]:
                COALESCE(AVG(op.actual_move_pct), 0)::float AS actual_avg_move,
                COUNT(op.id) AS n_preds
         FROM inconc i
-        LEFT JOIN oracle_predictions op
+        LEFT JOIN """ + VISIBLE_ORACLE_PREDICTIONS + """ op
           ON op.ticker = i.ticker
          AND op.created_at BETWEEN i.hyp_at AND i.hyp_at + INTERVAL '14 days'
          AND op.scored_at IS NOT NULL

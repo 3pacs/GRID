@@ -693,6 +693,7 @@ def options_recommendations(
     return {
         "recommendations": [vars(r) for r in recs],
         "count": len(recs),
+        "rejection_counts": dict(recommender.last_rejection_counts),
     }
 
 

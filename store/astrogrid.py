@@ -3555,7 +3555,8 @@ class AstroGridStore:
                 WHERE fr.name = :feature_name
                   AND rs.obs_date BETWEEN :start_date AND :evaluation_date
                   AND (CAST(:release_cutoff AS date) IS NULL
-                       OR rs.release_date <= CAST(:release_cutoff AS date))
+                       OR (rs.release_date <= CAST(:release_cutoff AS date)
+                           AND rs.vintage_date <= CAST(:release_cutoff AS date)))
                 -- One value per day: the latest vintage, as _lookup_symbol_price reads.
                 ORDER BY rs.obs_date, rs.release_date DESC, rs.vintage_date DESC
                 """
@@ -3709,9 +3710,11 @@ class AstroGridStore:
         from the producer. The universe contract's 14-day *history coverage*
         limit is too loose for a return.
 
-        ``release_cutoff`` (optional) restricts the read to rows released on
-        or before that UTC date (day precision, like ``release_date``), so a
-        score computed as of a past cutoff ignores later vintages.
+        ``release_cutoff`` (optional) restricts the read to rows released
+        *and* held (``release_date`` and ``vintage_date``) on or before that
+        UTC date (day precision), so a score computed as of a past cutoff
+        ignores later vintages, including a backfill that stamped an early
+        ``release_date`` on a row fetched after the cutoff (E1-V7c).
         """
         symbol = str(symbol or "").upper()
         feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol)
@@ -3741,7 +3744,8 @@ class AstroGridStore:
             WHERE fr.name = :feature_name
               AND rs.obs_date <= :target_date
               AND (CAST(:release_cutoff AS date) IS NULL
-                   OR rs.release_date <= CAST(:release_cutoff AS date))
+                   OR (rs.release_date <= CAST(:release_cutoff AS date)
+                       AND rs.vintage_date <= CAST(:release_cutoff AS date)))
             ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
             LIMIT 1
             """

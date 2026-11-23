@@ -1,11 +1,15 @@
-"""Synthetic receipt-to-conditional seam; no real ledgers or holdouts."""
+"""Synthetic receipt-to-conditional seam; no real ledgers or holdouts (the factory run is a synthetic store)."""
 import copy
 import hashlib
 import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from analysis import cross_section_factory as X
 from analysis.desk_conditional_receipt import receipt_bound_conditional_cards
+from tests.test_cross_section_factory import RUN, build, ledger_at, write_run
 
 def cut(n=40, net=-2.5):
     return {"nights": n, "gross_bp": 1.5, "net_bp": net, "sd_bp": 10.0, "t_gross": 0.95}
@@ -122,6 +126,26 @@ class ConditionalReceiptTest(unittest.TestCase):
         result["cards"][0]["overall"]["net_bp"] = 999
         self.assertEqual(before, (self.report, self.receipt))
         self.assertEqual(self.call(raw)["cards"][0]["overall"]["net_bp"], -2.5)
+
+
+class FactoryRunReceiptTest(unittest.TestCase):
+    def test_a_factory_report_and_its_ledger_result_line_are_adapted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build(root)
+            report = X.run(write_run(root, RUN), root, root / "state.db", ledger_at(root), root / "out")
+            report_raw = (root / "out" / "report.json").read_bytes()
+            line = (root / "l.jsonl").read_text().splitlines()[-1].encode()
+        self.assertEqual(json.loads(line)["kind"], "factory_run_result")
+        now = datetime.now(timezone.utc)
+        result = receipt_bound_conditional_cards(
+            report_raw, line, expected_result_sha256=hashlib.sha256(line).hexdigest(),
+            receipt_available_at=now, as_of=now, max_age=timedelta(days=1))
+        self.assertEqual(len(result["cards"]), report["trial_count"])
+        self.assertTrue(result["base"]["selected_ids_verified_against_result_receipt"])
+        self.assertEqual({c["producer_paid_split"] for c in result["cards"]}, {"checked_against_cuts_not_carried"})
+        self.assertFalse(result["promotion_allowed"])
+
 
 if __name__ == "__main__":
     unittest.main()
