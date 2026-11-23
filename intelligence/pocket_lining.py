@@ -111,51 +111,10 @@ def assess_pocket_lining(engine: Engine) -> list[dict]:
         log.debug("Committee jurisdiction check failed: {e}", e=str(exc))
 
     # ── Detection 2: Fund manager personal trades diverge from fund ────────
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                WITH insider_trades AS (
-                    SELECT source_id, ticker, signal_type, signal_date
-                    FROM signal_sources
-                    WHERE source_type = 'insider'
-                      AND signal_date >= :cutoff
-                ),
-                fund_trades AS (
-                    SELECT source_id, ticker, signal_type, signal_date
-                    FROM signal_sources
-                    WHERE source_type = 'institutional'
-                      AND signal_date >= :cutoff
-                )
-                SELECT i.source_id AS insider_name,
-                       i.ticker,
-                       i.direction AS insider_direction,
-                       f.direction AS fund_direction,
-                       i.signal_date
-                FROM insider_trades i
-                JOIN fund_trades f ON i.ticker = f.ticker
-                    AND ABS(i.signal_date - f.signal_date) <= 30
-                WHERE i.direction != f.direction
-                LIMIT 100
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                flags.append({
-                    "detection": "fund_manager_divergence",
-                    "who": str(r[0]),
-                    "what": (
-                        f"Personal: {r[2]} {r[1]}; "
-                        f"Fund: {r[3]} {r[1]} on {r[4]}"
-                    ),
-                    "who_benefits": str(r[0]),
-                    "confidence": "likely",
-                    "implication": (
-                        f"Insider {r[0]} is personally trading {r[2]} {r[1]} "
-                        f"while their fund is doing the opposite ({r[3]})"
-                    ),
-                    "severity": "high",
-                })
-    except Exception as exc:
-        log.debug("Fund manager divergence check failed: {e}", e=str(exc))
+    # Disabled: the "fund" side came from 13F signal_sources rows
+    # (source_type 'institutional'), and 13F is non-directional (owner
+    # decision 2026-11-23). A filing change is not a fund trade direction, so
+    # there is nothing to compare an insider's trade against.
 
     # ── Detection 3: Insider sells before bad news ─────────────────────────
     try:
