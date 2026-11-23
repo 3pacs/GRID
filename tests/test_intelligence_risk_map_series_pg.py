@@ -8,10 +8,16 @@ tga_drawdown (a 30-day change) or mortgage_30y. TED was a 2022 reading of a
 discontinued series. VIX matched nothing.
 
 This seeds the real inputs alongside the decoys from griddb, each decoy
-dated *newer* than the real series. It adds multi-vintage dates and a
-retracted vintage, then runs the builder on a scratch schema through the
-real ``store.pit.PITStore`` SQL. The decoys must never be read. Each date
-counts once, at its newest unretracted vintage. HY / IG are in basis points.
+dated *newer* than the real series. It adds a multi-vintage date, a
+retracted vintage, a VIX holiday print and a vintage written after the
+cutoff. The builder then runs on a scratch schema through the real
+``store.pit.PITStore`` SQL, with the cutoff fixed at Monday 2026-11-23.
+The checks:
+- the decoys are never read;
+- each NYSE session counts once, at its newest unretracted vintage held on
+  the cutoff;
+- HY / IG are in basis points;
+- the month-back readings are anchored to each current print.
 
 Runs on ``pg_engine`` (``GRID_TEST_DB_URL``) and skips without PostgreSQL.
 """
@@ -20,12 +26,14 @@ from __future__ import annotations
 
 import sys
 import types
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+
+from ingestion.market_calendar import trading_days_between
 
 pytestmark = pytest.mark.xdist_group("postgres")
 
@@ -57,41 +65,45 @@ _DDL = (
     """,
 )
 
-TODAY = date.today()
-
-
-def _ago(days: int) -> date:
-    return TODAY - timedelta(days=days)
-
+CUTOFF = date(2026, 11, 23)  # Monday
+D = date
+YEAR = trading_days_between(CUTOFF - timedelta(days=364), CUTOFF)
 
 # (obs_date, vintage_date, value). release_date = vintage_date.
 REAL = {
-    # 1y of weekly VIX closes. Two vintages on _ago(7) (newest wins), and on
-    # _ago(14) a newer vintage of 99.0 that is retracted.
-    "vix_spot": [(_ago(7 * k), _ago(7 * k), v) for k, v in
-                 ((49, 12.0), (42, 14.0), (35, 15.0), (28, 16.0), (21, 18.0), (3, 22.0))]
-    + [(_ago(14), _ago(14), 19.0), (_ago(14), _ago(13), 99.0),
-       (_ago(7), _ago(7), 40.0), (_ago(7), _ago(6), 20.0),
-       (_ago(0), _ago(0), 30.0)],
-    "hy_oas_spread": [(_ago(33), _ago(30), 3.38), (_ago(3), _ago(0), 3.76)],
-    "ig_oas_spread": [(_ago(33), _ago(30), 0.91), (_ago(3), _ago(0), 0.98)],
-    "fed_balance_sheet": [(_ago(33), _ago(32), 6_753_604.0), (_ago(5), _ago(4), 6_741_452.0)],
-    "treasury_general_acct": [(_ago(33), _ago(32), 952_002.0), (_ago(5), _ago(4), 916_613.0)],
-    "reverse_repo_usage": [(_ago(31), _ago(31), 0.20), (_ago(0), _ago(0), 0.35)],
+    # Every NYSE session in the year at 15.0, the current print 30.0.
+    # 11-16 has two vintages (40.0, then 20.0 the next day: newest wins).
+    # 11-09 has a newer vintage of 99.0 that is retracted. Labor Day
+    # (09-07) has a Cboe holiday print, which is not a session.
+    "vix_spot": [(d, d, 15.0) for d in YEAR if d not in (D(2026, 11, 16), D(2026, 11, 9), CUTOFF)]
+    + [(D(2026, 11, 16), D(2026, 11, 16), 40.0), (D(2026, 11, 16), D(2026, 11, 17), 20.0),
+       (D(2026, 11, 9), D(2026, 11, 9), 19.0), (D(2026, 11, 9), D(2026, 11, 10), 99.0),
+       (D(2026, 9, 7), D(2026, 9, 7), 77.0),
+       (CUTOFF, CUTOFF, 30.0)],
+    # The 11-23 HY row was written on 11-24, after the cutoff: never read.
+    "hy_oas_spread": [(D(2026, 10, 20), D(2026, 10, 21), 3.38), (D(2026, 11, 20), D(2026, 11, 23), 3.76),
+                      (D(2026, 11, 23), D(2026, 11, 24), 5.00)],
+    "ig_oas_spread": [(D(2026, 10, 20), D(2026, 10, 21), 0.91), (D(2026, 11, 20), D(2026, 11, 23), 0.98)],
+    "fed_balance_sheet": [(D(2026, 10, 14), D(2026, 10, 15), 6_753_604.0),
+                          (D(2026, 10, 21), D(2026, 10, 22), 6_760_000.0),
+                          (D(2026, 11, 18), D(2026, 11, 19), 6_741_452.0)],
+    "treasury_general_acct": [(D(2026, 10, 14), D(2026, 10, 15), 952_002.0),
+                              (D(2026, 11, 18), D(2026, 11, 19), 916_613.0)],
+    "reverse_repo_usage": [(D(2026, 10, 23), D(2026, 10, 23), 0.20), (CUTOFF, CUTOFF, 0.35)],
 }
 # Same-pattern features from griddb, each newer than the real series.
 DECOYS = {
-    "hy_spread_3m_chg": [(_ago(40), _ago(40), 0.10), (_ago(0), _ago(0), 0.83)],
-    "hy_spread_proxy": [(_ago(1), _ago(1), 3.52)],
-    "hy_spread": [(_ago(0), _ago(0), 9.99)],
-    "ig_spread_proxy": [(_ago(0), _ago(0), 5.55)],
-    "ted_spread": [(date(2022, 1, 21), date(2022, 1, 21), 0.09)],
-    "tga_drawdown": [(_ago(33), _ago(33), 74_974.0), (_ago(0), _ago(0), 33_240.0)],
-    "treasury_tga_balance": [(_ago(236), _ago(235), 847_718.0)],
-    "mortgage_30y": [(_ago(0), _ago(0), 6.0)],
-    "reverse_repo": [(_ago(0), _ago(0), 777.0)],
-    "vix": [(_ago(0), _ago(0), 11.0)],
-    "vix_close_decoy": [(_ago(0), _ago(0), 88.0)],
+    "hy_spread_3m_chg": [(D(2026, 10, 15), D(2026, 10, 15), 0.10), (CUTOFF, CUTOFF, 0.83)],
+    "hy_spread_proxy": [(D(2026, 11, 21), D(2026, 11, 21), 3.52)],
+    "hy_spread": [(CUTOFF, CUTOFF, 9.99)],
+    "ig_spread_proxy": [(CUTOFF, CUTOFF, 5.55)],
+    "ted_spread": [(D(2022, 1, 21), D(2022, 1, 21), 0.09)],
+    "tga_drawdown": [(D(2026, 10, 21), D(2026, 10, 21), 74_974.0), (CUTOFF, CUTOFF, 33_240.0)],
+    "treasury_tga_balance": [(D(2026, 4, 1), D(2026, 4, 2), 847_718.0)],
+    "mortgage_30y": [(CUTOFF, CUTOFF, 6.0)],
+    "reverse_repo": [(CUTOFF, CUTOFF, 777.0)],
+    "vix": [(CUTOFF, CUTOFF, 11.0)],
+    "vix_close_decoy": [(CUTOFF, CUTOFF, 88.0)],
 }
 
 
@@ -117,9 +129,10 @@ def scratch(pg_engine: Engine):
             conn.execute(
                 text("INSERT INTO resolved_series_retractions (feature_id, obs_date, vintage_date, "
                      "retracted_at, reason, run_tag) "
-                     "SELECT id, :od, :vd, NOW() - INTERVAL '2 days', 'bad print', 'test' "
+                     "SELECT id, :od, :vd, :at, 'bad print', 'test' "
                      "FROM feature_registry WHERE name = 'vix_spot'"),
-                {"od": _ago(14), "vd": _ago(13)},
+                {"od": D(2026, 11, 9), "vd": D(2026, 11, 10),
+                 "at": datetime(2026, 11, 20, tzinfo=timezone.utc)},
             )
         yield engine
     finally:
@@ -144,6 +157,7 @@ def risk_map(scratch, monkeypatch):
     mod.DealerGammaEngine = DealerGammaEngine
     monkeypatch.setitem(sys.modules, "physics.dealer_gamma", mod)
     monkeypatch.setattr(ir, "get_db_engine", lambda: scratch)
+    monkeypatch.setattr(ir, "_risk_cutoff", lambda: CUTOFF)
     ir._risk_map_cache.clear()
     try:
         yield ir._build_risk_map()
@@ -151,22 +165,24 @@ def risk_map(scratch, monkeypatch):
         ir._risk_map_cache.clear()
 
 
-def test_volatility_reads_vix_spot_one_value_per_date(risk_map):
+def test_volatility_reads_vix_spot_one_value_per_session(risk_map):
     vol = risk_map["volatility_risk"]
     assert vol["available"] is True, vol
     assert vol["vix"] == 30.0
-    assert vol["vix_as_of"] == TODAY.isoformat()
-    # 9 dates, newest unretracted vintage each: 12 14 15 16 18 19 20 22 30.
-    # The superseded 40.0 and the retracted 99.0 are not in the sample.
-    assert vol["vix_percentile_sample"] == 9
+    assert vol["vix_as_of"] == "2026-11-23"
+    # Every session once, at its newest unretracted vintage: 15s, 20.0, 19.0, 30.0.
+    # The superseded 40.0, the retracted 99.0 and the holiday 77.0 would each
+    # put 30.0 below the 100th percentile.
+    assert vol["vix_percentile_sample"] == vol["vix_sessions_expected"] == len(YEAR)
     assert vol["vix_percentile_1y"] == 100
 
 
 def test_credit_reads_oas_in_basis_points_not_the_decoys(risk_map):
     credit = risk_map["credit_risk"]
     assert credit["available"] is True, credit
-    assert credit["hy_spread"] == 376
-    assert credit["hy_spread_as_of"] == _ago(3).isoformat()
+    assert credit["hy_spread"] == 376  # not the 11-23 row written after the cutoff
+    assert credit["hy_spread_as_of"] == "2026-11-20"
+    assert credit["hy_spread_prior_as_of"] == "2026-10-20"
     assert credit["ig_spread"] == 98
     assert credit["spread_direction"] == "widening"
     assert credit["risk_level"] == "elevated"
@@ -176,8 +192,10 @@ def test_credit_reads_oas_in_basis_points_not_the_decoys(risk_map):
 def test_liquidity_reads_walcl_wtregen_rrpontsyd_not_the_decoys(risk_map):
     liq = risk_map["liquidity_risk"]
     assert liq["available"] is True, liq
-    assert liq["fed_net_liquidity_change_1m"] == -12_152
-    assert liq["fed_balance_sheet_as_of"] == _ago(5).isoformat()
+    # Anchored to 11-18: the prior is 10-14 (35 days), not 10-21 (28 days).
+    assert liq["fed_total_assets_change_1m_usd"] == -12_152_000_000
+    assert liq["fed_total_assets_as_of"] == "2026-11-18"
+    assert liq["fed_total_assets_prior_as_of"] == "2026-10-14"
     # tga_drawdown (74,974 -> 33,240) would read "draining".
     assert liq["tga_trend"] == "stable"
     assert liq["reverse_repo_trend"] == "rising"

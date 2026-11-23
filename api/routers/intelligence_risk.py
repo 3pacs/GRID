@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import asdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,6 +16,7 @@ from sqlalchemy.engine import Engine
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from api.precompute_serving import serve_precomputed
+from ingestion.market_calendar import is_market_open, trading_days_between
 from store.pit import PITStore
 from utils.ttl_cache import TTLCache
 
@@ -79,42 +81,139 @@ _FED_ASSETS = "fed_balance_sheet"  # FRED WALCL, millions USD, weekly (Wednesday
 _RRP = "reverse_repo_usage"        # FRED RRPONTSYD, billions USD
 _TGA = "treasury_general_acct"     # FRED WTREGEN, millions USD, weekly (Wednesday)
 
-#: Oldest latest reading (in days before today) that each input is still
-#: scored from. An older one is reported as unavailable, the same as no
-#: series at all. treasury_tga_balance stopped in April, and its April
-#: value would otherwise have been served as the current TGA. Daily series
-#: get two weeks of holiday and outage slack. The weekly H.4.1 series get
-#: three weeks.
-_MAX_AGE_DAYS: dict[str, int] = {
-    _VIX: 14, _HY_OAS: 14, _IG_OAS: 14, _RRP: 14, _FED_ASSETS: 21, _TGA: 21,
+#: How often each input is published; this sets its freshness rule.
+_DAILY, _WEEKLY = "daily", "weekly"
+_CADENCE: dict[str, str] = {
+    _VIX: _DAILY, _HY_OAS: _DAILY, _IG_OAS: _DAILY, _RRP: _DAILY,
+    _FED_ASSETS: _WEEKLY, _TGA: _WEEKLY,
 }
-#: Read window: the 1-year VIX rank plus slack for the 30-day-back readings.
+#: A daily input is current if its latest reading is from one of the last
+#: ``1 + _DAILY_SESSION_SLACK`` NYSE sessions on or before the cutoff. That
+#: allows FRED's one-day publication lag plus one missed day.
+_DAILY_SESSION_SLACK = 2
+#: A weekly H.4.1 input (a Wednesday level, released Thursday) is current if
+#: it is from the latest released Wednesday or the ``_WEEKLY_RELEASE_SLACK``
+#: releases before it. One missed release is allowed.
+_WEEKLY_RELEASE_SLACK = 1
+#: Month-back comparisons are anchored to the current reading's own date,
+#: not to the cutoff. The prior reading is the latest one at least
+#: ``_MONTH_BACK_DAYS`` before it, and the span between the two may not
+#: exceed ``_MONTH_BACK_MAX_SPAN_DAYS``. That is 30 days plus one weekly
+#: step, so a weekly series always has such a reading. Measured from the
+#: cutoff instead, a weekly print accepted at 21 days old could have been
+#: compared over 11 days.
+_MONTH_BACK_DAYS = 30
+_MONTH_BACK_MAX_SPAN_DAYS = 37
+#: VIX is ranked against the year before its current print, on NYSE
+#: sessions only. Cboe's holiday prints are real, but research reads VIX on
+#: the SPY session calendar, so they are left out of both the sample and the
+#: coverage count. The rank is served only when the year covers
+#: ``_VIX_MIN_COVERAGE`` of the expected sessions and the last
+#: ``_VIX_TAIL_SESSIONS`` sessions are nearly complete. Otherwise the
+#: sub-system abstains: one print would rank itself at 100.
+_VIX_WINDOW_DAYS = 365
+_VIX_MIN_COVERAGE = 0.90
+_VIX_TAIL_SESSIONS = 21
+_VIX_TAIL_MIN_COVERED = 19
+#: Read window: the VIX year plus the longest month-back span.
 _INPUT_WINDOW_DAYS = 400
-#: A 1-month fall in Fed total assets of more than $50B (fed_balance_sheet
-#: is in millions USD). The earlier ``-50_000_000_000`` assumed dollars and
-#: could never be reached.
-_FED_ASSETS_DROP_MUSD = 50_000
+#: A 1-month fall in Fed total assets of more than $50B. fed_balance_sheet
+#: is stored in millions USD and is converted to dollars before this
+#: comparison. The earlier code compared the raw millions against
+#: -50_000_000_000, so the check could never fire.
+_FED_ASSETS_DROP_USD = 50_000_000_000
+_MUSD_TO_USD = 1_000_000
 _PERCENT_TO_BP = 100.0
 
 
-def _read_risk_inputs(engine: Engine, today: date) -> dict[str, list[tuple[date, float]]]:
-    """Each risk input's series over the last ``_INPUT_WINDOW_DAYS``, oldest first.
+def _risk_cutoff() -> date:
+    """The as-of date for the risk map's PIT read: today's UTC date.
+
+    The resolver stamps ``vintage_date`` as the UTC date of the pull
+    (``normalization/resolver.py``). A UTC cutoff therefore admits exactly
+    the vintages GRID held by the end of that UTC day.
+    """
+    return datetime.now(timezone.utc).date()
+
+
+def _freshness_floor(cadence: str, cutoff: date) -> date:
+    """Oldest obs_date still counted as a current reading on *cutoff*."""
+    if cadence == _DAILY:
+        sessions = trading_days_between(cutoff - timedelta(days=21), cutoff)
+        return sessions[-(1 + _DAILY_SESSION_SLACK)]
+    latest_wednesday = cutoff - timedelta(days=(cutoff.weekday() - 2) % 7)
+    if latest_wednesday + timedelta(days=1) > cutoff:  # released Thursday
+        latest_wednesday -= timedelta(days=7)
+    return latest_wednesday - timedelta(days=7 * _WEEKLY_RELEASE_SLACK)
+
+
+def _month_back(rows: list[tuple[date, float]], current: date) -> tuple[date, float] | None:
+    """The reading about a month before *current*, or None.
+
+    This is the latest reading at least ``_MONTH_BACK_DAYS`` before
+    *current*. It is None if the only such reading lies more than
+    ``_MONTH_BACK_MAX_SPAN_DAYS`` before *current*.
+    """
+    target = current - timedelta(days=_MONTH_BACK_DAYS)
+    older = [r for r in rows if r[0] <= target]
+    if not older or (current - older[-1][0]).days > _MONTH_BACK_MAX_SPAN_DAYS:
+        return None
+    return older[-1]
+
+
+def _vix_coverage(dates: Iterable[date], current: date) -> dict[str, int]:
+    """Session coverage of the VIX year ending at *current*. Counts only, no score.
+
+    ``expected`` counts the NYSE sessions in (current - 365d, current].
+    ``covered`` counts how many of those have a print. The ``tail_*`` keys
+    count the same over the last ``_VIX_TAIL_SESSIONS`` expected sessions.
+    Prints on non-session days are never counted.
+    """
+    expected = trading_days_between(current - timedelta(days=_VIX_WINDOW_DAYS - 1), current)
+    have = set(dates)
+    tail = expected[-_VIX_TAIL_SESSIONS:]
+    return {
+        "expected": len(expected),
+        "covered": sum(1 for d in expected if d in have),
+        "tail_expected": len(tail),
+        "tail_covered": sum(1 for d in tail if d in have),
+    }
+
+
+def _vix_coverage_shortfall(cov: dict[str, int], current: date) -> str | None:
+    """Why the VIX year is too sparse to rank, or None if it is not."""
+    need = math.ceil(_VIX_MIN_COVERAGE * cov["expected"])
+    if cov["covered"] < need:
+        return (
+            f"vix_spot covers {cov['covered']} of {cov['expected']} NYSE sessions in the year "
+            f"to {current.isoformat()} (need {need}); not ranked"
+        )
+    if cov["tail_covered"] < _VIX_TAIL_MIN_COVERED:
+        return (
+            f"vix_spot covers {cov['tail_covered']} of the last {cov['tail_expected']} NYSE "
+            f"sessions to {current.isoformat()} (need {_VIX_TAIL_MIN_COVERED}); not ranked"
+        )
+    return None
+
+
+def _read_risk_inputs(engine: Engine, cutoff: date) -> dict[str, list[tuple[date, float]]]:
+    """Each risk input's series over the ``_INPUT_WINDOW_DAYS`` to *cutoff*, oldest first.
 
     Reads through ``store.pit.PITStore``. Names are bound to ids first.
-    LATEST_AS_OF on *today* gives one row per obs_date: the newest vintage
-    held today, with retracted rows excluded. The old reads took any
+    LATEST_AS_OF on *cutoff* gives one row per obs_date: the newest vintage
+    held on that date, with retracted rows excluded. The old reads took any
     vintage of the newest date, and the VIX rank counted every vintage as
     a separate day (vix_spot: 4,517 rows over 258 dates in the last year).
     An unregistered name maps to ``[]``.
     """
     pit = PITStore(engine)
-    ids = pit.feature_ids_by_name(list(_MAX_AGE_DAYS))
-    series: dict[str, list[tuple[date, float]]] = {name: [] for name in _MAX_AGE_DAYS}
+    ids = pit.feature_ids_by_name(list(_CADENCE))
+    series: dict[str, list[tuple[date, float]]] = {name: [] for name in _CADENCE}
     if not ids:
         return series
     frame = pit.get_pit(
-        list(ids.values()), today, "LATEST_AS_OF",
-        start_date=today - timedelta(days=_INPUT_WINDOW_DAYS),
+        list(ids.values()), cutoff, "LATEST_AS_OF",
+        start_date=cutoff - timedelta(days=_INPUT_WINDOW_DAYS),
     )
     name_by_id = {fid: name for name, fid in ids.items()}
     for fid, obs_date, value in frame[["feature_id", "obs_date", "value"]].itertuples(index=False):
@@ -140,17 +239,17 @@ def _build_risk_map() -> dict[str, Any]:
     whenever a query failed or returned nothing, and those literals were
     indistinguishable from real readings.
 
-    Volatility, credit and liquidity read one exact feature per input (see
-    ``_VIX`` .. ``_TGA``) through the PIT store, once per build. An input
-    with no rows, or with a latest reading older than ``_MAX_AGE_DAYS``,
-    counts as missing.
+    Volatility, credit and liquidity read one exact feature per input
+    (``_VIX`` .. ``_TGA``) through the PIT store, once per build, as of the
+    UTC date (``_risk_cutoff``). An input counts as missing if it has no
+    rows, or if its latest reading is older than its cadence allows
+    (``_freshness_floor``). Month-back comparisons are anchored to the
+    current reading's own date (``_month_back``).
     """
-    from datetime import datetime, timezone, date as _date, timedelta
-
     engine = get_db_engine()
     errors: list[str] = []
     sub_scores: list[float] = []
-    today = _date.today()
+    cutoff = _risk_cutoff()
 
     def _fail(name: str, exc: BaseException) -> dict[str, Any]:
         reason = str(exc) or exc.__class__.__name__
@@ -165,7 +264,7 @@ def _build_risk_map() -> dict[str, Any]:
     # sub-system that needs it, with the read's own error as the reason.
     inputs_error: BaseException | None = None
     try:
-        inputs = _read_risk_inputs(engine, today)
+        inputs = _read_risk_inputs(engine, cutoff)
     except Exception as exc:
         inputs, inputs_error = {}, exc
 
@@ -174,17 +273,17 @@ def _build_risk_map() -> dict[str, Any]:
             raise inputs_error
         return inputs.get(name, [])
 
-    def _current(name: str) -> tuple[date, float]:
-        """Latest reading of *name*. Raises ``_NoData`` if absent or too old."""
-        rows = _series(name)
+    def _current(name: str, rows: list[tuple[date, float]] | None = None) -> tuple[date, float]:
+        """Latest reading of *name*. Raises ``_NoData`` if absent or not current."""
+        rows = _series(name) if rows is None else rows
         if not rows:
             raise _NoData(f"no {name} rows in resolved_series")
         obs_date, value = rows[-1]
-        age = (today - obs_date).days
-        if age > _MAX_AGE_DAYS[name]:
+        floor = _freshness_floor(_CADENCE[name], cutoff)
+        if obs_date < floor:
             raise _NoData(
-                f"{name} latest reading {obs_date.isoformat()} is {age} days old "
-                f"(limit {_MAX_AGE_DAYS[name]})"
+                f"{name} latest reading {obs_date.isoformat()} is older than its "
+                f"{_CADENCE[name]} freshness floor {floor.isoformat()} on {cutoff.isoformat()}"
             )
         return obs_date, value
 
@@ -193,12 +292,6 @@ def _build_risk_map() -> dict[str, Any]:
             return _current(name)
         except _NoData:
             return None
-
-    def _month_back(name: str) -> tuple[date, float] | None:
-        """Latest reading of *name* dated at least 30 days before today."""
-        cutoff = today - timedelta(days=30)
-        older = [r for r in _series(name) if r[0] <= cutoff]
-        return older[-1] if older else None
 
     # ── 1. Dealer Risk ──────────────────────────────────────────────
     try:
@@ -224,7 +317,7 @@ def _build_risk_map() -> dict[str, Any]:
         # Find nearest OPEX (third Friday)
         days_to_opex = 30
         for d_offset in range(45):
-            candidate = today + timedelta(days=d_offset)
+            candidate = cutoff + timedelta(days=d_offset)
             if candidate.weekday() == 4:  # Friday
                 week_num = (candidate.day - 1) // 7 + 1
                 if week_num == 3:
@@ -257,23 +350,26 @@ def _build_risk_map() -> dict[str, Any]:
 
     # ── 2. Volatility Risk ──────────────────────────────────────────
     try:
-        vix_date, vix_val = _current(_VIX)
-        year_start = today - timedelta(days=365)
-        vals = [v for d, v in _series(_VIX) if d >= year_start]
+        # NYSE sessions only, for the current print, the rank and the coverage.
+        vix_rows = [r for r in _series(_VIX) if is_market_open(r[0])]
+        vix_date, vix_val = _current(_VIX, vix_rows)
+        year_start = vix_date - timedelta(days=_VIX_WINDOW_DAYS)
+        window = [(d, v) for d, v in vix_rows if year_start < d <= vix_date]
+        coverage = _vix_coverage((d for d, _ in window), vix_date)
+        shortfall = _vix_coverage_shortfall(coverage, vix_date)
+        if shortfall:
+            raise _NoData(shortfall)
+        vals = [v for _, v in window]
         pct = int(sum(1 for v in vals if v <= vix_val) / len(vals) * 100)
-
-        term = "contango"
-        if vix_val > 25:
-            term = "backwardation"
 
         v_score = min(pct / 100, 1.0)
         vol_risk: dict[str, Any] = {
             "vix": round(vix_val, 1),
             "vix_as_of": vix_date.isoformat(),
             "vix_percentile_1y": pct,
-            # One reading per obs_date (the latest vintage), not one per vintage.
+            # One print per NYSE session, at its newest vintage.
             "vix_percentile_sample": len(vals),
-            "vix_term_structure": term,
+            "vix_sessions_expected": coverage["expected"],
             # No realized-vol series is read here; the previous value was
             # vix / (0.9 * vix), a constant 1.11 for every reading.
             "realized_vs_implied": None,
@@ -404,7 +500,7 @@ def _build_risk_map() -> dict[str, Any]:
         # old read served 3.76 % as "hy_spread": 4 and scored it 3.76 / 800.
         hy_date, hy_pct = _current(_HY_OAS)
         hy_bp = hy_pct * _PERCENT_TO_BP
-        hy_prev = _month_back(_HY_OAS)
+        hy_prev = _month_back(_series(_HY_OAS), hy_date)
         hy_prev_bp = hy_prev[1] * _PERCENT_TO_BP if hy_prev else None
         # IG is reported when current and null otherwise; it does not enter
         # the score, so its absence does not block the read.
@@ -427,6 +523,7 @@ def _build_risk_map() -> dict[str, Any]:
         credit_risk: dict[str, Any] = {
             "hy_spread": round(hy_bp),
             "hy_spread_as_of": hy_date.isoformat(),
+            "hy_spread_prior_as_of": hy_prev[0].isoformat() if hy_prev else None,
             "ig_spread": round(ig_bp) if ig_bp is not None else None,
             "spread_direction": direction,
             "risk_level": _compute_risk_level(cr_score),
@@ -438,16 +535,22 @@ def _build_risk_map() -> dict[str, Any]:
 
     # ── 6. Liquidity Risk ───────────────────────────────────────────
     try:
-        liq_date, liq_val = _current(_FED_ASSETS)
-        liq_prev = _month_back(_FED_ASSETS)
-        if liq_prev is None:
-            raise _NoData(f"no {_FED_ASSETS} reading >= 30 days old to measure the 1m change")
-        # Change in Fed total assets, millions USD. The key keeps its old
-        # name, which the PWA reads; TGA and RRP enter the score separately.
-        liq_change = liq_val - liq_prev[1]
+        # Fed total assets (WALCL), not net liquidity: TGA and RRP enter the
+        # score separately below. Until 2026-11-23 this change was served as
+        # ``fed_net_liquidity_change_1m``, in millions, measured from the
+        # cutoff rather than from the current print.
+        fa_date, fa_now = _current(_FED_ASSETS)
+        fa_prev = _month_back(_series(_FED_ASSETS), fa_date)
+        if fa_prev is None:
+            raise _NoData(
+                f"no {_FED_ASSETS} reading {_MONTH_BACK_DAYS}-{_MONTH_BACK_MAX_SPAN_DAYS} days "
+                f"before {fa_date.isoformat()} to measure the 1m change"
+            )
+        fa_change_usd = (fa_now - fa_prev[1]) * _MUSD_TO_USD
 
         def _trend(name: str, up_label: str, down_label: str) -> str:
-            cur, prev = _current_or_none(name), _month_back(name)
+            cur = _current_or_none(name)
+            prev = _month_back(_series(name), cur[0]) if cur else None
             if cur is None or prev is None:
                 return "unknown"
             if cur[1] < prev[1] * 0.95:
@@ -460,9 +563,9 @@ def _build_risk_map() -> dict[str, Any]:
         tga_trend = _trend(_TGA, "building", "draining")
 
         l_score = 0.3
-        if liq_change < -_FED_ASSETS_DROP_MUSD:
+        if fa_change_usd < -_FED_ASSETS_DROP_USD:
             l_score += 0.3
-        elif liq_change < 0:
+        elif fa_change_usd < 0:
             l_score += 0.15
         if tga_trend == "building":
             l_score += 0.15
@@ -471,8 +574,9 @@ def _build_risk_map() -> dict[str, Any]:
         l_score = max(0, min(l_score, 1.0))
 
         liq_risk: dict[str, Any] = {
-            "fed_net_liquidity_change_1m": round(liq_change),
-            "fed_balance_sheet_as_of": liq_date.isoformat(),
+            "fed_total_assets_change_1m_usd": round(fa_change_usd),
+            "fed_total_assets_as_of": fa_date.isoformat(),
+            "fed_total_assets_prior_as_of": fa_prev[0].isoformat(),
             "reverse_repo_trend": rrp_trend,
             "tga_trend": tga_trend,
             "risk_level": _compute_risk_level(l_score),
