@@ -2,12 +2,30 @@
 GRID Oracle — Model Evolver.
 
 Autonomous lifecycle manager: create, mutate, crossover, score, kill models.
-Run every 6h via Hermes. Reads stats from oracle_predictions, kills losers,
-spawns mutations/crossovers of top performers, seeds from hypothesis discoveries.
+Runs only inside OracleEngine.run_cycle (``python oracle/run_cycle.py`` without
+``--predict-only``); Hermes's Oracle slot holds evolution and never calls it.
+Reads stats from oracle_predictions, kills losers, spawns mutations/crossovers
+of top performers, seeds from hypothesis discoveries.
 
 Shadow promotion needs a harness that records shadow predictions without voting;
 until it exists, shadow models stay inactive and are promoted only by an operator
 after review.
+
+Open behaviour question for Anik (Codex review 6011905413), unchanged here:
+evolve_cycle still retires models from the existing ACTIVE roster on its own.
+  * Kill rule: an active model with at least KILL_THRESHOLD_PREDICTIONS (20)
+    scored, dedup-kept, non-AstroGrid predictions and a raw hit rate below
+    KILL_THRESHOLD_HIT_RATE (20%; partials are not hits) is set active=FALSE.
+  * Cap: while more than MAX_ACTIVE_MODELS (50) are active, the lowest
+    adjusted-hit-rate models among those with at least MIN_PREDICTIONS_TO_SCORE
+    (10) scored are set active=FALSE until 50 remain. Models with fewer than 10
+    scored are never cap-retired. New models now start inactive, so the cap no
+    longer holds 4 slots free for this cycle's spawns (it was ``current + 4``).
+  * Retirement only sets active=FALSE; weight and history are untouched.
+With 305 active models, one cycle could retire up to 255 through the cap alone.
+Whether the cycle should do this is Anik's decision before it is enabled.
+tests/test_evolver_defects.py::TestModelEvolverRosterPin pins the behaviour, so
+a change has to be deliberate.
 """
 
 from __future__ import annotations

@@ -13,7 +13,10 @@ Pipeline:
   4. TraceEvolver   — orchestrates the full cycle
 
 Integration:
-  Called by hermes_operator every 6h alongside existing ModelEvolver.
+  Called only from OracleEngine.run_cycle (oracle/engine.py), alongside
+  ModelEvolver; that is reached by ``python oracle/run_cycle.py`` without
+  ``--predict-only``. Hermes's Oracle slot (scripts/hermes_operator.py
+  ``_run_oracle_forward_pass``) holds evolution and runs neither evolver.
   TraceEvolver is the "smart" layer; ModelEvolver remains the "random" layer.
   Together they implement explore (random) + exploit (trace-informed) evolution.
 
@@ -29,6 +32,7 @@ import random
 import re
 import string
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -112,6 +116,85 @@ def _rand(n: int = 6) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
+@dataclass(frozen=True)
+class ScoredPrediction:
+    """One eligible Oracle prediction for Pattern 1.
+
+    Eligible means: scored inside the lookback, verdict hit/miss/partial,
+    ``dedup_keep = TRUE`` and not an AstroGrid row. Pattern 1's failures and
+    its fire denominator both come from these prediction ids only.
+    """
+    prediction_id: str
+    verdict: str
+    model_name: str | None
+    signals: frozenset[str]
+
+
+def _signal_fire_counts(
+    eligible: Mapping[str, ScoredPrediction],
+) -> tuple[dict[str, int], int, int]:
+    """Per-signal fires (one per prediction id and signal), winners, total."""
+    fires: Counter[str] = Counter()
+    winning = 0
+    for pred in eligible.values():
+        if pred.verdict in ("hit", "partial"):
+            winning += 1
+        fires.update(pred.signals)
+    return dict(fires), winning, len(eligible)
+
+
+def _eligible_failure_postmortems(
+    postmortems: list[dict],
+    eligible: Mapping[str, ScoredPrediction],
+) -> list[dict]:
+    """Postmortems of eligible failed (miss) predictions, one per prediction id.
+
+    The newest postmortem wins (``_load_postmortems`` orders by generated_at
+    DESC). Paper-trade postmortems (no prediction id) and postmortems of
+    predictions outside the eligible set are dropped, so they cannot add to a
+    failure count whose denominator never saw them (Codex review 6011905413).
+    """
+    kept: list[dict] = []
+    seen: set[str] = set()
+    for pm in postmortems:
+        pid = pm.get("prediction_id")
+        pred = eligible.get(pid) if isinstance(pid, str) else None
+        if pred is None or pred.verdict != "miss" or pid in seen:
+            continue
+        seen.add(pid)
+        kept.append({**pm, "model_name": pred.model_name})
+    return kept
+
+
+def _signal_failure_counts(
+    postmortems: list[dict],
+    key: str,
+    eligible: Mapping[str, ScoredPrediction],
+) -> dict[str, tuple[int, int]]:
+    """``signal -> (failures, fires)`` over the same eligible prediction ids.
+
+    A failure is one (prediction id, signal) pair: the prediction is eligible
+    and a miss, the signal fired in it, and a postmortem of it lists the signal
+    under ``key``. Fires count eligible predictions in which the signal fired.
+    Failures are therefore a subset of fires.
+    """
+    fires, _winning, _total = _signal_fire_counts(eligible)
+    failed: set[tuple[str, str]] = set()
+    for pm in postmortems:
+        pid = pm.get("prediction_id")
+        pred = eligible.get(pid) if isinstance(pid, str) else None
+        if pred is None or pred.verdict != "miss":
+            continue
+        signals = pm.get(key, [])
+        if not isinstance(signals, list):
+            continue
+        for sig in signals:
+            if isinstance(sig, str) and sig in pred.signals:
+                failed.add((pid, sig))
+    failures = Counter(sig for _pid, sig in failed)
+    return {sig: (failures.get(sig, 0), n) for sig, n in fires.items()}
+
+
 # ── Data Classes ──────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -178,7 +261,8 @@ class TraceAnalyzer:
         postmortems = self._load_postmortems(cutoff)
         scoring = self._load_scoring_data(cutoff)
         signal_accuracy = self._load_signal_accuracy(cutoff)
-        overall_fires, winning_outcomes, total_outcomes = self._load_signal_fire_counts(cutoff)
+        eligible = self._load_eligible_scored(cutoff)
+        overall_fires, winning_outcomes, total_outcomes = _signal_fire_counts(eligible)
         registry_names = set(self._available_sources())
         regime = self._get_current_regime()
 
@@ -192,7 +276,9 @@ class TraceAnalyzer:
         # Pattern 1: Rate-based failure category clustering (requires overall fire
         # counts across BOTH winning and losing outcomes; trade_postmortems alone
         # only records failures, so disable Pattern 1 when no winning+losing
-        # denominator is available).
+        # denominator is available). Failures and fires come from the same
+        # eligible prediction ids: postmortems of paper trades or of predictions
+        # outside that set do not count (Codex review 6011905413).
         if winning_outcomes <= 0 or total_outcomes <= 0 or not overall_fires:
             log.warning(
                 "TraceAnalyzer: Pattern 1 disabled — trade_postmortems contains "
@@ -201,19 +287,27 @@ class TraceAnalyzer:
                 w=winning_outcomes, t=total_outcomes, s=len(overall_fires),
             )
         else:
-            cat_counts = Counter(pm["failure_category"] for pm in postmortems)
+            failure_pms = _eligible_failure_postmortems(postmortems, eligible)
+            if len(failure_pms) < len(postmortems):
+                log.info(
+                    "TraceAnalyzer: Pattern 1 uses {k} of {n} postmortems (one per "
+                    "eligible failed Oracle prediction; paper-trade, ineligible and "
+                    "repeat postmortems dropped)",
+                    k=len(failure_pms), n=len(postmortems),
+                )
+            cat_counts = Counter(pm["failure_category"] for pm in failure_pms)
             for cat, count in cat_counts.most_common():
                 if count < 2:
                     continue
-                cat_pms = [pm for pm in postmortems if pm["failure_category"] == cat]
+                cat_pms = [pm for pm in failure_pms if pm["failure_category"] == cat]
                 wrong_signals = self._aggregate_signals(
                     cat_pms, "signals_wrong",
-                    overall_fires=overall_fires,
+                    eligible=eligible,
                     min_rate=SIGNAL_WRONG_THRESHOLD,
                 )
                 right_signals = self._aggregate_signals(
                     cat_pms, "signals_right",
-                    overall_fires=overall_fires,
+                    eligible=eligible,
                     min_rate=0.0,
                 )
                 missed_signals = self._aggregate_missed(
@@ -301,13 +395,15 @@ class TraceAnalyzer:
     def _load_postmortems(self, cutoff: datetime) -> list[dict]:
         try:
             with self.engine.connect() as conn:
+                # prediction_id is NULL for paper-trade postmortems. Pattern 1
+                # joins it to the eligible scored predictions in Python, which
+                # also supplies model_name (_eligible_failure_postmortems).
                 rows = conn.execute(text("""
                     SELECT tp.ticker, tp.outcome, tp.failure_category, tp.root_cause,
                            tp.signals_wrong, tp.signals_right, tp.what_we_missed,
                            tp.recommended_fix, tp.confidence, tp.generated_at,
-                           op.model_name
+                           tp.prediction_id
                     FROM trade_postmortems tp
-                    LEFT JOIN oracle_predictions op ON op.id = tp.prediction_id
                     WHERE tp.generated_at >= :cutoff
                     ORDER BY tp.generated_at DESC
                 """), {"cutoff": cutoff}).fetchall()
@@ -317,7 +413,8 @@ class TraceAnalyzer:
                     "root_cause": r[3], "signals_wrong": _parse_json(r[4]),
                     "signals_right": _parse_json(r[5]), "what_we_missed": r[6],
                     "recommended_fix": r[7], "confidence": r[8],
-                    "generated_at": r[9], "model_name": r[10],
+                    "generated_at": r[9],
+                    "prediction_id": str(r[10]) if r[10] is not None else None,
                 }
                 for r in rows
             ]
@@ -387,12 +484,15 @@ class TraceAnalyzer:
         except Exception:
             return None
 
-    def _load_signal_fire_counts(self, cutoff: datetime) -> tuple[dict[str, int], int, int]:
-        """Load per-signal overall fire counts across winning AND losing scored predictions."""
+    def _load_eligible_scored(self, cutoff: datetime) -> dict[str, ScoredPrediction]:
+        """Eligible scored Oracle predictions by id: both sides of Pattern 1.
+
+        Returns {} on a query failure, which disables Pattern 1 (fail closed).
+        """
         try:
             with self.engine.connect() as conn:
                 rows = conn.execute(text("""
-                    SELECT verdict, signals
+                    SELECT id, verdict, model_name, signals
                     FROM oracle_predictions
                     WHERE scored_at >= :cutoff
                       AND verdict IN ('hit', 'miss', 'partial')
@@ -400,20 +500,21 @@ class TraceAnalyzer:
                       AND id NOT LIKE 'astrogrid:%'
                 """), {"cutoff": cutoff}).fetchall()
         except Exception as e:
-            log.warning("TraceAnalyzer: signal fire counts query failed: {e}", e=str(e))
-            return {}, 0, 0
+            log.warning("TraceAnalyzer: eligible scored predictions query failed: {e}", e=str(e))
+            return {}
 
-        fire_counts: Counter[str] = Counter()
-        winning = 0
-        total = 0
-        for verdict, signals_raw in rows:
-            if verdict not in ("hit", "miss", "partial"):
+        eligible: dict[str, ScoredPrediction] = {}
+        for pid, verdict, model_name, signals_raw in rows:
+            if pid is None or verdict not in ("hit", "miss", "partial"):
                 continue
-            total += 1
-            if verdict in ("hit", "partial"):
-                winning += 1
-            fire_counts.update(_extract_prediction_signal_names(signals_raw))
-        return dict(fire_counts), winning, total
+            key = str(pid)
+            eligible[key] = ScoredPrediction(
+                prediction_id=key,
+                verdict=verdict,
+                model_name=model_name,
+                signals=frozenset(_extract_prediction_signal_names(signals_raw)),
+            )
+        return eligible
 
     def _available_sources(self) -> list[str]:
         try:
@@ -433,31 +534,24 @@ class TraceAnalyzer:
         postmortems: list[dict],
         key: str,
         *,
-        overall_fires: dict[str, int] | None = None,
+        eligible: Mapping[str, ScoredPrediction] | None = None,
         min_rate: float = SIGNAL_WRONG_THRESHOLD,
         min_mentions: int = MIN_PATTERN1_FAIL_MENTIONS,
     ) -> list[str]:
-        """Rank signals by failure rate (mentions in failures / overall fires).
+        """Rank signals by failure rate (failed fires / all fires, same ids).
 
-        Requires overall fire counts from BOTH winning and losing outcomes.
-        Fails closed (returns []) when no denominator is supplied.
+        Both sides come from ``eligible`` (see ``_signal_failure_counts``).
+        Fails closed (returns []) when no eligible predictions are supplied.
         """
-        if not overall_fires:
+        if not eligible:
             log.warning(
-                "TraceAnalyzer._aggregate_signals: disabled — no winning+losing overall fire denominator"
+                "TraceAnalyzer._aggregate_signals: disabled — no eligible scored predictions"
             )
             return []
-        mentions: Counter[str] = Counter()
-        for pm in postmortems:
-            signals = pm.get(key, [])
-            if isinstance(signals, list):
-                mentions.update({s for s in signals if isinstance(s, str) and s})
+        counts = _signal_failure_counts(postmortems, key, eligible)
         scored_signals: list[tuple[float, int, str]] = []
-        for sig, fail_count in mentions.items():
-            if fail_count < min_mentions:
-                continue
-            total_fires = int(overall_fires.get(sig, 0))
-            if total_fires <= 0 or fail_count > total_fires:
+        for sig, (fail_count, total_fires) in counts.items():
+            if fail_count < min_mentions or total_fires <= 0:
                 continue
             rate = fail_count / total_fires
             if rate > min_rate:
@@ -948,7 +1042,8 @@ class EvolutionGate:
 class TraceEvolver:
     """Orchestrates trace-based self-evolution.
 
-    Called every 6h by hermes_operator alongside ModelEvolver.
+    Called from OracleEngine.run_cycle alongside ModelEvolver (not by Hermes,
+    whose Oracle slot holds evolution).
     TraceEvolver = "exploit" (targeted), ModelEvolver = "explore" (random).
 
     Pipeline:
