@@ -210,6 +210,8 @@ def _options_provider_offline_default(monkeypatch):
     that exercise the Cboe path opt in by deleting this variable.
     """
     monkeypatch.setenv("GRID_OPTIONS_PRIMARY_PROVIDER", "yahoo")
+    # The dedicated options timer hand-off (ingestion/options.py) is opt-in per test.
+    monkeypatch.delenv("GRID_OPTIONS_DEDICATED_TIMER", raising=False)
 
 
 @pytest.fixture(autouse=True)

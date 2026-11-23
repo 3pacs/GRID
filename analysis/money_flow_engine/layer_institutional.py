@@ -39,36 +39,31 @@ _SWF_TOTAL_USD = sum(s["aum_usd"] for s in _SWF_ESTIMATES)
 # ── Node Builders ────────────────────────────────────────────────────────
 
 def _build_13f_aggregate(engine: Engine, as_of: date) -> FlowNode:
-    """Sum net dollar flows from 13F filings over the trailing 90 days."""
-    lookback = as_of - timedelta(days=90)
-    value: float | None = None
+    """13F node: non-directional, so it carries no value.
 
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT SUM(amount_usd) AS net_flow
-                    FROM dollar_flows
-                    WHERE source_type = '13f'
-                      AND flow_date >= :start
-                      AND flow_date <= :end
-                """),
-                {"start": lookback, "end": as_of},
-            ).fetchone()
-            if row and row[0] is not None:
-                value = float(row[0])
-    except Exception as exc:
-        log.warning("13f_aggregate query failed: {}", exc)
-
+    Owner decision 2026-11-23 (Anik, "Yes, non-directional"): a 13F change is
+    an observed filing holdings change at reference prices, not a flow. A
+    continuing position can hide a split or reverse split, and a NEW/CLOSED
+    CUSIP can be a rekey, merger or exchange with no trade; GRID has neither
+    corporate-action nor identity coverage at CUSIP level. Until it does, this
+    node reads nothing and reports value None rather than a direction.
+    """
+    del engine  # nothing is read until coverage exists
     return FlowNode(
         id="13f_aggregate",
-        label="13F Aggregate Net Flows",
+        label="13F Holdings Changes (non-directional)",
         layer=LAYER_ID,
-        value=value,
-        change_1m=value,  # trailing 90d is the best proxy we have
-        confidence="derived",
+        value=None,
+        change_1m=None,
+        confidence="estimated",
         source="SEC:13F-HR",
-        metadata={"lookback_days": 90},
+        metadata={
+            "lookback_days": 90,
+            "as_of": as_of.isoformat(),
+            "measure": "observed_filing_holdings_change_at_reference_prices",
+            "not_observed_cash_flow": True,
+            "coverage": "13f_non_directional_until_identity_and_split_coverage",
+        },
     )
 
 

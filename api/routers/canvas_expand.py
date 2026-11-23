@@ -16,6 +16,7 @@ from sqlalchemy.engine import Connection
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 from api.routers.canvas_board_store import (
     sync_board_from_legacy_canvas,
     sync_legacy_canvas_from_board,
@@ -686,7 +687,7 @@ def expand_node(
                 text("""
                     SELECT id, ticker, direction, confidence, expected_move_pct,
                            verdict, model_name
-                    FROM oracle_predictions WHERE ticker = :t
+                    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions WHERE ticker = :t
                     ORDER BY created_at DESC LIMIT 2
                 """),
                 {"t": ticker},

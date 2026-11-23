@@ -84,7 +84,7 @@ This module reads only; it never writes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable
 
 from sqlalchemy import text
@@ -460,6 +460,16 @@ def _utc_date(ts: datetime | None) -> date | None:
     return ts.date()  # naive timestamps are taken as UTC (griddb runs Etc/UTC)
 
 
+def _utc_instant(ts: datetime) -> datetime:
+    """``ts`` as an aware UTC instant; a naive timestamp is taken as UTC (griddb runs Etc/UTC)."""
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+
+
+def _day_end(d: date) -> datetime:
+    """The end of UTC day ``d``: when a date-only clock ("known by the end of d") is certainly past."""
+    return datetime.combine(d + timedelta(days=1), time(0), tzinfo=timezone.utc)
+
+
 def read_window_known_at(
     conn: Any,
     series_id: str,
@@ -468,6 +478,7 @@ def read_window_known_at(
     lag: PublicationLag | None,
     source: str | None = None,
     start: date | None = None,
+    as_of_ts: datetime | None = None,
 ) -> list[Observation]:
     """Accepted observations of ``series_id`` that were known by the end of ``as_of``.
 
@@ -497,7 +508,33 @@ def read_window_known_at(
 
     Each returned :class:`Observation` has ``known_at`` set and
     ``known_at_basis`` = ``"pulled"`` or ``"modeled_lag"``.
+
+    ``as_of_ts`` (timezone-aware, before the end of ``as_of``'s UTC day) answers "what GRID held at that instant";
+    observation dates are still bounded by ``as_of``. An observation counts only when one of its vintages has a
+    ``pull_timestamp`` (naive taken as UTC) at or before ``as_of_ts``, and the value is the latest such vintage.
+    There is no modeled path: a modeled known-at date never admits a row GRID first pulled later. A release
+    override can still delay a row: it counts only once the override's whole UTC day has ended by ``as_of_ts``,
+    since the time of day is not known. Without ``as_of_ts`` the result is exactly the end-of-day read above.
     """
+    if as_of_ts is None:
+        def pulled_by(ts: datetime | None, pull_day: date | None) -> bool:
+            return pull_day is not None and pull_day <= as_of
+
+        def known_by(day: date) -> bool:
+            return day <= as_of
+    else:
+        if as_of_ts.utcoffset() is None:
+            raise ValueError("as_of_ts must be timezone-aware")
+        cut = as_of_ts.astimezone(timezone.utc)
+        if cut >= _day_end(as_of):
+            raise ValueError(f"as_of_ts {cut.isoformat()} must be before the end of as_of {as_of}")
+
+        def pulled_by(ts: datetime | None, pull_day: date | None) -> bool:
+            return ts is not None and _utc_instant(ts) <= cut
+
+        def known_by(day: date) -> bool:
+            return _day_end(day) <= cut
+
     rows = conn.execute(
         text(_WINDOW_SQL),
         {
@@ -526,17 +563,19 @@ def read_window_known_at(
     for (d, vintages), modeled_known in zip(groups, modeled):
         if lag is not None and d in lag.unpublished_dates:
             continue  # official reference period was never published
-        if release_overrides.get(d, date.min) > as_of:
+        if d in release_overrides and not known_by(release_overrides[d]):
             continue  # an anomalous early pull cannot override an official embargo
         pulled = [(v, ts, s, _utc_date(ts)) for v, ts, s in vintages]
-        proven = [p for p in pulled if p[3] is not None and p[3] <= as_of]
+        proven = [p for p in pulled if pulled_by(p[1], p[3])]
         if proven:
             v, ts, s, pull_day = proven[0]  # latest vintage pulled by as_of
             known = pull_day if modeled_known is None else min(pull_day, modeled_known)
             known = max(d, known, release_overrides.get(d, date.min))
             out.append(Observation(series_id, d, v, ts, s, known, "pulled"))
             known_sources.update(p[2] for p in proven if p[2] is not None)
-        elif modeled_known is not None and modeled_known <= as_of:
+        elif as_of_ts is None and modeled_known is not None and known_by(modeled_known):
+            # End-of-day reads only. Under as_of_ts every vintage here was pulled after the cutoff, so GRID did not
+            # hold the observation then, whatever its modeled publication date (#1312).
             v, ts, s, _ = pulled[-1]  # earliest pulled vintage
             out.append(Observation(series_id, d, v, ts, s, modeled_known, "modeled_lag"))
             # SQL does not order sources tied at the earliest timestamp.

@@ -19,6 +19,7 @@ import numpy as np
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 @dataclass
@@ -93,7 +94,7 @@ def compute_calibration(
     """
     query = """
         SELECT confidence, verdict
-        FROM oracle_predictions
+        FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE verdict IN ('hit', 'miss', 'partial')
           AND dedup_keep = TRUE
           AND id NOT LIKE 'astrogrid:%'
@@ -908,7 +909,7 @@ def _as_utc_date(value: Any) -> date:
 _OFFICIAL_OUTCOMES_SQL = """
     SELECT p.id, p.model_name, p.horizon_days, p.confidence, p.verdict,
            p.expiry, p.created_at
-    FROM oracle_predictions p
+    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ p
     WHERE p.verdict IN ('hit', 'miss', 'partial')
       AND p.dedup_keep = TRUE
       AND p.id NOT LIKE 'astrogrid:%'
@@ -923,7 +924,7 @@ _RESCORE_OUTCOMES_SQL = """
     SELECT p.id, p.model_name, p.horizon_days, p.confidence, r.verdict,
            p.expiry, p.created_at
     FROM oracle_prediction_rescores r
-    JOIN oracle_predictions p ON p.id = r.prediction_id
+    JOIN """ + VISIBLE_ORACLE_PREDICTIONS + """ p ON p.id = r.prediction_id
     WHERE r.scoring_version = :rescore_version
       AND r.official = FALSE
       AND r.verdict IN ('hit', 'miss', 'partial')

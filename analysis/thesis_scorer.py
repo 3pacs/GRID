@@ -41,6 +41,7 @@ Each model in the breakdown:
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import time as _time
 from datetime import date, datetime, timedelta, timezone
@@ -52,6 +53,7 @@ from sqlalchemy.engine import Engine
 
 from analysis.sec_valuation import trailing_pe
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
+from ingestion.market_calendar import trading_days_between
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
@@ -61,6 +63,290 @@ from store.journal_qualification import DECISION_JOURNAL, non_provisional_journa
 EVALUATION_WINDOW_DAYS = 5
 STALE_HOURS = 72  # data older than this gets downweighted
 DEFAULT_ACCURACY = 0.50  # start at coin-flip until we have history
+
+# Regime changepoints (_score_regime_changepoints). The detector
+# (discovery/changepoint_detector.py) stamps its version in
+# signal_registry.provenance and writes a break only while it is fresh; these
+# two values are its CHANGEPOINT_DETECTOR_VERSION and FRESH_BREAK_DAYS (a test
+# pins them together). Rows from the earlier detector (provenance NULL; about
+# 1.08M rows, and 59% of all registry rows written 2026-11-08..22) are ignored
+# by version, not deleted.
+CHANGEPOINT_DETECTOR_VERSION = "changepoint_detector/2"
+CHANGEPOINT_FRESH_DAYS = 5
+# Each feature with a fresh break moves the score by this times the average
+# confidence; the tally is capped so it can never dominate the thesis.
+CHANGEPOINT_POINTS_PER_FEATURE = 10.0
+CHANGEPOINT_SCORE_CAP = 30.0
+CHANGEPOINT_CONFIDENCE_CAP = 60.0
+
+# Fed Net Liquidity 30-day change bands (millions USD; WALCL/WTREGEN are millions,
+# RRPONTSYD is converted from billions via RRPONTSYD_TO_MILLIONS).
+FED_LIQ_MODERATE_MILLIONS = 50_000.0   # $50B
+FED_LIQ_STRONG_MILLIONS = 100_000.0    # $100B
+FED_LIQ_BAND_STEP_MILLIONS = 50_000.0  # $50B linear ramp width
+
+# Options-derived models (dealer_gamma, vanna_charm) freshness gate and proxy labels.
+# Model keys stay "dealer_gamma" and "vanna_charm" for downstream accuracy table stability;
+# names and measurement tags distinguish these proxies from directly observed dealer Greeks.
+OPTIONS_MAX_AGE_TRADING_DAYS = 2
+_DEALER_GAMMA_NAME = "Options Sentiment (PCR Proxy)"
+_DEALER_GAMMA_MEASUREMENT = "proxy:put_call_ratio"
+_VANNA_CHARM_NAME = "Vanna/Charm (Max-Pain Proxy)"
+_VANNA_CHARM_MEASUREMENT = "proxy:max_pain_distance"
+_UNSET = object()
+
+# The two options scorers are live-only. options_daily_signals keeps one mutable
+# row per (ticker, signal_date): no immutable revision history, and no commit-time
+# availability clock (created_at is a write-time lower bound; PostgreSQL NOW() is
+# the writing transaction's start, before its commit). A live read sees only
+# committed rows, so it is sound; the value as of a past decision clock cannot be
+# reproduced. So a replay request, or a session row last written after the
+# decision clock, is reported unavailable and never replaced by an earlier session.
+# A live score's decision clock is the instant just before its read.
+OPTIONS_REPLAY_UNAVAILABLE = "historical_replay_unavailable"
+OPTIONS_WRITTEN_AFTER_CLOCK = "unavailable_written_after_decision_clock"
+
+# News sentiment scoring thresholds
+NEWS_MIN_DIRECTIONAL_ARTICLES = 5
+NEWS_DEFAULT_ARTICLE_CONF = 0.5
+NEWS_SCORE_SCALE = 100.0
+
+# Social sentiment contrarian scoring thresholds
+SOCIAL_SENTIMENT_MAX_SCORE = 80.0
+SOCIAL_SENTIMENT_EXTREME_RATIO = 2.0
+
+# CFTC COT positioning thresholds (net speculative contracts) and asset-class weights
+CFTC_EXTREME_NET_CONTRACTS = 100_000.0
+CFTC_MODERATE_NET_CONTRACTS = 50_000.0
+CFTC_VIX_EXTREME_CONTRACTS = 50_000.0
+CFTC_VIX_MODERATE_CONTRACTS = 20_000.0
+CFTC_EQUITY_WEIGHT = 2.0
+CFTC_SAFE_HAVEN_WEIGHT = 1.0
+CFTC_VIX_WEIGHT = 1.0
+
+# Valuation compression thresholds
+VALUATION_MAX_PE = 500.0
+VALUATION_MIN_TICKERS = 3
+VALUATION_PE_CHANGE_MODERATE_PCT = 5.0
+VALUATION_PE_CHANGE_STRONG_PCT = 10.0
+VALUATION_MIN_EPS_GROWTH_PCT = 0.0  # EPS growth must be > 0% for earnings-driven compression
+
+# Snapshot summary limits
+TOP_RISK_FACTORS_LIMIT = 3
+
+
+def _trading_days_age(sig_date: date, as_of: date) -> int:
+    """Count US equity trading days elapsed strictly after ``sig_date`` through ``as_of``.
+
+    Raises ``ValueError`` when ``sig_date > as_of`` so a future-dated row can
+    never be misread as age 0.
+    """
+    if sig_date > as_of:
+        raise ValueError(
+            f"signal_date {sig_date.isoformat()} is after decision date {as_of.isoformat()}"
+        )
+    if sig_date == as_of:
+        return 0
+    return len(trading_days_between(sig_date + timedelta(days=1), as_of))
+
+
+def _coerce_utc_timestamp(value: Any) -> datetime | None:
+    """Normalize a timestamp value to timezone-aware UTC, or None if invalid."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = _dt.datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, _dt.datetime):
+        return None
+    return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _coerce_signal_date(value: Any) -> date | None:
+    """Normalize a DB date value to ``date``, or None if missing/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    if isinstance(value, str):
+        try:
+            return _dt.date.fromisoformat(value)
+        except ValueError:
+            try:
+                return _dt.datetime.fromisoformat(value).date()
+            except ValueError:
+                return None
+    return None
+
+
+def _options_decision_clock(as_of_ts: datetime | None) -> tuple[datetime, bool]:
+    """``(decision_clock, is_replay)``. None means live: now, UTC.
+
+    Any explicit clock is a replay, even one a moment ago: a row committed
+    between that clock and the read is visible to the read but carries a
+    created_at from before its commit, so only a live read is sound.
+    """
+    if as_of_ts is None:
+        now = datetime.now(timezone.utc)
+        return (now if now.tzinfo else now.replace(tzinfo=timezone.utc)), False
+    clock = as_of_ts if as_of_ts.tzinfo else as_of_ts.replace(tzinfo=timezone.utc)
+    return clock.astimezone(timezone.utc), True
+
+
+def _options_unavailable(
+    model_key: str,
+    model_name: str,
+    measurement: str,
+    accuracy: float,
+    availability: str,
+    threshold: str,
+    reasoning: str,
+) -> dict[str, Any]:
+    """A fail-closed ``no_data`` verdict that says why the evidence is unavailable."""
+    verdict = _verdict(
+        model_key, model_name,
+        0, 0, "historical value unavailable", threshold, reasoning,
+        data_age_hours=None, historical_accuracy=accuracy, status="no_data",
+        measurement=measurement,
+    )
+    verdict["evidence_availability"] = availability
+    return verdict
+
+
+def _options_replay_refusal(
+    model_key: str, model_name: str, measurement: str, accuracy: float, as_of_ts: datetime,
+) -> dict[str, Any]:
+    return _options_unavailable(
+        model_key, model_name, measurement, accuracy, OPTIONS_REPLAY_UNAVAILABLE,
+        "live decision clock only",
+        f"SPY options values as of {as_of_ts.isoformat()} cannot be reproduced: "
+        "options_daily_signals keeps one mutable row per session, with no revision "
+        "history or commit-time availability clock. Not scored; no other session substituted.",
+    )
+
+
+def _label_options_session(verdict: dict[str, Any], sig_date_raw: Any, as_of_date: date) -> dict[str, Any]:
+    """Name the session a live score used; say so when it is an earlier session."""
+    sig_date = _coerce_signal_date(sig_date_raw)
+    if sig_date is None:
+        return verdict
+    verdict["evidence_session"] = sig_date.isoformat()
+    if sig_date == as_of_date:
+        verdict["evidence_basis"] = "same_session"
+    else:
+        verdict["evidence_basis"] = "prior_session"
+        verdict["reasoning"] = (
+            f"Uses an earlier session's row ({sig_date.isoformat()}): no {as_of_date.isoformat()} "
+            "row was written by the decision clock. " + verdict["reasoning"]
+        )
+    return verdict
+
+
+def _validate_options_clock(
+    *,
+    model_key: str,
+    model_name: str,
+    measurement: str,
+    metric_summary: str,
+    sig_date_raw: Any,
+    created_at_raw: Any,
+    as_of_ts: datetime,
+    accuracy: float,
+) -> tuple[float | None, dict[str, Any] | None]:
+    """Defend options-derived scores against future dates, late captures, and staleness.
+
+    Returns ``(age_hours, None)`` when eligible and fresh, or ``(None, verdict)``
+    with a fail-closed ``no_data`` / ``stale`` verdict otherwise.
+    """
+    as_of_date = as_of_ts.date()
+    sig_date = _coerce_signal_date(sig_date_raw)
+    if sig_date is None:
+        log.warning(
+            "{m}: missing signal_date — marking stale and excluding from score",
+            m=model_name,
+        )
+        return None, _verdict(
+            model_key, model_name,
+            0, 0, f"stale {metric_summary} (unknown date)",
+            f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+            "SPY options signal_date is missing; excluded from score.",
+            data_age_hours=None, historical_accuracy=accuracy, status="stale",
+            measurement=measurement,
+        )
+
+    date_age_hours = (as_of_date - sig_date).days * 24.0
+    if sig_date > as_of_date or date_age_hours < 0:
+        log.warning(
+            "{m}: lookahead guard rejected signal_date={sd} > as_of={as_of} "
+            "(age_hours={ah:.1f}) — failing closed",
+            m=model_name, sd=sig_date, as_of=as_of_date, ah=date_age_hours,
+        )
+        return None, _verdict(
+            model_key, model_name,
+            0, 0, "no eligible data",
+            f"signal_date <= {as_of_date.isoformat()}",
+            f"SPY options signal_date {sig_date} is after decision date {as_of_date}; "
+            "excluded from score (lookahead guard).",
+            data_age_hours=None, historical_accuracy=accuracy, status="no_data",
+            measurement=measurement,
+        )
+
+    age_hours = date_age_hours
+    if created_at_raw is not _UNSET:
+        created_ts = _coerce_utc_timestamp(created_at_raw)
+        if created_ts is None:
+            log.warning(
+                "{m}: missing/invalid created_at for signal_date={sd} — failing closed",
+                m=model_name, sd=sig_date,
+            )
+            return None, _verdict(
+                model_key, model_name,
+                0, 0, "no eligible data",
+                f"created_at <= {as_of_ts.isoformat()}",
+                "SPY options created_at timestamp is missing or unverifiable; excluded from score.",
+                data_age_hours=None, historical_accuracy=accuracy, status="no_data",
+                measurement=measurement,
+            )
+        capture_age_hours = (as_of_ts - created_ts).total_seconds() / 3600.0
+        if capture_age_hours < 0:
+            log.warning(
+                "{m}: lookahead guard rejected created_at={ca} > as_of={as_of} "
+                "(age_hours={ah:.2f}) — failing closed",
+                m=model_name, ca=created_ts.isoformat(), as_of=as_of_ts.isoformat(),
+                ah=capture_age_hours,
+            )
+            return None, _options_unavailable(
+                model_key, model_name, measurement, accuracy, OPTIONS_WRITTEN_AFTER_CLOCK,
+                f"created_at <= {as_of_ts.isoformat()}",
+                f"SPY options row for {sig_date.isoformat()} was last written at "
+                f"{created_ts.isoformat()}, after decision clock {as_of_ts.isoformat()} "
+                "(late capture or in-place revision). Its value as of the decision clock "
+                "cannot be reproduced; not scored, and no earlier session substituted "
+                "(lookahead guard).",
+            )
+        age_hours = max(date_age_hours, capture_age_hours)
+
+    trading_age = _trading_days_age(sig_date, as_of_date)
+    if trading_age > OPTIONS_MAX_AGE_TRADING_DAYS:
+        log.warning(
+            "{m} stale: signal_date={sd}, trading_days_old={td} > {lim}",
+            m=model_name, sd=sig_date, td=trading_age, lim=OPTIONS_MAX_AGE_TRADING_DAYS,
+        )
+        return None, _verdict(
+            model_key, model_name,
+            0, 0, f"stale {metric_summary} (as of {sig_date})",
+            f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+            f"SPY options data is {trading_age} trading days old (last signal {sig_date}, "
+            f"max {OPTIONS_MAX_AGE_TRADING_DAYS}); excluded from score.",
+            data_age_hours=age_hours, historical_accuracy=accuracy, status="stale",
+            measurement=measurement,
+        )
+
+    return age_hours, None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -78,6 +364,7 @@ def _verdict(
     data_age_hours: float | None = None,
     historical_accuracy: float = DEFAULT_ACCURACY,
     status: str = "active",
+    measurement: str | None = None,
 ) -> dict[str, Any]:
     """Build an immutable model verdict dict.
 
@@ -93,7 +380,7 @@ def _verdict(
     else:
         direction = "neutral"
 
-    return {
+    verdict: dict[str, Any] = {
         "key": key,
         "name": name,
         "score": round(clamped_score, 1),
@@ -106,6 +393,9 @@ def _verdict(
         "historical_accuracy": round(historical_accuracy, 3),
         "status": status,
     }
+    if measurement is not None:
+        verdict["measurement"] = measurement
+    return verdict
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -115,9 +405,11 @@ def _verdict(
 def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
     """Fed net liquidity: balance sheet minus TGA minus reverse repo.
 
-    Logic: 30-day change in net liquidity.
-    Existing arithmetic compares millions to 50/100, i.e. $50M/$100M.
-    These bands are preserved here; recalibration requires a separate review.
+    Logic: 30-day change in net liquidity (all inputs converted to millions USD:
+    WALCL and WTREGEN are FRED millions; RRPONTSYD is FRED billions scaled by
+    RRPONTSYD_TO_MILLIONS). Thresholds are ±$50B (±50,000M) moderate and
+    ±$100B (±100,000M) strong. Fails closed if any current or 30-day baseline
+    component is missing.
 
     Score scales linearly within bands.  Confidence from data freshness
     and historical accuracy.
@@ -140,15 +432,28 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                 "ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
 
-            if not bs:
+            missing_cur = [
+                name for name, row in (("WALCL", bs), ("RRPONTSYD", rr), ("WTREGEN", tga))
+                if not row or row[0] is None
+            ]
+            if missing_cur:
+                log.warning(
+                    "Fed liquidity: missing current component(s) {m} — failing closed",
+                    m=", ".join(missing_cur),
+                )
                 return _verdict("fed_liquidity", "Fed Net Liquidity",
-                    0, 0, "no data", "", "No Fed balance sheet data available.",
+                    0, 0, "no data", "",
+                    f"Missing current Fed liquidity component(s): {', '.join(missing_cur)}.",
                     status="no_data", historical_accuracy=accuracy)
 
             # RRPONTSYD is billions; WALCL/WTREGEN are millions
-            net_liq = float(bs[0]) - (float(rr[0]) * RRPONTSYD_TO_MILLIONS if rr else 0) - (float(tga[0]) if tga else 0)
+            net_liq = float(bs[0]) - float(rr[0]) * RRPONTSYD_TO_MILLIONS - float(tga[0])
             pull_ts = bs[1] if bs[1] else datetime.now(timezone.utc)
-            age_hours = (datetime.now(timezone.utc) - pull_ts.replace(tzinfo=timezone.utc)).total_seconds() / 3600 if hasattr(pull_ts, 'replace') else None
+            if hasattr(pull_ts, "replace"):
+                ts_utc = pull_ts.astimezone(timezone.utc) if pull_ts.tzinfo else pull_ts.replace(tzinfo=timezone.utc)
+                age_hours = (datetime.now(timezone.utc) - ts_utc).total_seconds() / 3600
+            else:
+                age_hours = None
 
             # 30-day prior
             bs_30 = conn.execute(text(
@@ -170,31 +475,44 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                 "ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
 
-            if not bs_30:
+            missing_30 = [
+                name for name, row in (("WALCL", bs_30), ("RRPONTSYD", rr_30), ("WTREGEN", tga_30))
+                if not row or row[0] is None
+            ]
+            if missing_30:
+                log.warning(
+                    "Fed liquidity: missing 30d baseline component(s) {m} — failing closed",
+                    m=", ".join(missing_30),
+                )
                 return _verdict("fed_liquidity", "Fed Net Liquidity",
-                    0, 20, f"{format_liquidity_usd(net_liq, unit='millions_usd')} current",
-                    "need 30d history", "Current net liquidity known but no 30-day baseline.",
+                    0, 0, f"{format_liquidity_usd(net_liq, unit='millions_usd')} current",
+                    "need 30d history",
+                    f"Current net liquidity known but missing 30-day baseline ({', '.join(missing_30)}).",
                     data_age_hours=age_hours, historical_accuracy=accuracy, status="stale")
 
             # RRPONTSYD is billions; WALCL/WTREGEN are millions
-            net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) * RRPONTSYD_TO_MILLIONS if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
+            net_liq_30 = float(bs_30[0]) - float(rr_30[0]) * RRPONTSYD_TO_MILLIONS - float(tga_30[0])
             change = net_liq - net_liq_30
 
-            # Score: linear scale within bands
-            if change >= 100:
-                score = 60 + min(20, (change - 100) / 50 * 20)
-            elif change >= 50:
-                score = 30 + (change - 50) / 50 * 30
-            elif change >= -50:
-                score = change / 50 * 25
-            elif change >= -100:
-                score = -30 + (change + 50) / 50 * -30
+            # Score: odd-symmetric linear scale within ±$50B / ±$100B bands (millions USD)
+            if change >= FED_LIQ_STRONG_MILLIONS:
+                score = 60 + min(
+                    20, (change - FED_LIQ_STRONG_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 20
+                )
+            elif change >= FED_LIQ_MODERATE_MILLIONS:
+                score = 30 + (change - FED_LIQ_MODERATE_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 30
+            elif change > -FED_LIQ_MODERATE_MILLIONS:
+                score = change / FED_LIQ_MODERATE_MILLIONS * 25
+            elif change > -FED_LIQ_STRONG_MILLIONS:
+                score = -30 - (abs(change) - FED_LIQ_MODERATE_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 30
             else:
-                score = -60 - min(20, (abs(change) - 100) / 50 * 20)
+                score = -60 - min(
+                    20, (abs(change) - FED_LIQ_STRONG_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 20
+                )
 
             # Confidence: base 60%, +20% if data fresh, scale by accuracy
             conf_base = 60
-            conf_fresh = 20 if (age_hours and age_hours < 24) else 0
+            conf_fresh = 20 if (age_hours is not None and age_hours < 24) else 0
             conf_accuracy = accuracy * 20  # 0-20% from track record
             confidence = min(95, conf_base + conf_fresh + conf_accuracy)
 
@@ -203,11 +521,11 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                 score, confidence,
                 data_point=(f"{format_liquidity_usd(change, unit='millions_usd', signed=True)} "
                             f"30d change (current {format_liquidity_usd(net_liq, unit='millions_usd')})"),
-                threshold="current scoring bands: bearish < -$50M, bullish > +$50M, strong at ±$100M",
+                threshold="bearish < -$50B (-$50,000M), bullish > +$50B (+$50,000M), strong at ±$100B (±$100,000M)",
                 reasoning=(
                     f"Net liquidity {'rose' if change > 0 else 'fell' if change < 0 else 'was unchanged by'} "
                     f"{format_liquidity_usd(abs(change), unit='millions_usd')} over 30 days. "
-                    f"{'Expanding liquidity supports risk assets.' if change > 50 else 'Contracting liquidity pressures risk assets.' if change < -50 else 'Liquidity roughly flat — no strong directional signal.'}"
+                    f"{'Expanding liquidity supports risk assets.' if change >= FED_LIQ_MODERATE_MILLIONS else 'Contracting liquidity pressures risk assets.' if change <= -FED_LIQ_MODERATE_MILLIONS else 'Liquidity roughly flat — no strong directional signal.'}"
                 ),
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
@@ -219,8 +537,10 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
             status="broken", historical_accuracy=accuracy)
 
 
-def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
-    """Dealer gamma via SPY put/call ratio.
+def _score_dealer_gamma(engine: Engine, accuracy: float, as_of_ts: datetime | None = None) -> dict:
+    """Put/call ratio proxy for dealer gamma (not directly observed dealer gamma).
+
+    Model key remains ``dealer_gamma`` for downstream accuracy table stability.
 
     Logic: PCR is the ratio of put volume to call volume.
     - PCR < 0.6  → extreme complacency, contrarian bearish (-30)
@@ -232,23 +552,52 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
     Note: PCR is CONTRARIAN.  High put buying = bullish setup.
     """
     try:
+        as_of_ts, is_replay = _options_decision_clock(as_of_ts)
+        if is_replay:
+            return _options_replay_refusal(
+                "dealer_gamma", _DEALER_GAMMA_NAME, _DEALER_GAMMA_MEASUREMENT, accuracy, as_of_ts,
+            )
+        as_of_date = as_of_ts.date()
+
+        # The newest session at or before the decision date, whatever its write
+        # time: if it was written after the clock, the guard below reports it
+        # unavailable rather than letting SQL fall through to an earlier session.
         with engine.connect() as conn:
-            row = conn.execute(visible_sql(
-                "SELECT put_call_ratio, spot_price, signal_date "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE ticker = 'SPY' AND put_call_ratio IS NOT NULL "
-                "ORDER BY signal_date DESC LIMIT 1"
-            )).fetchone()
+            row = conn.execute(
+                visible_sql(
+                    "SELECT put_call_ratio, spot_price, signal_date, created_at "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                    "WHERE ticker = 'SPY' AND put_call_ratio IS NOT NULL "
+                    "AND signal_date <= :as_of_date "
+                    "ORDER BY signal_date DESC, created_at DESC LIMIT 1"
+                ),
+                {"as_of_date": as_of_date},
+            ).fetchone()
 
             if not row or not row[0]:
-                return _verdict("dealer_gamma", "Options Sentiment (PCR)",
+                return _verdict(
+                    "dealer_gamma", _DEALER_GAMMA_NAME,
                     0, 0, "no data", "", "No SPY options data available.",
-                    status="no_data", historical_accuracy=accuracy)
+                    status="no_data", historical_accuracy=accuracy,
+                    measurement=_DEALER_GAMMA_MEASUREMENT,
+                )
 
             pcr = float(row[0])
             spot = float(row[1]) if row[1] else None
-            sig_date = row[2]
-            age_hours = (datetime.now(timezone.utc).date() - sig_date).days * 24 if sig_date else None
+            sig_date_raw = row[2]
+            created_at_raw = row[3] if len(row) > 3 else _UNSET
+            age_hours, rejected = _validate_options_clock(
+                model_key="dealer_gamma",
+                model_name=_DEALER_GAMMA_NAME,
+                measurement=_DEALER_GAMMA_MEASUREMENT,
+                metric_summary=f"SPY PCR = {pcr:.2f}",
+                sig_date_raw=sig_date_raw,
+                created_at_raw=created_at_raw,
+                as_of_ts=as_of_ts,
+                accuracy=accuracy,
+            )
+            if rejected is not None:
+                return rejected
 
             # Contrarian scoring
             if pcr < 0.6:
@@ -271,52 +620,91 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
             if age_hours and age_hours > 48:
                 confidence *= 0.7
 
-            return _verdict(
-                "dealer_gamma", "Options Sentiment (PCR)",
+            return _label_options_session(_verdict(
+                "dealer_gamma", _DEALER_GAMMA_NAME,
                 score, confidence,
                 data_point=f"SPY PCR = {pcr:.2f}" + (f", spot ${spot:.0f}" if spot else ""),
                 threshold="<0.6 contrarian bear, 0.6-0.8 bull, 1.0-1.3 contrarian bull, >1.3 strong contrarian bull",
-                reasoning=f"SPY put/call ratio is {pcr:.2f} ({label}). "
-                    f"{'High put buying historically precedes reversals upward.' if pcr > 1.0 else 'Low put buying signals complacency risk.' if pcr < 0.7 else 'Sentiment in neutral range.'}",
+                reasoning=(
+                    f"Put/call ratio proxy (not directly observed dealer gamma): "
+                    f"SPY put/call ratio is {pcr:.2f} ({label}). "
+                    f"{'High put buying historically precedes reversals upward.' if pcr > 1.0 else 'Low put buying signals complacency risk.' if pcr < 0.7 else 'Sentiment in neutral range.'}"
+                ),
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
-            )
+                measurement=_DEALER_GAMMA_MEASUREMENT,
+            ), sig_date_raw, as_of_date)
     except Exception as exc:
         log.debug("Dealer gamma scorer error: {e}", e=str(exc))
-        return _verdict("dealer_gamma", "Options Sentiment (PCR)",
+        return _verdict(
+            "dealer_gamma", _DEALER_GAMMA_NAME,
             0, 0, "error", "", f"Scorer error: {exc}",
-            status="broken", historical_accuracy=accuracy)
+            status="broken", historical_accuracy=accuracy,
+            measurement=_DEALER_GAMMA_MEASUREMENT,
+        )
 
 
-def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
-    """Vanna/charm: spot distance from max pain.
+def _score_vanna_charm(engine: Engine, accuracy: float, as_of_ts: datetime | None = None) -> dict:
+    """Max-pain distance proxy for vanna/charm (not directly observed dealer vanna/charm).
 
-    Logic: Options market makers hedge toward max pain as expiry approaches.
-    - Spot > max pain by 2%+ → charm pulls DOWN (bearish -30 to -50)
+    Model key remains ``vanna_charm`` for downstream accuracy table stability.
+
+    Logic: Uses spot distance from max pain as a pin-pressure proxy.
+    - Spot > max pain by 2%+ → pull DOWN (bearish -30 to -50)
     - Spot > max pain by 1-2% → mild bearish (-10 to -30)
     - Spot within 1% of max pain → pinned/neutral
     - Spot < max pain by 1-2% → mild bullish (+10 to +30)
-    - Spot < max pain by 2%+ → charm pulls UP (bullish +30 to +50)
+    - Spot < max pain by 2%+ → pull UP (bullish +30 to +50)
 
     Confidence increases closer to OpEx (Friday).
     """
     try:
+        as_of_ts, is_replay = _options_decision_clock(as_of_ts)
+        if is_replay:
+            return _options_replay_refusal(
+                "vanna_charm", _VANNA_CHARM_NAME, _VANNA_CHARM_MEASUREMENT, accuracy, as_of_ts,
+            )
+        as_of_date = as_of_ts.date()
+
+        # The newest session at or before the decision date, whatever its write
+        # time: if it was written after the clock, the guard below reports it
+        # unavailable rather than letting SQL fall through to an earlier session.
         with engine.connect() as conn:
-            row = conn.execute(visible_sql(
-                "SELECT max_pain, spot_price, signal_date "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0 "
-                "ORDER BY signal_date DESC LIMIT 1"
-            )).fetchone()
+            row = conn.execute(
+                visible_sql(
+                    "SELECT max_pain, spot_price, signal_date, created_at "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                    "WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0 "
+                    "AND signal_date <= :as_of_date "
+                    "ORDER BY signal_date DESC, created_at DESC LIMIT 1"
+                ),
+                {"as_of_date": as_of_date},
+            ).fetchone()
 
             if not row:
-                return _verdict("vanna_charm", "Vanna/Charm (Max Pain)",
+                return _verdict(
+                    "vanna_charm", _VANNA_CHARM_NAME,
                     0, 0, "no data", "", "No max pain data available.",
-                    status="no_data", historical_accuracy=accuracy)
+                    status="no_data", historical_accuracy=accuracy,
+                    measurement=_VANNA_CHARM_MEASUREMENT,
+                )
 
-            mp, spot, sig_date = float(row[0]), float(row[1]), row[2]
+            mp, spot, sig_date_raw = float(row[0]), float(row[1]), row[2]
+            created_at_raw = row[3] if len(row) > 3 else _UNSET
+            age_hours, rejected = _validate_options_clock(
+                model_key="vanna_charm",
+                model_name=_VANNA_CHARM_NAME,
+                measurement=_VANNA_CHARM_MEASUREMENT,
+                metric_summary=f"max pain ${mp:.0f}",
+                sig_date_raw=sig_date_raw,
+                created_at_raw=created_at_raw,
+                as_of_ts=as_of_ts,
+                accuracy=accuracy,
+            )
+            if rejected is not None:
+                return rejected
+
             gap_pct = (spot - mp) / spot * 100
-            age_hours = (datetime.now(timezone.utc).date() - sig_date).days * 24 if sig_date else None
 
             # Score: linear in gap
             if gap_pct > 2:
@@ -331,32 +719,36 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
                 score = 30 + min(20, (abs(gap_pct) - 2) * 10)
 
             # Confidence: higher closer to Friday (OpEx)
-            today = date.today()
-            days_to_friday = (4 - today.weekday()) % 7
+            days_to_friday = (4 - as_of_date.weekday()) % 7
             opex_boost = max(0, 15 - days_to_friday * 3)
             confidence = 40 + opex_boost + (accuracy * 15)
             if age_hours and age_hours > 48:
                 confidence *= 0.6
 
-            return _verdict(
-                "vanna_charm", "Vanna/Charm (Max Pain)",
+            return _label_options_session(_verdict(
+                "vanna_charm", _VANNA_CHARM_NAME,
                 score, confidence,
                 data_point=f"Spot ${spot:.0f} vs max pain ${mp:.0f} (gap {gap_pct:+.1f}%)",
                 threshold="bearish if spot >1% above max pain, bullish if >1% below",
                 reasoning=(
+                    f"Max-pain distance proxy (not directly observed vanna/charm): "
                     f"SPY spot is {abs(gap_pct):.1f}% {'above' if gap_pct > 0 else 'below'} "
                     f"max pain (${mp:.0f}). "
-                    f"{'Charm and dealer hedging should pull price down toward max pain.' if gap_pct > 1 else 'Charm should pull price up toward max pain.' if gap_pct < -1 else 'Spot near max pain — dealers are balanced, expect low volatility.'}"
+                    f"{'Distance above max pain implies downward pin pressure toward max pain.' if gap_pct > 1 else 'Distance below max pain implies upward pin pressure toward max pain.' if gap_pct < -1 else 'Spot near max pain — limited implied pin pressure.'}"
                     + (f" OpEx in {days_to_friday} day{'s' if days_to_friday != 1 else ''} — gravitational pull strengthening." if days_to_friday <= 3 else "")
                 ),
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
-            )
+                measurement=_VANNA_CHARM_MEASUREMENT,
+            ), sig_date_raw, as_of_date)
     except Exception as exc:
         log.debug("Vanna/charm scorer error: {e}", e=str(exc))
-        return _verdict("vanna_charm", "Vanna/Charm (Max Pain)",
+        return _verdict(
+            "vanna_charm", _VANNA_CHARM_NAME,
             0, 0, "error", "", f"Scorer error: {exc}",
-            status="broken", historical_accuracy=accuracy)
+            status="broken", historical_accuracy=accuracy,
+            measurement=_VANNA_CHARM_MEASUREMENT,
+        )
 
 
 def _score_congressional(engine: Engine, accuracy: float) -> dict:
@@ -782,17 +1174,62 @@ def _score_trust_convergence(engine: Engine, accuracy: float) -> dict:
             status="broken", historical_accuracy=accuracy)
 
 
-def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
-    """Regime changepoint signals from the discovery pipeline.
+def _score_regime_changepoints(engine: Engine, accuracy: float, as_of: datetime | None = None) -> dict:
+    """Regime changepoints: which declared regime features broke recently, as of ``as_of``.
 
-    Logic: The changepoint detector publishes regime change signals
-    (rising/falling/stable) to signal_registry every 12h.  Count
-    bullish vs bearish regime transitions in the last 48 hours.
+    Logic: discovery/changepoint_detector.py writes one signal_registry row
+    per point-in-time drift break on a declared regime feature (VIX, credit
+    spreads, curve, 10y, S&P 500, net liquidity, dollar, claims, breakevens),
+    stamped with its version in ``provenance``. ``direction`` is already the
+    risk reading: bullish = toward risk-on, bearish = toward risk-off.
 
-    Score scales with the net direction and average confidence of
-    the detected changepoints.
+    ``as_of`` is an explicit instant (default: now, UTC; a naive value is
+    UTC). A row is visible at ``as_of`` only if both fences hold, each on the
+    row itself, in SQL and before any reconciliation:
+
+    * ``valid_from <= as_of``: its availability;
+    * ``metadata.published_at <= as_of``: the scan that actually wrote it.
+      A break's first row written by a late scan has valid_from = its
+      effective known-at, earlier than the scan; without this fence a replay
+      between the two would see a break GRID did not hold yet, and a
+      withdrawal or revision published after ``as_of`` could change what was
+      live then.
+
+    A row with no ``published_at`` (none is written by detector version 2)
+    is not visible and is counted as ``unpublished``.
+
+    Counts *features*, not visible rows, in three steps:
+
+    1. Each break (``signal_id``) is reduced to its latest availability row
+       (``valid_from``). A break re-evaluated on a later vintage has a later
+       row of the same signal_id; one no longer detected has a row with
+       metadata status ``withdrawn``.
+    2. Breaks whose latest row is a withdrawal are dropped, and so are breaks
+       whose effective known-at is older than CHANGEPOINT_FRESH_DAYS
+       before ``as_of``.
+    3. Each feature counts once, by its surviving break with the latest
+       break date, so withdrawing one break never hides another on the same
+       feature.
+
+    Two times are kept apart. ``metadata.effective_known_at`` is when the
+    break became knowable from its inputs (release, vintage and retraction
+    dates); the freshness window is measured on it. ``metadata.
+    first_published_at`` is when the detector first wrote the break; it is
+    informational and never extends freshness. ``valid_from`` is the row's
+    availability: the effective known-at for a break's first row, and never
+    before the scan that saw a revision or withdrawal.
+
+    Only rows of CHANGEPOINT_DETECTOR_VERSION count; the earlier detector's
+    rows (about 1.08M, one per feature per index per 12 h scan) are ignored.
+    Score = net (risk-on minus risk-off features) x
+    CHANGEPOINT_POINTS_PER_FEATURE x average confidence, capped at
+    +/-CHANGEPOINT_SCORE_CAP; confidence is capped at
+    CHANGEPOINT_CONFIDENCE_CAP.
     """
     try:
+        as_of = as_of or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
         with engine.connect() as conn:
             # Guard: table might not exist yet
             try:
@@ -805,88 +1242,154 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy,
                 )
 
+            # Both fences on every row, before reconciliation. valid_from >=
+            # effective known-at on every row, so the window holds every row
+            # whose break can still be fresh at as_of. Rows without
+            # published_at come back flagged and are dropped below.
             rows = conn.execute(text(
-                "SELECT direction, confidence, value, valid_from "
+                "SELECT signal_id, ticker, direction, confidence, valid_from, "
+                "metadata->>'status', metadata->>'break_date', "
+                "COALESCE(CAST(metadata->>'effective_known_at' AS timestamptz), valid_from), "
+                "metadata->>'published_at' IS NULL "
                 "FROM signal_registry "
                 "WHERE source_module = :src "
                 "AND signal_type = :stype "
-                "AND valid_from >= NOW() - INTERVAL '48 hours' "
-                "ORDER BY valid_from DESC"
+                "AND provenance = :version "
+                "AND valid_from <= :as_of "
+                "AND valid_from > :window_start "
+                "AND (metadata->>'published_at' IS NULL "
+                "OR CAST(metadata->>'published_at' AS timestamptz) <= :as_of) "
+                "ORDER BY valid_from DESC "
+                "LIMIT :row_limit"
             ).bindparams(
                 src="discovery.changepoint_detector",
                 stype="regime_change",
+                version=CHANGEPOINT_DETECTOR_VERSION,
+                as_of=as_of,
+                window_start=as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS),
+                row_limit=1000,
             )).fetchall()
 
+        window = f"{CHANGEPOINT_FRESH_DAYS}d"
+        unpublished_count = sum(1 for r in rows if r[8])
+        rows = [r for r in rows if not r[8]]
         if not rows:
             return _verdict(
                 "regime_changepoints", "Regime Changepoints",
-                0, 0, "no recent signals", "",
-                "No regime change signals in last 48 hours.",
+                0, 0, "no fresh breaks", "",
+                f"No declared regime feature has a break known in the last {window} "
+                f"as of {as_of.isoformat()} (detector {CHANGEPOINT_DETECTOR_VERSION}"
+                + (f"; {unpublished_count} row{'s' if unpublished_count != 1 else ''} without "
+                   "published_at not visible" if unpublished_count else "")
+                + ").",
                 status="no_data", historical_accuracy=accuracy,
             )
 
-        bullish = [r for r in rows if r[0] == "bullish"]
-        bearish = [r for r in rows if r[0] == "bearish"]
-        total = len(rows)
+        # rows: (signal_id, ticker, direction, confidence, valid_from, status,
+        # break_date, effective_known_at, unpublished), newest valid_from first.
+        def _utc(ts: Any) -> Any:
+            return ts if ts is None or ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+        # 1. Latest availability per break (by valid_from, whatever the row order).
+        latest_by_break: dict[Any, Any] = {}
+        for i, r in enumerate(rows):
+            key = r[0] if r[0] is not None else ("row", i)
+            current = latest_by_break.get(key)
+            if current is None or _utc(r[4]) > _utc(current[4]):
+                latest_by_break[key] = r
+        # 2. Drop withdrawn breaks, then breaks no longer fresh by effective known-at.
+        live = [r for r in latest_by_break.values() if r[5] != "withdrawn"]
+        withdrawn_count = len(latest_by_break) - len(live)
+        fresh_after = as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS)
+        fresh = [r for r in live if _utc(r[7]) is not None and _utc(r[7]) > fresh_after]
+        aged_count = len(live) - len(fresh)
+        # 3. One break per feature: the latest break date, then the latest availability.
+        by_feature: dict[Any, Any] = {}
+        for r in fresh:
+            current = by_feature.get(r[1])
+            if current is None or (str(r[6] or ""), _utc(r[4])) > (str(current[6] or ""), _utc(current[4])):
+                by_feature[r[1]] = r
+        features = [(r[1], r[2], r[3], r[7]) for r in by_feature.values()]
+        if not features:
+            return _verdict(
+                "regime_changepoints", "Regime Changepoints",
+                0, 0, "no fresh breaks", "",
+                f"No live regime break known in the last {window}: {withdrawn_count} "
+                f"withdrawn on later data, {aged_count} older than the window "
+                f"(as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}).",
+                status="no_data", historical_accuracy=accuracy,
+            )
+        total = len(features)
+        bullish = sorted(str(r[0]) for r in features if r[1] == "bullish")
+        bearish = sorted(str(r[0]) for r in features if r[1] == "bearish")
         bull_count = len(bullish)
         bear_count = len(bearish)
-        neutral_count = sum(r[0] == "neutral" for r in rows)
+        neutral_count = sum(r[1] == "neutral" for r in features)
         other_count = total - bull_count - bear_count - neutral_count
 
-        # Average confidence across all signals (0-1 scale)
-        avg_conf = sum(float(r[1]) for r in rows) / total
-        # Average magnitude
-        avg_mag = sum(abs(float(r[2])) for r in rows) / total
+        # Average confidence over every counted feature, unknown ones included
+        avg_conf = sum(float(r[2] or 0) for r in features) / total
 
-        # Net direction: each signal ~ 12 points, scaled by avg confidence
         net = bull_count - bear_count
-        score = net * 12 * avg_conf
-        score = max(-80, min(80, score))
+        score = net * CHANGEPOINT_POINTS_PER_FEATURE * avg_conf
+        score = max(-CHANGEPOINT_SCORE_CAP, min(CHANGEPOINT_SCORE_CAP, score))
 
-        # Confidence: base from signal count and their confidence values
-        conf_base = 25
-        conf_volume = min(25, total * 5)
-        conf_quality = avg_conf * 25  # 0-25 from signal confidence
-        conf_accuracy = accuracy * 15
-        confidence = min(90, conf_base + conf_volume + conf_quality + conf_accuracy)
+        conf_base = 20
+        conf_volume = min(20, total * 4)
+        conf_quality = avg_conf * 20  # 0-20 from break confidence
+        conf_accuracy = accuracy * 10
+        confidence = min(CHANGEPOINT_CONFIDENCE_CAP,
+                         conf_base + conf_volume + conf_quality + conf_accuracy)
 
-        # Data age from most recent signal
-        most_recent = rows[0][3]  # valid_from of most recent
+        # Data age from the most recently knowable counted break
+        most_recent = max(_utc(r[3]) for r in features)
         age_hours = None
         if most_recent:
             try:
                 ts = most_recent if most_recent.tzinfo else most_recent.replace(tzinfo=timezone.utc)
-                age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                age_hours = (as_of - ts).total_seconds() / 3600
             except Exception as exc:
                 log.warning("Failed to compute regime changepoints age: {e}", e=exc)
+
+        def _named(names: list[str]) -> str:
+            return f" ({', '.join(names)})" if names else ""
 
         result = _verdict(
             "regime_changepoints", "Regime Changepoints",
             score, confidence,
             data_point=(
+                f"{total} feature{'s' if total != 1 else ''} with a fresh break: "
                 f"{bull_count} bullish, {bear_count} bearish, "
                 f"{neutral_count} neutral, {other_count} other/unknown "
-                f"(48h, avg conf {avg_conf:.0%})"
+                f"({window}, avg conf {avg_conf:.0%})"
             ),
-            threshold="each changepoint ~ +/-12 pts scaled by confidence; net direction determines signal",
+            threshold=(
+                f"each feature ~ +/-{CHANGEPOINT_POINTS_PER_FEATURE:g} pts scaled by confidence, "
+                f"capped at +/-{CHANGEPOINT_SCORE_CAP:g}; latest break per feature in {window}"
+            ),
             reasoning=(
-                f"{total} regime changepoints in 48h: "
-                f"{bull_count} bullish, {bear_count} bearish. "
-                f"{neutral_count} explicitly neutral; {other_count} other/unknown. "
-                f"Average confidence {avg_conf:.0%}, magnitude {avg_mag:.2f}. "
-                + ("Net bullish regime shifts suggest improving conditions. "
+                f"{total} declared regime feature{'s' if total != 1 else ''} broke in the last {window}: "
+                f"{bull_count} toward risk-on{_named(bullish)}, "
+                f"{bear_count} toward risk-off{_named(bearish)}. "
+                f"{neutral_count} neutral; {other_count} other/unknown. "
+                + (f"{withdrawn_count} break{'s' if withdrawn_count != 1 else ''} withdrawn on later data, "
+                   "not counted. " if withdrawn_count else "")
+                + f"Average confidence {avg_conf:.0%}. "
+                + ("Net risk-on regime shifts suggest improving conditions. "
                    if net > 0
-                   else "Net bearish regime shifts suggest deteriorating conditions. "
+                   else "Net risk-off regime shifts suggest deteriorating conditions. "
                    if net < 0
                    else "Balanced regime shifts — no clear directional signal. ")
-                + "Changepoints detect structural breaks in feature time series."
+                + f"Point-in-time drift breaks as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}."
             ),
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
         )
         result["category_counts"] = {
+            "unit": "features", "rows_read": len(rows), "breaks_read": len(latest_by_break),
             "total": total, "bullish": bull_count, "bearish": bear_count,
             "neutral": neutral_count, "other_unknown": other_count,
+            "withdrawn": withdrawn_count, "aged_out": aged_count, "unpublished": unpublished_count,
             "known_categories_exhaustive": other_count == 0,
         }
         return result
@@ -991,9 +1494,10 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
             """)).fetchall()
 
         if not rows:
+            log.debug("News sentiment: no articles in last 6h — excluding from score")
             return _verdict(
                 "news_sentiment", "News Sentiment",
-                0, 10, "no recent articles", "",
+                0, 0, "no recent articles", "",
                 "No news articles in the last 6 hours.",
                 status="stale", historical_accuracy=accuracy,
             )
@@ -1003,28 +1507,34 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
         bear = sum(1 for r in rows if r[2] and r[2].upper() == "BEARISH")
         neutral = total - bull - bear
 
-        # Weighted score: high-confidence articles count more
+        # Weighted score: high-confidence articles count more, including neutrals in denominator
         weighted_bull = 0.0
         weighted_bear = 0.0
+        weighted_neutral = 0.0
         for r in rows:
             sent = (r[2] or "").upper()
-            conf = float(r[4]) if r[4] is not None else 0.5
+            conf = float(r[4]) if r[4] is not None else NEWS_DEFAULT_ARTICLE_CONF
             if sent == "BULLISH":
                 weighted_bull += conf
             elif sent == "BEARISH":
                 weighted_bear += conf
+            else:
+                weighted_neutral += conf
 
-        # Score: weighted net sentiment scaled to [-100, +100]
-        weight_total = weighted_bull + weighted_bear
-        if weight_total > 0:
+        # Score: weighted net sentiment over ALL articles (including neutrals), scaled to [-100, +100].
+        # Require at least NEWS_MIN_DIRECTIONAL_ARTICLES directional headlines for a nonzero score.
+        directional_count = bull + bear
+        weight_total = weighted_bull + weighted_bear + weighted_neutral
+        if directional_count >= NEWS_MIN_DIRECTIONAL_ARTICLES and weight_total > 0:
             net_pct = (weighted_bull - weighted_bear) / weight_total
-            score = net_pct * 100
+            score = net_pct * NEWS_SCORE_SCALE
+            conf_skew = min(30, abs(bull - bear) * 2)
         else:
-            score = 0
+            score = 0.0
+            conf_skew = 0.0
 
         # Confidence: volume + skew + quality
         conf_volume = min(40, total * 0.5)
-        conf_skew = min(30, abs(bull - bear) * 2)
         conf_accuracy = accuracy * 20
         confidence = min(90, 20 + conf_volume + conf_skew + conf_accuracy)
 
@@ -1057,7 +1567,12 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
             except Exception:
                 pass
 
-        if bear > bull * 2:
+        if directional_count < NEWS_MIN_DIRECTIONAL_ARTICLES:
+            mood = (
+                f"insufficient directional articles ({directional_count} < "
+                f"{NEWS_MIN_DIRECTIONAL_ARTICLES}) — neutral"
+            )
+        elif bear > bull * 2:
             mood = "strongly negative — risk-off environment"
         elif bear > bull:
             mood = "leaning negative"
@@ -1078,7 +1593,10 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
             "news_sentiment", "News Sentiment",
             score, confidence,
             data_point=f"{total} articles: {bull} bullish, {bear} bearish, {neutral} neutral",
-            threshold="net sentiment % scaled to [-100, +100]",
+            threshold=(
+                f"weighted (bull - bear) / (bull + bear + neutral) scaled to [-100, +100]; "
+                f"requires >={NEWS_MIN_DIRECTIONAL_ARTICLES} directional articles"
+            ),
             reasoning=reasoning,
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
@@ -1273,41 +1791,51 @@ def _score_social_sentiment(engine: Engine, accuracy: float) -> dict:
                                   "Treat as neutral until signal_feed captures direction.",
                         historical_accuracy=accuracy,
                     )
+                log.debug("Social sentiment: no signals in last 24h — excluding from score")
                 return _verdict(
                     "social_sentiment", "Social Sentiment",
-                    0, 10, "no social signals", "",
+                    0, 0, "no social signals", "",
                     "No social media signals in the last 24 hours.",
                     status="stale", historical_accuracy=accuracy,
                 )
 
             net_pct = (bull - bear) / total if total > 0 else 0
-            score = net_pct * 80  # cap at ±80 (social is noisy)
+            # Contrarian: retail euphoria (bull > bear) scores bearish; panic scores bullish.
+            score = -net_pct * SOCIAL_SENTIMENT_MAX_SCORE
 
             confidence = min(70, 15 + total * 0.5 + accuracy * 15)
 
-            if bull > bear * 2:
-                mood = "retail euphoria"
+            if bull > bear * SOCIAL_SENTIMENT_EXTREME_RATIO:
+                mood = "retail euphoria (contrarian bearish)"
+                implication = "Extreme retail euphoria often precedes corrections — contrarian bearish signal."
             elif bull > bear:
-                mood = "leaning positive"
-            elif bear > bull * 2:
-                mood = "retail panic"
+                mood = "leaning positive (mildly contrarian bearish)"
+                implication = "Skewed bullish retail chatter leans contrarian bearish."
+            elif bear > bull * SOCIAL_SENTIMENT_EXTREME_RATIO:
+                mood = "retail panic (contrarian bullish)"
+                implication = "Extreme retail panic often marks capitulation — contrarian bullish signal."
             elif bear > bull:
-                mood = "leaning negative"
+                mood = "leaning negative (mildly contrarian bullish)"
+                implication = "Skewed bearish retail chatter leans contrarian bullish."
             else:
-                mood = "mixed chatter"
+                mood = "mixed chatter (neutral)"
+                implication = "Balanced retail chatter — no contrarian directional edge."
 
             reasoning = (
                 f"{total} social signals (24h): {bull} bullish, {bear} bearish. "
                 f"Retail mood: {mood}. "
-                "Social sentiment is a lagging/contrarian indicator — "
-                "extreme retail euphoria often precedes corrections."
+                f"Social sentiment is a lagging/contrarian indicator: {implication}"
             )
 
             return _verdict(
                 "social_sentiment", "Social Sentiment",
                 score, confidence,
                 data_point=f"{total} signals: {bull} bullish, {bear} bearish",
-                threshold="net social direction scaled to [-80, +80]",
+                threshold=(
+                    f"contrarian -(bull - bear)/total scaled to "
+                    f"[-{int(SOCIAL_SENTIMENT_MAX_SCORE)}, +{int(SOCIAL_SENTIMENT_MAX_SCORE)}] "
+                    "(euphoria = bearish, panic = bullish)"
+                ),
                 reasoning=reasoning,
                 historical_accuracy=accuracy,
             )
@@ -1436,13 +1964,18 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
 
 
 def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
-    """CFTC Commitments of Traders — net speculative positioning.
+    """CFTC Commitments of Traders — net speculative positioning for equity direction.
 
-    Tracks smart-money futures bets across SP500, Gold, Crude Oil, VIX.
-    - Extreme net long + rising → institutions riding trend (+60)
-    - Net long shrinking → profit-taking, caution (-20)
-    - Net short + increasing → hedging/bear bet (-60)
-    - VIX net long spike → fear hedging, contrarian bullish (+30)
+    Tracks smart-money futures positioning with asset-class-appropriate signs:
+    - ES (E-mini S&P, equity index, weight 2x): net long + rising → bullish (+60),
+      net short → bearish (-20 to -50).
+    - GC (Gold, safe haven, weight 1x, INVERSE): heavy net long Gold reflects
+      flight-to-safety / risk-off positioning (bearish for equities, -10 to -30);
+      net short Gold reflects risk-on (+10 to +20).
+    - VX (VIX, equity vol, weight 1x, CONTRARIAN): extreme net long VIX → fear
+      hedging / contrarian bullish (+15 to +30); extreme net short → complacency (-20).
+    - CL (WTI crude, commodity): reported for context only and excluded from
+      the equity-direction score so commodity longs cannot flip equity positioning.
 
     Data is weekly (Tuesday snapshot, Friday release).
 
@@ -1456,8 +1989,9 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
     KEY_CONTRACTS = {"ES": "E-mini S&P", "GC": "Gold", "CL": "WTI", "VX": "VIX"}
     try:
         with engine.connect() as conn:
-            scores = []
-            details = []
+            weighted_scores: list[tuple[float, float]] = []
+            details: list[str] = []
+            context_details: list[str] = []
             oldest_date = None
 
             for root, contract in KEY_CONTRACTS.items():
@@ -1480,39 +2014,66 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
 
                 val = float(cur[0])
                 obs = cur[1]
-                if oldest_date is None or (obs and obs < oldest_date):
-                    oldest_date = obs
                 # No prior observation -> momentum unknown (never "val - 0").
                 momentum = val - float(prior[0]) if prior else None
+                direction = "long" if val > 0 else "short" if val < 0 else "flat"
 
-                # VIX is contrarian: net long VIX = fear = bullish for equities
-                if root == "VX":
-                    if val > 50000:
-                        s = 30  # extreme fear → contrarian bullish
-                    elif val > 20000:
-                        s = 15
-                    elif val < -50000:
-                        s = -20  # complacency
-                    else:
-                        s = 0
-                else:
-                    # SP500/Gold/Crude: net long = bullish, momentum matters
-                    if val > 100000 and momentum is not None and momentum > 0:
-                        s = 60
-                    elif val > 50000:
-                        s = 30
+                if root == "CL":
+                    # Non-equity commodity positioning: context only, excluded from equity score.
+                    context_details.append(f"{contract}: {val:+,.0f} net spec ({direction}, context only)")
+                    continue
+
+                if oldest_date is None or (obs and obs < oldest_date):
+                    oldest_date = obs
+
+                if root == "ES":
+                    # Equity index: pro-equity direction (primary weight).
+                    if val > CFTC_EXTREME_NET_CONTRACTS and momentum is not None and momentum > 0:
+                        s = 60.0
+                    elif val > CFTC_MODERATE_NET_CONTRACTS:
+                        s = 30.0
                     elif val > 0:
-                        s = 10
-                    elif val > -50000:
-                        s = -20
+                        s = 10.0
+                    elif val == 0:
+                        s = 0.0
+                    elif val > -CFTC_MODERATE_NET_CONTRACTS:
+                        s = -20.0
                     else:
-                        s = -50
+                        s = -50.0
+                    weighted_scores.append((s, CFTC_EQUITY_WEIGHT))
+                    details.append(f"{contract}: {val:+,.0f} net spec ({direction})")
+                elif root == "GC":
+                    # Safe haven: net long Gold = risk-off (bearish for equities).
+                    if val > CFTC_EXTREME_NET_CONTRACTS and momentum is not None and momentum > 0:
+                        s = -30.0
+                    elif val > CFTC_MODERATE_NET_CONTRACTS:
+                        s = -20.0
+                    elif val > 0:
+                        s = -10.0
+                    elif val == 0:
+                        s = 0.0
+                    elif val > -CFTC_MODERATE_NET_CONTRACTS:
+                        s = 10.0
+                    else:
+                        s = 20.0
+                    weighted_scores.append((s, CFTC_SAFE_HAVEN_WEIGHT))
+                    tag = "long, risk-off" if val > 0 else "short, risk-on" if val < 0 else "flat"
+                    details.append(f"{contract}: {val:+,.0f} net spec ({tag})")
+                elif root == "VX":
+                    # VIX is contrarian: net long VIX = fear = bullish for equities.
+                    if val > CFTC_VIX_EXTREME_CONTRACTS:
+                        s = 30.0  # extreme fear → contrarian bullish
+                    elif val > CFTC_VIX_MODERATE_CONTRACTS:
+                        s = 15.0
+                    elif val < -CFTC_VIX_EXTREME_CONTRACTS:
+                        s = -20.0  # complacency
+                    else:
+                        s = 0.0
+                    weighted_scores.append((s, CFTC_VIX_WEIGHT))
+                    details.append(f"{contract}: {val:+,.0f} net spec ({direction})")
 
-                scores.append(s)
-                direction = "long" if val > 0 else "short"
-                details.append(f"{contract}: {val:+,.0f} net spec ({direction})")
-
-            if not scores:
+            if not weighted_scores:
+                log.debug("CFTC positioning: no scored equity/safe-haven/VIX COT series found")
                 return _verdict(
                     "cftc_positioning", "Futures Positioning (COT)",
                     0, 0, "no CFTC data", "",
@@ -1520,7 +2081,9 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy,
                 )
 
-            score = sum(scores) / len(scores)
+            total_weight = sum(w for _, w in weighted_scores)
+            score = sum(s * w for s, w in weighted_scores) / total_weight
+            all_details = details + context_details
 
             age_hours = None
             if oldest_date:
@@ -1528,26 +2091,30 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                 age_hours = days * 24.0
 
             # Weekly data → lower confidence, but high-signal
-            confidence = min(80, 45 + len(scores) * 5 + accuracy * 15)
+            confidence = min(80, 45 + len(weighted_scores) * 5 + accuracy * 15)
             if age_hours and age_hours > 168:  # older than 1 week
                 confidence *= 0.7
 
-            reasoning = "Futures positioning from CFTC COT report. "
+            reasoning = "Futures positioning from CFTC COT report (equity-weighted; Gold longs scored risk-off). "
             if score > 30:
-                reasoning += "Smart money heavily long — institutions riding the trend. "
+                reasoning += "Smart money heavily long equities — institutions riding the trend. "
             elif score > 0:
-                reasoning += "Modest net long positioning — cautiously bullish. "
+                reasoning += "Modest risk-on / net long equity positioning — cautiously bullish. "
             elif score > -20:
-                reasoning += "Near-neutral positioning — no strong conviction. "
+                reasoning += "Near-neutral equity positioning — no strong conviction. "
             else:
-                reasoning += "Net short positioning — institutions hedging or betting on decline. "
-            reasoning += "; ".join(details[:3]) + "."
+                reasoning += "Risk-off / net short equity positioning — institutions hedging or betting on decline. "
+            reasoning += "; ".join(all_details[:4]) + "."
 
             return _verdict(
                 "cftc_positioning", "Futures Positioning (COT)",
                 score, confidence,
-                data_point="; ".join(details[:2]),
-                threshold="net long >100K = bullish (+60), net short >50K = bearish (-50)",
+                data_point="; ".join(all_details[:2]),
+                threshold=(
+                    "ES equity (2x): long >100K rising (+60), short <-50K (-50); "
+                    "GC safe-haven (1x, risk-off inverse): long >100K rising (-30); "
+                    "VX contrarian (1x); CL context only"
+                ),
                 reasoning=reasoning,
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
@@ -1707,7 +2274,9 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
     try:
         with engine.connect() as conn:
             pe_current = []
-            pe_30d = []
+            paired_cur_pe = []
+            paired_prior_pe = []
+            eps_changes = []
 
             today = date.today()
             for ticker in TICKERS:
@@ -1715,12 +2284,19 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
                 prior = trailing_pe(conn, ticker, today - timedelta(days=30))
                 # Same 0-500 band as the old Tiingo reads: a near-zero EPS
                 # makes a P/E in the thousands that would swamp the average.
-                if cur is not None and cur.pe < 500:
+                cur_ok = cur is not None and cur.pe < VALUATION_MAX_PE
+                prior_ok = prior is not None and prior.pe < VALUATION_MAX_PE
+                if cur_ok:
                     pe_current.append(cur.pe)
-                if prior is not None and prior.pe < 500:
-                    pe_30d.append(prior.pe)
+                if cur_ok and prior_ok:
+                    paired_cur_pe.append(cur.pe)
+                    paired_prior_pe.append(prior.pe)
+                    cur_eps = getattr(cur, "eps_ttm", None)
+                    prior_eps = getattr(prior, "eps_ttm", None)
+                    if cur_eps is not None and prior_eps is not None and prior_eps > 0:
+                        eps_changes.append((cur_eps - prior_eps) / prior_eps * 100.0)
 
-            if len(pe_current) < 3:
+            if len(pe_current) < VALUATION_MIN_TICKERS:
                 return _verdict(
                     "valuation_compression", "Valuation Momentum",
                     0, 0, f"only {len(pe_current)} tickers with PE data", "",
@@ -1729,8 +2305,28 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
                 )
 
             avg_pe = sum(pe_current) / len(pe_current)
-            avg_pe_30d = sum(pe_30d) / len(pe_30d) if pe_30d else avg_pe
-            pe_change_pct = ((avg_pe - avg_pe_30d) / avg_pe_30d * 100) if avg_pe_30d > 0 else 0
+            if paired_cur_pe and paired_prior_pe:
+                avg_pe_paired = sum(paired_cur_pe) / len(paired_cur_pe)
+                avg_pe_30d = sum(paired_prior_pe) / len(paired_prior_pe)
+                pe_change_pct = (
+                    ((avg_pe_paired - avg_pe_30d) / avg_pe_30d * 100.0)
+                    if avg_pe_30d > 0
+                    else 0.0
+                )
+            else:
+                pe_change_pct = 0.0
+
+            avg_eps_change_pct = (
+                sum(eps_changes) / len(eps_changes) if eps_changes else None
+            )
+            earnings_growing = (
+                avg_eps_change_pct is not None
+                and avg_eps_change_pct > VALUATION_MIN_EPS_GROWTH_PCT
+            )
+            price_driven_compression = (
+                pe_change_pct < -VALUATION_PE_CHANGE_MODERATE_PCT
+                and not earnings_growing
+            )
 
             # Score based on level AND direction
             if avg_pe > 35:
@@ -1746,19 +2342,23 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
             else:
                 level_score = 60
 
-            # Momentum adjustment: compression = bullish, expansion = bearish
-            if pe_change_pct > 10:
+            # Momentum adjustment: expansion = bearish; compression is bullish ONLY
+            # when trailing EPS actually grew (> 0%) over the 30-day window.
+            if pe_change_pct > VALUATION_PE_CHANGE_STRONG_PCT:
                 momentum_adj = -20  # rapid expansion
-            elif pe_change_pct > 5:
+            elif pe_change_pct > VALUATION_PE_CHANGE_MODERATE_PCT:
                 momentum_adj = -10
-            elif pe_change_pct < -10:
-                momentum_adj = 20  # rapid compression (value appearing)
-            elif pe_change_pct < -5:
+            elif pe_change_pct < -VALUATION_PE_CHANGE_STRONG_PCT and earnings_growing:
+                momentum_adj = 20  # rapid earnings-driven compression (value appearing)
+            elif pe_change_pct < -VALUATION_PE_CHANGE_MODERATE_PCT and earnings_growing:
                 momentum_adj = 10
             else:
                 momentum_adj = 0
 
             score = max(-80, min(80, level_score + momentum_adj))
+            if price_driven_compression:
+                # Price-driven P/E compression (prices fell without EPS growth): never score bullish.
+                score = min(0, score)
 
             confidence = min(75, 35 + len(pe_current) * 3 + accuracy * 15)
 
@@ -1775,18 +2375,31 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
                 f"(avg across {len(pe_current)} major stocks). "
                 f"PE ratios {direction} {abs(pe_change_pct):.1f}% over 30 days. "
             )
-            if avg_pe > 30 and pe_change_pct > 5:
+            if avg_pe > 30 and pe_change_pct > VALUATION_PE_CHANGE_MODERATE_PCT:
                 reasoning += "Investors paying more and more for each dollar of earnings — classic late-cycle stretch. Risky. "
+            elif price_driven_compression:
+                eps_note = (
+                    f"avg trailing EPS {avg_eps_change_pct:+.1f}%"
+                    if avg_eps_change_pct is not None
+                    else "trailing EPS growth unavailable"
+                )
+                reasoning += (
+                    f"Price-driven compression ({eps_note} over 30d) — P/E fell because prices dropped "
+                    "without positive earnings growth; not scored bullish. "
+                )
+            elif pe_change_pct < -VALUATION_PE_CHANGE_MODERATE_PCT and earnings_growing:
+                reasoning += (
+                    f"Earnings growing faster than prices (avg trailing EPS {avg_eps_change_pct:+.1f}%) "
+                    "— value is appearing. "
+                )
             elif avg_pe < 20:
                 reasoning += "Stocks are historically cheap relative to earnings — potential bargains. "
-            elif pe_change_pct < -5:
-                reasoning += "Earnings growing faster than prices — value is appearing. "
 
             return _verdict(
                 "valuation_compression", "Valuation Momentum",
                 score, confidence,
                 data_point=f"avg PE {avg_pe:.1f}x ({pe_change_pct:+.1f}% 30d), {len(pe_current)} stocks",
-                threshold="PE >30 expensive, <20 cheap; expansion = bearish, compression = bullish",
+                threshold="PE >30 expensive, <20 cheap; expansion = bearish, compression = bullish only when 30d EPS growth > 0%",
                 reasoning=reasoning,
                 historical_accuracy=accuracy,
             )
@@ -2452,6 +3065,17 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
                 "supply_chain": 0.7,
                 "crucix_osint": 1.5, "gdelt_geopolitical": 1.4,
             }
+        elif regime == "FRAGILE":
+            # scripts/auto_regime.py's elevated-stress state (stress index
+            # above 0.6 or rising fast; posture DEFENSIVE): the CRISIS tilts
+            # at half strength.
+            adjustments = {
+                "dealer_gamma": 1.2, "vanna_charm": 1.2,
+                "capital_flows": 1.1, "trust_convergence": 1.15,
+                "regime_changepoints": 1.15,
+                "supply_chain": 0.85,
+                "crucix_osint": 1.25, "gdelt_geopolitical": 1.2,
+            }
         elif regime in ("EXPANSION", "RISK_ON", "GROWTH"):
             adjustments = {
                 "capital_flows": 1.3, "insider_cluster": 1.2,
@@ -2531,7 +3155,7 @@ def score_thesis(engine: Engine, force_refresh: bool = False) -> dict[str, Any]:
 
     for v in verdicts:
         conf = v["confidence"]
-        if conf <= 0 or v["status"] in ("broken", "no_data"):
+        if conf <= 0 or v["status"] in ("broken", "no_data", "stale"):
             continue
         weighted_sum += v["score"] * conf
         conf_sum += conf
@@ -2551,7 +3175,7 @@ def score_thesis(engine: Engine, force_refresh: bool = False) -> dict[str, Any]:
 
     # Assign weight_in_final to each verdict
     for v in verdicts:
-        if conf_sum > 0 and v["confidence"] > 0 and v["status"] not in ("broken", "no_data"):
+        if conf_sum > 0 and v["confidence"] > 0 and v["status"] not in ("broken", "no_data", "stale"):
             v["weight_in_final"] = round(v["confidence"] / conf_sum, 3)
         else:
             v["weight_in_final"] = 0.0
@@ -2624,18 +3248,24 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
                 "status": m["status"],
             }
 
+        top_risk_limit = globals().get("TOP_RISK_FACTORS_LIMIT", 3)
+        active_models = [m for m in thesis.get("models", []) if m["status"] == "active"]
         key_drivers = [
             {"key": m["key"], "name": m["name"], "detail": m["reasoning"]}
-            for m in sorted(thesis.get("models", []), key=lambda x: -abs(x["score"]))[:3]
-            if m["status"] == "active"
+            for m in sorted(active_models, key=lambda x: -abs(x["score"]))[:top_risk_limit]
         ]
+        thesis_dir = thesis["direction"]
+        if thesis_dir == "BULLISH":
+            risk_candidates = [m for m in active_models if m["direction"] == "bearish"]
+        elif thesis_dir == "BEARISH":
+            risk_candidates = [m for m in active_models if m["direction"] == "bullish"]
+        else:
+            risk_candidates = [m for m in active_models if m["direction"] != "neutral"]
         risk_factors = [
             {"key": m["key"], "name": m["name"], "detail": m["reasoning"]}
-            for m in thesis.get("models", [])
-            if m["status"] == "active" and (
-                (thesis["direction"] == "BULLISH" and m["direction"] == "bearish")
-                or (thesis["direction"] == "BEARISH" and m["direction"] == "bullish")
-            )
+            for m in sorted(
+                risk_candidates, key=lambda x: (-abs(x["score"]), x["score"])
+            )[:top_risk_limit]
         ]
 
         with engine.begin() as conn:
@@ -2725,8 +3355,8 @@ _MODEL_PLAIN_NAMES: dict[str, str] = {
     "insider_clusters": "Corporate Insider Trading",
     "insider_cluster": "Corporate Insider Trading",
     "options_flow": "Options Market Bets",
-    "dealer_gamma": "Dealer Positioning",
-    "vanna_charm": "Options Decay & Flows",
+    "dealer_gamma": _DEALER_GAMMA_NAME,
+    "vanna_charm": _VANNA_CHARM_NAME,
     "gex": "Dealer Positioning",
     "news_sentiment": "News Mood",
     "social_sentiment": "Social Media Mood",
