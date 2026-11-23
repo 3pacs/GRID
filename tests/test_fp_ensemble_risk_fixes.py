@@ -5,22 +5,33 @@ Covers:
   1. Direction-blind ensemble confidence & disagreement shrinking toward 0.5.
   2. Track-record triple-counting in vote_weight & Beta-prior hit-rate shrinkage.
   3. Direction-blind FCI confidence multiplier.
-  4. Hardcoded +-3% target_move, neutral calling options_implied_probability,
-     and missing horizon / realized-vol scaling.
+  4. Hardcoded +-3% target_move and neutral calls reading
+     options_implied_probability (the adjustment is now withheld outright;
+     see the Codex HOLD section at the end).
   5. Unsigned ensemble CI and zero-width CI for small/uniform ensembles.
   6. CircuitBreaker exposure using confidence as price and fail-open ticket gate.
   7. GRID_SIGNAL_REGISTRY default mismatch between engine.py and model_factory.py.
+  8. Codex HOLD 6011902881: dampers scale the edge around 0.5 (never the whole
+     probability, never across 0.5), and the options-implied adjustment is
+     withheld because it compared a different event from a latest-only read.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
+from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from intelligence.liquidity_regime import STATE_CRISIS, LiquidityRegimeResult
+from intelligence.market_implied_prob import (
+    MarketImpliedProb,
+    options_implied_probability_from_iv,
+)
 from intelligence.signal_provenance import (
     CausationChain,
     SignalEvidence,
@@ -324,8 +335,10 @@ class TestDefect3SignedFCI:
                 "AAPL", as_of=datetime(2026, 11, 21, tzinfo=timezone.utc)
             )
 
-        assert r_bull.confidence == pytest.approx(0.7 * 1.10, abs=1e-3)
-        assert r_bear.confidence == pytest.approx(0.7 * 0.90, abs=1e-3)
+        # The signed multiplier scales the edge around 0.5 (Codex HOLD
+        # 6011902881), not the whole probability.
+        assert r_bull.confidence == pytest.approx(0.5 + 0.2 * 1.10, abs=1e-3)
+        assert r_bear.confidence == pytest.approx(0.5 + 0.2 * 0.90, abs=1e-3)
 
     def test_tight_fci_lowers_bullish_and_raises_bearish(self):
         bull_pred = _make_predictor([("bullish", 0.7), ("bullish", 0.7)])
@@ -342,8 +355,8 @@ class TestDefect3SignedFCI:
                 "AAPL", as_of=datetime(2026, 11, 21, tzinfo=timezone.utc)
             )
 
-        assert r_bull.confidence == pytest.approx(0.7 * 0.90, abs=1e-3)
-        assert r_bear.confidence == pytest.approx(0.7 * 1.10, abs=1e-3)
+        assert r_bull.confidence == pytest.approx(0.5 + 0.2 * 0.90, abs=1e-3)
+        assert r_bear.confidence == pytest.approx(0.5 + 0.2 * 1.10, abs=1e-3)
 
     def test_fci_does_not_distort_neutral(self):
         neut_pred = _make_predictor([("bullish", 0.8), ("bearish", 0.8)])
@@ -360,7 +373,9 @@ class TestDefect3SignedFCI:
         assert r_neut.confidence == pytest.approx(0.5, abs=1e-4)
 
 
-# ── Defect 4: Horizon-scaled realized-vol target_move & neutral abstention ───
+# ── Defect 4: no hardcoded target move; neutral and no-vol calls abstain ────
+# (The +-sigma*sqrt(h) target-move test was removed with the options-implied
+# adjustment it fed; see TestHoldOptionsImpliedAdjustmentWithheld.)
 
 
 def _synthetic_price_observations(n_days: int = 25, step_log_ret: float = 0.015):
@@ -409,51 +424,6 @@ class TestDefect4HorizonScaledTargetMove:
         mock_opt.assert_not_called()
         assert pred.market_implied_prob == 0.0
         assert pred.market_divergence_severity == ""
-
-    def test_target_move_scales_with_realized_vol_and_sqrt_horizon(self):
-        obs = _synthetic_price_observations(n_days=25, step_log_ret=0.015)
-        log_rets = [
-            math.log(obs[i].value / obs[i - 1].value) for i in range(1, len(obs))
-        ]
-        mean_r = sum(log_rets) / len(log_rets)
-        expected_sigma = math.sqrt(
-            sum((r - mean_r) ** 2 for r in log_rets) / (len(log_rets) - 1)
-        )
-
-        as_of = datetime(2026, 11, 21, 15, 0, tzinfo=timezone.utc)
-        seen_moves: list[float] = []
-
-        def _capture_opt(engine, ticker, *, target_move_pct, horizon_days):
-            seen_moves.append(target_move_pct)
-            return None
-
-        for direction, horizon in [("bullish", 7), ("bullish", 28), ("bearish", 7)]:
-            predictor = _make_predictor([(direction, 0.8), (direction, 0.8)])
-            p1, p2, p3, p4, p5, p6, p7 = _neutral_context_patches()
-            with p1, p2, p3, p4, p5, p6, p7, patch(
-                "store.observations.read_window", return_value=obs
-            ) as mock_rw, patch(
-                "store.observations.read_splits", return_value=[]
-            ), patch(
-                "intelligence.market_implied_prob.options_implied_probability",
-                side_effect=_capture_opt,
-            ):
-                predictor.predict("AAPL", as_of=as_of, horizon=horizon)
-                # Must pass PIT bounds to store.observations.read_window
-                assert mock_rw.called
-                rw_kwargs = mock_rw.call_args.kwargs
-                assert rw_kwargs["as_of"] == as_of.date()
-                assert rw_kwargs["as_of_ts"] == as_of
-
-        move_bull_7, move_bull_28, move_bear_7 = seen_moves
-        assert move_bull_7 > 0
-        assert move_bear_7 < 0
-        assert move_bear_7 == pytest.approx(-move_bull_7, rel=1e-6)
-        # sqrt(28) / sqrt(7) == 2.0
-        assert move_bull_28 == pytest.approx(2.0 * move_bull_7, rel=1e-6)
-        assert move_bull_7 == pytest.approx(
-            expected_sigma * math.sqrt(7), rel=1e-3
-        )
 
     def test_missing_realized_vol_abstains_instead_of_hardcoded_3pct(self):
         predictor = _make_predictor([("bullish", 0.8), ("bullish", 0.8)])
@@ -627,3 +597,259 @@ class TestDefect7SignalRegistryFlagUnified:
             monkeypatch.setenv("GRID_SIGNAL_REGISTRY", val)
             assert mf.signal_registry_enabled() is False
             assert oe._signal_registry_enabled() is False
+
+
+# ── Codex HOLD 6011902881: damp the edge around 0.5; withhold the options ────
+# ── adjustment that compares different events from a latest-only read ──────
+
+# The replay clock sits after the synthetic price history (which ends
+# 2026-11-08), so every price the engine could read is dated before the call.
+_HOLD_AS_OF = datetime(2026, 11, 21, 15, 0, tzinfo=timezone.utc)
+
+
+def _site_patches(
+    *,
+    catalyst: float = 0.0,
+    liquidity_state: str | None = None,
+    fci_score: float = 0.0,
+    fragility: float = 1.0,
+    crowd_multiplier: float = 1.0,
+) -> list:
+    """Patch every confidence damper to a chosen multiplier (no DB)."""
+    regime = None
+    if liquidity_state is not None:
+        regime = LiquidityRegimeResult(
+            state=liquidity_state, as_of=_HOLD_AS_OF.date(), net_liquidity=4e12,
+            level_percentile=5.0, weekly_change=0.0, weekly_change_z=0.0,
+            monthly_change=0.0, confidence_multiplier=1.0, sample_size=100,
+            reason="test",
+        )
+    return [
+        patch(
+            "intelligence.catalyst_aggregator.proximity_score",
+            return_value={"score": catalyst, "catalyst_type": "fomc" if catalyst else None},
+        ),
+        patch(
+            "intelligence.liquidity_regime.classify_current_regime",
+            return_value=regime,
+        ),
+        patch(
+            "oracle.regime_router.RegimeRouter.model_regime_weight",
+            return_value=1.0,
+        ),
+        patch(
+            "intelligence.financial_conditions_index.compute_fci",
+            return_value=SimpleNamespace(score=fci_score, regime="NEUTRAL"),
+        ),
+        patch(
+            "intelligence.shapley_attribution.attribute_votes",
+            return_value=SimpleNamespace(
+                fragility_multiplier=fragility, top_contributor="", top_share=0.0
+            ),
+        ),
+        patch(
+            "intelligence.consensus_crowdedness.compute_crowdedness",
+            return_value=SimpleNamespace(score=0.0, crowd_direction=None),
+        ),
+        patch(
+            "intelligence.consensus_crowdedness.compute_penalty",
+            return_value=SimpleNamespace(
+                multiplier=crowd_multiplier, aligned=crowd_multiplier != 1.0
+            ),
+        ),
+        patch(
+            "intelligence.market_implied_prob.options_implied_probability",
+            return_value=None,
+        ),
+    ]
+
+
+def _predict_with(direction: str, head_conf: float, *, horizon: int = 7, **site):
+    predictor = _make_predictor([(direction, head_conf), (direction, head_conf)])
+    with contextlib.ExitStack() as stack:
+        for p in _site_patches(**site):
+            stack.enter_context(p)
+        return predictor.predict("AAPL", as_of=_HOLD_AS_OF, horizon=horizon)
+
+
+# Each damper at an adverse setting, with the edge multiplier k it applies.
+# FCI is signed, so the adverse reading is mirrored: tight (-2) for a bull,
+# loose (+2) for a bear; both give k = 1 - 0.05 * 2 = 0.90.
+_ADVERSE_SITES = [
+    ("catalyst", {"catalyst": 1.0}, {"catalyst": 1.0}, 0.5),
+    ("liquidity", {"liquidity_state": STATE_CRISIS}, {"liquidity_state": STATE_CRISIS}, 0.6),
+    ("fci", {"fci_score": -2.0}, {"fci_score": 2.0}, 0.9),
+    ("fragility", {"fragility": 0.5}, {"fragility": 0.5}, 0.5),
+    ("crowd", {"crowd_multiplier": 0.5}, {"crowd_multiplier": 0.5}, 0.5),
+]
+
+
+class TestHoldDampEdgeAroundHalf:
+    def test_sixty_percent_bullish_damped_by_half_is_fifty_five(self):
+        from oracle.engine import EnsemblePredictor
+
+        assert EnsemblePredictor._damp_edge(0.6, 0.5) == pytest.approx(0.55)
+        # The whole-probability product (0.6 x 0.5 = 0.30) must never appear.
+        assert EnsemblePredictor._damp_edge(0.6, 0.5) != pytest.approx(0.30)
+
+    def test_damp_edge_never_crosses_half_or_leaves_unit_interval(self):
+        from oracle.engine import EnsemblePredictor
+
+        ps = [0.5, 0.5001, 0.52, 0.6, 0.75, 0.99, 1.0]
+        ks = [0.0, 0.1, 0.5, 0.85, 1.0, 1.15, 5.0, -1.0, float("nan"), float("inf")]
+        for p in ps:
+            for k in ks:
+                out = EnsemblePredictor._damp_edge(p, k)
+                case = f"p={p} k={k} -> {out}"
+                assert math.isfinite(out), case
+                assert 0.5 <= out <= 1.0, case
+                if math.isfinite(k) and 0.0 <= k <= 1.0:
+                    assert out <= p + 1e-9, case
+                if not math.isfinite(k) or k <= 0.0:
+                    assert out == pytest.approx(0.5), case
+
+    def test_non_finite_confidence_fails_closed_to_no_edge(self):
+        from oracle.engine import EnsemblePredictor
+
+        assert EnsemblePredictor._damp_edge(float("nan"), 0.5) == pytest.approx(0.5)
+
+    @pytest.mark.parametrize(
+        "site,bull_kw,bear_kw,k", _ADVERSE_SITES, ids=[s[0] for s in _ADVERSE_SITES]
+    )
+    def test_each_damper_is_mirrored_and_keeps_the_side(self, site, bull_kw, bear_kw, k):
+        # Two unanimous heads at 0.6: bull p_up = 0.60, bear p_up = 0.40.
+        bull = _predict_with("bullish", 0.6, **bull_kw)
+        bear = _predict_with("bearish", 0.6, **bear_kw)
+
+        expected = 0.5 + k * 0.1
+        assert bull.direction == "bullish"
+        assert bear.direction == "bearish"
+        assert bull.confidence == pytest.approx(expected, abs=1e-4)
+        assert bear.confidence == pytest.approx(expected, abs=1e-4)
+        assert bull.confidence > 0.5 and bear.confidence > 0.5
+        assert bull.score >= 50 >= bear.score
+        assert bull.score - 50 == 50 - bear.score
+
+    def test_every_damper_at_once_never_crosses_half(self):
+        bull = _predict_with(
+            "bullish", 0.52, catalyst=1.0, liquidity_state=STATE_CRISIS,
+            fci_score=-3.0, fragility=0.3, crowd_multiplier=0.3,
+        )
+        bear = _predict_with(
+            "bearish", 0.52, catalyst=1.0, liquidity_state=STATE_CRISIS,
+            fci_score=3.0, fragility=0.3, crowd_multiplier=0.3,
+        )
+        for pred, side in ((bull, "bullish"), (bear, "bearish")):
+            assert pred.direction == side
+            assert 0.5 <= pred.confidence <= 0.52
+            assert pred.confidence_lower <= pred.confidence <= pred.confidence_upper
+        assert bull.confidence == pytest.approx(bear.confidence, abs=1e-6)
+
+    def test_favourable_fci_widens_the_edge_but_caps_at_one(self):
+        bull = _predict_with("bullish", 0.99, fci_score=3.0)
+        bear = _predict_with("bearish", 0.99, fci_score=-3.0)
+        assert bull.confidence == pytest.approx(min(1.0, 0.5 + 0.49 * 1.15), abs=1e-4)
+        assert bear.confidence == pytest.approx(bull.confidence, abs=1e-6)
+        assert bull.confidence <= 1.0
+
+    def test_neutral_call_stays_at_half_under_every_damper(self):
+        predictor = _make_predictor([("bullish", 0.7), ("bearish", 0.7)])
+        with contextlib.ExitStack() as stack:
+            for p in _site_patches(
+                catalyst=1.0, liquidity_state=STATE_CRISIS, fci_score=-3.0,
+                fragility=0.3, crowd_multiplier=0.3,
+            ):
+                stack.enter_context(p)
+            pred = predictor.predict("AAPL", as_of=_HOLD_AS_OF)
+        assert pred.direction == "neutral"
+        assert pred.confidence == pytest.approx(0.5, abs=1e-4)
+        assert pred.score == 50
+
+
+def _latest_only_chain(rows: list[tuple[date, float, float]]):
+    """Fake ``options_implied_probability`` that, like the real reader
+    (``ORDER BY signal_date DESC LIMIT 1``, no ``as_of``), always reads the
+    newest snapshot in ``rows`` — including snapshots after the call's time."""
+
+    def _reader(engine, ticker, *, target_move_pct, horizon_days, **_kw):
+        if not rows:
+            return None
+        _sig_date, spot, iv = max(rows, key=lambda r: r[0])
+        prob = options_implied_probability_from_iv(
+            spot=spot,
+            target_price=spot * (1.0 + target_move_pct),
+            iv=iv,
+            days_to_expiry=horizon_days,
+        )
+        return MarketImpliedProb(
+            ticker=ticker.upper(), prob=prob, source="options_iv",
+            target_move_pct=target_move_pct, horizon_days=horizon_days,
+            raw_iv=iv, spot=spot,
+        )
+
+    return _reader
+
+
+def _replay(
+    direction: str, chain_rows, *, horizon: int = 7, head_conf: float = 0.7
+):
+    """Historical replay at _HOLD_AS_OF with PIT prices available."""
+    obs = _synthetic_price_observations(n_days=25, step_log_ret=0.015)
+    predictor = _make_predictor([(direction, head_conf), (direction, head_conf)])
+    reader = MagicMock(side_effect=_latest_only_chain(chain_rows))
+    with contextlib.ExitStack() as stack:
+        for p in _site_patches()[:-1]:
+            stack.enter_context(p)
+        stack.enter_context(patch("store.observations.read_window", return_value=obs))
+        stack.enter_context(patch("store.observations.read_splits", return_value=[]))
+        stack.enter_context(
+            patch(
+                "intelligence.market_implied_prob.options_implied_probability",
+                reader,
+            )
+        )
+        pred = predictor.predict("AAPL", as_of=_HOLD_AS_OF, horizon=horizon)
+    return pred, reader
+
+
+class TestHoldOptionsImpliedAdjustmentWithheld:
+    @pytest.mark.parametrize("direction", ["bullish", "bearish"])
+    def test_historical_replay_ignores_later_option_chain_changes(self, direction):
+        # Chain as it stood at the call, then the same table after later
+        # snapshots landed (an IV spike dated after the decision time).
+        at_call = [(date(2026, 11, 20), 100.0, 0.20)]
+        later = at_call + [(date(2026, 12, 18), 100.0, 2.00)]
+
+        pred_then, _ = _replay(direction, at_call, head_conf=0.55)
+        pred_now, _ = _replay(direction, later, head_conf=0.55)
+
+        assert asdict(pred_then) == asdict(pred_now)
+        assert pred_now.confidence == pytest.approx(0.55, abs=1e-4)
+        assert pred_now.market_implied_prob == 0.0
+        assert pred_now.market_divergence_severity == ""
+
+    @pytest.mark.parametrize("direction", ["bullish", "bearish"])
+    @pytest.mark.parametrize("horizon", [1, 7, 28])
+    def test_event_mismatch_withholds_and_records_why(self, direction, horizon):
+        # A deep divergence that the old path turned into a 0.85x multiplier.
+        rows = [(date(2026, 11, 20), 100.0, 0.05)]
+        pred, reader = _replay(direction, rows, horizon=horizon)
+
+        reader.assert_not_called()
+        assert pred.direction == direction
+        assert pred.confidence == pytest.approx(0.7, abs=1e-4)
+        assert pred.market_implied_prob == 0.0
+        assert pred.market_divergence_severity == ""
+        reason = pred.market_adjustment_withheld
+        assert "event_mismatch" in reason
+        assert "not_point_in_time" in reason
+
+    def test_withheld_reason_is_reported_for_neutral_calls_too(self):
+        predictor = _make_predictor([("bullish", 0.8), ("bearish", 0.8)])
+        with contextlib.ExitStack() as stack:
+            for p in _site_patches():
+                stack.enter_context(p)
+            pred = predictor.predict("AAPL", as_of=_HOLD_AS_OF)
+        assert pred.direction == "neutral"
+        assert "event_mismatch" in pred.market_adjustment_withheld
+        assert asdict(pred)["market_adjustment_withheld"] == pred.market_adjustment_withheld
