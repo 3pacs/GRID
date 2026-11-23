@@ -1024,6 +1024,8 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 
     # ── CBOE vol self-mappings (puller writes feature name as series_id) ──
     "put_call_ratio": "put_call_ratio",
+    # Same daily options page (migration cboe_equity_pcr_20261123).
+    "equity_put_call_ratio": "equity_put_call_ratio",
     "correlation_index": "correlation_index",
 
     # ── Pump.fun mappings (puller writes PUMP:{signal} as series_id) ──────

@@ -1057,6 +1057,7 @@ def _d8_neutral_data(as_of: date) -> dict[str, Any]:
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [100.0] * 40, as_of),        # CROWD data, 0 points
             "put_call_ratio": _d8_obs("put_call_ratio", [0.9], as_of),  # market-wide, shown, not scored
+            "equity_put_call_ratio": _d8_obs("equity_put_call_ratio", [0.7], as_of),  # FLOW: shown, not scored
             _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 40, as_of),        # NARRATIVE: shown, not scored
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
@@ -1306,6 +1307,7 @@ def _d9_max_data(as_of: date) -> dict[str, Any]:
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [1_000.0] * 80 + [50_000.0] * 10, as_of),   # FTD surge 5
             "put_call_ratio": _d8_obs("put_call_ratio", [1.3], as_of),          # shown, not scored
+            "equity_put_call_ratio": _d8_obs("equity_put_call_ratio", [0.9], as_of),  # shown, not scored
             _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 60 + [49.0] * 31, as_of),       # shown, not scored
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
@@ -1427,6 +1429,48 @@ class TestDefect9LostEvidenceAndDormantConviction:
 
         outcomes = {pcr: outcome(pcr) for pcr in (None, 0.5, 1.05, 1.3, 3.0)}
         assert len(set(outcomes.values())) == 1, outcomes
+
+    @pytest.mark.parametrize(
+        "ticker_state", ["max", "neutral", "flow-missing", "crowd-missing", "ticker-layers-missing"],
+    )
+    def test_equity_put_call_never_moves_the_total_or_its_bounds(
+        self, monkeypatch: pytest.MonkeyPatch, ticker_state: str,
+    ) -> None:
+        # Codex HOLD on #1397 cd0b24b1 / 4e30ed90: the equity ratio is
+        # descriptive. It is the same number for every ticker, so it is tried
+        # against tickers at every kind of state: every layer at its maximum
+        # (with a FLOW volatility spike), neutral, FLOW or CROWD missing, and
+        # every ticker layer missing. No value of it, and its absence, changes
+        # total_score, score_low, score_high, the alert, the attainable
+        # ceiling (57) or FLOW's score and availability.
+        base = _d9_max_data(AS_OF) if ticker_state == "max" else _d8_neutral_data(AS_OF)
+        dropped = {
+            "flow-missing": ("FLOW",),
+            "crowd-missing": ("CROWD",),
+            "ticker-layers-missing": ("CROWD", "NARRATIVE", "FLOW", "SMART_MONEY"),
+        }.get(ticker_state, ())
+        for layer in dropped:
+            base = _d8_drop(base, layer)
+
+        def outcome(epcr: float | None) -> tuple[Any, ...]:
+            known = dict(base["known"])
+            if epcr is None:
+                known.pop("equity_put_call_ratio", None)
+            else:
+                known["equity_put_call_ratio"] = _d8_obs("equity_put_call_ratio", [epcr], AS_OF)
+            r = _d8_score(monkeypatch, {**base, "known": known})
+            flow = _d8_layer(r, "FLOW")
+            assert cs.EQUITY_PCR_NOT_SCORED in flow.signals
+            return (
+                r.total_score, r.score_low, r.score_high, r.alert_level,
+                r.max_attainable_score, r.dormant_alert_levels,
+                flow.score, flow.data_available, flow.trust,
+            )
+
+        outcomes = {epcr: outcome(epcr) for epcr in (None, 0.4, 0.8, 0.81, 1.4, 3.0)}
+        assert len(set(outcomes.values())) == 1, outcomes
+        (_, _, _, _, ceiling, dormant, *_rest) = outcomes[None]
+        assert (ceiling, dormant) == (57, ("CONVICTION", "FIRE"))
 
     def test_bound_tables_agree_with_the_scorers(self) -> None:
         assert set(cs.LAYER_MIN_SCORE) == set(cs.LAYER_ATTAINABLE_SCORE) == set(cs.LAYER_MAX_SCORE)
