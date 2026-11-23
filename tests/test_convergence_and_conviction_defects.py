@@ -1053,6 +1053,7 @@ def _d8_neutral_data(as_of: date) -> dict[str, Any]:
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [100.0] * 40, as_of),        # CROWD data, 0 points
             "put_call_ratio": _d8_obs("put_call_ratio", [0.9], as_of),  # market-wide, 0 points
+            "equity_put_call_ratio": _d8_obs("equity_put_call_ratio", [0.7], as_of),  # market-wide, 0 points
             _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 40, as_of),        # NARRATIVE data (1/day), 0 points
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
@@ -1242,9 +1243,10 @@ class TestDefect8NoLayerPromotesByMissingData:
 # PASS, the same sell on a short window 24 PASS, and SMART_MONEY unavailable
 # 26 WATCH. The alert now comes from score_low (every unknown at its worst
 # attainable value) and total_score stays the neutral point estimate.
-# (2) The current scorers top out at 40.90 of 63.15 = 65 (81 before the
-# inputs with no live writer stopped counting, 2026-11-23), so CONVICTION (85)
-# and FIRE (70) are unreachable; reports say so instead of implying they are live.
+# (2) The current scorers top out at 42.70 of 63.15 = 68 (81 before the
+# inputs with no live writer stopped counting, 2026-11-23; 65 until FLOW read
+# the equity put/call ratio again), so CONVICTION (85) and FIRE (70) are
+# unreachable; reports say so instead of implying they are live.
 
 _LEVEL_ORDER = ("PASS", "WATCH", "PILOT", "SCALE", "FIRE", "CONVICTION")
 
@@ -1285,7 +1287,8 @@ _D9_CASES = {
 def _d9_max_data(as_of: date) -> dict[str, Any]:
     """Inputs that drive every current layer scorer to its attainable maximum."""
     # Crash 100 -> 20, flat, then a 5-day rebound to 27: drawdown -73 %
-    # (SETUP 5), a volatility spike (FLOW 5) and a confirmed turn (CONFIRM 10).
+    # (SETUP 5), a volatility spike (FLOW 5, + 3 equity PCR) and a confirmed
+    # turn (CONFIRM 10).
     values = (
         [100.0 - 80.0 * i / 60 for i in range(61)]
         + [20.0] * 25
@@ -1296,6 +1299,7 @@ def _d9_max_data(as_of: date) -> dict[str, Any]:
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [1_000.0] * 80 + [50_000.0] * 10, as_of),   # FTD surge 5
             "put_call_ratio": _d8_obs("put_call_ratio", [1.3], as_of),          # PCR 3
+            "equity_put_call_ratio": _d8_obs("equity_put_call_ratio", [0.9], as_of),  # FLOW equity PCR 3
             _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 60 + [49.0] * 31, as_of),       # news surge 5
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
@@ -1382,14 +1386,14 @@ class TestDefect9LostEvidenceAndDormantConviction:
         assert {layer.name: layer.score for layer in report.layers} == {
             name: cs.LAYER_ATTAINABLE_SCORE[name] for name in cs.LAYER_FULL_TRUST if name != "COMPANY"
         }
-        # ... earns 40.90 of 63.15 = 65: SCALE is the highest reachable alert.
-        assert (report.total_score, report.score_low, report.score_high) == (65, 65, 65)
+        # ... earns 42.70 of 63.15 = 68: SCALE is the highest reachable alert.
+        assert (report.total_score, report.score_low, report.score_high) == (68, 68, 68)
         assert report.alert_level == "SCALE"
-        assert report.max_attainable_score == 65
+        assert report.max_attainable_score == 68
         assert report.dormant_alert_levels == ("CONVICTION", "FIRE")
         thresholds = dict(cs.ALERT_THRESHOLDS)
         assert min(thresholds["CONVICTION"], thresholds["FIRE"]) > report.max_attainable_score
-        assert all(floor <= 65 for name, floor in cs.ALERT_THRESHOLDS if name not in {"CONVICTION", "FIRE"})
+        assert all(floor <= 68 for name, floor in cs.ALERT_THRESHOLDS if name not in {"CONVICTION", "FIRE"})
 
     def test_bound_tables_agree_with_the_scorers(self) -> None:
         assert set(cs.LAYER_MIN_SCORE) == set(cs.LAYER_ATTAINABLE_SCORE) == set(cs.LAYER_MAX_SCORE)
@@ -1431,5 +1435,5 @@ class TestDefect9LostEvidenceAndDormantConviction:
         }
         for body in bodies.values():
             assert body["alert_basis"] == "score_low"
-            assert body["max_attainable_score"] == 65
+            assert body["max_attainable_score"] == 68
             assert body["dormant_alert_levels"] == ["CONVICTION", "FIRE"]

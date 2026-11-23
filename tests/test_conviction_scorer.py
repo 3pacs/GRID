@@ -313,19 +313,26 @@ def test_score_narrative_buckets_news_surge_and_reports_wiki_gdelt_unavailable(
     assert reads == [(sid, "tiingo_news", 90)]
 
 
-def test_score_flow_buckets_volatility_and_reads_no_options_series() -> None:
+def test_score_flow_buckets_volatility_and_equity_put_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     prices = _series([100.0] * 60 + [110.0, 121.0, 133.1, 146.41, 161.051])
+    reads = _install_known(monkeypatch, {
+        "equity_put_call_ratio": _obs("equity_put_call_ratio", [0.85]),
+    })
     conn = _RecordingConn()
 
     result = cs.score_flow(conn, "ABC", prices, as_of_date=date(2026, 5, 13))
 
     assert result.name == "FLOW"
-    assert result.score == 5 == cs.LAYER_ATTAINABLE_SCORE["FLOW"]
+    assert result.score == 8 == cs.LAYER_ATTAINABLE_SCORE["FLOW"]  # volatility 5 + equity PCR 3
     assert any("Volatility spike" in signal for signal in result.signals)
+    assert "Equity PCR=0.85 (2026-05-13) [BEARISH - contrarian buy]" in result.signals
     assert cs.WHALE_NOT_SCORED in result.signals
-    assert cs.EQUITY_PCR_UNAVAILABLE in result.signals
     assert result.data_available is True
-    assert conn.calls == []  # no WHALE:* or equity put/call read
+    # The equity ratio is read from its writer's source; nothing reads WHALE:*.
+    assert reads == [("equity_put_call_ratio", "CBOE", 5)]
+    assert conn.calls == []
 
 
 # ── CROWD / NARRATIVE / FLOW inputs on a real raw_series table ────────────
@@ -538,13 +545,86 @@ def test_score_narrative_ignores_stale_and_unpulled_news_counts() -> None:
 def test_score_flow_counts_a_quiet_tape_as_measured() -> None:
     quiet = _series([100.0 + (i % 2) for i in range(61)])
 
-    measured = cs.score_flow(object(), "ABC", quiet, as_of_date=date(2026, 5, 13))
-    short = cs.score_flow(object(), "ABC", quiet.tail(60), as_of_date=date(2026, 5, 13))
+    with _RawDB().engine.connect() as conn:
+        measured = cs.score_flow(conn, "ABC", quiet, as_of_date=date(2026, 5, 13))
+        short = cs.score_flow(conn, "ABC", quiet.tail(60), as_of_date=date(2026, 5, 13))
 
     assert (measured.score, measured.data_available, measured.trust) == (0, True, cs.LAYER_FULL_TRUST["FLOW"])
     assert any(s.startswith("No volatility spike") for s in measured.signals)
     # 59 returns: no 60-day baseline, so nothing was measured.
     assert (short.score, short.data_available) == (0, False)
+
+
+def _flow_prices(n: int, end: date = _AS_OF) -> pd.Series:
+    """A quiet tape (alternating +-1 %): 0 volatility points, measured from 61 prices."""
+    return _series([100.0 + (i % 2) for i in range(n)], end=end)
+
+
+def test_score_flow_reads_equity_put_call_point_in_time() -> None:
+    db = _RawDB()
+    db.add("equity_put_call_ratio", _AS_OF - timedelta(days=1), 0.86, source="CBOE")
+    # Pulled after the as-of date: not known yet, so 0.86 is the newest.
+    db.add("equity_put_call_ratio", _AS_OF, 0.55, source="CBOE", pulled=_evening(_AS_OF + timedelta(days=1)))
+    # The legacy id, and the same id under another source, count for nothing.
+    db.add("CBOE:equitypc", _AS_OF, 0.40, source="CBOE")
+    db.add("equity_put_call_ratio", _AS_OF, 0.40, source="SEC_EDGAR")
+
+    with db.engine.connect() as conn:
+        result = cs.score_flow(conn, "SPY", _flow_prices(61), as_of_date=_AS_OF)
+
+    assert result.score == 3
+    assert (result.data_available, result.trust) == (True, cs.LAYER_FULL_TRUST["FLOW"])
+    assert f"Equity PCR=0.86 ({_AS_OF - timedelta(days=1)}) [BEARISH - contrarian buy]" in result.signals
+
+
+@pytest.mark.parametrize(
+    ("value", "points", "signal"),
+    [
+        (0.81, 3, "Equity PCR=0.81 (2026-11-20) [BEARISH - contrarian buy]"),
+        (0.80, 0, "Equity PCR=0.80 (2026-11-20)"),  # the rule is strictly above 0.8
+        (0.62, 0, "Equity PCR=0.62 (2026-11-20)"),
+    ],
+)
+def test_score_flow_equity_put_call_threshold(value: float, points: int, signal: str) -> None:
+    db = _RawDB()
+    db.add("equity_put_call_ratio", _AS_OF, value, source="CBOE")
+
+    with db.engine.connect() as conn:
+        result = cs.score_flow(conn, "SPY", _flow_prices(61), as_of_date=_AS_OF)
+
+    assert result.score == points
+    assert signal in result.signals
+
+
+def test_score_flow_ignores_a_stale_equity_put_call() -> None:
+    db = _RawDB()
+    db.add("equity_put_call_ratio", _AS_OF - timedelta(days=cs.EQUITY_PCR_FRESH_DAYS + 1), 1.4, source="CBOE")
+
+    with db.engine.connect() as conn:
+        result = cs.score_flow(conn, "SPY", _flow_prices(61), as_of_date=_AS_OF)
+
+    assert result.score == 0
+    assert (
+        f"Equity put/call unavailable (no equity_put_call_ratio in the {cs.EQUITY_PCR_FRESH_DAYS} days to {_AS_OF})"
+        in result.signals
+    )
+
+
+def test_market_wide_equity_put_call_never_makes_flow_available() -> None:
+    # 59 returns: no 60-day baseline, so this ticker's flow was not measured.
+    # The market-wide ratio still adds its points (at the missing-layer trust),
+    # as CROWD's total ratio does, but FLOW stays unavailable.
+    db = _RawDB()
+    db.add("equity_put_call_ratio", _AS_OF, 0.95, source="CBOE")
+
+    with db.engine.connect() as conn:
+        result = cs.score_flow(conn, "SPY", _flow_prices(60), as_of_date=_AS_OF)
+        no_price = cs.score_flow(conn, "SPY", pd.Series(dtype=float), as_of_date=_AS_OF)
+
+    assert (result.score, result.data_available, result.trust) == (3, False, 0.15)
+    assert cs._layer_bound(result, cs.LAYER_MIN_SCORE) == 0.0  # not ticker evidence
+    # Without a price panel FLOW is not scored at all, so nothing is read.
+    assert (no_price.score, no_price.data_available) == (0, False)
 
 
 def test_input_constants_match_their_writers() -> None:
@@ -555,8 +635,12 @@ def test_input_constants_match_their_writers() -> None:
 
     assert sec_ftd.SECFTDPuller.SOURCE_NAME == cs.FTD_SOURCE
     assert sec_ftd.SECFTDPuller.series_id("037833100") == f"{cs.FTD_SERIES_PREFIX}037833100"
-    assert cboe_indices.CBOEIndicesPuller.SOURCE_NAME == cs.PCR_SOURCE
+    assert cboe_indices.CBOEIndicesPuller.SOURCE_NAME == cs.PCR_SOURCE == cs.EQUITY_PCR_SOURCE
     assert cboe_indices.PUT_CALL_SERIES_ID == cs.PCR_SERIES
+    assert cboe_indices.EQUITY_PUT_CALL_SERIES_ID == cs.EQUITY_PCR_SERIES
+    # Each id is the page ratio its rule was written for.
+    assert cboe_indices.PUT_CALL_PAGE_SERIES[cs.PCR_SERIES][0] == "TOTAL PUT/CALL RATIO"
+    assert cboe_indices.PUT_CALL_PAGE_SERIES[cs.EQUITY_PCR_SERIES][0] == "EQUITY PUT/CALL RATIO"
     assert tiingo_news_pull.TiingoNewsPuller.SOURCE_NAME.lower() == cs.NEWS_SOURCE
     pull_all = inspect.signature(tiingo_news_pull.TiingoNewsPuller.pull_all)
     assert pull_all.parameters["limit_per_ticker"].default == cs.NEWS_FETCH_CAP
