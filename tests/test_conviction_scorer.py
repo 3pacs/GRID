@@ -1,18 +1,35 @@
 """Focused tests for alpha_research.conviction_scorer.
 
-The tests use connection and engine doubles only. They guard the PIT query
-contract, representative scorer buckets for all seven layers, and the public
+The tests use connection and engine doubles, and an in-memory SQLite
+raw_series for the CROWD / NARRATIVE inputs (read through the real
+store.observations reader). They guard the PIT query contract,
+representative scorer buckets for all seven layers, and the public
 entry-point alert level mapping.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
 import pytest
+from sqlalchemy import (
+    Column,
+    Date,
+    DateTime,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+)
+from sqlalchemy.pool import StaticPool
 
 from alpha_research import conviction_scorer as cs
 from store.pit import retraction_cutoff
@@ -84,18 +101,31 @@ def test_load_latest_uses_release_and_vintage_as_of_filter() -> None:
     }
 
 
-def test_load_raw_latest_uses_pull_timestamp_as_release_proxy_with_source() -> None:
+def test_read_known_is_a_pull_evidence_read_from_the_writer_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     as_of = date(2026, 5, 13)
-    conn = _RecordingConn(rows=[(1.23,)])
+    calls: list[dict[str, Any]] = []
 
-    assert cs._load_raw_latest(conn, "CBOE:totalpc", source_id=5, as_of_date=as_of) == 1.23
+    def fake_known_at(conn: Any, series_id: str, **kwargs: Any) -> list[Any]:
+        calls.append({"conn": conn, "series_id": series_id, **kwargs})
+        return []
 
-    call = conn.calls[0]
-    assert "pull_timestamp::date <= :as_of" in call.sql
-    assert "obs_date <= :as_of" in call.sql
-    assert "source_id = :s" in call.sql
-    assert call.params["s"] == 5
-    assert call.params["as_of"] == as_of
+    monkeypatch.setattr(cs, "read_window_known_at", fake_known_at)
+    conn = object()
+
+    assert cs._read_known(conn, "put_call_ratio", "CBOE", as_of, 5) == []
+    # No modeled lag: a row counts only once it was pulled by the end of as_of.
+    assert calls == [{
+        "conn": conn, "series_id": "put_call_ratio", "as_of": as_of, "lag": None,
+        "source": "CBOE", "start": as_of - timedelta(days=5),
+    }]
+
+
+def test_prefix_range_loader_is_gone() -> None:
+    # Under griddb's en_US.UTF-8 collation 'WHALE:SPY:600' < 'WHALE:SPY;' is
+    # false, so the ">= prefix / < prefix+1" scan read none of the rows.
+    assert not hasattr(cs, "_load_raw_latest")
 
 
 def test_load_raw_series_uses_as_of_window_and_pull_timestamp_release_proxy() -> None:
@@ -207,68 +237,495 @@ def test_form4_ps_fields_never_include_all_code_or_legacy_series() -> None:
     assert not any(f.startswith("OPEN_MKT") for f in cs._FORM4_PS_FIELDS)
 
 
-def test_score_crowd_buckets_short_ftd_and_put_call_extremes(
+def _obs(series_id: str, values: list[float], end: date = date(2026, 5, 13), step: int = 1) -> list[Any]:
+    from store.observations import Observation
+
+    first = end - timedelta(days=step * (len(values) - 1))
+    return [
+        Observation(series_id, first + timedelta(days=step * i), v, None, None)
+        for i, v in enumerate(values)
+    ]
+
+
+def _install_known(monkeypatch: pytest.MonkeyPatch, known: dict[str, list[Any]]) -> list[tuple[str, str, int]]:
+    reads: list[tuple[str, str, int]] = []
+
+    def fake_read_known(_conn: Any, series_id: str, source: str, _as_of: date, days: int) -> list[Any]:
+        reads.append((series_id, source, days))
+        return known.get(series_id, [])
+
+    monkeypatch.setattr(cs, "_read_known", fake_read_known)
+    return reads
+
+
+def test_score_crowd_scores_ftd_and_shows_put_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = {
-        "SHORT:ABC:ratio": _series([0.60, 0.62, 0.61]),
-        "FTD:ABC:qty": _series([5_000.0] * 30 + [20_000.0] * 10),
-    }
+    ftd_id = "sec:ftd_balance:000000AB1"
+    reads = _install_known(monkeypatch, {
+        ftd_id: _obs(ftd_id, [5_000.0] * 30 + [20_000.0] * 10),
+        "put_call_ratio": _obs("put_call_ratio", [1.30]),
+    })
 
-    def fake_raw_series(_conn: Any, series_id: str, *_args: Any, **_kwargs: Any) -> pd.Series:
-        return data.get(series_id, pd.Series(dtype=float))
+    checked: list[tuple[str, str, int]] = []
 
-    monkeypatch.setattr(cs, "_load_raw_series", fake_raw_series)
-    monkeypatch.setattr(cs, "_load_raw_latest", lambda *_args, **_kwargs: 1.30)
+    def fake_identity(_conn: Any, series_id: str, symbol: str, _as_of: date, selected: Any) -> None:
+        checked.append((series_id, symbol, len(selected)))
 
-    result = cs.score_crowd(object(), "ABC", as_of_date=date(2026, 5, 13))
+    monkeypatch.setattr(cs, "_ftd_identity_break", fake_identity)
 
-    assert result.name == "CROWD"
-    assert result.score == 13
-    assert any("HEAVILY SHORTED" in signal for signal in result.signals)
-    assert result.data_available is True
-
-
-def test_score_narrative_buckets_news_attention_and_gdelt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        cs,
-        "_load_raw_series",
-        lambda *_args, **_kwargs: _series([1.0] * 30 + [3.0] * 7),
+    result = cs.score_crowd(
+        object(), "ABC", as_of_date=date(2026, 5, 13), ftd_series_ids={"ABC": (ftd_id,)},
     )
 
-    latest = {"wiki_abc": 10.0, "gdelt_article_count": 1500.0}
-    monkeypatch.setattr(cs, "_load_latest", lambda _c, name, **_kw: latest.get(name))
+    assert checked == [(ftd_id, "ABC", 40)]  # every selected balance goes to the identity check
+    assert result.name == "CROWD"
+    assert result.score == 5  # FTD surge 5; put/call 1.30 is shown, not scored
+    assert result.score == cs.LAYER_ATTAINABLE_SCORE["CROWD"]
+    assert cs.SHORT_INTEREST_UNAVAILABLE in result.signals
+    assert any("SQUEEZE SETUP" in signal for signal in result.signals)
+    assert cs.PCR_NOT_SCORED in result.signals
+    assert "Total put/call, not scored: 1.30 (2026-05-13)" in result.signals
+    assert result.data_available is True
+    # Each input is read from its writer's own source.
+    assert reads == [(ftd_id, "SEC_FTD", 90), ("put_call_ratio", "CBOE", 5)]
+
+
+@pytest.mark.parametrize("pcr", [None, 0.6, 1.05, 1.30, 2.5])
+def test_score_crowd_put_call_never_scores_or_makes_crowd_available(
+    monkeypatch: pytest.MonkeyPatch, pcr: float | None,
+) -> None:
+    # Codex HOLD on #1395 a994e347: the Cboe puller's pull_timestamp is its
+    # transaction start, not the fetch time, so total put/call is descriptive.
+    _install_known(monkeypatch, {} if pcr is None else {"put_call_ratio": _obs("put_call_ratio", [pcr])})
+
+    result = cs.score_crowd(object(), "ABC", as_of_date=date(2026, 5, 13), ftd_series_ids={})
+
+    assert (result.score, result.data_available) == (0, False)
+    assert cs.PCR_NOT_SCORED in result.signals
+
+
+def test_score_crowd_reads_nothing_for_short_interest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = _install_known(monkeypatch, {})
+
+    result = cs.score_crowd(object(), "ABC", as_of_date=date(2026, 5, 13), ftd_series_ids={})
+
+    assert not any(sid.startswith("SHORT:") or "short_volume" in sid for sid, _, _ in reads)
+    assert result.score == 0
+    assert result.data_available is False
+    assert cs.SHORT_INTEREST_UNAVAILABLE in result.signals
+
+
+def test_score_narrative_shows_news_and_scores_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "TIINGO_NEWS:ABC:daily_count"
+    # A jump in the trailing 7-day count (7 -> 49) is shown and never scored.
+    reads = _install_known(monkeypatch, {sid: _obs(sid, [7.0] * 6 + [49.0])})
+    monkeypatch.setattr(cs, "_load_latest", lambda *_a, **_k: pytest.fail("wiki/GDELT must not be read"))
 
     result = cs.score_narrative(object(), "ABC", as_of_date=date(2026, 5, 13))
 
     assert result.name == "NARRATIVE"
-    assert result.score == 8
-    assert any("News volume surging" in signal for signal in result.signals)
-    assert result.data_available is True
+    assert result.score == 0 == cs.LAYER_ATTAINABLE_SCORE["NARRATIVE"]
+    assert result.data_available is False
+    assert result.signals == (
+        cs.NEWS_NOT_SCORED,
+        "Tiingo news, not scored: 49 articles returned for the 7 days to 2026-05-13",
+        cs.WIKI_UNAVAILABLE,
+        cs.GDELT_UNAVAILABLE,
+    )
+    assert reads == [(sid, "tiingo_news", 7)]
 
 
-def test_score_flow_buckets_volatility_options_and_equity_put_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_score_flow_buckets_volatility_and_reads_no_options_series() -> None:
     prices = _series([100.0] * 60 + [110.0, 121.0, 133.1, 146.41, 161.051])
+    conn = _RecordingConn()
 
-    def fake_raw_latest(_conn: Any, pattern: str, *_args: Any, **_kwargs: Any) -> float | None:
-        if pattern.startswith("WHALE:ABC"):
-            return 1.0
-        if pattern == "CBOE:equitypc":
-            return 0.90
-        return None
-
-    monkeypatch.setattr(cs, "_load_raw_latest", fake_raw_latest)
-
-    result = cs.score_flow(object(), "ABC", prices, as_of_date=date(2026, 5, 13))
+    result = cs.score_flow(conn, "ABC", prices, as_of_date=date(2026, 5, 13))
 
     assert result.name == "FLOW"
-    assert result.score == 13
-    assert any("Unusual options" in signal for signal in result.signals)
+    assert result.score == 5 == cs.LAYER_ATTAINABLE_SCORE["FLOW"]
+    assert any("Volatility spike" in signal for signal in result.signals)
+    assert cs.WHALE_NOT_SCORED in result.signals
+    assert cs.EQUITY_PCR_UNAVAILABLE in result.signals
     assert result.data_available is True
+    assert conn.calls == []  # no WHALE:* or equity put/call read
+
+
+# ── CROWD / NARRATIVE / FLOW inputs on a real raw_series table ────────────
+#
+# SQLite stands in for griddb: the FTD symbol lookup is plain SQL, and the
+# value reads go through the real store.observations.read_window_known_at.
+
+sqlite3.register_adapter(date, lambda d: d.isoformat())
+sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
+
+_AS_OF = date(2026, 11, 20)
+_SRC = {"SEC_FTD": 1, "CBOE": 2, "tiingo_news": 3, "SEC_EDGAR": 4}
+
+
+def _evening(d: date) -> datetime:
+    return datetime.combine(d, datetime.min.time()) + timedelta(hours=22)
+
+
+class _RawDB:
+    def __init__(self) -> None:
+        self.engine = create_engine(
+            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False},
+        )
+        md = MetaData()
+        catalog = Table(
+            "source_catalog", md,
+            Column("id", Integer, primary_key=True), Column("name", String, nullable=False),
+        )
+        self._raw = Table(
+            "raw_series", md,
+            Column("series_id", String, nullable=False),
+            Column("source_id", Integer, nullable=False),
+            Column("obs_date", Date, nullable=False),
+            Column("pull_timestamp", DateTime, nullable=False),
+            Column("value", Float, nullable=False),
+            Column("raw_payload", Text),
+            Column("pull_status", String, nullable=False),
+        )
+        md.create_all(self.engine)
+        with self.engine.begin() as c:
+            c.execute(catalog.insert(), [{"id": i, "name": n} for n, i in _SRC.items()])
+
+    def add(
+        self, series_id: str, obs_date: date, value: float, *, source: str,
+        pulled: datetime | None = None, symbol: str | None = None, status: str = "SUCCESS",
+    ) -> None:
+        with self.engine.begin() as c:
+            c.execute(self._raw.insert(), [{
+                "series_id": series_id, "source_id": _SRC[source], "obs_date": obs_date,
+                "pull_timestamp": pulled or _evening(obs_date), "value": value,
+                "raw_payload": json.dumps({"symbol": symbol} if symbol else {}),
+                "pull_status": status,
+            }])
+
+    def ftd(self, cusip: str, symbol: str, balances: list[float], end: date, **kw: Any) -> str:
+        sid = f"sec:ftd_balance:{cusip}"
+        first = end - timedelta(days=len(balances) - 1)
+        for i, v in enumerate(balances):
+            self.add(sid, first + timedelta(days=i), v, source="SEC_FTD", symbol=symbol, **kw)
+        return sid
+
+
+def test_ftd_series_ids_maps_symbols_known_at_the_as_of_date() -> None:
+    db = _RawDB()
+    aapl = db.ftd("037833100", "AAPL", [100.0], _AS_OF - timedelta(days=20))
+    # Pulled after the as-of date: not yet known.
+    db.ftd("594918104", "MSFT", [100.0], _AS_OF - timedelta(days=20), pulled=_evening(_AS_OF + timedelta(days=1)))
+    # Settled before the 90-day window, a failed pull, and another source's row.
+    db.ftd("88160R101", "TSLA", [100.0], _AS_OF - timedelta(days=95))
+    db.ftd("30303M102", "META", [0.0], _AS_OF - timedelta(days=5), status="FAILED")
+    db.add("FTD:NVDA:qty", _AS_OF - timedelta(days=5), 1.0, source="SEC_EDGAR", symbol="NVDA")
+    # One symbol on two CUSIPs, and the listed GOLD (the gold_full panel is futures).
+    db.ftd("36467W109", "GME", [100.0], _AS_OF - timedelta(days=30))
+    db.ftd("36467W208", "GME", [100.0], _AS_OF - timedelta(days=10))
+    db.ftd("067901108", "GOLD", [100.0], _AS_OF - timedelta(days=10))
+    # "_" in the prefix is a literal: a look-alike id never matches.
+    db.add("sec:ftdXbalance:000000000", _AS_OF - timedelta(days=5), 1.0, source="SEC_FTD", symbol="AMD")
+
+    with db.engine.connect() as conn:
+        ids = cs._ftd_series_ids(
+            conn, ["AAPL", "msft", "TSLA", "META", "NVDA", "GME", "GOLD", "AMD"], _AS_OF,
+        )
+
+    assert ids == {
+        "AAPL": (aapl,),
+        "GME": ("sec:ftd_balance:36467W109", "sec:ftd_balance:36467W208"),
+    }
+
+
+def test_score_crowd_reads_ftd_and_put_call_point_in_time() -> None:
+    db = _RawDB()
+    # 40 settlement dates ending 10 days before as-of: 30 at 5k, then 10 at 20k.
+    sid = db.ftd("037833100", "AAPL", [5_000.0] * 30 + [20_000.0] * 10, _AS_OF - timedelta(days=10))
+    # A revision of the last date pulled after as-of must not count.
+    db.add(sid, _AS_OF - timedelta(days=10), 1.0, source="SEC_FTD", symbol="AAPL",
+           pulled=_evening(_AS_OF + timedelta(days=2)))
+    db.add("put_call_ratio", _AS_OF - timedelta(days=1), 1.25, source="CBOE")
+    db.add("put_call_ratio", _AS_OF, 0.80, source="CBOE", pulled=_evening(_AS_OF + timedelta(days=1)))
+
+    with db.engine.connect() as conn:
+        result = cs.score_crowd(conn, "AAPL", as_of_date=_AS_OF)
+
+    assert result.score == 5  # FTD surge 5; put/call is shown, not scored
+    assert result.data_available is True
+    assert result.trust == cs.LAYER_FULL_TRUST["CROWD"]
+    signals = " | ".join(result.signals)
+    assert f"settled to {_AS_OF - timedelta(days=10)}" in signals
+    # The 0.80 pulled after the as-of date is not known yet.
+    assert f"Total put/call, not scored: 1.25 ({_AS_OF - timedelta(days=1)})" in signals
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("none", "No SEC FTD balance filed under AAPL"),
+        ("stale", "SEC FTD balance stale for AAPL"),
+        ("two_cusips", "FTD not scored (AAPL is filed under 2 CUSIPs"),
+    ],
+)
+def test_score_crowd_ftd_fails_closed(setup: str, expected: str) -> None:
+    db = _RawDB()
+    if setup == "stale":
+        db.ftd("037833100", "AAPL", [50_000.0] * 5, _AS_OF - timedelta(days=cs.FTD_FRESH_DAYS + 1))
+    elif setup == "two_cusips":
+        db.ftd("037833100", "AAPL", [50_000.0] * 5, _AS_OF - timedelta(days=10))
+        db.ftd("037833209", "AAPL", [50_000.0] * 5, _AS_OF - timedelta(days=10))
+    # Put/call older than the freshness window does not count either.
+    db.add("put_call_ratio", _AS_OF - timedelta(days=cs.PCR_FRESH_DAYS + 1), 1.5, source="CBOE")
+
+    with db.engine.connect() as conn:
+        result = cs.score_crowd(conn, "AAPL", as_of_date=_AS_OF)
+
+    assert result.score == 0
+    assert result.data_available is False
+    assert any(s.startswith(expected) for s in result.signals), result.signals
+    assert f"No total put/call in the {cs.PCR_FRESH_DAYS} days to {_AS_OF}" in result.signals
+
+
+# ── FTD identity: the scored balance must be filed under the ticker ──────
+#
+# The symbol lookup finds a CUSIP from any row filed under the symbol, while
+# the balances are read from the CUSIP series. Codex HOLD on #1395 f821c50c:
+# old A/C rows plus newer B/C rows (a symbol change, or a corrected filing)
+# must not let A score B's balance. Every row of the series in the read
+# bounds has to be filed under the ticker, and every selected vintage has to
+# be one of those rows.
+
+_CUSIP = "30303M102"
+_FTD_SID = f"sec:ftd_balance:{_CUSIP}"
+_SURGE = [5_000.0] * 30 + [20_000.0] * 10  # FTD surge: 5 points when it scores
+
+
+def _ftd_result(db: _RawDB, ticker: str) -> cs.LayerResult:
+    with db.engine.connect() as conn:
+        return cs.score_crowd(conn, ticker, as_of_date=_AS_OF)
+
+
+def test_ftd_symbol_change_on_one_cusip_abstains_for_both_symbols() -> None:
+    db = _RawDB()
+    # One CUSIP: filed as FB for 40 dates, then as META for the newest 10.
+    db.ftd(_CUSIP, "FB", _SURGE, _AS_OF - timedelta(days=20))
+    db.ftd(_CUSIP, "META", [90_000.0] * 10, _AS_OF - timedelta(days=10))
+
+    with db.engine.connect() as conn:
+        ids = cs._ftd_series_ids(conn, ["FB", "META"], _AS_OF)
+    assert ids == {"FB": (_FTD_SID,), "META": (_FTD_SID,)}
+
+    fb, meta = _ftd_result(db, "FB"), _ftd_result(db, "META")
+
+    # Before the fix FB scored META's fresh 90,000 sh balance as its own.
+    assert (fb.score, fb.data_available) == (0, False)
+    assert (meta.score, meta.data_available) == (0, False)
+    assert f"FTD not scored ({_FTD_SID} was also filed as META in the window)" in fb.signals
+    assert f"FTD not scored ({_FTD_SID} was also filed as FB in the window)" in meta.signals
+
+
+@pytest.mark.parametrize(
+    ("pulled", "scores"),
+    [
+        # A corrected vintage of the newest date, filed under another symbol.
+        # Known by the end of the as-of date: the identity is broken.
+        (datetime.combine(_AS_OF, datetime.min.time()) + timedelta(hours=23, minutes=59), False),
+        # Pulled at the end of the as-of date (UTC) or later: not known yet,
+        # so it neither breaks the identity nor replaces the balance.
+        (datetime.combine(_AS_OF + timedelta(days=1), datetime.min.time()), True),
+        (_evening(_AS_OF + timedelta(days=3)), True),
+    ],
+    ids=["known", "at-cutoff", "after-cutoff"],
+)
+def test_ftd_corrected_vintage_breaks_identity_only_once_known(pulled: datetime, scores: bool) -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    db.add(_FTD_SID, _AS_OF - timedelta(days=10), 1.0, source="SEC_FTD", symbol="MVRS", pulled=pulled)
+
+    result = _ftd_result(db, "META")
+
+    if scores:
+        assert (result.score, result.data_available) == (5, True)
+        assert any("FTD balance surging (20,000 vs 5,000 sh" in s for s in result.signals), result.signals
+    else:
+        assert (result.score, result.data_available) == (0, False)
+        assert f"FTD not scored ({_FTD_SID} was also filed as MVRS in the window)" in result.signals
+
+
+def test_ftd_identity_is_judged_on_the_read_window_only() -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    # Another symbol settled before the window, after the as-of date, from
+    # another source, or on a failed pull: none of them is a row the read can
+    # select, so none breaks the identity.
+    db.add(_FTD_SID, _AS_OF - timedelta(days=cs.FTD_WINDOW_DAYS + 1), 1.0, source="SEC_FTD", symbol="FB")
+    db.add(_FTD_SID, _AS_OF + timedelta(days=1), 1.0, source="SEC_FTD", symbol="FB",
+           pulled=_evening(_AS_OF - timedelta(days=1)))
+    db.add(_FTD_SID, _AS_OF - timedelta(days=5), 1.0, source="SEC_EDGAR", symbol="FB")
+    db.add(_FTD_SID, _AS_OF - timedelta(days=5), 0.0, source="SEC_FTD", symbol="FB", status="FAILED")
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (5, True)
+    # On the first day of the window it does.
+    db.add(_FTD_SID, _AS_OF - timedelta(days=cs.FTD_WINDOW_DAYS), 1.0, source="SEC_FTD", symbol="FB")
+    assert _ftd_result(db, "META").data_available is False
+
+
+def test_ftd_row_without_a_symbol_breaks_identity() -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    db.add(_FTD_SID, _AS_OF - timedelta(days=30), 7.0, source="SEC_FTD", symbol=None)
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (0, False)
+    assert f"FTD not scored ({_FTD_SID} was also filed as no symbol in the window)" in result.signals
+
+
+def test_ftd_selected_vintage_must_be_a_row_on_file_under_the_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    real_read = cs._read_known
+
+    def read_with_a_vintage_not_on_file(conn: Any, series_id: str, source: str, as_of: date, days: int) -> list[Any]:
+        obs = real_read(conn, series_id, source, as_of, days)
+        if series_id != _FTD_SID:
+            return obs
+        stray = cs.Observation(_FTD_SID, obs[-1].obs_date, 90_000.0, _evening(_AS_OF - timedelta(days=2)), "SEC_FTD")
+        return [*obs[:-1], stray]
+
+    monkeypatch.setattr(cs, "_read_known", read_with_a_vintage_not_on_file)
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (0, False)
+    assert (
+        f"FTD not scored (the {_AS_OF - timedelta(days=10)} balance read from {_FTD_SID} "
+        "is not on file under META)"
+    ) in result.signals
+
+
+def test_ftd_row_pulled_between_the_read_and_the_check_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As of today, a pull can land after the balances are read. The identity
+    # check runs after the read, so the new row is judged, not skipped.
+    db = _RawDB()
+    db.ftd(_CUSIP, "META", _SURGE, _AS_OF - timedelta(days=10))
+    real_read = cs._read_known
+
+    def read_then_a_pull_lands(conn: Any, series_id: str, source: str, as_of: date, days: int) -> list[Any]:
+        obs = real_read(conn, series_id, source, as_of, days)
+        if series_id == _FTD_SID:
+            db.add(_FTD_SID, _AS_OF - timedelta(days=10), 1.0, source="SEC_FTD", symbol="MVRS",
+                   pulled=_evening(_AS_OF) - timedelta(hours=1))
+        return obs
+
+    monkeypatch.setattr(cs, "_read_known", read_then_a_pull_lands)
+
+    result = _ftd_result(db, "META")
+
+    assert (result.score, result.data_available) == (0, False)
+    assert f"FTD not scored ({_FTD_SID} was also filed as MVRS in the window)" in result.signals
+
+
+@pytest.mark.parametrize("ticker", ["GOLD", "BTC"])
+def test_symbol_keyed_inputs_skip_a_ticker_whose_panel_is_another_instrument(ticker: str) -> None:
+    # gold_full is gold futures and btc_full Binance BTCUSDT; SEC and Tiingo
+    # file Barrick Gold and a bitcoin trust under the same symbols.
+    db = _RawDB()
+    db.ftd("067901108", ticker, [50_000.0] * 40, _AS_OF)
+    db.add(f"TIINGO_NEWS:{ticker}:daily_count", _AS_OF, 49.0, source="tiingo_news")
+
+    with db.engine.connect() as conn:
+        crowd = cs.score_crowd(conn, ticker, as_of_date=_AS_OF)
+        narrative = cs.score_narrative(conn, ticker, as_of_date=_AS_OF)
+
+    assert (crowd.data_available, narrative.data_available) == (False, False)
+    assert any(s.startswith("FTD not read") for s in crowd.signals)
+    assert any(s.startswith("News not read") for s in narrative.signals)
+
+
+def _news_db(values: list[float], end: date = _AS_OF) -> _RawDB:
+    db = _RawDB()
+    first = end - timedelta(days=len(values) - 1)
+    for i, v in enumerate(values):
+        db.add("TIINGO_NEWS:SPY:daily_count", first + timedelta(days=i), v, source="tiingo_news")
+    return db
+
+
+@pytest.mark.parametrize(
+    ("values", "signal"),
+    [
+        ([7.0, 21.0], "Tiingo news, not scored: 21 articles returned for the 7 days to 2026-11-20"),
+        # A value at the fetch cap is a lower bound.
+        ([49.0, 50.0], "Tiingo news, not scored: >=50 articles returned for the 7 days to 2026-11-20"),
+    ],
+    ids=["count", "capped"],
+)
+def test_score_narrative_shows_the_newest_tiingo_count_and_never_scores(
+    values: list[float], signal: str,
+) -> None:
+    db = _news_db(values)
+
+    with db.engine.connect() as conn:
+        result = cs.score_narrative(conn, "SPY", as_of_date=_AS_OF)
+
+    assert (result.score, result.data_available) == (0, False)
+    assert result.signals[:2] == (cs.NEWS_NOT_SCORED, signal)
+
+
+def test_score_narrative_ignores_stale_and_unpulled_news_counts() -> None:
+    db = _news_db([49.0] * 10, end=_AS_OF - timedelta(days=cs.NEWS_TRAILING_DAYS + 1))
+    db.add("TIINGO_NEWS:SPY:daily_count", _AS_OF, 49.0, source="tiingo_news",
+           pulled=_evening(_AS_OF + timedelta(days=1)))
+    # The legacy id carries nothing any more.
+    db.add("NEWS:SPY:daily_count", _AS_OF, 49.0, source="tiingo_news")
+
+    with db.engine.connect() as conn:
+        result = cs.score_narrative(conn, "SPY", as_of_date=_AS_OF)
+
+    assert (result.score, result.data_available) == (0, False)
+    assert result.signals[1] == "No Tiingo news count for SPY in the 7 days to 2026-11-20"
+
+
+def test_score_flow_counts_a_quiet_tape_as_measured() -> None:
+    quiet = _series([100.0 + (i % 2) for i in range(61)])
+
+    measured = cs.score_flow(object(), "ABC", quiet, as_of_date=date(2026, 5, 13))
+    short = cs.score_flow(object(), "ABC", quiet.tail(60), as_of_date=date(2026, 5, 13))
+
+    assert (measured.score, measured.data_available, measured.trust) == (0, True, cs.LAYER_FULL_TRUST["FLOW"])
+    assert any(s.startswith("No volatility spike") for s in measured.signals)
+    # 59 returns: no 60-day baseline, so nothing was measured.
+    assert (short.score, short.data_available) == (0, False)
+
+
+def test_input_constants_match_their_writers() -> None:
+    import inspect
+
+    from ingestion import tiingo_news_pull
+    from ingestion.altdata import cboe_indices, sec_ftd
+
+    assert sec_ftd.SECFTDPuller.SOURCE_NAME == cs.FTD_SOURCE
+    assert sec_ftd.SECFTDPuller.series_id("037833100") == f"{cs.FTD_SERIES_PREFIX}037833100"
+    assert cboe_indices.CBOEIndicesPuller.SOURCE_NAME == cs.PCR_SOURCE
+    assert cboe_indices.PUT_CALL_SERIES_ID == cs.PCR_SERIES
+    assert tiingo_news_pull.TiingoNewsPuller.SOURCE_NAME.lower() == cs.NEWS_SOURCE
+    pull_all = inspect.signature(tiingo_news_pull.TiingoNewsPuller.pull_all)
+    assert pull_all.parameters["limit_per_ticker"].default == cs.NEWS_FETCH_CAP
+    body = inspect.getsource(tiingo_news_pull.TiingoNewsPuller.pull_ticker_news)
+    assert f"timedelta(days={cs.NEWS_TRAILING_DAYS})" in body
+    assert '"sid": f"TIINGO_NEWS:{ticker}:daily_count"' in body
+    assert cs.NEWS_SERIES.format(ticker="SPY") == "TIINGO_NEWS:SPY:daily_count"
 
 
 def test_score_confirmation_buckets_turning_momentum_and_higher_low() -> None:
@@ -309,8 +766,9 @@ def test_score_ticker_passes_as_of_date_to_layer_helpers(
         seen.append((f"smart:{ticker}", as_of_date))
         return layer("SMART_MONEY", 7.5, 15)
 
-    def fake_crowd(_conn: Any, ticker: str, *, as_of_date: date | None = None):
+    def fake_crowd(_conn: Any, ticker: str, *, as_of_date: date | None = None, ftd_series_ids: Any = None):
         seen.append((f"crowd:{ticker}", as_of_date))
+        assert ftd_series_ids == {}  # looked up for the ticker on the engine's connection
         return layer("CROWD", 7.5, 15)
 
     def fake_narrative(_conn: Any, ticker: str, *, as_of_date: date | None = None):
@@ -421,13 +879,22 @@ def test_scan_all_filters_ticker_universe_as_of_and_scores_same_date(
 ) -> None:
     as_of = date(2026, 5, 13)
     conn = _RecordingConn(rows=[("BBB",), ("AAA",)])
-    seen: list[tuple[str, date | None]] = []
+    seen: list[tuple[str, date | None, Any]] = []
+    lookups: list[tuple[list[str], date]] = []
+    ftd_ids = {"AAA": ("sec:ftd_balance:000000AA1",)}
 
-    def fake_score_ticker(_engine: Any, ticker: str, *, as_of_date: date | None = None):
-        seen.append((ticker, as_of_date))
+    def fake_ftd_ids(_conn: Any, tickers: list[str], at: date) -> dict[str, tuple[str, ...]]:
+        lookups.append((list(tickers), at))
+        return ftd_ids
+
+    def fake_score_ticker(
+        _engine: Any, ticker: str, *, as_of_date: date | None = None, ftd_series_ids: Any = None,
+    ):
+        seen.append((ticker, as_of_date, ftd_series_ids))
         score = 80 if ticker == "AAA" else 30
         return cs.ConvictionReport(ticker, score, score, (), "FIRE", "ts")
 
+    monkeypatch.setattr(cs, "_ftd_series_ids", fake_ftd_ids)
     monkeypatch.setattr(cs, "score_ticker", fake_score_ticker)
 
     reports = cs.scan_all(_Engine(conn), min_score=40, as_of_date=as_of)
@@ -437,5 +904,7 @@ def test_scan_all_filters_ticker_universe_as_of_and_scores_same_date(
     assert "rs.vintage_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
     assert call.params == {"as_of": as_of}
-    assert seen == [("BBB", as_of), ("AAA", as_of)]
+    # One FTD symbol lookup for the universe, handed to every ticker.
+    assert lookups == [(["BBB", "AAA"], as_of)]
+    assert seen == [("BBB", as_of, ftd_ids), ("AAA", as_of, ftd_ids)]
     assert [report.ticker for report in reports] == ["AAA"]
