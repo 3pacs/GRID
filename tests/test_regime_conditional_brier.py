@@ -885,3 +885,117 @@ class TestRegimeSourceAPI:
                 engine, "flow_momentum", 7, "EXPANSION"
             )
         assert via_source is via_fallback is sentinel
+
+
+# ── Alias key policy (Codex HOLD 6030789643) ─────────────────────────────
+
+
+def _alias_card(source: str, weight: float) -> SignalScorecard:
+    return SignalScorecard(
+        signal_source=source,
+        horizon_days=7,
+        scored_count=60,
+        running_brier=0.1,
+        running_ece=0.1,
+        hit_rate=0.6,
+        last_updated=datetime(2026, 4, 13, tzinfo=timezone.utc),
+        is_calibrated=True,
+        conviction_weight=weight,
+    )
+
+
+class TestAliasKeyPolicy:
+    """``aliases`` are other spellings of the same signal. Every key's
+    regime row is tried before any key's flat scorecard, so a flat card on
+    an earlier key never hides a warm regime card on a later one. Within a
+    tier the earliest key (``signal_source`` first) wins."""
+
+    def _tables(self, regime: dict, flat: dict):
+        reads: list[tuple[str, str]] = []
+
+        def _regime(_eng, src, _h, _reg):
+            reads.append(("regime", src))
+            return regime.get(src)
+
+        def _flat(_eng, src, _h):
+            reads.append(("flat", src))
+            return flat.get(src)
+
+        return reads, _regime, _flat
+
+    def _lookup(self, regime: dict, flat: dict, *, signal_regime="EXPANSION"):
+        from features.regime_conditional_brier import get_scorecard_with_regime_source
+
+        reads, fake_regime, fake_flat = self._tables(regime, flat)
+        with patch(
+            "features.regime_conditional_brier.get_regime_conditional_scorecard",
+            fake_regime,
+        ), patch(
+            "features.regime_conditional_brier.get_signal_scorecard", fake_flat
+        ):
+            card, source = get_scorecard_with_regime_source(
+                MagicMock(),
+                "jodi_oil",
+                7,
+                signal_regime,
+                aliases=("feature:jodi_oil",),
+            )
+        return card, source, reads
+
+    def test_regime_card_on_later_alias_beats_flat_card_on_earlier_alias(self):
+        card, source, reads = self._lookup(
+            regime={"feature:jodi_oil": _alias_card("feature:jodi_oil", 1.4)},
+            flat={"jodi_oil": _alias_card("jodi_oil", 0.9)},
+        )
+        assert source == "regime"
+        assert card.signal_source == "feature:jodi_oil"
+        assert card.conviction_weight == 1.4
+        # Both aliases' regime rows are read before any flat scorecard.
+        assert reads == [("regime", "jodi_oil"), ("regime", "feature:jodi_oil")]
+
+    def test_earliest_alias_wins_within_the_regime_tier(self):
+        card, source, reads = self._lookup(
+            regime={
+                "jodi_oil": _alias_card("jodi_oil", 1.3),
+                "feature:jodi_oil": _alias_card("feature:jodi_oil", 1.4),
+            },
+            flat={},
+        )
+        assert (source, card.signal_source) == ("regime", "jodi_oil")
+        assert reads == [("regime", "jodi_oil")]
+
+    def test_flat_tier_tries_every_alias_after_every_regime_miss(self):
+        card, source, reads = self._lookup(
+            regime={},
+            flat={"feature:jodi_oil": _alias_card("feature:jodi_oil", 1.1)},
+        )
+        assert (source, card.signal_source) == ("flat_fallback", "feature:jodi_oil")
+        assert reads == [
+            ("regime", "jodi_oil"),
+            ("regime", "feature:jodi_oil"),
+            ("flat", "jodi_oil"),
+            ("flat", "feature:jodi_oil"),
+        ]
+
+    def test_earliest_alias_wins_within_the_flat_tier(self):
+        card, source, _ = self._lookup(
+            regime={},
+            flat={
+                "jodi_oil": _alias_card("jodi_oil", 1.1),
+                "feature:jodi_oil": _alias_card("feature:jodi_oil", 0.8),
+            },
+        )
+        assert (source, card.signal_source) == ("flat_fallback", "jodi_oil")
+
+    def test_no_regime_reads_only_flat_cards_across_aliases(self):
+        card, source, reads = self._lookup(
+            regime={"jodi_oil": _alias_card("jodi_oil", 1.3)},
+            flat={"feature:jodi_oil": _alias_card("feature:jodi_oil", 1.1)},
+            signal_regime=None,
+        )
+        assert (source, card.signal_source) == ("flat", "feature:jodi_oil")
+        assert all(kind == "flat" for kind, _ in reads)
+
+    def test_no_card_on_any_alias_reports_no_source(self):
+        card, source, _ = self._lookup(regime={}, flat={})
+        assert (card, source) == (None, None)

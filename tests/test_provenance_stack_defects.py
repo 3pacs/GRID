@@ -1113,3 +1113,323 @@ class TestCodexHold6011905360PredictionClock:
         assert report is None
         assert err is not None and "live-only" in err
         assert reads == []
+
+
+# ── Codex HOLD 6030789643: alias priority and one validated decision clock ──
+#
+# 1. A signal's scorecard is looked up under every spelling of its key
+#    (``jodi_oil`` / ``feature:jodi_oil``). A regime card on any alias wins
+#    over a flat card on an earlier one.
+# 2. The prediction's clock is validated asymmetrically: a future clock past
+#    a 60 s skew, a clock older than the live window, a date-only clock and a
+#    missing clock are all refused before any layer is read.
+# 3. Only evidence bound by a timestamp at or before that clock moves a
+#    number directional use reads. Everything else is computed and reported
+#    as advisory, and the decision-bearing numbers take the neutral value.
+
+_ADVISORY_LAYERS_NVDA = (
+    "cooccurrence",
+    "confidence_bucket",
+    "scenario",
+    "null_hypothesis",
+    "meta_learning",
+    "contra_indicator",
+    "short_squeeze",
+    "prediction_market_arb",
+    "convergence",
+    "money_flow",
+    "memory_lesson",
+)
+
+
+def _card_at(source: str, weight: float, last_updated: Any) -> SignalScorecard:
+    return SignalScorecard(
+        signal_source=source,
+        horizon_days=7,
+        scored_count=50,
+        running_brier=0.08,
+        running_ece=0.06,
+        hit_rate=0.65,
+        last_updated=last_updated,
+        is_calibrated=True,
+        conviction_weight=weight,
+    )
+
+
+def _fudge_engine(rows: list[dict[str, Any]]) -> MagicMock:
+    engine = MagicMock()
+    conn = engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.mappings.return_value.all.return_value = rows
+    return engine
+
+
+class TestCodexHold6030789643AliasPriority:
+    def test_regime_card_on_later_alias_beats_flat_card_on_earlier_alias(self) -> None:
+        pred = _prediction(signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = _LIVE_NOW - timedelta(minutes=2)
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            calls = _patch_calibration_tables(
+                stack,
+                regime_cards={
+                    "feature:jodi_oil": _card_at("feature:jodi_oil", 1.4, _LIVE_NOW - timedelta(days=1))
+                },
+                flat_cards={"jodi_oil": _card_at("jodi_oil", 0.9, _LIVE_NOW - timedelta(days=1))},
+            )
+            report = sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        row = _evidence_rows(report)["jodi_oil"]
+        assert row["calibration_source"] == "regime"
+        assert row["scorecard"]["conviction_weight"] == pytest.approx(1.4)
+        assert report.regime_calibrated_signal_count == 1
+        assert calls["regime"] == [
+            ("jodi_oil", "EXPANSION"),
+            ("feature:jodi_oil", "EXPANSION"),
+        ]
+        assert calls["flat"] == []
+
+    def test_prefixed_source_finds_regime_card_on_bare_alias(self) -> None:
+        pred = _prediction(signal_contributions={"feature:vol": 1.0})
+        pred.as_of = _LIVE_NOW - timedelta(minutes=2)
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            _patch_calibration_tables(
+                stack,
+                regime_cards={"vol": _card_at("vol", 1.4, _LIVE_NOW - timedelta(days=1))},
+                flat_cards={"feature:vol": _card_at("feature:vol", 0.8, _LIVE_NOW - timedelta(days=1))},
+            )
+            report = sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        row = _evidence_rows(report)["feature:vol"]
+        assert row["calibration_source"] == "regime"
+        assert row["scorecard"]["conviction_weight"] == pytest.approx(1.4)
+
+
+class TestCodexHold6030789643DecisionClock:
+    @pytest.mark.parametrize(
+        "clock",
+        [
+            pytest.param(_LIVE_NOW + timedelta(seconds=61), id="future-just-past-skew"),
+            pytest.param(_LIVE_NOW + timedelta(minutes=10), id="future-same-hour"),
+            pytest.param(_LIVE_NOW + timedelta(hours=3), id="future-same-day"),
+        ],
+    )
+    def test_future_stamp_is_refused_before_any_read(self, clock: datetime) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = clock
+        with ExitStack() as stack:
+            reads = _spy_every_layer(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            with pytest.raises(ValueError, match="future"):
+                sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert reads == []
+
+    def test_clock_within_the_future_skew_is_the_decision_clock(self) -> None:
+        clock = _LIVE_NOW + timedelta(seconds=30)
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = clock
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=1.0)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            _patch_calibration_tables(
+                stack,
+                regime_cards={},
+                flat_cards={"jodi_oil": _card_at("jodi_oil", 1.3, _LIVE_NOW - timedelta(days=1))},
+            )
+            report = sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert sp.LIVE_CLOCK_MAX_FUTURE_SKEW <= timedelta(seconds=60)
+        assert report.decision_clock == clock.isoformat()
+        assert report.to_dict()["decision_clock"] == clock.isoformat()
+
+    @pytest.mark.parametrize(
+        "clock",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param(_LIVE_NOW.date(), id="date-only-today"),
+        ],
+    )
+    def test_missing_or_date_only_clock_is_refused_for_directional_use(self, clock: Any) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = clock
+        with ExitStack() as stack:
+            reads = _spy_every_layer(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            with pytest.raises(ValueError, match="decision clock"):
+                sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert reads == []
+
+    def test_missing_clock_fails_closed_through_the_decision_gateway(self) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        assert getattr(pred, "as_of", None) is None
+        with ExitStack() as stack:
+            reads = _spy_every_layer(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            report, err = dg._run_provenance(MagicMock(), pred, None)
+
+        assert report is None
+        assert err is not None and "decision clock" in err
+        assert reads == []
+
+    def test_clock_older_than_the_live_window_is_refused(self) -> None:
+        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
+        pred.as_of = _LIVE_NOW - sp.LIVE_CLOCK_MAX_AGE - timedelta(seconds=1)
+        with ExitStack() as stack:
+            reads = _spy_every_layer(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            with pytest.raises(ValueError, match="older than"):
+                sp.build_provenance_report(MagicMock(), prediction=pred)
+
+        assert reads == []
+
+
+class TestCodexHold6030789643EvidenceFence:
+    def _build(
+        self,
+        *,
+        layer_value: float,
+        cards: dict[str, SignalScorecard],
+        contributions: dict[str, float],
+        clock: datetime,
+        ticker: str = "NVDA",
+        engine: Any = None,
+    ) -> Any:
+        pred = _prediction(ticker=ticker, confidence=0.72, signal_contributions=contributions)
+        pred.as_of = clock
+        with ExitStack() as stack:
+            _patch_all_non_fudge_adapters(stack, value=layer_value)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
+            _patch_calibration_tables(stack, regime_cards=cards, flat_cards={})
+            return sp.build_provenance_report(engine or MagicMock(), prediction=pred)
+
+    def test_only_the_fudge_alert_layer_is_fenced_to_the_clock(self) -> None:
+        assert sp.CLOCK_FENCED_LAYERS == frozenset({"fudge_alerts"})
+        assert set(_ADVISORY_LAYERS_NVDA) == (
+            set(sp.CONVICTION_LAYERS) - sp.CLOCK_FENCED_LAYERS - {"edge_signal"}
+        )
+
+    def test_unfenced_layers_are_advisory_and_do_not_move_numbers(self) -> None:
+        clock = _LIVE_NOW - timedelta(minutes=2)
+        cards = {"jodi_oil": _card_at("jodi_oil", 1.3, _LIVE_NOW - timedelta(days=1))}
+        quiet = self._build(layer_value=1.0, cards=cards, contributions={"jodi_oil": 1.0}, clock=clock)
+        loud = self._build(layer_value=0.9, cards=cards, contributions={"jodi_oil": 1.0}, clock=clock)
+
+        # Every number directional use reads is the same whether the
+        # unfenced layers say 1.0 or 0.9.
+        for field_name in (
+            "aggregate_conviction",
+            "verdict",
+            "confidence",
+            "score",
+            "cooccurrence_lift",
+            "confidence_bucket_multiplier",
+            "scenario_multiplier",
+            "null_hypothesis_penalty",
+            "meta_learning_multiplier",
+            "contra_indicator_multiplier",
+            "squeeze_multiplier",
+            "arbitrage_multiplier",
+            "convergence_multiplier",
+            "money_flow_multiplier",
+            "memory_lesson_multiplier",
+            "layers_present",
+            "evidence_coverage",
+        ):
+            assert getattr(loud, field_name) == getattr(quiet, field_name), field_name
+        assert loud.aggregate_conviction == pytest.approx(1.3)
+        assert loud.scenario_multiplier == 1.0
+
+        # ...and the unfenced values are still reported, marked advisory.
+        assert loud.advisory_layers == {name: pytest.approx(0.9) for name in _ADVISORY_LAYERS_NVDA}
+        for name in _ADVISORY_LAYERS_NVDA:
+            assert loud.layer_coverage[name] == sp.LAYER_ADVISORY
+        assert loud.layers_advisory == len(_ADVISORY_LAYERS_NVDA)
+        assert loud.layers_present == 0
+        assert loud.to_dict()["advisory_layers"]["scenario"] == pytest.approx(0.9)
+        assert loud.to_dict()["layer_coverage"]["scenario"] == "advisory"
+
+        # Directional use fails closed: HIGH needs layer coverage that only
+        # unfenced evidence could supply, so the verdict is LOW and says why.
+        assert loud.verdict == "low"
+        assert "advisory" in loud.verdict_reason
+
+    def test_same_hour_late_scorecard_is_advisory_not_decision_bearing(self) -> None:
+        clock = _LIVE_NOW - timedelta(minutes=2)
+        cards = {
+            # Rewritten five minutes after the decision, same hour, same day.
+            "jodi_oil": _card_at("jodi_oil", 1.4, clock + timedelta(minutes=5)),
+            "pcr": _card_at("pcr", 1.2, clock - timedelta(minutes=5)),
+        }
+        report = self._build(
+            layer_value=1.0,
+            cards=cards,
+            contributions={"jodi_oil": 0.5, "pcr": 0.5},
+            clock=clock,
+        )
+
+        rows = _evidence_rows(report)
+        assert rows["jodi_oil"]["classification"] == "advisory"
+        assert rows["jodi_oil"]["scorecard"] is None
+        assert rows["jodi_oil"]["advisory_scorecard"]["conviction_weight"] == pytest.approx(1.4)
+        assert rows["pcr"]["classification"] == "strong"
+        assert rows["pcr"]["scorecard"]["conviction_weight"] == pytest.approx(1.2)
+        # The late card counts as no history: neutral weight, no coverage.
+        assert report.aggregate_conviction == pytest.approx(0.5 * 1.0 + 0.5 * 1.2)
+        assert report.evidence_coverage == pytest.approx(0.5)
+
+    @pytest.mark.parametrize(
+        "stamp",
+        [
+            pytest.param(None, id="no-stamp"),
+            pytest.param(_LIVE_NOW.date(), id="date-only-stamp"),
+        ],
+    )
+    def test_scorecard_without_a_timestamp_is_advisory(self, stamp: Any) -> None:
+        report = self._build(
+            layer_value=1.0,
+            cards={"jodi_oil": _card_at("jodi_oil", 1.4, stamp)},
+            contributions={"jodi_oil": 1.0},
+            clock=_LIVE_NOW - timedelta(minutes=2),
+        )
+        assert _evidence_rows(report)["jodi_oil"]["classification"] == "advisory"
+        assert report.aggregate_conviction == pytest.approx(1.0)
+        assert report.evidence_coverage == 0.0
+
+    def test_same_hour_late_fudge_alert_is_excluded(self) -> None:
+        clock = _LIVE_NOW - timedelta(minutes=2)
+        rows = [
+            {"name": "before", "assessment": "major_divergence", "checked_at": clock - timedelta(minutes=5)},
+            {"name": "late", "assessment": "contradiction", "checked_at": clock + timedelta(minutes=5)},
+        ]
+        engine = _fudge_engine(rows)
+        alerts = sp._recent_fudge_alerts(engine, ticker="XOM", clock=clock)
+
+        assert [a["name"] for a in alerts] == ["before"]
+        sql, params = engine.connect.return_value.__enter__.return_value.execute.call_args[0]
+        assert "checked_at <= :clock" in str(sql)
+        assert params["clock"] == clock
+
+    def test_fenced_fudge_alerts_still_move_conviction(self) -> None:
+        clock = _LIVE_NOW - timedelta(minutes=2)
+        engine = _fudge_engine(
+            [
+                {"name": "before", "assessment": "major_divergence", "checked_at": clock - timedelta(hours=3)},
+                {"name": "late", "assessment": "contradiction", "checked_at": clock + timedelta(minutes=1)},
+            ]
+        )
+        report = self._build(
+            layer_value=1.0,
+            cards={"jodi_oil": _card_at("jodi_oil", 1.4, _LIVE_NOW - timedelta(days=1))},
+            contributions={"jodi_oil": 1.0},
+            clock=clock,
+            ticker="XOM",
+            engine=engine,
+        )
+        assert [a["name"] for a in report.shipping_fudge_alerts] == ["before"]
+        assert report.layer_coverage["fudge_alerts"] is True
+        # One fenced alert -> 1.0 - 0.15 = 0.85.
+        assert report.aggregate_conviction == pytest.approx(1.4 * 0.85)
