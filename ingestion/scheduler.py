@@ -1251,10 +1251,13 @@ def _get_pullers_for_group(
         #    "pull"): no raw_series row ever under source 720 since 2026-05-27;
         #    runs FAILED auth_failed, then "SKIPPED: ... plan not entitled (HTTP 403)".
         #  - Polygon (ingestion.altdata.polygon_puller.PolygonPuller, "pull"):
-        #    no raw_series row ever under source 722; options snapshots are not
-        #    in the plan (HTTP 403, then "30 of 30 tickers failed"). Only this
-        #    registration is retired: gex and research read Polygon minute
-        #    history through their own code paths, and the module stays.
+        #    no raw_series row ever under source 722; options snapshots were
+        #    not in the plan (HTTP 403 to 2026-11-10). The "30 of 30 tickers
+        #    failed" runs after that were the puller's own invalid sort=volume
+        #    (HTTP 400), fixed 2026-11-23; the key now gets the snapshot.
+        #    Hermes's stale-source repair still runs the puller (interval 24 h).
+        #    Only this registration is retired: gex and research read Polygon
+        #    minute history through their own code paths, and the module stays.
         # NASA FIRMS — active fire/thermal anomaly detection (daily)
         try:
             from ingestion.altdata.nasa_firms_puller import NASAFirmsPuller

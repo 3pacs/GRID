@@ -19,6 +19,16 @@ is all zeros. ``pull()`` therefore stops on the first entitlement refusal and
 reports SKIPPED with the operator action instead of storing zero-valued
 Greeks for 30 tickers.
 
+Re-probed 2026-11-23: the key now gets the snapshot with OI and Greeks for
+all 30 tickers. The HTTP 400s logged since 2026-11-11 ("30 of 30 tickers
+failed") were this module's own request: ``sort=volume`` is not a sort key
+of this endpoint (Polygon answers ``Invalid value for sort parameter``; it
+sorts only by ticker, expiration_date or strike_price), so "the 250 most
+active contracts" was never available. The chain is now read whole inside a
+fixed expiry window (today .. today + ``OPTIONS_WINDOW_DAYS``) by following
+``next_url``; SPY is about 20 pages of 250. A 400 stops the run on the first
+ticker with Polygon's own error text, instead of repeating it 30 times.
+
 The key is sent as an ``Authorization: Bearer`` header, never as the
 ``apiKey`` query parameter: request URLs end up in exception text and logs.
 """
@@ -26,7 +36,7 @@ The key is sent as an ``Authorization: Bearer`` header, never as the
 from __future__ import annotations
 
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import requests
@@ -54,6 +64,18 @@ OPTIONS_TICKERS = [
 ]
 
 
+# Options chain window and paging. The summary covers every contract that
+# expires today through today + OPTIONS_WINDOW_DAYS, read whole: on
+# 2026-11-23 that was 20 pages for SPY, 21 for QQQ and 199 calls for all 30
+# tickers. MAX_CHAIN_PAGES bounds a runaway cursor; a chain that needs more
+# pages is not summarized at all (a truncated chain is not the window).
+OPTIONS_WINDOW_DAYS = 35
+CHAIN_PAGE_LIMIT = 250
+MAX_CHAIN_PAGES = 60
+SUMMARY_METHOD = "polygon-snapshot-window/2"
+_CHAIN_PATH = "/v3/snapshot/options/"
+
+
 class PolygonNotEntitled(RuntimeError):
     """The API key's plan does not include the requested endpoint (permanent)."""
 
@@ -61,9 +83,34 @@ class PolygonNotEntitled(RuntimeError):
 class _PolygonHTTPError(RuntimeError):
     """Non-2xx Polygon response; the message never contains the request URL."""
 
-    def __init__(self, status_code: int, endpoint: str) -> None:
+    def __init__(self, status_code: int, endpoint: str, detail: str = "") -> None:
         self.status_code = status_code
-        super().__init__(f"Polygon HTTP {status_code} on {endpoint}")
+        suffix = f": {detail}" if detail else ""
+        super().__init__(f"Polygon HTTP {status_code} on {endpoint}{suffix}")
+
+
+class PolygonBadRequest(_PolygonHTTPError):
+    """HTTP 400: the request itself is wrong, so every ticker would fail alike."""
+
+
+class PolygonRateLimited(_PolygonHTTPError):
+    """HTTP 429: stop the run rather than keep calling."""
+
+
+class PolygonChainTruncated(RuntimeError):
+    """The chain needed more than MAX_CHAIN_PAGES pages (not summarized)."""
+
+
+def _error_detail(resp: Any, secret: str) -> str:
+    """Polygon's own error text from a JSON body, short and without the key."""
+    try:
+        body = resp.json() or {}
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    text = str(body.get("error") or body.get("message") or "")[:200]
+    return text.replace(secret, "<key>") if secret else text
 
 
 def _inserted(result: Any) -> int:
@@ -98,15 +145,24 @@ class PolygonPuller(BasePuller):
         if not self.api_key:
             log.warning("POLYGON_API_KEY not set — Polygon puller disabled")
 
-    @retry_on_failure(max_attempts=3, retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.exceptions.RequestException))
     def _api_get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Make a Polygon API call (key in the Authorization header).
 
         Raises:
             PolygonNotEntitled: 403 whose body says the plan lacks the endpoint.
+            PolygonBadRequest: 400, with Polygon's error text (not retried).
+            PolygonRateLimited: 429 (not retried).
             _PolygonHTTPError: any other non-2xx status (not retried).
         """
-        url = f"{POLYGON_BASE}{endpoint}"
+        return self._get(f"{POLYGON_BASE}{endpoint}", params, endpoint)
+
+    @retry_on_failure(max_attempts=3, retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.exceptions.RequestException))
+    def _get(self, url: str, params: dict[str, Any] | None, endpoint: str) -> dict[str, Any]:
+        """One GET against ``POLYGON_BASE``; ``endpoint`` is the label used in errors."""
+        if not url.startswith(f"{POLYGON_BASE}/"):
+            # A next_url pointing anywhere else never gets the key.
+            raise _PolygonHTTPError(0, endpoint, "refused a URL outside api.polygon.io")
+        self._api_calls = getattr(self, "_api_calls", 0) + 1
         resp = requests.get(
             url,
             params=params or None,
@@ -120,6 +176,10 @@ class PolygonPuller(BasePuller):
                 status = None
             if status == _NOT_ENTITLED_STATUS:
                 raise PolygonNotEntitled(f"{endpoint}: {_NOT_ENTITLED_STATUS}")
+        if resp.status_code == 400:
+            raise PolygonBadRequest(400, endpoint, _error_detail(resp, self.api_key))
+        if resp.status_code == 429:
+            raise PolygonRateLimited(429, endpoint, _error_detail(resp, self.api_key))
         if resp.status_code >= 400:
             raise _PolygonHTTPError(resp.status_code, endpoint)
         return resp.json()
@@ -128,7 +188,7 @@ class PolygonPuller(BasePuller):
     # Options with Greeks
     # ------------------------------------------------------------------
 
-    def pull_options_chain(self, ticker: str) -> list[dict[str, Any]]:
+    def pull_options_chain(self, ticker: str, as_of: date | None = None) -> list[dict[str, Any]]:
         """Pull the options chain snapshot with Greeks for a ticker.
 
         Returns options contracts with: strike, expiry, type (call/put),
@@ -141,21 +201,43 @@ class PolygonPuller(BasePuller):
 
         Raises:
             PolygonNotEntitled: the key's plan lacks the snapshot endpoint.
+            PolygonChainTruncated: the window needed more than MAX_CHAIN_PAGES.
         """
-        data = self._api_get(f"/v3/snapshot/options/{ticker}", {
-            "limit": 250,
-            "order": "desc",
-            "sort": "volume",
-        })
-        return data.get("results", []) or []
+        return self._options_chain_window(ticker, as_of or date.today())[0]
 
-    def pull_options_greeks_summary(self, ticker: str) -> dict[str, Any]:
+    def _options_chain_window(self, ticker: str, as_of: date) -> tuple[list[dict[str, Any]], int]:
+        """Every contract expiring as_of .. as_of + OPTIONS_WINDOW_DAYS, and the page count."""
+        endpoint = f"{_CHAIN_PATH}{ticker}"
+        params: dict[str, Any] | None = {
+            "limit": CHAIN_PAGE_LIMIT,
+            "expiration_date.gte": as_of.isoformat(),
+            "expiration_date.lte": (as_of + timedelta(days=OPTIONS_WINDOW_DAYS)).isoformat(),
+        }
+        url: str | None = f"{POLYGON_BASE}{endpoint}"
+        contracts: list[dict[str, Any]] = []
+        pages = 0
+        while url:
+            if pages >= MAX_CHAIN_PAGES:
+                raise PolygonChainTruncated(
+                    f"{endpoint}: more than {MAX_CHAIN_PAGES} pages of {CHAIN_PAGE_LIMIT}")
+            # next_url carries the cursor and the original filters; the key
+            # still travels only in the header.
+            data = self._get(url, params, endpoint)
+            pages += 1
+            params = None
+            contracts.extend(data.get("results", []) or [])
+            url = data.get("next_url") or None
+        return contracts, pages
+
+    def pull_options_greeks_summary(self, ticker: str, as_of: date | None = None) -> dict[str, Any]:
         """Pull and summarize options Greeks for a ticker.
 
         Computes aggregate Greeks: total call/put OI, put/call ratio,
-        volume-weighted IV, net delta exposure (GEX proxy).
+        volume-weighted IV, net delta exposure (GEX proxy), over every
+        contract expiring as_of .. as_of + OPTIONS_WINDOW_DAYS.
         """
-        chain = self.pull_options_chain(ticker)
+        as_of = as_of or date.today()
+        chain, pages = self._options_chain_window(ticker, as_of)
         if not chain:
             return {}
 
@@ -211,6 +293,11 @@ class PolygonPuller(BasePuller):
             "net_gamma_exposure": round(net_gamma, 2),
             "net_delta_exposure": round(net_delta, 2),
             "contracts_count": len(chain),
+            # Coverage, so a stored row says what it summarizes.
+            "method": SUMMARY_METHOD,
+            "expiration_gte": as_of.isoformat(),
+            "expiration_lte": (as_of + timedelta(days=OPTIONS_WINDOW_DAYS)).isoformat(),
+            "pages": pages,
         }
 
     # ------------------------------------------------------------------
@@ -268,15 +355,14 @@ class PolygonPuller(BasePuller):
         succeeded = 0
         no_data = 0
         failed = 0
-        api_calls = 0
+        self._api_calls = 0
         anomalies: list[dict[str, Any]] = []
 
         for idx, ticker in enumerate(OPTIONS_TICKERS):
             if idx:
-                time.sleep(12.5)  # free tier is 5 calls/min
+                time.sleep(12.5)  # paced per ticker (pages within a ticker are not)
             try:
-                api_calls += 1
-                summary = self.pull_options_greeks_summary(ticker)
+                summary = self.pull_options_greeks_summary(ticker, as_of=today)
             except PolygonNotEntitled:
                 if succeeded or rows_inserted:
                     # Entitlement changed mid-run: keep what was committed.
@@ -286,7 +372,21 @@ class PolygonPuller(BasePuller):
                     log.warning("Polygon: {r}", r=_NOT_ENTITLED_REASON)
                     _entitlement_warned = True
                 return {"status": "SKIPPED", "rows_inserted": 0,
-                        "skipped_reason": _NOT_ENTITLED_REASON, "api_calls": api_calls}
+                        "skipped_reason": _NOT_ENTITLED_REASON, "api_calls": self._api_calls}
+            except PolygonBadRequest as exc:
+                if not (succeeded or rows_inserted or no_data):
+                    # The request is wrong for every ticker alike: one call, not 30.
+                    log.warning("Polygon options request rejected on {t}: {e}", t=ticker, e=str(exc))
+                    return {"status": "FAILED", "rows_inserted": 0, "api_calls": self._api_calls,
+                            "total": len(OPTIONS_TICKERS), "tickers_failed": len(OPTIONS_TICKERS),
+                            "error": f"request rejected (HTTP 400): {exc}"}
+                failed += 1
+                log.warning("Polygon options failed for {t}: {e}", t=ticker, e=str(exc))
+                continue
+            except PolygonRateLimited as exc:
+                failed += len(OPTIONS_TICKERS) - idx
+                log.warning("Polygon rate-limited on {t}; stopping this run: {e}", t=ticker, e=str(exc))
+                break
             except Exception as exc:
                 failed += 1
                 log.warning("Polygon options failed for {t}: {e}", t=ticker, e=str(exc))
@@ -337,7 +437,7 @@ class PolygonPuller(BasePuller):
 
         log.info("Polygon: {ok}/{n} tickers, {r} rows, {a} anomalies, {api} API calls",
                  ok=succeeded, n=len(OPTIONS_TICKERS), r=rows_inserted,
-                 a=len(anomalies), api=api_calls)
+                 a=len(anomalies), api=self._api_calls)
 
         total = len(OPTIONS_TICKERS)
         if failed:
@@ -353,7 +453,7 @@ class PolygonPuller(BasePuller):
             "tickers_no_data": no_data,
             "tickers_failed": failed,
             "anomalies": anomalies,
-            "api_calls": api_calls,
+            "api_calls": self._api_calls,
         }
         if failed:
             result["error"] = f"{failed} of {total} tickers failed"
