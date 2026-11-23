@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from loguru import logger as log
+from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from api.precompute_serving import serve_precomputed
+from store.pit import PITStore
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
@@ -56,6 +60,74 @@ def _unavailable(reason: str) -> dict[str, Any]:
     return {"risk_level": "unknown", "available": False, "reason": reason}
 
 
+# ── Risk-map input series ────────────────────────────────────────────────
+#
+# The exact feature behind each input. Until 2026-11-23 these were ILIKE
+# patterns read with ``ORDER BY obs_date DESC LIMIT 1``. Each pattern
+# matched several features, and "latest" was whichever one had the newest
+# date. On griddb (2026-11-23), '%hy%spread%' matched hy_oas_spread,
+# hy_spread, hy_spread_3m_chg and hy_spread_proxy. '%tga%' matched
+# tga_drawdown (a 30-day change), treasury_tga_balance (no rows since
+# 2026-04-01), mortgage_30y and three EIA natgas series. '%vix%close%'
+# matched nothing. '%ted%spread%' served ted_spread, which was deprecated
+# 2026-04-03 and last observed 2022-01-21.
+# Names follow normalization/entity_map.py. Units are as stored.
+_VIX = "vix_spot"                  # VIXCLS / CBOE:VIX, index points
+_HY_OAS = "hy_oas_spread"          # FRED BAMLH0A0HYM2, percent (sanity range 1-30)
+_IG_OAS = "ig_oas_spread"          # FRED BAMLC0A0CM, percent (sanity range 0.1-10)
+_FED_ASSETS = "fed_balance_sheet"  # FRED WALCL, millions USD, weekly (Wednesday)
+_RRP = "reverse_repo_usage"        # FRED RRPONTSYD, billions USD
+_TGA = "treasury_general_acct"     # FRED WTREGEN, millions USD, weekly (Wednesday)
+
+#: Oldest latest reading (in days before today) that each input is still
+#: scored from. An older one is reported as unavailable, the same as no
+#: series at all. treasury_tga_balance stopped in April, and its April
+#: value would otherwise have been served as the current TGA. Daily series
+#: get two weeks of holiday and outage slack. The weekly H.4.1 series get
+#: three weeks.
+_MAX_AGE_DAYS: dict[str, int] = {
+    _VIX: 14, _HY_OAS: 14, _IG_OAS: 14, _RRP: 14, _FED_ASSETS: 21, _TGA: 21,
+}
+#: Read window: the 1-year VIX rank plus slack for the 30-day-back readings.
+_INPUT_WINDOW_DAYS = 400
+#: A 1-month fall in Fed total assets of more than $50B (fed_balance_sheet
+#: is in millions USD). The earlier ``-50_000_000_000`` assumed dollars and
+#: could never be reached.
+_FED_ASSETS_DROP_MUSD = 50_000
+_PERCENT_TO_BP = 100.0
+
+
+def _read_risk_inputs(engine: Engine, today: date) -> dict[str, list[tuple[date, float]]]:
+    """Each risk input's series over the last ``_INPUT_WINDOW_DAYS``, oldest first.
+
+    Reads through ``store.pit.PITStore``. Names are bound to ids first.
+    LATEST_AS_OF on *today* gives one row per obs_date: the newest vintage
+    held today, with retracted rows excluded. The old reads took any
+    vintage of the newest date, and the VIX rank counted every vintage as
+    a separate day (vix_spot: 4,517 rows over 258 dates in the last year).
+    An unregistered name maps to ``[]``.
+    """
+    pit = PITStore(engine)
+    ids = pit.feature_ids_by_name(list(_MAX_AGE_DAYS))
+    series: dict[str, list[tuple[date, float]]] = {name: [] for name in _MAX_AGE_DAYS}
+    if not ids:
+        return series
+    frame = pit.get_pit(
+        list(ids.values()), today, "LATEST_AS_OF",
+        start_date=today - timedelta(days=_INPUT_WINDOW_DAYS),
+    )
+    name_by_id = {fid: name for name, fid in ids.items()}
+    for fid, obs_date, value in frame[["feature_id", "obs_date", "value"]].itertuples(index=False):
+        if value is None or not math.isfinite(float(value)):
+            continue
+        if isinstance(obs_date, datetime):
+            obs_date = obs_date.date()
+        series[name_by_id[int(fid)]].append((obs_date, float(value)))
+    for rows in series.values():
+        rows.sort(key=lambda r: r[0])
+    return series
+
+
 def _build_risk_map() -> dict[str, Any]:
     """Assemble the full risk map from dealer gamma, volatility, concentration,
     correlation, credit, and liquidity sub-systems.
@@ -67,12 +139,18 @@ def _build_risk_map() -> dict[str, Any]:
     TED 0.30, ``avg_cross_correlation`` 0.5 and ``risk_level: "moderate"``
     whenever a query failed or returned nothing, and those literals were
     indistinguishable from real readings.
+
+    Volatility, credit and liquidity read one exact feature per input (see
+    ``_VIX`` .. ``_TGA``) through the PIT store, once per build. An input
+    with no rows, or with a latest reading older than ``_MAX_AGE_DAYS``,
+    counts as missing.
     """
     from datetime import datetime, timezone, date as _date, timedelta
 
     engine = get_db_engine()
     errors: list[str] = []
     sub_scores: list[float] = []
+    today = _date.today()
 
     def _fail(name: str, exc: BaseException) -> dict[str, Any]:
         reason = str(exc) or exc.__class__.__name__
@@ -82,6 +160,45 @@ def _build_risk_map() -> dict[str, Any]:
             log.debug("Risk map {n} failed: {r}", n=name, r=reason)
         errors.append(f"{name}: {reason}")
         return _unavailable(reason)
+
+    # One read for every series input. A failure here fails each
+    # sub-system that needs it, with the read's own error as the reason.
+    inputs_error: BaseException | None = None
+    try:
+        inputs = _read_risk_inputs(engine, today)
+    except Exception as exc:
+        inputs, inputs_error = {}, exc
+
+    def _series(name: str) -> list[tuple[date, float]]:
+        if inputs_error is not None:
+            raise inputs_error
+        return inputs.get(name, [])
+
+    def _current(name: str) -> tuple[date, float]:
+        """Latest reading of *name*. Raises ``_NoData`` if absent or too old."""
+        rows = _series(name)
+        if not rows:
+            raise _NoData(f"no {name} rows in resolved_series")
+        obs_date, value = rows[-1]
+        age = (today - obs_date).days
+        if age > _MAX_AGE_DAYS[name]:
+            raise _NoData(
+                f"{name} latest reading {obs_date.isoformat()} is {age} days old "
+                f"(limit {_MAX_AGE_DAYS[name]})"
+            )
+        return obs_date, value
+
+    def _current_or_none(name: str) -> tuple[date, float] | None:
+        try:
+            return _current(name)
+        except _NoData:
+            return None
+
+    def _month_back(name: str) -> tuple[date, float] | None:
+        """Latest reading of *name* dated at least 30 days before today."""
+        cutoff = today - timedelta(days=30)
+        older = [r for r in _series(name) if r[0] <= cutoff]
+        return older[-1] if older else None
 
     # ── 1. Dealer Risk ──────────────────────────────────────────────
     try:
@@ -105,7 +222,6 @@ def _build_risk_map() -> dict[str, Any]:
             flip_dist_pct = round((gamma_flip - spot) / spot * 100, 2)
 
         # Find nearest OPEX (third Friday)
-        today = _date.today()
         days_to_opex = 30
         for d_offset in range(45):
             candidate = today + timedelta(days=d_offset)
@@ -141,32 +257,9 @@ def _build_risk_map() -> dict[str, Any]:
 
     # ── 2. Volatility Risk ──────────────────────────────────────────
     try:
-        from sqlalchemy import text as sql_text
-
-        with engine.connect() as conn:
-            vix_row = conn.execute(sql_text("""
-                SELECT rs.value, rs.obs_date FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%vix%close%"}).fetchone()
-
-            if not vix_row or vix_row[0] is None:
-                raise _NoData("no VIX close series in resolved_series")
-            vix_val = float(vix_row[0])
-            vix_as_of = vix_row[1].isoformat() if len(vix_row) > 1 and vix_row[1] else None
-
-            vix_hist = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                AND rs.obs_date >= CURRENT_DATE - INTERVAL '365 days'
-                ORDER BY rs.obs_date
-            """), {"n": "%vix%close%"}).fetchall()
-
-        vals = [float(r[0]) for r in vix_hist if r[0] is not None]
-        if not vals:
-            raise _NoData("no 1y VIX history to rank the current level")
+        vix_date, vix_val = _current(_VIX)
+        year_start = today - timedelta(days=365)
+        vals = [v for d, v in _series(_VIX) if d >= year_start]
         pct = int(sum(1 for v in vals if v <= vix_val) / len(vals) * 100)
 
         term = "contango"
@@ -176,8 +269,9 @@ def _build_risk_map() -> dict[str, Any]:
         v_score = min(pct / 100, 1.0)
         vol_risk: dict[str, Any] = {
             "vix": round(vix_val, 1),
-            "vix_as_of": vix_as_of,
+            "vix_as_of": vix_date.isoformat(),
             "vix_percentile_1y": pct,
+            # One reading per obs_date (the latest vintage), not one per vintage.
             "vix_percentile_sample": len(vals),
             "vix_term_structure": term,
             # No realized-vol series is read here; the previous value was
@@ -305,64 +399,35 @@ def _build_risk_map() -> dict[str, Any]:
 
     # ── 5. Credit Risk ──────────────────────────────────────────────
     try:
-        from sqlalchemy import text as sql_text
+        # hy_oas_spread / ig_oas_spread are stored in percent (FRED); the
+        # score and the PWA ("HY: {hy_spread}bp") are in basis points. The
+        # old read served 3.76 % as "hy_spread": 4 and scored it 3.76 / 800.
+        hy_date, hy_pct = _current(_HY_OAS)
+        hy_bp = hy_pct * _PERCENT_TO_BP
+        hy_prev = _month_back(_HY_OAS)
+        hy_prev_bp = hy_prev[1] * _PERCENT_TO_BP if hy_prev else None
+        # IG is reported when current and null otherwise; it does not enter
+        # the score, so its absence does not block the read.
+        ig = _current_or_none(_IG_OAS)
+        ig_bp = ig[1] * _PERCENT_TO_BP if ig else None
 
-        with engine.connect() as conn:
-            hy_row = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%hy%spread%"}).fetchone()
-
-            ig_row = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%ig%spread%"}).fetchone()
-
-            ted_row = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%ted%spread%"}).fetchone()
-
-            hy_prev = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                AND rs.obs_date <= CURRENT_DATE - INTERVAL '30 days'
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%hy%spread%"}).fetchone()
-
-        if not hy_row or hy_row[0] is None:
-            raise _NoData("no HY spread series in resolved_series")
-        hy_val = float(hy_row[0])
-        # IG / TED are reported when present and null otherwise; they do
-        # not enter the score, so their absence does not block the read.
-        ig_val = float(ig_row[0]) if ig_row and ig_row[0] is not None else None
-        ted_val = float(ted_row[0]) if ted_row and ted_row[0] is not None else None
-        hy_prev_val = float(hy_prev[0]) if hy_prev and hy_prev[0] is not None else None
-
-        if hy_prev_val is None:
+        if hy_prev_bp is None:
             direction = "unknown"
-        elif hy_val > hy_prev_val * 1.05:
+        elif hy_bp > hy_prev_bp * 1.05:
             direction = "widening"
-        elif hy_val < hy_prev_val * 0.95:
+        elif hy_bp < hy_prev_bp * 0.95:
             direction = "tightening"
         else:
             direction = "stable"
 
-        cr_score = min(hy_val / 800, 1.0)
+        cr_score = min(hy_bp / 800, 1.0)
         if direction == "widening":
             cr_score = min(cr_score + 0.15, 1.0)
 
         credit_risk: dict[str, Any] = {
-            "hy_spread": round(hy_val),
-            "ig_spread": round(ig_val) if ig_val is not None else None,
-            "ted_spread": round(ted_val, 2) if ted_val is not None else None,
+            "hy_spread": round(hy_bp),
+            "hy_spread_as_of": hy_date.isoformat(),
+            "ig_spread": round(ig_bp) if ig_bp is not None else None,
             "spread_direction": direction,
             "risk_level": _compute_risk_level(cr_score),
             "available": True,
@@ -373,77 +438,29 @@ def _build_risk_map() -> dict[str, Any]:
 
     # ── 6. Liquidity Risk ───────────────────────────────────────────
     try:
-        from sqlalchemy import text as sql_text
+        liq_date, liq_val = _current(_FED_ASSETS)
+        liq_prev = _month_back(_FED_ASSETS)
+        if liq_prev is None:
+            raise _NoData(f"no {_FED_ASSETS} reading >= 30 days old to measure the 1m change")
+        # Change in Fed total assets, millions USD. The key keeps its old
+        # name, which the PWA reads; TGA and RRP enter the score separately.
+        liq_change = liq_val - liq_prev[1]
 
-        with engine.connect() as conn:
-            liq_row = conn.execute(sql_text("""
-                SELECT rs.value, rs.obs_date FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%fed%balance%"}).fetchone()
-
-            liq_prev = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                AND rs.obs_date <= CURRENT_DATE - INTERVAL '30 days'
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%fed%balance%"}).fetchone()
-
-            rrp_row = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%reverse_repo%"}).fetchone()
-
-            rrp_prev = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                AND rs.obs_date <= CURRENT_DATE - INTERVAL '30 days'
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%reverse_repo%"}).fetchone()
-
-            tga_row = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%tga%"}).fetchone()
-
-            tga_prev = conn.execute(sql_text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name ILIKE :n
-                AND rs.obs_date <= CURRENT_DATE - INTERVAL '30 days'
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {"n": "%tga%"}).fetchone()
-
-        if not liq_row or liq_row[0] is None:
-            raise _NoData("no Fed balance sheet series in resolved_series")
-        if not liq_prev or liq_prev[0] is None:
-            raise _NoData("no Fed balance sheet reading >= 30 days old to measure the 1m change")
-        liq_val = float(liq_row[0])
-        liq_prev_val = float(liq_prev[0])
-        liq_change = liq_val - liq_prev_val
-
-        def _trend(cur_row, prev_row, up_label: str, down_label: str) -> str:
-            if not cur_row or cur_row[0] is None or not prev_row or prev_row[0] is None:
+        def _trend(name: str, up_label: str, down_label: str) -> str:
+            cur, prev = _current_or_none(name), _month_back(name)
+            if cur is None or prev is None:
                 return "unknown"
-            cur, prev = float(cur_row[0]), float(prev_row[0])
-            if cur < prev * 0.95:
+            if cur[1] < prev[1] * 0.95:
                 return down_label
-            if cur > prev * 1.05:
+            if cur[1] > prev[1] * 1.05:
                 return up_label
             return "stable"
 
-        rrp_trend = _trend(rrp_row, rrp_prev, "rising", "declining")
-        tga_trend = _trend(tga_row, tga_prev, "building", "draining")
+        rrp_trend = _trend(_RRP, "rising", "declining")
+        tga_trend = _trend(_TGA, "building", "draining")
 
         l_score = 0.3
-        if liq_change < -50_000_000_000:
+        if liq_change < -_FED_ASSETS_DROP_MUSD:
             l_score += 0.3
         elif liq_change < 0:
             l_score += 0.15
@@ -455,6 +472,7 @@ def _build_risk_map() -> dict[str, Any]:
 
         liq_risk: dict[str, Any] = {
             "fed_net_liquidity_change_1m": round(liq_change),
+            "fed_balance_sheet_as_of": liq_date.isoformat(),
             "reverse_repo_trend": rrp_trend,
             "tga_trend": tga_trend,
             "risk_level": _compute_risk_level(l_score),
