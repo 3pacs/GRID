@@ -373,6 +373,25 @@ class TestEntryAnchorDecisionClockFence:
         assert pm.failure_category == "insufficient_data"
         assert reason in pm.root_cause
 
+    def test_abstains_when_the_known_prior_close_is_ambiguous(self, monkeypatch):
+        """Two completed vintages of Tuesday, both pulled before the decision,
+        disagree (an adjusted value under the raw id): abstain rather than pick
+        one, and never step back to an older session instead."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        tue = date(2026, 4, 14)
+        db = _ClockFakeDB(_trade_row(17, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        db.add_close("AAPL", date(2026, 4, 13), 99.0, _ny(date(2026, 4, 13), 17, 30))
+        db.add_close("AAPL", tue, 100.0, _ny(tue, 17, 30))
+        db.add_close("AAPL", tue, 96.0, _ny(tue, 23), source="yfinance")
+        for d, v in ((self.WED, 104.0), (date(2026, 4, 16), 103.0), (date(2026, 4, 17), 102.5)):
+            db.add_close("AAPL", d, v, _ny(d, 17, 30))
+
+        pm = _run_trade_postmortem(monkeypatch, db, 17)
+        assert "underlying_entry_spot" not in pm.data_at_decision
+        assert "ambiguous" in pm.data_at_decision["underlying_entry_spot_unavailable"]
+        assert pm.failure_category == "insufficient_data"
+
     def test_scanner_lookup_ignores_a_row_written_after_the_decision(self, monkeypatch):
         """Wednesday's options_daily_signals row was written at 16:30 ET, after the
         11:00 ET decision: the scanner context and anchor are Tuesday's row."""

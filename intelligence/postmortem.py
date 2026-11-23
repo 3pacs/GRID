@@ -29,6 +29,7 @@ from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -226,11 +227,16 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     # Underlying spot at decision/entry time (PIT-safe, same price source as
     # the path). options_recommendations.entry_price is the option premium, NOT
     # underlying spot — never mix units when evaluating the underlying path.
-    underlying_spot = _load_underlying_entry_spot(
+    # Only data known at generated_at may anchor it (Codex HOLD 6011903681);
+    # when none was, the reason is kept with the record instead of a guess.
+    underlying_spot, spot_note = _load_underlying_entry_spot(
         engine, ticker, generated_at, data_at_decision, price_source=price_source,
     )
     if underlying_spot is not None:
         data_at_decision["underlying_entry_spot"] = underlying_spot
+        data_at_decision["underlying_entry_spot_basis"] = spot_note
+    else:
+        data_at_decision["underlying_entry_spot_unavailable"] = spot_note
 
     # Classify the failure
     category, root_cause, signals_wrong, signals_right, what_missed = _classify_failure(
@@ -1388,6 +1394,103 @@ def _finite_positive(val: Any) -> float | None:
     return f
 
 
+# ── Decision clock (Codex HOLD 6011903681) ───────────────────────────────
+#
+# A postmortem attributes a failure by comparing the underlying path with an
+# entry anchor. The anchor, and the scanner context beside it, must be what
+# GRID held at ``generated_at``: never that day's later close (an 11:00 ET
+# decision has no 16:00 close), never a vintage pulled after the decision, and
+# never a guess when nothing was known -- then the postmortem abstains
+# (``insufficient_data``) and records why.
+#
+# * raw closes: ``evaluation.prices.CompletedCloseAccessor`` (through
+#   ``store.observations.read_completed_closes``): a label counts only from a
+#   pull at or after 17:00 ET on its session day and at or before the clock,
+#   so a same-day close counts only when the decision came after it, a later
+#   revision is invisible, and disagreeing completed vintages abstain;
+# * ``options_daily_signals``: one mutable row per (ticker, signal_date) whose
+#   ``created_at`` is its last-write time (``ingestion/options.py`` upsert).
+#   A row last written by the clock held its current value at the clock (up
+#   to the writing transaction's own duration: ``NOW()`` is its start); a row
+#   written or revised later is never read. The newest row written by the
+#   clock is a value GRID held then; it is not claimed to be the row the
+#   recommender read (that is not reproducible: analysis/thesis_scorer.py).
+
+_ET = ZoneInfo("America/New_York")
+# Calendar days searched back for the last completed close: any weekend plus
+# a holiday run; older than that is not an entry anchor.
+ENTRY_CLOSE_LOOKBACK_DAYS = 7
+
+_SCANNER_ROW_SQL = (
+    "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price, "
+    "total_oi, term_structure_slope, oi_concentration, signal_date, created_at "
+    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+    "WHERE ticker = :t AND signal_date <= :d AND created_at <= :decision_ts "
+    "ORDER BY signal_date DESC LIMIT 1"
+)
+
+_SCANNER_SPOT_SQL = (
+    "SELECT spot_price, signal_date, created_at FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+    "WHERE ticker = :t AND signal_date <= :d AND created_at <= :decision_ts "
+    "AND spot_price > 0 "
+    "ORDER BY signal_date DESC LIMIT 1"
+)
+
+
+def _decision_clock(val: Any) -> datetime | None:
+    """``val`` as an aware UTC instant, or None when it is not a timestamp.
+
+    A naive datetime is taken as UTC (griddb runs Etc/UTC). A bare date (or
+    date-only string) has no time of day, so it cannot say whether that day's
+    close or scanner row existed yet: None, and the caller abstains.
+    """
+    if isinstance(val, datetime):
+        if val.tzinfo is None or val.utcoffset() is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    if isinstance(val, str):
+        s = val.strip()
+        if "T" not in s and " " not in s:
+            return None
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return _decision_clock(parsed)
+    return None
+
+
+def _decision_session_date(clock: datetime) -> date:
+    """The New York calendar date of the decision clock (session dates are ET)."""
+    return clock.astimezone(_ET).date()
+
+
+def _no_clock_note(decision_date: Any) -> str:
+    return (
+        f"decision clock {decision_date!r} is not a timestamp, so no value can be "
+        f"shown to have been known at decision time"
+    )
+
+
+def _scanner_row_known_at(conn: Any, ticker: str, clock: datetime) -> Any:
+    """Newest visible ``options_daily_signals`` row last written by ``clock``.
+
+    Bounded twice: ``signal_date`` on or before the clock's ET date, and
+    ``created_at`` at or before the clock. ``created_at`` is re-checked here
+    so a NULL or unparseable write time never passes.
+    """
+    row = conn.execute(
+        visible_sql(_SCANNER_ROW_SQL),
+        {"t": ticker, "d": _decision_session_date(clock), "decision_ts": clock},
+    ).fetchone()
+    if row is None:
+        return None
+    written = _decision_clock(row[9])
+    if written is None or written > clock:
+        return None
+    return row
+
+
 def _reconstruct_decision_data(
     engine: Engine,
     ticker: str,
@@ -1398,7 +1501,9 @@ def _reconstruct_decision_data(
     """Reconstruct the data state at the time a recommendation was made.
 
     Gathers scanner signals, GEX data, and regime context that were
-    available on the decision date.
+    available on the decision date. The scanner row is the newest one
+    written by the decision clock (:func:`_scanner_row_known_at`); with no
+    such row, or no clock, ``scanner_signals_unavailable`` says why.
     """
     data: dict[str, Any] = {
         "sanity_status": sanity,
@@ -1409,16 +1514,21 @@ def _reconstruct_decision_data(
     if as_of is None:
         return data
     data["decision_date"] = as_of.isoformat()
+    clock = _decision_clock(decision_date)
 
     with engine.connect() as conn:
-        # Options scanner signals near decision date
-        opt_row = conn.execute(visible_sql("""
-            SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
-                   total_oi, term_structure_slope, oi_concentration, signal_date
-            FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
-            WHERE ticker = :t AND signal_date <= :d
-            ORDER BY signal_date DESC LIMIT 1
-        """), {"t": ticker, "d": as_of}).fetchone()
+        # Options scanner signals known at the decision clock
+        opt_row = None
+        if clock is None:
+            data["scanner_signals_unavailable"] = _no_clock_note(decision_date)
+        else:
+            opt_row = _scanner_row_known_at(conn, ticker, clock)
+            if opt_row is None:
+                data["scanner_signals_unavailable"] = (
+                    f"no options_daily_signals row for {ticker} dated on or before "
+                    f"{_decision_session_date(clock).isoformat()} was last written by the "
+                    f"decision clock {clock.isoformat()}"
+                )
 
         if opt_row:
             data["scanner_signals"] = {
@@ -1431,6 +1541,7 @@ def _reconstruct_decision_data(
                 "term_structure_slope": float(opt_row[6]) if opt_row[6] else None,
                 "oi_concentration": float(opt_row[7]) if opt_row[7] else None,
                 "signal_date": str(opt_row[8]) if opt_row[8] else None,
+                "created_at": _decision_clock(opt_row[9]).isoformat(),
             }
 
         # Regime at decision time
@@ -1542,59 +1653,91 @@ def _load_underlying_entry_spot(
     data_at_decision: dict[str, Any],
     *,
     price_source: str | None = None,
-) -> float | None:
-    """Return PIT-safe underlying spot at or before ``decision_date``.
+) -> tuple[float | None, str]:
+    """Return ``(spot, note)``: the underlying entry anchor known at ``decision_date``.
 
-    Reads from the same price source that supplied ``price_path`` so the entry
-    basis and path share units and vendor conventions:
-      - ``"options_daily_signals"``: uses reconstructed scanner ``spot_price``
-        or queries ``VISIBLE_DAILY_SIGNALS`` with ``signal_date <= as_of``.
-      - ``"raw_series"``: queries ``raw_series`` (``YF:{ticker}:close``) with
-        ``obs_date <= as_of``.
-      - ``None`` (no path loaded): checks scanner spot first, then ``raw_series``.
+    ``decision_date`` is the decision clock (``generated_at``). Reads from the
+    same price source that supplied ``price_path`` so the entry basis and path
+    share units and vendor conventions:
+      - ``"options_daily_signals"``: the reconstructed scanner ``spot_price``
+        (already fenced), else the newest visible row with a spot that was
+        last written by the clock.
+      - ``"raw_series"``: the newest completed ``YF:{ticker}:close`` known at
+        the clock (:class:`evaluation.prices.CompletedCloseAccessor`).
+      - ``None`` (no path loaded): scanner first, then the completed close.
 
-    Returns ``None`` when no positive finite PIT price exists — never falls
-    back to option premium or looks past ``decision_date``.
+    ``note`` names the basis when a spot is returned, and otherwise why none
+    was provably known. Never falls back to option premium, to a close of a
+    session that had not ended by the clock, or to a vintage pulled after it.
     """
-    as_of = _to_date(decision_date)
-    scanner_spot = _finite_positive(
-        (data_at_decision.get("scanner_signals") or {}).get("spot_price")
-    )
+    clock = _decision_clock(decision_date)
+    if clock is None:
+        return None, _no_clock_note(decision_date)
 
+    scanner = data_at_decision.get("scanner_signals") or {}
+    scanner_spot = _finite_positive(scanner.get("spot_price"))
     if price_source != "raw_series" and scanner_spot is not None:
-        return scanner_spot
+        return scanner_spot, (
+            f"options_daily_signals {scanner.get('signal_date')} written "
+            f"{scanner.get('created_at')}, at or before decision clock {clock.isoformat()}"
+        )
 
-    if as_of is None:
-        return None
-
+    missing: list[str] = []
     with engine.connect() as conn:
         if price_source in ("options_daily_signals", None):
-            row = conn.execute(visible_sql("""
-                SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
-                WHERE ticker = :t AND signal_date <= :d AND spot_price > 0
-                ORDER BY signal_date DESC LIMIT 1
-            """), {"t": ticker, "d": as_of}).fetchone()
-            if row is not None:
-                spot = _finite_positive(row[0])
-                if spot is not None:
-                    return spot
+            row = conn.execute(
+                visible_sql(_SCANNER_SPOT_SQL),
+                {"t": ticker, "d": _decision_session_date(clock), "decision_ts": clock},
+            ).fetchone()
+            written = _decision_clock(row[2]) if row is not None else None
+            spot = _finite_positive(row[0]) if row is not None else None
+            if spot is not None and written is not None and written <= clock:
+                return spot, (
+                    f"options_daily_signals {row[1]} written {written.isoformat()}, "
+                    f"at or before decision clock {clock.isoformat()}"
+                )
+            missing.append("no options_daily_signals spot last written by the clock")
 
         if price_source in ("raw_series", None):
-            row = conn.execute(text("""
-                SELECT value FROM raw_series
-                WHERE series_id = :sid
-                  AND obs_date <= :d
-                  AND pull_status = 'SUCCESS'
-                  AND value > 0
-                ORDER BY obs_date DESC, pull_timestamp DESC
-                LIMIT 1
-            """), {"sid": f"YF:{ticker}:close", "d": as_of}).fetchone()
-            if row is not None:
-                spot = _finite_positive(row[0])
-                if spot is not None:
-                    return spot
+            spot, note = _completed_close_known_at(conn, ticker, clock)
+            if spot is not None:
+                return spot, note
+            missing.append(note)
 
-    return None
+    return None, (
+        f"no underlying entry spot for {ticker} was known at decision clock "
+        f"{clock.isoformat()}: " + "; ".join(missing)
+    )
+
+
+def _completed_close_known_at(conn: Any, ticker: str, clock: datetime) -> tuple[float | None, str]:
+    """Newest completed raw close of ``ticker`` known at ``clock``, or why there is none."""
+    from evaluation.prices import (
+        AmbiguousPriceError,
+        CompletedCloseAccessor,
+        UnsupportedInstrumentError,
+    )
+
+    session = _decision_session_date(clock)
+    start = session - timedelta(days=ENTRY_CLOSE_LOOKBACK_DAYS)
+    try:
+        point = CompletedCloseAccessor(conn, start=start, evaluated_at=clock)(ticker, session)
+    except AmbiguousPriceError as exc:
+        return None, f"completed close is ambiguous ({exc})"
+    except UnsupportedInstrumentError as exc:
+        return None, f"no completed-close policy for {ticker!r} ({exc})"
+    if point is None:
+        return None, (
+            f"no completed YF:{ticker}:close from {start.isoformat()} to "
+            f"{session.isoformat()} was pulled by the clock"
+        )
+    spot = _finite_positive(point.value)
+    if spot is None:
+        return None, f"completed close {point.obs_date.isoformat()} is not a positive price"
+    return spot, (
+        f"{point.source_ref} {point.obs_date.isoformat()}, pulled after its close "
+        f"and at or before decision clock {clock.isoformat()}"
+    )
 
 
 def _classify_failure(
@@ -1670,10 +1813,13 @@ def _classify_failure(
                 signals_right.append(f"sanity_{layer}_passed")
 
     # Resolve underlying entry spot — NEVER substitute option premium entry_price.
+    # When the loader recorded why no anchor was known at the decision clock,
+    # that abstention stands: no other price source is tried here.
+    abstained = data_at_decision.get("underlying_entry_spot_unavailable")
     spot_basis = (
         _finite_positive(underlying_entry_price)
         or _finite_positive(data_at_decision.get("underlying_entry_spot"))
-        or _finite_positive((scanner or {}).get("spot_price"))
+        or (None if abstained else _finite_positive((scanner or {}).get("spot_price")))
     )
     if spot_basis is None:
         log.warning(
@@ -1681,10 +1827,11 @@ def _classify_failure(
             "labeling insufficient_data instead of guessing",
             t=ticker,
         )
+        why = f" {abstained}." if abstained else ""
         return (
             "insufficient_data",
             f"Underlying spot price at entry time is unavailable for {ticker}; "
-            f"cannot compare underlying price path against option premium.",
+            f"cannot compare underlying price path against option premium.{why}",
             signals_wrong,
             signals_right,
             "Underlying entry spot price was not available at decision time.",
