@@ -266,6 +266,19 @@ def _parse_nonneg_int(raw: str | None) -> int | None:
     return int(value)
 
 
+def _failure_kind(exc: BaseException) -> str:
+    """Short, secret-free label for a fetch failure (``http_503``, ``timeout``...)."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return f"http_{status}"
+    if isinstance(exc, (requests.Timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, requests.ConnectionError):
+        return "connection"
+    return type(exc).__name__
+
+
 @dataclass
 class FilingSnapshot:
     """One filing's holdings plus the evidence that they were read in full.
@@ -359,26 +372,39 @@ def _13f_value_multiplier(filing_date: date | str | None) -> int | None:
     return 1 if parsed >= _13F_DOLLAR_CUTOVER_DATE else 1000
 
 
+UNCLASSIFIED_AMENDMENT = "unclassified"
+
+
 def _select_latest_filings_by_report_date(
     filings: list[dict[str, Any]],
     *,
     count: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Collapse 13F-HR / 13F-HR/A filings so a RESTATEMENT replaces its original.
+    """Collapse 13F-HR / 13F-HR/A filings to one standing filing per quarter.
 
-    Only an amendment whose ``amendment_type`` is verified as ``RESTATEMENT``
-    may replace the original. A "NEW HOLDINGS" amendment lists only added
-    positions, so treating it as the quarter's full holdings would turn every
-    omitted position into a false CLOSED outflow. EDGAR's submissions index
-    does not carry the amendment type, so unverified amendments are skipped
-    (logged) and the original 13F-HR stands, as before amendments were read.
+    An amendment's ``amendment_type`` comes from its cover page
+    (``_fetch_13f_index`` classifies candidates before calling this; EDGAR's
+    submissions index does not carry it):
 
-    Filings that share a valid ``report_date`` collapse to the single latest
-    eligible filing ranked by ``(filing_date, is_amendment, accession)``.
-    Filings with no ``report_date`` (e.g. legacy callers/tests) remain
-    distinct by ``(accession, filing_date)``. Returned newest quarter first.
+    * ``RESTATEMENT`` replaces the filings before it for that quarter.
+    * ``NEW HOLDINGS`` lists only added positions. It never replaces the
+      original (that would turn every omitted position into a false CLOSED);
+      it is kept apart and listed on the quarter's standing filing as
+      ``additive_supplements``, and the comparison is then withheld because
+      the original alone is not the quarter's full holdings.
+    * Anything else (no type, an unreadable cover, a failed fetch) is
+      unclassified. A newer unclassified amendment becomes the quarter's
+      standing filing flagged ``amendment_classification = 'unclassified'``,
+      so the quarter reads as unknown rather than silently as the original.
+
+    Filings that share a valid ``report_date`` collapse to the latest by
+    ``(filing_date, is_amendment, accession)``. Filings with no
+    ``report_date`` (legacy callers/tests) stay distinct by ``(accession,
+    filing_date)``, and an amendment without a report date that is not a
+    RESTATEMENT is skipped (logged). Returned newest quarter first.
     """
     by_report_date: dict[date, tuple[tuple[date, int, str], dict[str, Any]]] = {}
+    supplements: dict[date, list[tuple[date, str]]] = {}
     without_report_date: list[tuple[tuple[date, int, str], dict[str, Any]]] = []
     seen_no_rd: set[tuple[str | None, date | None]] = set()
 
@@ -389,20 +415,30 @@ def _select_latest_filings_by_report_date(
         entry["is_amendment"] = is_amend
         if form:
             entry["form"] = form
-        if is_amend and str(entry.get("amendment_type") or "").strip().upper() != "RESTATEMENT":
-            log.warning(
-                "13F: skipping amendment {acc} ({form}, report_date={rd}): amendment type "
-                "{t!r} is not a verified RESTATEMENT; the original filing stands",
-                acc=entry.get("accession"),
-                form=form,
-                rd=entry.get("report_date"),
-                t=entry.get("amendment_type"),
-            )
-            continue
         fdate = _parse_13f_date(entry.get("filing_date"))
         rdate = _parse_13f_date(entry.get("report_date"))
         acc = str(entry.get("accession") or "").strip()
+        amendment_type = str(entry.get("amendment_type") or "").strip().upper()
+        if is_amend and amendment_type != "RESTATEMENT":
+            if rdate is not None and amendment_type == "NEW HOLDINGS":
+                supplements.setdefault(rdate, []).append((fdate or date.min, acc))
+                continue
+            if rdate is None:
+                log.warning(
+                    "13F: skipping amendment {acc} ({form}) with no report date: amendment type "
+                    "{t!r} is not a verified RESTATEMENT",
+                    acc=acc, form=form, t=entry.get("amendment_type"),
+                )
+                continue
+            entry["amendment_classification"] = UNCLASSIFIED_AMENDMENT
+            log.warning(
+                "13F: amendment {acc} ({form}, report_date={rd}) is unclassified ({why}); "
+                "its quarter reads as unknown, not as the original",
+                acc=acc, form=form, rd=rdate, why=entry.get("classification_reason") or "no amendment type",
+            )
         rank = (fdate or date.min, 1 if is_amend else 0, acc)
+        unclassified = entry.get("amendment_classification") == UNCLASSIFIED_AMENDMENT
+        over_key = "unclassified_over_accession" if unclassified else "replaces_accession"
 
         if rdate is not None:
             prev = by_report_date.get(rdate)
@@ -411,18 +447,30 @@ def _select_latest_filings_by_report_date(
             elif rank > prev[0]:
                 prev_acc = str(prev[1].get("accession") or "").strip()
                 if prev_acc and prev_acc != acc:
-                    entry["replaces_accession"] = prev_acc
+                    entry[over_key] = prev_acc
                 by_report_date[rdate] = (rank, entry)
             else:
                 prev_entry = prev[1]
+                prev_unclassified = prev_entry.get("amendment_classification") == UNCLASSIFIED_AMENDMENT
                 if acc and acc != str(prev_entry.get("accession") or "").strip():
-                    prev_entry.setdefault("replaces_accession", acc)
+                    prev_entry.setdefault(
+                        "unclassified_over_accession" if prev_unclassified else "replaces_accession", acc
+                    )
         else:
             key = (acc or None, fdate)
             if key in seen_no_rd:
                 continue
             seen_no_rd.add(key)
             without_report_date.append((rank, entry))
+
+    for rdate, items in supplements.items():
+        if rdate not in by_report_date:
+            continue
+        winner_rank, winner = by_report_date[rdate]
+        # A restatement filed after a supplement already includes it.
+        later = sorted(a for fd, a in items if fd >= winner_rank[0] and a)
+        if later:
+            winner["additive_supplements"] = sorted(set(winner.get("additive_supplements") or []) | set(later))
 
     combined: list[tuple[tuple[date, date, int, str], dict[str, Any]]] = []
     for rdate, (rank, entry) in by_report_date.items():
@@ -747,7 +795,62 @@ class InstitutionalFlowsPuller(BasePuller):
                     "primary_doc": primary_docs[i] if i < len(primary_docs) else None,
                 })
 
+        # The submissions index carries no amendment type: classify each
+        # amendment candidate of the quarters that will be compared from its
+        # own cover page before choosing a quarter's standing filing.
+        quarters = sorted(
+            {rd for f in raw_filings if (rd := _parse_13f_date(f.get("report_date"))) is not None},
+            reverse=True,
+        )
+        relevant = set(quarters if count is None else quarters[:count])
+        for f in raw_filings:
+            if f["is_amendment"] and f.get("accession") and _parse_13f_date(f.get("report_date")) in relevant:
+                time.sleep(_EDGAR_RATE_DELAY)
+                amendment_type, how = self._classify_13f_amendment(cik, str(f["accession"]))
+                f["amendment_classified_by"] = how
+                if amendment_type:
+                    f["amendment_type"] = amendment_type
+                else:
+                    f["classification_reason"] = how
+
         return _select_latest_filings_by_report_date(raw_filings, count=count)
+
+    def _classify_13f_amendment(self, cik: str, accession: str) -> tuple[str | None, str]:
+        """``(amendment_type, how)`` from the amendment's own cover page.
+
+        ``amendment_type`` is ``RESTATEMENT`` or ``NEW HOLDINGS`` when the
+        cover says so (``how == 'cover'``), else ``None`` with the reason:
+        no or unparseable cover, a cover that is not an amendment, an unknown
+        type, or a failed fetch (``fetch_failed:<kind>``). Never raises for a
+        network or HTTP failure: the accession is known, so the caller must
+        record it as unclassified rather than fall back to the original.
+        """
+        base_url = f"{_EDGAR_13F_XML_BASE}/{cik}/{accession.replace('-', '')}"
+        try:
+            resp = requests.get(f"{base_url}/index.json", headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+            if resp.status_code in (404, 410):
+                return None, "missing_filing_index"
+            resp.raise_for_status()
+            names = [str(item.get("name") or "") for item in resp.json().get("directory", {}).get("item", [])]
+            if _13F_COVER_DOCUMENT not in {n.lower() for n in names}:
+                return None, "missing_cover_page"
+            time.sleep(_EDGAR_RATE_DELAY)
+            resp = requests.get(f"{base_url}/{_13F_COVER_DOCUMENT}", headers=_EDGAR_HEADERS,
+                                timeout=_REQUEST_TIMEOUT)
+            if resp.status_code in (404, 410):
+                return None, "missing_cover_page"
+            resp.raise_for_status()
+            cover = _parse_13f_cover(resp.content)
+        except ET.ParseError:
+            return None, "unparseable_cover_page"
+        except (requests.RequestException, OSError, TimeoutError, ValueError) as exc:
+            return None, f"fetch_failed:{_failure_kind(exc)}"
+        if _parse_cover_bool(cover.get("isAmendment")) is not True:
+            return None, "cover_not_an_amendment"
+        amendment_type = str(cover.get("amendmentType") or "").strip().upper()
+        if amendment_type in ("RESTATEMENT", "NEW HOLDINGS"):
+            return amendment_type, "cover"
+        return None, "unknown_amendment_type"
 
     @retry_on_failure(
         max_attempts=2,
@@ -1125,6 +1228,38 @@ class InstitutionalFlowsPuller(BasePuller):
 
         return changes
 
+    def _read_filing_snapshot(self, cik: str, filing: dict[str, Any]) -> FilingSnapshot:
+        """``_fetch_13f_filing``, but a known accession always yields a snapshot.
+
+        An unclassified amendment, a quarter with an additive (NEW HOLDINGS)
+        supplement, or a fetch that fails after the accession is known (HTTP
+        429/503, a failed index.json, a timeout) returns an incomplete
+        snapshot instead of raising, so the caller still stores a dated
+        ``withheld_incomplete`` receipt for the newer accession and an older
+        receipt is never left standing as the latest.
+        """
+        accession = str(filing.get("accession") or "").strip()
+        evidence: dict[str, Any] = {
+            "accession": accession,
+            "form": str(filing.get("form") or "13F-HR").strip().upper(),
+        }
+        if filing.get("amendment_classification") == UNCLASSIFIED_AMENDMENT:
+            evidence["classification_reason"] = filing.get("classification_reason")
+            return FilingSnapshot(accession=accession, status="unclassified_amendment", evidence=evidence)
+        if filing.get("additive_supplements"):
+            evidence["additive_supplements"] = list(filing["additive_supplements"])
+            return FilingSnapshot(accession=accession, status="additive_supplement_not_merged", evidence=evidence)
+        try:
+            return self._fetch_13f_filing(cik, filing)
+        except (requests.RequestException, OSError, TimeoutError, ValueError) as exc:
+            kind = _failure_kind(exc)
+            log.warning(
+                "13F CIK={c}: reading filing {a} failed ({k}); recording it as unverified",
+                c=cik, a=accession, k=kind,
+            )
+            evidence["failure"] = kind
+            return FilingSnapshot(accession=accession, status=f"fetch_failed:{kind}", evidence=evidence)
+
     def _insert_receipt(
         self,
         conn: Any,
@@ -1133,9 +1268,12 @@ class InstitutionalFlowsPuller(BasePuller):
         payload: dict[str, Any],
         curr_snap: FilingSnapshot,
     ) -> int:
-        """Store one filing comparison receipt (value = the cover's entry count)."""
-        if self._row_exists(series_id, obs_date, conn):
-            return 0
+        """Store one filing comparison receipt (value = the cover's entry count).
+
+        Not deduplicated: each run's receipt is a dated record of what that
+        run read, and the newest received vintage is the one that stands (a
+        retry within the hour must be able to replace a failure's receipt).
+        """
         self._insert_raw(
             conn=conn,
             series_id=series_id,
@@ -1238,9 +1376,9 @@ class InstitutionalFlowsPuller(BasePuller):
                     })
                     continue
 
-                curr_snap = self._fetch_13f_filing(cik, curr_filing)
+                curr_snap = self._read_filing_snapshot(cik, curr_filing)
                 time.sleep(_EDGAR_RATE_DELAY)
-                prev_snap = self._fetch_13f_filing(cik, prev_filing)
+                prev_snap = self._read_filing_snapshot(cik, prev_filing)
                 time.sleep(_EDGAR_RATE_DELAY)
                 # The cover page is authoritative for a period the index omits.
                 curr_report_date = curr_report_date or curr_snap.evidence.get("cover_report_date")

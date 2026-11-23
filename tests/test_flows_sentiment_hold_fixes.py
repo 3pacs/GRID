@@ -629,13 +629,19 @@ def test_fetch_13f_index_amendment_replaces_original_for_same_report_date(monkey
     monkeypatch.setattr(institutional_flows.requests, "get", lambda *_a, **_k: resp)
 
     filings = puller._fetch_13f_index("1067983", count=2)
-    # EDGAR's submissions index carries no amendment type, so the 13F-HR/A
-    # can't be verified as a RESTATEMENT: the original Q2 filing stands, and
-    # Q2 is still compared with Q1, never with itself.
+    # EDGAR's submissions index carries no amendment type, so the writer
+    # reads the 13F-HR/A's own cover page. This mock serves no cover page,
+    # so the amendment is unclassified. Codex HOLD 6016410247 on #1393: an
+    # unclassifiable newer amendment makes the quarter unknown (the caller
+    # withholds the pair), never silently the original. Q2 is still compared
+    # with Q1, never with itself.
     assert len(filings) == 2
-    assert filings[0]["accession"] == "0001067983-26-000010"
-    assert filings[0]["form"] == "13F-HR"
-    assert filings[0]["is_amendment"] is False
+    assert filings[0]["accession"] == "0001067983-26-000020"
+    assert filings[0]["is_amendment"] is True
+    assert filings[0]["amendment_classification"] == "unclassified"
+    assert filings[0]["classification_reason"] == "missing_cover_page"
+    assert filings[0]["unclassified_over_accession"] == "0001067983-26-000010"
+    assert "replaces_accession" not in filings[0]
     assert filings[0]["report_date"] == "2026-06-30"
     assert filings[1]["accession"] == "0001067983-26-000005"
     assert filings[1]["report_date"] == "2026-03-31"
@@ -645,17 +651,29 @@ def test_only_a_verified_restatement_replaces_the_original_13f():
     """A NEW HOLDINGS 13F-HR/A lists only added positions; using it as the
     quarter's holdings would turn every omitted position into a false CLOSED
     outflow (e.g. 5 of 100 holdings -> 95 fake sales). Only a verified
-    RESTATEMENT may replace the original."""
+    RESTATEMENT may replace the original. A NEW HOLDINGS supplement is kept
+    apart on the original; an amendment of unknown type makes the quarter
+    unknown (Codex HOLD 6016410247 on #1393), never silently the original."""
     select = institutional_flows._select_latest_filings_by_report_date
     original = {"form": "13F-HR", "accession": "acc-orig", "filing_date": "2026-08-14",
                 "report_date": "2026-06-30"}
     prior_q = {"form": "13F-HR", "accession": "acc-q1", "filing_date": "2026-05-15",
                "report_date": "2026-03-31"}
-    for amendment_type in (None, "", "NEW HOLDINGS", "new holdings"):
+    for amendment_type in ("NEW HOLDINGS", "new holdings"):
         amend = {"form": "13F-HR/A", "accession": "acc-amend", "filing_date": "2026-08-28",
                  "report_date": "2026-06-30", "amendment_type": amendment_type}
         picked = select([amend, original, prior_q], count=2)
         assert [f["accession"] for f in picked] == ["acc-orig", "acc-q1"], amendment_type
+        assert picked[0]["additive_supplements"] == ["acc-amend"], amendment_type
+        assert "amendment_classification" not in picked[0]
+    for amendment_type in (None, "", "OTHER"):
+        amend = {"form": "13F-HR/A", "accession": "acc-amend", "filing_date": "2026-08-28",
+                 "report_date": "2026-06-30", "amendment_type": amendment_type}
+        picked = select([amend, original, prior_q], count=2)
+        assert [f["accession"] for f in picked] == ["acc-amend", "acc-q1"], amendment_type
+        assert picked[0]["amendment_classification"] == "unclassified", amendment_type
+        assert picked[0]["unclassified_over_accession"] == "acc-orig"
+        assert "replaces_accession" not in picked[0]
 
     restated = {"form": "13F-HR/A", "accession": "acc-restated", "filing_date": "2026-08-28",
                 "report_date": "2026-06-30", "amendment_type": "RESTATEMENT"}

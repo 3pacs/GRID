@@ -227,31 +227,10 @@ def test_a_later_vintage_of_the_same_filing_wins_and_receipt_picks_the_vintage(e
     assert older[(s.CIK_ALPHA, s.ROOT)].reported_value_usd == 260_000.0
 
 
-def _index_with_amendment_type(monkeypatch, edgar):
-    """EDGAR's submissions index carries no amendment type, so the writer
-    skips amendments it cannot verify. Supply the index's claim (RESTATEMENT)
-    through the writer's own index hook; the cover page is still checked."""
-    from ingestion.altdata import institutional_flows
-
-    def typed(self, cik, filing_type="13F-HR", count=4):
-        raw = []
-        for f in edgar._visible(cik):
-            entry = {"accession": f.accession, "filing_date": f.filing_date.isoformat(),
-                     "report_date": f.report_date.isoformat(), "form": f.form,
-                     "is_amendment": f.form.endswith("/A")}
-            if entry["is_amendment"]:
-                entry["amendment_type"] = "RESTATEMENT"
-            raw.append(entry)
-        return institutional_flows._select_latest_filings_by_report_date(raw, count=count)
-
-    monkeypatch.setattr(institutional_flows.InstitutionalFlowsPuller, "_fetch_13f_index", typed)
-
-
 def test_a_restatement_replaces_the_original_filing(engine, monkeypatch):
-    """A verified 13F-HR/A RESTATEMENT replaces the original for its quarter.
-    EDGAR's submissions index carries no amendment type, so the writer
-    skips amendments it cannot verify; this test supplies the type through
-    the writer's own index hook and keeps everything else real."""
+    """A 13F-HR/A whose cover page says RESTATEMENT replaces the original
+    for its quarter. The submissions index (real shape) carries no amendment
+    type; the writer classifies the amendment from its own cover page."""
     edgar = s.FakeEdgar()
     q1_report, q1_filed = s.quarter_dates(1)
     q0_report, q0_filed = s.quarter_dates(0)
@@ -261,7 +240,6 @@ def test_a_restatement_replaces_the_original_filing(engine, monkeypatch):
                                                                   s.ROOT_CUSIP: ("ROOT", 40_000, 400)}))
     edgar.add(s.CIK_ALPHA, s.Filing("A-0R", restated_filed, q0_report, {s.PEER_A_CUSIP: ("PA", 9_000, 90)},
                                     form="13F-HR/A"))
-    _index_with_amendment_type(monkeypatch, edgar)
     filers = {s.CIK_ALPHA: s.ALPHA}
     edgar.today = q0_filed
     s.run_writer(engine, monkeypatch, edgar, filers)
@@ -582,7 +560,6 @@ def test_a_no_delta_restatement_withdraws_the_original_through_the_served_graph(
     edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
         s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
     edgar.add(s.CIK_ALPHA, s.Filing("A-0R", restated_filed, q0_report, dict(y_unchanged), form="13F-HR/A"))
-    _index_with_amendment_type(monkeypatch, edgar)
     s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
     filers = {s.CIK_ALPHA: s.ALPHA}
 
@@ -704,9 +681,10 @@ def test_a_verified_empty_filing_closes_every_position(engine, monkeypatch, serv
     assert "managers_latest_filing_unverified" not in snap.counts
 
 
-def test_an_amendment_the_cover_page_calls_new_holdings_is_withheld(engine, monkeypatch):
-    """The index claims a restatement but the cover page says NEW HOLDINGS
-    (a partial list): comparing it would close every omitted position."""
+def test_a_new_holdings_supplement_is_kept_apart_and_withholds_the_quarter(engine, monkeypatch):
+    """A NEW HOLDINGS 13F-HR/A lists only added positions. It never replaces
+    the original (that would close every omitted position), and the original
+    alone is not the quarter's full holdings, so the pair is withheld."""
     edgar = s.FakeEdgar()
     q1_report, q1_filed = s.quarter_dates(1)
     q0_report, q0_filed = s.quarter_dates(0)
@@ -716,11 +694,13 @@ def test_an_amendment_the_cover_page_calls_new_holdings_is_withheld(engine, monk
     edgar.add(s.CIK_ALPHA, s.Filing("A-0N", q0_filed + timedelta(days=2), q0_report,
                                     {s.PEER_B_CUSIP: ("PB", 5_000, 50)}, form="13F-HR/A",
                                     amendment_type="NEW HOLDINGS"))
-    _index_with_amendment_type(monkeypatch, edgar)
 
     results = s.run_writer(engine, monkeypatch, edgar, {s.CIK_ALPHA: s.ALPHA})
-    assert results[0]["curr_snapshot"] == "amendment_not_verified_restatement"
     assert s.series_rows(engine, "13F:%") == []
+    assert results[0]["curr_snapshot"] == "additive_supplement_not_merged"
+    receipt = _receipt(engine, "A-0")
+    assert receipt["comparison_status"] == "withheld_incomplete"
+    assert receipt["curr_snapshot"]["additive_supplements"] == ["A-0N"]
     assert h13f.read_13f_holdings_snapshot(engine).holdings == ()
 
 
@@ -744,7 +724,6 @@ def test_a_restated_prior_filing_retires_rows_from_the_old_comparison(engine, mo
     edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {s.PEER_A_CUSIP: ("PA", 1_000, 10)}))
     edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
         s.PEER_A_CUSIP: ("PA", 9_000, 90), s.ROOT_CUSIP: ("ROOT", 40_000, 400)}))
-    _index_with_amendment_type(monkeypatch, edgar)
     filers = {s.CIK_ALPHA: s.ALPHA}
     s.run_writer(engine, monkeypatch, edgar, filers)
     s.set_receipt(engine, q0_filed, datetime.combine(q0_filed, datetime.min.time()).replace(hour=6))
@@ -773,3 +752,120 @@ def test_the_writer_reads_every_information_table_namespace():
         assert holdings[0]["value_usd"] == 1_000 and holdings[0]["cusip"] == "FXROOT001"
     with pytest.raises(institutional_flows.ET.ParseError):
         institutional_flows._parse_13f_infotable(b"<informationTable><infoTable>", 1)
+
+
+# ── Codex HOLD 6016410247: real amendment selection, known-accession failures ─
+
+@pytest.mark.parametrize("defect", ["cover_missing", "cover_malformed", "cover_503", "unknown_type"])
+def test_an_unclassifiable_newer_amendment_reads_as_unknown_not_as_the_original(
+    engine, monkeypatch, served, defect
+):
+    """A newer 13F-HR/A whose cover cannot classify it (missing, malformed,
+    a 503, an unknown type) becomes the quarter's standing filing as
+    unclassified: a withheld receipt is stored for it and nothing is shown.
+    Before it was filed, the original's holdings are shown (control)."""
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    amended_filed = q0_filed + timedelta(days=3)
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    amendment = s.Filing("A-0A", amended_filed, q0_report, {s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90)},
+                         form="13F-HR/A")
+    if defect == "cover_503":
+        amendment.fail, amendment.fail_on = "503", "cover"
+    elif defect == "unknown_type":
+        amendment.amendment_type = "OTHER"
+    else:
+        amendment.cover = defect.split("_", 1)[1]
+    edgar.add(s.CIK_ALPHA, amendment)
+    s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+
+    edgar.today = q0_filed
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    s.set_receipt(engine, q0_filed, datetime.combine(q0_filed, datetime.min.time()).replace(hour=6))
+    edgar.today = date.today()
+    results = s.run_writer(engine, monkeypatch, edgar, filers)
+
+    assert _served_layer9(served)["actors"] == []  # not silently the original
+    assert results[0]["status"] == "QUARANTINED" and results[0]["curr_snapshot"] == "unclassified_amendment"
+    receipt = _receipt(engine, "A-0A")
+    assert receipt["comparison_status"] == "withheld_incomplete"
+    assert receipt["curr_snapshot"]["classification_reason"]
+    snap = h13f.read_13f_holdings_snapshot(engine)
+    assert snap.holdings == () and snap.counts["managers_latest_filing_unverified"] == 1
+    control = _by_key(h13f.read_13f_holdings_snapshot(engine, as_of=q0_filed))
+    assert {(s.CIK_ALPHA, s.ROOT), (s.CIK_ALPHA, s.PEER_A)} <= set(control)
+
+
+@pytest.mark.parametrize("failure", ["429", "503", "timeout"])
+@pytest.mark.parametrize("side", ["current", "prior"])
+def test_a_failed_read_of_a_known_newer_filing_is_recorded_until_recovery(
+    engine, monkeypatch, served, side, failure
+):
+    """Q-1's holdings are verified. Reading the Q-1 -> Q0 pair fails on one
+    side (429, 503 or timeout on the filing's index.json) after Q0's
+    accession is known. The newer accession is stored as known but
+    unverified, so Q-1's holdings are not shown as current; as of before the
+    failure they are (control); once a later run reads the pair, Q0 shows."""
+    edgar = s.FakeEdgar()
+    dates = {q: s.quarter_dates(q) for q in range(3)}
+    edgar.add(s.CIK_ALPHA, s.Filing("A-2", dates[2][1], dates[2][0], {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", dates[1][1], dates[1][0], {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", dates[0][1], dates[0][0], {
+        s.PEER_A_CUSIP: ("PEER A CORP", 30_000, 300), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 44_000, 400)}))
+    s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+
+    edgar.today = dates[1][1]
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    s.set_receipt(engine, dates[1][1], datetime.combine(dates[1][1], datetime.min.time()).replace(hour=6))
+    assert [a["label"] for a in _served_layer9(served)["actors"]] == [s.ALPHA]
+
+    failing = edgar.filings[s.CIK_ALPHA][2 if side == "current" else 1]
+    failing.fail = failure
+    edgar.today = date.today()
+    results = s.run_writer(engine, monkeypatch, edgar, filers)
+    failed_at = datetime.combine(dates[0][1] + timedelta(days=1), datetime.min.time()).replace(hour=6)
+    s.set_receipt(engine, dates[0][1], failed_at)
+
+    expected = "timeout" if failure == "timeout" else f"http_{failure}"
+    assert results[0]["status"] == "QUARANTINED"
+    assert results[0]["curr_snapshot" if side == "current" else "prev_snapshot"] == f"fetch_failed:{expected}"
+    assert _change_rows(engine, dates[0][1]) == []
+    receipt = _receipt(engine, "A-0")
+    assert receipt["comparison_status"] == "withheld_incomplete"
+    assert _served_layer9(served)["actors"] == []  # Q-1 is not shown as current
+    unverified = h13f.read_13f_holdings_snapshot(engine)
+    assert unverified.holdings == () and unverified.counts["managers_latest_filing_unverified"] == 1
+    before = _by_key(h13f.read_13f_holdings_snapshot(engine, as_of_ts=_utc(failed_at) - timedelta(seconds=1)))
+    assert before[(s.CIK_ALPHA, s.ROOT)].held_through_report_date == dates[1][0]
+
+    failing.fail = None
+    results = s.run_writer(engine, monkeypatch, edgar, filers)
+    assert results[0]["status"] == "SUCCESS"
+    layer9 = _served_layer9(served)
+    assert [a["label"] for a in layer9["actors"]] == [s.ALPHA]
+    assert layer9["actors"][0]["observation"]["held_through_report_date"] == dates[0][0].isoformat()
+    still_failed = h13f.read_13f_holdings_snapshot(engine, as_of_ts=_utc(failed_at) + timedelta(hours=1))
+    assert still_failed.holdings == ()
+
+
+def test_a_newer_unvalidatable_receipt_withholds_the_manager(engine, monkeypatch):
+    """A receipt for a newer filing that cannot be validated (here its report
+    date is missing) must not leave the older valid receipt standing."""
+    s.run_writer(engine, monkeypatch, s.two_quarter_scenario(), {s.CIK_ALPHA: s.ALPHA})
+    _report, filed = s.quarter_dates(0)
+    s.set_receipt(engine, filed, datetime.combine(filed + timedelta(days=1), datetime.min.time()).replace(hour=6))
+    later = filed + timedelta(days=5)
+    _insert_row(engine, f"13F-FILING:{s.CIK_ALPHA}:A-LATER", later, {
+        "measure": h13f.WRITER_RECEIPT_MEASURE, "qualified_for_directional_flow": False,
+        "manager_cik": s.CIK_ALPHA, "filing_accession": "A-LATER", "filing_date": later.isoformat(),
+        "report_date": None, "comparison_status": "withheld_incomplete",
+    }, received=datetime.combine(later, datetime.min.time()).replace(hour=6))
+    snap = h13f.read_13f_holdings_snapshot(engine)
+    assert snap.holdings == () and snap.counts["managers_receipt_unreadable"] == 1
+    assert h13f.read_13f_holdings_snapshot(engine, as_of=later - timedelta(days=1)).holdings != ()

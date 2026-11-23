@@ -63,9 +63,12 @@ Point in time
 * Per ``(manager, CUSIP)`` the observation with the latest report date wins.
   A CLOSED (``filing_disappearance``) ends the holding: it is never shown as
   held.
-* A manager whose latest filing has no ``compared`` receipt (unreadable or
-  withheld) shows nothing (``managers_latest_filing_unverified``): its last
-  verified filing cannot be claimed as current. A manager whose latest report
+* A manager whose latest filing has no ``compared`` receipt (unreadable,
+  unclassified amendment, additive supplement, or a fetch that failed once
+  the accession was known) shows nothing
+  (``managers_latest_filing_unverified``): its last verified filing cannot
+  be claimed as current. So does a manager with an unvalidatable receipt
+  filed on or after its latest valid one (``managers_receipt_unreadable``). A manager whose latest report
   date is more than ``MAX_REPORT_AGE_DAYS`` old shows nothing
   (``managers_stale_filing``).
 
@@ -527,6 +530,10 @@ def _read(
     with engine.connect() as conn:
         # Stage 1: filing comparison receipts -> per-quarter authority.
         receipts: dict[tuple[str, str], dict[str, Any]] = {}
+        # Latest filing date of a receipt that could not be validated, per
+        # manager: a newer unreadable receipt must not leave an older valid
+        # one standing as the latest.
+        unreadable_since: dict[str, date] = {}
         for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in _latest_vintages(
             conn, f"{WRITER_RECEIPT_PREFIX}:%", earliest, day, instant
         ):
@@ -539,6 +546,9 @@ def _read(
                 rec = _receipt_check(parts[1].strip(), parts[2].strip(), seen[0], seen[1], payload)
             if rec is None:
                 _bump(counts, "invalid_filing_receipt")
+                if len(parts) == 3 and seen is not None:
+                    cik = parts[1].strip()
+                    unreadable_since[cik] = max(seen[0], unreadable_since.get(cik, date.min))
                 continue
             receipts[(parts[1].strip(), rec["accession"])] = rec
 
@@ -604,6 +614,9 @@ def _read(
             latest = receipts.get((cik, authority[(cik, latest_rd)][2]))
             if latest is None or not latest["compared"]:
                 _bump(counts, "managers_latest_filing_unverified")
+                continue
+            if cik in unreadable_since and unreadable_since[cik] >= latest["filing_date"]:
+                _bump(counts, "managers_receipt_unreadable")
                 continue
             if latest_rd < stale_cutoff:
                 _bump(counts, "managers_stale_filing")

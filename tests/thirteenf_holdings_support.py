@@ -58,6 +58,10 @@ class Filing:
     cover: str = "ok"  # "ok" | "missing" | "malformed"
     amendment_type: str = "RESTATEMENT"  # what the cover page says for a /A form
     cover_entry_total: int | None = None  # override the cover's tableEntryTotal
+    # Transient failure on this filing's documents: "429" | "503" | "timeout",
+    # on "index" (index.json), "cover" (primary_doc.xml) or "infotable".
+    fail: str | None = None
+    fail_on: str = "index"
 
 
 class _Resp:
@@ -73,7 +77,7 @@ class _Resp:
         if self.status_code >= 400:
             import requests
 
-            raise requests.HTTPError(f"HTTP {self.status_code}")
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
 
 class FakeEdgar:
@@ -96,17 +100,43 @@ class FakeEdgar:
             match = next((c for c in self.filings if c.lstrip("0") == cik), None)
             if match is None:
                 return _Resp(status=404)
-            rows = self._visible(match)
-            return _Resp(payload={"filings": {"recent": {
-                "form": [f.form for f in rows],
-                "accessionNumber": [f.accession for f in rows],
-                "filingDate": [f.filing_date.isoformat() for f in rows],
-                "reportDate": [f.report_date.isoformat() for f in rows],
-                "primaryDocument": ["xslForm13F_X02/primary_doc.xml" for _ in rows],
-            }}})
+            # The real submissions shape: parallel arrays under filings.recent,
+            # other forms mixed in, and no amendment type anywhere.
+            rows = [(f.form, f.accession, f.filing_date, f.report_date, "xslForm13F_X02/primary_doc.xml")
+                    for f in self._visible(match)]
+            rows.append(("4", f"{match}-26-900001", self.today, None, "xslF345X05/form4.xml"))
+            rows.sort(key=lambda r: r[2], reverse=True)
+            return _Resp(payload={
+                "cik": match, "entityType": "other", "name": "SYNTHETIC FILER", "tickers": [], "exchanges": [],
+                "filings": {"recent": {
+                    "accessionNumber": [r[1] for r in rows],
+                    "filingDate": [r[2].isoformat() for r in rows],
+                    "reportDate": [r[3].isoformat() if r[3] else "" for r in rows],
+                    "acceptanceDateTime": [f"{r[2].isoformat()}T16:01:02.000Z" for r in rows],
+                    "act": ["" for _ in rows],
+                    "form": [r[0] for r in rows],
+                    "fileNumber": ["028-00000" for _ in rows],
+                    "filmNumber": ["26000000" for _ in rows],
+                    "items": ["" for _ in rows],
+                    "core_type": [r[0] for r in rows],
+                    "size": [12345 for _ in rows],
+                    "isXBRL": [0 for _ in rows],
+                    "isInlineXBRL": [0 for _ in rows],
+                    "primaryDocument": [r[4] for r in rows],
+                    "primaryDocDescription": ["" for _ in rows],
+                }, "files": []},
+            })
         for cik, rows in self.filings.items():
             for f in rows:
                 base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{f.accession.replace('-', '')}"
+                document = {f"{base}/index.json": "index", f"{base}/primary_doc.xml": "cover",
+                            f"{base}/infotable.xml": "infotable"}.get(url)
+                if document is not None and f.fail and f.fail_on == document:
+                    if f.fail == "timeout":
+                        import requests
+
+                        raise requests.Timeout(f"read timed out: {document}")
+                    return _Resp(status=int(f.fail))
                 if url == f"{base}/index.json":
                     items = [{"name": f"{f.accession}-index.html"}]
                     if f.cover != "missing":

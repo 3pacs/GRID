@@ -172,11 +172,11 @@ def _layer9_live(monkeypatch, engine):
 
 
 def test_pg_no_delta_restatement_and_unreadable_filing_are_negative_controls(pg_engine, monkeypatch):
-    """Codex HOLD 6016240483 on PostgreSQL: a no-delta restatement withdraws
-    the original's holdings, and an unreadable later filing closes nothing
-    and leaves nothing claimed, both through the served route."""
-    from ingestion.altdata import institutional_flows
-
+    """Codex HOLDs 6016240483 / 6016410247 on PostgreSQL, real submissions
+    shape (the writer classifies the amendment from its cover page): a
+    no-delta restatement withdraws the original's holdings, and an
+    unreadable later filing closes nothing and leaves nothing claimed, both
+    through the served route."""
     edgar = s.FakeEdgar()
     q1_report, q1_filed = s.quarter_dates(1)
     q0_report, q0_filed = s.quarter_dates(0)
@@ -187,15 +187,6 @@ def test_pg_no_delta_restatement_and_unreadable_filing_are_negative_controls(pg_
     edgar.add(s.CIK_ALPHA, s.Filing("A-0R", q0_filed + timedelta(days=3), q0_report, dict(y_unchanged),
                                     form="13F-HR/A"))
 
-    def typed(self, cik, filing_type="13F-HR", count=4):
-        raw = [{"accession": f.accession, "filing_date": f.filing_date.isoformat(),
-                "report_date": f.report_date.isoformat(), "form": f.form,
-                "is_amendment": f.form.endswith("/A"),
-                **({"amendment_type": "RESTATEMENT"} if f.form.endswith("/A") else {})}
-               for f in edgar._visible(cik)]
-        return institutional_flows._select_latest_filings_by_report_date(raw, count=count)
-
-    monkeypatch.setattr(institutional_flows.InstitutionalFlowsPuller, "_fetch_13f_index", typed)
     s.seed_upstream_layers(pg_engine, s.ROOT, [s.PEER_A, s.PEER_B])
     filers = {s.CIK_ALPHA: s.ALPHA}
 
@@ -217,3 +208,38 @@ def test_pg_no_delta_restatement_and_unreadable_filing_are_negative_controls(pg_
     final = _layer9_live(monkeypatch, pg_engine)
     assert final["actors"] == []
     assert final["holdings_observation"]["excluded"]["managers_latest_filing_unverified"] == 1
+
+
+def test_pg_known_newer_filing_that_fails_to_read_is_recorded_until_recovery(pg_engine, monkeypatch):
+    """A 503 on the newer filing's index.json after its accession is known:
+    a dated withheld receipt stands for it (nothing shown as current), the
+    older holdings show as of before the failure, and a later run recovers."""
+    edgar = s.FakeEdgar()
+    dates = {q: s.quarter_dates(q) for q in range(3)}
+    edgar.add(s.CIK_ALPHA, s.Filing("A-2", dates[2][1], dates[2][0], {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", dates[1][1], dates[1][0], {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    newer = s.Filing("A-0", dates[0][1], dates[0][0], {
+        s.PEER_A_CUSIP: ("PEER A CORP", 30_000, 300), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 44_000, 400)},
+        fail="503")
+    edgar.add(s.CIK_ALPHA, newer)
+    s.seed_upstream_layers(pg_engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+
+    edgar.today = dates[1][1]
+    s.run_writer(pg_engine, monkeypatch, edgar, filers)
+    s.set_receipt(pg_engine, dates[1][1],
+                  datetime.combine(dates[1][1], datetime.min.time(), tzinfo=timezone.utc).replace(hour=6))
+    edgar.today = date.today()
+    results = s.run_writer(pg_engine, monkeypatch, edgar, filers)
+    assert results[0]["curr_snapshot"] == "fetch_failed:http_503"
+    failed_at = datetime.combine(dates[0][1] + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    s.set_receipt(pg_engine, dates[0][1], failed_at)
+    assert _layer9_live(monkeypatch, pg_engine)["actors"] == []
+    before = h13f.read_13f_holdings_snapshot(pg_engine, as_of_ts=failed_at - timedelta(seconds=1))
+    assert {h.ticker for h in before.holdings} == {s.ROOT, s.PEER_A}
+
+    newer.fail = None
+    assert s.run_writer(pg_engine, monkeypatch, edgar, filers)[0]["status"] == "SUCCESS"
+    recovered = _layer9_live(monkeypatch, pg_engine)
+    assert recovered["actors"][0]["observation"]["held_through_report_date"] == dates[0][0].isoformat()
