@@ -55,7 +55,8 @@ def _card(source: str, weight: float = 1.3, calibrated: bool = True) -> SignalSc
         running_brier=0.08,
         running_ece=0.06,
         hit_rate=0.65,
-        last_updated=datetime.now(timezone.utc),
+        # Scored a day before any test's decision clock, so it is fenced.
+        last_updated=datetime.now(timezone.utc) - timedelta(days=1),
         is_calibrated=calibrated,
         conviction_weight=weight,
     )
@@ -96,12 +97,27 @@ def _prediction(
         market_implied_prob=0.65,
         catalyst_type="earnings",
         liquidity_state="EXPANSION",
+        # The decision clock predict() stamps; builders refuse a missing one.
+        as_of=datetime.now(timezone.utc),
     )
     if signals is not None:
         ns.signals = signals
     if signal_contributions is not None:
         ns.signal_contributions = signal_contributions
     return ns
+
+
+def _fence_every_layer(stack: ExitStack) -> None:
+    """Treat every adjuster layer as fenced to the decision clock.
+
+    For tests of the coverage and multiplier mechanics, which predate the
+    clock fence (Codex HOLD 6030789643) and exercise layers that are
+    advisory in production. The real fence set is pinned by
+    ``TestCodexHold6030789643EvidenceFence``.
+    """
+    stack.enter_context(
+        patch.object(sp, "CLOCK_FENCED_LAYERS", frozenset(sp.CONVICTION_LAYERS))
+    )
 
 
 def _failing_engine() -> MagicMock:
@@ -318,7 +334,7 @@ class TestDefect1HonestCoverage:
         with patch.object(
             sp,
             "get_scorecard_with_regime_source",
-            lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
+            lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.3), "regime"),
         ):
             report = sp.build_provenance_report(engine, prediction=pred)
 
@@ -370,25 +386,30 @@ class TestDefect1HonestCoverage:
             missing_stream_count=6,
         )
 
-        with patch(
-            "intelligence.signal_convergence_scanner.scan_convergence",
-            return_value=empty_conv,
-        ):
+        with ExitStack() as stack:
+            _fence_every_layer(stack)
+            stack.enter_context(patch(
+                "intelligence.signal_convergence_scanner.scan_convergence",
+                return_value=empty_conv,
+            ))
             rep_empty = sp.build_provenance_report(engine, prediction=pred)
         assert rep_empty.layer_coverage["convergence"] is False
         assert rep_empty.convergence_multiplier == 1.0
 
-        with patch(
-            "intelligence.signal_convergence_scanner.scan_convergence",
-            return_value=active_conv,
-        ):
+        with ExitStack() as stack:
+            _fence_every_layer(stack)
+            stack.enter_context(patch(
+                "intelligence.signal_convergence_scanner.scan_convergence",
+                return_value=active_conv,
+            ))
             rep_active = sp.build_provenance_report(engine, prediction=pred)
         assert rep_active.layer_coverage["convergence"] is True
         assert rep_active.convergence_multiplier == pytest.approx(1.05)
 
     def test_fudge_alerts_db_failure_returns_none_and_not_covered(self) -> None:
         engine = _failing_engine()
-        assert sp._recent_fudge_alerts(engine, ticker="XOM") is None
+        clock = datetime.now(timezone.utc)
+        assert sp._recent_fudge_alerts(engine, ticker="XOM", clock=clock) is None
 
 
 # ── Defect 2: No double counting of disagreement and fragility ──────────────
@@ -431,7 +452,7 @@ class TestDefect2NoDoubleCounting:
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (_card(src, 1.25), "regime"),
+                    lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.25), "regime"),
                 )
             )
             rep_clean = sp.build_provenance_report(MagicMock(), prediction=pred_clean)
@@ -466,8 +487,9 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
         engine = MagicMock()
         engine.connect.return_value.__enter__.return_value.execute.return_value.mappings.return_value.all.return_value = fake_alerts
 
+        clock = datetime.now(timezone.utc)
         for non_shipping in ("NVDA", "JPM", "UNKNWN_TICKER"):
-            assert sp._recent_fudge_alerts(engine, ticker=non_shipping) is None
+            assert sp._recent_fudge_alerts(engine, ticker=non_shipping, clock=clock) is None
 
         pred = _prediction(
             ticker="NVDA",
@@ -476,11 +498,12 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
         )
         with ExitStack() as stack:
             _patch_all_non_fudge_adapters(stack, value=1.0)
+            _fence_every_layer(stack)
             stack.enter_context(
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (_card(src, 1.4), "regime"),
+                    lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.4), "regime"),
                 )
             )
             report = sp.build_provenance_report(engine, prediction=pred)
@@ -504,6 +527,7 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
         )
         with ExitStack() as stack:
             _patch_all_non_fudge_adapters(stack, value=1.0)
+            _fence_every_layer(stack)
             for absent_adapter in (
                 "scenario_conviction_multiplier",
                 "null_hypothesis_penalty",
@@ -515,7 +539,7 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
+                    lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.3), "regime"),
                 )
             )
             report = sp.build_provenance_report(MagicMock(), prediction=pred)
@@ -527,15 +551,19 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
         assert report.verdict == "high"
 
     def test_shipping_exposed_ticker_applies_fudge_alert_penalty(self) -> None:
+        checked = datetime.now(timezone.utc) - timedelta(hours=2)
         fake_alerts = [
-            {"name": "port_x", "assessment": "major_divergence", "divergence_zscore": 3.0},
-            {"name": "port_y", "assessment": "contradiction", "divergence_zscore": 2.8},
+            {"name": "port_x", "assessment": "major_divergence", "divergence_zscore": 3.0,
+             "checked_at": checked},
+            {"name": "port_y", "assessment": "contradiction", "divergence_zscore": 2.8,
+             "checked_at": checked},
         ]
         engine = MagicMock()
         engine.connect.return_value.__enter__.return_value.execute.return_value.mappings.return_value.all.return_value = fake_alerts
 
+        clock = datetime.now(timezone.utc)
         for exposed in ("XOM", "UPS", "BHP", "ZIM"):
-            res = sp._recent_fudge_alerts(engine, ticker=exposed)
+            res = sp._recent_fudge_alerts(engine, ticker=exposed, clock=clock)
             assert res is not None and len(res) == 2
 
         pred = _prediction(
@@ -549,7 +577,7 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (_card(src, 1.4), "regime"),
+                    lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.4), "regime"),
                 )
             )
             report = sp.build_provenance_report(engine, prediction=pred)
@@ -576,7 +604,7 @@ class TestDefect4RedTeamAdvisoryOnly:
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
+                    lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.3), "regime"),
                 )
             )
             rep_not_run = sp.build_provenance_report(
@@ -739,11 +767,12 @@ class TestDefect5ScorecardKeyMapping:
 
         with ExitStack() as stack:
             _patch_all_non_fudge_adapters(stack, value=1.0)
+            _fence_every_layer(stack)
             stack.enter_context(
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (family_cards.get(src), "regime"),
+                    lambda _eng, src, _h, _reg=None, **_k: (family_cards.get(src), "regime"),
                 )
             )
             report = sp.build_provenance_report(_OracleModelsEngine(), prediction=pred)
@@ -772,7 +801,10 @@ class TestDefect5ScorecardKeyMapping:
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (cards.get(src), "regime"),
+                    lambda _eng, src, _h, _reg=None, *, aliases=(): (
+                        next((cards[k] for k in (src, *aliases) if k in cards), None),
+                        "regime",
+                    ),
                 )
             )
             report = sp.build_provenance_report(MagicMock(), prediction=pred)
@@ -790,12 +822,13 @@ class TestDefect6EdgeSignalAbsence:
         pred = _prediction(ticker="XOM", confidence=0.72)
         with ExitStack() as stack:
             _patch_all_non_fudge_adapters(stack, value=1.0)
+            _fence_every_layer(stack)
             stack.enter_context(patch.object(sp, "_recent_fudge_alerts", lambda *_a, **_k: []))
             stack.enter_context(
                 patch.object(
                     sp,
                     "get_scorecard_with_regime_source",
-                    lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
+                    lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.3), "regime"),
                 )
             )
             report = sp.build_provenance_report(MagicMock(), prediction=pred)
@@ -867,11 +900,10 @@ class TestScriptsMatchProductionMath:
 #    regime_calibrated_signal_count, and every evidence row reports which
 #    table answered ("regime", "flat_fallback", "flat", or None).
 # 2. The builder dates its layers from the prediction's own clock
-#    (prediction.as_of), not date.today(). The undated layers (scorecards,
-#    confidence bucket, null hypothesis, meta-learning, co-occurrence, memory,
-#    fudge alerts) read current state, so the builder is live-only: a
-#    prediction whose clock is outside the live window is refused before any
-#    layer is read.
+#    (prediction.as_of), not date.today(), and is live-only: a prediction
+#    whose clock is outside the live window is refused before any layer is
+#    read. (Round 2, below: a missing clock is refused too, and the layers
+#    that read current state are advisory.)
 
 
 def _patch_calibration_tables(
@@ -1050,20 +1082,6 @@ class TestCodexHold6011905360PredictionClock:
         assert set(seen) == {*_DATED_ADAPTERS, "convergence"}
         assert all(value == expected for value in seen.values()), seen
         assert report.generated_at == _LIVE_NOW.isoformat()
-
-    def test_missing_clock_uses_the_builder_utc_date(self) -> None:
-        pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
-        assert getattr(pred, "as_of", None) is None
-        with ExitStack() as stack:
-            _patch_all_non_fudge_adapters(stack, value=1.0)
-            seen = _capture_dated_layers(stack)
-            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
-            _patch_calibration_tables(
-                stack, regime_cards={}, flat_cards={"jodi_oil": _card("jodi_oil", 1.3)}
-            )
-            sp.build_provenance_report(MagicMock(), prediction=pred)
-
-        assert all(value == _LIVE_NOW.date() for value in seen.values()), seen
 
     def test_naive_clock_is_read_as_utc(self) -> None:
         pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
@@ -1265,7 +1283,7 @@ class TestCodexHold6030789643DecisionClock:
 
     def test_missing_clock_fails_closed_through_the_decision_gateway(self) -> None:
         pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
-        assert getattr(pred, "as_of", None) is None
+        pred.as_of = None
         with ExitStack() as stack:
             reads = _spy_every_layer(stack)
             stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))

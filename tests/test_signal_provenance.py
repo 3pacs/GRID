@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 from features.per_signal_brier import (
     SignalScorecard,
 )
+from intelligence import signal_provenance as sp_module
 from intelligence.signal_convergence_scanner import ConvergenceReport
 from intelligence.signal_provenance import (
     CausationChain,
@@ -39,7 +40,7 @@ def _card(
         running_brier=brier,
         running_ece=brier,
         hit_rate=0.6,
-        last_updated=datetime.now(timezone.utc),
+        last_updated=datetime.now(timezone.utc) - timedelta(days=1),
         is_calibrated=calibrated,
         conviction_weight=weight,
     )
@@ -301,10 +302,14 @@ class TestBuildReport:
             "macro": _card("macro", 7, 50, 0.07, 1.42),
         }
 
-        def fake_get(eng, source, h, regime=None):
+        def fake_get(eng, source, h, regime=None, aliases=()):
             return family_cards.get(source), "regime"
 
-        with patch(
+        with patch.object(
+            # HIGH needs layer coverage; these layers are advisory in
+            # production (CLOCK_FENCED_LAYERS), so fence them all here.
+            sp_module, "CLOCK_FENCED_LAYERS", frozenset(sp_module.CONVICTION_LAYERS),
+        ), patch(
             "intelligence.signal_provenance.get_scorecard_with_regime_source",
             side_effect=fake_get,
         ), patch(
@@ -380,6 +385,7 @@ class TestBuildReport:
                 market_implied_prob=0.78,
                 catalyst_type="earnings",
                 liquidity_state="EXPANSION",
+                as_of=datetime.now(timezone.utc),
             )
             report = build_provenance_report(
                 engine,
@@ -395,7 +401,9 @@ class TestBuildReport:
         engine = MagicMock()
         strong_card = _card("equity", 7, 50, 0.06, 1.5)
 
-        with patch(
+        with patch.object(
+            sp_module, "CLOCK_FENCED_LAYERS", frozenset(sp_module.CONVICTION_LAYERS),
+        ), patch(
             "intelligence.signal_provenance.get_scorecard_with_regime_source",
             return_value=(strong_card, "regime"),
         ), patch(
@@ -468,6 +476,7 @@ class TestBuildReport:
                 market_implied_prob=0.4,
                 catalyst_type="",
                 liquidity_state="",
+                as_of=datetime.now(timezone.utc),
             )
             report = build_provenance_report(
                 engine,
@@ -565,6 +574,7 @@ class TestBuildReport:
                 market_implied_prob=0.6,
                 catalyst_type="commodity_cycle",
                 liquidity_state="",
+                as_of=datetime.now(timezone.utc),
             )
             report = build_provenance_report(
                 engine,

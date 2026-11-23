@@ -15,7 +15,7 @@ where everything was checked and neutral. These tests pin that:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -44,7 +44,7 @@ def _card(source: str, weight: float, calibrated: bool = True) -> SignalScorecar
         running_brier=0.1,
         running_ece=0.1,
         hit_rate=0.6,
-        last_updated=datetime.now(timezone.utc),
+        last_updated=datetime.now(timezone.utc) - timedelta(days=1),
         is_calibrated=calibrated,
         conviction_weight=weight,
     )
@@ -165,10 +165,19 @@ class TestBuildProvenanceReportCoverage:
             fragility_multiplier=1.0,
             disagreement_score=0.0,
             signals={},
+            as_of=datetime.now(timezone.utc),
         )
 
     def _patch_all_layers(self, stack, *, raise_layers: bool, scorecard):
-        """Make every DB-backed layer either succeed neutrally or raise."""
+        """Make every DB-backed layer either succeed neutrally or raise.
+
+        Every layer is treated as fenced to the decision clock: these tests
+        pin coverage mechanics, and in production only the fenced layers
+        (``CLOCK_FENCED_LAYERS``) count as present.
+        """
+        stack.enter_context(
+            patch.object(sp, "CLOCK_FENCED_LAYERS", frozenset(CONVICTION_LAYERS))
+        )
         def _fail(*_a, **_k):
             raise RuntimeError("layer unavailable")
 
