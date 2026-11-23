@@ -154,6 +154,8 @@ def _policy_line(pr: dict) -> str:
             text_ += f" (hike {odds['hike']:.0%}, hold {odds['hold']:.0%}, cut {odds['cut']:.0%})"
         elif nm.get("odds_withheld"):
             text_ += f" (odds withheld: {nm['odds_withheld']})"
+        avail = (nm.get("snapshot") or {}).get("availability") or "not recorded"
+        text_ += f"; Kalshi availability: {avail}, not exact point-in-time evidence"
     return head + text_
 
 

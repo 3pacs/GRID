@@ -214,6 +214,18 @@ def test_an_explicit_clock_that_cannot_be_trusted_makes_the_row_unusable(clock, 
     assert s.available_at == pulled + PP.LEGACY_SPAN          # never earlier than an older row would be
 
 
+def test_only_an_absent_clock_key_is_an_older_row_an_explicit_null_is_untrusted():
+    # Matched controls (Codex review 6023958626): the same valid ladder, the clock key absent versus null.
+    pulled = datetime(2025, 11, 14, 5, tzinfo=UTC)
+    payload = _payload("KXFED-26JAN", JAN, 4.3)
+    absent = PP.snapshot_from_row("KALSHI:KXFED-26JAN", date(2025, 11, 14), pulled, json.dumps(payload))
+    null = PP.snapshot_from_row("KALSHI:KXFED-26JAN", date(2025, 11, 14), pulled,
+                                json.dumps({**payload, "clock": None}))
+    assert absent.clock_basis == "transaction_start" and absent.ladder is not None and absent.reason is None
+    assert null.clock_basis == "clock_unreadable" and null.ladder is None and null.reason == "clock: clock is null"
+    assert null.available_at == absent.available_at == pulled + PP.LEGACY_SPAN
+
+
 def test_the_writer_and_reader_share_one_clock_rule():
     from ingestion.altdata import kalshi_markets as K
 
@@ -574,6 +586,7 @@ def test_the_desk_brief_shows_the_block_as_research_only(engine):
     line = next(x for x in lines if x.startswith("policy response"))
     assert "research only, decides nothing" in line and "stress_front_end_not_eased" in line and "hike" in line
     assert "through the 2025-11-13 close" in line
+    assert "Kalshi availability: proxy, not exact point-in-time evidence" in line      # beside the odds
     unknown, _ = _record_lines({"policy_response": {"rule": M.POLICY_RESPONSE_RULE, "status": "unknown",
                                                     "reason": "vix: stale"}})
     assert unknown[-1].endswith("unknown (vix: stale)")

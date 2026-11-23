@@ -39,9 +39,9 @@ among its unqualified read paths, and a historical comparison built on these row
   ``pull_timestamp`` is ``acquired_at``. The writer commits each row in its own transaction under lock and statement
   timeouts and rolls it back unless it is ready to commit within ``kalshi_markets.COMMIT_FENCE`` (30 s) of the
   response; the commit itself is not timestamped. Available ``COMMIT_GRACE`` (1 min) after the response;
-* a row whose payload carries a clock that cannot be trusted (another rule, an unreadable or missing instant,
-  ``requested_at`` after ``acquired_at``, or a ``pull_timestamp`` that is not ``acquired_at``) is unusable;
-* older rows carry only ``pull_timestamp``, the raw_series default, which is the start of one transaction that
+* a row whose payload carries a ``clock`` key that cannot be trusted (null, another rule, an unreadable or missing
+  instant, ``requested_at`` after ``acquired_at``, or a ``pull_timestamp`` that is not ``acquired_at``) is unusable;
+* older rows have no ``clock`` key and carry only ``pull_timestamp``, the raw_series default, which is the start of one transaction that
   spanned the whole pull, so their quotes arrived after it: acquired by, and available, ``LEGACY_SPAN`` later
   (pull_log 2026-05-27..11-23: 289 Kalshi runs, the longest 70 s).
 
@@ -281,13 +281,16 @@ def price_ladder(strikes: Sequence[dict[str, Any]], *, event: str | None = None,
 def row_clock(pulled_at: datetime, payload: Any) -> tuple[str, datetime, datetime, datetime, str | None]:
     """(basis, acquired_from, acquired_by, available_at, problem) for a row's stored pull clock and payload.
 
-    ``problem`` is set when the payload carries a clock that cannot be trusted; the row is then unusable and keeps
-    the conservative legacy bounds (basis ``clock_unreadable``).
+    Only a payload with no ``clock`` key is an older (transaction-start) row. ``problem`` is set when the payload
+    carries a clock key that cannot be trusted, an explicit null included; the row is then unusable and keeps the
+    conservative legacy bounds (basis ``clock_unreadable``).
     """
     legacy = (pulled_at, pulled_at + LEGACY_SPAN, pulled_at + LEGACY_SPAN)
-    clock = payload.get("clock") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or "clock" not in payload:
+        return ("transaction_start", *legacy, None)        # the writer before the rule wrote no clock key at all
+    clock = payload["clock"]
     if clock is None:
-        return ("transaction_start", *legacy, None)
+        return ("clock_unreadable", *legacy, "clock is null")
     if not isinstance(clock, dict) or clock.get("rule") != ACQUIRED_CLOCK_RULE:
         rule = clock.get("rule") if isinstance(clock, dict) else clock
         return ("clock_unreadable", *legacy, f"unrecognised clock {rule!r}")

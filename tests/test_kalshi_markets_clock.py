@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import Column, Date, DateTime, Float, Integer, MetaData, String, Table, Text, create_engine, text
 
 from ingestion.altdata import kalshi_markets as K
+from ingestion.smart_scheduler import _classify_outcome
 from intelligence.regime import market_state as M
 from intelligence.regime import policy_path as PP
 
@@ -167,12 +168,15 @@ def test_a_response_after_utc_midnight_is_dated_by_its_own_day(engine, monkeypat
 
 def test_a_row_not_ready_to_commit_within_the_fence_is_rolled_back(engine, monkeypatch):
     out = _run(engine, monkeypatch, stall=K.COMMIT_FENCE + timedelta(seconds=1))
-    assert out["status"] == "SUCCESS" and out["rows_inserted"] == 0 and out["late_rolled_back"] == 1
+    assert out["status"] == "FAILED" and out["rows_inserted"] == 0 and out["late_rolled_back"] == 1
+    assert "rolled back" in out["error"]
+    assert _classify_outcome([out])[0] == "FAILED"               # the scheduler never reads it as coverage
     with engine.connect() as c:
         assert c.execute(text("SELECT count(*) FROM raw_series")).scalar() == 0
     assert _kxfed(engine, RESPONSE + timedelta(hours=2)) == []
     out = _run(engine, monkeypatch, stall=K.COMMIT_FENCE)          # at the fence it still commits
-    assert out["rows_inserted"] == 1 and out["late_rolled_back"] == 0
+    assert out["status"] == "SUCCESS" and out["rows_inserted"] == 1 and out["late_rolled_back"] == 0
+    assert _classify_outcome([out])[:2] == ("SUCCESS", 1)
     snaps = _kxfed(engine, RESPONSE + PP.COMMIT_GRACE)
     assert len(snaps) == 1 and snaps[0].available_at == RESPONSE + PP.COMMIT_GRACE
 
@@ -190,3 +194,53 @@ def test_a_stored_row_whose_clocks_disagree_is_unusable(engine, monkeypatch):
     snaps = _kxfed(engine, RESPONSE + timedelta(hours=1))
     assert len(snaps) == 1 and snaps[0].ladder is None and snaps[0].clock_basis == "clock_unreadable"
     assert "pull_timestamp is not clock.acquired_at" in snaps[0].reason
+
+
+def test_a_pull_with_one_event_rolled_back_is_partial(engine, monkeypatch):
+    clock = {"now": RUN, "inserts": 0}
+    monkeypatch.setattr(K, "_now", lambda: clock["now"])
+    puller = K.KalshiMarketsPuller(engine)
+    second = "KXFED-27JAN"
+    monkeypatch.setattr(puller, "_fetch_events", lambda series: [
+        {"event_ticker": EVENT, "series_ticker": "KXFED", "strike_date": "2026-12-09T19:00:00Z"},
+        {"event_ticker": second, "series_ticker": "KXFED", "strike_date": "2027-01-27T19:00:00Z"}]
+        if series == "KXFED" else [])
+
+    def fetch_markets(event):
+        clock["now"] = RESPONSE
+        return [dict(m) for m in MARKETS]
+
+    def exists(conn, **kw):
+        clock["inserts"] += 1
+        if clock["inserts"] == 2:                 # the second event's transaction stalls past the fence
+            clock["now"] = clock["now"] + K.COMMIT_FENCE + timedelta(seconds=1)
+        return _REAL_EXISTS(conn, **kw)
+
+    monkeypatch.setattr(puller, "_fetch_markets", fetch_markets)
+    monkeypatch.setattr(K, "_raw_series_success_exists", exists)
+    out = puller.pull_all()[0]
+    assert out["status"] == "PARTIAL" and out["rows_inserted"] == 1 and out["late_rolled_back"] == 1
+    assert _classify_outcome([out])[0] == "PARTIAL"
+    with engine.connect() as c:
+        assert [r[0] for r in c.execute(text("SELECT series_id FROM raw_series"))] == [f"KALSHI:{EVENT}"]
+
+
+@pytest.mark.parametrize("clock_key", ["absent", "null"])
+def test_a_stored_row_with_a_null_clock_never_prices(engine, clock_key):
+    # Matched controls through the record reader: the same old-writer row, its clock key absent versus null.
+    old = {"event_ticker": EVENT, "strike_date": "2026-12-09T19:00:00Z",
+           "all_strikes": [{"ticker": m["ticker"], "title": m["title"],
+                            "yes_bid": 0.0 if m["yes_bid_dollars"] in (None, "abc") else float(m["yes_bid_dollars"]),
+                            "yes_ask": float(m["yes_ask_dollars"])} for m in MARKETS]}
+    if clock_key == "null":
+        old["clock"] = None
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, "
+                       "pull_status) VALUES (:s, 3, :d, :ts, 0.93, :p, 'SUCCESS')"),
+                  {"s": f"KALSHI:{EVENT}", "d": RUN.date(), "ts": RUN, "p": json.dumps(old)})
+    snaps = _kxfed(engine, RUN + PP.LEGACY_SPAN)
+    assert len(snaps) == 1
+    if clock_key == "absent":
+        assert snaps[0].clock_basis == "transaction_start" and snaps[0].ladder is not None
+    else:
+        assert snaps[0].clock_basis == "clock_unreadable" and snaps[0].ladder is None

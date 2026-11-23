@@ -372,6 +372,11 @@ class KalshiMarketsPuller(BasePuller):
             result["rows_inserted"] = inserted
             result["late_rolled_back"] = late
             result["events_found"] = total_events
+            if late:
+                # A rolled-back event has no row for the day: the pull is incomplete, never SUCCESS coverage.
+                result["status"] = "PARTIAL" if inserted else "FAILED"
+                result["error"] = (f"{late} event(s) rolled back, not ready to commit within "
+                                   f"{COMMIT_FENCE.total_seconds():.0f} s of the response")
             log.info(
                 "Kalshi: {s} series, {e} events, {i} rows inserted, {n} rolled back late",
                 s=result["series_checked"], e=total_events, i=inserted, n=late,
