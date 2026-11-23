@@ -238,21 +238,43 @@ reports the count (`rows_with_a_blank_price`, `price_files_with_a_blank_price`).
 volume, dividend, split factor or date is still refused. The store stayed unbound until this change had
 been reviewed.
 
-**The condition (review of `addfd43f`).** The factory's valid-bar rule reads six of the eight prices:
-close, high, low, open, adjusted close and adjusted open. It does not read the adjusted high or the
-adjusted low. The first version of this change took a blank in any of the eight, so a row blank only in
+**The condition (review of `addfd43f`).** The factory's valid-bar rule then read six of the eight prices:
+close, high, low, open, adjusted close and adjusted open. It did not read the adjusted high or the
+adjusted low (it reads all eight since 2026-11-22, see below). The first version of this change took a
+blank in any of the eight, so a row blank only in
 the adjusted high or low would have been sealed and still ranked as a valid bar. Now at least one blank
 must be in a price the factory reads; a row blank only in the adjusted high or low is refused, by `fetch`,
 `bind-existing` and `build` alike. The rows on grid-svr are blank in the low and the adjusted low
 together, so they pass: a read-only dry run of this rule over all 9,576 files refused none and counted
-2,238 rows with a blank price in 10 files (2026-11-21, nothing written). If Tiingo ever serves the other kind, the pull stops there and the rule is decided
-then: the alternative is to make the factory read and require all eight, which is a change to the shared
-factory and belongs in its own PR.
+2,238 rows with a blank price in 10 files (2026-11-21, nothing written). If Tiingo ever serves the other
+kind, the pull stops there. The alternative, making the factory read and require all eight, was a change
+to the shared factory and went in its own PR (#1326, below).
 
 Tests cover each price on its own, at zero and at positive volume: a lone blank in each of the six takes
 the company out of the factory's universe that day, in `universe`, `universe_on` and `load_panel`, with
 the served row unchanged in the panel; a lone blank in the adjusted high or low is refused and nothing is
 bound, built or left behind.
+
+**The factory reads all eight prices since 2026-11-22 (PR #1326, merge `73765f34`).** A valid bar there
+now needs every one of the eight prices present, finite and positive, so a row blank only in the adjusted
+high or low is no longer a valid bar in the factory either. The factory also refuses, by name, a price
+file with a cell that is not a number or a row with the wrong number of cells. The rule and its checks are
+in `docs/reference/CROSS_SECTION_FACTORY.md`, "All eight prices".
+
+- This builder is unchanged (`analysis/smallcap_universe.py` is the file that bound and built the store).
+  It still refuses a row blank only in the adjusted high or low. That is now stricter than the factory
+  needs. It is left as it is: the sealed store holds no such row, so relaxing it would change nothing
+  there, and a comment in the builder still describes the six-price rule.
+- The sealed generation is unchanged and needs no rebuild: it is fixed by its files' hashes, not by the
+  factory's code. A run declares the run file's hash and the data's hashes; it does not declare a code
+  version.
+- `counts` was run again on the sealed generation with the deployed code (release tree at `49f5cafa`,
+  2026-11-22, read-only): at $2 and $1M and at $5 and $10M the numbers equal the earlier ones on the last
+  session of every year from 2009 to 2022.
+- From the factory PR's own count of this generation (made by its builder, not repeated here): the new
+  file check refuses none of the 9,471 price files; 1,208 bars in 35 files are invalid, and every one was
+  already invalid under the six-price rule. What changed for a run is that the adjusted closes on those
+  bars no longer reach the signals built from closes. 45 of them are in the discovery years.
 
 **The store is bound and built (2026-11-21, code at `7c998c7a`).** After that head was accepted in review:
 
@@ -324,10 +346,11 @@ scratch or real. Review accepted it as a file to register, not as permission to 
   call its `universe` and `seal_export`. No signal has been run on real small-cap data.
 - The review accepted the source code. It did not check the survey of the real store or this build, and a
   sealed generation is not permission to run anything on it.
-- The factory itself still counts a row blank only in the adjusted high or low as a valid bar. This
-  builder refuses such a row, so no generation it builds holds one, but a directory sealed some other way
-  could. Making the factory require all eight prices is a change to the shared factory, proposed as its own
-  PR and not started.
+- **The factory requires all eight prices (PR #1326, 2026-11-22).** A row blank only in the adjusted high
+  or low is not a valid bar there, in a generation this builder made or in a directory sealed some other
+  way. The builder's own rule and its comment were not changed (see above).
+- The price floor reads the prior session's close whether or not that session's bar was valid. Whether it
+  should require a valid prior bar is an open question raised in that PR. It is not decided and not built.
 - No sector source, so no within-sector ranking, sector gate or sector card for small caps yet.
 - The factory's default cost is 1 bp a side, set for index members. A small-cap run file must set its
   own figure. Owner decision, 2026-11-20: the first run file assumes 25 bp a side. That is a stand-in
