@@ -73,9 +73,8 @@ OPTIONAL_CHECKS: frozenset[str] = frozenset({
 # a recommendation. The persisted ``sanity_status`` is their forward record.
 # CROSS_ASSET is shadow until a separately approved validation look (its
 # thresholds and its role) says it should veto: Anik's decision of
-# 2026-11-23 on Codex review 6030559940. Before it leaves this set, a
-# date-only reconstruction (``basis: date_only_reconstruction``) must still
-# never veto (tests/test_options_sanity_momentum_pg.py has a tripwire).
+# 2026-11-23 on Codex review 6030559940. Separately, a date-only
+# reconstruction never vetoes from any check (``_vetoes``).
 SHADOW_CHECKS: frozenset[str] = frozenset({"CROSS_ASSET"})
 
 
@@ -160,8 +159,23 @@ class UnderlyingMomentum:
 DECISION_TIME_BASIS = "decision_time"
 #: ``basis`` of a result fenced only at the end of ``run_date`` (a replay that
 #: has no decision instant). It is a reconstruction and never a veto (Codex
-#: review 6030559940); see ``SHADOW_CHECKS``.
+#: reviews 6030559940 and 6030789774): see ``_vetoes``.
 DATE_ONLY_BASIS = "date_only_reconstruction"
+
+
+def _vetoes(name: str, entry: Any) -> bool:
+    """Whether sanity result ``entry`` of check ``name`` can reject a recommendation.
+
+    Shadow checks (``SHADOW_CHECKS``) never can, and neither can a date-only
+    reconstruction (``basis == DATE_ONLY_BASIS``) of a check that is not
+    required, whatever its shadow status. Its verdict is kept as computed
+    either way. Required checks always gate.
+    """
+    if name in REQUIRED_CHECKS:
+        return True
+    if name in SHADOW_CHECKS:
+        return False
+    return not (isinstance(entry, dict) and entry.get("basis") == DATE_ONLY_BASIS)
 
 
 def _as_utc(ts: datetime) -> datetime:
@@ -746,9 +760,10 @@ class OptionsRecommendation:
         """True only if every required sanity check PASSed and no gating check FAILed.
 
         SKIP is accepted only for checks explicitly listed in ``OPTIONAL_CHECKS``.
-        Checks in ``SHADOW_CHECKS`` are recorded, never gating: their verdict
-        does not count either way. An empty ``sanity_status`` or a
-        missing/SKIPped required check fails closed.
+        Checks in ``SHADOW_CHECKS`` and date-only reconstructions are recorded,
+        never gating (``_vetoes``): their verdict does not count either way.
+        An empty ``sanity_status`` or a missing/SKIPped required check fails
+        closed.
         """
         if not self.sanity_status:
             return False
@@ -757,7 +772,7 @@ class OptionsRecommendation:
             if not isinstance(entry, dict) or entry.get("status") != "PASS":
                 return False
         for name, entry in self.sanity_status.items():
-            if name in SHADOW_CHECKS:
+            if not _vetoes(name, entry):
                 continue
             if not isinstance(entry, dict):
                 return False
@@ -1260,9 +1275,9 @@ class OptionsRecommender:
         rec.sanity_status = sanity
 
         # Fail closed on any gating FAIL or on SKIP/absence of a required check.
-        # Shadow checks (SHADOW_CHECKS) never reject.
+        # Shadow checks and date-only reconstructions never reject (_vetoes).
         if not rec.all_sanity_passed:
-            gating = {k: v for k, v in sanity.items() if k not in SHADOW_CHECKS}
+            gating = {k: v for k, v in sanity.items() if _vetoes(k, v)}
             skipped_required = [
                 k for k, v in gating.items()
                 if isinstance(v, dict) and v.get("status") == "SKIP" and k not in OPTIONAL_CHECKS
@@ -1962,9 +1977,9 @@ class OptionsRecommender:
         decides now). Each result carries ``as_of`` (that instant) and
         ``basis``. A replay given only a past ``run_date`` has no decision
         instant: it reads to the end of that day in New York and is labelled
-        ``DATE_ONLY_BASIS``. Its verdict is kept as computed; it is never a
-        veto because CROSS_ASSET is in ``SHADOW_CHECKS`` (and must stay
-        non-vetoing for reconstructions if it ever leaves that set).
+        ``DATE_ONLY_BASIS``. Its verdict is kept as computed and it is never
+        a veto (``_vetoes``), independently of CROSS_ASSET being in
+        ``SHADOW_CHECKS``.
         """
         effective_run_date = run_date or date.today()
         decided_at = decision_time(run_date, decision_ts)

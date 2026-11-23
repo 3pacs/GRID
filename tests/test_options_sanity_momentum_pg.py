@@ -19,7 +19,8 @@ Codex review 6030559940 (#1400 at d63cd12e) asked for the decision instant
 rather than the end of the run date, and an intraday same-day fixture. A
 recommendation at 11:00 New York must not see that day's close pulled at
 17:05 or a regime written that afternoon; one after them must. A replay
-with only a date is a labelled reconstruction and keeps its real verdict.
+with only a date is a labelled reconstruction and keeps its real verdict;
+it never vetoes (``_vetoes``, tested in tests/test_options_recommender_pricing.py).
 
 CROSS_ASSET is a shadow check (Anik, 2026-11-23: "shadow until validated"):
 its verdict is recorded with ``"shadow": True`` and never rejects. The gate
@@ -341,19 +342,6 @@ def test_date_only_replay_is_a_labelled_reconstruction(pg):
     }
     put = _check(pg, "AAA", "PUT", RUN, None)
     assert (put["status"], put["basis"]) == ("PASS", "date_only_reconstruction")
-
-
-def test_tripwire_reconstructions_never_veto_because_cross_asset_is_shadow():
-    """Codex 6030559940: a date-only reconstruction is never a replayed veto.
-
-    That holds today because CROSS_ASSET is in SHADOW_CHECKS and never
-    rejects. Promoting it out of shadow (after an approved validation look)
-    must keep DATE_ONLY_BASIS results non-vetoing; update this test then.
-    """
-    from trading.options_recommender import OPTIONAL_CHECKS, REQUIRED_CHECKS, SHADOW_CHECKS
-
-    assert "CROSS_ASSET" in SHADOW_CHECKS
-    assert "CROSS_ASSET" not in REQUIRED_CHECKS | OPTIONAL_CHECKS
 
 
 def test_live_call_without_date_or_instant_decides_now():

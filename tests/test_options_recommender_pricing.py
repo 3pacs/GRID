@@ -618,6 +618,129 @@ def test_pipeline_log_counts_shadow_fail_separately(monkeypatch: pytest.MonkeyPa
     assert pipeline and pipeline[-1].strip().endswith("2 PASS, 2 SKIP, 0 FAIL, 1 shadow FAIL")
 
 
+def _without_cross_asset(rec: OptionsRecommendation) -> dict:
+    from dataclasses import asdict
+
+    out = asdict(rec)
+    out["sanity_status"] = {k: v for k, v in out["sanity_status"].items() if k != "CROSS_ASSET"}
+    return out
+
+
+@pytest.mark.parametrize("verdict", [
+    {"status": "FAIL", "reason": "Momentum (-9.00%) and regime both contradict CALL"},
+    {"status": "SKIP", "reason": "No momentum: no completed SPY close"},
+], ids=["FAIL", "SKIP"])
+def test_output_parity_build_recommendation_with_or_without_cross_asset_fail(
+    monkeypatch: pytest.MonkeyPatch, verdict,
+) -> None:
+    """Same inputs, CROSS_ASSET PASS vs FAIL/SKIP: the same recommendation is emitted (Codex 6030789774)."""
+    from datetime import datetime, timezone
+
+    decided = datetime(2026, 11, 18, 16, 0, tzinfo=timezone.utc)
+    built = {}
+    for label, ca in (("pass", {"status": "PASS", "reason": "aligned"}), ("other", verdict)):
+        rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=ca)
+        built[label] = (rec_engine._build_recommendation(_make_opp(direction="CALL", spot=100.0, score=8.5), gex, db,
+                                                         run_date=RUN_WED, decision_ts=decided),
+                        dict(rec_engine.last_rejection_counts))
+    (rec_pass, rej_pass), (rec_other, rej_other) = built["pass"], built["other"]
+    assert rec_pass is not None and rec_other is not None
+    assert _without_cross_asset(rec_pass) == _without_cross_asset(rec_other)
+    assert rej_pass == rej_other == {}
+    assert rec_other.sanity_status["CROSS_ASSET"] == {**verdict, "shadow": True}
+
+
+def _generate_with_cross_asset(monkeypatch: pytest.MonkeyPatch, verdict: dict, decided) -> tuple[list, dict, dict]:
+    """The rejection-counts fixture (AAA emits, BBB stale, CCC rejected) with a fixed CROSS_ASSET verdict."""
+    import sys
+    import discovery.options_scanner as scanner_mod
+    import physics.dealer_gamma as gex_mod
+
+    _freeze_date(monkeypatch, RUN_WED)
+    snapshots = [
+        _contract_row(ticker="AAA", strike=105.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.28),
+        _contract_row(ticker="BBB", strike=105.0, expiry=EXP_21D, snap_date=date(2026, 11, 10)),
+        _contract_row(ticker="CCC", strike=103.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.25),
+    ]
+    db = _FakeDb(_FakeConn(snapshots=snapshots))
+    rec_engine = OptionsRecommender(db)
+    _disable_llm(rec_engine, monkeypatch)
+    monkeypatch.setattr(rec_engine, "_persist_recommendations", lambda _db, recs: len(recs))
+    monkeypatch.setattr(rec_engine, "_sanity_cross_asset", lambda *_a, **_k: dict(verdict))
+    opps = [
+        _make_opp(ticker="AAA", direction="CALL", spot=100.0, score=8.5),
+        _make_opp(ticker="BBB", direction="CALL", spot=100.0, score=8.5),
+        _make_opp(ticker="CCC", direction="CALL", spot=100.0, score=2.0, confidence="LOW"),
+    ]
+    profiles = {"AAA": {"regime": "SHORT_GAMMA", "call_wall": 110.0},
+                "BBB": {"regime": "SHORT_GAMMA", "call_wall": 110.0},
+                "CCC": {"regime": "NEUTRAL", "call_wall": 104.0}}
+
+    class _FakeScanner:
+        def __init__(self, db_engine):
+            pass
+
+        def scan_all(self, tickers=None, min_score=0.0):
+            return opps
+
+    class _FakeGex:
+        def __init__(self, db_engine):
+            pass
+
+        def compute_gex_profile(self, ticker):
+            return profiles[ticker]
+
+    monkeypatch.setattr(scanner_mod, "OptionsScanner", _FakeScanner)
+    monkeypatch.setattr(gex_mod, "DealerGammaEngine", _FakeGex)
+    monkeypatch.setitem(sys.modules, "api.main", SimpleNamespace(broadcast_event=lambda *_a, **_k: None))
+    recs = rec_engine.generate_recommendations(engine=db, run_date=RUN_WED, decision_ts=decided)
+    return recs, dict(rec_engine.last_rejection_counts), dict(rec_engine.last_run_summary)
+
+
+def test_output_parity_generate_recommendations_with_or_without_cross_asset_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The emitted set, rejection counts and run summary do not depend on CROSS_ASSET's verdict."""
+    from datetime import datetime, timezone
+
+    decided = datetime(2026, 11, 18, 16, 0, tzinfo=timezone.utc)
+    recs_p, rej_p, sum_p = _generate_with_cross_asset(monkeypatch, {"status": "PASS", "reason": "aligned"}, decided)
+    recs_f, rej_f, sum_f = _generate_with_cross_asset(
+        monkeypatch, {"status": "FAIL", "reason": "both contradict CALL"}, decided)
+    assert [r.ticker for r in recs_p] == [r.ticker for r in recs_f] == ["AAA"]
+    assert [_without_cross_asset(r) for r in recs_p] == [_without_cross_asset(r) for r in recs_f]
+    assert rej_p == rej_f and sum(rej_f.values()) == 2
+    assert sum_p == sum_f
+    assert recs_f[0].sanity_status["CROSS_ASSET"] == {"status": "FAIL", "reason": "both contradict CALL", "shadow": True}
+
+
+def test_date_only_reconstruction_never_vetoes_even_outside_shadow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Codex 6030789774: a date-only reconstruction cannot produce a veto, independently of shadow.
+
+    Simulates CROSS_ASSET promoted out of SHADOW_CHECKS into OPTIONAL_CHECKS:
+    a FAIL fenced at a decision instant then rejects, a date-only one does not.
+    """
+    monkeypatch.setattr(recommender_mod, "SHADOW_CHECKS", frozenset())
+    monkeypatch.setattr(recommender_mod, "OPTIONAL_CHECKS", recommender_mod.OPTIONAL_CHECKS | {"CROSS_ASSET"})
+    live_fail = {"status": "FAIL", "reason": "contradict CALL", "basis": "decision_time"}
+    replay_fail = {"status": "FAIL", "reason": "contradict CALL", "basis": "date_only_reconstruction"}
+
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=live_fail)
+    assert rec_engine._build_recommendation(_make_opp(), gex, db) is None
+    assert rec_engine.last_rejection_counts == {"sanity_failed:CROSS_ASSET": 1}
+
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=replay_fail)
+    rec = rec_engine._build_recommendation(_make_opp(), gex, db)
+    assert rec is not None and rec_engine.last_rejection_counts == {}
+    assert rec.sanity_status["CROSS_ASSET"] == replay_fail  # the verdict is kept, not relabelled
+
+
+def test_required_checks_gate_even_when_marked_date_only() -> None:
+    assert recommender_mod._vetoes("DATA_QUALITY", {"status": "FAIL", "basis": "date_only_reconstruction"}) is True
+    assert recommender_mod._vetoes("CROSS_ASSET", {"status": "FAIL", "basis": "decision_time"}) is False  # shadow
+    assert recommender_mod._vetoes("DEALER_FLOW", {"status": "FAIL"}) is True
+
+
 # ── Defect 5: Data-quality SQL must filter by expiry with bound params ──────
 
 
