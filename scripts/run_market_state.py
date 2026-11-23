@@ -22,6 +22,10 @@ vintages (``--no-refresh`` is accepted and changes nothing; no flag turns a refr
 ``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is still the one
 this writer makes the next evening.
 
+Each decision record also carries a ``spells`` block (``intelligence/regime/spells.py``, #1309): every variable's
+current label spell and three named spells, derived from the stored labels of earlier sessions plus this record, and
+the transitions read at this session. A provisional record has none.
+
 Before computing, a real run fetches the FRED vintages published since the last stored one for the news indexes
 (``ingestion/fred_vintages.py``; ``--no-refresh`` skips it). First time: ``python -m ingestion.fred_vintages backfill``.
 """
@@ -116,7 +120,7 @@ def readiness(record: dict, target: date) -> dict:
 
 def code_receipt() -> dict:
     names = ("scripts/run_market_state.py", "intelligence/regime/market_state.py",
-             "intelligence/regime/baseline.py", "intelligence/regime/state_vector.py",
+             "intelligence/regime/baseline.py", "intelligence/regime/spells.py", "intelligence/regime/state_vector.py",
              "physics/dealer_gex_daily.py", "ingestion/market_calendar.py",
              "store/observations.py", "store/fred_vintages.py", "analysis/factory_session_calendar.py",
              "config/econ_release_dates.json")
@@ -151,7 +155,8 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         print("market-state: refusing empty or nontrading target sessions", file=sys.stderr)
         return 2
 
-    from intelligence.regime.market_state import compute_market_state, load_calendar, store_market_state
+    from intelligence.regime.market_state import RECORD_RULE, compute_market_state, load_calendar, store_market_state
+    from intelligence.regime.spells import SpellRow, load_rows, record_spells, spells_unavailable
 
     if engine is None:
         from db import get_engine
@@ -177,6 +182,15 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         refresh = [refresh_vintages(engine, s) for s in SERIES]
     written = held = 0
     code = code_receipt()
+    # Spells (#1309) read the stored labels once, then follow this run's own records, so a range or a dry run sees
+    # its earlier targets. A failed read leaves every record without spells, never unwritten.
+    spell_rows: dict[date, SpellRow] | None = {}
+    spell_error = ""
+    if pending:
+        try:
+            spell_rows = {r.as_of: r for r in load_rows(engine, through=max(pending))}
+        except Exception as exc:  # spells never sink the record
+            spell_rows, spell_error = None, f"error reading stored labels: {type(exc).__name__}"
     for t in pending:
         state = compute_market_state(engine, t, calendar=calendar)
         rec = state.to_dict()
@@ -189,9 +203,13 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             "dry_run": a.dry_run, "target_dealer_required": a.require_target_dealer,
             "execution_origin": "unverified", "code_sha256": code, "readiness": ready,
         }
-        outcome = {**ready, "written_this_run": False}
+        state.spells = (record_spells(spell_rows.values(), t, RECORD_RULE, state.to_dict())
+                        if spell_rows is not None else spells_unavailable(t, spell_error))
+        outcome = {**ready, "written_this_run": False, "spells_status": state.spells.get("status")}
         if a.dry_run:
             outcome["outcome"] = "dry_run"
+            if spell_rows is not None:
+                spell_rows[t] = SpellRow.from_record(t, RECORD_RULE, state.to_dict())
             outcome["would_hold"] = a.require_target_dealer and not ready["dealer_target_ready"]
             if a.json:
                 print(json.dumps(state.to_dict(), sort_keys=True, default=str))
@@ -204,11 +222,19 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             written += 1
             outcome["outcome"] = "replaced" if a.replace else "written"
             outcome["written_this_run"] = True
+            if spell_rows is not None:
+                spell_rows[t] = SpellRow.from_record(t, RECORD_RULE, state.to_dict())
         else:
             # A competing insert can win after our preflight. Never report our computed
             # metadata as the winner's stored provenance or overwrite that record.
             outcome = {"target_session": t.isoformat(), "outcome": "already_present_race",
                        "written_this_run": False, "forward_qualified": False}
+            if spell_rows is not None:  # later targets follow the winner's stored labels, not ours
+                spell_rows.pop(t, None)
+                try:
+                    spell_rows.update({r.as_of: r for r in load_rows(engine, through=t) if r.as_of == t})
+                except Exception as exc:  # spells never sink the record
+                    spell_rows, spell_error = None, f"error reading stored labels: {type(exc).__name__}"
         outcomes.append(outcome)
     if not a.dry_run:
         summary = {"job": "run_market_state", "run_id": run_id, "sessions": len(targets),

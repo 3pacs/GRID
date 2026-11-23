@@ -117,6 +117,47 @@ display only (owner's decision, bring-up plan rev 100).
   - The decision writer still refuses today and targets the prior session.
   - `tests/test_market_state_provisional_cutoff.py` holds the delayed-input test.
 
+## Spells and transitions (market-state-spells/1, #1309)
+
+Each label says how far a variable is from its normal today; a spell says how long it has been there, and a transition
+says when it changed. Both are derived from the labels already stored in `market_state_daily`, so a spell always agrees
+with them. Code: `intelligence/regime/spells.py`; tests `tests/test_market_state_spells.py`.
+
+| Part | Rule |
+|---|---|
+| Sessions | the pinned XNYS sessions (`xnys_sessions`). A stored row on a day that is not a session is ignored (2025-01-09 was backfilled); a session with no row is `missing_row` |
+| Eligible reading | label spells: `ok` only. Value spells: `ok` or `no_baseline` (the value is fresh, it only lacks a baseline). `stale`, `unavailable` and missing rows are never eligible |
+| Spell | consecutive eligible sessions with one label. An ineligible session neither starts nor ends one: inside a spell it is counted in `ineligible_sessions`, after its last eligible session in `trailing_ineligible_sessions` |
+| Transition | the first eligible session whose label differs from the previous eligible one: variable, from, to, date, observation date, value, z, status, `gap_sessions` (ineligible sessions it crossed) and the spell it ended |
+| Length | `spell_sessions` and distinct `observations` (a monthly reading repeats across about 21 sessions). A spell that starts at a variable's first eligible reading is `left_censored`: its length is a lower bound |
+| Named spells | `vix_above_vix3m` (VIX / VIX3M > 1), `spot_below_gamma_flip` (spot_vs_gamma_flip < 0), `hy_spread_above_normal` (HY label above or high); each is `on` or `off` |
+| Origin | `nightly` for a row the nightly writer stored (`writer_provenance.mode = daily`), `reconstruction` for every other row: the 2026-11-13 backfill (no provenance), ranges, explicit sessions, replacements, dry runs. Each transition names its row's origin; each spell counts its sessions by origin |
+
+- **Writer.** Each new decision record carries a `spells` block: every variable's spell, the named spells, the
+  transitions read at that session, the first session folded, missing sessions and ignored rows. The writer reads
+  the stored labels once per run, then follows its own records, so a range or a dry run sees its earlier targets. A
+  failed read is reported in the block (`status: unavailable`), and the record is still written. The block is
+  about 14 KB.
+- **The log.** The nightly run appends to it by storing each session's transitions in that session's record. Rows
+  stored before spells existed are folded on read. `scripts/market_state_spells.py` is read-only (a READ ONLY
+  transaction on Postgres):
+  - `--transitions [--from --to --name]` prints the whole log, one JSON object per line;
+  - `--as-of D` prints the block at D;
+  - `--check` compares every stored block with a fresh derivation and exits 1 on a difference. A later `--replace` of
+    an earlier session causes one.
+- **Not here.** A provisional record (#1312) carries no spells: at the close, the previous session's decision record
+  is not written yet, and a display-only row never advances a spell. There is no hysteresis either: a spell changes
+  exactly when the stored label does. Labels near a boundary flip often (DIX's 5-session change, 853 times since
+  2019; VIX, 328). Confirmation rules belong to #1307.
+- **First read of griddb** (2026-11-23, read-only):
+  - 1,981 rows from 2019-01-02 to 2026-11-19: 1,976 reconstruction, 5 nightly.
+  - Three sessions have no row: 2019-06-19, 2020-06-19 and 2021-06-18. The scheduler helpers closed them.
+  - One row is ignored: 2025-01-09.
+  - 5,112 transitions: 4,966 of labels and 146 of named spells. 12 of them cross an ineligible gap.
+  - Every eligible reading of the last 60 sessions (1,380) has its stored label as its spell state.
+  - On 2026-11-19, VIX had been `high` for 3 sessions and HY `high` for 15. `hy_spread_above_normal` had been on
+    for 38 sessions (since 2026-09-29) and `spot_below_gamma_flip` for 23.
+
 ## Variables (v1)
 
 | Group | Variable | Input | Window |
