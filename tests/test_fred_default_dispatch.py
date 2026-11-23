@@ -56,7 +56,7 @@ def test_default_bulk_dispatches_each_existing_identity_once_in_original_order()
     puller, calls, state = fixture_puller()
     result = puller.pull_all(start_date='2026-10-21', end_date='2026-10-28')
     assert [c[0] for c in calls] == expected_ids()
-    assert len(calls) == 95 and Counter(c[0] for c in calls)['RRPONTSYD'] == 1
+    assert len(calls) == 97 and Counter(c[0] for c in calls)['RRPONTSYD'] == 1
     assert [r['series_id'] for r in result] == expected_ids()
     assert all(c[1:] == ('2026-10-21', '2026-10-28') for c in calls)
     assert state.deadline is None and state.within_budget is None
@@ -78,7 +78,7 @@ def test_explicit_empty_list_does_not_expand_to_default_workload():
 def test_deadline_does_not_dispatch_or_reclassify_remaining_sources():
     puller, calls, _ = fixture_puller()
     result = puller.pull_all(should_continue=lambda: False)
-    assert calls == [] and len(result) == 95
+    assert calls == [] and len(result) == 97
     assert all(r['status'] == 'SKIPPED' and r['deadline'] for r in result)
 
 
@@ -90,7 +90,7 @@ def test_database_abort_still_stops_next_source_dispatch():
                 'aborted': True, 'errors': ['synthetic database abort']}
     puller.pull_series = aborted
     result = puller.pull_all()
-    assert len(calls) == 1 and len(result) == 95
+    assert len(calls) == 1 and len(result) == 97
     assert result[0]['status'] == 'FAILED'
     assert all(r['status'] == 'SKIPPED' and r['aborted'] for r in result[1:])
 
@@ -103,5 +103,5 @@ def test_partial_empty_window_outcome_is_not_promoted_to_success():
                 'errors': ['No data returned']}
     puller.pull_series = partial
     result = puller.pull_all()
-    assert len(calls) == 95
+    assert len(calls) == 97
     assert all(r['status'] == 'PARTIAL' and r['rows_inserted'] == 0 for r in result)
