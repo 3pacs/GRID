@@ -227,22 +227,12 @@ def test_a_later_vintage_of_the_same_filing_wins_and_receipt_picks_the_vintage(e
     assert older[(s.CIK_ALPHA, s.ROOT)].reported_value_usd == 260_000.0
 
 
-def test_a_restatement_replaces_the_original_filing(engine, monkeypatch):
-    """A verified 13F-HR/A RESTATEMENT replaces the original for its quarter.
-    EDGAR's submissions index carries no amendment type, so the writer
-    skips amendments it cannot verify; this test supplies the type through
-    the writer's own index hook and keeps everything else real."""
+def _index_with_amendment_type(monkeypatch, edgar):
+    """EDGAR's submissions index carries no amendment type, so the writer
+    skips amendments it cannot verify. Supply the index's claim (RESTATEMENT)
+    through the writer's own index hook; the cover page is still checked."""
     from ingestion.altdata import institutional_flows
 
-    edgar = s.FakeEdgar()
-    q1_report, q1_filed = s.quarter_dates(1)
-    q0_report, q0_filed = s.quarter_dates(0)
-    restated_filed = q0_filed + timedelta(days=3)
-    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {s.PEER_A_CUSIP: ("PA", 1_000, 10)}))
-    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {s.PEER_A_CUSIP: ("PA", 9_000, 90),
-                                                                  s.ROOT_CUSIP: ("ROOT", 40_000, 400)}))
-    edgar.add(s.CIK_ALPHA, s.Filing("A-0R", restated_filed, q0_report, {s.PEER_A_CUSIP: ("PA", 9_000, 90)},
-                                    form="13F-HR/A"))
     def typed(self, cik, filing_type="13F-HR", count=4):
         raw = []
         for f in edgar._visible(cik):
@@ -255,6 +245,23 @@ def test_a_restatement_replaces_the_original_filing(engine, monkeypatch):
         return institutional_flows._select_latest_filings_by_report_date(raw, count=count)
 
     monkeypatch.setattr(institutional_flows.InstitutionalFlowsPuller, "_fetch_13f_index", typed)
+
+
+def test_a_restatement_replaces_the_original_filing(engine, monkeypatch):
+    """A verified 13F-HR/A RESTATEMENT replaces the original for its quarter.
+    EDGAR's submissions index carries no amendment type, so the writer
+    skips amendments it cannot verify; this test supplies the type through
+    the writer's own index hook and keeps everything else real."""
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    restated_filed = q0_filed + timedelta(days=3)
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {s.PEER_A_CUSIP: ("PA", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {s.PEER_A_CUSIP: ("PA", 9_000, 90),
+                                                                  s.ROOT_CUSIP: ("ROOT", 40_000, 400)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0R", restated_filed, q0_report, {s.PEER_A_CUSIP: ("PA", 9_000, 90)},
+                                    form="13F-HR/A"))
+    _index_with_amendment_type(monkeypatch, edgar)
     filers = {s.CIK_ALPHA: s.ALPHA}
     edgar.today = q0_filed
     s.run_writer(engine, monkeypatch, edgar, filers)
@@ -267,7 +274,7 @@ def test_a_restatement_replaces_the_original_filing(engine, monkeypatch):
     after = h13f.read_13f_holdings_snapshot(engine)
     assert (s.CIK_ALPHA, s.ROOT) not in _by_key(after)
     assert _by_key(after)[(s.CIK_ALPHA, s.PEER_A)].filing_accession == "A-0R"
-    assert after.counts["superseded_vintages"] >= 1
+    assert after.counts["superseded_filing"] >= 1
 
 
 def _insert_row(engine, series_id, obs_date, payload, *, received=None):
@@ -322,7 +329,7 @@ def test_a_manager_whose_latest_filing_is_stale_is_left_out(engine, monkeypatch)
 
     snap = h13f.read_13f_holdings_snapshot(engine)
     assert snap.holdings == ()
-    assert snap.counts["stale_manager_filing"] == 1
+    assert snap.counts["managers_stale_filing"] == 1
 
 
 def test_the_shared_mapping_and_its_fallback_are_used(engine, monkeypatch):
@@ -540,3 +547,229 @@ def test_fund_concentration_narrative_claims_no_direction(monkeypatch):
     for word in ("selling pressure", "buying pressure", "holds significant", "redemption"):
         assert word not in narrative
     assert "says nothing about buying or selling" in narrative
+
+
+# ── Codex HOLD 6016240483: negative controls, real writer -> served graph ──
+
+def _served_layer9(companies):
+    """Layer 9 of the served deep-graph route, caches cleared first."""
+    h13f.clear_snapshot_cache()
+    companies._deep_graph_cache.clear()
+    response = json.loads(json.dumps(companies.get_deep_graph(ticker=s.ROOT, depth=10, _token="t")))
+    return next(layer for layer in response["drill"]["layers"] if layer["depth"] == 9)
+
+
+def _receipt(engine, accession):
+    rows = [p for sid, p in s.series_rows(engine, "13F-FILING:%") if sid.endswith(f":{accession}")]
+    assert rows, f"no receipt for {accession}"
+    return rows[-1]
+
+
+def _change_rows(engine, filing_date):
+    return [(sid, p) for sid, p in s.series_rows(engine, "13F:%") if p.get("filing_date") == filing_date.isoformat()]
+
+
+def test_a_no_delta_restatement_withdraws_the_original_through_the_served_graph(engine, monkeypatch, served):
+    """Codex's case: Q1 lists Y; Q2's original adds X; Q2's restatement goes
+    back to only Y, unchanged, so comparing it emits no change row. Its
+    receipt still names it the quarter's filing, so X is no longer shown."""
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    restated_filed = q0_filed + timedelta(days=3)
+    y_unchanged = {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, dict(y_unchanged)))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0R", restated_filed, q0_report, dict(y_unchanged), form="13F-HR/A"))
+    _index_with_amendment_type(monkeypatch, edgar)
+    s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+
+    edgar.today = q0_filed
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    before = _served_layer9(served)
+    assert [a["label"] for a in before["actors"]] == [s.ALPHA]
+    assert s.ROOT in before["actors"][0]["shared_tickers"]
+
+    edgar.today = date.today()
+    results = s.run_writer(engine, monkeypatch, edgar, filers)
+    after = _served_layer9(served)
+    assert after["actors"] == [] and after["connections"] == []  # X is no longer claimed
+
+    assert results[0]["status"] == "SUCCESS" and results[0]["changes_detected"] == 0
+    assert _change_rows(engine, restated_filed) == []
+    receipt = _receipt(engine, "A-0R")
+    assert receipt["comparison_status"] == "compared" and receipt["changes_detected"] == 0
+    assert receipt["curr_snapshot"]["status"] == "complete" and receipt["replaces_accession"] == "A-0"
+    assert after["holdings_observation"]["excluded"]["superseded_filing"] == 2
+
+
+_DEFECT_STATUS = {
+    "missing": "missing_infotable",
+    "malformed": "unparseable_infotable",
+    "truncated": "entry_count_mismatch",
+    "cover_missing": "missing_cover_page",
+    "cover_malformed": "unparseable_cover_page",
+}
+
+
+def _defective(filing: s.Filing, defect: str) -> s.Filing:
+    if defect.startswith("cover_"):
+        filing.cover = defect.split("_", 1)[1]
+    else:
+        filing.infotable = defect
+    return filing
+
+
+@pytest.mark.parametrize("defect", list(_DEFECT_STATUS))
+def test_an_unreadable_current_filing_closes_nothing_and_claims_nothing(engine, monkeypatch, served, defect):
+    """Alpha's Q-1 holdings are verified. Q0's filing cannot be read in full:
+    no CLOSED row is written (an unreadable table is not an empty one), the
+    pair is withheld with a receipt naming why, and Q-1's holdings are not
+    claimed as current."""
+    edgar = s.FakeEdgar()
+    dates = {q: s.quarter_dates(q) for q in range(3)}
+    held = {s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}
+    edgar.add(s.CIK_ALPHA, s.Filing("A-2", dates[2][1], dates[2][0], {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", dates[1][1], dates[1][0], dict(held)))
+    edgar.add(s.CIK_ALPHA, _defective(s.Filing("A-0", dates[0][1], dates[0][0], dict(held)), defect))
+    s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+
+    edgar.today = dates[1][1]
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    assert [a["label"] for a in _served_layer9(served)["actors"]] == [s.ALPHA]
+
+    edgar.today = date.today()
+    results = s.run_writer(engine, monkeypatch, edgar, filers)
+    assert not [sid for sid, _p in s.series_rows(engine, "13F:%") if sid.endswith(":CLOSED")]  # no false CLOSED
+    assert _change_rows(engine, dates[0][1]) == []
+    assert results[0]["status"] == "QUARANTINED" and results[0]["curr_snapshot"] == _DEFECT_STATUS[defect]
+    receipt = _receipt(engine, "A-0")
+    assert receipt["comparison_status"] == "withheld_incomplete"
+    assert receipt["curr_snapshot"]["status"] == _DEFECT_STATUS[defect]
+    assert receipt["prev_snapshot"]["status"] == "complete"
+
+    snap = h13f.read_13f_holdings_snapshot(engine)
+    assert snap.holdings == () and snap.counts["managers_latest_filing_unverified"] == 1
+    layer9 = _served_layer9(served)
+    assert layer9["actors"] == []
+    assert layer9["holdings_observation"]["excluded"]["managers_latest_filing_unverified"] == 1
+
+
+@pytest.mark.parametrize("defect", list(_DEFECT_STATUS))
+def test_an_unreadable_prior_filing_opens_nothing_and_claims_nothing(engine, monkeypatch, served, defect):
+    """The prior filing cannot be read in full: no NEW row is written for the
+    current filing's holdings, and nothing is shown."""
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    edgar.add(s.CIK_ALPHA, _defective(s.Filing("A-1", q1_filed, q1_report, {
+        s.PEER_B_CUSIP: ("PEER B INC", 3_000, 30), s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}), defect))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    s.seed_upstream_layers(engine, s.ROOT, [s.PEER_A, s.PEER_B])
+
+    results = s.run_writer(engine, monkeypatch, edgar, {s.CIK_ALPHA: s.ALPHA})
+    assert s.series_rows(engine, "13F:%") == []  # no false NEW (or anything else)
+    assert results[0]["status"] == "QUARANTINED" and results[0]["prev_snapshot"] == _DEFECT_STATUS[defect]
+    receipt = _receipt(engine, "A-0")
+    assert receipt["comparison_status"] == "withheld_incomplete"
+    assert receipt["prev_snapshot"]["status"] == _DEFECT_STATUS[defect]
+
+    snap = h13f.read_13f_holdings_snapshot(engine)
+    assert snap.holdings == () and snap.counts["managers_latest_filing_unverified"] == 1
+    assert _served_layer9(served)["actors"] == []
+
+
+def test_a_verified_empty_filing_closes_every_position(engine, monkeypatch, served):
+    """A cover page counting zero entries, with no information table, is a
+    verified empty snapshot: the CLOSED rows are real and nothing is held."""
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {}, infotable="missing"))
+
+    results = s.run_writer(engine, monkeypatch, edgar, {s.CIK_ALPHA: s.ALPHA})
+    assert results[0]["status"] == "SUCCESS"
+    assert sorted(sid.rsplit(":", 1)[1] for sid, _p in _change_rows(engine, q0_filed)) == ["CLOSED", "CLOSED"]
+    receipt = _receipt(engine, "A-0")
+    assert receipt["comparison_status"] == "compared" and receipt["curr_snapshot"]["status"] == "verified_empty"
+
+    snap = h13f.read_13f_holdings_snapshot(engine)
+    assert snap.holdings == () and snap.counts["closed"] == 2
+    assert "managers_latest_filing_unverified" not in snap.counts
+
+
+def test_an_amendment_the_cover_page_calls_new_holdings_is_withheld(engine, monkeypatch):
+    """The index claims a restatement but the cover page says NEW HOLDINGS
+    (a partial list): comparing it would close every omitted position."""
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {s.PEER_A_CUSIP: ("PA", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PA", 9_000, 90), s.ROOT_CUSIP: ("ROOT", 40_000, 400)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0N", q0_filed + timedelta(days=2), q0_report,
+                                    {s.PEER_B_CUSIP: ("PB", 5_000, 50)}, form="13F-HR/A",
+                                    amendment_type="NEW HOLDINGS"))
+    _index_with_amendment_type(monkeypatch, edgar)
+
+    results = s.run_writer(engine, monkeypatch, edgar, {s.CIK_ALPHA: s.ALPHA})
+    assert results[0]["curr_snapshot"] == "amendment_not_verified_restatement"
+    assert s.series_rows(engine, "13F:%") == []
+    assert h13f.read_13f_holdings_snapshot(engine).holdings == ()
+
+
+def test_change_rows_without_a_filing_receipt_are_withheld(engine, monkeypatch):
+    """Rows the writer stored before it wrote receipts carry no evidence that
+    their filing was read in full or still stands: none is shown."""
+    s.run_writer(engine, monkeypatch, s.two_quarter_scenario())
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM raw_series WHERE series_id LIKE '13F-FILING:%'"))
+    snap = h13f.read_13f_holdings_snapshot(engine)
+    assert snap.holdings == () and snap.counts["no_filing_receipt"] == 6
+
+
+def test_a_restated_prior_filing_retires_rows_from_the_old_comparison(engine, monkeypatch):
+    """Q0 was first compared against Q-1's original, then against Q-1's
+    restatement. A row only the old comparison produced (ROOT NEW: the
+    restatement already listed ROOT) is no longer shown."""
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, {s.PEER_A_CUSIP: ("PA", 1_000, 10)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PA", 9_000, 90), s.ROOT_CUSIP: ("ROOT", 40_000, 400)}))
+    _index_with_amendment_type(monkeypatch, edgar)
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    s.set_receipt(engine, q0_filed, datetime.combine(q0_filed, datetime.min.time()).replace(hour=6))
+    assert (s.CIK_ALPHA, s.ROOT) in _by_key(h13f.read_13f_holdings_snapshot(engine))
+
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1R", q0_filed + timedelta(days=1), q1_report, {
+        s.PEER_A_CUSIP: ("PA", 1_000, 10), s.ROOT_CUSIP: ("ROOT", 40_000, 400)}, form="13F-HR/A"))
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    assert _receipt(engine, "A-0")["prev_filing_accession"] == "A-1R"
+
+    snap = h13f.read_13f_holdings_snapshot(engine)
+    assert set(_by_key(snap)) == {(s.CIK_ALPHA, s.PEER_A)}
+    assert snap.counts["stale_comparison"] == 1
+
+
+def test_the_writer_reads_every_information_table_namespace():
+    from ingestion.altdata import institutional_flows
+
+    entry = ("<infoTable><nameOfIssuer>X CORP</nameOfIssuer><cusip>FXROOT001</cusip><value>1000</value>"
+             "<shrsOrPrnAmt><sshPrnamt>10</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></shrsOrPrnAmt></infoTable>")
+    for ns in (s.INFOTABLE_NS, "http://www.sec.gov/document/thirteenf", ""):
+        xmlns = f' xmlns="{ns}"' if ns else ""
+        holdings, entries, total = institutional_flows._parse_13f_infotable(
+            f"<informationTable{xmlns}>{entry}{entry}</informationTable>".encode(), 1)
+        assert (len(holdings), entries, total) == (2, 2, 2_000.0), ns
+        assert holdings[0]["value_usd"] == 1_000 and holdings[0]["cusip"] == "FXROOT001"
+    with pytest.raises(institutional_flows.ET.ParseError):
+        institutional_flows._parse_13f_infotable(b"<informationTable><infoTable>", 1)

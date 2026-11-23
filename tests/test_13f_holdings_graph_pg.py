@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -159,3 +159,61 @@ def test_pg_shown_observation_is_absent_from_directional_readers(pg_engine, monk
     assert sentiment_scorer._score_flows(pg_engine, days=30).raw_value == pytest.approx(1.0)
     with pg_engine.connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM signal_sources")).scalar() == 0
+
+
+def _layer9_live(monkeypatch, engine):
+    companies = _route(monkeypatch, engine)
+    h13f.clear_snapshot_cache()
+    try:
+        response = json.loads(json.dumps(companies.get_deep_graph(ticker=s.ROOT, depth=10, _token="t")))
+    finally:
+        companies._deep_graph_cache.clear()
+    return next(layer for layer in response["drill"]["layers"] if layer["depth"] == 9)
+
+
+def test_pg_no_delta_restatement_and_unreadable_filing_are_negative_controls(pg_engine, monkeypatch):
+    """Codex HOLD 6016240483 on PostgreSQL: a no-delta restatement withdraws
+    the original's holdings, and an unreadable later filing closes nothing
+    and leaves nothing claimed, both through the served route."""
+    from ingestion.altdata import institutional_flows
+
+    edgar = s.FakeEdgar()
+    q1_report, q1_filed = s.quarter_dates(1)
+    q0_report, q0_filed = s.quarter_dates(0)
+    y_unchanged = {s.PEER_A_CUSIP: ("PEER A CORP", 1_000, 10)}
+    edgar.add(s.CIK_ALPHA, s.Filing("A-1", q1_filed, q1_report, dict(y_unchanged)))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0", q0_filed, q0_report, {
+        s.PEER_A_CUSIP: ("PEER A CORP", 9_000, 90), s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 40_000, 400)}))
+    edgar.add(s.CIK_ALPHA, s.Filing("A-0R", q0_filed + timedelta(days=3), q0_report, dict(y_unchanged),
+                                    form="13F-HR/A"))
+
+    def typed(self, cik, filing_type="13F-HR", count=4):
+        raw = [{"accession": f.accession, "filing_date": f.filing_date.isoformat(),
+                "report_date": f.report_date.isoformat(), "form": f.form,
+                "is_amendment": f.form.endswith("/A"),
+                **({"amendment_type": "RESTATEMENT"} if f.form.endswith("/A") else {})}
+               for f in edgar._visible(cik)]
+        return institutional_flows._select_latest_filings_by_report_date(raw, count=count)
+
+    monkeypatch.setattr(institutional_flows.InstitutionalFlowsPuller, "_fetch_13f_index", typed)
+    s.seed_upstream_layers(pg_engine, s.ROOT, [s.PEER_A, s.PEER_B])
+    filers = {s.CIK_ALPHA: s.ALPHA}
+
+    edgar.today = q0_filed
+    s.run_writer(pg_engine, monkeypatch, edgar, filers)
+    assert [a["label"] for a in _layer9_live(monkeypatch, pg_engine)["actors"]] == [s.ALPHA]
+    edgar.today = date.today()
+    s.run_writer(pg_engine, monkeypatch, edgar, filers)
+    after = _layer9_live(monkeypatch, pg_engine)
+    assert after["actors"] == [] and after["holdings_observation"]["excluded"]["superseded_filing"] == 2
+
+    # A later filing whose information table is missing: withheld, no CLOSED.
+    later = s.Filing("A-N", date.today() - timedelta(days=1), date.today() - timedelta(days=10),
+                     dict(y_unchanged), infotable="missing")
+    edgar.add(s.CIK_ALPHA, later)
+    results = s.run_writer(pg_engine, monkeypatch, edgar, filers)
+    assert results[0]["status"] == "QUARANTINED" and results[0]["curr_snapshot"] == "missing_infotable"
+    assert not [sid for sid, _p in s.series_rows(pg_engine, "13F:%") if sid.endswith(":CLOSED")]
+    final = _layer9_live(monkeypatch, pg_engine)
+    assert final["actors"] == []
+    assert final["holdings_observation"]["excluded"]["managers_latest_filing_unverified"] == 1

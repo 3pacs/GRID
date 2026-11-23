@@ -40,6 +40,11 @@ UNMAPPED_CUSIP = "FXUNMAP04"
 IDENTIFIERS = {ROOT_CUSIP: ROOT, PEER_A_CUSIP: PEER_A, PEER_B_CUSIP: PEER_B}
 
 
+# EDGAR's current namespaces (information table; 13F-HR cover page).
+INFOTABLE_NS = "http://www.sec.gov/edgar/document/thirteenf/informationtable"
+COVER_NS = "http://www.sec.gov/edgar/thirteenffiler"
+
+
 @dataclass
 class Filing:
     accession: str
@@ -48,6 +53,11 @@ class Filing:
     # cusip -> (issuer name, value in whole USD, shares)
     holdings: dict[str, tuple[str, int, int]] = field(default_factory=dict)
     form: str = "13F-HR"
+    # Negative-control knobs: "ok" | "missing" | "malformed" | "truncated" (infotable)
+    infotable: str = "ok"
+    cover: str = "ok"  # "ok" | "missing" | "malformed"
+    amendment_type: str = "RESTATEMENT"  # what the cover page says for a /A form
+    cover_entry_total: int | None = None  # override the cover's tableEntryTotal
 
 
 class _Resp:
@@ -92,20 +102,54 @@ class FakeEdgar:
                 "accessionNumber": [f.accession for f in rows],
                 "filingDate": [f.filing_date.isoformat() for f in rows],
                 "reportDate": [f.report_date.isoformat() for f in rows],
-                "primaryDocument": ["primary_doc.xml" for _ in rows],
+                "primaryDocument": ["xslForm13F_X02/primary_doc.xml" for _ in rows],
             }}})
         for cik, rows in self.filings.items():
             for f in rows:
                 base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{f.accession.replace('-', '')}"
                 if url == f"{base}/index.json":
-                    return _Resp(payload={"directory": {"item": [{"name": "infotable.xml"}]}})
-                if url == f"{base}/infotable.xml":
-                    return _Resp(content=_infotable_xml(f.holdings))
+                    items = [{"name": f"{f.accession}-index.html"}]
+                    if f.cover != "missing":
+                        items.append({"name": "primary_doc.xml"})
+                    if f.infotable != "missing":
+                        items.append({"name": "infotable.xml"})
+                    return _Resp(payload={"directory": {"item": items}})
+                if url == f"{base}/primary_doc.xml" and f.cover != "missing":
+                    return _Resp(content=b"<edgarSubmission><headerData>" if f.cover == "malformed"
+                                 else _cover_xml(f))
+                if url == f"{base}/infotable.xml" and f.infotable != "missing":
+                    if f.infotable == "malformed":
+                        return _Resp(content=b"<informationTable><infoTable><cusip>X")
+                    listed = dict(list(f.holdings.items())[:-1]) if f.infotable == "truncated" else f.holdings
+                    return _Resp(content=_infotable_xml(listed))
         return _Resp(status=404)
 
 
+def _cover_date(d: date) -> str:
+    return d.strftime("%m-%d-%Y")
+
+
+def _cover_xml(f: Filing) -> bytes:
+    is_amendment = f.form.endswith("/A")
+    total = len(f.holdings) if f.cover_entry_total is None else f.cover_entry_total
+    amendment = (f"<amendmentInfo><amendmentType>{f.amendment_type}</amendmentType></amendmentInfo>"
+                 if is_amendment else "")
+    return (
+        f'<edgarSubmission xmlns="{COVER_NS}" xmlns:com="http://www.sec.gov/edgar/common">'
+        f"<headerData><submissionType>{f.form}</submissionType>"
+        f"<filerInfo><periodOfReport>{_cover_date(f.report_date)}</periodOfReport></filerInfo></headerData>"
+        f"<formData><coverPage><reportCalendarOrQuarter>{_cover_date(f.report_date)}</reportCalendarOrQuarter>"
+        f"<isAmendment>{'true' if is_amendment else 'false'}</isAmendment>{amendment}</coverPage>"
+        f"<summaryPage><otherIncludedManagersCount>0</otherIncludedManagersCount>"
+        f"<tableEntryTotal>{total}</tableEntryTotal>"
+        f"<tableValueTotal>{sum(v for _n, v, _s in f.holdings.values())}</tableValueTotal>"
+        f"<isConfidentialOmitted>false</isConfidentialOmitted></summaryPage></formData>"
+        "</edgarSubmission>"
+    ).encode()
+
+
 def _infotable_xml(holdings: dict[str, tuple[str, int, int]]) -> bytes:
-    parts = ["<informationTable>"]
+    parts = [f'<informationTable xmlns="{INFOTABLE_NS}">']
     for cusip, (name, value, shares) in holdings.items():
         parts.append(
             "<infoTable>"
@@ -260,9 +304,24 @@ def two_quarter_scenario() -> FakeEdgar:
 
 
 def set_receipt(engine: Engine, obs_date: date, received_at: datetime) -> int:
-    """Move every 13F row filed on ``obs_date`` to a known receipt instant."""
+    """Move every 13F change row and filing receipt filed on ``obs_date`` to a
+    known receipt instant. Returns the number of change rows moved."""
     with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE raw_series SET pull_timestamp = :ts WHERE series_id LIKE '13F-FILING:%' AND obs_date = :d"),
+            {"ts": received_at, "d": obs_date},
+        )
         return conn.execute(
             text("UPDATE raw_series SET pull_timestamp = :ts WHERE series_id LIKE '13F:%' AND obs_date = :d"),
             {"ts": received_at, "d": obs_date},
         ).rowcount
+
+
+def series_rows(engine: Engine, pattern: str) -> list[tuple[str, Any]]:
+    """``(series_id, payload)`` of every raw_series row matching ``pattern``."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT series_id, raw_payload FROM raw_series WHERE series_id LIKE :p ORDER BY id"),
+            {"p": pattern},
+        ).fetchall()
+    return [(r[0], r[1] if isinstance(r[1], dict) else json.loads(r[1])) for r in rows]

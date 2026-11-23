@@ -24,44 +24,61 @@ observation, never a buy, sell or flow. This module keeps to that:
 
 Source rows
 -----------
-``13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED}`` with ``obs_date`` = the
-SEC filing date of the current filing, carrying the #1369 labels:
-``measure = observed_filing_holdings_change_at_reference_prices``,
-``observation_kind`` (``filing_appearance`` / ``filing_holding_change`` /
-``filing_disappearance``, matching the action),
-``qualified_for_directional_flow = False``, ``filing_date``, ``report_date``,
-``prev_report_date``, ``filing_accession``, ``prev_filing_accession``,
-``curr_value_usd`` / ``curr_shares``, ``value_units = 'usd'`` and
-``value_multiplier``. Rows without those labels (the pre-#1369 writer stored
-no units, report date or labels, and its post-2023 values could be 1000x)
-are left out and counted, never repaired.
+Two series, both written by the 13F writer in one transaction per filing pair:
+
+* ``13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED}`` (``obs_date`` = the
+  current filing's SEC filing date) with the #1369 labels:
+  ``measure = observed_filing_holdings_change_at_reference_prices``,
+  ``observation_kind`` matching the action, ``qualified_for_directional_flow
+  = False``, ``filing_date``, ``report_date``, ``filing_accession``,
+  ``prev_filing_accession``, ``curr_value_usd`` / ``curr_shares``,
+  ``value_units = 'usd'`` and ``value_multiplier``.
+* ``13F-FILING:{cik}:{accession}``, the filing comparison receipt
+  (``measure = 13f_filing_comparison_receipt``): which accession was read for
+  the filer-quarter, which filing it was compared against, and whether both
+  sides were complete (the cover page's ``tableEntryTotal`` matched the
+  information table, an amendment was a verified RESTATEMENT). It is written
+  even when the comparison found no change, so it is the authority on which
+  filing stands for each quarter. ``withheld_incomplete`` receipts record a
+  pair the writer refused to compare.
+
+A change row counts only when its filing has a ``compared`` receipt, that
+filing is the quarter's winning filing, and the row came from the comparison
+the receipt records (same prior accession). Rows without receipts (the
+pre-receipt writer), without #1369 labels (the pre-#1369 writer stored no
+units, report date or labels; its post-2023 values could be 1000x), or
+claiming direction are left out and counted, never repaired.
 
 Point in time
 -------------
-* A row is visible only once filed (``obs_date`` = ``filing_date`` <= as-of)
-  and once received by GRID (``pull_timestamp`` <= the as-of instant; for an
-  explicit as-of date, the end of that UTC day).
+* A row or receipt is visible only once filed (``obs_date`` = filing date <=
+  as-of) and once received by GRID (``pull_timestamp`` <= the as-of instant;
+  for an explicit as-of date, the end of that UTC day).
 * Per ``(series_id, obs_date)`` the latest visible vintage wins (the same
-  rule as ``store/observations.py`` LATEST_AS_OF), then 13F-HR/A
-  restatements replace the filings they restate per filer-quarter
-  (``dollar_flows._resolve_13f_amendments``, reused, not copied).
+  rule as ``store/observations.py`` LATEST_AS_OF).
+* Per filer-quarter, the winning filing is the latest by (filing date,
+  amendment, accession) among the filings the receipts name, current or
+  prior side: the writer's own selection rule. A restatement therefore
+  replaces the original even when it changed nothing.
 * Per ``(manager, CUSIP)`` the observation with the latest report date wins.
   A CLOSED (``filing_disappearance``) ends the holding: it is never shown as
   held.
+* A manager whose latest filing has no ``compared`` receipt (unreadable or
+  withheld) shows nothing (``managers_latest_filing_unverified``): its last
+  verified filing cannot be claimed as current. A manager whose latest report
+  date is more than ``MAX_REPORT_AGE_DAYS`` old shows nothing
+  (``managers_stale_filing``).
 
 Holdings the latest filing did not mention
 ------------------------------------------
 The writer stores changes only: a position whose share count moved by 20 %
 or less between two filings leaves no row. A position last observed in an
-older filing is shown only when every filing pair from that filing to the
-manager's latest filing was compared by the writer (each pair is evidenced
-by a row whose ``prev_report_date`` / ``prev_filing_accession`` names the
-winning filing of the quarter before). Then no CLOSED was missed, and the
-position is shown "held through" the manager's latest report date, valued
-at its own (older) report date. Any gap breaks the chain and the position
-is left out and counted (``unverified_continuity``). A manager whose latest
-observed report date is more than ``MAX_REPORT_AGE_DAYS`` before the as-of
-is left out (``stale_manager_filing``).
+older filing is shown only when the receipts chain every filing from that
+one to the manager's latest: each receipt was ``compared`` and names, as its
+prior side, the winning filing of the quarter before. Then no CLOSED was
+missed, and the position is shown "held through" the manager's latest report
+date, valued at its own (older) report date. Any gap breaks the chain and the
+position is left out and counted (``unverified_continuity``).
 
 Ticker mapping
 --------------
@@ -76,12 +93,15 @@ under the old symbol: it then simply does not match the graph's ticker.
 Known limits (also in the PR body)
 ----------------------------------
 * Coverage is change-driven: a position held unchanged since before the
-  writer started (or before #1369 labelled rows) is never observed.
+  writer started writing receipts is never observed.
   ``institutional_holdings`` (``sec_13f_live``) has full snapshots, but it
   maps tickers at write time with the undated FTD map and upserts in place
   (no vintages); reading it instead is a separate decision.
 * Only ``LOOKBACK_DAYS`` of filings are read, so a chain cannot reach a
   position last observed before that.
+* A cover page with confidential treatment (``isConfidentialOmitted``) still
+  counts as complete for the entries it lists; an omitted position reads as
+  CLOSED, which hides it rather than inventing one.
 """
 
 from __future__ import annotations
@@ -103,16 +123,14 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-# One mapping and one amendment rule for every 13F reader: reuse dollar_flows'
-# helpers instead of copying them (they are module-private there).
+# One CUSIP mapping for every 13F reader: reuse dollar_flows' helpers instead
+# of copying them (they are module-private there).
 from intelligence.dollar_flows import (
     _UNSET,
     _as_date,
     _coerce_ts,
-    _extract_13f_vintage_meta,
     _parse_13f_shares,
     _parse_positive_float,
-    _resolve_13f_amendments,
     _resolve_13f_ticker,
     _table_exists,
     _ts_utc,
@@ -122,6 +140,9 @@ from intelligence.dollar_flows import (
 # literals rather than imported so this read path does not import the puller
 # (requests, yfinance, EDGAR config); tests pin them equal.
 WRITER_OBSERVATION_MEASURE = "observed_filing_holdings_change_at_reference_prices"
+WRITER_RECEIPT_MEASURE = "13f_filing_comparison_receipt"
+WRITER_RECEIPT_PREFIX = "13F-FILING"
+WRITER_COMPLETE_SNAPSHOTS: frozenset[str] = frozenset({"complete", "verified_empty"})
 _KIND_FOR_ACTION: Mapping[str, str] = MappingProxyType({
     "NEW": "filing_appearance",
     "INCREASED": "filing_holding_change",
@@ -322,41 +343,97 @@ def _held_value(payload: dict[str, Any], filing_date: date) -> tuple[float, int 
     return value, shares
 
 
-def _verified_chain(rows_at: dict[date, list[dict[str, Any]]]) -> set[date]:
-    """Report dates linked to the manager's latest one by compared filing pairs.
+_Rank = tuple[date, int, str]
 
-    The latest report date is always in the chain. An older report date P is
-    added when the rows of the next filing up the chain all name P (and the
-    accession of P's winning filing) as the filing they were compared
-    against. Ambiguity or a gap stops the walk.
+
+def _filing_rank(filing_date: date, is_amendment: Any, accession: str) -> _Rank:
+    """The writer's own selection rule (``_select_latest_filings_by_report_date``)."""
+    return (filing_date, 1 if is_amendment else 0, accession)
+
+
+def _receipt_check(
+    cik: str, accession: str, obs_date: date, received_at: datetime, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """A validated filing comparison receipt, or ``None``.
+
+    The prior filing may have been filed after the current one (a later
+    restatement of the prior quarter), but not after GRID received this
+    receipt vintage.
     """
-    if not rows_at:
-        return set()
-    current = max(rows_at)
-    chain = {current}
+    if payload.get("measure") != WRITER_RECEIPT_MEASURE:
+        return None
+    if payload.get("qualified_for_directional_flow") is not False:
+        return None
+    if str(payload.get("manager_cik") or "").strip() != cik:
+        return None
+    if str(payload.get("filing_accession") or "").strip() != accession:
+        return None
+    filing_date = _strict_date(payload.get("filing_date"))
+    report_date = _strict_date(payload.get("report_date"))
+    prev_filing_date = _strict_date(payload.get("prev_filing_date"))
+    prev_report_date = _strict_date(payload.get("prev_report_date"))
+    prev_acc = str(payload.get("prev_filing_accession") or "").strip()
+    if filing_date is None or filing_date != obs_date or report_date is None or report_date > filing_date:
+        return None
+    if not prev_acc or prev_acc == accession or prev_filing_date is None or prev_report_date is None:
+        return None
+    if prev_filing_date > _ts_utc(received_at).date() or prev_report_date >= report_date:
+        return None
+    status = payload.get("comparison_status")
+    if status not in ("compared", "withheld_incomplete"):
+        return None
+    curr_snap = payload.get("curr_snapshot") if isinstance(payload.get("curr_snapshot"), dict) else {}
+    prev_snap = payload.get("prev_snapshot") if isinstance(payload.get("prev_snapshot"), dict) else {}
+    compared = (
+        status == "compared"
+        and curr_snap.get("status") in WRITER_COMPLETE_SNAPSHOTS
+        and prev_snap.get("status") in WRITER_COMPLETE_SNAPSHOTS
+        and str(curr_snap.get("accession") or "") == accession
+        and str(prev_snap.get("accession") or "") == prev_acc
+    )
+    if status == "compared" and not compared:
+        return None
+    return {
+        "accession": accession,
+        "filing_date": filing_date,
+        "report_date": report_date,
+        "rank": _filing_rank(filing_date, payload.get("is_amendment"), accession),
+        "prev_accession": prev_acc,
+        "prev_report_date": prev_report_date,
+        "prev_rank": _filing_rank(prev_filing_date, payload.get("prev_is_amendment"), prev_acc),
+        "compared": compared,
+    }
+
+
+def _verified_chain(
+    cik: str,
+    latest_rd: date,
+    authority: dict[tuple[str, date], _Rank],
+    receipts: dict[tuple[str, str], dict[str, Any]],
+) -> set[date]:
+    """Report dates linked to the manager's latest one by compared receipts.
+
+    The latest report date is in the chain when its winning filing has a
+    ``compared`` receipt. An older report date P joins when that receipt's
+    prior side is P's winning filing and P's filing has its own ``compared``
+    receipt; the walk continues from P. Anything else stops it.
+    """
+    chain: set[date] = set()
+    current = latest_rd
     while True:
-        links = {
-            (
-                _strict_date(r["payload"].get("prev_report_date")),
-                str(r["payload"].get("prev_filing_accession") or "").strip(),
-            )
-            for r in rows_at[current]
-        }
-        if len(links) != 1:
+        rec = receipts.get((cik, authority[(cik, current)][2]))
+        if rec is None or not rec["compared"]:
             return chain
-        prev_rd, prev_acc = next(iter(links))
-        if prev_rd is None or not prev_acc or prev_rd >= current or prev_rd not in rows_at:
+        chain.add(current)
+        prev_rd, prev_acc = rec["prev_report_date"], rec["prev_accession"]
+        if prev_rd >= current or authority.get((cik, prev_rd), (None, None, None))[2] != prev_acc:
             return chain
-        prev_accs = {r["meta"]["filing_accession"] for r in rows_at[prev_rd]}
-        if prev_accs != {prev_acc}:
-            return chain
-        chain.add(prev_rd)
         current = prev_rd
 
 
-def _position_rank(c: dict[str, Any]) -> tuple[date, date, datetime]:
-    """Latest report date wins, then the later filing, then the later receipt."""
-    return (c["meta"]["report_date"], c["meta"]["filing_date"], _ts_utc(c["pull_ts"]))
+def _position_rank(c: dict[str, Any]) -> tuple[date, datetime]:
+    """Latest report date wins, then the later receipt."""
+    return (c["report_date"], _ts_utc(c["pull_ts"]))
 
 
 def _bump(counts: dict[str, int], key: str, n: int = 1) -> None:
@@ -423,6 +500,21 @@ def read_13f_holdings_snapshot(
     return snapshot
 
 
+def _latest_vintages(conn: Any, pattern: str, earliest: date, day: date, instant: datetime) -> list[Any]:
+    return conn.execute(
+        _READ_SQL,
+        {"pattern": pattern, "earliest": earliest, "as_of": day, "as_of_ts": instant},
+    ).fetchall()
+
+
+def _visible(raw_obs_date: Any, raw_pull_ts: Any, day: date, instant: datetime) -> tuple[date, datetime] | None:
+    obs_date = _as_date(raw_obs_date)
+    pull_ts = _coerce_ts(raw_pull_ts)
+    if obs_date is None or pull_ts is None or obs_date > day or _ts_utc(pull_ts) > instant:
+        return None
+    return obs_date, pull_ts
+
+
 def _read(
     engine: Engine,
     day: date,
@@ -433,30 +525,45 @@ def _read(
 ) -> HoldingsSnapshot:
     earliest = day - timedelta(days=max(int(lookback_days), 1))
     with engine.connect() as conn:
-        rows = conn.execute(
-            _READ_SQL,
-            {"pattern": "13F:%", "earliest": earliest, "as_of": day, "as_of_ts": instant},
-        ).fetchall()
+        # Stage 1: filing comparison receipts -> per-quarter authority.
+        receipts: dict[tuple[str, str], dict[str, Any]] = {}
+        for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in _latest_vintages(
+            conn, f"{WRITER_RECEIPT_PREFIX}:%", earliest, day, instant
+        ):
+            _bump(counts, "receipts_read")
+            parts = str(series_id).split(":")
+            seen = _visible(raw_obs_date, raw_pull_ts, day, instant)
+            payload = _payload_dict(raw_payload)
+            rec = None
+            if len(parts) == 3 and parts[0] == WRITER_RECEIPT_PREFIX and seen is not None and payload is not None:
+                rec = _receipt_check(parts[1].strip(), parts[2].strip(), seen[0], seen[1], payload)
+            if rec is None:
+                _bump(counts, "invalid_filing_receipt")
+                continue
+            receipts[(parts[1].strip(), rec["accession"])] = rec
 
-        # Stage 1: one labelled, visible observation per (series_id, obs_date).
-        candidates: list[dict[str, Any]] = []
-        for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in rows:
+        authority: dict[tuple[str, date], _Rank] = {}
+        for (cik, _acc), rec in receipts.items():
+            for rd, rank in ((rec["report_date"], rec["rank"]), (rec["prev_report_date"], rec["prev_rank"])):
+                if (cik, rd) not in authority or rank > authority[(cik, rd)]:
+                    authority[(cik, rd)] = rank
+
+        # Stage 2: labelled change rows from a verified, winning comparison.
+        by_manager: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        for series_id, raw_obs_date, _value, raw_payload, raw_pull_ts in _latest_vintages(
+            conn, "13F:%", earliest, day, instant
+        ):
             _bump(counts, "rows_read")
             parts = str(series_id).split(":")
             if len(parts) != 4 or parts[0] != "13F" or parts[3].strip().upper() not in _KIND_FOR_ACTION:
                 _bump(counts, "not_position_series")
                 continue
-            cik = parts[1].strip()
-            cusip = parts[2].strip().upper()
-            action = parts[3].strip().upper()
-            obs_date = _as_date(raw_obs_date)
-            pull_ts = _coerce_ts(raw_pull_ts)
-            if not cik or not cusip or obs_date is None:
+            cik, cusip, action = parts[1].strip(), parts[2].strip().upper(), parts[3].strip().upper()
+            seen = _visible(raw_obs_date, raw_pull_ts, day, instant)
+            if not cik or not cusip or seen is None:
                 _bump(counts, "not_position_series")
                 continue
-            if obs_date > day or pull_ts is None or _ts_utc(pull_ts) > instant:
-                _bump(counts, "not_yet_received")
-                continue
+            obs_date, pull_ts = seen
             payload = _payload_dict(raw_payload)
             if payload is None:
                 _bump(counts, "not_observation_labelled")
@@ -465,25 +572,26 @@ def _read(
             if reason is not None:
                 _bump(counts, reason)
                 continue
-            candidates.append({
-                "series_id": series_id,
-                "cik": cik,
-                "cusip": cusip,
-                "action": action,
-                "obs_date": obs_date,
-                "payload": payload,
-                "pull_ts": pull_ts,
-                "meta": _extract_13f_vintage_meta(payload, obs_date),
-            })
-
-        # Stage 2: restatements replace the filings they restate (shared rule).
-        survivors, superseded = _resolve_13f_amendments(candidates)
-        if superseded:
-            _bump(counts, "superseded_vintages", superseded)
-
-        by_manager: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for c in survivors:
-            by_manager[c["cik"]].append(c)
+            accession = str(payload["filing_accession"]).strip()
+            report_date = _strict_date(payload.get("report_date"))
+            rec = receipts.get((cik, accession))
+            if rec is None or not rec["compared"]:
+                _bump(counts, "no_filing_receipt")
+                continue
+            if (
+                rec["report_date"] != report_date
+                or str(payload.get("prev_filing_accession") or "").strip() != rec["prev_accession"]
+            ):
+                _bump(counts, "stale_comparison")
+                continue
+            if authority[(cik, report_date)][2] != accession:
+                _bump(counts, "superseded_filing")
+                continue
+            row = {"cusip": cusip, "action": action, "obs_date": obs_date, "pull_ts": pull_ts,
+                   "payload": payload, "report_date": report_date, "accession": accession}
+            prev = by_manager[cik].get(cusip)
+            if prev is None or _position_rank(row) > _position_rank(prev):
+                by_manager[cik][cusip] = row
 
         has_sec_ids = _table_exists(conn, "security_identifiers")
         has_inst_holdings = _table_exists(conn, "institutional_holdings")
@@ -491,33 +599,27 @@ def _read(
         stale_cutoff = day - timedelta(days=MAX_REPORT_AGE_DAYS)
         holdings: list[HoldingObservation] = []
 
-        for cik in sorted(by_manager):
-            items = by_manager[cik]
-            rows_at: dict[date, list[dict[str, Any]]] = defaultdict(list)
-            for c in items:
-                rows_at[c["meta"]["report_date"]].append(c)
-            latest_rd = max(rows_at)
-            latest_by_cusip: dict[str, dict[str, Any]] = {}
-            for c in items:
-                prev = latest_by_cusip.get(c["cusip"])
-                if prev is None or _position_rank(c) > _position_rank(prev):
-                    latest_by_cusip[c["cusip"]] = c
-
-            if latest_rd < stale_cutoff:
-                _bump(counts, "stale_manager_filing", len(latest_by_cusip))
+        for cik in sorted({c for c, _rd in authority}):
+            latest_rd = max(rd for c, rd in authority if c == cik)
+            latest = receipts.get((cik, authority[(cik, latest_rd)][2]))
+            if latest is None or not latest["compared"]:
+                _bump(counts, "managers_latest_filing_unverified")
                 continue
-
-            chain = _verified_chain(rows_at)
-            manager_name = str(
-                next(
-                    (r["payload"].get("manager_name") for r in rows_at[latest_rd] if r["payload"].get("manager_name")),
-                    cik,
-                )
+            if latest_rd < stale_cutoff:
+                _bump(counts, "managers_stale_filing")
+                continue
+            chain = _verified_chain(cik, latest_rd, authority, receipts)
+            positions = by_manager.get(cik, {})
+            manager_name = next(
+                (str(r["payload"]["manager_name"]) for r in positions.values()
+                 if r["report_date"] == latest_rd and r["payload"].get("manager_name")),
+                next((str(r["payload"]["manager_name"]) for r in positions.values()
+                      if r["payload"].get("manager_name")), cik),
             )
 
-            for cusip in sorted(latest_by_cusip):
-                c = latest_by_cusip[cusip]
-                rd = c["meta"]["report_date"]
+            for cusip in sorted(positions):
+                c = positions[cusip]
+                rd = c["report_date"]
                 if c["action"] == "CLOSED":
                     _bump(counts, "closed")
                     continue
@@ -554,10 +656,13 @@ def _read(
                     held_through_report_date=latest_rd,
                     filing_date=c["obs_date"],
                     received_at=_ts_utc(c["pull_ts"]),
-                    filing_accession=c["meta"]["filing_accession"],
+                    filing_accession=c["accession"],
                     observation_kind=c["payload"]["observation_kind"],
                     carried_forward=rd != latest_rd,
                 ))
+
+        # Rows of managers with no receipt at all were counted above
+        # (no_filing_receipt); nothing of theirs is shown.
 
     return HoldingsSnapshot(
         as_of=day,
@@ -575,28 +680,28 @@ _SNAPSHOT_CACHE: weakref.WeakKeyDictionary[Engine, dict[Any, tuple[float, Holdin
 )
 
 
-def _cache_get(engine: Engine, key: Any) -> HoldingsSnapshot | None:
+def _cache_get(engine: Engine, cache_slot: Any) -> HoldingsSnapshot | None:
     with _CACHE_LOCK:
         try:
             entries = _SNAPSHOT_CACHE.get(engine)
         except TypeError:
             return None
-        if not entries or key not in entries:
+        if not entries or cache_slot not in entries:
             return None
-        expires, snapshot = entries[key]
+        expires, snapshot = entries[cache_slot]
         if time.monotonic() >= expires:
-            del entries[key]
+            del entries[cache_slot]
             return None
         return snapshot
 
 
-def _cache_put(engine: Engine, key: Any, snapshot: HoldingsSnapshot) -> None:
+def _cache_put(engine: Engine, cache_slot: Any, snapshot: HoldingsSnapshot) -> None:
     with _CACHE_LOCK:
         try:
             entries = _SNAPSHOT_CACHE.setdefault(engine, {})
         except TypeError:
             return
-        entries[key] = (time.monotonic() + _SNAPSHOT_TTL_SECONDS, snapshot)
+        entries[cache_slot] = (time.monotonic() + _SNAPSHOT_TTL_SECONDS, snapshot)
 
 
 def clear_snapshot_cache() -> None:
