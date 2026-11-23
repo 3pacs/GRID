@@ -30,6 +30,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.availability import freshness
 from store.pit import PITStore
 
 
@@ -91,6 +92,13 @@ GDELT_TENSION_FEATURES = [
 # never run once, reporting "No price features available" instead.
 # tests/test_momentum_feature_contract.py fails on a name with no writer.
 PRICE_FEATURES = ["sp500_full"]
+
+# The tone composite counts as stale once its newest observation is this many
+# days behind as_of_date (same threshold as physics.news_energy). Without it a
+# 90-day window that ended weeks ago still read as the current state: the
+# actor-tone features stopped on 2026-11-06 and the DOC puller that wrote them
+# was retired on 2026-11-23, yet the endpoint kept answering available=True.
+TONE_STALE_AFTER_DAYS = 5
 
 
 class NewsMomentumAnalyzer:
@@ -174,6 +182,28 @@ class NewsMomentumAnalyzer:
                 as_of_date,
                 note="Insufficient non-null tone data",
                 warning="Too few non-null GDELT tone observations",
+            )
+
+        newest = pd.Timestamp(tone_series.index.max()).date()
+        tone_fresh = freshness(newest, stale_after_days=TONE_STALE_AFTER_DAYS, today=as_of_date)
+        details["tone_last_observed"] = newest.isoformat()
+        if tone_fresh.stale:
+            return self._unavailable_result(
+                as_of_date,
+                note=(
+                    f"GDELT actor-tone features end on {newest.isoformat()}, "
+                    f"{tone_fresh.age_days} days before {as_of_date.isoformat()}; "
+                    "no current news momentum can be computed"
+                ),
+                warning=(
+                    f"GDELT actor tone is stale: newest observation {newest.isoformat()} "
+                    f"(more than {TONE_STALE_AFTER_DAYS} days old)"
+                ),
+                extra_details={
+                    "tone_last_observed": newest.isoformat(),
+                    "tone_age_days": tone_fresh.age_days,
+                    "stale_after_days": TONE_STALE_AFTER_DAYS,
+                },
             )
 
         # 1) Sentiment trend: linear regression slope over lookback

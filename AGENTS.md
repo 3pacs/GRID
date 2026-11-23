@@ -1022,3 +1022,32 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
 - Remaining review gates: Claude reviews the pushed head; Anik alone decides
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
+
+## 2026-11-23 - GDELT DOC puller retired (owner), draft only
+
+Branch `claude/gdelt-retire-20261123`. Anik: "retire gdelt". Not scheduled, not
+deleted: `ingestion/altdata/gdelt.py`, its tests and all stored rows stay.
+
+- **Why:** `smart:gdelt` had no SUCCESS since 2026-11-04 (25 runs ended in HTTP
+  429, 5-10 rows a week). On 11-23 at 22:30Z `api.gdeltproject.org:443` refused
+  TCP from grid-svr, precision5520 and i7gen10.
+- **Scheduling:** `hold_reason` on the `gdelt` entry of `PULLER_REGISTRY`
+  (SCHED re-pin 08c0356f -> 08f8db79 in `tests/test_hermes_sec_only.py`; #1407
+  re-pins the same base, so the second to merge re-pins again).
+  `ingestion/scheduler.py` follows it through `hold_reason_for("gdelt")`.
+  `scripts/hermes_fixers.py` drops the `GDELT -> gdelt` retry route.
+- **Readers:** `/physics/news-momentum` answered `available: true` from actor
+  tone that ended 11-06; it now answers unavailable once the newest tone is
+  more than 5 days old and says the date. Migration `gdelt_doc_retire_20261123`
+  marks the 24 DOC features deprecated and not model-eligible (14 were
+  model-eligible with forward fill). `news_energy`, the thesis scorer and the
+  signal extractor already read only recent rows or flag staleness.
+- **Not touched:** the bulk-file loader (`gdelt_bulk`, 12 daily event features,
+  current to 11-22) and the three other DOC API callers
+  (`intelligence/breaking_news.py`, `actor_news_puller._fetch_gdelt`,
+  `spider/sources/news_cooccurrence.py`).
+- **To turn it back on:** remove the `hold_reason`, restore the
+  `"GDELT": "gdelt"` line in `hermes_fixers._CATALOG_TO_REGISTRY`, move GDELT
+  back to `_PRODUCING` in `tests/test_scheduler_daily_outcomes_20261117.py`, add
+  a migration that undoes `gdelt_doc_retire_20261123` (its downgrade shows the
+  flags), and re-pin SCHED.
