@@ -136,6 +136,20 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      # 13F holdings observations (intelligence/holdings_observations_13f.py):
+      # the real 13F writer -> reader -> deep_graph layer 9 -> served route on
+      # PostgreSQL types (JSONB payloads, TIMESTAMPTZ receipts, the window-
+      # function vintage read, graph_overlaps' real DDL). The test fails
+      # instead of skipping when REQUIRE_13F_HOLDINGS_PG=1.
+      - name: 13F holdings observations PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_13F_HOLDINGS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_13f_holdings_graph_pg.py -q -rA
+
       - name: Pipeline health PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
