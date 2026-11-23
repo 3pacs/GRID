@@ -114,15 +114,15 @@ class TestGoodResponse:
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
         empty = _load_json("empty_response.json")
-        # _SERIES_MAP order is RBRTE then RWTC.
-        mock_get.side_effect = [_resp(good), _resp(empty)]
+        # _SERIES_MAP order is RBRTE then RWTC, followed by weekly Cushing stocks.
+        mock_get.side_effect = [_resp(good), _resp(empty), _resp(empty)]
 
         puller = EIAPuller(db_engine=engine)
         result = puller.pull()
 
         assert result["status"] == "SUCCESS"
         assert result["rows_inserted"] == 3
-        rows = engine.store.rows_for("eia.brent_spot")
+        rows = engine.store.rows_for("EIA:eia_brent_spot")
         assert len(rows) == 3
         assert {r["obs_date"] for r in rows} == {
             date(2026, 9, 14),
@@ -148,11 +148,11 @@ class TestGoodResponse:
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
         empty = _load_json("empty_response.json")
-        mock_get.side_effect = [_resp(good), _resp(empty)]
+        mock_get.side_effect = [_resp(good), _resp(empty), _resp(empty)]
 
         EIAPuller(db_engine=engine).pull()
 
-        row = engine.store.rows_for("eia.brent_spot")[0]
+        row = engine.store.rows_for("EIA:eia_brent_spot")[0]
         assert set(row.keys()) == {
             "series_id",
             "source_id",
@@ -174,7 +174,7 @@ class TestEmptyResponse:
     def test_empty_writes_nothing(self, mock_get, engine, monkeypatch):
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         empty = _load_json("empty_response.json")
-        mock_get.side_effect = [_resp(empty), _resp(empty)]
+        mock_get.side_effect = [_resp(empty), _resp(empty), _resp(empty)]
 
         result = EIAPuller(db_engine=engine).pull()
 
@@ -199,7 +199,7 @@ class TestMalformedResponse:
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         malformed = _load_json("malformed_records.json")
         empty = _load_json("empty_response.json")
-        mock_get.side_effect = [_resp(malformed), _resp(empty)]
+        mock_get.side_effect = [_resp(malformed), _resp(empty), _resp(empty)]
 
         result = EIAPuller(db_engine=engine).pull()
 
@@ -207,7 +207,7 @@ class TestMalformedResponse:
         # value=68.95) should survive; None value, empty period, bad date,
         # and non-numeric value are all skipped without raising.
         assert result["rows_inserted"] == 1
-        rows = engine.store.rows_for("eia.brent_spot")
+        rows = engine.store.rows_for("EIA:eia_brent_spot")
         assert len(rows) == 1
         assert rows[0]["obs_date"] == date(2026, 9, 16)
 
@@ -238,7 +238,7 @@ class TestMalformedResponse:
             "?api_key=REDACTED-FIXTURE&frequency=daily&facets%5Bseries%5D%5B%5D=RBRTE"
         )
         empty = _load_json("empty_response.json")
-        mock_get.side_effect = [_resp(json_error=leaking_exc), _resp(empty)]
+        mock_get.side_effect = [_resp(json_error=leaking_exc), _resp(empty), _resp(empty)]
 
         with patch("ingestion.altdata.eia_puller.log") as mock_log:
             result = EIAPuller(db_engine=engine).pull()
@@ -290,11 +290,11 @@ class TestDuplicateWithinBatch:
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         empty = _load_json("empty_response.json")
         dup = _load_json("duplicate_in_batch.json")
-        mock_get.side_effect = [_resp(empty), _resp(dup)]
+        mock_get.side_effect = [_resp(empty), _resp(dup), _resp(empty)]
 
         result = EIAPuller(db_engine=engine).pull()
 
-        rows = engine.store.rows_for("eia.wti_spot")
+        rows = engine.store.rows_for("EIA:eia_crude_price")
         assert len(rows) == 1  # not 2
         assert rows[0]["obs_date"] == date(2026, 9, 16)
         assert result["rows_inserted"] == 1
@@ -324,15 +324,15 @@ class TestRevisedValue:
         empty = _load_json("empty_response.json")
         puller = EIAPuller(db_engine=engine)
 
-        mock_get.side_effect = [_resp(good), _resp(empty)]
+        mock_get.side_effect = [_resp(good), _resp(empty), _resp(empty)]
         puller.pull()
-        original = {r["obs_date"]: r["value"] for r in engine.store.rows_for("eia.brent_spot")}
+        original = {r["obs_date"]: r["value"] for r in engine.store.rows_for("EIA:eia_brent_spot")}
 
         revised = _load_json("revised_response.json")
-        mock_get.side_effect = [_resp(revised), _resp(empty)]
+        mock_get.side_effect = [_resp(revised), _resp(empty), _resp(empty)]
         puller.pull()
 
-        rows = engine.store.rows_for("eia.brent_spot")
+        rows = engine.store.rows_for("EIA:eia_brent_spot")
         assert len(rows) == 3  # still just the original three, no new/updated rows
         assert {r["obs_date"]: r["value"] for r in rows} == original
         assert original[date(2026, 9, 14)] == pytest.approx(68.42)  # not 70.10
@@ -351,12 +351,12 @@ class TestIdempotentRerun:
         empty = _load_json("empty_response.json")
         puller = EIAPuller(db_engine=engine)
 
-        mock_get.side_effect = [_resp(good), _resp(empty)]
+        mock_get.side_effect = [_resp(good), _resp(empty), _resp(empty)]
         puller.pull()
-        mock_get.side_effect = [_resp(good), _resp(empty)]
+        mock_get.side_effect = [_resp(good), _resp(empty), _resp(empty)]
         puller.pull()
 
-        assert len(engine.store.rows_for("eia.brent_spot")) == 3
+        assert len(engine.store.rows_for("EIA:eia_brent_spot")) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -400,16 +400,23 @@ class TestPerFacetFailureStatus:
     def test_one_of_two_facets_fails_returns_partial(self, mock_get, engine, monkeypatch):
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
-        # _SERIES_MAP order is RBRTE then RWTC -- RBRTE succeeds, RWTC's
-        # fetch raises.
-        mock_get.side_effect = [_resp(good), ConnectionError("RWTC outage")]
+        empty = _load_json("empty_response.json")
+        # _SERIES_MAP order is RBRTE then RWTC (3 retry attempts on ConnectionError),
+        # followed by weekly Cushing stocks.
+        mock_get.side_effect = [
+            _resp(good),
+            ConnectionError("RWTC outage"),
+            ConnectionError("RWTC outage"),
+            ConnectionError("RWTC outage"),
+            _resp(empty),
+        ]
 
         result = EIAPuller(db_engine=engine).pull()
 
         assert result["status"] == "PARTIAL"
         assert result["rows_inserted"] == 3  # RBRTE's rows still committed
         assert "error" in result
-        assert len(engine.store.rows_for("eia.brent_spot")) == 3
+        assert len(engine.store.rows_for("EIA:eia_brent_spot")) == 3
 
     @patch("ingestion.altdata.eia_puller.requests.get")
     def test_both_facets_succeed_returns_success_not_partial(
@@ -418,7 +425,7 @@ class TestPerFacetFailureStatus:
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
         empty = _load_json("empty_response.json")
-        mock_get.side_effect = [_resp(good), _resp(empty)]
+        mock_get.side_effect = [_resp(good), _resp(empty), _resp(empty)]
 
         result = EIAPuller(db_engine=engine).pull()
 

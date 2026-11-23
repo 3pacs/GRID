@@ -620,3 +620,15 @@ def test_a_blank_in_any_price_the_builder_accepts_is_never_a_valid_bar_in_the_fa
         with pytest.raises(U.UniverseError, match="blank only in adjHigh or adjLow"):
             U.build(mm, store_dir)
         assert not (store_dir / "panel").exists()
+
+
+def test_the_committed_first_run_file_fits_the_built_export():
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "docs/research/cross-section-runs/xs-smallcap-published-effects-1-20261120.json"
+    body = json.loads(path.read_text())
+    run = X.RunFile.from_dict(body)                                         # the factory accepts it as written
+    assert run.first_session >= U.DISCOVERY_FIRST and run.last_session <= X.DEV_LAST   # inside the export's discovery days
+    assert run.sector_uses() == [] and run.rankings == ("pooled",)          # the store has no sector labels
+    assert (run.min_price, run.min_dollar_volume, run.cost_bp_per_side) == (2, 1_000_000, 25.0)
+    assert run.trial_count() == 8 and {m["horizon"] for m in run.modules()} == {"close_1d"}
+    assert any("S&P 500" in look for look in run.prior_dev_looks) and any("spread estimate" in look for look in run.prior_dev_looks)

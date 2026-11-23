@@ -3,8 +3,17 @@ GRID Point-in-Time (PIT) query engine.
 
 The most critical correctness component in the entire system. Enforces strict
 no-lookahead constraints ensuring that no data with ``release_date > as_of_date``
-is ever returned.  Supports both FIRST_RELEASE and LATEST_AS_OF vintage policies
-for backtesting and live inference.
+or ``vintage_date > as_of_date`` is ever returned.  Supports both FIRST_RELEASE
+and LATEST_AS_OF vintage policies for backtesting and live inference.
+
+Knowable-at is the later of the two dates. Every writer in the resolver path
+stamps ``release_date = vintage_date`` (the pull date), but nothing in the
+schema enforces it: a backfill that stamps ``release_date = obs_date`` and
+``vintage_date = fetch date`` (E1-V7c,
+scripts/backfill_resolved_series_from_ticker_metrics.sql) wrote rows with
+``release_date <= as_of < vintage_date``. Fencing release only served those
+rows to an as_of before GRID held them; every read here fences both, as
+``get_source_snapshot`` always has.
 
 Retractions (``resolved_series_retractions``,
 migrations/versions/resolved_retractions_20260927.py): a resolved row that was
@@ -367,12 +376,15 @@ class PITStore:
     ) -> pd.DataFrame:
         """Return point-in-time correct data for the given features and date.
 
-        HARD CONSTRAINT 1: Every returned row has release_date <= as_of_date.
+        HARD CONSTRAINT 1: Every returned row has release_date <= as_of_date
+            AND vintage_date <= as_of_date (a vintage written after as_of
+            was not held on as_of, whatever release_date it claims).
         HARD CONSTRAINT 2: Every returned row has obs_date <= as_of_date.
         HARD CONSTRAINT 3:
-            FIRST_RELEASE  — earliest vintage_date per (feature_id, obs_date).
+            FIRST_RELEASE  — earliest vintage_date per (feature_id, obs_date)
+                             among the rows constraint 1 admits.
             LATEST_AS_OF   — latest vintage_date per (feature_id, obs_date)
-                             where release_date <= as_of_date.
+                             among the rows constraint 1 admits.
         HARD CONSTRAINT 4: rows retracted in resolved_series_retractions by
             the end of as_of_date are excluded *before* the vintage policy
             picks a row. as_of dates before the retraction's UTC date
@@ -424,7 +436,8 @@ class PITStore:
 
         if vintage_policy == "FIRST_RELEASE":
             # For each (feature_id, obs_date), return the row with the
-            # MINIMUM vintage_date, provided release_date <= as_of_date.
+            # MINIMUM vintage_date, provided release_date and vintage_date
+            # are both <= as_of_date.
             query = text("""
                 SELECT DISTINCT ON (rs.feature_id, rs.obs_date)
                     rs.feature_id, rs.obs_date, rs.value, rs.release_date, rs.vintage_date
@@ -433,6 +446,7 @@ class PITStore:
                   AND rs.obs_date <= :aod
                   AND rs.obs_date BETWEEN :obs_start AND :obs_end
                   AND rs.release_date <= :aod
+                  AND rs.vintage_date <= :aod
                   AND NOT EXISTS (
                       SELECT 1 FROM resolved_series_retractions rr
                       WHERE rr.feature_id = rs.feature_id
@@ -444,7 +458,8 @@ class PITStore:
             """)
         else:
             # LATEST_AS_OF: for each (feature_id, obs_date), return the row
-            # with the MAXIMUM vintage_date where release_date <= as_of_date.
+            # with the MAXIMUM vintage_date where release_date and
+            # vintage_date are both <= as_of_date.
             query = text("""
                 SELECT DISTINCT ON (rs.feature_id, rs.obs_date)
                     rs.feature_id, rs.obs_date, rs.value, rs.release_date, rs.vintage_date
@@ -453,6 +468,7 @@ class PITStore:
                   AND rs.obs_date <= :aod
                   AND rs.obs_date BETWEEN :obs_start AND :obs_end
                   AND rs.release_date <= :aod
+                  AND rs.vintage_date <= :aod
                   AND NOT EXISTS (
                       SELECT 1 FROM resolved_series_retractions rr
                       WHERE rr.feature_id = rs.feature_id
@@ -576,27 +592,36 @@ class PITStore:
         return matrix
 
     def assert_no_lookahead(self, df: pd.DataFrame, as_of_date: date) -> None:
-        """Verify that no row in the DataFrame has release_date > as_of_date.
+        """Verify that no row has release_date or vintage_date > as_of_date.
 
         This is a safety net called automatically by ``get_pit`` before
         returning results. Raises immediately if any violation is found.
+        ``vintage_date`` is checked when the frame carries it (every
+        ``get_pit`` frame does).
 
         Parameters:
-            df: DataFrame with a 'release_date' column.
+            df: DataFrame with a 'release_date' column (and optionally
+                'vintage_date').
             as_of_date: The decision date.
 
         Raises:
-            ValueError: If any row has release_date > as_of_date, with a
-                        message identifying the violating rows.
+            ValueError: If any row has release_date > as_of_date or
+                        vintage_date > as_of_date, with a message
+                        identifying the violating rows.
         """
         if df.empty or "release_date" not in df.columns:
             return
 
-        violations = df[df["release_date"] > as_of_date]
+        late = df["release_date"] > as_of_date
+        shown = ["feature_id", "obs_date", "release_date"]
+        if "vintage_date" in df.columns:
+            late = late | (df["vintage_date"] > as_of_date)
+            shown.append("vintage_date")
+        violations = df[late]
         if not violations.empty:
-            detail = violations[["feature_id", "obs_date", "release_date"]].head(5).to_string()
+            detail = violations[[c for c in shown if c in df.columns]].head(5).to_string()
             log.critical(
-                "LOOKAHEAD VIOLATION detected — {n} rows with release_date > {d}",
+                "LOOKAHEAD VIOLATION detected — {n} rows with release_date or vintage_date > {d}",
                 n=len(violations),
                 d=as_of_date,
             )
@@ -605,7 +630,7 @@ class PITStore:
             df.drop(df.index, inplace=True)
             raise ValueError(
                 f"LOOKAHEAD VIOLATION: {len(violations)} row(s) have "
-                f"release_date > as_of_date ({as_of_date}).\n"
+                f"release_date or vintage_date > as_of_date ({as_of_date}).\n"
                 f"First violations:\n{detail}"
             )
 
@@ -701,7 +726,7 @@ class PITStore:
 # rebalance, each time over a window that overlaps the last one by 51 weeks.
 # ``PITWindowCache`` reads every candidate vintage of a bounded window ONCE
 # (one SQL statement) and then answers ``get_pit`` for any ``as_of`` inside
-# it in memory, applying the same three filters and the same vintage pick as
+# it in memory, applying the same filters and the same vintage pick as
 # the SQL above. The same object serialises to a hash-receipted snapshot file
 # so a remote worker can run the job without reading the database at all.
 
@@ -728,6 +753,7 @@ PIT_WINDOW_SELECT_SQL = """
     WHERE rs.feature_id = ANY(:fids)
       AND rs.obs_date BETWEEN :obs_start AND :obs_end
       AND rs.release_date <= :max_as_of
+      AND rs.vintage_date <= :max_as_of
     ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date
 """
 
@@ -776,11 +802,11 @@ class PITWindowCache(PITStore):
     """``PITStore`` over an in-memory window of ``resolved_series`` vintages.
 
     Holds every vintage of ``feature_ids`` with ``obs_date`` in
-    ``[start_date, end_date]`` and ``release_date <= max_as_of``, plus each
-    row's retraction time. ``get_pit`` then reproduces the SQL read for any
-    ``as_of <= max_as_of`` whose obs_date window lies inside the held one:
-    same three filters (obs_date and release_date <= as_of, retraction by the
-    end of as_of), same vintage pick, same columns and row order, and the
+    ``[start_date, end_date]`` and ``release_date``, ``vintage_date <=
+    max_as_of``, plus each row's retraction time. ``get_pit`` then reproduces
+    the SQL read for any ``as_of <= max_as_of`` whose obs_date window lies
+    inside the held one: same filters (obs_date, release_date and
+    vintage_date <= as_of, retraction by the end of as_of), same vintage pick, same columns and row order, and the
     same ``assert_no_lookahead`` safety net. A read outside the window
     raises ``PITWindowMiss`` or, when ``allow_db_fallback`` is set and an
     engine is attached, is answered by the database with a warning.
@@ -943,6 +969,7 @@ class PITWindowCache(PITStore):
         mask = np.isin(self._fid, np.fromiter((int(f) for f in feature_ids), np.int64))
         mask &= self._obs <= aod
         mask &= self._release <= aod
+        mask &= self._vintage <= aod
         if start_date is not None:
             mask &= self._obs >= start_date.toordinal()
         if end_date is not None:

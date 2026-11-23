@@ -11,6 +11,16 @@ Usage:
     python3 scripts/run_market_state.py                         # prior session
     python3 scripts/run_market_state.py --dry-run --json        # print the record, write nothing
     python3 scripts/run_market_state.py --from 2019-01-02 --to 2026-11-12   # backfill sessions
+    python3 scripts/run_market_state.py --provisional --json    # today's session at its close, display only
+
+``--provisional`` (#1312) writes a display-only record for today's UTC session, and only at or after that session's
+close in the pinned XNYS calendar (``analysis/factory_session_calendar.PINS``); before the close, or on a day that is
+not a session, it refuses with exit 2. It runs ``compute_market_state`` with ``known_by`` = that close, an exact
+availability cutoff, so a rerun hours later reads only what GRID held at the close. It never refreshes the FRED
+vintages (``--no-refresh`` is accepted and changes nothing; no flag turns a refresh on). It writes to its own table
+(never ``market_state_daily``), insert-only unless ``--replace``, and never takes ``--from/--to``, ``--as-of`` or
+``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is still the one
+this writer makes the next evening.
 
 Before computing, a real run fetches the FRED vintages published since the last stored one for the news indexes
 (``ingestion/fred_vintages.py``; ``--no-refresh`` skips it). First time: ``python -m ingestion.fred_vintages backfill``.
@@ -25,6 +35,11 @@ import sys
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from analysis.factory_session_calendar import FactoryCalendar
+    from ingestion.market_calendar import MarketSession
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -47,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip fetching new FRED vintages of the news indexes first (a dry run never fetches)")
     p.add_argument("--require-target-dealer", action="store_true",
                    help="hold a daily write unless dealer gamma is from the exact target session; exit 3 on hold")
+    p.add_argument("--provisional", action="store_true",
+                   help="display-only record for today's UTC session, from the inputs held at its close (#1312); "
+                        "refuses before the close or on a non-session (exit 2); never refreshes vintages")
     return p
 
 
@@ -58,6 +76,10 @@ def sessions(start: date, end: date) -> list[date]:
 
 def utc_today() -> date:
     return datetime.now(timezone.utc).date()
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def existing_row(engine, target: date) -> dict | None:
@@ -81,7 +103,7 @@ def readiness(record: dict, target: date) -> dict:
         "dealer_target_ready": dealer_ready,
         "dealer_observation_date": gamma.get("obs_date"),
         "dealer_reason": None if dealer_ready else gamma.get("reason", "no exact target-session dealer row"),
-        "variable_status": {k: {a: v.get(a) for a in ("status", "obs_date", "age_days", "reason")}
+        "variable_status": {k: {a: v.get(a) for a in ("status", "obs_date", "age_days", "freshness", "reason")}
                             for k, v in variables.items()},
         "analysis_gaps": sorted(k for k, v in variables.items() if v.get("status") != "ok"),
         "event_status": (record.get("events") or {}).get("status", "unknown"),
@@ -96,7 +118,7 @@ def code_receipt() -> dict:
     names = ("scripts/run_market_state.py", "intelligence/regime/market_state.py",
              "intelligence/regime/baseline.py", "intelligence/regime/state_vector.py",
              "physics/dealer_gex_daily.py", "ingestion/market_calendar.py",
-             "store/observations.py", "store/fred_vintages.py",
+             "store/observations.py", "store/fred_vintages.py", "analysis/factory_session_calendar.py",
              "config/econ_release_dates.json")
     return {name: hashlib.sha256((_ROOT / name).read_bytes()).hexdigest()
             if (_ROOT / name).is_file() else None for name in names}
@@ -104,6 +126,8 @@ def code_receipt() -> dict:
 
 def main(argv: list[str] | None = None, engine=None) -> int:
     a = build_parser().parse_args(argv)
+    if a.provisional:
+        return run_provisional(a, engine)
     today = utc_today()  # Explicit UTC; laptop/server local timezone cannot change the target.
     if a.require_target_dealer and (a.replace or a.start or a.end):
         print("market-state: target-dealer gate is daily, insert-only; no --replace or range", file=sys.stderr)
@@ -196,6 +220,125 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         print(json.dumps(summary, default=str) if a.json else
               f"market-state: {written} written, {summary['already_present']} already present, {held} held")
     return 3 if held else 0
+
+
+# ── --provisional (#1312): display only, at the close ───────────────────────
+
+def provisional_target(now: datetime,
+                       calendar: FactoryCalendar | None = None) -> tuple[date, MarketSession, FactoryCalendar]:
+    """(session day, its pinned session, the calendar) for today's UTC session once its close has passed.
+
+    ``now`` must be aware. ValueError when the day is outside the pinned XNYS parts, is not a session, or its close
+    (``closes`` in the manifest: 21:00Z or 20:00Z, earlier on an early-close day) is still ahead. Every XNYS close is
+    before midnight UTC, so the session is the one dated today in UTC; after midnight UTC the next day is targeted
+    and refused until its own close.
+    """
+    if now.utcoffset() is None:
+        raise ValueError("the provisional clock must be timezone-aware")
+    from analysis.factory_session_calendar import PINS, FactoryCalendar
+
+    now = now.astimezone(timezone.utc)
+    cal = calendar or FactoryCalendar(pins=PINS)
+    day = now.date()
+    session = cal.for_day(day.isoformat())       # ValueError outside the pinned parts
+    if session is None:
+        raise ValueError(f"{day} is not an XNYS session in the pinned calendar")
+    if now < session.closes:
+        raise ValueError(f"session {day} closes at {session.closes.isoformat()}; it is {now.isoformat()}")
+    return day, session, cal
+
+
+def existing_provisional_row(engine, target: date) -> dict | None:  # engine: sqlalchemy Engine, as existing_row
+    """Metadata of a stored provisional row; never creates the table."""
+    from sqlalchemy import inspect, text
+
+    if not inspect(engine).has_table("market_state_provisional"):
+        return None
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT rule, computed_at FROM market_state_provisional WHERE as_of_date = :d"),
+                           {"d": target}).mappings().first()
+    return dict(row) if row is not None else None
+
+
+def run_provisional(a: argparse.Namespace, engine=None) -> int:
+    """Today's UTC session at or after its close, into market_state_provisional. Display only (#1312).
+
+    The record is computed with the session's close as its availability cutoff, and this path never refreshes the
+    FRED vintages: a refresh writes rows fetched now, and those are after the close by construction.
+    """
+    if a.start or a.end or a.as_of or a.require_target_dealer:
+        print("market-state: --provisional targets today's session only; no --from/--to, --as-of or "
+              "--require-target-dealer", file=sys.stderr)
+        return 2
+    now = utc_now()
+    try:
+        target, session, cal = provisional_target(now)
+    except ValueError as exc:
+        print(f"market-state: provisional refused: {exc}", file=sys.stderr)
+        return 2
+
+    from intelligence.regime.market_state import (
+        PROVISIONAL_DECISION_USE,
+        PROVISIONAL_MODE,
+        PROVISIONAL_TABLE,
+        compute_market_state,
+        load_calendar,
+        provisional_record,
+        store_provisional_market_state,
+    )
+
+    if engine is None:
+        from db import get_engine
+
+        engine = get_engine()
+    started = now.isoformat()
+    cutoff = session.closes.astimezone(timezone.utc)
+    run_id = str(uuid.uuid4())
+    written = 0
+    old = None if a.dry_run or a.replace else existing_provisional_row(engine, target)
+    if old is not None:
+        outcome = {"target_session": target.isoformat(), "outcome": "already_present", "written_this_run": False,
+                   "forward_qualified": False, "stored_computed_at": str(old["computed_at"]),
+                   "stored_rule": old["rule"], "reason": "existing provisional row preserved"}
+    else:
+        state = compute_market_state(engine, target, calendar=load_calendar(), known_by=cutoff)
+        ready = readiness(state.to_dict(), target)
+        state.writer_provenance = {
+            "run_id": run_id, "started_at": started, "target_session": target.isoformat(),
+            "availability_cutoff": cutoff.isoformat(),
+            "minutes_after_close": round((now - cutoff).total_seconds() / 60, 1),
+            "mode": PROVISIONAL_MODE, "decision_use": PROVISIONAL_DECISION_USE, "table": PROVISIONAL_TABLE,
+            "session_closes": session.closes.isoformat(), "calendar": cal.version,
+            "computed_after_close": True, "vintage_refresh": "never",
+            "dry_run": a.dry_run, "replace": a.replace, "target_dealer_required": False,
+            "execution_origin": "unverified", "code_sha256": code_receipt(), "readiness": ready,
+        }
+        outcome = {**ready, "written_this_run": False}
+        if a.dry_run:
+            rec = provisional_record(state)
+            if a.json:
+                print(json.dumps(rec, sort_keys=True, default=str))
+            else:
+                print(f"market-state provisional {target}: {rec['coverage']['ok']}/{rec['coverage']['total']} "
+                      "variables ok (dry run)")
+            return 0
+        if store_provisional_market_state(engine, state, replace=a.replace):
+            written = 1
+            outcome["outcome"] = "replaced" if a.replace else "written"
+            outcome["written_this_run"] = True
+        else:
+            outcome = {"target_session": target.isoformat(), "outcome": "already_present_race",
+                       "written_this_run": False, "forward_qualified": False}
+    summary = {"job": "run_market_state", "mode": PROVISIONAL_MODE, "decision_use": PROVISIONAL_DECISION_USE,
+               "table": PROVISIONAL_TABLE, "run_id": run_id, "target_session": target.isoformat(),
+               "session_closes": session.closes.isoformat(), "written": written,
+               "already_present": int(outcome["outcome"].startswith("already_present")), "outcomes": [outcome],
+               "availability_cutoff": cutoff.isoformat(),
+               "vintage_refresh": "never: a provisional run reads only what GRID held at the close",
+               "generated_at": datetime.now(timezone.utc).isoformat()}
+    print(json.dumps(summary, default=str) if a.json else
+          f"market-state provisional {target}: {written} written, {summary['already_present']} already present")
+    return 0
 
 
 if __name__ == "__main__":

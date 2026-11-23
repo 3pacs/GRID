@@ -49,6 +49,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, ProgrammingError
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 # ── Magnitude thresholds (hardcoded module constants) ─────────────────
 
@@ -268,7 +269,7 @@ def get_oracle_vs_market_calibration(
     sql = text(
         """
         SELECT oracle_hit, market_hit
-        FROM oracle_predictions
+        FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE ticker = :ticker
           AND direction = :direction
           AND horizon_days = :horizon_days

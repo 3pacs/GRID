@@ -100,7 +100,7 @@ def guard_engine():
         conn.execute(text(
             "CREATE TABLE dollar_flows (source_type TEXT, actor_name TEXT, ticker TEXT, "
             "amount_usd DOUBLE PRECISION, direction TEXT, confidence TEXT, "
-            "flow_date DATE, evidence TEXT)"
+            "flow_date DATE, evidence TEXT, created_at TIMESTAMPTZ DEFAULT NOW())"
         ))
         conn.execute(text(
             "CREATE TABLE signal_sources (source_type TEXT, ticker TEXT, signal_date DATE, "
