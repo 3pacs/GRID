@@ -218,18 +218,15 @@ def _drewry_names_wci(texts: Any) -> bool:
 def _drewry_scoped_heading_text(table: Any) -> str:
     """Text of the nearest heading before *table* that belongs to the table's own scope.
 
-    Inside a ``<section>``/``<article>``, the heading must be inside that same
-    element. Outside any, the heading must not sit inside a section/article of
-    its own. A heading from a different section never lends WCI context.
+    The heading's innermost ``<section>``/``<article>`` must be exactly the
+    table's innermost one (or both must have none). A heading in a sibling
+    section, or in a child section of the table's article, never lends WCI
+    context.
     """
     heading = table.find_previous(["h1", "h2", "h3", "h4"])
     if heading is None:
         return ""
-    scope = table.find_parent(["section", "article"])
-    if scope is not None:
-        if scope not in heading.parents:
-            return ""
-    elif heading.find_parent(["section", "article"]) is not None:
+    if heading.find_parent(["section", "article"]) is not table.find_parent(["section", "article"]):
         return ""
     return heading.get_text(" ", strip=True)
 

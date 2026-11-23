@@ -996,6 +996,53 @@ class TestDrewryWCIPositiveAttribution:
         """
         assert sc._parse_drewry_wci_html(same_section, pull_date=self.PULL) == [{"date": "2026-11-19", "value": 2145.0}]
 
+    def test_wci_heading_in_a_child_section_does_not_lend_context_to_its_parent_article(self):
+        """Codex HOLD on 3f51e76a: a WCI heading inside a child <section> must not
+        attribute a bare Composite table that sits directly in the parent <article>."""
+        html = """
+        <html><body>
+          <article>
+            <section>
+              <h2>World Container Index, 19 Nov 2026</h2>
+              <p>Lane commentary only.</p>
+            </section>
+            <table>
+              <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+              <tbody><tr><td>2026-11-19</td><td>$9,999</td></tr></tbody>
+            </table>
+          </article>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(html, pull_date=self.PULL) == []
+
+        same_article = """
+        <html><body>
+          <article>
+            <h2>World Container Index, 19 Nov 2026</h2>
+            <table>
+              <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+              <tbody><tr><td>2026-11-19</td><td>$2,145</td></tr></tbody>
+            </table>
+          </article>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(same_article, pull_date=self.PULL) == [{"date": "2026-11-19", "value": 2145.0}]
+
+        parent_heading_child_table = """
+        <html><body>
+          <article>
+            <h2>World Container Index, 19 Nov 2026</h2>
+            <section>
+              <table>
+                <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+                <tbody><tr><td>2026-11-19</td><td>$9,999</td></tr></tbody>
+              </table>
+            </section>
+          </article>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(parent_heading_child_table, pull_date=self.PULL) == []
+
     @pytest.mark.parametrize("label,ctx,ok", [
         ("WCI Composite", False, True),
         ("Drewry World Container Index composite", False, True),
