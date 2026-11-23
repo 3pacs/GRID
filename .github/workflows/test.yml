@@ -975,6 +975,25 @@ jobs:
             exit 1
           fi
 
+      # Signal executor (#1356, Codex review 6011903757): the gross-exposure
+      # reservation and the trade insert are one step under a transaction-
+      # scoped advisory lock. Two runs on two connections: the second waits on
+      # the lock, then sees the first's entry (no duplicate) and its exposure
+      # (the cap holds). A skip must fail this step.
+      - name: Signal executor exposure lock PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_signal_executor_exposure_lock_pg.py -q -rA | tee /tmp/grid-signal-executor-lock-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-signal-executor-lock-pg.txt; then
+            echo "::error::Signal executor exposure lock PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # E2 forward scoreboard (evals/e2, milestone M2): price resolution is
       # point-in-time against real SQL (no close before its pull or its
       # session close, no revision pulled after the run instant, one named

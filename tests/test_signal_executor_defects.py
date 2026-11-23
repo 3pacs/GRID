@@ -11,6 +11,10 @@ Covers:
    freshness checks for leader, entry, and exit prices.
 6. Missing paper_strategy_breaker_state table / DB error in should_execute fails
    closed for entries with error log, still runs closes, and runs no runtime DDL.
+7. Codex review 6011903757: the exposure reservation and the trade insert are one
+   serialized step (advisory lock, re-read, re-check, then insert), and the exit
+   pass runs over every open position whatever its strategy's status.
+   (The two-connection proof is tests/test_signal_executor_exposure_lock_pg.py.)
 """
 
 from __future__ import annotations
@@ -49,11 +53,15 @@ class _FakeConn:
         closed_pnls_by_sid: dict[str, list[float]] | None = None,
         open_trades_by_sid: dict[str, list[tuple]] | None = None,
         initial_gross_exposure: float = 0.0,
+        inactive_strategies: list[tuple] | None = None,
     ) -> None:
         self.strategies = strategies or []
         self.closed_pnls_by_sid = closed_pnls_by_sid or {}
         self.open_trades_by_sid = open_trades_by_sid or {}
         self.initial_gross_exposure = initial_gross_exposure
+        # (id, hypothesis_id, leader, follower, horizon_days, status) for
+        # strategies that are not ACTIVE (PAUSED / KILLED).
+        self.inactive_strategies = inactive_strategies or []
         self.queries: list[tuple[str, dict | None]] = []
 
     def __enter__(self):
@@ -62,6 +70,20 @@ class _FakeConn:
     def __exit__(self, *_):
         return False
 
+    def _open_positions(self) -> list[tuple]:
+        """Every OPEN trade joined to its strategy row (any status)."""
+        by_sid: dict[str, tuple] = {
+            s[0]: (s[1], s[3], s[4], "ACTIVE") for s in self.strategies
+        }
+        for s in self.inactive_strategies:
+            by_sid[s[0]] = (s[1], s[3], s[4], s[5])
+        rows = []
+        for sid, trades in self.open_trades_by_sid.items():
+            hid, follower, horizon, status = by_sid.get(sid, (None, None, None, None))
+            for t in trades:
+                rows.append((t[0], sid, t[1], t[2], status, hid, follower, horizon))
+        return sorted(rows)
+
     def execute(self, stmt, params=None):
         sql = str(stmt)
         self.queries.append((sql, params))
@@ -69,7 +91,9 @@ class _FakeConn:
         result.fetchall.return_value = []
         result.fetchone.return_value = None
 
-        if "FROM paper_strategies WHERE status = 'ACTIVE'" in sql:
+        if "LEFT JOIN paper_strategies" in sql and "paper_trades" in sql:
+            result.fetchall.return_value = self._open_positions()
+        elif "FROM paper_strategies WHERE status = 'ACTIVE'" in sql:
             result.fetchall.return_value = list(self.strategies)
         elif "COUNT(*) FROM paper_strategies" in sql:
             result.fetchone.return_value = (0,)
@@ -95,9 +119,10 @@ class _FakeConn:
         return result
 
 
-def _make_engine(conn_factory):
+def _make_engine(conn_factory, tx_factory=None):
     engine = MagicMock()
     engine.connect.side_effect = conn_factory
+    engine.begin.side_effect = tx_factory or conn_factory
     return engine
 
 
@@ -701,3 +726,200 @@ class TestDefect6MissingBreakerTable:
         )
         engine.begin.assert_not_called()
 
+
+
+# ── Codex review 6011903757: serialized reservation, exits for every open position ─
+
+
+def _entry_signal_patches(monkeypatch, stub_pe, breaker, prices) -> None:
+    monkeypatch.setattr(se, "PaperTradingEngine", lambda _e: stub_pe)
+    monkeypatch.setattr(se, "StrategyCircuitBreaker", lambda _e: breaker)
+    monkeypatch.setattr(se, "_get_latest_prices", lambda _c, name, n=2: prices[name][:n])
+    monkeypatch.setattr(se, "_get_expected_lag", lambda *_a: 1)
+    monkeypatch.setattr("intelligence.trust_scorer.detect_convergence", lambda *_a, **_k: [])
+
+
+def _passing_breaker() -> MagicMock:
+    breaker = MagicMock()
+    breaker.should_execute.return_value = True
+    breaker.last_error = None
+    return breaker
+
+
+class TestCodexHold6011903757:
+    """Exposure race (scheduled + manual run) and exits for non-ACTIVE strategies."""
+
+    _KELLY_TEN_PCT = [0.02] * 12 + [-0.02] * 8  # half-Kelly = 0.10
+
+    def test_gross_exposure_is_reread_under_the_lock_before_insert(self, monkeypatch):
+        # The run's snapshot sees 0.90. By the time it reserves, a concurrent
+        # run (scheduled vs manual) has committed a 0.10 entry: total is 1.00.
+        # Pre-fix the executor trusted its snapshot, allowed 0.10 and breached
+        # MAX_GROSS_EXPOSURE (1.10).
+        class _ConcurrentCommitConn(_FakeConn):
+            sum_reads = 0
+
+            def execute(self, stmt, params=None):
+                sql = str(stmt)
+                if "SUM(" in sql and "paper_trades" in sql:
+                    type(self).sum_reads += 1
+                    self.queries.append((sql, params))
+                    res = MagicMock()
+                    res.fetchone.return_value = (0.90 if type(self).sum_reads == 1 else 1.00,)
+                    return res
+                return super().execute(stmt, params)
+
+        conn = _ConcurrentCommitConn(
+            strategies=[("s1", None, "spy_close", "qqq_close", None)],
+            closed_pnls_by_sid={"s1": self._KELLY_TEN_PCT},
+        )
+        engine = _make_engine(lambda: conn)
+        stub_pe = _StubPaperEngine()
+        d0, d1 = _fresh_dates()
+        prices = {"spy_close": [(d0, 103.0), (d1, 100.0)], "qqq_close": [(d0, 500.0)]}
+        _entry_signal_patches(monkeypatch, stub_pe, _passing_breaker(), prices)
+
+        summary = se.execute_signals(engine)
+
+        assert summary["trades_opened"] == 0
+        assert stub_pe.opened == []
+        cap_skips = [d for d in summary["details"] if d.get("reason") == "max_gross_exposure"]
+        assert len(cap_skips) == 1
+        assert cap_skips[0]["strategy_id"] == "s1"
+        assert cap_skips[0]["current_gross_exposure"] == pytest.approx(1.00)
+
+    def test_open_entry_is_rechecked_under_the_lock_before_insert(self, monkeypatch):
+        # The early check finds no OPEN trade for s1; a concurrent run then
+        # commits s1's entry before this run reserves. Pre-fix the executor
+        # opened a second (duplicate) entry for s1.
+        class _ConcurrentEntryConn(_FakeConn):
+            open_checks = 0
+
+            def execute(self, stmt, params=None):
+                sql = str(stmt)
+                if "SELECT id FROM paper_trades" in sql and "OPEN" in sql:
+                    type(self).open_checks += 1
+                    self.queries.append((sql, params))
+                    res = MagicMock()
+                    res.fetchone.return_value = None if type(self).open_checks == 1 else (77,)
+                    return res
+                return super().execute(stmt, params)
+
+        conn = _ConcurrentEntryConn(
+            strategies=[("s1", None, "spy_close", "qqq_close", None)],
+            closed_pnls_by_sid={"s1": self._KELLY_TEN_PCT},
+        )
+        engine = _make_engine(lambda: conn)
+        stub_pe = _StubPaperEngine()
+        d0, d1 = _fresh_dates()
+        prices = {"spy_close": [(d0, 103.0), (d1, 100.0)], "qqq_close": [(d0, 500.0)]}
+        _entry_signal_patches(monkeypatch, stub_pe, _passing_breaker(), prices)
+
+        summary = se.execute_signals(engine)
+
+        assert summary["trades_opened"] == 0
+        assert stub_pe.opened == []
+        dupes = [d for d in summary["details"] if d.get("reason") == "open_entry_exists"]
+        assert [d["strategy_id"] for d in dupes] == ["s1"]
+
+    def test_reservation_locks_rechecks_and_inserts_in_one_transaction(self, monkeypatch):
+        # Reads run on engine.connect(); the reservation must run on ONE
+        # engine.begin() transaction: lock_timeout, the fixed-key advisory
+        # transaction lock, the open-entry re-check and the exposure re-read,
+        # then the insert on that same connection.
+        data = dict(
+            strategies=[("s1", None, "spy_close", "qqq_close", None)],
+            closed_pnls_by_sid={"s1": self._KELLY_TEN_PCT},
+            initial_gross_exposure=0.20,
+        )
+        read_conn = _FakeConn(**data)
+        tx_conn = _FakeConn(**data)
+        engine = _make_engine(lambda: read_conn, lambda: tx_conn)
+        stub_pe = _StubPaperEngine()
+        d0, d1 = _fresh_dates()
+        prices = {"spy_close": [(d0, 103.0), (d1, 100.0)], "qqq_close": [(d0, 500.0)]}
+        _entry_signal_patches(monkeypatch, stub_pe, _passing_breaker(), prices)
+
+        summary = se.execute_signals(engine)
+
+        assert summary["trades_opened"] == 1
+        assert engine.begin.call_count == 1
+        tx_sql = [sql for sql, _ in tx_conn.queries]
+        assert tx_sql[0] == "SET LOCAL lock_timeout = '30s'"
+        assert tx_sql[1] == "SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"
+        assert tx_conn.queries[1][1] == {"key": se.EXPOSURE_LOCK_KEY}
+        assert se.EXPOSURE_LOCK_KEY == "trading.signal_executor.gross_exposure"
+        assert "SELECT id FROM paper_trades" in tx_sql[2] and tx_conn.queries[2][1] == {"sid": "s1"}
+        assert "SUM(" in tx_sql[3]
+        assert len(tx_sql) == 4
+        # The insert ran on the locked transaction's connection.
+        assert len(stub_pe.opened) == 1
+        assert stub_pe.opened[0]["conn"] is tx_conn
+        assert stub_pe.opened[0]["position_size"] == pytest.approx(0.10)
+        # No reservation statement ran on the plain read connection.
+        assert not any("pg_advisory" in sql for sql, _ in read_conn.queries)
+
+    def test_open_positions_of_paused_and_killed_strategies_are_exited(self, monkeypatch):
+        # Exits are enumerated from open positions, not from ACTIVE strategies.
+        # Pre-fix only ACTIVE strategies' trades were walked, so the PAUSED and
+        # KILLED strategies' expired trades stayed open forever.
+        d0, d1 = _fresh_dates()
+        expired = d0 - timedelta(days=5)
+        conn = _FakeConn(
+            strategies=[("s_active", None, "spy_close", "dia_close", None)],
+            inactive_strategies=[
+                ("s_paused", None, "spy_close", "qqq_close", None, "PAUSED"),
+                ("s_killed", None, "spy_close", "iwm_close", None, "KILLED"),
+            ],
+            open_trades_by_sid={
+                "s_paused": [(201, "qqq_close", expired, 0.10)],
+                "s_killed": [(202, "iwm_close", expired, 0.10)],
+            },
+        )
+        engine = _make_engine(lambda: conn)
+        stub_pe = _StubPaperEngine()
+        prices = {
+            "spy_close": [(d0, 103.0), (d1, 100.0)],
+            "dia_close": [(d0, 400.0)],
+            "qqq_close": [(d0, 510.0)],
+            "iwm_close": [(d0, 210.0)],
+        }
+        breaker = _passing_breaker()
+        _entry_signal_patches(monkeypatch, stub_pe, breaker, prices)
+
+        summary = se.execute_signals(engine)
+
+        assert summary["trades_closed"] == 2
+        assert sorted(c["trade_id"] for c in stub_pe.closed) == [201, 202]
+        exit_px = {c["trade_id"]: c["exit_price"] for c in stub_pe.closed}
+        assert exit_px == {201: 510.0, 202: 210.0}
+        closes = {d["trade_id"]: d for d in summary["details"] if d["action"] == "CLOSE"}
+        assert closes[201]["strategy_status"] == "PAUSED"
+        assert closes[202]["strategy_status"] == "KILLED"
+        # New entries stay limited to ACTIVE strategies: only s_active opened,
+        # and the breaker was never consulted for the paused/killed ones.
+        assert [t["strategy_id"] for t in stub_pe.opened] == ["s_active"]
+        assert [c.args[0] for c in breaker.should_execute.call_args_list] == ["s_active"]
+        # Closing a KILLED strategy's trade bumps its updated_at; the run's kill
+        # count only looks at strategies that were ACTIVE when the run began.
+        kill_counts = [p for sql, p in conn.queries if "COUNT(*) FROM paper_strategies" in sql]
+        assert kill_counts == [{"active_ids": ["s_active"]}]
+
+    def test_open_position_without_a_strategy_row_is_reported_not_closed(self, monkeypatch):
+        d0, d1 = _fresh_dates()
+        conn = _FakeConn(
+            open_trades_by_sid={"s_gone": [(301, "qqq_close", d0 - timedelta(days=5), 0.10)]},
+        )
+        engine = _make_engine(lambda: conn)
+        stub_pe = _StubPaperEngine()
+        prices = {"qqq_close": [(d0, 510.0)]}
+        _entry_signal_patches(monkeypatch, stub_pe, _passing_breaker(), prices)
+
+        summary = se.execute_signals(engine)
+
+        assert summary["trades_closed"] == 0
+        assert stub_pe.closed == []
+        assert {
+            "action": "SKIP_CLOSE", "strategy_id": "s_gone", "trade_id": 301,
+            "ticker": "qqq_close", "reason": "strategy_missing",
+        } in summary["details"]

@@ -309,6 +309,8 @@ class _FakeConn:
 def _executor_engine(strategies):
     engine = MagicMock()
     engine.connect.side_effect = lambda: _FakeConn(strategies)
+    # The exposure reservation + insert runs on its own engine.begin() transaction.
+    engine.begin.side_effect = lambda: _FakeConn(strategies)
     return engine
 
 
