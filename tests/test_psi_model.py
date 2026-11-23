@@ -55,14 +55,24 @@ def test_check_psi_condition_unknown_op_returns_false() -> None:
 
 
 def _make_engine_returning(rows: dict[str, tuple | None]) -> MagicMock:
-    """Build a MagicMock engine whose .connect()/.execute()/.fetchone()
-    returns ``rows[feature_name]`` based on the bound ``:name`` param."""
+    """Build a MagicMock engine whose value read returns ``rows[feature_name]``.
+
+    ``_load_latest_value`` looks the feature id up by the bound ``:name``
+    first, then reads resolved_series by the bound ``:fid``; every key of
+    *rows* is a registered feature.
+    """
     engine = MagicMock()
     conn = engine.connect.return_value.__enter__.return_value
+    ids = {name: 100 + i for i, name in enumerate(rows)}
+    names = {fid: name for name, fid in ids.items()}
 
     def _execute(_sql, params):
         result = MagicMock()
-        result.fetchone.return_value = rows.get(params["name"])
+        if "fid" in params:
+            result.fetchone.return_value = rows[names[params["fid"]]]
+        else:
+            fid = ids.get(params["name"])
+            result.fetchone.return_value = (fid,) if fid is not None else None
         return result
 
     conn.execute.side_effect = _execute
@@ -77,6 +87,11 @@ def test_load_latest_value_returns_float_when_row_exists() -> None:
 def test_load_latest_value_returns_none_when_no_row() -> None:
     engine = _make_engine_returning({"missing_feature": None})
     assert _load_latest_value(engine, "missing_feature") is None
+
+
+def test_load_latest_value_returns_none_when_feature_unregistered() -> None:
+    engine = _make_engine_returning({})
+    assert _load_latest_value(engine, "not_in_registry") is None
 
 
 def test_load_latest_value_coerces_decimal_or_int_to_float() -> None:
