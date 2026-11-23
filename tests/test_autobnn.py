@@ -15,9 +15,13 @@ import pandas as pd
 import pytest
 
 from timeseries.autobnn import (
+    CAUSAL_PEAK_WINDOW,
+    CAUSAL_POST_WINDOW,
+    CAUSAL_PRE_WINDOW,
     AutoBNNDecomposer,
     DecompositionResult,
     RegimeChangeSignal,
+    causal_context_start,
 )
 
 
@@ -274,3 +278,109 @@ class TestDecomposerSingleton:
 
         assert d1 is d2
         ab._decomposer_instance = None
+
+
+# ---------------------------------------------------------------------------
+# Causal drift-break test (the fallback the changepoint detector uses)
+# ---------------------------------------------------------------------------
+
+W, K, M = CAUSAL_PRE_WINDOW, CAUSAL_POST_WINDOW, CAUSAL_PEAK_WINDOW
+
+
+def _drift_shift(n: int = 400, at: int = 300, drift: float = 1.5, seed: int = 3) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return np.cumsum(np.concatenate([rng.normal(0, 1, at), rng.normal(drift, 1, n - at)]))
+
+
+def _old_fallback_trend(series: np.ndarray) -> np.ndarray:
+    """The pre-#1301 fallback: centred rolling mean, NaN ends filled with the series mean."""
+    window = min(30, len(series) // 4)
+    trend = pd.Series(series).rolling(window, center=True).mean().values
+    return np.nan_to_num(trend, nan=series.mean())
+
+
+class TestCausalBreaks:
+    def test_finds_a_drift_shift_near_where_it_happened(self, decomposer: AutoBNNDecomposer) -> None:
+        breaks = decomposer.detect_causal_breaks(_drift_shift())
+        assert len(breaks) == 1
+        (b,) = breaks
+        assert 300 - K <= b.change_index <= 300 + K
+        assert b.statistic > 0 and b.post_regime == "rising"
+        assert b.confirm_index == b.change_index + M + K
+        assert 0.5 <= b.confidence <= 1.0
+
+    def test_down_shift_has_a_negative_statistic(self, decomposer: AutoBNNDecomposer) -> None:
+        (b,) = decomposer.detect_causal_breaks(_drift_shift(drift=-1.5))
+        assert b.statistic < 0 and b.post_regime == "falling"
+
+    def test_v_shape_turns_at_the_top(self, decomposer: AutoBNNDecomposer) -> None:
+        v = np.concatenate([np.linspace(100, 150, 200), np.linspace(150, 110, 200)])
+        (b,) = decomposer.detect_causal_breaks(v)
+        assert 195 <= b.change_index <= 200
+        assert (b.pre_regime, b.post_regime) == ("rising", "falling")
+
+    def test_no_breaks_on_a_trend(self, decomposer: AutoBNNDecomposer) -> None:
+        assert decomposer.detect_causal_breaks(np.linspace(100, 200, 750)) == []
+        noisy = np.linspace(100, 200, 750) + np.random.default_rng(1).normal(0, 1, 750)
+        assert decomposer.detect_causal_breaks(noisy) == []
+
+    def test_no_edge_artifacts_on_random_walks(self, decomposer: AutoBNNDecomposer) -> None:
+        n = 365
+        old_edge = new_total = 0
+        for seed in range(30):
+            walk = 100 + np.cumsum(np.random.default_rng(seed).normal(0, 1, n))
+            old = decomposer._detect_changepoints(_old_fallback_trend(walk), None, "RW", edge_guard=0)
+            old_edge += sum(1 for c in old if c.change_index <= 16 or c.change_index >= n - 17)
+            for b in decomposer.detect_causal_breaks(walk):
+                assert 2 * W <= b.change_index <= n - 1 - (M + K)
+                new_total += 1
+        assert old_edge >= 30          # the defect: an edge "break" in every window
+        assert new_total <= 30         # rare, and never at an edge
+
+    def test_decision_does_not_depend_on_the_window(self, decomposer: AutoBNNDecomposer) -> None:
+        x = _drift_shift(n=700, at=500, drift=-2.0, seed=5)
+        full = {(b.change_index, round(b.statistic, 9)) for b in decomposer.detect_causal_breaks(x)}
+        later = {(b.change_index + 150, round(b.statistic, 9)) for b in decomposer.detect_causal_breaks(x[150:])}
+        cut = {(b.change_index, round(b.statistic, 9)) for b in decomposer.detect_causal_breaks(x[:560])}
+        decidable = {e for e in full if e[0] >= 150 + 2 * W}
+        assert decidable and decidable == later
+        assert {e for e in full if e[0] + M + K <= 559} == cut
+        for b in decomposer.detect_causal_breaks(x):
+            assert causal_context_start(b.change_index) == b.change_index - 2 * W
+
+    def test_non_finite_values_are_never_filled(self, decomposer: AutoBNNDecomposer) -> None:
+        x = _drift_shift()
+        x[100] = np.nan
+        x[-1] = np.inf
+        breaks = decomposer.detect_causal_breaks(x)
+        # Windows touching the NaN or the inf are skipped; the shift is still found.
+        assert [b for b in breaks if 290 <= b.change_index <= 310]
+        assert all(b.confirm_index < len(x) - 1 for b in breaks)
+        assert all(np.isfinite(b.statistic) and np.isfinite(b.magnitude) for b in breaks)
+
+    def test_short_series_and_bad_windows(self, decomposer: AutoBNNDecomposer) -> None:
+        assert decomposer.detect_causal_breaks(np.arange(2 * W + K + M, dtype=float)) == []
+        with pytest.raises(ValueError):
+            decomposer.detect_causal_breaks(np.arange(500.0), pre_window=1)
+        with pytest.raises(ValueError):
+            decomposer.detect_causal_breaks(np.arange(500.0), pre_window=5, post_window=10)
+
+    def test_fallback_runs_the_causal_test(self, decomposer: AutoBNNDecomposer) -> None:
+        decomposer._available = False
+        x = _drift_shift()
+        assert decomposer.detect_regime_changes(x) == decomposer.detect_causal_breaks(x)
+        assert all(c.confirm_index is not None for c in decomposer.detect_regime_changes(x))
+
+
+class TestCurvatureEdgeGuard:
+    def test_nan_ends_are_not_filled_or_treated_as_breaks(self, decomposer: AutoBNNDecomposer) -> None:
+        walk = 100 + np.cumsum(np.random.default_rng(4).normal(0, 1, 250))
+        trend = pd.Series(walk).rolling(30, center=True).mean().values   # NaN ends, unfilled
+        finite = np.flatnonzero(np.isfinite(trend))
+        for c in decomposer._detect_changepoints(trend, None, "MA"):
+            assert finite[0] + 10 <= c.change_index <= finite[-1] - 10
+
+    def test_edge_guard_drops_breaks_at_the_ends(self, decomposer: AutoBNNDecomposer) -> None:
+        kink_near_end = np.concatenate([np.linspace(0, 10, 195), np.linspace(10, 0, 5)])
+        assert decomposer._detect_changepoints(kink_near_end, None, "END") == []
+        assert decomposer._detect_changepoints(kink_near_end, None, "END", edge_guard=0)

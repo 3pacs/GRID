@@ -233,3 +233,30 @@ def test_track_wealth_migration_excludes_future_signal_date(monkeypatch, signal_
     tickers = {f.to_actor for f in flows}
     assert "GRDX" in tickers, "past-dated row should still surface"
     assert "GRDY" not in tickers, "future-dated row must never surface"
+
+
+def test_track_wealth_migration_emits_no_13f_wealth_flows(monkeypatch, signal_sources_engine):
+    """13F is non-directional (owner decision 2026-11-23; Codex HOLD on #1369
+    d304044d): legacy 13F 'institutional' / NET_POSITION_DELTA rows for a
+    filing appearance, a disappearance and a holding change never become a
+    dollar-valued WealthFlow; other sources still do."""
+    monkeypatch.setattr("intelligence.actor_network._ensure_tables", lambda engine: None)
+    past = date.today() - timedelta(days=2)
+    for cusip, action, value in (
+        ("67066G104", "NEW", 30_000_000.0),
+        ("459200101", "CLOSED", 20_000_000.0),
+        ("594918104", "INCREASED", 50_000_000.0),
+    ):
+        _insert_signal_source(
+            signal_sources_engine, "institutional", "0001067983:BERKSHIRE", cusip, past,
+            "NET_POSITION_DELTA",
+            {"action": action, "value_usd": value, "qualified_for_directional_flow": True},
+        )
+    _insert_signal_source(
+        signal_sources_engine, "congressional", "rep-x", "GRDX", past, "BUY", {"amount_midpoint": 50_000},
+    )
+
+    flows = wealth_tracker.track_wealth_migration(signal_sources_engine, days=90)
+
+    assert {f.to_actor for f in flows} == {"GRDX"}
+    assert not any("13f_filing" in (f.evidence or []) for f in flows)

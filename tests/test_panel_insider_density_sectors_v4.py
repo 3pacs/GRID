@@ -26,7 +26,7 @@ def historical_v6_terminal(monkeypatch):
     """Replay the recorded sectors-v4 checks before v7 source was present."""
     assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
     modules = s4._technology_modules()
-    assert [m.VERSION for m in modules[6:]] == ["vs1-v7", "vs1-v8"]
+    assert [m.VERSION for m in modules[6:]] == ["vs1-v7", "vs1-v8", "vs1-v9"]
     monkeypatch.setattr(s4, "_technology_modules", lambda: modules[:6])
     monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
 
@@ -73,7 +73,7 @@ def test_v7_stopped_or_superseded_blocks_sectors_v4_without_an_anchor(tmp_path):
     assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
     # v7 is itself superseded (terminal STOP) until its successor's module exists: still refused.
     refused = ("supersession pin does not name the terminal|no single terminal member"
-               "|terminal Technology version vs1-v8 is not registered")
+               "|terminal Technology version vs1-v9 is not registered")
     with pytest.raises(PermissionError, match=refused):
         s4.check_technology_run()
     with pytest.raises(PermissionError, match=refused):

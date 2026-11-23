@@ -114,6 +114,7 @@ class LlamaCppClient:
         # --reasoning-budget flag in /etc/default/z4-llama.
         self.reasoning_headroom = reasoning_headroom
         self.is_available: bool = False
+        self.last_finish_reason: str | None = None
         self._ctx_size: int = _CTX_SIZE_BY_URL.get(self.base_url.rstrip("/"), _DEFAULT_CTX_SIZE)
         self._knowledge_cache: dict[str, str] = {}
         # Keyed by base_url alone (not base_url|model): several router
@@ -260,6 +261,7 @@ class LlamaCppClient:
         Returns:
             str: The assistant's response text, or None if unavailable.
         """
+        self.last_finish_reason = None
         if not self.is_available:
             # Honor an active chat-failure backoff window before spending a
             # network round-trip on a health re-check — the whole point of
@@ -341,6 +343,12 @@ class LlamaCppClient:
 
             data = resp.json()
             choice = data["choices"][0]
+            raw_finish = choice.get("finish_reason")
+            self.last_finish_reason = (
+                raw_finish.strip()
+                if isinstance(raw_finish, str) and raw_finish.strip()
+                else None
+            )
             message = choice["message"]
             content = message.get("content") or ""
             reasoning_content = message.get("reasoning_content") or ""

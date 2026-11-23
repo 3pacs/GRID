@@ -41,6 +41,7 @@ if _GRID_DIR not in sys.path:
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Category → milestone_type mapping for business_events ─────────────
@@ -638,7 +639,7 @@ def _from_oracle(engine: Engine) -> int:
             SELECT ticker, prediction_type, direction, target_price,
                    entry_price, expiry, confidence, expected_move_pct,
                    model_name, created_at
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE confidence > 0.7
             ORDER BY created_at DESC NULLS LAST
             LIMIT 50000
