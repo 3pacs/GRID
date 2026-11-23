@@ -983,36 +983,13 @@ def test_13f_straddling_cutover_pair_creates_no_spurious_change_event(monkeypatc
         assert payload["observation_kind"] == kind, series_id
         assert payload["measure"] == "observed_filing_holdings_change_at_reference_prices", series_id
 
+    # No 13F row reaches signal_sources (13F is non-directional): the old
+    # 'institutional' / NET_POSITION_DELTA rows fed wealth_tracker and
+    # pocket_lining as dollar-valued fund flows. The labelled observations
+    # above (raw_series) are the holdings-observation path.
     with engine.connect() as conn:
-        sig_rows = conn.execute(
-            text("SELECT ticker, signal_value FROM signal_sources WHERE source_type = :st"),
-            {"st": "institutional"},
-        ).fetchall()
-    # Every change is written to signal_sources as an observation (holdings
-    # graphs), carrying the same labels and dollar values.
-    sig_by_cusip = {r[0]: json.loads(r[1]) for r in sig_rows}
-    assert set(sig_by_cusip) == {"67066G104", "459200101", "594918104"}
-    assert sig_by_cusip["67066G104"]["action"] == "NEW"
-    assert sig_by_cusip["67066G104"]["value_usd"] == pytest.approx(30_000_000.0)
-    assert sig_by_cusip["67066G104"]["curr_value_usd"] == pytest.approx(30_000_000.0)
-    assert sig_by_cusip["459200101"]["action"] == "CLOSED"
-    assert sig_by_cusip["459200101"]["value_usd"] == pytest.approx(20_000_000.0)
-    assert sig_by_cusip["459200101"]["prev_value_usd"] == pytest.approx(20_000_000.0)
-    assert sig_by_cusip["594918104"]["action"] == "INCREASED"
-    assert sig_by_cusip["594918104"]["value_usd"] == pytest.approx(50_000_000.0)
-    assert sig_by_cusip["594918104"]["curr_value_usd"] == pytest.approx(150_000_000.0)
-    assert sig_by_cusip["594918104"]["prev_value_usd"] == pytest.approx(100_000_000.0)
-    sig_series = {
-        "67066G104": "13F:1067983:67066G104:NEW",
-        "459200101": "13F:1067983:459200101:CLOSED",
-        "594918104": "13F:1067983:594918104:INCREASED",
-    }
-    for cusip, sig in sig_by_cusip.items():
-        reason, kind = expected_labels[sig_series[cusip]]
-        assert sig["qualified_for_directional_flow"] is False, cusip
-        assert sig["unqualified_reason"] == reason, cusip
-        assert sig["observation_kind"] == kind, cusip
-        assert sig["measure"] == "observed_filing_holdings_change_at_reference_prices", cusip
+        sig_count = conn.execute(text("SELECT COUNT(*) FROM signal_sources")).scalar_one()
+    assert sig_count == 0
 
 
 def test_13f_compare_holdings_uses_delta_for_increased_decreased_and_keeps_new_closed():

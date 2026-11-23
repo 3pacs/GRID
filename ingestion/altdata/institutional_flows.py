@@ -28,7 +28,6 @@ Data stored:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import time
@@ -38,7 +37,6 @@ from typing import Any
 import pandas as pd
 import requests
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
@@ -1073,86 +1071,15 @@ class InstitutionalFlowsPuller(BasePuller):
                         )
                         rows_inserted += 1
 
-                    # Emit one signal_sources row per position change for
-                    # trust scoring + downstream convergence detection.
-                    # Schema (schema.sql ~803):
-                    #   (source_type, source_id, ticker, signal_date,
-                    #    signal_type, signal_value JSONB, ...)
-                    # Matches working pullers: congressional / insider / dark_pool.
-                    for chg in changes:
-                        # 13F filings carry CUSIP only — use it as the ticker
-                        # slot so the UNIQUE(source_type, source_id, ticker,
-                        # signal_date, signal_type) key stays stable and the
-                        # convergence scanner (which filters ticker IS NOT NULL)
-                        # still sees each instrument.
-                        chg_ticker = str(chg.get("cusip") or "").strip()
-                        if not chg_ticker:
-                            continue
-                        try:
-                            conn.execute(
-                                text(
-                                    "INSERT INTO signal_sources "
-                                    "(source_type, source_id, ticker, signal_date, "
-                                    "signal_type, signal_value) "
-                                    "VALUES (:stype, :sid, :ticker, :sdate, "
-                                    ":stype2, :sval) "
-                                    "ON CONFLICT (source_type, source_id, ticker, "
-                                    "signal_date, signal_type) DO NOTHING"
-                                ),
-                                {
-                                    "stype": "institutional",
-                                    "sid": f"{cik}:{manager_name}"[:200],
-                                    "ticker": chg_ticker,
-                                    "sdate": obs_date,
-                                    "stype2": "NET_POSITION_DELTA",
-                                    "sval": json.dumps({
-                                        "manager": manager_name,
-                                        "cik": cik,
-                                        "cusip": chg.get("cusip"),
-                                        "issuer_name": chg.get("name", ""),
-                                        "action": chg.get("action"),
-                                        "value_usd": float(chg.get("value_usd", 0) or 0),
-                                        "estimated_flow_usd": float(chg.get("estimated_flow_usd", 0) or 0),
-                                        "holdings_value_delta_usd": chg.get("holdings_value_delta_usd"),
-                                        "curr_value_usd": (
-                                            float(chg["curr_value_usd"])
-                                            if chg.get("curr_value_usd") is not None
-                                            else None
-                                        ),
-                                        "prev_value_usd": float(
-                                            chg.get("prev_value_usd", 0) or 0
-                                        ),
-                                        "pct_change": chg.get("pct_change"),
-                                        "shares": chg.get("shares"),
-                                        "curr_shares": chg.get("curr_shares"),
-                                        "prev_shares": chg.get("prev_shares"),
-                                        "delta_shares": chg.get("delta_shares"),
-                                        "valuation_price_usd": chg.get("valuation_price_usd"),
-                                        "valuation_price_basis": chg.get("valuation_price_basis"),
-                                        "flow_estimation_method": chg.get("flow_estimation_method"),
-                                        "value_units": chg.get("value_units", "usd"),
-                                        "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
-                                        "unqualified_reason": chg.get("unqualified_reason"),
-                                        "observation_kind": chg.get("observation_kind"),
-                                        "measure": chg.get("measure"),
-                                        "filing_accession": curr_acc,
-                                        "prev_filing_accession": prev_acc,
-                                        "report_date": curr_report_date,
-                                        "form_type": curr_form,
-                                        "is_amendment": curr_is_amendment,
-                                    }),
-                                },
-                            )
-                        except Exception as sig_exc:
-                            # Never break raw_series ingestion because of a
-                            # signal_sources write — log loudly and continue.
-                            log.warning(
-                                "institutional_flows: signal_sources write "
-                                "failed for {m}/{c}: {e}",
-                                m=manager_name,
-                                c=chg_ticker,
-                                e=str(sig_exc),
-                            )
+                    # No 13F row goes to signal_sources (owner decision
+                    # 2026-11-23: 13F is non-directional until CUSIP identity
+                    # and split coverage exist). The old writer emitted
+                    # source_type 'institutional' / NET_POSITION_DELTA with a
+                    # dollar value, which wealth_tracker and pocket_lining read
+                    # as directional fund flows; its CUSIP-keyed rows never
+                    # matched the ticker-keyed holdings graph either. The
+                    # observations stay in raw_series (labelled above) and in
+                    # dollar_flows as direction "observed".
 
                 results.append({
                     "feature": f"13F:{cik}",
