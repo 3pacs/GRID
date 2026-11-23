@@ -328,11 +328,134 @@ def test_oracle_publication_entry_price_skips_the_schwab_day(db) -> None:
 
 
 def test_oracle_quote_reference_skips_the_schwab_batch(db) -> None:
+    """The default viewer (the API's tracking read) still never sees a Schwab batch."""
     from oracle.entry_price_policy import load_quote_reference
 
     with db.connect() as conn:
         receipt = load_quote_reference(conn, "SPY", as_of=datetime(2026, 11, 23, 16, tzinfo=timezone.utc))
     assert receipt["capture_batch_id"] == "spy-cboe" and receipt["provider"] == "cboe"
+
+
+# ── The Oracle engine: the owner's private use (2026-11-23) ──────────
+
+
+def test_oracle_reads_schwab_is_exactly_true() -> None:
+    assert op.ORACLE_READS_SCHWAB is True
+    assert op.include_schwab_rows(op.ORACLE_READS_SCHWAB) is True
+
+
+def _schwab_batch_is_newest(db: Any) -> None:
+    """capture_ordinal is one global sequence in GRID: the later capture has the higher one."""
+    with db.begin() as conn:
+        conn.execute(text("UPDATE options_capture_batches SET capture_ordinal = 2 "
+                          "WHERE capture_batch_id = 'spy-schwab'"))
+
+
+def test_oracle_engine_quote_reference_reads_the_schwab_batch(db) -> None:
+    from oracle.entry_price_policy import load_quote_reference
+
+    _schwab_batch_is_newest(db)
+    with db.connect() as conn:
+        receipt = load_quote_reference(conn, "SPY", as_of=datetime(2026, 11, 23, 16, tzinfo=timezone.utc),
+                                       include_schwab=op.ORACLE_READS_SCHWAB)
+    assert receipt["capture_batch_id"] == "spy-schwab" and receipt["provider"] == "schwab"
+    assert receipt["observed_on"] == SCHWAB_DAY.isoformat()
+
+
+@pytest.mark.parametrize("flag", [None, 1, "true", "admin-only"])
+def test_quote_reference_flag_must_be_exactly_true(db, flag) -> None:
+    from oracle.entry_price_policy import load_quote_reference
+
+    _schwab_batch_is_newest(db)
+    with db.connect() as conn:
+        receipt = load_quote_reference(conn, "SPY", as_of=datetime(2026, 11, 23, 16, tzinfo=timezone.utc),
+                                       include_schwab=flag)
+    assert receipt["capture_batch_id"] == "spy-cboe"
+
+
+def _bare_oracle(db: Any) -> Any:
+    from oracle.engine import OracleEngine
+
+    oracle = object.__new__(OracleEngine)  # skip __init__: no schema DDL, no model load
+    oracle.engine = db
+    return oracle
+
+
+def test_oracle_engine_freezes_its_entry_quote_with_the_private_use_flag(db, monkeypatch) -> None:
+    import oracle.entry_price_policy as policy
+
+    seen: list[Any] = []
+    real = policy.load_quote_reference
+
+    def spy(conn, ticker, *, as_of, include_schwab=False):
+        seen.append(include_schwab)
+        return real(conn, ticker, as_of=as_of, include_schwab=include_schwab)
+
+    monkeypatch.setattr(policy, "load_quote_reference", spy)
+    _schwab_batch_is_newest(db)
+    receipt = _bare_oracle(db)._get_entry_price_reference("SPY")
+    assert seen == [True]
+    assert receipt["capture_batch_id"] == "spy-schwab" and receipt["provider"] == "schwab"
+
+
+class _NoFeatures:
+    """The real SQLite engine, except the feature_registry read (``= ANY(:fams)`` is PostgreSQL)."""
+
+    def __init__(self, real: Any) -> None:
+        self.real = real
+
+    def connect(self):
+        real = self.real
+
+        class _Ctx:
+            def __enter__(self_inner):
+                self_inner.conn = real.connect()
+                conn = self_inner.conn
+
+                class _Conn:
+                    def execute(self, stmt, params=None):
+                        if "feature_registry" in str(stmt):
+                            return type("Empty", (), {"fetchall": lambda _s: []})()
+                        return conn.execute(stmt, params or {})
+
+                return _Conn()
+
+            def __exit__(self_inner, *exc):
+                self_inner.conn.close()
+                return False
+
+        return _Ctx()
+
+
+def test_oracle_engine_options_signals_use_the_schwab_day(db) -> None:
+    with db.begin() as conn:
+        conn.execute(text("UPDATE options_daily_signals SET put_call_ratio = 1.3 "
+                          "WHERE ticker = 'SPY' AND signal_date = :d"), {"d": SCHWAB_DAY.isoformat()})
+    signals = _bare_oracle(_NoFeatures(db))._gather_signals("SPY", ["sentiment"])
+    pcr = [s.value for s in signals if s.name == "pcr"]
+    assert pcr == [1.3]  # the Schwab day's 1.3, not the Cboe day's 0.9
+
+
+def test_only_the_oracle_engine_passes_the_private_use_flag() -> None:
+    """ORACLE_READS_SCHWAB admits Schwab rows, so only the Oracle engine may use it in code."""
+    import ast
+
+    users: dict[str, int] = {}
+    for path in ROOT.rglob("*.py"):
+        rel = path.relative_to(ROOT).as_posix()
+        if (rel.split("/")[0] in {"tests", "migrations", ".git", ".venv", "venv", "node_modules"}
+                or "site-packages" in rel or rel == "store/options_provenance.py"):
+            continue
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        if "ORACLE_READS_SCHWAB" not in source:
+            continue
+        uses = sum(1 for node in ast.walk(ast.parse(source))
+                   if (isinstance(node, ast.Name) and node.id == "ORACLE_READS_SCHWAB")
+                   or (isinstance(node, ast.Attribute) and node.attr == "ORACLE_READS_SCHWAB"))
+        if uses:
+            users[rel] = uses
+    # The two read sites: options signals and the frozen entry quote.
+    assert users == {"oracle/engine.py": 2}
 
 
 def test_scanner_and_digest_never_read_a_schwab_day(db, monkeypatch) -> None:

@@ -9,11 +9,15 @@ tables every other options reader uses: ``options_capture_batches``,
 those rows a reader may see. The rule:
 
 * an **admin request** sees every row;
+* the **Oracle forecast engine** sees every row (owner decision 2026-11-23,
+  :data:`ORACLE_READS_SCHWAB`): ``oracle/engine.py`` and the entry quote it
+  freezes through ``oracle/entry_price_policy.load_quote_reference``;
 * every other reader -- a contributor request, and every consumer that is not
-  a request at all (e-mail digests, oracle publication, chat/LLM context,
-  scanners and engines whose output is stored and served) -- sees no row that
-  came from a Schwab capture. Where a reader asks for "the latest", it gets
-  the latest non-Schwab value instead (an earlier day), never a stand-in.
+  a request at all (e-mail digests, AstroGrid publication in
+  ``oracle/publish.py``, chat/LLM context, scanners and engines whose output is
+  stored and served) -- sees no row that came from a Schwab capture. Where a
+  reader asks for "the latest", it gets the latest non-Schwab value instead (an
+  earlier day), never a stand-in.
 
 How a row is traced to a capture. A capture batch records its provider in
 ``options_capture_batches.spot_provider`` and in ``clock_metadata->>'provider'``
@@ -67,6 +71,15 @@ from datetime import date
 from typing import Any
 
 SCHWAB_PROVIDER = "schwab"
+
+#: Owner decision, 2026-11-23: "oracle counts as private use, let it read
+#: schwab". The Oracle forecast engine passes this as its ``include_schwab``
+#: flag, so it reads Schwab captures as an admin request does: its entry quote
+#: (``oracle/entry_price_policy.load_quote_reference``) and its options signals
+#: (``oracle/engine.py``). Only those two Oracle call sites may pass it. Every
+#: other reader keeps its own flag, and AstroGrid publication
+#: (``oracle/publish.py``) stays filtered.
+ORACLE_READS_SCHWAB: bool = True
 # The Schwab options provider was written on this day (#1299). A capture of
 # unknown provenance dated on or after it may have come from Schwab.
 SCHWAB_POSSIBLE_FROM = date(2026, 11, 21)

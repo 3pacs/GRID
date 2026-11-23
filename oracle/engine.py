@@ -38,7 +38,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import ORACLE_READS_SCHWAB, VISIBLE_DAILY_SIGNALS, visible_sql
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
@@ -998,14 +998,15 @@ class OracleEngine:
                 AND model_eligible = TRUE
             """), {"fams": families}).fetchall()
 
-            # Add options signals if available
+            # Add options signals if available. The Oracle is the owner's
+            # private use (ORACLE_READS_SCHWAB), so a Schwab-captured day counts.
             opt_row = conn.execute(visible_sql("""
                 SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
                        total_oi, term_structure_slope, oi_concentration
                 FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)
                 ORDER BY signal_date DESC LIMIT 1
-            """), {"t": ticker}).fetchone()
+            """, ORACLE_READS_SCHWAB), {"t": ticker}).fetchone()
 
         # Feature z-scores over the trailing window, PIT-correct as of today.
         meta = {int(r[0]): (str(r[1]), str(r[2])) for r in feat_rows}
@@ -2629,7 +2630,8 @@ class OracleEngine:
         as_of = datetime.now(timezone.utc)
         try:
             with self.engine.connect() as conn:
-                return load_quote_reference(conn, ticker, as_of=as_of)
+                return load_quote_reference(conn, ticker, as_of=as_of,
+                                            include_schwab=ORACLE_READS_SCHWAB)
         except Exception:
             log.warning("Oracle reference unavailable for {t}", t=ticker)
             return {"status": "unavailable", "ticker": ticker, "price": None,
