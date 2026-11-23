@@ -66,15 +66,32 @@ def _auth_header() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _answer_in_order(results):
+    """``execute`` side effect: the quote first looks up its candidate
+    features' ids (store.feature_ids); answer that with the first candidate
+    registered (id 1), then hand out *results* in order."""
+    queue = list(results)
+
+    def _execute(statement, params=None, *args, **kwargs):
+        if "FROM feature_registry" in str(statement):
+            result = MagicMock()
+            result.fetchall.return_value = [(1, params["names"][0])]
+            return result
+        return queue.pop(0)
+
+    return _execute
+
+
 def _mock_quote_conn(price_rows, opt_row=None):
-    """Mock connection: `price_rows` (freshest first) answers the resolved_series
-    fetchall(), `opt_row` answers the options_daily_signals fetchone()."""
+    """Mock connection: the feature id lookup, then `price_rows` (freshest
+    first) answers the resolved_series fetchall(), `opt_row` answers the
+    options_daily_signals fetchone()."""
     mock_conn = MagicMock()
     price_result = MagicMock()
     price_result.fetchall.return_value = price_rows
     opt_result = MagicMock()
     opt_result.fetchone.return_value = opt_row
-    mock_conn.execute.side_effect = [price_result, opt_result]
+    mock_conn.execute.side_effect = _answer_in_order([price_result, opt_result])
     return mock_conn
 
 
@@ -240,7 +257,7 @@ class TestSpyIntradayQuote:
         options.fetchone.return_value = None
         realtime = MagicMock()
         realtime.fetchone.return_value = candle
-        mock_conn.execute.side_effect = [prices, options, realtime]
+        mock_conn.execute.side_effect = _answer_in_order([prices, options, realtime])
         _wire_engine(mock_engine, mock_conn)
         return mock_conn
 
@@ -264,7 +281,8 @@ class TestSpyIntradayQuote:
         assert data["source"] == "yahoo_intraday"
         assert data["price_tier"] == "intraday_delayed"
         assert data["price_bar_end_at"] == (bucket + timedelta(minutes=5)).isoformat()
-        assert "realtime_candles" in str(conn.execute.call_args_list[2].args[0])
+        # Statements: feature ids, daily prices, options, realtime candle.
+        assert "realtime_candles" in str(conn.execute.call_args_list[3].args[0])
 
     @patch("api.routers.watchlist_overview.get_db_engine")
     def test_old_bar_keeps_daily_price(self, mock_engine):

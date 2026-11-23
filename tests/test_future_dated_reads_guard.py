@@ -75,7 +75,9 @@ def guard_engine():
             "model_eligible BOOLEAN DEFAULT TRUE)"
         ))
         conn.execute(text(
-            "CREATE TABLE resolved_series (feature_id INTEGER, obs_date DATE, value DOUBLE PRECISION)"
+            # vintage_date as on griddb (NOT NULL): latest reads order a date's vintages by it.
+            "CREATE TABLE resolved_series (feature_id INTEGER, obs_date DATE, value DOUBLE PRECISION, "
+            "vintage_date DATE NOT NULL DEFAULT CURRENT_DATE)"
         ))
         conn.execute(text(
             "CREATE TABLE wealth_flows (id SERIAL PRIMARY KEY, from_actor TEXT, to_entity TEXT, "

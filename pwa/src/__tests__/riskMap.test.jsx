@@ -37,7 +37,7 @@ beforeAll(() => {
 
 const MEASURED = {
     dealer_risk: { gex_regime: 'long_gamma', net_gex: 1200, gamma_flip_distance_pct: 2.1, days_to_opex: 12, risk_level: 'low', available: true },
-    volatility_risk: { vix: 18.2, vix_percentile_1y: 40, vix_term_structure: 'contango', realized_vs_implied: null, risk_level: 'moderate', available: true },
+    volatility_risk: { vix: 18.2, vix_percentile_1y: 40, realized_vs_implied: null, risk_level: 'moderate', available: true },
     concentration_risk: { risk_level: 'unknown', available: false, reason: 'no active watchlist positions' },
     correlation_risk: { risk_level: 'unknown', available: false, reason: 'insufficient 90d close history' },
     credit_risk: { hy_spread: 350, ig_spread: null, ted_spread: null, spread_direction: 'stable', risk_level: 'moderate', available: true },

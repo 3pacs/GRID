@@ -1388,19 +1388,27 @@ def _sanity_check_llm_response(
         try:
             engine = _get_db_engine()
             from sqlalchemy import text as sa_text
+
+            from store.feature_ids import feature_ids
             t_lower = ticker.lower()
             with engine.connect() as conn:
-                row = conn.execute(sa_text(
-                    "SELECT rs.value FROM resolved_series rs "
-                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE (fr.name = :n1 OR fr.name = :n2 OR fr.name = :n3) "
-                    "AND rs.value IS NOT NULL "
-                    "ORDER BY rs.obs_date DESC LIMIT 1"
-                ), {
-                    "n1": f"{t_lower}_full",
-                    "n2": f"{t_lower}_usd_full",
-                    "n3": t_lower,
-                }).fetchone()
+                # Bound ids, each feature's newest non-null row through
+                # LATERAL (store.feature_ids): the feature_registry name join
+                # read and sorted every vintage (spy_full: 182 ms on griddb,
+                # 2026-11-23; 0.8 ms bound). Same-date ties: the newest
+                # vintage, then the first name listed.
+                fids = feature_ids(conn, [f"{t_lower}_full", f"{t_lower}_usd_full", t_lower])
+                row = None if not fids else conn.execute(sa_text(
+                    "SELECT x.value "
+                    "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
+                    "CROSS JOIN LATERAL ("
+                    "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                    "  WHERE rs.feature_id = f.id "
+                    "  AND rs.value IS NOT NULL "
+                    "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                    ") x "
+                    "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
+                ), {"fids": fids}).fetchone()
 
                 if row and row[0] is not None:
                     db_price = float(row[0])
