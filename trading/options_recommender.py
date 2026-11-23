@@ -2032,16 +2032,17 @@ Respond with ONLY the JSON object."""
         with db.connect() as conn:
             # Bound ids, each feature's newest row through LATERAL
             # (store.feature_ids); the name join read every vintage first.
+            # Same-date ties: the newest vintage, then {t}_close before {t}.
             fids = feature_ids(conn, [f"{ticker.lower()}_close", ticker.lower()])
             row = None if not fids else conn.execute(text("""
                 SELECT x.value
-                FROM unnest(CAST(:fids AS integer[])) AS f(id)
+                FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord)
                 CROSS JOIN LATERAL (
                     SELECT rs.value, rs.obs_date FROM resolved_series rs
                     WHERE rs.feature_id = f.id
-                    ORDER BY rs.obs_date DESC LIMIT 1
+                    ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1
                 ) x
-                ORDER BY x.obs_date DESC
+                ORDER BY x.obs_date DESC, f.ord
                 LIMIT 1
             """), {"fids": fids}).fetchone()
         return float(row[0]) if row else 0.0

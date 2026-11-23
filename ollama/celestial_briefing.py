@@ -92,10 +92,12 @@ def _gather_celestial_state(engine: Engine) -> dict[str, Any]:
             # newest obs_date (<= today) is computed once (LATERAL), not once
             # per resolved_series row: the correlated MAX ran for every vintage
             # of every matched feature (1,147 ms on griddb, 2026-11-23; this
-            # form returns the same rows in 18 ms).
+            # form takes 18 ms). One row per feature: the newest vintage of its
+            # newest date. The old read returned every vintage of that date in
+            # no set order, and the dict below kept whichever came last.
             rows = conn.execute(
                 text(
-                    "SELECT fr.name, rs.value, rs.obs_date "
+                    "SELECT DISTINCT ON (fr.name) fr.name, rs.value, rs.obs_date "
                     "FROM feature_registry fr "
                     "CROSS JOIN LATERAL ("
                     "  SELECT MAX(obs_date) AS max_obs FROM resolved_series "
@@ -115,7 +117,7 @@ def _gather_celestial_state(engine: Engine) -> dict[str, Any]:
                     "  OR LOWER(fr.name) LIKE '%eclipse%' OR LOWER(fr.name) LIKE '%celestial%' "
                     ") "
                     "AND rs.obs_date <= CURRENT_DATE "
-                    "ORDER BY fr.name"
+                    "ORDER BY fr.name, rs.vintage_date DESC"
                 )
             ).fetchall()
 

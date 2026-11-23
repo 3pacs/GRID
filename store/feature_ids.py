@@ -15,14 +15,26 @@ rows first from the ``(feature_id, obs_date)`` index. griddb, 2026-11-23:
 Look the id up first with :func:`feature_id` (one name) or
 :func:`feature_ids` (several), then filter ``rs.feature_id = :fid``. For a
 read across several features, bind the ids as an array
-(``unnest(CAST(:fids AS integer[])) AS f(id)``), take each feature's newest
-row in a ``CROSS JOIN LATERAL`` subquery filtered on ``rs.feature_id = f.id``
-with the read's own ``ORDER BY ... LIMIT``, then apply that same
-``ORDER BY ... LIMIT`` to those rows (see the price read in
+(``unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord)``), take
+each feature's newest row in a ``CROSS JOIN LATERAL`` subquery filtered on
+``rs.feature_id = f.id``, then order those rows (see the price read in
 ``api/routers/watchlist_core.py``). ``rs.feature_id = ANY(:fids)`` is not
 enough there: PostgreSQL 14 cannot read a ScalarArrayOp index scan in
 ``obs_date`` order, so it still reads and sorts every row (71 ms for the one
 id of spy_full; 0.7 ms with LATERAL).
+
+Ties. ``ORDER BY obs_date DESC LIMIT n`` alone leaves the row to the plan
+when a date has several vintages or two candidates share the newest date.
+The readers that use these lookups settle both:
+
+- within a feature, the newest ``vintage_date`` of a date wins (PITStore's
+  LATEST_AS_OF; ``(feature_id, obs_date, vintage_date)`` is unique, so the
+  row is fixed): ``ORDER BY rs.obs_date DESC, rs.vintage_date DESC``;
+- across candidates, the caller's order wins among those sharing the newest
+  date: ``ORDER BY x.obs_date DESC, f.ord`` (:func:`feature_ids` keeps it);
+- a read of the last *n* observations takes one row per ``obs_date``
+  (``DISTINCT ON (rs.obs_date)``), and a list of features one row per
+  feature (``DISTINCT ON (fr.name)``), each its newest vintage.
 """
 
 from __future__ import annotations

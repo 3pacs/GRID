@@ -152,7 +152,7 @@ def _get_feature_value(engine: Engine, feature_name: str) -> tuple[float | None,
             text(
                 "SELECT rs.value, rs.obs_date FROM resolved_series rs "
                 "WHERE rs.feature_id = :fid "
-                "ORDER BY rs.obs_date DESC LIMIT 1"
+                "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
             ),
             {"fid": fid},
         ).fetchone()
