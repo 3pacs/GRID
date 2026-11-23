@@ -1046,14 +1046,18 @@ def _d8_obs(series_id: str, values: list[float], as_of: date) -> list[Observatio
 
 
 def _d8_neutral_data(as_of: date) -> dict[str, Any]:
-    """Every layer has data and reads neutral (0 points) except SETUP and CONFIRM."""
+    """Every layer with a scored input has data and reads neutral (0 points) except SETUP and CONFIRM.
+
+    NARRATIVE has no scored input (its Tiingo news count is shown, not
+    scored, since the Codex HOLD on #1395 f821c50c), so it is unavailable here.
+    """
     return {
         "latest": {"vix_spot": 36.0, "hy_oas_spread": 5.5, "yld_curve_2s10s": -0.25},
         # Rows the CROWD / NARRATIVE inputs read through _read_known.
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [100.0] * 40, as_of),        # CROWD data, 0 points
             "put_call_ratio": _d8_obs("put_call_ratio", [0.9], as_of),  # market-wide, 0 points
-            _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 40, as_of),        # NARRATIVE data (1/day), 0 points
+            _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 40, as_of),        # NARRATIVE: shown, not scored
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
         # FLOW data: a 60-day volatility baseline and no spike, 0 points.
@@ -1087,6 +1091,9 @@ def _d8_install(monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]) -> None:
     monkeypatch.setattr(cs, "_load_latest", lambda _c, name, **_k: data["latest"].get(name))
     monkeypatch.setattr(cs, "_read_known", lambda _c, sid, *_a, **_k: data["known"].get(sid, []))
     monkeypatch.setattr(cs, "_ftd_series_ids", lambda *_a, **_k: data["ftd_ids"])
+    # The fixture's FTD rows are filed under the ticker (the identity check
+    # itself is tested on a real raw_series table in test_conviction_scorer.py).
+    monkeypatch.setattr(cs, "_ftd_identity_break", lambda *_a, **_k: None)
     monkeypatch.setattr(cs, "FLOW_BASELINE_RETURNS", data["flow_baseline_returns"])
     monkeypatch.setattr(cs, "_form4_ps_window", lambda *_a, **_k: data["form4"])
 
@@ -1107,7 +1114,7 @@ class TestDefect8NoLayerPromotesByMissingData:
         report = _d8_score(monkeypatch, _d8_neutral_data(AS_OF))
 
         assert (report.total_score, report.alert_level) == (_D8_NEUTRAL_TOTAL, "WATCH")
-        assert report.unavailable_layers == ("COMPANY",)
+        assert report.unavailable_layers == ("COMPANY", "NARRATIVE")
         assert {layer.name: layer.score for layer in report.layers} == {
             "SETUP": 12, "SMART_MONEY": 0, "CROWD": 0, "NARRATIVE": 0, "FLOW": 0, "CONFIRM": 10,
         }
@@ -1116,8 +1123,8 @@ class TestDefect8NoLayerPromotesByMissingData:
     @pytest.mark.parametrize(
         "missing",
         # Before the fix: CROWD 38, NARRATIVE 34, FLOW 36 (SMART_MONEY was 32
-        # since Defect 7).
-        ["CROWD", "NARRATIVE", "FLOW", "SMART_MONEY"],
+        # since Defect 7). NARRATIVE is unavailable in the baseline itself.
+        ["CROWD", "FLOW", "SMART_MONEY"],
     )
     def test_a_missing_layer_scores_the_same_as_that_layer_read_neutral(
         self, monkeypatch: pytest.MonkeyPatch, missing: str,
@@ -1128,7 +1135,9 @@ class TestDefect8NoLayerPromotesByMissingData:
         assert layer.data_available is False
         assert layer.trust < cs.LAYER_FULL_TRUST[missing]
         assert layer.denominator_trust == cs.LAYER_FULL_TRUST[missing]
-        assert report.unavailable_layers == ("COMPANY", missing)
+        assert report.unavailable_layers == tuple(
+            name for name in cs.LAYER_MAX_SCORE if name in {"COMPANY", "NARRATIVE", missing}
+        )
         assert (report.total_score, report.alert_level) == (_D8_NEUTRAL_TOTAL, "WATCH")
 
     def test_every_ticker_layer_missing_still_scores_32_not_47(
@@ -1242,9 +1251,10 @@ class TestDefect8NoLayerPromotesByMissingData:
 # PASS, the same sell on a short window 24 PASS, and SMART_MONEY unavailable
 # 26 WATCH. The alert now comes from score_low (every unknown at its worst
 # attainable value) and total_score stays the neutral point estimate.
-# (2) The current scorers top out at 40.90 of 63.15 = 65 (81 before the
-# inputs with no live writer stopped counting, 2026-11-23), so CONVICTION (85)
-# and FIRE (70) are unreachable; reports say so instead of implying they are live.
+# (2) The current scorers top out at 38.40 of 63.15 = 61 (81 before the
+# inputs with no live writer stopped counting and news became descriptive,
+# 2026-11-23), so CONVICTION (85) and FIRE (70) are unreachable; reports say
+# so instead of implying they are live.
 
 _LEVEL_ORDER = ("PASS", "WATCH", "PILOT", "SCALE", "FIRE", "CONVICTION")
 
@@ -1296,7 +1306,7 @@ def _d9_max_data(as_of: date) -> dict[str, Any]:
         "known": {
             _D8_FTD: _d8_obs(_D8_FTD, [1_000.0] * 80 + [50_000.0] * 10, as_of),   # FTD surge 5
             "put_call_ratio": _d8_obs("put_call_ratio", [1.3], as_of),          # PCR 3
-            _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 60 + [49.0] * 31, as_of),       # news surge 5
+            _D8_NEWS: _d8_obs(_D8_NEWS, [7.0] * 60 + [49.0] * 31, as_of),       # shown, not scored
         },
         "ftd_ids": {_D8_TICKER: (_D8_FTD,)},
         "flow_baseline_returns": cs.FLOW_BASELINE_RETURNS,
@@ -1382,14 +1392,14 @@ class TestDefect9LostEvidenceAndDormantConviction:
         assert {layer.name: layer.score for layer in report.layers} == {
             name: cs.LAYER_ATTAINABLE_SCORE[name] for name in cs.LAYER_FULL_TRUST if name != "COMPANY"
         }
-        # ... earns 40.90 of 63.15 = 65: SCALE is the highest reachable alert.
-        assert (report.total_score, report.score_low, report.score_high) == (65, 65, 65)
+        # ... earns 38.40 of 63.15 = 61: SCALE is the highest reachable alert.
+        assert (report.total_score, report.score_low, report.score_high) == (61, 61, 61)
         assert report.alert_level == "SCALE"
-        assert report.max_attainable_score == 65
+        assert report.max_attainable_score == 61
         assert report.dormant_alert_levels == ("CONVICTION", "FIRE")
         thresholds = dict(cs.ALERT_THRESHOLDS)
         assert min(thresholds["CONVICTION"], thresholds["FIRE"]) > report.max_attainable_score
-        assert all(floor <= 65 for name, floor in cs.ALERT_THRESHOLDS if name not in {"CONVICTION", "FIRE"})
+        assert all(floor <= 61 for name, floor in cs.ALERT_THRESHOLDS if name not in {"CONVICTION", "FIRE"})
 
     def test_bound_tables_agree_with_the_scorers(self) -> None:
         assert set(cs.LAYER_MIN_SCORE) == set(cs.LAYER_ATTAINABLE_SCORE) == set(cs.LAYER_MAX_SCORE)
@@ -1431,5 +1441,5 @@ class TestDefect9LostEvidenceAndDormantConviction:
         }
         for body in bodies.values():
             assert body["alert_basis"] == "score_low"
-            assert body["max_attainable_score"] == 65
+            assert body["max_attainable_score"] == 61
             assert body["dormant_alert_levels"] == ["CONVICTION", "FIRE"]
