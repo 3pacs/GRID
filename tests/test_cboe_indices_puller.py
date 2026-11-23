@@ -452,12 +452,15 @@ def test_equity_series_maps_to_the_feature_its_revision_registers():
     assert {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}[EQUITY] == "equity_put_call_ratio"
 
 
-def test_equity_revision_is_idempotent_dated_and_refuses_downgrade():
+def test_equity_revision_is_idempotent_literal_and_refuses_downgrade():
     rev = importlib.import_module(_EQUITY_REVISION)
     sql = " ".join(rev.EQUITY_PCR_FEATURE.split())
     assert sql.endswith("ON CONFLICT (name) DO NOTHING")
-    # Dated from the total ratio on the same page; never model-eligible on day one.
-    assert "'put_call_ratio')" in sql and "first_obs.obs_date, FALSE" in sql
+    # Codex review 6026828927 finding 2: a literal row, registered whatever
+    # raw_series holds (tests/test_cboe_equity_pcr_fresh_install_pg.py runs
+    # it on a fresh database). Never model-eligible on day one.
+    assert "raw_series" not in sql and "JOIN" not in sql.upper() and "SELECT" not in sql.upper()
+    assert sql.endswith("'FORWARD_FILL', '2026-11-20', FALSE) ON CONFLICT (name) DO NOTHING")
     assert "%s" not in sql and "{}" not in sql
     assert len(rev.revision) <= 32 and rev.down_revision == "market_state_prov_20261122"
     with pytest.raises(RuntimeError, match="refused"):

@@ -13,10 +13,20 @@ not in registry", the ghost-mapping case of ``finra_ats_feature_20261020``).
 
 It sits beside ``put_call_ratio`` (schema.sql: family ``vol``, RAW, lag 0,
 FORWARD_FILL), but ``model_eligible`` is FALSE: the series starts in November
-2026, so no model has seen it. The series does not exist when this revision
-runs, so ``eligible_from_date`` is dated from the first SUCCESS row of
-``put_call_ratio``, which comes from the same page; skipped if that has no
-data (an empty database).
+2026, so no model has seen it.
+
+The row is a literal, so every database gets it whatever raw_series holds
+(Codex review 6026828927 finding 2). The first version dated it from
+``put_call_ratio``'s first SUCCESS row through a CROSS JOIN, which inserts
+nothing on a fresh database; Alembic never replays a revision, so the
+equity series would have been a ghost mapping there for good.
+``eligible_from_date`` is 2026-11-20, the first session whose page was read
+and checked for this ratio (0.77, the fixture
+``tests/fixtures/cboe/daily_options_2026-11-20.json``). Nothing reads the
+date to admit rows (the resolver keys on the name); a backfill may store
+earlier sessions. griddb was at ``market_state_prov_20261122`` with no
+``equity_put_call_ratio`` row on 2026-11-23, so no database ran the first
+version.
 
 Idempotent: ``ON CONFLICT (name) DO NOTHING``. Downgrade refuses, like
 ``finra_dix_feature_20261113``.
@@ -36,29 +46,14 @@ depends_on: str | Sequence[str] | None = None
 log = logging.getLogger("alembic.runtime.migration")
 
 EQUITY_PCR_FEATURE = """
-WITH candidate (name, family, description, transformation, transformation_version,
-                lag_days, normalization, missing_data_policy, dating_series_id) AS (
-  VALUES
-  ('equity_put_call_ratio', 'vol', 'CBOE equity PUT/CALL volume ratio',
-   'Cboe daily options page, ratios[] EQUITY PUT/CALL RATIO', 1, 0, 'RAW', 'FORWARD_FILL',
-   'put_call_ratio')
-)
 INSERT INTO feature_registry
   (name, family, description, transformation,
    transformation_version, lag_days, normalization, missing_data_policy,
    eligible_from_date, model_eligible)
-SELECT c.name, c.family, c.description, c.transformation,
-       c.transformation_version, c.lag_days, c.normalization, c.missing_data_policy,
-       first_obs.obs_date, FALSE
-FROM candidate c
-CROSS JOIN LATERAL (
-  SELECT r.obs_date
-  FROM raw_series r
-  WHERE r.series_id = c.dating_series_id
-    AND r.pull_status = 'SUCCESS'
-  ORDER BY r.obs_date ASC
-  LIMIT 1
-) AS first_obs
+VALUES
+  ('equity_put_call_ratio', 'vol', 'CBOE equity PUT/CALL volume ratio',
+   'Cboe daily options page, ratios[] EQUITY PUT/CALL RATIO', 1, 0, 'RAW', 'FORWARD_FILL',
+   '2026-11-20', FALSE)
 ON CONFLICT (name) DO NOTHING
 """
 
@@ -67,9 +62,7 @@ REGISTERED_FEATURES: dict[str, str] = {"equity_put_call_ratio": "equity_put_call
 
 def upgrade() -> None:
     conn = op.get_bind()
-    op.execute("SET LOCAL statement_timeout = '120s'")
     op.execute(EQUITY_PCR_FEATURE)
-    op.execute("SET LOCAL statement_timeout TO DEFAULT")
     n = conn.execute(text("SELECT count(*) FROM feature_registry WHERE name = ANY(:n)"),
                      {"n": list(REGISTERED_FEATURES)}).scalar()
     log.warning("feature_registry equity put/call: %d of %d present after upgrade.", n, len(REGISTERED_FEATURES))
