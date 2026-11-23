@@ -28,6 +28,7 @@ from scipy.stats import norm
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.feature_ids import feature_ids
 from store.options_iv import positive_finite, wing_comparison_key
 from store.options_provenance import (
     VISIBLE_DAILY_SIGNALS,
@@ -1036,20 +1037,25 @@ class VolSurfaceEngine:
             if price is not None:
                 return price
 
-            # Try resolved_series (yfinance close)
-            row = conn.execute(
+            # Try resolved_series (yfinance close). The ids are bound and each
+            # feature's newest row is read through LATERAL (store.feature_ids):
+            # matched through a feature_registry name join, smh_close (241k
+            # rows) took 195 ms per read on griddb (2026-11-23); < 1 ms bound.
+            # Same-date ties: the newest vintage, then {t}_close before {t}.
+            fids = feature_ids(conn, [f"{ticker.lower()}_close", ticker.lower()])
+            row = None if not fids else conn.execute(
                 text("""
-                    SELECT rs.value FROM resolved_series rs
-                    JOIN feature_registry fr ON rs.feature_id = fr.id
-                    WHERE (fr.name = :name1 OR fr.name = :name2)
-                    AND rs.obs_date <= :d
-                    ORDER BY rs.obs_date DESC LIMIT 1
+                    SELECT x.value
+                    FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord)
+                    CROSS JOIN LATERAL (
+                        SELECT rs.value, rs.obs_date FROM resolved_series rs
+                        WHERE rs.feature_id = f.id
+                        AND rs.obs_date <= :d
+                        ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1
+                    ) x
+                    ORDER BY x.obs_date DESC, f.ord LIMIT 1
                 """),
-                {
-                    "name1": f"{ticker.lower()}_close",
-                    "name2": ticker.lower(),
-                    "d": as_of_date,
-                },
+                {"fids": fids, "d": as_of_date},
             ).fetchone()
             price = recorded_price(row)
             if price is not None:

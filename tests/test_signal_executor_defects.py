@@ -515,14 +515,21 @@ class TestDefect5PriceFreshnessAndPIT:
         def _exec(stmt, params=None):
             captured.append((str(stmt), params))
             res = MagicMock()
+            if "FROM feature_registry" in str(stmt):
+                # store.feature_ids.feature_id: the id is bound first (#1399).
+                res.fetchone.return_value = (42,)
+                return res
             res.fetchall.return_value = [(date(2026, 11, 20), 500.5), (date(2026, 11, 19), 495.0)]
             return res
 
         conn.execute.side_effect = _exec
         rows = se._get_latest_prices(conn, "spy_close", 2, as_of=as_of)
         assert rows == [(date(2026, 11, 20), 500.5), (date(2026, 11, 19), 495.0)]
-        assert len(captured) == 1
-        sql, params = captured[0]
+        assert len(captured) == 2
+        assert captured[0][1] == {"name": "spy_close"}
+        sql, params = captured[1]
+        assert "rs.feature_id = :fid" in sql and "feature_registry" not in sql
+        assert params["fid"] == 42
         assert "obs_date <= :as_of" in sql
         assert "release_date <= :as_of" in sql
         # main's vintage-fence guard: knowable at the later of release and vintage.

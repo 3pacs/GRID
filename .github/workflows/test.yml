@@ -378,6 +378,19 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
 
+      # The bound-id resolved_series readers (store/feature_ids.py) run next
+      # to the legacy feature_registry name-join statements on one seeded
+      # schema. REQUIRE_BOUND_ID_READS_PG turns a missing DB URL into a
+      # failure, so this step cannot pass without running the comparisons.
+      - name: Bound-id resolved_series reads PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BOUND_ID_READS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_resolved_series_bound_id_reads_pg.py -q -rA
+
       # #1344: scripts/bulk_resolve.py (run by scripts/server_startup.sh)
       # writes resolved_series in SQL, outside normalization/resolver.py, so
       # its obs_date guard is SQL too. Run it on real PostgreSQL with the

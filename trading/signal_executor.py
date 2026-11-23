@@ -29,6 +29,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
 from ingestion.market_calendar import last_trading_day
+from store.feature_ids import feature_id
 from trading.circuit_breaker import StrategyCircuitBreaker
 from trading.paper_engine import (
     MAX_KELLY_FRACTION,
@@ -74,16 +75,24 @@ def _get_latest_prices(
     Enforces point-in-time bounds (``obs_date``, ``release_date`` and
     ``vintage_date`` all ``<= as_of``: a row is knowable at the later of its
     release and vintage dates, as main's vintage-fence guard requires) and
-    excludes retracted vintages via ``resolved_series_retractions``.
+    excludes retracted vintages via ``resolved_series_retractions``. One row
+    per ``obs_date``: the newest eligible vintage.
+
+    The id is bound rather than matched through a feature_registry name
+    join: the active strategies' features are sector ETF panels (xle_full
+    286k rows), which the join read in full on every call (377 ms on griddb,
+    2026-11-23; < 1 ms bound).
     """
     from store.pit import retraction_cutoff
 
     as_of_date = as_of or date.today()
+    fid = feature_id(conn, feature_name)
+    if fid is None:
+        return []
     rows = conn.execute(text(
-        "SELECT DISTINCT ON (rs.obs_date) rs.obs_date, rs.value "
+        "SELECT DISTINCT ON (obs_date) obs_date, value "
         "FROM resolved_series rs "
-        "JOIN feature_registry fr ON fr.id = rs.feature_id "
-        "WHERE fr.name = :feature_name "
+        "WHERE rs.feature_id = :fid "
         "  AND rs.obs_date <= :as_of "
         "  AND rs.release_date <= :as_of "
         "  AND rs.vintage_date <= :as_of "
@@ -94,10 +103,10 @@ def _get_latest_prices(
         "        AND rr.vintage_date = rs.vintage_date "
         "        AND rr.retracted_at <= :retraction_cutoff"
         "  ) "
-        "ORDER BY rs.obs_date DESC, rs.vintage_date DESC "
+        "ORDER BY obs_date DESC, vintage_date DESC "
         "LIMIT :n"
     ), {
-        "feature_name": feature_name,
+        "fid": fid,
         "as_of": as_of_date,
         "retraction_cutoff": retraction_cutoff(as_of_date),
         "n": n,
