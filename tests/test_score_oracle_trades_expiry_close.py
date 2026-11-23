@@ -243,7 +243,7 @@ CREATE TABLE oracle_predictions (
     model_name TEXT, signals TEXT, verdict TEXT DEFAULT 'pending',
     actual_price DOUBLE PRECISION, actual_move_pct DOUBLE PRECISION, pnl_pct DOUBLE PRECISION,
     scored_at TEXT, score_notes TEXT, dedup_keep BOOLEAN NOT NULL DEFAULT 1,
-    null_write_policy TEXT
+    null_write_policy TEXT, flow_context TEXT
 )
 """
 

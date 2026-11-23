@@ -18,7 +18,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Response
 from loguru import logger as log
 from sqlalchemy import text
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_ORACLE_PREDICTIONS, visible_sql
 from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
@@ -740,7 +740,7 @@ def _fetch_track_record(
                 "COUNT(*) FILTER (WHERE verdict = 'partial') AS partials, "
                 "COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
                 "AVG(pnl_pct) AS avg_pnl_pct, AVG(confidence) AS avg_confidence "
-                "FROM oracle_predictions WHERE " + where_sql
+                "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions WHERE " + where_sql
             ),
             params,
         ).fetchone()
@@ -1879,7 +1879,7 @@ def _fetch_oracle_candidates(conn: Any, limit: int) -> list[dict[str, Any]]:
                     id, created_at, ticker, {prediction_type_expr}, direction, expiry,
                     confidence, expected_move_pct, signal_strength, coherence,
                     model_name, signals, anti_signals, flow_context, verdict
-                FROM oracle_predictions
+                FROM {VISIBLE_ORACLE_PREDICTIONS} oracle_predictions
                 WHERE created_at >= NOW() - (:hours * interval '1 hour')
                 ORDER BY ticker, direction, created_at DESC
             ) latest

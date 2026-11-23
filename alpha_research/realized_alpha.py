@@ -72,6 +72,7 @@ import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 HORIZONS: tuple[int, ...] = (5, 10, 20, 60, 90, 180)
 SOURCES: tuple[str, ...] = ("paper_trades", "oracle_predictions")
@@ -582,7 +583,7 @@ def _collect_oracle_predictions(engine: Engine, as_of: date) -> list[TradeRow]:
                 SELECT id, ticker, direction, entry_price, actual_price,
                        (created_at AT TIME ZONE 'UTC')::date AS entry_date,
                        expiry, verdict, flow_context->>'source' AS fc_source
-                FROM oracle_predictions
+                FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
                 WHERE verdict IS NOT NULL AND verdict <> 'pending'
                   AND actual_price IS NOT NULL
                   AND entry_price IS NOT NULL AND entry_price > 0
