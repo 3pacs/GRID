@@ -38,7 +38,40 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import (
+    ORACLE_PRIVATE_USE_KEY,
+    ORACLE_PRIVATE_USE_SCHWAB,
+    SIGNAL_ROW_IS_SCHWAB,
+    VISIBLE_CAPTURE_BATCHES,
+    VISIBLE_DAILY_SIGNALS,
+    oracle_reads_schwab,
+    provider_is_schwab,
+    visible_sql,
+)
+
+# The one options-signal row the Oracle reads per ticker, values and lineage
+# in one statement (``OracleEngine._read_options_signal``).
+_OPTIONS_SIGNAL_SQL = (
+    "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,"
+    " total_oi, term_structure_slope, oi_concentration, "
+    + SIGNAL_ROW_IS_SCHWAB + " AS schwab_private"
+    " FROM " + VISIBLE_DAILY_SIGNALS
+    + " ods WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)"
+    " ORDER BY signal_date DESC LIMIT 1"
+)
+
+
+@dataclass(frozen=True)
+class OptionsSignalRead:
+    """The options-signal row one Oracle pass consumed, and whether it is Schwab-derived.
+
+    ``values`` is the eight signal columns, or ``None`` when the ticker has no
+    qualifying row. ``schwab_private`` comes from the same statement as the
+    values, so the prediction's tag describes exactly what it used.
+    """
+
+    values: tuple[Any, ...] | None
+    schwab_private: bool
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
@@ -972,7 +1005,23 @@ class OracleEngine:
             self._pit_store_instance = store
         return store
 
-    def _gather_signals(self, ticker: str, families: list[str]) -> list[Signal]:
+    def _read_options_signal(self, ticker: str) -> OptionsSignalRead:
+        """Read this ticker's options-signal row with its lineage. Raises on a DB error.
+
+        The Oracle is the owner's private use (``oracle_reads_schwab()``), so a
+        Schwab-captured day counts once the operator has turned it on. A NULL
+        lineage reads as Schwab (fail closed).
+        """
+        with self.engine.connect() as conn:
+            row = conn.execute(visible_sql(_OPTIONS_SIGNAL_SQL, oracle_reads_schwab()),
+                               {"t": ticker}).fetchone()
+        if row is None:
+            return OptionsSignalRead(None, False)
+        return OptionsSignalRead(tuple(row[:8]), row[8] is None or bool(row[8]))
+
+    def _gather_signals(
+        self, ticker: str, families: list[str], options_read: OptionsSignalRead | None = None,
+    ) -> list[Signal]:
         """Gather all available signals for a ticker across specified families.
 
         Feature history is read through ``store.pit.PITStore`` so only
@@ -982,7 +1031,9 @@ class OracleEngine:
         ``resolved_series`` directly with no vintage filter — the lookahead
         CLAUDE.md forbids on inference paths (LEVER-PACKAGE.md §4.1 item 3).
         Options signals still come from ``options_daily_signals``, which is
-        same-day data with no revision history.
+        same-day data with no revision history. ``_oracle_one_ticker`` passes
+        the row it already read (and tagged the prediction from); a caller
+        without one gets a fresh read.
         """
         from datetime import timedelta
 
@@ -998,14 +1049,10 @@ class OracleEngine:
                 AND model_eligible = TRUE
             """), {"fams": families}).fetchall()
 
-            # Add options signals if available
-            opt_row = conn.execute(visible_sql("""
-                SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
-                       total_oi, term_structure_slope, oi_concentration
-                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
-                WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)
-                ORDER BY signal_date DESC LIMIT 1
-            """), {"t": ticker}).fetchone()
+        # Add options signals if available: the row the caller tagged from.
+        if options_read is None:
+            options_read = self._read_options_signal(ticker)
+        opt_row = options_read.values
 
         # Feature z-scores over the trailing window, PIT-correct as of today.
         meta = {int(r[0]): (str(r[1]), str(r[2])) for r in feat_rows}
@@ -1579,6 +1626,18 @@ class OracleEngine:
         reference = self._get_entry_price_reference(ticker)
         spot = reference.get("price") if reference.get("status") == "measured" else None
         flow_ctx = {**(flow_ctx or {}), "entry_price_basis": reference}
+        # The options-signal row is read once here; the tag below and every
+        # model's signal gathering use this same read.
+        options_read: OptionsSignalRead | None
+        try:
+            options_read = self._read_options_signal(ticker)
+        except Exception as exc:  # noqa: BLE001 - tagged below; gathering reads again
+            log.warning("Oracle {t}: options-signal read failed: {e}", t=ticker, e=str(exc))
+            options_read = None
+        # Every prediction below (abstentions too: their receipt holds the
+        # price) inherits this tag, which keeps it out of non-admin readers.
+        if self._schwab_private_inputs(ticker, reference, options_read):
+            flow_ctx[ORACLE_PRIVATE_USE_KEY] = ORACLE_PRIVATE_USE_SCHWAB
         if not spot:
             log.warning(
                 "Oracle: no spot price for {t} - storing no_data placeholder per model",
@@ -1710,7 +1769,8 @@ class OracleEngine:
                     family_key = tuple(sorted(str(f) for f in model.signal_families))
                     cache_key = (ticker, family_key)
                     if cache_key not in signal_cache:
-                        signal_cache[cache_key] = self._gather_signals(ticker, model.signal_families)
+                        signal_cache[cache_key] = self._gather_signals(
+                            ticker, model.signal_families, options_read=options_read)
                     signals = [replace(sig) for sig in signal_cache[cache_key]]
 
                 # Actor evidence is selected before any credibility boost or vote.
@@ -2629,11 +2689,50 @@ class OracleEngine:
         as_of = datetime.now(timezone.utc)
         try:
             with self.engine.connect() as conn:
-                return load_quote_reference(conn, ticker, as_of=as_of)
+                return load_quote_reference(conn, ticker, as_of=as_of,
+                                            include_schwab=oracle_reads_schwab())
         except Exception:
             log.warning("Oracle reference unavailable for {t}", t=ticker)
             return {"status": "unavailable", "ticker": ticker, "price": None,
                     "reason": "timestamped reference lookup failed"}
+
+    def _schwab_private_inputs(
+        self, ticker: str, reference: Any, options_read: OptionsSignalRead | None,
+    ) -> bool:
+        """True when this ticker's consumed inputs include a Schwab capture. Fails closed.
+
+        Judged on the inputs the prediction actually used, never on a second
+        read of "the latest". Two inputs can carry Schwab data:
+
+        * the frozen entry receipt: Schwab when it names the Schwab provider,
+          or when a non-admin reader cannot see its capture batch, whatever the
+          receipt's status (an unqualified receipt still holds the price). A
+          price with no capture batch is of unknown origin, so it is private;
+        * the options-signal row (``options_read``), whose lineage was selected
+          in the same statement as its values. No read (it failed) is private.
+
+        If the batch check fails, the prediction is tagged.
+        """
+        if options_read is None or options_read.schwab_private:
+            return True
+        if not isinstance(reference, dict):
+            return True
+        if provider_is_schwab(reference.get("provider")):
+            return True
+        batch_id = reference.get("capture_batch_id")
+        if not batch_id:
+            return reference.get("price") is not None
+        try:
+            with self.engine.connect() as conn:
+                public_batch = conn.execute(visible_sql(
+                    "SELECT 1 FROM " + VISIBLE_CAPTURE_BATCHES
+                    + " b WHERE b.capture_batch_id = :id"
+                ), {"id": batch_id}).fetchone()
+        except Exception as exc:  # noqa: BLE001 - fail closed: an unproven input is private
+            log.warning("Oracle: Schwab-input check failed for {t}, tagging private: {e}",
+                        t=ticker, e=str(exc))
+            return True
+        return public_batch is None
 
     def _get_spot_price(self, ticker: str) -> float | None:
         """Compatibility price-only view of the qualified reference receipt."""

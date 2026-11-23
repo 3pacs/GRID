@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 def get_system_context() -> str:
@@ -294,7 +295,7 @@ def _get_active_predictions() -> str:
         with engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT prediction_text, confidence, target_date "
-                "FROM oracle_predictions "
+                "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                 "WHERE status = 'ACTIVE' AND target_date > CURRENT_DATE "
                 "ORDER BY confidence DESC LIMIT 3"
             )).fetchall()

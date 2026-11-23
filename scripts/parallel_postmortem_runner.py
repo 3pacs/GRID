@@ -51,6 +51,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from db import get_engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 _DEFAULT_PROVIDERS = [
@@ -72,7 +73,7 @@ def _count_candidates(engine, days: int = 30) -> tuple[int, int]:
               AND id NOT IN (SELECT trade_id FROM trade_postmortems WHERE trade_id IS NOT NULL)
         """), {"d": int(days)}).scalar() or 0)
         n_pred = int(c.execute(text("""
-            SELECT COUNT(*) FROM oracle_predictions
+            SELECT COUNT(*) FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict = 'miss'
               AND scored_at >= CURRENT_DATE - (:d || ' days')::interval
               AND id NOT IN (SELECT prediction_id FROM trade_postmortems WHERE prediction_id IS NOT NULL)
@@ -155,7 +156,7 @@ def _worker_main() -> int:
             ORDER BY closed_at DESC
         """), {"d": days, "n": partitions, "i": idx}).fetchall()
         pred_rows = c.execute(text("""
-            SELECT id FROM oracle_predictions
+            SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict = 'miss'
               AND scored_at >= CURRENT_DATE - (:d || ' days')::interval
               AND id NOT IN (SELECT prediction_id FROM trade_postmortems WHERE prediction_id IS NOT NULL)
