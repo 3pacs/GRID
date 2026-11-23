@@ -26,6 +26,7 @@ from api.routers.watchlist_helpers import (
 # is how they drift. Module-level import is cheap: entity_resolver's own
 # imports are stdlib + loguru + sqlalchemy.
 from intelligence.entity_resolver import _log_query_failure
+from store.feature_ids import feature_ids
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
 router = APIRouter(tags=["watchlist"])
@@ -129,14 +130,24 @@ def get_ticker_overview(
     feature_names = _resolve_feature_names(ticker_upper)
 
     with engine.connect() as conn:
-        # Price
+        # Price. The candidate features' ids are bound and each one's newest
+        # row is read through LATERAL (store.feature_ids): matched through a
+        # feature_registry name join, spy_full's 225k vintages were read and
+        # sorted per request (182 ms on griddb, 2026-11-23; 0.7 ms bound).
+        # Same-date ties: the newest vintage, then the first candidate listed
+        # (store.feature_ids).
         try:
-            price_row = conn.execute(text(
-                "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                "WHERE fr.name = ANY(:names) "
-                "ORDER BY rs.obs_date DESC LIMIT 1"
-            ), {"names": feature_names}).fetchone()
+            fids = feature_ids(conn, feature_names)
+            price_row = None if not fids else conn.execute(text(
+                "SELECT x.value, x.obs_date "
+                "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
+                "CROSS JOIN LATERAL ("
+                "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                "  WHERE rs.feature_id = f.id "
+                "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                ") x "
+                "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
+            ), {"fids": fids}).fetchone()
             if price_row:
                 price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
         except Exception as exc:
@@ -214,19 +225,26 @@ def get_ticker_overview(
                 if pattern not in like_patterns:
                     like_patterns.append(pattern)
 
+            # Each matched feature's newest obs_date is computed once (LATERAL),
+            # not once per resolved_series row: the correlated MAX ran for every
+            # vintage of every matched feature (1.1-3.9 s for spy%, aapl%, xle% on griddb,
+            # 2026-11-23); this form takes ~2 ms. One row per feature: the newest
+            # vintage of its newest date (the old read returned every vintage of
+            # that date, in no set order).
             feat_rows = conn.execute(
                 text(
-                    "SELECT fr.name, rs.value, rs.obs_date "
-                    "FROM resolved_series rs "
-                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                    "SELECT DISTINCT ON (fr.name) fr.name, rs.value, rs.obs_date "
+                    "FROM feature_registry fr "
+                    "CROSS JOIN LATERAL ("
+                    "  SELECT MAX(rs2.obs_date) AS max_obs FROM resolved_series rs2 "
+                    "  WHERE rs2.feature_id = fr.id"
+                    ") m "
+                    "JOIN resolved_series rs "
+                    "  ON rs.feature_id = fr.id AND rs.obs_date = m.max_obs "
                     "WHERE (" + " OR ".join(
                         f"fr.name LIKE :p{i}" for i in range(len(like_patterns))
                     ) + ") "
-                    "AND rs.obs_date = ("
-                    "  SELECT MAX(rs2.obs_date) FROM resolved_series rs2 "
-                    "  WHERE rs2.feature_id = rs.feature_id"
-                    ") "
-                    "ORDER BY fr.name LIMIT 10"
+                    "ORDER BY fr.name, rs.vintage_date DESC LIMIT 10"
                 ),
                 {f"p{i}": p for i, p in enumerate(like_patterns)},
             ).fetchall()
@@ -513,18 +531,29 @@ def get_ticker_quote(
             # SAME day and turn change_pct into a same-day delta (often 0).
             # Pin to the single feature with the freshest row first, then
             # collapse to one (latest-vintage) value per calendar day.
-            rows = conn.execute(text(
+            # The winner is picked from each candidate's newest row (LATERAL
+            # over the bound ids, store.feature_ids); matched through a
+            # feature_registry name join it sorted every vintage first
+            # (spy_full: 144 ms on griddb, 2026-11-23, max 29 s; 0.9 ms bound).
+            # Candidates whose newest row has the same date and vintage: the
+            # first one listed wins (WITH ORDINALITY).
+            fids = feature_ids(conn, feature_names)
+            rows = [] if not fids else conn.execute(text(
                 "WITH winner AS ("
-                "  SELECT rs.feature_id FROM resolved_series rs "
-                "  JOIN feature_registry fr ON fr.id = rs.feature_id "
-                "  WHERE fr.name = ANY(:names) "
-                "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                "  SELECT f.id AS feature_id "
+                "  FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
+                "  CROSS JOIN LATERAL ("
+                "    SELECT rs.obs_date, rs.vintage_date FROM resolved_series rs "
+                "    WHERE rs.feature_id = f.id "
+                "    ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                "  ) x "
+                "  ORDER BY x.obs_date DESC, x.vintage_date DESC, f.ord LIMIT 1"
                 ") "
                 "SELECT DISTINCT ON (rs.obs_date) rs.value, rs.obs_date "
                 "FROM resolved_series rs "
                 "WHERE rs.feature_id = (SELECT feature_id FROM winner) "
                 "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 2"
-            ), {"names": feature_names}).fetchall()
+            ), {"fids": fids}).fetchall()
             daily_rows = rows
             if rows:
                 price = float(rows[0][0])

@@ -30,6 +30,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.market_calendar import last_trading_day
+from store.feature_ids import feature_ids
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_SNAPSHOTS, visible_sql
 from trading.trade_ticket_generator import MAX_KELLY_PER_TICKET
 
@@ -2029,17 +2030,21 @@ Respond with ONLY the JSON object."""
     def _get_spot(self, db: Engine, ticker: str) -> float:
         """Get latest spot price for a ticker."""
         with db.connect() as conn:
-            row = conn.execute(text("""
-                SELECT rs.value
-                FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name = :fname OR fr.name = :fname2
-                ORDER BY rs.obs_date DESC
+            # Bound ids, each feature's newest row through LATERAL
+            # (store.feature_ids); the name join read every vintage first.
+            # Same-date ties: the newest vintage, then {t}_close before {t}.
+            fids = feature_ids(conn, [f"{ticker.lower()}_close", ticker.lower()])
+            row = None if not fids else conn.execute(text("""
+                SELECT x.value
+                FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord)
+                CROSS JOIN LATERAL (
+                    SELECT rs.value, rs.obs_date FROM resolved_series rs
+                    WHERE rs.feature_id = f.id
+                    ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1
+                ) x
+                ORDER BY x.obs_date DESC, f.ord
                 LIMIT 1
-            """), {
-                "fname": f"{ticker.lower()}_close",
-                "fname2": ticker.lower(),
-            }).fetchone()
+            """), {"fids": fids}).fetchone()
         return float(row[0]) if row else 0.0
 
     def _get_atm_iv(
