@@ -6,23 +6,44 @@ trust in the underlying data. A score of 85+ with all layers confirming
 = highest conviction. Uses ONLY data that actually exists in raw_series.
 
 Layers:
-  1. SETUP      (20 pts) — VIX, HY spread, PSI, drawdown severity
+  1. SETUP      (17 pts) — VIX, HY spread, curve, drawdown severity
   2. COMPANY    (15 pts) — Revenue trend, EPS, shares outstanding, cash
-  3. SMART_MONEY(15 pts) — Insider buying (Form 4), institutional flows
+  3. SMART_MONEY(15 pts) — Insider reported P/S (Form 4)
   4. CROWD      (15 pts) — Short ratio, FTD, put/call ratio
   5. NARRATIVE  (10 pts) — News volume trend, wiki attention
   6. FLOW       (15 pts) — Volume spike, options unusual activity
   7. CONFIRM    (10 pts) — Price momentum turning, higher low formed
 
 Each layer returns (score, max_possible, trust_weight, signals[]).
-Final score = sum(score * trust) / sum(max * trust) * 100
+Final score = sum(score * trust) / sum(max * full_trust) * 100, where
+full_trust is the layer's trust with its data in hand (LAYER_FULL_TRUST):
+missing or thinner data lowers a layer's numerator weight only, never the
+denominator, so a missing layer can never raise the total above that layer
+read neutral. (It can still sit above that layer read adverse, which is why
+the alert does not come from the total; see score_low below.)
+
+total_score treats a missing layer as contributing nothing (neutral). The
+alert level instead comes from score_low, the total with every unknown at
+its worst attainable value (LAYER_MIN_SCORE): a missing layer at its minimum
+over its full weight, and the untrusted share of a partly trusted layer
+(full_trust - trust) at its minimum. Lost evidence therefore never promotes
+an alert: a layer that goes missing can only lower score_low, since its
+minimum is at or below anything it could have measured. score_high is the
+same with every unknown at its best attainable value (LAYER_ATTAINABLE_SCORE).
+
+CONVICTION (85) is dormant: with the current scorers the best attainable
+total is 81 (50.95 of 63.15), so the ladder tops out at FIRE. Each report
+says so (max_attainable_score, dormant_alert_levels); raising it needs a
+separately approved recalibration, not a quiet threshold change.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
+from types import MappingProxyType
 
 import pandas as pd
 from loguru import logger as log
@@ -43,10 +64,12 @@ class LayerResult:
     signals: tuple[str, ...]
     data_available: bool
     # Weight of max_score in the composite denominator; None means ``trust``.
-    # A layer whose certainty can drop (SMART_MONEY's Form 4 coverage) keeps
-    # its full-certainty weight here, so lost certainty can only shrink its
-    # contribution toward neutral and never raises total_score by shrinking
-    # the denominator (Codex HOLD on #1353 57514cc5).
+    # Every layer scorer sets it to the layer's full-data trust
+    # (LAYER_FULL_TRUST), so missing or thinner data can only shrink a
+    # layer's contribution toward zero and never raises total_score by
+    # shrinking the denominator (Codex HOLD on #1353 57514cc5 for
+    # SMART_MONEY; the same hole in CROWD / NARRATIVE / FLOW / CONFIRM /
+    # SETUP closed 2026-11-23).
     baseline_trust: float | None = None
 
     @property
@@ -60,9 +83,17 @@ class ConvictionReport:
     total_score: int  # 0-100
     confidence_pct: float
     layers: tuple[LayerResult, ...]
-    alert_level: str  # WATCH / PILOT / SCALE / FIRE / CONVICTION
+    alert_level: str  # PASS / WATCH / PILOT / SCALE / FIRE / CONVICTION, from score_low
     timestamp: str
     unavailable_layers: tuple[str, ...] = ()
+    # Total with every unknown at its worst / best attainable value (see the
+    # module docstring); score_ticker sets the alert level from score_low.
+    score_low: int | None = None
+    score_high: int | None = None
+    # Best total the current scorers can produce over the present layers,
+    # and the alert levels it cannot reach (CONVICTION while it is 81).
+    max_attainable_score: int | None = None
+    dormant_alert_levels: tuple[str, ...] = ()
 
 
 def _resolve_as_of_date(as_of_date: date | None) -> date:
@@ -192,9 +223,76 @@ def _load_price(
 
 # Max attainable SETUP points: drawdown 5 + VIX 5 + credit 4 + curve 3. The
 # 3-point planetary_stress_index component was removed 2026-09-10 (astrology
-# is not a market-scoring input); the layer's 20-point weight in the composite
-# is preserved through LayerResult.max_score.
+# is not a market-scoring input), so the layer's weight is 17, not 20.
 SETUP_MAX_SCORE = 17
+
+# Each layer's fixed weight in score_ticker's denominator: its max points and
+# its trust with its data in hand. A layer scorer returns its own trust
+# (lower when its data is missing or thin), which weights the numerator only;
+# the denominator weight is the same for every ticker and date, so a ticker
+# with a missing layer never scores above one whose same layer read neutral.
+LAYER_MAX_SCORE: Mapping[str, float] = MappingProxyType({
+    "SETUP": float(SETUP_MAX_SCORE),
+    "COMPANY": 15.0,
+    "SMART_MONEY": 15.0,
+    "CROWD": 15.0,
+    "NARRATIVE": 10.0,
+    "FLOW": 15.0,
+    "CONFIRM": 10.0,
+})
+LAYER_FULL_TRUST: Mapping[str, float] = MappingProxyType({
+    "SETUP": 0.95,
+    "COMPANY": 0.90,
+    "SMART_MONEY": 0.85,
+    "CROWD": 0.75,
+    "NARRATIVE": 0.50,
+    "FLOW": 0.60,
+    "CONFIRM": 0.90,
+})
+
+# Each layer's lowest and highest points its current scorer can produce. Only
+# SMART_MONEY goes below zero (the Form 4 sell cap, -2); the others top out
+# where their components sum: SETUP 5+5+4+3, COMPANY 4+3+4+4, SMART_MONEY the
+# +5 strong-buy tier, CROWD 5+5+3, NARRATIVE 5+2+1, FLOW 5+5+3, CONFIRM
+# 3+4+3. They bound what an unknown could have been (score_low / score_high)
+# and which alert levels are reachable at all; max_score stays the weight.
+LAYER_MIN_SCORE: Mapping[str, float] = MappingProxyType({
+    "SETUP": 0.0,
+    "COMPANY": 0.0,
+    "SMART_MONEY": -2.0,
+    "CROWD": 0.0,
+    "NARRATIVE": 0.0,
+    "FLOW": 0.0,
+    "CONFIRM": 0.0,
+})
+LAYER_ATTAINABLE_SCORE: Mapping[str, float] = MappingProxyType({
+    "SETUP": 17.0,
+    "COMPANY": 15.0,
+    "SMART_MONEY": 5.0,
+    "CROWD": 13.0,
+    "NARRATIVE": 8.0,
+    "FLOW": 13.0,
+    "CONFIRM": 10.0,
+})
+
+
+def _layer_result(
+    name: str,
+    score: float,
+    trust: float,
+    signals: Sequence[str],
+    data_available: bool,
+) -> LayerResult:
+    """A layer's result with its fixed composite weight (LAYER_MAX_SCORE, LAYER_FULL_TRUST)."""
+    return LayerResult(
+        name,
+        score,
+        LAYER_MAX_SCORE[name],
+        trust,
+        tuple(signals),
+        data_available,
+        baseline_trust=LAYER_FULL_TRUST[name],
+    )
 
 
 def score_setup(
@@ -216,7 +314,7 @@ def score_setup(
     yc = _load_latest(conn, "yld_curve_2s10s", as_of_date=as_of_date)
 
     if price.empty:
-        return LayerResult("SETUP", 0, 20, 0.95, (), False)
+        return _layer_result("SETUP", 0, LAYER_FULL_TRUST["SETUP"], (), False)
 
     ath = price.max()
     current = price.iloc[-1]
@@ -259,9 +357,8 @@ def score_setup(
         score += 3
         signals.append(f"YC={yc:.2f} [INVERTED]")
 
-    # Max is 17 since the 3-point celestial component was removed; the layer
-    # keeps its 20-point weight in the composite via LayerResult.max_score.
-    return LayerResult("SETUP", min(score, SETUP_MAX_SCORE), SETUP_MAX_SCORE, 0.95, tuple(signals), True)
+    # Max is 17 since the 3-point celestial component was removed.
+    return _layer_result("SETUP", min(score, SETUP_MAX_SCORE), LAYER_FULL_TRUST["SETUP"], signals, True)
 
 
 def score_company(
@@ -368,8 +465,8 @@ def score_company(
         else:
             signals.append(f"Cash/Liab={cash_ratio:.2f} [WEAK]")
 
-    trust = 0.90 if has_data else 0.20
-    return LayerResult("COMPANY", max(score, 0), 15, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["COMPANY"] if has_data else 0.20
+    return _layer_result("COMPANY", max(score, 0), trust, signals, has_data)
 
 
 # SMART_MONEY Form 4 input: reported non-derivative P/S transactions only
@@ -415,9 +512,9 @@ _FORM4_MIN_VERIFIED_DAYS = 7
 _FORM4_PS_LABEL = "Insider reported P/S (non-derivative, venue unknown)"
 _FORM4_VALUE_STRONG_USD = 500_000.0
 _FORM4_SELL_CAP = -2.0
-# SMART_MONEY's trust on a full verified 90-day window, and its fixed weight
-# in score_ticker's denominator whatever the coverage (LayerResult.baseline_trust).
-_SMART_MONEY_FULL_TRUST = 0.85
+# SMART_MONEY's trust on a full verified 90-day window is
+# LAYER_FULL_TRUST["SMART_MONEY"], which is also its fixed weight in
+# score_ticker's denominator whatever the coverage (LayerResult.baseline_trust).
 
 
 @dataclass(frozen=True)
@@ -579,15 +676,13 @@ def score_smart_money(
     # sorted last (Codex HOLD on #1353 5c4c7b32).
     signals.append("Institutional flow unavailable (no INST_FLOW writer; 13F is non-directional)")
 
-    trust = (_SMART_MONEY_FULL_TRUST if full_window else 0.5) if has_data else 0.15
-    return LayerResult(
+    trust = (LAYER_FULL_TRUST["SMART_MONEY"] if full_window else 0.5) if has_data else 0.15
+    return _layer_result(
         "SMART_MONEY",
         max(_FORM4_SELL_CAP, min(points, 15.0)),
-        15,
         trust,
-        tuple(signals),
+        signals,
         has_data,
-        baseline_trust=_SMART_MONEY_FULL_TRUST,
     )
 
 
@@ -641,8 +736,8 @@ def score_crowd(
             score += 1
             signals.append(f"PCR={pcr:.2f} [BEARISH]")
 
-    trust = 0.75 if has_data else 0.15
-    return LayerResult("CROWD", min(score, 15), 15, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["CROWD"] if has_data else 0.15
+    return _layer_result("CROWD", min(score, 15), trust, signals, has_data)
 
 
 def score_narrative(
@@ -682,8 +777,8 @@ def score_narrative(
         score += 1
         signals.append(f"GDELT high ({gdelt:.0f} articles)")
 
-    trust = 0.50 if has_data else 0.10
-    return LayerResult("NARRATIVE", min(score, 10), 10, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["NARRATIVE"] if has_data else 0.10
+    return _layer_result("NARRATIVE", min(score, 10), trust, signals, has_data)
 
 
 def score_flow(
@@ -698,7 +793,7 @@ def score_flow(
     has_data = False
 
     if price.empty or len(price) < 20:
-        return LayerResult("FLOW", 0, 15, 0.10, (), False)
+        return _layer_result("FLOW", 0, 0.10, (), False)
 
     # Volume spike (from price data — use returns as proxy if no volume)
     returns = price.pct_change().dropna()
@@ -729,8 +824,8 @@ def score_flow(
             score += 3
             signals.append(f"Equity PCR={epcr:.2f} [BEARISH - contrarian buy]")
 
-    trust = 0.60 if has_data else 0.15
-    return LayerResult("FLOW", min(score, 15), 15, trust, tuple(signals), has_data)
+    trust = LAYER_FULL_TRUST["FLOW"] if has_data else 0.15
+    return _layer_result("FLOW", min(score, 15), trust, signals, has_data)
 
 
 def score_confirmation(price: pd.Series) -> LayerResult:
@@ -739,7 +834,7 @@ def score_confirmation(price: pd.Series) -> LayerResult:
     signals = []
 
     if price.empty or len(price) < 30:
-        return LayerResult("CONFIRM", 0, 10, 0.10, (), False)
+        return _layer_result("CONFIRM", 0, 0.10, (), False)
 
     current = price.iloc[-1]
 
@@ -773,7 +868,7 @@ def score_confirmation(price: pd.Series) -> LayerResult:
             score += 3
             signals.append(f"Higher low forming (${current:.2f} vs 30d low ${low_30d:.2f})")
 
-    return LayerResult("CONFIRM", min(score, 10), 10, 0.90, tuple(signals), True)
+    return _layer_result("CONFIRM", min(score, 10), LAYER_FULL_TRUST["CONFIRM"], signals, True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -781,6 +876,45 @@ def score_confirmation(price: pd.Series) -> LayerResult:
 # ═══════════════════════════════════════════════════════════════
 
 MIN_COVERAGE_FOR_ALERT = 0.5
+CONVICTION_MIN_COVERAGE = 0.8
+# Alert ladder, highest first: (level, minimum score). Below the last is PASS.
+ALERT_THRESHOLDS: tuple[tuple[str, int], ...] = (
+    ("CONVICTION", 85),
+    ("FIRE", 70),
+    ("SCALE", 55),
+    ("PILOT", 40),
+    ("WATCH", 25),
+)
+
+
+def _pct(weighted: float, weighted_max: float) -> int:
+    return max(0, min(100, int(round(weighted / weighted_max * 100)))) if weighted_max > 0 else 0
+
+
+def _layer_bound(layer: LayerResult, extreme: Mapping[str, float]) -> float:
+    """The layer's weighted contribution with its unknown part at ``extreme``.
+
+    A missing layer is all unknown: its full weight at the extreme (any
+    market-wide points it scored at low trust are not ticker evidence). An
+    available layer keeps its measured score * trust and puts the untrusted
+    share of its weight (full trust - trust) at the extreme.
+    """
+    full = layer.denominator_trust
+    if not layer.data_available:
+        return extreme[layer.name] * full
+    return layer.score * layer.trust + extreme[layer.name] * (full - layer.trust)
+
+
+def _alert_level(score: int, coverage: float) -> str:
+    """Alert for ``score``; thin coverage (< 50 %) caps the alert at WATCH."""
+    level = "PASS"
+    for name, floor in ALERT_THRESHOLDS:
+        if score >= floor and (name != "CONVICTION" or coverage >= CONVICTION_MIN_COVERAGE):
+            level = name
+            break
+    if coverage < MIN_COVERAGE_FOR_ALERT and level in {"CONVICTION", "FIRE", "SCALE", "PILOT"}:
+        level = "WATCH"
+    return level
 
 
 def score_ticker(
@@ -810,54 +944,45 @@ def score_ticker(
     )
 
     # Exclude never-written None layers (COMPANY) from the weighted total, while
-    # keeping data_available=False layers as before (counted as 0) so thin data
+    # keeping data_available=False layers in it (counted as 0) so thin data
     # cannot inflate total_score.
-    # A layer's denominator weight is its baseline_trust when set (see
-    # LayerResult): for SMART_MONEY, a shorter verified window or no coverage
-    # lowers the numerator weight only, so the same evidence with less
-    # certainty can never promote the total.
-    weighted_score = sum(layer.score * layer.trust for layer in present_layers)
+    # A layer's denominator weight is its baseline_trust (its full-data trust,
+    # LAYER_FULL_TRUST): missing data, a shorter SMART_MONEY window or a
+    # too-short price history lowers the numerator weight only, so a missing
+    # layer never lifts total_score above that layer read neutral. Against an
+    # adverse reading it still can (SMART_MONEY -2 lost), so the alert comes
+    # from score_low, where every unknown sits at its worst attainable value
+    # (Codex HOLD on #1394 7da0c760).
     weighted_max = sum(layer.max_score * layer.denominator_trust for layer in present_layers)
-    total = (
-        max(0, min(100, int(round(weighted_score / weighted_max * 100))))
-        if weighted_max > 0
-        else 0
+    total = _pct(sum(layer.score * layer.trust for layer in present_layers), weighted_max)
+    # Unknowns at their worst / best attainable value: a missing layer over
+    # its full weight, a partly trusted layer over its untrusted share.
+    score_low = _pct(sum(_layer_bound(layer, LAYER_MIN_SCORE) for layer in present_layers), weighted_max)
+    score_high = _pct(sum(_layer_bound(layer, LAYER_ATTAINABLE_SCORE) for layer in present_layers), weighted_max)
+    max_attainable = _pct(
+        sum(LAYER_ATTAINABLE_SCORE[layer.name] * LAYER_FULL_TRUST[layer.name] for layer in present_layers),
+        sum(LAYER_MAX_SCORE[layer.name] * LAYER_FULL_TRUST[layer.name] for layer in present_layers),
     )
 
     # Confidence = how much data we actually have across the 7 designed layers
     data_coverage = len(available_layers) / len(named_layers)
     confidence = total * data_coverage
 
-    # Alert level (coverage floor: thin data < 50% coverage is capped at WATCH)
-    if total >= 85 and data_coverage >= 0.8:
-        level = "CONVICTION"
-    elif total >= 70:
-        level = "FIRE"
-    elif total >= 55:
-        level = "SCALE"
-    elif total >= 40:
-        level = "PILOT"
-    elif total >= 25:
-        level = "WATCH"
-    else:
-        level = "PASS"
-
-    if data_coverage < MIN_COVERAGE_FOR_ALERT and level in {
-        "CONVICTION",
-        "FIRE",
-        "SCALE",
-        "PILOT",
-    }:
-        level = "WATCH"
-
     return ConvictionReport(
         ticker=ticker,
         total_score=total,
         confidence_pct=round(confidence, 1),
         layers=present_layers,
-        alert_level=level,
+        # From score_low, so lost evidence never promotes the alert.
+        alert_level=_alert_level(score_low, data_coverage),
         timestamp=pd.Timestamp.now().isoformat(),
         unavailable_layers=unavailable_layers,
+        score_low=score_low,
+        score_high=score_high,
+        max_attainable_score=max_attainable,
+        dormant_alert_levels=tuple(
+            name for name, floor in ALERT_THRESHOLDS if floor > max_attainable
+        ),
     )
 
 
@@ -893,9 +1018,9 @@ def scan_all(
 def print_report(report: ConvictionReport) -> None:
     """Pretty-print a conviction report."""
     log.info(
-        "\n  {t:8s} [{level:10s}] Score={s:3d}/100  Confidence={c:.0f}%",
+        "\n  {t:8s} [{level:10s}] Score={s:3d}/100 (unknowns {lo}..{hi}; alert from {lo})  Confidence={c:.0f}%",
         t=report.ticker, level=report.alert_level,
-        s=report.total_score, c=report.confidence_pct,
+        s=report.total_score, lo=report.score_low, hi=report.score_high, c=report.confidence_pct,
     )
     for layer in report.layers:
         data_flag = "+" if layer.data_available else "-"
