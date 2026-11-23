@@ -30,7 +30,9 @@ DIRECT_ORACLE_PREDICTION_WRITER_FILES = (
 
 def _scored_oracle_query_blocks(source: str) -> list[str]:
     blocks: list[str] = []
-    for match in re.finditer(r"FROM oracle_predictions(?P<body>.*?)(?:ORDER BY|GROUP BY|LIMIT|\"\"\")", source, re.S):
+    # The public-cohort fragment keeps the alias: FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions.
+    source_from = r'FROM (?:"{1,3}\s*\+\s*\w+\s*\+\s*"{1,3}\s*|\{\w+\}\s+)?oracle_predictions'
+    for match in re.finditer(source_from + r"(?P<body>.*?)(?:ORDER BY|GROUP BY|LIMIT|\"\"\")", source, re.S):
         block = match.group(0)
         if re.search(r"verdict\s+IN\s*\(\s*'hit'\s*,\s*'miss'\s*,\s*'partial'\s*\)", block):
             blocks.append(block)

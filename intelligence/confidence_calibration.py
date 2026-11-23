@@ -70,6 +70,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # Bucket boundaries (lower-inclusive, upper-exclusive except the last).
@@ -284,7 +285,7 @@ def build_reliability_curves(
                     SELECT model_name,
                            confidence,
                            CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END AS hit
-                      FROM oracle_predictions
+                      FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
                      WHERE created_at >= NOW() - (:days || ' days')::interval
                        AND verdict IN ('hit', 'miss', 'partial')
                        AND dedup_keep = TRUE

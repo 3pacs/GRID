@@ -39,7 +39,7 @@ _ORACLE_DDL = """
 CREATE TABLE oracle_predictions (
     id TEXT PRIMARY KEY, created_at TIMESTAMPTZ, ticker TEXT, direction TEXT,
     expiry DATE, confidence DOUBLE PRECISION, model_name TEXT, verdict TEXT,
-    scored_at TIMESTAMPTZ, dedup_keep BOOLEAN, horizon_days INTEGER
+    scored_at TIMESTAMPTZ, dedup_keep BOOLEAN, horizon_days INTEGER, flow_context JSONB
 )
 """
 
@@ -94,7 +94,7 @@ def _seed(engine: Engine) -> None:
                 official = k < 8
                 conn.execute(text(
                     "INSERT INTO oracle_predictions VALUES (:id, :c, 'AAA', 'PUT', :e, :conf, :m, "
-                    ":v, :s, TRUE, NULL)"
+                    ":v, :s, TRUE, NULL, NULL)"
                 ), {"id": pid, "c": created, "e": expiry, "conf": t, "m": "options_flow_mut_x",
                     "v": verdict if official else "no_data", "s": created + timedelta(days=8)})
                 if not official:

@@ -8,6 +8,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 def _coerce_int(value: Any) -> int:
@@ -55,7 +56,7 @@ def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> di
                     SUM(CASE WHEN verdict = 'pending' AND expiry > :today THEN 1 ELSE 0 END) AS active,
                     SUM(CASE WHEN verdict = 'pending' AND expiry <= :today THEN 1 ELSE 0 END) AS awaiting_score,
                     SUM(CASE WHEN verdict = 'no_data' THEN 1 ELSE 0 END) AS unscorable
-                FROM oracle_predictions
+                FROM {VISIBLE_ORACLE_PREDICTIONS} oracle_predictions
                 {where_sql}
                 """
             ),
@@ -118,7 +119,7 @@ def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
                            SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials,
                            SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending,
                            SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS pnl
-                    FROM oracle_predictions
+                    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
                     WHERE dedup_keep = TRUE
                     GROUP BY model_name
                 )
@@ -184,7 +185,7 @@ def _fetch_ticker_rows(
                        SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending,
                        AVG(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct END) AS avg_pnl,
                        SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl
-                FROM oracle_predictions
+                FROM {VISIBLE_ORACLE_PREDICTIONS} oracle_predictions
                 {where_sql}
                 GROUP BY ticker
                 {order_sql}
@@ -263,7 +264,7 @@ def _fetch_recording_cohorts(engine: Engine) -> dict[str, dict[str, Any]]:
                    SUM(CASE WHEN verdict = 'no_data' THEN 1 ELSE 0 END),
                    SUM(CASE WHEN verdict IN ('hit', 'partial', 'miss') THEN 1 ELSE 0 END),
                    AVG(CASE WHEN verdict IN ('hit', 'partial', 'miss') THEN pnl_pct END)
-            FROM oracle_predictions WHERE dedup_keep = TRUE GROUP BY recording_policy
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions WHERE dedup_keep = TRUE GROUP BY recording_policy
         """)).fetchall()
     cohorts = {key: {"total": 0, "pending": 0, "unscorable": 0, "scored": 0,
                      "other": 0, "mean_signed_return_pct": None}
