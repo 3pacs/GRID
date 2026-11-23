@@ -41,6 +41,7 @@ import numpy as np
 
 from analysis.offline_research_proof import autocorrelation_block, bh_adjusted
 from evals.e2.scoring import seed_for, splitmix64, wilson_interval
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 RULE_VERSION = "prune_rule_v1"
 PREREGISTRATION_DOC = "docs/research/prune-rule-v1-preregistration.md"
@@ -360,7 +361,7 @@ _ORACLE_CELLS_SQL = """
            SUM(CASE WHEN p.confidence >= 0 AND p.confidence <= 1 AND p.verdict IN ('hit', 'partial')
                     THEN 1 ELSE 0 END) AS prob_y,
            AVG(p.expiry - CAST((p.created_at AT TIME ZONE 'UTC') AS DATE)) AS horizon
-      FROM oracle_predictions p
+      FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ p
      WHERE p.dedup_keep
        AND p.verdict IN ('hit', 'partial', 'miss')
        AND p.direction IN ('CALL', 'PUT')
@@ -376,7 +377,7 @@ _ORACLE_RESCORE_CELLS_SQL = """
            SUM(CASE WHEN p.direction = 'CALL' THEN 1 ELSE 0 END) AS long_calls,
            AVG(p.expiry - CAST((p.created_at AT TIME ZONE 'UTC') AS DATE)) AS horizon
       FROM oracle_prediction_rescores r
-      JOIN oracle_predictions p ON p.id = r.prediction_id
+      JOIN """ + VISIBLE_ORACLE_PREDICTIONS + """ p ON p.id = r.prediction_id
      WHERE p.dedup_keep
        AND r.verdict IN ('hit', 'partial', 'miss')
      GROUP BY 1, 2

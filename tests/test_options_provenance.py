@@ -339,9 +339,21 @@ def test_oracle_quote_reference_skips_the_schwab_batch(db) -> None:
 # ── The Oracle engine: the owner's private use (2026-11-23) ──────────
 
 
-def test_oracle_reads_schwab_is_exactly_true() -> None:
-    assert op.ORACLE_READS_SCHWAB is True
-    assert op.include_schwab_rows(op.ORACLE_READS_SCHWAB) is True
+@pytest.fixture
+def oracle_on(monkeypatch):
+    """The operator switch on grid-hermes: the Oracle reads Schwab captures."""
+    monkeypatch.setenv(op.ORACLE_SCHWAB_ENV, op.ORACLE_SCHWAB_ON)
+
+
+@pytest.mark.parametrize("value,on", [(None, False), ("", False), ("1", False), ("true", False),
+                                      ("admin-only", False), ("private-use", True), (" Private-Use ", True)])
+def test_oracle_switch_is_off_unless_the_operator_sets_it(monkeypatch, value, on) -> None:
+    if value is None:
+        monkeypatch.delenv(op.ORACLE_SCHWAB_ENV, raising=False)
+    else:
+        monkeypatch.setenv(op.ORACLE_SCHWAB_ENV, value)
+    assert op.oracle_reads_schwab() is on
+    assert op.include_schwab_rows(op.oracle_reads_schwab()) is on
 
 
 def _schwab_batch_is_newest(db: Any) -> None:
@@ -351,13 +363,13 @@ def _schwab_batch_is_newest(db: Any) -> None:
                           "WHERE capture_batch_id = 'spy-schwab'"))
 
 
-def test_oracle_engine_quote_reference_reads_the_schwab_batch(db) -> None:
+def test_oracle_engine_quote_reference_reads_the_schwab_batch(db, oracle_on) -> None:
     from oracle.entry_price_policy import load_quote_reference
 
     _schwab_batch_is_newest(db)
     with db.connect() as conn:
         receipt = load_quote_reference(conn, "SPY", as_of=datetime(2026, 11, 23, 16, tzinfo=timezone.utc),
-                                       include_schwab=op.ORACLE_READS_SCHWAB)
+                                       include_schwab=op.oracle_reads_schwab())
     assert receipt["capture_batch_id"] == "spy-schwab" and receipt["provider"] == "schwab"
     assert receipt["observed_on"] == SCHWAB_DAY.isoformat()
 
@@ -381,9 +393,14 @@ def _bare_oracle(db: Any) -> Any:
     return oracle
 
 
-def test_oracle_engine_freezes_its_entry_quote_with_the_private_use_flag(db, monkeypatch) -> None:
+@pytest.mark.parametrize("switch,flag,batch", [(True, True, "spy-schwab"), (False, False, "spy-cboe")])
+def test_oracle_engine_freezes_its_entry_quote_per_the_switch(db, monkeypatch, switch, flag, batch) -> None:
     import oracle.entry_price_policy as policy
 
+    if switch:
+        monkeypatch.setenv(op.ORACLE_SCHWAB_ENV, op.ORACLE_SCHWAB_ON)
+    else:
+        monkeypatch.delenv(op.ORACLE_SCHWAB_ENV, raising=False)
     seen: list[Any] = []
     real = policy.load_quote_reference
 
@@ -394,8 +411,8 @@ def test_oracle_engine_freezes_its_entry_quote_with_the_private_use_flag(db, mon
     monkeypatch.setattr(policy, "load_quote_reference", spy)
     _schwab_batch_is_newest(db)
     receipt = _bare_oracle(db)._get_entry_price_reference("SPY")
-    assert seen == [True]
-    assert receipt["capture_batch_id"] == "spy-schwab" and receipt["provider"] == "schwab"
+    assert seen == [flag]
+    assert receipt["capture_batch_id"] == batch
 
 
 class _NoFeatures:
@@ -403,9 +420,10 @@ class _NoFeatures:
 
     def __init__(self, real: Any) -> None:
         self.real = real
+        self.sql: list[str] = []
 
     def connect(self):
-        real = self.real
+        real, seen = self.real, self.sql
 
         class _Ctx:
             def __enter__(self_inner):
@@ -414,6 +432,7 @@ class _NoFeatures:
 
                 class _Conn:
                     def execute(self, stmt, params=None):
+                        seen.append(str(stmt))
                         if "feature_registry" in str(stmt):
                             return type("Empty", (), {"fetchall": lambda _s: []})()
                         return conn.execute(stmt, params or {})
@@ -427,17 +446,68 @@ class _NoFeatures:
         return _Ctx()
 
 
-def test_oracle_engine_options_signals_use_the_schwab_day(db) -> None:
+def _spy_schwab_pcr(db: Any) -> None:
     with db.begin() as conn:
         conn.execute(text("UPDATE options_daily_signals SET put_call_ratio = 1.3 "
                           "WHERE ticker = 'SPY' AND signal_date = :d"), {"d": SCHWAB_DAY.isoformat()})
+
+
+def test_oracle_engine_options_signals_use_the_schwab_day(db, oracle_on) -> None:
+    _spy_schwab_pcr(db)
     signals = _bare_oracle(_NoFeatures(db))._gather_signals("SPY", ["sentiment"])
     pcr = [s.value for s in signals if s.name == "pcr"]
     assert pcr == [1.3]  # the Schwab day's 1.3, not the Cboe day's 0.9
 
 
-def test_only_the_oracle_engine_passes_the_private_use_flag() -> None:
-    """ORACLE_READS_SCHWAB admits Schwab rows, so only the Oracle engine may use it in code."""
+def test_oracle_engine_options_signals_stay_public_with_the_switch_off(db, monkeypatch) -> None:
+    monkeypatch.delenv(op.ORACLE_SCHWAB_ENV, raising=False)
+    _spy_schwab_pcr(db)
+    signals = _bare_oracle(_NoFeatures(db))._gather_signals("SPY", ["sentiment"])
+    assert [s.value for s in signals if s.name == "pcr"] == [0.9]
+
+
+def test_options_read_carries_the_lineage_of_the_row_it_returns(db, oracle_on, monkeypatch) -> None:
+    _spy_schwab_pcr(db)
+    oracle = _bare_oracle(db)
+    spy = oracle._read_options_signal("SPY")
+    assert spy.values[0] == 1.3 and spy.schwab_private is True
+    nuox = oracle._read_options_signal("NUOX")
+    assert nuox.values is not None and nuox.schwab_private is False
+    assert oracle._read_options_signal("NONE").values is None
+    assert oracle._read_options_signal("NONE").schwab_private is False
+    iwm = oracle._read_options_signal("IWM")  # wing metadata names Schwab, no batch row
+    assert iwm.schwab_private is True
+    monkeypatch.delenv(op.ORACLE_SCHWAB_ENV, raising=False)
+    public = oracle._read_options_signal("SPY")  # switch off: the Cboe day, not private
+    assert public.values[0] == 0.9 and public.schwab_private is False
+
+
+def test_gathering_uses_the_read_the_tag_came_from(db, oracle_on) -> None:
+    """A Schwab row that lands after the tagged read is not consumed by that pass."""
+    from oracle.engine import OptionsSignalRead
+
+    oracle = _bare_oracle(_NoFeatures(db))
+    first = oracle._read_options_signal("NUOX")
+    assert first.schwab_private is False
+    later = SCHWAB_DAY + timedelta(days=2)
+    with db.begin() as conn:  # a newer Schwab capture arrives mid-pass
+        _batch(conn, "nuox-schwab", "NUOX", later, "schwab", ordinal=3)
+        _signal(conn, "NUOX", later, 7.5, "schwab")
+        conn.execute(text("UPDATE options_daily_signals SET put_call_ratio = 2.2 "
+                          "WHERE ticker = 'NUOX' AND signal_date = :d"), {"d": later.isoformat()})
+    oracle.engine.sql.clear()
+    signals = oracle._gather_signals("NUOX", ["sentiment"], options_read=first)
+    assert [s.value for s in signals if s.name == "pcr"] == [0.9]  # the tagged read, not 2.2
+    assert not any("options_daily_signals" in sql for sql in oracle.engine.sql)
+    fresh = oracle._read_options_signal("NUOX")
+    assert fresh.values[0] == 2.2 and fresh.schwab_private is True
+    supplied = OptionsSignalRead((2.2, 0.25, None, None, 7.5, 5000, None, None), True)
+    signals = oracle._gather_signals("NUOX", ["sentiment"], options_read=supplied)
+    assert [s.value for s in signals if s.name == "pcr"] == [2.2]
+
+
+def test_only_the_oracle_engine_turns_on_the_private_use_flag() -> None:
+    """oracle_reads_schwab() admits Schwab rows, so only the Oracle engine may use it in code."""
     import ast
 
     users: dict[str, int] = {}
@@ -447,40 +517,67 @@ def test_only_the_oracle_engine_passes_the_private_use_flag() -> None:
                 or "site-packages" in rel or rel == "store/options_provenance.py"):
             continue
         source = path.read_text(encoding="utf-8", errors="ignore")
-        if "ORACLE_READS_SCHWAB" not in source:
+        if "oracle_reads_schwab" not in source and "ORACLE_SCHWAB" not in source:
             continue
         uses = sum(1 for node in ast.walk(ast.parse(source))
-                   if (isinstance(node, ast.Name) and node.id == "ORACLE_READS_SCHWAB")
-                   or (isinstance(node, ast.Attribute) and node.attr == "ORACLE_READS_SCHWAB"))
+                   if (isinstance(node, ast.Name) and node.id in {"oracle_reads_schwab", "ORACLE_SCHWAB_ON"})
+                   or (isinstance(node, ast.Attribute)
+                       and node.attr in {"oracle_reads_schwab", "ORACLE_SCHWAB_ON"}))
         if uses:
             users[rel] = uses
-    # The read sites: options signals, the frozen entry quote, and the
-    # Schwab-input check that tags what the engine built from them.
-    assert users == {"oracle/engine.py": 3}
+        assert "GRID_ORACLE_SCHWAB" not in source, f"{rel} reads the Oracle switch directly"
+    # The read sites: the options-signal row (with its lineage) and the frozen entry quote.
+    assert users == {"oracle/engine.py": 2}
 
 
 # ── The engine tags what it built from Schwab rows ────────────────────
 
 
+def _public_read() -> Any:
+    from oracle.engine import OptionsSignalRead
+
+    return OptionsSignalRead((0.9,) + (None,) * 7, False)
+
+
+def _schwab_read() -> Any:
+    from oracle.engine import OptionsSignalRead
+
+    return OptionsSignalRead((1.3,) + (None,) * 7, True)
+
+
 def test_schwab_receipt_tags_the_prediction(db) -> None:
-    assert _bare_oracle(db)._schwab_private_inputs("NUOX", {"capture_batch_id": "spy-schwab"}) is True
+    assert _bare_oracle(db)._schwab_private_inputs("NUOX", {"capture_batch_id": "spy-schwab"},
+                                                   _public_read()) is True
 
 
 def test_unqualified_schwab_receipt_still_tags(db) -> None:
     """An unavailable receipt keeps its price in flow_context, so its status does not matter."""
     receipt = {"status": "unavailable", "capture_batch_id": "spy-schwab", "price": 595.0}
-    assert _bare_oracle(db)._schwab_private_inputs("NUOX", receipt) is True
+    assert _bare_oracle(db)._schwab_private_inputs("NUOX", receipt, _public_read()) is True
 
 
-def test_schwab_options_day_tags_even_with_a_public_receipt(db) -> None:
-    # SPY's latest options row (Oracle view) is the Schwab day; the public view is the Cboe day.
-    assert _bare_oracle(db)._schwab_private_inputs("SPY", {"capture_batch_id": "spy-cboe"}) is True
+def test_schwab_options_row_tags_even_with_a_public_receipt(db) -> None:
+    assert _bare_oracle(db)._schwab_private_inputs("SPY", {"capture_batch_id": "spy-cboe"},
+                                                   _schwab_read()) is True
 
 
 def test_public_inputs_are_not_tagged(db) -> None:
-    # NUOX: a Yahoo batch and a Yahoo signal row, both visible to every reader.
-    assert _bare_oracle(db)._schwab_private_inputs("NUOX", {"capture_batch_id": "nuox-yahoo"}) is False
-    assert _bare_oracle(db)._schwab_private_inputs("NUOX", {"status": "unavailable"}) is False
+    oracle = _bare_oracle(db)
+    assert oracle._schwab_private_inputs("NUOX", {"capture_batch_id": "nuox-yahoo", "provider": "yahoo"},
+                                         _public_read()) is False
+    assert oracle._schwab_private_inputs("NUOX", {"status": "unavailable"}, _public_read()) is False
+
+
+@pytest.mark.parametrize("receipt,options_read", [
+    ({"capture_batch_id": "nuox-yahoo"}, None),                        # options read failed
+    ({"price": 7.0, "status": "measured"}, "public"),                   # a price of unknown origin
+    ({"provider": "schwab", "status": "unavailable"}, "public"),        # names Schwab, no batch
+    ({"capture_batch_id": "nuox-yahoo", "provider": " Schwab "}, "public"),
+    (None, "public"),                                                   # no receipt shape at all
+])
+def test_unknown_origin_tags(db, receipt, options_read) -> None:
+    read = _public_read() if options_read == "public" else None
+    assert _bare_oracle(db)._schwab_private_inputs("NUOX", receipt, read) is True
 
 
 def test_schwab_input_check_fails_closed() -> None:
@@ -488,35 +585,58 @@ def test_schwab_input_check_fails_closed() -> None:
         def connect(self):
             raise RuntimeError("database down")
 
-    assert _bare_oracle(_Broken())._schwab_private_inputs("NUOX", {"capture_batch_id": "nuox-yahoo"}) is True
+    assert _bare_oracle(_Broken())._schwab_private_inputs(
+        "NUOX", {"capture_batch_id": "nuox-yahoo"}, _public_read()) is True
 
 
-def test_no_data_placeholders_carry_the_tag(db) -> None:
+def _placeholder_oracle(db: Any, receipt: dict[str, Any]) -> Any:
     from types import SimpleNamespace
 
     oracle = _bare_oracle(db)
     oracle.models = [SimpleNamespace(name="m1", version="v1"), SimpleNamespace(name="m2", version="v1")]
     oracle._get_flow_context = lambda _t: {}
-    oracle._get_entry_price_reference = lambda _t: {
-        "status": "unavailable", "capture_batch_id": "spy-schwab", "price": 595.0,
-        "reason": "quote is older than the 20-minute reference limit"}
-    now = datetime(2026, 11, 23, 16, tzinfo=timezone.utc)
-    placeholders = oracle._oracle_one_ticker(1, "SPY", 1, now, {}, horizon_days=1)
-    assert len(placeholders) == 2
-    assert all(p.flow_context.get(op.ORACLE_PRIVATE_USE_KEY) == op.ORACLE_PRIVATE_USE_SCHWAB
-               for p in placeholders)
+    oracle._get_entry_price_reference = lambda _t: receipt
+    return oracle
 
 
-def test_public_placeholders_are_not_tagged(db) -> None:
-    from types import SimpleNamespace
+def _tagged(predictions: list[Any]) -> list[bool]:
+    return [p.flow_context.get(op.ORACLE_PRIVATE_USE_KEY) == op.ORACLE_PRIVATE_USE_SCHWAB for p in predictions]
 
-    oracle = _bare_oracle(db)
-    oracle.models = [SimpleNamespace(name="m1", version="v1")]
-    oracle._get_flow_context = lambda _t: {}
-    oracle._get_entry_price_reference = lambda _t: {"status": "unavailable", "capture_batch_id": "nuox-yahoo"}
-    now = datetime(2026, 11, 23, 16, tzinfo=timezone.utc)
-    (placeholder,) = oracle._oracle_one_ticker(1, "NUOX", 1, now, {}, horizon_days=1)
-    assert op.ORACLE_PRIVATE_USE_KEY not in placeholder.flow_context
+
+NOW = datetime(2026, 11, 23, 16, tzinfo=timezone.utc)
+
+
+def test_no_data_placeholders_carry_the_tag(db) -> None:
+    oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "spy-schwab", "price": 595.0,
+                                      "reason": "quote is older than the 20-minute reference limit"})
+    placeholders = oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)
+    assert _tagged(placeholders) == [True, True]
+
+
+def test_public_placeholders_are_not_tagged(db, oracle_on) -> None:
+    oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "nuox-yahoo"})
+    assert _tagged(oracle._oracle_one_ticker(1, "NUOX", 1, NOW, {}, horizon_days=1)) == [False, False]
+
+
+def test_a_consumed_schwab_options_row_tags_with_a_public_receipt(db, oracle_on) -> None:
+    oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "spy-cboe"})
+    assert _tagged(oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)) == [True, True]
+
+
+def test_switch_off_spy_pass_is_public(db, monkeypatch) -> None:
+    monkeypatch.delenv(op.ORACLE_SCHWAB_ENV, raising=False)
+    oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "spy-cboe"})
+    assert _tagged(oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)) == [False, False]
+
+
+def test_a_failed_options_read_tags_the_pass(db, oracle_on) -> None:
+    oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "nuox-yahoo"})
+
+    def broken(_t):
+        raise RuntimeError("database blip")
+
+    oracle._read_options_signal = broken
+    assert _tagged(oracle._oracle_one_ticker(1, "NUOX", 1, NOW, {}, horizon_days=1)) == [True, True]
 
 
 def test_scanner_and_digest_never_read_a_schwab_day(db, monkeypatch) -> None:

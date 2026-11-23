@@ -6,7 +6,8 @@ what it builds from them in ``flow_context``. Those predictions reach admin
 requests only. Every reader that serves people reads through
 ``VISIBLE_ORACLE_PREDICTIONS`` (or ``oracle_predictions_from(include_schwab)``
 in a route that knows its viewer). That covers API routes, the MCP server, chat
-and LLM context, postmortem narratives, and tables copied for serving.
+and LLM context, postmortem narratives, tables copied for serving, and every
+shared aggregate and its caches.
 
 This test scans every Python module outside ``tests/`` and ``migrations/`` for
 SQL text that names ``oracle_predictions`` after ``FROM`` or ``JOIN``, and
@@ -38,39 +39,22 @@ _RAW_READ = re.compile(
     r"\b(?:FROM|JOIN)" + _GAP + r'(?:"?public"?\s*\.\s*)?"?oracle_predictions\b"?', re.I | re.S)
 
 # Raw reads allowed on 2026-11-23. Lower or delete an entry when a file moves
-# onto the fragment.
-_AGGREGATE = "aggregate statistics only (counts, hit rates, Brier); no per-prediction value or price"
+# onto the fragment. Only the Oracle's own work may stay raw: writing, scoring
+# and enriching its rows, learning its weights, and naming its tickers. Every
+# aggregate whose result is shared (scoreboard, evidence, calibration, realized
+# alpha, hypothesis and Brier trackers) reads the public cohort, because a mean
+# over a single Schwab-built prediction gives its entry back (Codex review
+# 6027282293).
 ALLOWED_RAW_READS: dict[str, tuple[int, str]] = {
-    # The Oracle's own internals: the owner's private use, writing back to the
-    # same rows or to per-model aggregates.
     "oracle/engine.py": (2, "the writer: dedup and scoring of its own rows"),
-    "oracle/scoreboard.py": (4, "per-model scoreboard: " + _AGGREGATE),
-    "oracle/calibration.py": (3, "per-model calibration: " + _AGGREGATE),
     "oracle/trace_evolver.py": (3, "weight evolution inside the Oracle; stores weights, not predictions"),
     "oracle/model_evolver.py": (1, "model evolution inside the Oracle; stores models, not predictions"),
-    "oracle/evidence.py": (1, "per-model bootstrap evidence: " + _AGGREGATE),
     "oracle/publish.py": (1, "reads back the AstroGrid row it just inserted (never Schwab-built)"),
     "scripts/score_oracle_trades.py": (13, "the scorer: writes outcomes back onto the same rows"),
     "scripts/backfill_oracle_prediction_context.py": (1, "enriches the same rows in place"),
     "scripts/backfill_oracle_closes.py": (1, "ticker universe only (DISTINCT ticker)"),
     "ingestion/yfinance_pull.py": (1, "ticker universe only (DISTINCT ticker)"),
-    # Aggregate analytics; their stored and served outputs carry no per-prediction value.
-    "alpha_research/realized_alpha.py": (1, "the served route reads realized_alpha_daily: " + _AGGREGATE),
-    "evaluation/edge_report.py": (2, _AGGREGATE),
-    "features/regime_conditional_brier.py": (1, _AGGREGATE),
-    "intelligence/confidence_bucket_tracker.py": (1, _AGGREGATE),
-    "intelligence/confidence_calibration.py": (1, _AGGREGATE),
-    "intelligence/hypothesis_engine.py": (2, "model convergence counts and outcome moves: " + _AGGREGATE),
-    "intelligence/meta_learning_matrix.py": (1, _AGGREGATE),
-    "intelligence/null_hypothesis_forecaster.py": (2, _AGGREGATE),
-    "intelligence/prediction_market_arbitrage.py": (1, _AGGREGATE),
-    "intelligence/signal_cooccurrence.py": (1, _AGGREGATE),
-    "intelligence/source_quality_ablation.py": (1, _AGGREGATE),
-    "scripts/backfill_surfacer_calibration.py": (2, "materialized per-ticker calibration: " + _AGGREGATE),
-    "scripts/bootstrap_per_signal_brier.py": (3, "per-signal Brier seed (one count is argparse help text): "
-                                                 + _AGGREGATE),
-    "scripts/score_boost_log_with_local_llm.py": (1, "max/min/avg outcome move per hypothesis: " + _AGGREGATE),
-    # Operator-run offline research reports, not served.
+    # Operator-run offline research reports: the owner's own use, not served or stored.
     "scripts/backtest_intelligence.py": (2, "operator-run offline backtest report"),
     "scripts/walk_forward_profitability.py": (3, "operator-run offline walk-forward report"),
     "scripts/walk_forward_validate.py": (2, "operator-run offline walk-forward report"),
