@@ -363,36 +363,45 @@ def score_company(
 
 
 # SMART_MONEY Form 4 input: reported non-derivative P/S transactions only
-# (ingestion/edgar.py's FORM4:{ticker}:PS_* family), trailing 90 days.
+# (ingestion/edgar.py's FORM4:{ticker}:PS_* family plus its coverage series).
 #
 #   * P/S is "open market or private" (SEC Form 4 codes); the venue is not
 #     reported, so nothing here is labelled open-market (Codex HOLD on #1353
 #     67ce6bdc). Never the all-code NET_SHARES / NET_VALUE: they count awards,
 #     exercises and imputed $0 prices as trades (Codex HOLD on 5c4c7b32).
-#   * Each filing date must carry all of _FORM4_PS_FIELDS from one vintage (one
-#     pull_timestamp: the writer inserts a ticker's series in one transaction),
-#     with every P/S row share-valid and no unread filings. One incomplete
-#     date in the window and the Form 4 part is not scored: a partial window
-#     can flip the sign.
-#   * Dollars count only when every P/S row in the window is priced:
+#   * The writer writes every date of a pull's verified coverage interval,
+#     dates without filings included, so a missing date is "not observed",
+#     never "no trades" (Codex HOLD on 4f55dab9). A date is verified when all
+#     of _FORM4_PS_FIELDS are present from one vintage (one pull_timestamp),
+#     with every P/S row share-valid and no unread filing.
+#   * Scored: the contiguous run of verified dates ending at the as-of date
+#     (or the day before, which a routine pull covers once that ET date has
+#     closed), at most _FORM4_WINDOW_DAYS long. A gap or an unverified date
+#     ends the run. Fewer than _FORM4_MIN_VERIFIED_DAYS verified: not scored.
+#   * Full 90-day run, every P/S row priced: dollar rule
 #       >= +$500k -> +5,  > $0 -> +2,  == $0 -> 0 (fully priced offset),  < $0 -> -2
-#   * With any unpriced row, share direction only (the dollar total is unknown):
+#     Any unpriced row: share direction only (the dollar total is unknown):
 #       > 0 sh -> +2,  == 0 -> 0,  < 0 -> -2
-#   * A window whose P/S count is 0 scores 0: no P/S in the observed Form 4
-#     data (it does not prove the other codes were awards or exercises).
-#   * Legacy rows (OPEN_MKT_*, all-code only) carry no validity counts: unavailable.
+#   * Shorter run (7..89 days), a deliberately weaker policy: direction only,
+#     +2 / 0 / -2 at most, trust 0.5, and the signal names the verified span.
+#   * Zero P/S rows in the run scores 0: no P/S in the observed Form 4 data
+#     (it does not prove the other codes were awards or exercises).
+#   * Legacy rows (OPEN_MKT_*, all-code only) carry no validity or coverage:
+#     unavailable.
 #   Selling is capped at -2 because insider net selling is mostly routine
 #   liquidity / 10b5-1 selling (not strong bearish conviction), so SMART_MONEY
 #   layer scores can be negative.
 #   Reads go through store.observations.read_window_known_at with the explicit
 #   writer source (SEC_EDGAR): per series and date, the latest vintage pulled
 #   by the end of the as-of date (UTC); another source's rows never mix in.
+#   A later recovery pull therefore never changes an earlier as-of read.
 FORM4_SOURCE = "SEC_EDGAR"
 _FORM4_PS_FIELDS: tuple[str, ...] = (
     "PS_NET_SHARES", "PS_NET_VALUE", "PS_TXN_COUNT",
-    "PS_SHARES_VALID_COUNT", "PS_PRICED_COUNT", "FILINGS_UNREAD",
+    "PS_SHARES_VALID_COUNT", "PS_PRICED_COUNT", "FILINGS_LISTED", "FILINGS_UNREAD",
 )
 _FORM4_WINDOW_DAYS = 90
+_FORM4_MIN_VERIFIED_DAYS = 7
 _FORM4_PS_LABEL = "Insider reported P/S (non-derivative, venue unknown)"
 _FORM4_VALUE_STRONG_USD = 500_000.0
 _FORM4_SELL_CAP = -2.0
@@ -400,15 +409,22 @@ _FORM4_SELL_CAP = -2.0
 
 @dataclass(frozen=True)
 class Form4PSWindow:
-    """Reported non-derivative P/S Form 4 evidence over the trailing window."""
+    """Reported non-derivative P/S Form 4 evidence over the verified run."""
 
-    verified_dates: int = 0
-    incomplete_dates: int = 0
+    start: date | None = None  # first verified date of the run
+    end: date | None = None    # last verified date of the run
     txns: float = 0.0
     shares_valid: float = 0.0
     priced: float = 0.0
     net_shares: float = 0.0
     net_value: float = 0.0  # priced rows only; meaningful iff priced == txns
+    unverified_dates: int = 0  # observed dates in the read window that failed verification
+
+    @property
+    def verified_days(self) -> int:
+        if self.start is None or self.end is None:
+            return 0
+        return (self.end - self.start).days + 1
 
     @property
     def dollars_verified(self) -> bool:
@@ -419,8 +435,23 @@ def _is_count(value: float) -> bool:
     return math.isfinite(value) and value >= 0 and value == int(value)
 
 
+def _form4_day(obs: list) -> tuple[float, ...] | None:
+    """The day's (shares, value, txns, valid, priced) if it verifies, else None."""
+    if any(o is None for o in obs) or len({o.pull_timestamp for o in obs}) != 1:
+        return None  # a series missing, or the series from different vintages
+    d_shares, d_value, d_txns, d_valid, d_priced, d_listed, d_unread = (o.value for o in obs)
+    if not (
+        math.isfinite(d_shares) and math.isfinite(d_value)
+        and all(_is_count(v) for v in (d_txns, d_valid, d_priced, d_listed, d_unread))
+        and d_unread == 0 and d_valid == d_txns and d_priced <= d_valid
+        and (d_txns == 0 or d_listed > 0)
+    ):
+        return None  # unread filings, invalid share rows, or inconsistent counts
+    return d_shares, d_value, d_txns, d_valid, d_priced
+
+
 def _form4_ps_window(conn, ticker: str, as_of_date: date | None) -> Form4PSWindow:
-    """Match the PS_* series per filing date and check them before summing."""
+    """Verify the PS_* series per date and sum the contiguous verified run."""
     as_of = _resolve_as_of_date(as_of_date)
     by_field = {
         field: {
@@ -436,69 +467,86 @@ def _form4_ps_window(conn, ticker: str, as_of_date: date | None) -> Form4PSWindo
         }
         for field in _FORM4_PS_FIELDS
     }
-    dates = sorted({d for rows in by_field.values() for d in rows})
-    verified = incomplete = 0
-    txns = shares_valid = priced = net_shares = net_value = 0.0
-    for d in dates:
-        obs = [by_field[field].get(d) for field in _FORM4_PS_FIELDS]
-        if any(o is None for o in obs) or len({o.pull_timestamp for o in obs}) != 1:
-            incomplete += 1  # a series missing, or the series from different vintages
-            continue
-        d_shares, d_value, d_txns, d_valid, d_priced, d_unread = (o.value for o in obs)
-        if not (
-            math.isfinite(d_shares) and math.isfinite(d_value)
-            and all(_is_count(v) for v in (d_txns, d_valid, d_priced, d_unread))
-            and d_unread == 0 and d_valid == d_txns and d_priced <= d_valid
-        ):
-            incomplete += 1  # unread filings, invalid share rows, or bad counts
-            continue
-        verified += 1
-        txns += d_txns
-        shares_valid += d_valid
-        priced += d_priced
-        net_shares += d_shares
-        net_value += d_value
-    return Form4PSWindow(verified, incomplete, txns, shares_valid, priced, net_shares, net_value)
+    observed = {d for rows in by_field.values() for d in rows}
+    days = {d: _form4_day([by_field[f].get(d) for f in _FORM4_PS_FIELDS]) for d in observed}
+    unverified = sum(1 for v in days.values() if v is None)
+
+    end = as_of if days.get(as_of) is not None else as_of - timedelta(days=1)
+    if days.get(end) is None:
+        return Form4PSWindow(unverified_dates=unverified)
+    start = end
+    while (
+        (end - start).days + 1 < _FORM4_WINDOW_DAYS
+        and days.get(start - timedelta(days=1)) is not None
+    ):
+        start -= timedelta(days=1)
+    run = [days[start + timedelta(days=i)] for i in range((end - start).days + 1)]
+    return Form4PSWindow(
+        start=start,
+        end=end,
+        net_shares=sum(r[0] for r in run),
+        net_value=sum(r[1] for r in run),
+        txns=sum(r[2] for r in run),
+        shares_valid=sum(r[3] for r in run),
+        priced=sum(r[4] for r in run),
+        unverified_dates=unverified,
+    )
 
 
-def _score_form4_ps(window: Form4PSWindow) -> tuple[float, str, bool]:
-    """(points, signal, has_data) for SMART_MONEY's Form 4 part."""
+def _score_form4_ps(window: Form4PSWindow) -> tuple[float, str, bool, bool]:
+    """(points, signal, has_data, full_window) for SMART_MONEY's Form 4 part."""
     label = _FORM4_PS_LABEL
-    if window.incomplete_dates:
-        return (0.0, (
-            f"Insider Form 4 P/S data incomplete on {window.incomplete_dates} filing date(s) "
-            f"in {_FORM4_WINDOW_DAYS}d (missing series, mixed vintages, invalid share rows "
-            "or unread filings); not scored"
-        ), False)
-    if window.verified_dates == 0:
+    days = window.verified_days
+    if days == 0:
+        if window.unverified_dates:
+            return (0.0, (
+                "Insider Form 4 P/S coverage not verified through the as-of date "
+                f"({window.unverified_dates} observed date(s) incomplete: missing series, "
+                "mixed vintages, invalid share rows or unread filings); not scored"
+            ), False, False)
         return (0.0, (
             "Insider Form 4 P/S series unavailable (legacy OPEN_MKT_* and all-code rows "
-            "carry no price or share validity; not scored)"
-        ), False)
-    if window.txns == 0:
+            "carry no price, share or coverage evidence; not scored)"
+        ), False, False)
+    span = f"verified {window.start:%Y-%m-%d}..{window.end:%Y-%m-%d}, {days}d of {_FORM4_WINDOW_DAYS}d"
+    if days < _FORM4_MIN_VERIFIED_DAYS:
         return (0.0, (
-            f"No reported non-derivative P/S insider transactions in the observed Form 4 "
-            f"data ({_FORM4_WINDOW_DAYS}d)"
-        ), True)
+            f"Insider Form 4 P/S coverage too short ({span}; needs "
+            f"{_FORM4_MIN_VERIFIED_DAYS}d); not scored"
+        ), False, False)
+    full = days >= _FORM4_WINDOW_DAYS
+    if window.txns == 0:
+        return 0.0, f"No reported non-derivative P/S insider transactions in the observed Form 4 data ({span})", True, full
+    if not full:
+        # Shorter verified run: direction only, never the +5 tier.
+        if window.dollars_verified:
+            direction, basis = window.net_value, f"net ${window.net_value:,.0f}"
+        else:
+            direction, basis = window.net_shares, f"net {window.net_shares:+,.0f} sh, dollars unverified"
+        if direction > 0:
+            return 2.0, f"{label} net buy ({basis}; {span}; short window, direction only)", True, False
+        if direction < 0:
+            return _FORM4_SELL_CAP, f"{label} net sell ({basis}; {span}; short window, direction only)", True, False
+        return 0.0, f"{label} buys and sells offset ({basis}; {span}; short window)", True, False
     if window.dollars_verified:
         value = window.net_value
         if value >= _FORM4_VALUE_STRONG_USD:
-            return 5.0, f"{label} net buy ${value:,.0f}", True
+            return 5.0, f"{label} net buy ${value:,.0f} ({span})", True, True
         if value > 0:
-            return 2.0, f"{label} net buy ${value:,.0f}", True
+            return 2.0, f"{label} net buy ${value:,.0f} ({span})", True, True
         if value < 0:
-            return _FORM4_SELL_CAP, f"{label} net sell ${abs(value):,.0f}", True
-        return 0.0, f"{label} buys and sells offset (fully priced, net $0)", True
+            return _FORM4_SELL_CAP, f"{label} net sell ${abs(value):,.0f} ({span})", True, True
+        return 0.0, f"{label} buys and sells offset (fully priced, net $0; {span})", True, True
     unpriced = (
         f"dollars unverified: {window.txns - window.priced:,.0f} of {window.txns:,.0f} "
         "P/S rows unpriced"
     )
     shares = window.net_shares
     if shares > 0:
-        return 2.0, f"{label} net share buy +{shares:,.0f} sh ({unpriced})", True
+        return 2.0, f"{label} net share buy +{shares:,.0f} sh ({unpriced}; {span})", True, True
     if shares < 0:
-        return _FORM4_SELL_CAP, f"{label} net share sell {shares:,.0f} sh ({unpriced})", True
-    return 0.0, f"{label} share buys and sells offset (net 0 sh; {unpriced})", True
+        return _FORM4_SELL_CAP, f"{label} net share sell {shares:,.0f} sh ({unpriced}; {span})", True, True
+    return 0.0, f"{label} share buys and sells offset (net 0 sh; {unpriced}; {span})", True, True
 
 
 def score_smart_money(
@@ -507,7 +555,9 @@ def score_smart_money(
     as_of_date: date | None = None,
 ) -> LayerResult:
     """Layer 3: Are insiders buying? (Form 4 P/S only; no institutional input.)"""
-    points, form4_signal, has_data = _score_form4_ps(_form4_ps_window(conn, ticker, as_of_date))
+    points, form4_signal, has_data, full_window = _score_form4_ps(
+        _form4_ps_window(conn, ticker, as_of_date)
+    )
     signals = [form4_signal]
 
     # Institutional flow: no code writes INST_FLOW:*, and institutional (13F)
@@ -516,7 +566,7 @@ def score_smart_money(
     # sorted last (Codex HOLD on #1353 5c4c7b32).
     signals.append("Institutional flow unavailable (no INST_FLOW writer; 13F is non-directional)")
 
-    trust = 0.85 if has_data else 0.15
+    trust = (0.85 if full_window else 0.5) if has_data else 0.15
     return LayerResult(
         "SMART_MONEY",
         max(_FORM4_SELL_CAP, min(points, 15.0)),

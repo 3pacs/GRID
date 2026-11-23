@@ -8,8 +8,9 @@ Covers:
 5. SMART_MONEY pooled whichever INST_FLOW row sorted last; it now reads no
    institutional series (no INST_FLOW writer; 13F is non-directional).
 6. SMART_MONEY Form 4: only the reported P/S family from SEC_EDGAR (venue
-   unknown, priced and share-valid counts matched per vintage), never
-   all-code NET_SHARES (awards/exercises); dead XBRL:{ticker}:* series.
+   unknown, priced and share-valid counts matched per vintage, scored over
+   the contiguous verified coverage run), never all-code NET_SHARES
+   (awards/exercises); dead XBRL:{ticker}:* series.
 """
 
 from __future__ import annotations
@@ -391,22 +392,25 @@ class TestDefect4Stale13FExcluded:
 #
 # Real SQL against an in-memory SQLite raw_series + source_catalog shaped like
 # production (as in tests/test_store_observations.py), so every read goes
-# through store.observations the way it does on griddb. ingestion/edgar.py
-# writes, per filing date and in one transaction (one pull_timestamp): the
-# all-code NET_SHARES / NET_VALUE / TXN_COUNT, the P/S family PS_NET_SHARES /
-# PS_NET_VALUE / PS_TXN_COUNT / PS_SHARES_VALID_COUNT / PS_PRICED_COUNT, and
-# FILINGS_UNREAD. Writer-to-reader fixtures live in
-# tests/test_form4_writer_to_smart_money.py.
+# through store.observations the way it does on griddb.
+#
+# ingestion/edgar.py writes, for every date of a pull's verified coverage
+# interval, in one transaction (one pull_timestamp):
+# - the all-code NET_SHARES / NET_VALUE / TXN_COUNT;
+# - the P/S family PS_NET_SHARES / PS_NET_VALUE / PS_TXN_COUNT /
+#   PS_SHARES_VALID_COUNT / PS_PRICED_COUNT;
+# - FILINGS_LISTED and FILINGS_UNREAD.
+#
+# Writer-to-reader fixtures live in tests/test_form4_writer_to_smart_money.py.
 
 sqlite3.register_adapter(date, lambda d: d.isoformat())
 sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
 
 EDGAR_SRC = 1
 OTHER_SRC = 2
-PS_FIELDS = (
-    "PS_NET_SHARES", "PS_NET_VALUE", "PS_TXN_COUNT",
-    "PS_SHARES_VALID_COUNT", "PS_PRICED_COUNT", "FILINGS_UNREAD",
-)
+LABEL = "Insider reported P/S (non-derivative, venue unknown)"
+FULL_FIRST = AS_OF - timedelta(days=90)  # 90 verified days ending the day before as_of
+LAST = AS_OF - timedelta(days=1)
 
 
 def _evening(d: date) -> datetime:
@@ -459,22 +463,35 @@ class _Form4DB:
             }])
 
     def filing_day(
-        self, obs_date: date, *, ps_shares: float, ps_value: float, txns: float,
-        valid: float | None = None, priced: float | None = None, unread: float = 0.0,
+        self, obs_date: date, *, ps_shares: float = 0.0, ps_value: float = 0.0, txns: float = 0.0,
+        valid: float | None = None, priced: float | None = None,
+        listed: float | None = None, unread: float = 0.0,
         all_code_shares: float = 0.0, all_code_value: float = 0.0, all_code_txns: float = 0.0,
         pulled: datetime | None = None, skip: tuple[str, ...] = (), ticker: str = "AAPL",
     ) -> None:
-        """One filing date as ingestion/edgar.py writes it: one vintage for all series."""
+        """One covered date as ingestion/edgar.py writes it: one vintage for all series."""
         values = {
             "NET_SHARES": all_code_shares, "NET_VALUE": all_code_value, "TXN_COUNT": all_code_txns,
             "PS_NET_SHARES": ps_shares, "PS_NET_VALUE": ps_value, "PS_TXN_COUNT": txns,
             "PS_SHARES_VALID_COUNT": txns if valid is None else valid,
             "PS_PRICED_COUNT": txns if priced is None else priced,
+            "FILINGS_LISTED": (1.0 if txns else 0.0) if listed is None else listed,
             "FILINGS_UNREAD": unread,
         }
         for field, value in values.items():
             if field not in skip:
                 self.add(f"FORM4:{ticker}:{field}", obs_date, value, pulled=pulled or _evening(obs_date))
+
+    def cover(
+        self, first: date, last: date, days: dict[date, dict] | None = None,
+        *, pulled: datetime | None = None, skip_dates: tuple[date, ...] = (),
+    ) -> None:
+        """Every date in [first, last] written, as the writer covers an interval."""
+        d = first
+        while d <= last:
+            if d not in skip_dates:
+                self.filing_day(d, pulled=pulled, **(days or {}).get(d, {}))
+            d += timedelta(days=1)
 
     def score(self, ticker: str = "AAPL", as_of: date = AS_OF) -> cs.LayerResult:
         self.series_read.clear()
@@ -506,26 +523,26 @@ class TestDefect6Form4AndCompanyUnavailable:
     @pytest.mark.parametrize(
         ("ps_value", "expected_score", "signal"),
         [
-            (750_000.0, 5, "Insider reported P/S (non-derivative, venue unknown) net buy $750,000"),
-            (100_000.0, 2, "Insider reported P/S (non-derivative, venue unknown) net buy $100,000"),
+            (750_000.0, 5, f"{LABEL} net buy $750,000"),
+            (100_000.0, 2, f"{LABEL} net buy $100,000"),
             # Insider selling is capped at -2 (routine liquidity / 10b5-1).
-            (-750_000.0, -2, "Insider reported P/S (non-derivative, venue unknown) net sell $750,000"),
-            (-100_000.0, -2, "Insider reported P/S (non-derivative, venue unknown) net sell $100,000"),
-            (0.0, 0, "Insider reported P/S (non-derivative, venue unknown) buys and sells "
-                     "offset (fully priced, net $0)"),
+            (-750_000.0, -2, f"{LABEL} net sell $750,000"),
+            (-100_000.0, -2, f"{LABEL} net sell $100,000"),
+            (0.0, 0, f"{LABEL} buys and sells offset (fully priced, net $0"),
         ],
     )
-    def test_fully_priced_window_uses_the_dollar_rule(
+    def test_full_verified_window_fully_priced_uses_the_dollar_rule(
         self, ps_value: float, expected_score: int, signal: str,
     ) -> None:
         db = _Form4DB()
-        db.filing_day(T3, ps_shares=1.0, ps_value=ps_value, txns=2.0)
+        db.cover(FULL_FIRST, LAST, {T3: {"ps_shares": 1.0, "ps_value": ps_value, "txns": 2.0}})
 
         result = db.score()
 
         assert result.data_available is True
         assert result.score == expected_score
-        assert signal in result.signals
+        assert result.trust == 0.85
+        assert any(s.startswith(signal) and "90d of 90d" in s for s in result.signals), result.signals
         assert _no_venue_claim(result)
         # Exact zero is a measured offset, never labelled as an outflow.
         assert not (ps_value == 0 and any("net sell" in s for s in result.signals))
@@ -534,8 +551,8 @@ class TestDefect6Form4AndCompanyUnavailable:
         ("ps_shares", "ps_value", "txns", "priced", "expected_score", "signal"),
         [
             # P +100 unpriced and S 10 @ $10: the priced dollars alone read -$100.
-            (90.0, -100.0, 2.0, 1.0, 2, "net share buy +90 sh (dollars unverified: 1 of 2 P/S rows unpriced)"),
-            (60.0, 0.0, 2.0, 0.0, 2, "net share buy +60 sh (dollars unverified: 2 of 2 P/S rows unpriced)"),
+            (90.0, -100.0, 2.0, 1.0, 2, "net share buy +90 sh (dollars unverified: 1 of 2 P/S rows unpriced"),
+            (60.0, 0.0, 2.0, 0.0, 2, "net share buy +60 sh (dollars unverified: 2 of 2 P/S rows unpriced"),
             (-25_000.0, 0.0, 1.0, 0.0, -2, "net share sell -25,000 sh (dollars unverified: 1 of 1"),
             (0.0, 500.0, 2.0, 1.0, 0, "share buys and sells offset (net 0 sh; dollars unverified"),
         ],
@@ -545,7 +562,8 @@ class TestDefect6Form4AndCompanyUnavailable:
         expected_score: int, signal: str,
     ) -> None:
         db = _Form4DB()
-        db.filing_day(T3, ps_shares=ps_shares, ps_value=ps_value, txns=txns, priced=priced)
+        db.cover(FULL_FIRST, LAST, {T3: {"ps_shares": ps_shares, "ps_value": ps_value,
+                                         "txns": txns, "priced": priced}})
 
         result = db.score()
 
@@ -554,21 +572,93 @@ class TestDefect6Form4AndCompanyUnavailable:
         assert any(signal in s for s in result.signals), result.signals
         assert not any("$" in s for s in result.signals if "P/S" in s)  # no dollar total claimed
 
+    def test_seven_day_cold_start_uses_the_short_window_policy(self) -> None:
+        db = _Form4DB()
+        db.cover(AS_OF - timedelta(days=7), LAST, {T3: {"ps_shares": 9_000.0, "ps_value": 750_000.0,
+                                                        "txns": 1.0}})
+
+        result = db.score()
+
+        assert result.data_available is True
+        assert result.score == 2  # direction only: never the +5 tier on 7 verified days
+        assert result.trust == 0.5
+        span = f"verified {AS_OF - timedelta(days=7):%Y-%m-%d}..{LAST:%Y-%m-%d}, 7d of 90d"
+        assert f"{LABEL} net buy (net $750,000; {span}; short window, direction only)" in result.signals
+
+    def test_fewer_than_seven_verified_days_is_not_scored(self) -> None:
+        db = _Form4DB()
+        db.cover(AS_OF - timedelta(days=6), LAST, {T3: {"ps_shares": 9_000.0, "ps_value": 750_000.0,
+                                                        "txns": 1.0}})
+
+        result = db.score()
+
+        assert result.data_available is False
+        assert result.score == 0
+        assert any("coverage too short" in s and "6d of 90d" in s for s in result.signals)
+
+    def test_a_gap_in_coverage_ends_the_verified_run(self) -> None:
+        db = _Form4DB()
+        gap = AS_OF - timedelta(days=30)
+        # A big sale before the gap must not reach the score.
+        db.cover(FULL_FIRST, LAST, {
+            AS_OF - timedelta(days=60): {"ps_shares": -90_000.0, "ps_value": -9_000_000.0, "txns": 1.0},
+            T3: {"ps_shares": 900.0, "ps_value": 750_000.0, "txns": 1.0},
+        }, skip_dates=(gap,))
+
+        result = db.score()
+
+        assert result.score == 2
+        assert result.trust == 0.5
+        assert any("29d of 90d" in s and "net buy" in s for s in result.signals)
+
+    @pytest.mark.parametrize(
+        "damage",
+        ["missing_series", "mixed_vintage", "unread_filing", "invalid_share_rows",
+         "priced_over_valid", "txns_without_a_listed_filing"],
+    )
+    def test_an_unverified_date_ends_the_run(self, damage: str) -> None:
+        bad = AS_OF - timedelta(days=1)
+        kwargs: dict[str, Any] = {"ps_shares": -50.0, "ps_value": -5_000.0, "txns": 1.0}
+        if damage == "missing_series":
+            kwargs["skip"] = ("PS_PRICED_COUNT",)
+        elif damage == "mixed_vintage":
+            kwargs["skip"] = ("PS_NET_VALUE",)
+        elif damage == "unread_filing":
+            kwargs["unread"] = 1.0
+        elif damage == "invalid_share_rows":
+            kwargs.update(txns=2.0, valid=1.0, priced=1.0)
+        elif damage == "priced_over_valid":
+            kwargs["priced"] = 2.0
+        else:
+            kwargs["listed"] = 0.0
+        db = _Form4DB()
+        db.cover(FULL_FIRST, AS_OF - timedelta(days=2), {T3: {"ps_shares": 900.0, "ps_value": 750_000.0,
+                                                              "txns": 1.0}})
+        db.filing_day(bad, **kwargs)
+        if damage == "mixed_vintage":
+            db.add("FORM4:AAPL:PS_NET_VALUE", bad, -5_000.0, pulled=_evening(bad) + timedelta(hours=1))
+
+        result = db.score()
+
+        # The last closed date is unverified: nothing verified ends at as_of.
+        assert result.data_available is False
+        assert result.score == 0
+        assert any("coverage not verified through the as-of date" in s for s in result.signals)
+
     def test_award_only_window_scores_zero_without_claiming_award_codes(self) -> None:
         db = _Form4DB()
         # Grants and exercises: all-code sums large and positive, no P/S rows.
-        db.filing_day(
-            T3, ps_shares=0.0, ps_value=0.0, txns=0.0,
-            all_code_shares=250_000.0, all_code_value=40_000_000.0, all_code_txns=4.0,
-        )
+        db.cover(FULL_FIRST, LAST, {T3: {"listed": 1.0, "all_code_shares": 250_000.0,
+                                         "all_code_value": 40_000_000.0, "all_code_txns": 4.0}})
 
         result = db.score()
 
         assert result.score == 0
         assert result.data_available is True
-        assert (
-            "No reported non-derivative P/S insider transactions in the observed Form 4 data (90d)"
-            in result.signals
+        assert any(
+            s.startswith("No reported non-derivative P/S insider transactions in the observed "
+                         "Form 4 data (verified")
+            for s in result.signals
         )
         assert not any("award" in s.lower() for s in result.signals if "P/S" in s)
         assert "FORM4:AAPL:NET_SHARES" not in db.series_read
@@ -577,7 +667,7 @@ class TestDefect6Form4AndCompanyUnavailable:
     def test_legacy_rows_alone_are_unavailable(self) -> None:
         db = _Form4DB()
         # Rows the writer stored before 2026-11-23: all-code and OPEN_MKT_*,
-        # with an imputed-$0 price and no validity counts.
+        # with an imputed-$0 price and no validity or coverage evidence.
         for field, value in (
             ("NET_SHARES", 25_000.0), ("NET_VALUE", 4_000_000.0), ("TXN_COUNT", 3.0),
             ("OPEN_MKT_NET_SHARES", 25_000.0), ("OPEN_MKT_NET_VALUE", 750_000.0),
@@ -592,35 +682,9 @@ class TestDefect6Form4AndCompanyUnavailable:
         assert any("P/S series unavailable" in s for s in result.signals)
         assert not any("OPEN_MKT" in sid for sid in db.series_read)
 
-    @pytest.mark.parametrize(
-        "damage",
-        ["missing_series", "mixed_vintage", "unread_filing", "invalid_share_rows", "priced_over_valid"],
-    )
-    def test_one_incomplete_date_withholds_the_window(self, damage: str) -> None:
-        db = _Form4DB()
-        db.filing_day(T3, ps_shares=10_000.0, ps_value=750_000.0, txns=3.0)
-        d = AS_OF - timedelta(days=20)
-        if damage == "missing_series":
-            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, skip=("PS_PRICED_COUNT",))
-        elif damage == "mixed_vintage":
-            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, skip=("PS_NET_VALUE",))
-            db.add("FORM4:AAPL:PS_NET_VALUE", d, -5_000.0, pulled=_evening(d) + timedelta(hours=1))
-        elif damage == "unread_filing":
-            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, unread=1.0)
-        elif damage == "invalid_share_rows":
-            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=2.0, valid=1.0, priced=1.0)
-        else:
-            db.filing_day(d, ps_shares=-50.0, ps_value=-5_000.0, txns=1.0, priced=2.0)
-
-        result = db.score()
-
-        assert result.data_available is False
-        assert result.score == 0
-        assert any("P/S data incomplete on 1 filing date(s)" in s for s in result.signals)
-
     def test_other_source_rows_on_the_same_series_and_date_are_ignored(self) -> None:
         db = _Form4DB()
-        db.filing_day(T3, ps_shares=500.0, ps_value=100_000.0, txns=1.0)
+        db.cover(FULL_FIRST, LAST, {T3: {"ps_shares": 500.0, "ps_value": 100_000.0, "txns": 1.0}})
         # Simultaneous rows from another source for the same series and date,
         # pulled later: neither summed in nor allowed to replace EDGAR's rows.
         for field, value in (("PS_NET_VALUE", 9_000_000.0), ("PS_PRICED_COUNT", 0.0)):
@@ -631,43 +695,57 @@ class TestDefect6Form4AndCompanyUnavailable:
 
         assert result.data_available is True
         assert result.score == 2
-        assert "Insider reported P/S (non-derivative, venue unknown) net buy $100,000" in result.signals
+        assert any(s.startswith(f"{LABEL} net buy $100,000") for s in result.signals)
 
         only_other = _Form4DB()
-        only_other.filing_day(T3, ps_shares=500.0, ps_value=9_000_000.0, txns=1.0)
+        only_other.cover(FULL_FIRST, LAST, {T3: {"ps_shares": 500.0, "ps_value": 9_000_000.0, "txns": 1.0}})
         with only_other.engine.begin() as c:
             c.execute(text("UPDATE raw_series SET source_id = :o"), {"o": OTHER_SRC})
         assert only_other.score().data_available is False
 
+    def test_recovery_pull_never_rewrites_an_earlier_as_of(self) -> None:
+        db = _Form4DB()
+        recovered = AS_OF + timedelta(days=2)
+        # Routine pulls covered the last 10 days. The 80 days before were
+        # covered only by a recovery pull made two days after as_of.
+        db.cover(AS_OF - timedelta(days=10), LAST,
+                 {T3: {"ps_shares": 900.0, "ps_value": 750_000.0, "txns": 1.0}})
+        db.cover(FULL_FIRST, AS_OF - timedelta(days=11), pulled=_evening(recovered))
+
+        before = db.score()
+        assert before.score == 2 and before.trust == 0.5
+        assert any("10d of 90d" in s for s in before.signals)
+
+        # At the recovery date, its last closed date is not covered yet.
+        assert db.score(as_of=recovered).data_available is False
+        db.cover(AS_OF, recovered - timedelta(days=1), pulled=_evening(recovered))
+        after = db.score(as_of=recovered)
+        assert after.score == 5 and after.trust == 0.85
+
+        assert db.score().signals == before.signals  # the earlier as-of read is unchanged
+
     def test_only_vintages_pulled_by_the_end_of_as_of_count(self) -> None:
         db = _Form4DB()
-        db.filing_day(T3, ps_shares=500.0, ps_value=100_000.0, txns=1.0)
-        # A full re-pull of the same date after as_of, a FAILED marker, and a
-        # later filing date pulled after as_of: none counts.
+        db.cover(FULL_FIRST, LAST, {T3: {"ps_shares": 500.0, "ps_value": 100_000.0, "txns": 1.0}})
+        # A full re-pull of T3 after as_of, and a FAILED marker: neither counts.
         db.filing_day(T3, ps_shares=9_000.0, ps_value=900_000.0, txns=2.0,
                       pulled=_evening(AS_OF + timedelta(days=1)))
-        db.add("FORM4:AAPL:PS_NET_VALUE", AS_OF, 5_000_000.0, status="FAILED")
-        db.filing_day(AS_OF, ps_shares=9_000.0, ps_value=5_000_000.0, txns=1.0,
-                      pulled=_evening(AS_OF + timedelta(days=2)))
+        db.add("FORM4:AAPL:PS_NET_VALUE", T3, 5_000_000.0, status="FAILED")
 
         assert db.score().score == 2
 
-        # A filing date pulled late on the as-of day itself is known by its end.
-        db.filing_day(AS_OF - timedelta(days=1), ps_shares=900.0, ps_value=450_000.0, txns=1.0,
-                      pulled=datetime.combine(AS_OF, datetime.min.time()) + timedelta(hours=23))
-        assert db.score().score == 5
-
-    def test_window_sums_filing_days_within_90_days(self) -> None:
+    def test_window_sums_verified_days_within_90_days(self) -> None:
         db = _Form4DB()
-        for d in (T3, AS_OF - timedelta(days=60)):
-            db.filing_day(d, ps_shares=1_000.0, ps_value=300_000.0, txns=1.0)
-        db.filing_day(AS_OF - timedelta(days=120), ps_shares=-90_000.0, ps_value=-9_000_000.0,
-                      txns=1.0, unread=1.0)
+        db.cover(AS_OF - timedelta(days=120), LAST, {
+            T3: {"ps_shares": 1_000.0, "ps_value": 300_000.0, "txns": 1.0},
+            AS_OF - timedelta(days=60): {"ps_shares": 1_000.0, "ps_value": 300_000.0, "txns": 1.0},
+            AS_OF - timedelta(days=100): {"ps_shares": -90_000.0, "ps_value": -9_000_000.0, "txns": 1.0},
+        })
 
         result = db.score()
 
         assert result.score == 5
-        assert "Insider reported P/S (non-derivative, venue unknown) net buy $600,000" in result.signals
+        assert any(s.startswith(f"{LABEL} net buy $600,000") for s in result.signals)
 
     def test_company_layer_returns_none_because_no_xbrl_writer_exists(self) -> None:
         conn = _RawSeriesConn({})

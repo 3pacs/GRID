@@ -182,8 +182,8 @@ def test_score_smart_money_scores_reported_ps_form4_only(
     def fake_window(_conn: Any, ticker: str, as_of_date: date | None) -> cs.Form4PSWindow:
         calls.append((ticker, as_of_date))
         return cs.Form4PSWindow(
-            verified_dates=2, txns=3.0, shares_valid=3.0, priced=3.0,
-            net_shares=12_000.0, net_value=600_000.0,
+            start=date(2026, 2, 12), end=date(2026, 5, 12), txns=3.0, shares_valid=3.0,
+            priced=3.0, net_shares=12_000.0, net_value=600_000.0,
         )
 
     monkeypatch.setattr(cs, "_form4_ps_window", fake_window)
@@ -193,7 +193,11 @@ def test_score_smart_money_scores_reported_ps_form4_only(
     assert calls == [("ABC", date(2026, 5, 13))]
     assert result.name == "SMART_MONEY"
     assert result.score == 5
-    assert "Insider reported P/S (non-derivative, venue unknown) net buy $600,000" in result.signals
+    assert (
+        "Insider reported P/S (non-derivative, venue unknown) net buy $600,000 "
+        "(verified 2026-02-12..2026-05-12, 90d of 90d)"
+    ) in result.signals
+    assert result.trust == 0.85
     assert any("Institutional flow unavailable" in s for s in result.signals)
     assert result.data_available is True
 
