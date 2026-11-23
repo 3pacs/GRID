@@ -4,8 +4,10 @@ Paper Trading Signal Executor.
 Runs periodically (hourly during market hours) to:
 1. Check all ACTIVE paper strategies for fired signals
 2. For each strategy: compare leader's latest daily return to threshold (1%)
-3. If signal fires: compute Kelly position size, open paper trade on follower
-4. For open trades past their expected_lag days: close at current price
+3. If signal fires: compute Kelly position size, then reserve gross exposure and
+   open the paper trade on the follower as one serialized step (advisory lock)
+4. For EVERY open trade past its holding period — whatever its strategy's
+   status (ACTIVE, PAUSED or KILLED) — close at current price
 5. Log everything to decision journal for audit trail
 
 An optional **venue tag** (``execute_signals(engine, venue="robinhood")``)
@@ -24,7 +26,7 @@ from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from ingestion.market_calendar import last_trading_day
 from trading.circuit_breaker import StrategyCircuitBreaker
@@ -42,6 +44,18 @@ _DEFAULT_EXPECTED_LAG = 1  # days
 #: Portfolio-wide gross exposure cap (sum of OPEN position_size fractions across all strategies).
 MAX_GROSS_EXPOSURE: float = 1.0
 
+#: One exposure reservation at a time (Codex review 6011903757). A scheduled
+#: run (grid-scheduler) and a manual POST /execute-signals (grid-api) are
+#: separate processes: reading total exposure once and capping outside the
+#: insert let both read 0.90, each add 0.10 and breach MAX_GROSS_EXPOSURE, or
+#: both open the same strategy's entry. The insert transaction takes this
+#: transaction-scoped lock, then re-checks the open entry and re-reads the
+#: exposure, so an overlapping run waits for the first to commit and then sees
+#: its entry. Pattern: ingestion/altdata/cboe_indices.py (#1397).
+EXPOSURE_LOCK_KEY: str = "trading.signal_executor.gross_exposure"
+_EXPOSURE_LOCK = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
+_EXPOSURE_LOCK_TIMEOUT = text("SET LOCAL lock_timeout = '30s'")
+
 #: Fail-closed reason for refusing Robinhood mirror opens until close mirroring exists.
 ROBINHOOD_MIRROR_DISABLED_REASON = "robinhood mirror disabled: close mirroring not implemented"
 
@@ -57,8 +71,10 @@ def _get_latest_prices(
 ) -> list[tuple[date, float]]:
     """Get the latest n PIT-eligible daily prices for a feature.
 
-    Enforces point-in-time bounds (``obs_date <= as_of``, ``release_date <= as_of``)
-    and excludes retracted vintages via ``resolved_series_retractions``.
+    Enforces point-in-time bounds (``obs_date``, ``release_date`` and
+    ``vintage_date`` all ``<= as_of``: a row is knowable at the later of its
+    release and vintage dates, as main's vintage-fence guard requires) and
+    excludes retracted vintages via ``resolved_series_retractions``.
     """
     from store.pit import retraction_cutoff
 
@@ -70,6 +86,7 @@ def _get_latest_prices(
         "WHERE fr.name = :feature_name "
         "  AND rs.obs_date <= :as_of "
         "  AND rs.release_date <= :as_of "
+        "  AND rs.vintage_date <= :as_of "
         "  AND NOT EXISTS ("
         "      SELECT 1 FROM resolved_series_retractions rr "
         "      WHERE rr.feature_id = rs.feature_id "
@@ -399,6 +416,82 @@ def _get_open_gross_exposure(conn) -> float:
     return val if math.isfinite(val) else float("inf")
 
 
+def _reserve_and_open_trade(
+    conn: Connection,
+    pe: PaperTradingEngine,
+    *,
+    strategy_id: str,
+    ticker: str,
+    direction: str,
+    entry_price: float,
+    position_size: float,
+    signal_strength: float,
+    hypothesis_id: int | None,
+) -> tuple[int, str | None, float]:
+    """Reserve gross exposure and insert the entry as one serialized step.
+
+    Runs on *conn* inside the caller's open transaction (``engine.begin()``).
+    Takes the executor's transaction-scoped advisory lock, then, with the lock
+    held, re-checks that the strategy has no OPEN entry, re-reads the
+    portfolio's gross exposure, applies ``MAX_GROSS_EXPOSURE`` and only then
+    inserts on the same connection. The lock is released when the caller's
+    transaction commits or rolls back. Under PostgreSQL's default READ
+    COMMITTED each statement after the lock sees what an earlier run
+    committed, so a second run waits here and then sees the first's entry and
+    exposure. A lock wait past ``lock_timeout`` raises (fail closed).
+
+    Returns ``(trade_id, skip_reason, gross_exposure_under_lock)``. When
+    nothing was inserted ``trade_id`` is ``-1`` and ``skip_reason`` is
+    ``open_entry_exists``, ``max_gross_exposure`` or ``strategy_not_active``.
+    """
+    conn.execute(_EXPOSURE_LOCK_TIMEOUT)
+    conn.execute(_EXPOSURE_LOCK, {"key": EXPOSURE_LOCK_KEY})
+
+    open_entry = conn.execute(text(
+        "SELECT id FROM paper_trades "
+        "WHERE strategy_id = :sid AND status = 'OPEN' LIMIT 1"
+    ), {"sid": strategy_id}).fetchone()
+    gross = _get_open_gross_exposure(conn)
+    if open_entry:
+        return -1, "open_entry_exists", gross
+    if gross + position_size > MAX_GROSS_EXPOSURE + 1e-9:
+        return -1, "max_gross_exposure", gross
+
+    trade_id = pe.open_trade(
+        strategy_id=strategy_id,
+        ticker=ticker,
+        direction=direction,
+        entry_price=entry_price,
+        position_size=position_size,
+        signal_strength=signal_strength,
+        hypothesis_id=hypothesis_id,
+        threshold_used=_SIGNAL_THRESHOLD,
+        conn=conn,
+    )
+    if trade_id <= 0:
+        return -1, "strategy_not_active", gross
+    return trade_id, None, gross
+
+
+def _list_open_positions(conn: Connection) -> list[Any]:
+    """Every OPEN paper trade with its strategy's status and holding inputs.
+
+    Not filtered on strategy status (Codex review 6011903757): the exit pass
+    runs for ACTIVE, PAUSED and KILLED strategies alike. A trade whose
+    strategy row is missing comes back with ``status`` NULL.
+    Rows: ``(trade_id, strategy_id, ticker, entry_date, strategy_status,
+    hypothesis_id, follower, horizon_days)``.
+    """
+    return conn.execute(text(
+        "SELECT pt.id, pt.strategy_id, pt.ticker, pt.entry_date, "
+        "ps.status, ps.hypothesis_id, ps.follower, ps.horizon_days "
+        "FROM paper_trades pt "
+        "LEFT JOIN paper_strategies ps ON ps.id = pt.strategy_id "
+        "WHERE pt.status = 'OPEN' "
+        "ORDER BY pt.id"
+    )).fetchall()
+
+
 def execute_signals(
     engine: Engine,
     venue: str | None = None,
@@ -445,12 +538,14 @@ def execute_signals(
     strategies_halted = 0
 
     # ------------------------------------------------------------------
-    # 1. Load all ACTIVE strategies and current portfolio gross exposure
+    # 1. Load all ACTIVE strategies (entry candidates) and a snapshot of
+    #    portfolio gross exposure. The snapshot only gives an early skip;
+    #    the authoritative cap check is the re-read under the exposure lock.
     # ------------------------------------------------------------------
     with engine.connect() as conn:
         strategies = conn.execute(text(
             "SELECT id, hypothesis_id, leader, follower, horizon_days "
-            "FROM paper_strategies WHERE status = 'ACTIVE'"
+            "FROM paper_strategies WHERE status = 'ACTIVE' ORDER BY id"
         )).fetchall()
         gross_exposure = _get_open_gross_exposure(conn)
 
@@ -458,6 +553,9 @@ def execute_signals(
         "Signal executor: checking {n} active strategies (open gross exposure={g:.3f})",
         n=len(strategies), g=gross_exposure,
     )
+
+    entry_errors: dict[str, Exception] = {}
+    breaker_updates: list[str] = []  # strategies whose breaker this run may update
 
     for strat in strategies:
         strategy_id, hypothesis_id, leader, follower, strategy_horizon_days = strat
@@ -500,8 +598,8 @@ def execute_signals(
                 "error": str(exc),
             })
 
-        entry_error: Exception | None = None
-        close_error: Exception | None = None
+        if allow_entries and breaker_ok:
+            breaker_updates.append(strategy_id)
 
         # ------------------------------------------------------------------
         # 2-5. Entry signal evaluation (skipped if breaker halted/errored)
@@ -627,6 +725,8 @@ def execute_signals(
                                                     pass  # Convergence is optional — degrade gracefully
 
                                             if gross_exposure + position_size > MAX_GROSS_EXPOSURE + 1e-9:
+                                                # Early skip on this run's snapshot; the re-read under the
+                                                # exposure lock below is the authoritative check.
                                                 log.info(
                                                     "Strategy {s}: gross exposure {g:.3f} + {p:.3f} "
                                                     "exceeds cap {cap:.2f}, skipping entry",
@@ -643,16 +743,37 @@ def execute_signals(
                                                     "proposed_position_size": round(position_size, 4),
                                                 })
                                             else:
-                                                trade_id = pe.open_trade(
-                                                    strategy_id=strategy_id,
-                                                    ticker=follower,
-                                                    direction=direction,
-                                                    entry_price=entry_price,
-                                                    position_size=position_size,
-                                                    signal_strength=signal_strength,
-                                                    hypothesis_id=hypothesis_id,
-                                                    threshold_used=_SIGNAL_THRESHOLD,
-                                                )
+                                                # Exposure reservation + insert: one transaction under the
+                                                # executor's advisory lock (Codex review 6011903757).
+                                                with engine.begin() as tx:
+                                                    trade_id, reserve_skip, gross_exposure = _reserve_and_open_trade(
+                                                        tx, pe,
+                                                        strategy_id=strategy_id,
+                                                        ticker=follower,
+                                                        direction=direction,
+                                                        entry_price=entry_price,
+                                                        position_size=position_size,
+                                                        signal_strength=signal_strength,
+                                                        hypothesis_id=hypothesis_id,
+                                                    )
+                                                if reserve_skip is not None:
+                                                    log.info(
+                                                        "Strategy {s}: entry {p:.3f} refused under the exposure lock "
+                                                        "({r}, gross exposure {g:.3f}, cap {cap:.2f})",
+                                                        s=strategy_id, p=position_size, r=reserve_skip,
+                                                        g=gross_exposure, cap=MAX_GROSS_EXPOSURE,
+                                                    )
+                                                    skip = {
+                                                        "action": "SKIP",
+                                                        "strategy_id": strategy_id,
+                                                        "ticker": follower,
+                                                        "direction": direction,
+                                                        "reason": reserve_skip,
+                                                    }
+                                                    if reserve_skip == "max_gross_exposure":
+                                                        skip["current_gross_exposure"] = round(gross_exposure, 4)
+                                                        skip["proposed_position_size"] = round(position_size, 4)
+                                                    details.append(skip)
 
                                                 if trade_id > 0:
                                                     trades_opened += 1
@@ -697,7 +818,7 @@ def execute_signals(
                                             s=strategy_id, t=open_trade[0],
                                         )
             except Exception as exc:  # noqa: BLE001 — entry failure must not block closes
-                entry_error = exc
+                entry_errors[strategy_id] = exc
                 log.warning("Strategy {s} entry check failed: {e}", s=strategy_id, e=str(exc))
                 details.append({
                     "action": "ERROR",
@@ -705,26 +826,57 @@ def execute_signals(
                     "error": str(exc),
                 })
 
-        # ------------------------------------------------------------------
-        # 6. Close trades past the holding period (ALWAYS runs, even when
-        #    circuit breaker is OPEN/errored or leader data is missing/stale).
-        #    Strategy horizon_days beats the hypothesis expected_lag
-        #    so long-horizon paper trades are not closed next day.
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 6. Close trades past the holding period, for EVERY open position
+    #    (Codex review 6011903757): listed from paper_trades, not from the
+    #    ACTIVE strategies above, so a PAUSED or KILLED strategy's open trade
+    #    is still closed. ALWAYS runs, even when the circuit breaker is
+    #    OPEN/errored or leader data is missing/stale. Strategy horizon_days
+    #    beats the hypothesis expected_lag so long-horizon paper trades are
+    #    not closed next day. The exit price is the strategy follower's.
+    # ------------------------------------------------------------------
+    close_errors: dict[str, Exception] = {}
+    listing_error: Exception | None = None
+    positions: list[Any] = []
+    try:
+        with engine.connect() as conn:
+            positions = _list_open_positions(conn)
+    except Exception as exc:  # noqa: BLE001
+        listing_error = exc
+        log.warning("Open-position listing for the exit pass failed: {e}", e=str(exc))
+        details.append({"action": "ERROR", "stage": "exit_pass", "error": str(exc)})
+
+    exits_by_strategy: dict[str, tuple] = {}
+    for (trade_id, strategy_id, ticker, entry_date, strategy_status,
+         hypothesis_id, follower, strategy_horizon_days) in positions:
+        if strategy_status is None:
+            log.warning(
+                "Trade #{id} ({t}) has no paper_strategies row {s}: no holding rule, kept open",
+                id=trade_id, t=ticker, s=strategy_id,
+            )
+            details.append({
+                "action": "SKIP_CLOSE",
+                "strategy_id": strategy_id,
+                "trade_id": trade_id,
+                "ticker": ticker,
+                "reason": "strategy_missing",
+            })
+            continue
+        exits_by_strategy.setdefault(
+            strategy_id,
+            (strategy_status, hypothesis_id, follower, strategy_horizon_days, []),
+        )[4].append((trade_id, ticker, entry_date))
+
+    for strategy_id, exit_group in exits_by_strategy.items():
+        strategy_status, hypothesis_id, follower, strategy_horizon_days, open_trades = exit_group
         try:
             with engine.connect() as conn:
                 expected_lag = resolve_hold_days(
                     strategy_horizon_days, _get_expected_lag(conn, hypothesis_id)
                 )
 
-                open_trades = conn.execute(text(
-                    "SELECT id, ticker, entry_date, position_size FROM paper_trades "
-                    "WHERE strategy_id = :sid AND status = 'OPEN'"
-                ), {"sid": strategy_id}).fetchall()
-
                 for ot in open_trades:
                     trade_id, ticker, entry_date = ot[0], ot[1], ot[2]
-                    closed_pos_size = float(ot[3]) if len(ot) > 3 and ot[3] is not None else 0.0
                     if entry_date + timedelta(days=expected_lag) <= today:
                         # Get follower's current price for exit
                         exit_prices = _get_latest_prices(conn, follower, 1)
@@ -758,11 +910,10 @@ def execute_signals(
 
                         if "error" not in result:
                             trades_closed += 1
-                            if math.isfinite(closed_pos_size):
-                                gross_exposure = max(0.0, gross_exposure - abs(closed_pos_size))
                             details.append({
                                 "action": "CLOSE",
                                 "strategy_id": strategy_id,
+                                "strategy_status": strategy_status,
                                 "trade_id": trade_id,
                                 "ticker": ticker,
                                 "exit_price": exit_price,
@@ -770,7 +921,7 @@ def execute_signals(
                                 "pnl_pct": result.get("pnl_pct"),
                             })
         except Exception as exc:  # noqa: BLE001
-            close_error = exc
+            close_errors[strategy_id] = exc
             log.warning("Strategy {s} auto-close check failed: {e}", s=strategy_id, e=str(exc))
             details.append({
                 "action": "ERROR",
@@ -778,29 +929,35 @@ def execute_signals(
                 "error": str(exc),
             })
 
-        # Update breaker only when entries were permitted and the breaker table was usable.
-        if allow_entries and breaker_ok:
-            err = entry_error or close_error
-            try:
-                if err is not None:
-                    breaker.record_failure(strategy_id, str(err))
-                else:
-                    breaker.record_success(strategy_id)
-            except Exception as bexc:  # noqa: BLE001
-                log.error(
-                    "Circuit breaker state update failed for strategy {s}: {e}",
-                    s=strategy_id, e=str(bexc),
-                )
+    # Update breakers only for strategies whose entries were permitted and
+    # whose breaker table was usable (non-ACTIVE strategies are never here).
+    for strategy_id in breaker_updates:
+        err = entry_errors.get(strategy_id) or close_errors.get(strategy_id) or listing_error
+        try:
+            if err is not None:
+                breaker.record_failure(strategy_id, str(err))
+            else:
+                breaker.record_success(strategy_id)
+        except Exception as bexc:  # noqa: BLE001
+            log.error(
+                "Circuit breaker state update failed for strategy {s}: {e}",
+                s=strategy_id, e=str(bexc),
+            )
 
     # ------------------------------------------------------------------
-    # 7. Count any strategies killed during this run (from close_trade)
+    # 7. Count strategies killed during this run (from close_trade). Only
+    #    strategies ACTIVE at the start count: closing an already-KILLED
+    #    strategy's trade also bumps its updated_at.
     # ------------------------------------------------------------------
-    with engine.connect() as conn:
-        killed = conn.execute(text(
-            "SELECT COUNT(*) FROM paper_strategies "
-            "WHERE status = 'KILLED' AND updated_at >= NOW() - INTERVAL '5 minutes'"
-        )).fetchone()
-        strategies_killed = killed[0] if killed else 0
+    active_ids = [s[0] for s in strategies]
+    if active_ids:
+        with engine.connect() as conn:
+            killed = conn.execute(text(
+                "SELECT COUNT(*) FROM paper_strategies "
+                "WHERE status = 'KILLED' AND id = ANY(CAST(:active_ids AS TEXT[])) "
+                "AND updated_at >= NOW() - INTERVAL '5 minutes'"
+            ), {"active_ids": active_ids}).fetchone()
+            strategies_killed = killed[0] if killed else 0
 
     summary = {
         "signals_checked": signals_checked,

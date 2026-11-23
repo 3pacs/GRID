@@ -525,6 +525,8 @@ class TestDefect5PriceFreshnessAndPIT:
         sql, params = captured[0]
         assert "obs_date <= :as_of" in sql
         assert "release_date <= :as_of" in sql
+        # main's vintage-fence guard: knowable at the later of release and vintage.
+        assert "vintage_date <= :as_of" in sql
         assert "resolved_series_retractions" in sql
         assert params["as_of"] == as_of
         assert params["retraction_cutoff"] == retraction_cutoff(as_of)

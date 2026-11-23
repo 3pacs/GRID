@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import nullcontext
 from datetime import date, datetime
 
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 
 #: Minimum closed trades required before sizing via Kelly criterion
@@ -157,12 +158,18 @@ class PaperTradingEngine:
         physics_score: float = 0.0,
         hypothesis_id: int | None = None,
         threshold_used: float = 0.0,
+        conn: Connection | None = None,
     ) -> int:
         """Open a new paper trade.
 
-        Returns trade_id.
+        *conn*, when given, runs the status check and the insert on that
+        connection inside the caller's open transaction (the signal executor's
+        serialized exposure reservation) and leaves the commit to the caller.
+        Without it the trade gets a transaction of its own.
+
+        Returns trade_id, or -1 when the strategy is not ACTIVE.
         """
-        with self.engine.begin() as conn:
+        with (self.engine.begin() if conn is None else nullcontext(conn)) as conn:
             # Check strategy is active
             strat = conn.execute(text(
                 "SELECT status FROM paper_strategies WHERE id = :id"
