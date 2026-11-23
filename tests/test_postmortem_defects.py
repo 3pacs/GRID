@@ -10,6 +10,9 @@ Covers:
    edges on wrong-direction moves.
 6. thesis_invalidation_monitor querying non-existent decision_journal columns
    (and ticker_metrics_daily.as_of_date) and swallowing DB errors at log.debug.
+7. The entry anchor and scanner context read by date only, so an intraday
+   decision could anchor on that day's later close and a later revision could
+   move the anchor (Codex HOLD 6011903681): both are now fenced at generated_at.
 
 All tests are offline (synthetic inputs, mocks, or in-memory SQLite).
 """
@@ -21,6 +24,7 @@ import re
 import sys
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, event, text
@@ -144,75 +148,314 @@ class TestDefect1UnitMixing:
         assert cat == "insufficient_data", f"Expected insufficient_data, got {cat}: {root_cause}"
 
     def test_generate_postmortem_loads_pit_raw_series_close_when_scanner_spot_missing(self, monkeypatch):
-        """When options_daily_signals has no row and price path falls back to
-        raw_series, generate_postmortem loads the PIT close (obs_date <= generated_at)
-        from raw_series rather than dividing by option premium."""
-        gen_ts = datetime(2026, 4, 10, 15, 0, tzinfo=timezone.utc)
-        closed_ts = datetime(2026, 4, 24, 21, 0, tzinfo=timezone.utc)
-        executed_queries: list[tuple[str, dict]] = []
+        """When options_daily_signals has no row and the price path falls back to
+        raw_series, the entry anchor is the completed close known at generated_at
+        (the prior session for an 11:00 ET decision), never the option premium
+        and never the decision day's own close."""
+        gen_ts = _ny(date(2026, 4, 10), 11).astimezone(timezone.utc)  # Friday, intraday
+        db = _ClockFakeDB(_trade_row(7, "AAPL", "CALL", date(2026, 4, 24), gen_ts,
+                                     _ny(date(2026, 4, 24), 17)))
+        # Price path fell monotonically from 180 to 170.
+        db.add_close("AAPL", date(2026, 4, 9), 180.0, _ny(date(2026, 4, 9), 17, 30))
+        db.add_close("AAPL", date(2026, 4, 10), 180.0, _ny(date(2026, 4, 10), 17, 30))
+        db.add_close("AAPL", date(2026, 4, 17), 175.0, _ny(date(2026, 4, 17), 17, 30))
+        db.add_close("AAPL", date(2026, 4, 24), 170.0, _ny(date(2026, 4, 24), 17, 30))
 
-        class _FakeConn:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def execute(self, stmt, params=None):
-                sql = " ".join(str(stmt).split())
-                p = dict(params or {})
-                executed_queries.append((sql, p))
-                res = MagicMock()
-                if "FROM options_recommendations" in sql:
-                    res.fetchone.return_value = (
-                        7, "AAPL", "CALL", 185.0, date(2026, 4, 24), 2.50,
-                        5.00, 1.25, 0.7, "bullish call", "{}", gen_ts,
-                        "EXPIRED", -1.0, closed_ts, "",
-                        json.dumps([{"name": "iv_skew", "score": 3.0, "direction": "bullish"}]),
-                        "[]",
-                    )
-                elif "FROM raw_series" in sql and "obs_date >= :s" in sql:
-                    # Price path fell monotonically from 180 to 170
-                    res.fetchall.return_value = [
-                        (date(2026, 4, 10), 180.0),
-                        (date(2026, 4, 17), 175.0),
-                        (date(2026, 4, 24), 170.0),
-                    ]
-                elif "FROM raw_series" in sql and "obs_date <= :d" in sql:
-                    # PIT underlying close at or before generated_at
-                    res.fetchone.return_value = (180.0,)
-                else:
-                    res.fetchone.return_value = None
-                    res.fetchall.return_value = []
-                return res
-
-        class _FakeEngine:
-            def connect(self):
-                return _FakeConn()
-
-            def begin(self):
-                return _FakeConn()
-
-        monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
-        monkeypatch.setattr(pm_mod, "_store_postmortem", lambda *a, **k: None)
-        monkeypatch.setattr(pm_mod, "_emit_trade_postmortem", lambda **k: None)
-        monkeypatch.setattr(
-            pm_mod,
-            "_get_llm_postmortem",
-            lambda **k: {"recommended_fix": k["root_cause"], "what_we_missed": "", "confidence": 0.5},
-        )
-
-        pm = generate_postmortem(_FakeEngine(), trade_id=7)
+        pm = _run_trade_postmortem(monkeypatch, db, 7)
         assert pm is not None
         assert pm.failure_category == "wrong_signal"
         assert pm.actual_return == pytest.approx(-1.0)
-        # Confirm a PIT-bounded raw_series entry close query ran with d == 2026-04-10
-        pit_entry_calls = [
-            (sql, p) for sql, p in executed_queries
-            if "FROM raw_series" in sql and "obs_date <= :d" in sql
-        ]
-        assert len(pit_entry_calls) == 1
-        assert pit_entry_calls[0][1]["d"] == date(2026, 4, 10)
+        assert pm.data_at_decision["underlying_entry_spot"] == pytest.approx(180.0)
+        assert "2026-04-09" in pm.data_at_decision["underlying_entry_spot_basis"]
+        # The entry read went through store.observations, fenced at generated_at.
+        entry_reads = [p for sql, p in db.statements if "FROM raw_series r" in sql]
+        assert entry_reads, "entry anchor must be read through store.observations"
+        assert all(p["as_of_ts"] == gen_ts for p in entry_reads)
+
+
+# ── Decision-clock fence on the entry anchor (Codex HOLD 6011903681) ───────
+
+_NY = ZoneInfo("America/New_York")
+
+
+def _ny(d: date, hh: int, mm: int = 0) -> datetime:
+    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=_NY)
+
+
+class _Res:
+    def __init__(self, rows=(), one=None):
+        self._rows = list(rows)
+        self._one = one
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._one
+
+
+class _ClockFakeDB:
+    """Answers generate_postmortem's trade, options_daily_signals and raw_series reads.
+
+    Rows carry their write clock (``created_at`` / ``pull_timestamp``) and the
+    fake applies exactly the filters a statement states, so a read without a
+    decision-clock fence sees rows written after the decision, as the real
+    tables would show them.
+    """
+
+    def __init__(self, trade_row):
+        self.trade_row = trade_row
+        self.closes: list[dict] = []
+        self.signals: list[dict] = []
+        self.statements: list[tuple[str, dict]] = []
+
+    def add_close(self, ticker, d, value, pulled, *, source="TIINGO", status="SUCCESS", payload=None):
+        self.closes.append({"sid": f"YF:{ticker}:close", "od": d, "val": value,
+                            "pulled": pulled.astimezone(timezone.utc), "src": source,
+                            "status": status, "payload": payload})
+
+    def add_signal(self, ticker, d, spot, created_at, *, pcr=1.0, iv_skew=0.0):
+        self.signals.append({"t": ticker, "sd": d, "spot": spot, "pcr": pcr, "iv_skew": iv_skew,
+                             "created": None if created_at is None else created_at.astimezone(timezone.utc)})
+
+    def connect(self):
+        return self
+
+    def begin(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt, params=None):
+        sql = " ".join(str(stmt).split())
+        p = dict(params or {})
+        self.statements.append((sql, p))
+        if "FROM options_recommendations" in sql:
+            return _Res(one=self.trade_row)
+        if "options_daily_signals" in sql:
+            return self._signal_read(sql, p)
+        if "FROM raw_series" in sql:
+            return self._raw_read(sql, p)
+        return _Res()
+
+    def _signal_read(self, sql, p):
+        rows = [s for s in self.signals if s["t"] == p["t"]]
+        if "signal_date >= :s" in sql:  # price path
+            rows = sorted((s for s in rows if p["s"] <= s["sd"] <= p["e"] and s["spot"] > 0),
+                          key=lambda s: s["sd"])
+            return _Res([(s["sd"], s["spot"]) for s in rows])
+        rows = [s for s in rows if s["sd"] <= p["d"]]
+        if "created_at <= :decision_ts" in sql:
+            rows = [s for s in rows if s["created"] is not None and s["created"] <= p["decision_ts"]]
+        if "spot_price > 0" in sql:
+            rows = [s for s in rows if s["spot"] > 0]
+        rows.sort(key=lambda s: s["sd"], reverse=True)
+        if not rows:
+            return _Res()
+        s = rows[0]
+        if sql.startswith("SELECT spot_price"):
+            return _Res(one=(s["spot"],))
+        return _Res(one=(s["pcr"], 0.3, s["iv_skew"], None, s["spot"], 1000, -0.01, 0.1,
+                         s["sd"], s["created"]))
+
+    def _raw_read(self, sql, p):
+        rows = [r for r in self.closes if r["sid"] == p["sid"]]
+        if sql.startswith("SELECT obs_date, value FROM raw_series"):  # price path
+            rows = [r for r in rows if r["status"] == "SUCCESS" and r["val"] > 0
+                    and p["s"] <= r["od"] <= p["e"]]
+            rows.sort(key=lambda r: (r["od"], -r["pulled"].timestamp()))
+            return _Res([(r["od"], r["val"]) for r in rows])
+        if sql.startswith("SELECT value FROM raw_series"):  # obs_date-only entry read
+            rows = [r for r in rows if r["status"] == "SUCCESS" and r["val"] > 0 and r["od"] <= p["d"]]
+            rows.sort(key=lambda r: (r["od"], r["pulled"]), reverse=True)
+            return _Res(one=(rows[0]["val"],) if rows else None)
+        if sql.startswith("SELECT r.obs_date, r.value, r.pull_timestamp, sc.name"):  # store.observations
+            rows = [r for r in rows if r["status"] == p["ok"]
+                    and (p["source"] is None or r["src"].lower() == p["source"].lower())
+                    and (p["start"] is None or r["od"] >= p["start"])
+                    and (p["as_of"] is None or r["od"] <= p["as_of"])
+                    and (p["as_of_ts"] is None or r["pulled"] <= p["as_of_ts"])]
+            rows.sort(key=lambda r: (r["od"], -r["pulled"].timestamp()))
+            if "r.raw_payload" in sql:
+                return _Res([(r["od"], r["val"], r["pulled"], r["src"], r["payload"]) for r in rows])
+            return _Res([(r["od"], r["val"], r["pulled"], r["src"]) for r in rows])
+        raise AssertionError("unmodeled raw_series SQL: " + sql)
+
+
+def _trade_row(trade_id, ticker, direction, expiry, gen_ts, closed_ts):
+    return (
+        trade_id, ticker, direction, 100.0, expiry, 2.50,
+        5.00, 1.25, 0.7, f"{direction.lower()} thesis", "{}", gen_ts,
+        "EXPIRED", -1.0, closed_ts, "", "[]", "[]",
+    )
+
+
+def _run_trade_postmortem(monkeypatch, db, trade_id):
+    monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
+    monkeypatch.setattr(pm_mod, "_store_postmortem", lambda *a, **k: None)
+    monkeypatch.setattr(pm_mod, "_emit_trade_postmortem", lambda **k: None)
+    monkeypatch.setattr(
+        pm_mod,
+        "_get_llm_postmortem",
+        lambda **k: {"recommended_fix": k["root_cause"], "what_we_missed": "", "confidence": 0.5},
+    )
+    return generate_postmortem(db, trade_id=trade_id)
+
+
+class TestEntryAnchorDecisionClockFence:
+    """The entry anchor and scanner context hold only what was known at generated_at.
+
+    Calendar (EDT): Mon 2026-04-13 .. Fri 04-17, Sat 04-18, Mon 04-20, Tue 04-21.
+    Every TIINGO close is pulled at 17:30 ET on its session day unless stated.
+    """
+
+    WED = date(2026, 4, 15)
+
+    def test_intraday_decision_never_anchors_on_that_days_later_close(self, monkeypatch):
+        """11:00 ET decision on Wednesday: Wednesday's close (pulled 17:30 ET) did
+        not exist yet. Anchoring on it (104) reads the CALL as never right; the
+        known anchor (Tuesday's 100) shows it was +4 % right before expiry."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(11, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        for d, v in ((date(2026, 4, 14), 100.0), (self.WED, 104.0),
+                     (date(2026, 4, 16), 103.0), (date(2026, 4, 17), 102.5)):
+            db.add_close("AAPL", d, v, _ny(d, 17, 30))
+
+        pm = _run_trade_postmortem(monkeypatch, db, 11)
+        assert pm.data_at_decision["underlying_entry_spot"] == pytest.approx(100.0)
+        assert "2026-04-14" in pm.data_at_decision["underlying_entry_spot_basis"]
+        assert pm.failure_category == "right_signal_wrong_timing", pm.root_cause
+
+    def test_later_revision_of_prior_close_leaves_entry_anchor_unchanged(self, monkeypatch):
+        """Saturday decision: Friday's 100 close was known. A re-pull of Friday
+        on Monday (110) is a later revision and must not move the anchor."""
+        gen_ts = _ny(date(2026, 4, 18), 10).astimezone(timezone.utc)
+        fri = date(2026, 4, 17)
+
+        def build():
+            db = _ClockFakeDB(_trade_row(12, "AAPL", "CALL", date(2026, 4, 21), gen_ts,
+                                         _ny(date(2026, 4, 21), 17)))
+            db.add_close("AAPL", fri, 100.0, _ny(fri, 17, 30))
+            db.add_close("AAPL", date(2026, 4, 20), 103.0, _ny(date(2026, 4, 20), 17, 30))
+            db.add_close("AAPL", date(2026, 4, 21), 102.0, _ny(date(2026, 4, 21), 17, 30))
+            return db
+
+        baseline = _run_trade_postmortem(monkeypatch, build(), 12)
+        revised_db = build()
+        revised_db.add_close("AAPL", fri, 110.0, _ny(date(2026, 4, 20), 9))  # revision after the decision
+        revised = _run_trade_postmortem(monkeypatch, revised_db, 12)
+
+        assert baseline.data_at_decision["underlying_entry_spot"] == pytest.approx(100.0)
+        assert revised.data_at_decision["underlying_entry_spot"] == pytest.approx(100.0)
+        assert revised.failure_category == baseline.failure_category == "right_signal_wrong_timing"
+
+    def test_abstains_when_no_close_was_known_at_decision(self, monkeypatch):
+        """Tuesday's close was only backfilled after the decision and Wednesday's
+        only capture before the decision was intraday (not a close): nothing was
+        provably known, so no anchor and no attribution, with the reason kept."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(13, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        db.add_close("AAPL", date(2026, 4, 14), 100.0, _ny(date(2026, 4, 20), 9))  # backfill
+        db.add_close("AAPL", self.WED, 101.0, _ny(self.WED, 10, 30), source="yfinance")  # intraday
+        for d, v in ((self.WED, 104.0), (date(2026, 4, 16), 103.0), (date(2026, 4, 17), 102.5)):
+            db.add_close("AAPL", d, v, _ny(d, 17, 30))
+
+        pm = _run_trade_postmortem(monkeypatch, db, 13)
+        assert "underlying_entry_spot" not in pm.data_at_decision
+        reason = pm.data_at_decision["underlying_entry_spot_unavailable"]
+        assert gen_ts.isoformat() in reason
+        assert pm.failure_category == "insufficient_data"
+        assert reason in pm.root_cause
+
+    def test_scanner_lookup_ignores_a_row_written_after_the_decision(self, monkeypatch):
+        """Wednesday's options_daily_signals row was written at 16:30 ET, after the
+        11:00 ET decision: the scanner context and anchor are Tuesday's row."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(14, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        for d, v, pcr in ((date(2026, 4, 14), 100.0, 0.5), (self.WED, 104.0, 1.5),
+                          (date(2026, 4, 16), 103.0, 1.5), (date(2026, 4, 17), 102.5, 1.5)):
+            db.add_signal("AAPL", d, v, _ny(d, 16, 30), pcr=pcr)
+
+        pm = _run_trade_postmortem(monkeypatch, db, 14)
+        scanner = pm.data_at_decision["scanner_signals"]
+        assert scanner["signal_date"] == "2026-04-14"
+        assert scanner["put_call_ratio"] == pytest.approx(0.5)
+        assert pm.data_at_decision["underlying_entry_spot"] == pytest.approx(100.0)
+        assert pm.failure_category == "right_signal_wrong_timing", pm.root_cause
+        fenced = [p for sql, p in db.statements
+                  if "options_daily_signals" in sql and "signal_date <= :d" in sql]
+        assert fenced and all(p["decision_ts"] == gen_ts for p in fenced)
+
+    def test_scanner_row_revised_after_the_decision_is_not_used(self, monkeypatch):
+        """Tuesday's row was revised in place on Thursday (its created_at moved past
+        the decision), so its value at the decision cannot be shown; Monday's row,
+        unchanged since Monday, is the last one provably known."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(15, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        db.add_signal("AAPL", date(2026, 4, 13), 99.0, _ny(date(2026, 4, 13), 16, 30))
+        db.add_signal("AAPL", date(2026, 4, 14), 110.0, _ny(date(2026, 4, 16), 9))  # revised later
+        for d, v in ((self.WED, 104.0), (date(2026, 4, 16), 103.0), (date(2026, 4, 17), 102.5)):
+            db.add_signal("AAPL", d, v, _ny(d, 16, 30))
+
+        pm = _run_trade_postmortem(monkeypatch, db, 15)
+        assert pm.data_at_decision["scanner_signals"]["signal_date"] == "2026-04-13"
+        assert pm.data_at_decision["underlying_entry_spot"] == pytest.approx(99.0)
+        assert pm.failure_category == "right_signal_wrong_timing", pm.root_cause
+
+    def test_scanner_abstains_when_every_row_was_written_after_the_decision(self, monkeypatch):
+        """No options_daily_signals row existed by the decision: no scanner
+        context, no anchor from the scanner's price source, insufficient_data."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        db = _ClockFakeDB(_trade_row(16, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                                     _ny(date(2026, 4, 17), 17)))
+        db.add_signal("AAPL", date(2026, 4, 14), 100.0, _ny(date(2026, 4, 20), 9))  # backfilled
+        for d, v in ((self.WED, 104.0), (date(2026, 4, 16), 103.0), (date(2026, 4, 17), 102.5)):
+            db.add_signal("AAPL", d, v, _ny(d, 16, 30))
+
+        pm = _run_trade_postmortem(monkeypatch, db, 16)
+        assert "scanner_signals" not in pm.data_at_decision
+        assert gen_ts.isoformat() in pm.data_at_decision["scanner_signals_unavailable"]
+        assert "underlying_entry_spot" not in pm.data_at_decision
+        assert pm.failure_category == "insufficient_data"
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            (datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc), datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc)),
+            (datetime(2026, 4, 15, 15, 0), datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc)),  # naive = UTC
+            (datetime(2026, 4, 15, 11, 0, tzinfo=ZoneInfo("America/New_York")),
+             datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc)),
+            ("2026-04-15T15:00:00Z", datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc)),
+            (date(2026, 4, 15), None),     # no time of day: cannot say what was known
+            ("2026-04-15", None),
+            ("not a time", None),
+            (None, None),
+        ],
+    )
+    def test_decision_clock_is_an_aware_instant_or_none(self, raw, expected):
+        assert pm_mod._decision_clock(raw) == expected
+
+    def test_bare_date_clock_abstains_without_reading(self, monkeypatch):
+        """A decision clock with no time of day cannot fence a same-day close:
+        abstain rather than read by date."""
+        db = _ClockFakeDB(None)
+        db.add_close("AAPL", date(2026, 4, 14), 100.0, _ny(date(2026, 4, 14), 17, 30))
+        db.add_signal("AAPL", date(2026, 4, 14), 100.0, _ny(date(2026, 4, 14), 16, 30))
+        data = pm_mod._reconstruct_decision_data(db, "AAPL", date(2026, 4, 15), {}, "")
+        assert "scanner_signals" not in data
+        assert "scanner_signals_unavailable" in data
+        spot, note = pm_mod._load_underlying_entry_spot(db, "AAPL", date(2026, 4, 15), data)
+        assert spot is None and "timestamp" in note
+        assert not [sql for sql, _ in db.statements
+                    if "options_daily_signals" in sql or "FROM raw_series" in sql]
 
 
 # ── Defect 2: Staleness check uses future expiry instead of decision time ──
@@ -895,8 +1138,10 @@ class TestDefect6ThesisInvalidationMonitor:
                         "[]",
                     )
                 elif "put_call_ratio" in sql:
+                    # Written at 09:00 ET, before the 10:30 ET decision.
                     res.fetchone.return_value = (
                         1.4, 0.32, 0.25, 172.0, 180.0, 50000, -0.04, 0.12, date(2026, 4, 10),
+                        datetime(2026, 4, 10, 13, 0, tzinfo=timezone.utc),
                     )
                 elif "signal_date >= :s" in sql:
                     res.fetchall.return_value = [
