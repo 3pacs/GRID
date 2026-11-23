@@ -41,9 +41,12 @@ def _auth_header() -> dict[str, str]:
 
 
 def _mock_overview_conn(price_row=None, opt_row=None, regime_row=None, feat_rows=None):
-    """Mock connection answering get_ticker_overview's four sequential
-    reads in order: price, options, regime, related-features."""
+    """Mock connection answering get_ticker_overview's sequential reads in
+    order: the price features' ids (store.feature_ids, one registered
+    feature here), price, options, regime, related-features."""
     mock_conn = MagicMock()
+    ids_result = MagicMock()
+    ids_result.fetchall.return_value = [(1, "aapl_full")]
     price_result = MagicMock()
     price_result.fetchone.return_value = price_row
     opt_result = MagicMock()
@@ -52,7 +55,7 @@ def _mock_overview_conn(price_row=None, opt_row=None, regime_row=None, feat_rows
     regime_result.fetchone.return_value = regime_row
     feat_result = MagicMock()
     feat_result.fetchall.return_value = feat_rows or []
-    mock_conn.execute.side_effect = [price_result, opt_result, regime_result, feat_result]
+    mock_conn.execute.side_effect = [ids_result, price_result, opt_result, regime_result, feat_result]
     return mock_conn
 
 
