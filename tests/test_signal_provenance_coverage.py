@@ -212,7 +212,7 @@ class TestBuildProvenanceReportCoverage:
                     ),
                 )
             )
-        stack.enter_context(patch.object(sp, "get_scorecard_with_regime_fallback", lambda *_a, **_k: scorecard))
+        stack.enter_context(patch.object(sp, "get_scorecard_with_regime_source", lambda *_a, **_k: (scorecard, "regime")))
         stack.enter_context(patch.object(sp, "_recent_fudge_alerts", lambda *_a, **_k: []))
         stack.enter_context(patch.object(sp, "build_condition_tuple", lambda **_k: ("t",)))
 

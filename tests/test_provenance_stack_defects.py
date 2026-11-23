@@ -17,6 +17,10 @@ and mocks (no database, no network):
      signal names / families (matching bootstrap/Brier keys), not raw model
      names.
   6. Unwired edge_signal layer counts honestly as absent in coverage.
+  7. Codex HOLD 6011905360: only regime-table scorecards count as
+     regime-calibrated (each row reports its calibration source), and the
+     builder dates its layers from the prediction's clock and refuses a
+     clock outside the live window.
 """
 from __future__ import annotations
 
@@ -313,8 +317,8 @@ class TestDefect1HonestCoverage:
 
         with patch.object(
             sp,
-            "get_scorecard_with_regime_fallback",
-            lambda _eng, src, _h, _reg=None: _card(src, 1.3),
+            "get_scorecard_with_regime_source",
+            lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
         ):
             report = sp.build_provenance_report(engine, prediction=pred)
 
@@ -426,8 +430,8 @@ class TestDefect2NoDoubleCounting:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: _card(src, 1.25),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (_card(src, 1.25), "regime"),
                 )
             )
             rep_clean = sp.build_provenance_report(MagicMock(), prediction=pred_clean)
@@ -475,8 +479,8 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: _card(src, 1.4),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (_card(src, 1.4), "regime"),
                 )
             )
             report = sp.build_provenance_report(engine, prediction=pred)
@@ -510,8 +514,8 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: _card(src, 1.3),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
                 )
             )
             report = sp.build_provenance_report(MagicMock(), prediction=pred)
@@ -544,8 +548,8 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: _card(src, 1.4),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (_card(src, 1.4), "regime"),
                 )
             )
             report = sp.build_provenance_report(engine, prediction=pred)
@@ -571,8 +575,8 @@ class TestDefect4RedTeamAdvisoryOnly:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: _card(src, 1.3),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
                 )
             )
             rep_not_run = sp.build_provenance_report(
@@ -738,8 +742,8 @@ class TestDefect5ScorecardKeyMapping:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: family_cards.get(src),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (family_cards.get(src), "regime"),
                 )
             )
             report = sp.build_provenance_report(_OracleModelsEngine(), prediction=pred)
@@ -767,8 +771,8 @@ class TestDefect5ScorecardKeyMapping:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: cards.get(src),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (cards.get(src), "regime"),
                 )
             )
             report = sp.build_provenance_report(MagicMock(), prediction=pred)
@@ -790,8 +794,8 @@ class TestDefect6EdgeSignalAbsence:
             stack.enter_context(
                 patch.object(
                     sp,
-                    "get_scorecard_with_regime_fallback",
-                    lambda _eng, src, _h, _reg=None: _card(src, 1.3),
+                    "get_scorecard_with_regime_source",
+                    lambda _eng, src, _h, _reg=None: (_card(src, 1.3), "regime"),
                 )
             )
             report = sp.build_provenance_report(MagicMock(), prediction=pred)
@@ -1065,7 +1069,7 @@ class TestCodexHold6011905360PredictionClock:
         pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
         # 00:10 UTC on 2026-03-06, written without tzinfo.
         late_now = datetime(2026, 3, 6, 0, 20, tzinfo=timezone.utc)
-        pred.as_of = datetime(2026, 3, 6, 0, 10)
+        pred.as_of = datetime(2026, 3, 6, 0, 10)  # noqa: DTZ001 - naive on purpose
         with ExitStack() as stack:
             _patch_all_non_fudge_adapters(stack, value=1.0)
             seen = _capture_dated_layers(stack)

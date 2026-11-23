@@ -302,10 +302,10 @@ class TestBuildReport:
         }
 
         def fake_get(eng, source, h, regime=None):
-            return family_cards.get(source)
+            return family_cards.get(source), "regime"
 
         with patch(
-            "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
+            "intelligence.signal_provenance.get_scorecard_with_regime_source",
             side_effect=fake_get,
         ), patch(
             "intelligence.signal_provenance.get_lift_multiplier",
@@ -396,8 +396,8 @@ class TestBuildReport:
         strong_card = _card("equity", 7, 50, 0.06, 1.5)
 
         with patch(
-            "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
-            return_value=strong_card,
+            "intelligence.signal_provenance.get_scorecard_with_regime_source",
+            return_value=(strong_card, "regime"),
         ), patch(
             "intelligence.signal_provenance.get_lift_multiplier",
             return_value=1.0,
@@ -496,8 +496,8 @@ class TestBuildReport:
         ]
 
         with patch(
-            "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
-            return_value=strong_card,
+            "intelligence.signal_provenance.get_scorecard_with_regime_source",
+            return_value=(strong_card, "regime"),
         ), patch(
             "intelligence.signal_provenance.get_lift_multiplier",
             return_value=1.0,

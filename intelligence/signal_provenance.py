@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
 from loguru import logger as log
@@ -44,7 +44,8 @@ from features.per_signal_brier import (
     SignalScorecard,
 )
 from features.regime_conditional_brier import (
-    get_scorecard_with_regime_fallback,
+    CALIBRATION_SOURCE_REGIME,
+    get_scorecard_with_regime_source,
 )
 from intelligence import signal_convergence_scanner as _convergence_mod
 from intelligence.confidence_bucket_tracker import (
@@ -109,6 +110,10 @@ class SignalEvidence:
     shapley_weight: float         # normalized attribution share in [0, 1]
     scorecard: SignalScorecard | None
     classification: str           # strong / neutral / weak / anti_predictive / cold_start / no_history
+    # Which table the scorecard came from: "regime" (regime-conditional row),
+    # "flat_fallback" (regime given but its row missing or thin), "flat" (no
+    # regime on the prediction), or None (no scorecard).
+    calibration_source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,6 +123,7 @@ class SignalEvidence:
                 self.scorecard.to_dict() if self.scorecard is not None else None
             ),
             "classification": self.classification,
+            "calibration_source": self.calibration_source,
         }
 
 
@@ -175,7 +181,7 @@ class TradeProvenanceReport:
     shipping_fudge_alerts: list[dict[str, Any]]
     causation: CausationChain
     cooccurrence_lift: float  # pair-lift multiplier ∈ [0.75, 1.25] (CAT-177 signal_cooccurrence)
-    regime_calibrated_signal_count: int  # how many evidence rows used regime-conditional Brier
+    regime_calibrated_signal_count: int  # evidence rows whose scorecard came from the regime-conditional table (flat fallbacks excluded)
     confidence_bucket_multiplier: float  # ∈ [0.60, 1.08] (CAT-180 confidence_bucket_tracker)
     scenario_multiplier: float            # ∈ [0.70, 1.10] (CAT-176 historical_scenario_library)
     null_hypothesis_penalty: float        # ∈ [0.50, 1.00] (CAT-186 null_hypothesis_forecaster)
@@ -858,22 +864,28 @@ def _lookup_scorecard(
     source: str,
     horizon_days: int,
     regime: str | None,
-) -> SignalScorecard | None:
+) -> tuple[SignalScorecard | None, str | None]:
     """Look up a per-signal/regime scorecard, reconciling ``feature:<family>``
     and bare ``<family>`` key spellings written by different bootstrap paths.
+
+    Returns ``(card, calibration_source)``: the source says which table
+    answered (see ``features.regime_conditional_brier.CALIBRATION_SOURCE_*``)
+    and is ``None`` when no scorecard was found.
     """
-    card = get_scorecard_with_regime_fallback(engine, source, horizon_days, regime)
-    if card is not None:
-        return card
+    keys = [source]
     if source.startswith("feature:"):
         bare = source.split(":", 1)[1].strip()
         if bare:
-            return get_scorecard_with_regime_fallback(engine, bare, horizon_days, regime)
+            keys.append(bare)
     elif ":" not in source and source not in ("other", "oracle_aggregate"):
-        return get_scorecard_with_regime_fallback(
-            engine, f"feature:{source}", horizon_days, regime
+        keys.append(f"feature:{source}")
+    for key in keys:
+        card, calibration_source = get_scorecard_with_regime_source(
+            engine, key, horizon_days, regime
         )
-    return None
+        if card is not None:
+            return card, calibration_source
+    return None, None
 
 
 # ── Shipping fudge alert lookup (sector-gated) ────────────────────────────
@@ -1095,6 +1107,65 @@ def _lookup_convergence(
     return _finite_float_or_none(report.conviction_multiplier)
 
 
+# ── Decision clock (live-only) ────────────────────────────────────────────
+
+
+# Longest gap allowed between the prediction's own clock and the builder's
+# clock. Live callers (decision_gateway.should_i_trade) build provenance
+# minutes after predict(), with only the red-team LLM call in between.
+LIVE_CLOCK_TOLERANCE: timedelta = timedelta(hours=1)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _live_as_of_date(prediction: Any, now: datetime) -> date:
+    """The prediction's own decision date, for the layers that take one.
+
+    ``build_provenance_report`` is live-only. Six layers (fudge alerts,
+    co-occurrence, confidence bucket, null hypothesis, meta-learning, memory
+    lesson) and the scorecard lookups take no date and read current state,
+    so building a report for
+    an older prediction would read data from after its decision. Rather
+    than read that, the builder refuses any prediction whose clock is
+    outside the live window.
+
+    ``prediction.as_of`` (``EnsemblePrediction.as_of``, set by ``predict()``)
+    is the clock. A naive datetime is read as UTC, the convention
+    ``predict()`` uses. A date-only clock must be today's UTC date. A
+    prediction without a clock is taken as live and dated by the builder's
+    own clock. Any other value raises ``ValueError``.
+    """
+    raw = getattr(prediction, "as_of", None)
+    if raw is None:
+        return now.date()
+    if isinstance(raw, datetime):
+        clock = (
+            raw.astimezone(timezone.utc)
+            if raw.tzinfo is not None
+            else raw.replace(tzinfo=timezone.utc)
+        )
+        if abs(now - clock) > LIVE_CLOCK_TOLERANCE:
+            raise ValueError(
+                "signal_provenance is live-only: prediction as_of "
+                f"{clock.isoformat()} is more than {LIVE_CLOCK_TOLERANCE} "
+                f"from now ({now.isoformat()})"
+            )
+        return clock.date()
+    if isinstance(raw, date):
+        if raw != now.date():
+            raise ValueError(
+                "signal_provenance is live-only: prediction as_of "
+                f"{raw.isoformat()} is not today ({now.date().isoformat()} UTC)"
+            )
+        return raw
+    raise ValueError(
+        "signal_provenance is live-only: prediction as_of must be a datetime "
+        f"or date, got {type(raw).__name__}"
+    )
+
+
 # ── Main entry point ──────────────────────────────────────────────────────
 
 
@@ -1112,7 +1183,14 @@ def build_provenance_report(
     fields (fragility_multiplier, crowdedness, market-implied prob,
     etc.). This function does NOT call predict() itself — callers pass
     it in so provenance is testable in isolation.
+
+    Live-only: the dated layers read as of the prediction's own clock
+    (``prediction.as_of``), and a prediction whose clock is outside
+    ``LIVE_CLOCK_TOLERANCE`` of now raises ``ValueError`` before any layer
+    is read (see ``_live_as_of_date``).
     """
+    now = _utc_now()
+    as_of = _live_as_of_date(prediction, now)
     ticker = getattr(prediction, "ticker", "") or ""
     horizon_days = int(getattr(prediction, "horizon", 7) or 7)
     regime = getattr(prediction, "regime", None) or None
@@ -1124,9 +1202,12 @@ def build_provenance_report(
     for source, weight in contributions.items():
         # Regime-conditional Brier first, with graceful fallback to the
         # flat per-signal scorecard (CAT-180 wiring), reconciled across
-        # bare family and ``feature:<family>`` spellings.
-        scorecard = _lookup_scorecard(engine, source, horizon_days, regime)
-        if scorecard is not None and regime is not None:
+        # bare family and ``feature:<family>`` spellings. Only a scorecard
+        # from the regime-conditional table counts as regime-calibrated.
+        scorecard, calibration_source = _lookup_scorecard(
+            engine, source, horizon_days, regime
+        )
+        if calibration_source == CALIBRATION_SOURCE_REGIME:
             regime_calibrated_count += 1
         signal_evidence.append(
             SignalEvidence(
@@ -1134,6 +1215,7 @@ def build_provenance_report(
                 shapley_weight=float(weight),
                 scorecard=scorecard,
                 classification=_classify_evidence(scorecard),
+                calibration_source=calibration_source,
             )
         )
 
@@ -1174,7 +1256,6 @@ def build_provenance_report(
         )
         confidence_bucket_mult = None
 
-    today = date.today()
     direction_str = str(getattr(prediction, "direction", "") or "")
 
     # Historical scenario analog multiplier (CAT-176).
@@ -1182,7 +1263,7 @@ def build_provenance_report(
         scenario_mult = _finite_float_or_none(
             scenario_conviction_multiplier(
                 engine,
-                as_of=today,
+                as_of=as_of,
                 horizon_days=horizon_days,
                 direction=getattr(prediction, "direction", None),
             )
@@ -1233,7 +1314,7 @@ def build_provenance_report(
     try:
         contra_mult = _finite_float_or_none(
             contra_conviction_multiplier(
-                engine, as_of=today, trade_direction=direction_str
+                engine, as_of=as_of, trade_direction=direction_str
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -1248,7 +1329,7 @@ def build_provenance_report(
             squeeze_conviction_multiplier(
                 engine,
                 ticker=ticker,
-                as_of=today,
+                as_of=as_of,
                 trade_direction=direction_str,
             )
         )
@@ -1264,7 +1345,7 @@ def build_provenance_report(
             arbitrage_conviction_multiplier(
                 engine,
                 ticker=ticker,
-                as_of=today,
+                as_of=as_of,
                 direction=direction_str,
                 horizon_days=horizon_days,
                 oracle_confidence=conf_value,
@@ -1282,7 +1363,7 @@ def build_provenance_report(
         convergence_mult = _lookup_convergence(
             engine,
             ticker=ticker,
-            as_of=today,
+            as_of=as_of,
             target_direction=direction_str,
             window_days=7,
         )
@@ -1297,7 +1378,7 @@ def build_provenance_report(
         money_flow_mult = _finite_float_or_none(
             money_flow_conviction_multiplier(
                 engine,
-                as_of=today,
+                as_of=as_of,
                 trade_direction=direction_str,
             )
         )
@@ -1379,7 +1460,7 @@ def build_provenance_report(
 
     return TradeProvenanceReport(
         ticker=ticker,
-        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_at=now.isoformat(),
         direction=getattr(prediction, "direction", "") or "",
         score=int(getattr(prediction, "score", 50) or 50),
         confidence=float(getattr(prediction, "confidence", 0.0) or 0.0),
