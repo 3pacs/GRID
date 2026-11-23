@@ -47,6 +47,7 @@ if os.path.exists(_env_path):
                 os.environ.setdefault(_k.strip(), _v.strip())
 
 from db import get_engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 from sqlalchemy import text
 from loguru import logger as log
 
@@ -190,7 +191,7 @@ def get_grid_context(ticker: str) -> str:
         try:
             preds = conn.execute(text("""
                 SELECT call, setup, verdict, pnl_pct
-                FROM oracle_predictions
+                FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
                 WHERE ticker = :t
                 ORDER BY created_at DESC LIMIT 5
             """), {"t": ticker}).fetchall()

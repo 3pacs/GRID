@@ -108,6 +108,7 @@ from features.per_signal_brier import (  # noqa: F401
     compute_conviction_weight,
     get_signal_scorecard,
 )
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -516,7 +517,7 @@ _BOOTSTRAP_QUERY = text(
            signals,
            signals->'signal_contributions' AS signal_contributions,
            signals->>'regime'               AS regime
-    FROM oracle_predictions
+    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND dedup_keep = TRUE

@@ -10,6 +10,21 @@ open *events*, then fetches individual *markets* per event and writes
 the highest-volume contract's yes-probability plus metadata into
 ``raw_series``.
 
+Clock (``kalshi-acquired/1``): each event's row records ``clock.requested_at`` (read before that
+event's markets request) and ``clock.acquired_at`` (read right after its response, and stored as
+``pull_timestamp`` too), is dated by the UTC day of that response, and is committed in its own
+short transaction straight after. That transaction runs under lock and statement timeouts
+(Postgres) and is rolled back, and the event skipped for the pull, unless it is ready to commit
+within ``COMMIT_FENCE`` of the response; the commit itself is not timestamped, so readers treat
+availability as a proxy (response + ``policy_path.COMMIT_GRACE``), not a persistence receipt.
+Before this rule the whole pull ran in one transaction and ``pull_timestamp`` was the raw_series
+default (that transaction's start, before any response), so readers give those older rows a
+conservative availability bound (``intelligence/regime/policy_path.py``).
+
+Every strike in ``all_strikes`` keeps the source's missingness: a missing or malformed quote is
+stored as null, never 0.0, beside its quote sizes, its own event ticker and its payout terms
+(``strike_type``, ``floor_strike``, ``cap_strike``). The top-level best-market fields are unchanged.
+
 Source: https://docs.kalshi.com/getting_started/quick_start_market_data
 API:    https://api.elections.kalshi.com/trade-api/v2
 """
@@ -17,8 +32,9 @@ API:    https://api.elections.kalshi.com/trade-api/v2
 from __future__ import annotations
 
 import json as _json
+import math
 import time as _time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -29,6 +45,12 @@ from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller, retry_on_failure
 
 _API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+CLOCK_RULE = "kalshi-acquired/1"
+# An event's row is rolled back unless its transaction is ready to commit within this of the response
+# (policy_path.COMMIT_GRACE, the readers' availability proxy, leaves the commit itself the rest).
+COMMIT_FENCE = timedelta(seconds=30)
+_LOCK_TIMEOUT = "10s"        # Postgres lock_timeout / statement_timeout for that transaction
+_STATEMENT_TIMEOUT = "15s"
 _REQUEST_TIMEOUT = 30
 
 # Economic / financial series we care about.
@@ -57,6 +79,26 @@ def _parse_dollar(raw: Any) -> float:
 def _parse_fp(raw: Any) -> float:
     """Convert a volume/OI string like '30621.00' to float, default 0."""
     return _parse_dollar(raw)
+
+
+def _parse_quote(raw: Any) -> float | None:
+    """A quote field as a finite float, or None when the source left it missing or malformed."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        x = float(raw)
+    except (ValueError, TypeError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _now() -> datetime:
+    """UTC wall clock (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+class _LateCommit(RuntimeError):
+    """An event's transaction was not ready to commit within COMMIT_FENCE of its response."""
 
 
 def _raw_series_success_exists(
@@ -152,20 +194,36 @@ class KalshiMarketsPuller(BasePuller):
         return 0.0
 
     @staticmethod
-    def _build_payload(event: dict, market: dict, all_markets: list[dict]) -> dict:
-        """Build a JSON payload with useful metadata."""
+    def _build_payload(event: dict, market: dict, all_markets: list[dict],
+                       acquired_at: datetime | None = None,
+                       requested_at: datetime | None = None) -> dict:
+        """Build a JSON payload with useful metadata (and the acquisition clock, when given)."""
         strikes: list[dict] = []
         for m in all_markets:
             strikes.append({
                 "ticker": m.get("ticker"),
+                "event_ticker": m.get("event_ticker"),
                 "title": m.get("title"),
-                "yes_price": _parse_dollar(m.get("last_price_dollars")),
-                "yes_bid": _parse_dollar(m.get("yes_bid_dollars")),
-                "yes_ask": _parse_dollar(m.get("yes_ask_dollars")),
+                "strike_type": m.get("strike_type"),
+                "floor_strike": _parse_quote(m.get("floor_strike")),
+                "cap_strike": _parse_quote(m.get("cap_strike")),
+                "yes_price": _parse_quote(m.get("last_price_dollars")),
+                "yes_bid": _parse_quote(m.get("yes_bid_dollars")),
+                "yes_ask": _parse_quote(m.get("yes_ask_dollars")),
+                "yes_bid_size": _parse_quote(m.get("yes_bid_size_fp")),
+                "yes_ask_size": _parse_quote(m.get("yes_ask_size_fp")),
                 "volume": _parse_fp(m.get("volume_fp")),
                 "volume_24h": _parse_fp(m.get("volume_24h_fp")),
                 "open_interest": _parse_fp(m.get("open_interest_fp")),
             })
+        clock = None
+        if acquired_at is not None:
+            clock = {"rule": CLOCK_RULE, "acquired_at": acquired_at.astimezone(timezone.utc).isoformat(),
+                     "basis": "UTC wall clock read before this event's markets request (requested_at) and "
+                              "right after its response (acquired_at); the row is committed in its own "
+                              "transaction immediately after"}
+            if requested_at is not None:
+                clock["requested_at"] = requested_at.astimezone(timezone.utc).isoformat()
         return {
             "event_ticker": event.get("event_ticker"),
             "event_title": event.get("title"),
@@ -181,6 +239,7 @@ class KalshiMarketsPuller(BasePuller):
             "volume_24h": _parse_fp(market.get("volume_24h_fp")),
             "open_interest": _parse_fp(market.get("open_interest_fp")),
             "all_strikes": strikes,
+            **({"clock": clock} if clock else {}),
         }
 
     # ------------------------------------------------------------------
@@ -197,103 +256,139 @@ class KalshiMarketsPuller(BasePuller):
             "status": "SUCCESS",
         }
 
-        today = date.today()
         inserted = 0
+        late = 0
         total_events = 0
 
         try:
-            with self.engine.begin() as conn:
-                for series_ticker in _TARGET_SERIES:
-                    result["series_checked"] += 1
+            # No transaction is open during HTTP calls: each event's row is written and committed right after its
+            # markets response, with that response's clock (CLOCK_RULE).
+            for series_ticker in _TARGET_SERIES:
+                result["series_checked"] += 1
+                try:
+                    events = self._fetch_events(series_ticker)
+                except Exception as exc:
+                    log.warning(
+                        "Kalshi: failed to fetch events for {s}: {e}",
+                        s=series_ticker, e=str(exc),
+                    )
+                    continue
+
+                if not events:
+                    continue
+
+                total_events += len(events)
+
+                for event in events:
+                    event_ticker = event.get("event_ticker", "")
+                    if not event_ticker:
+                        continue
+
+                    requested_at = _now()
                     try:
-                        events = self._fetch_events(series_ticker)
+                        markets = self._fetch_markets(event_ticker)
                     except Exception as exc:
                         log.warning(
-                            "Kalshi: failed to fetch events for {s}: {e}",
-                            s=series_ticker, e=str(exc),
+                            "Kalshi: failed to fetch markets for {e}: {err}",
+                            e=event_ticker, err=str(exc),
                         )
                         continue
+                    acquired_at = _now()
+                    today = acquired_at.date()     # the UTC day of this event's response
 
-                    if not events:
+                    if not markets:
                         continue
 
-                    total_events += len(events)
+                    best = self._best_market(markets)
+                    if best is None:
+                        continue
 
-                    for event in events:
-                        event_ticker = event.get("event_ticker", "")
-                        if not event_ticker:
-                            continue
+                    yes_price = self._extract_price(best)
+                    volume = _parse_fp(best.get("volume_fp"))
+                    open_interest = _parse_fp(best.get("open_interest_fp"))
 
-                        try:
-                            markets = self._fetch_markets(event_ticker)
-                        except Exception as exc:
-                            log.warning(
-                                "Kalshi: failed to fetch markets for {e}: {err}",
-                                e=event_ticker, err=str(exc),
+                    # Accept the row if we have *any* signal:
+                    # price, volume, or open interest.
+                    if yes_price == 0 and volume == 0 and open_interest == 0:
+                        continue
+
+                    # Use the event ticker as series_id so each
+                    # meeting/report date gets its own row.
+                    series_id = f"KALSHI:{event_ticker}"
+                    payload = self._build_payload(event, best, markets, acquired_at=acquired_at,
+                                                  requested_at=requested_at)
+
+                    # Use yes_price as value when available;
+                    # fall back to volume as a proxy signal.
+                    value = yes_price if yes_price > 0 else volume
+
+                    try:
+                        with self.engine.begin() as conn:
+                            if conn.dialect.name == "postgresql":
+                                # A lock or statement stall fails this transaction instead of committing late.
+                                conn.execute(
+                                    text("SELECT set_config('lock_timeout', :lt, true), "
+                                         "set_config('statement_timeout', :st, true)"),
+                                    {"lt": _LOCK_TIMEOUT, "st": _STATEMENT_TIMEOUT},
+                                )
+                            if _raw_series_success_exists(
+                                conn,
+                                series_id=series_id,
+                                source_id=self.source_id,
+                                obs_date=today,
+                            ):
+                                continue
+
+                            conn.execute(
+                                text(
+                                    "INSERT INTO raw_series "
+                                    "(series_id, source_id, obs_date, value, "
+                                    " raw_payload, pull_status, pull_timestamp) "
+                                    "VALUES (:sid, :src, :od, :val, "
+                                    " :payload, 'SUCCESS', :ts)"
+                                ),
+                                {
+                                    "sid": series_id,
+                                    "src": self.source_id,
+                                    "od": today,
+                                    "val": float(value),
+                                    "payload": _json.dumps(payload),
+                                    "ts": acquired_at,
+                                },
                             )
-                            continue
-
-                        if not markets:
-                            continue
-
-                        best = self._best_market(markets)
-                        if best is None:
-                            continue
-
-                        yes_price = self._extract_price(best)
-                        volume = _parse_fp(best.get("volume_fp"))
-                        open_interest = _parse_fp(best.get("open_interest_fp"))
-
-                        # Accept the row if we have *any* signal:
-                        # price, volume, or open interest.
-                        if yes_price == 0 and volume == 0 and open_interest == 0:
-                            continue
-
-                        # Use the event ticker as series_id so each
-                        # meeting/report date gets its own row.
-                        series_id = f"KALSHI:{event_ticker}"
-                        payload = self._build_payload(event, best, markets)
-
-                        # Use yes_price as value when available;
-                        # fall back to volume as a proxy signal.
-                        value = yes_price if yes_price > 0 else volume
-
-                        if _raw_series_success_exists(
-                            conn,
-                            series_id=series_id,
-                            source_id=self.source_id,
-                            obs_date=today,
-                        ):
-                            continue
-
-                        conn.execute(
-                            text(
-                                "INSERT INTO raw_series "
-                                "(series_id, source_id, obs_date, value, "
-                                " raw_payload, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, "
-                                " :payload, 'SUCCESS')"
-                            ),
-                            {
-                                "sid": series_id,
-                                "src": self.source_id,
-                                "od": today,
-                                "val": float(value),
-                                "payload": _json.dumps(payload),
-                            },
+                            ready = _now()
+                            if ready - acquired_at > COMMIT_FENCE:
+                                raise _LateCommit(f"{(ready - acquired_at).total_seconds():.1f} s")
+                    except _LateCommit as exc:
+                        late += 1
+                        log.warning(
+                            "Kalshi: {e} rolled back, not ready to commit until {s} after its response "
+                            "(fence {f:.0f} s)",
+                            e=event_ticker, s=str(exc), f=COMMIT_FENCE.total_seconds(),
                         )
-                        inserted += 1
+                        continue
+                    inserted += 1
 
             result["rows_inserted"] = inserted
+            result["late_rolled_back"] = late
             result["events_found"] = total_events
+            if late:
+                # A rolled-back event has no row for the day: the pull is incomplete, never SUCCESS coverage.
+                result["status"] = "PARTIAL" if inserted else "FAILED"
+                result["error"] = (f"{late} event(s) rolled back, not ready to commit within "
+                                   f"{COMMIT_FENCE.total_seconds():.0f} s of the response")
             log.info(
-                "Kalshi: {s} series, {e} events, {i} rows inserted",
-                s=result["series_checked"], e=total_events, i=inserted,
+                "Kalshi: {s} series, {e} events, {i} rows inserted, {n} rolled back late",
+                s=result["series_checked"], e=total_events, i=inserted, n=late,
             )
 
         except Exception as exc:
             log.error("Kalshi pull failed: {e}", e=str(exc))
             result["status"] = "FAILED"
             result["error"] = str(exc)
+            # Rows already committed (one transaction per event) stay; report them.
+            result["rows_inserted"] = inserted
+            result["late_rolled_back"] = late
+            result["events_found"] = total_events
 
         return [result]

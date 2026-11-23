@@ -282,6 +282,18 @@ def test_quote_receipt_fail_closed(changes, reason):
     assert reason in validate_quote_reference(_receipt(**changes), as_of=DECISION, ticker="SPY")
 
 
+@pytest.mark.parametrize("provider", ["cboe", "yahoo", "schwab"])
+def test_quote_receipt_qualified_providers(provider):
+    from oracle.entry_price_policy import validate_quote_reference
+    assert validate_quote_reference(_receipt(provider=provider), as_of=DECISION, ticker="SPY") is None
+
+
+@pytest.mark.parametrize("provider", ["Schwab", "databento", "", "tradier"])
+def test_quote_receipt_unlisted_provider_is_unqualified(provider):
+    from oracle.entry_price_policy import validate_quote_reference
+    assert "unqualified" in validate_quote_reference(_receipt(provider=provider), as_of=DECISION, ticker="SPY")
+
+
 def test_exact_age_boundary_and_final_decision_revalidation():
     from oracle.entry_price_policy import validate_quote_reference
     receipt = _receipt(market_at="2026-11-10T14:50:00+00:00")

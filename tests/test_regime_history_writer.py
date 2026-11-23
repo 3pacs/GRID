@@ -19,6 +19,7 @@ from scripts.auto_regime import (
     LOOKBACK_DAYS,
     REGIME_HISTORY_LABELS,
     REGIME_HISTORY_SOURCE,
+    RegimeReplacement,
     backfill_regime_history,
     compute_regime_at,
     persist_regime_history,
@@ -123,14 +124,16 @@ class TestVocabulary:
 
 
 class TestPersistRegimeHistory:
-    def test_writes_parameterized_upsert_on_obs_date(self):
+    def test_default_write_is_a_parameterized_insert_that_never_updates(self):
+        """#1302: a second default write for the same obs_date leaves the row as it is."""
         engine, conn = _engine_with_features()
         assert persist_regime_history(engine, AS_OF, "GROWTH", 0.8) is True
 
+        assert conn.execute.call_count == 1
         sql = str(conn.execute.call_args[0][0])
         params = conn.execute.call_args[0][1]
         assert "INSERT INTO regime_history" in sql
-        assert "ON CONFLICT (obs_date)" in sql
+        assert "ON CONFLICT (obs_date) DO NOTHING" in sql and "UPDATE" not in sql
         # Values are bound, never interpolated.
         assert ":obs_date" in sql and ":regime" in sql and ":confidence" in sql
         assert "GROWTH" not in sql
@@ -164,13 +167,15 @@ class TestPersistRegimeHistory:
                     kw in line.upper()
                     for kw in ("SELECT", "INSERT", "UPDATE", "DELETE", "CONFLICT")
                 ), f"SQL assembled in an f-string: {line.strip()}"
-        # The two statements are module-level literals, selected by a flag.
-        for stmt in (auto._REGIME_HISTORY_UPSERT_SQL, auto._REGIME_HISTORY_INSERT_IGNORE_SQL):
+        # The statements are module-level literals with bound values, and none is an upsert.
+        for stmt in (auto._REGIME_HISTORY_INSERT_SQL, auto._REGIME_HISTORY_LOCK_SQL,
+                     auto._REGIME_HISTORY_REASON_SQL, auto._REGIME_HISTORY_REPLACE_SQL,
+                     auto._REGIME_HISTORY_ARCHIVED_SQL):
             sql = str(stmt)
-            assert "INSERT INTO regime_history" in sql
-            assert ":obs_date" in sql and ":regime" in sql
-        assert "DO UPDATE SET" in str(auto._REGIME_HISTORY_UPSERT_SQL)
-        assert "DO NOTHING" in str(auto._REGIME_HISTORY_INSERT_IGNORE_SQL)
+            assert ":obs_date" in sql or ":reason" in sql
+            assert "DO UPDATE" not in sql
+        assert "DO NOTHING" in str(auto._REGIME_HISTORY_INSERT_SQL)
+        assert not hasattr(auto, "_REGIME_HISTORY_UPSERT_SQL")
 
     def test_stamps_its_own_provenance(self):
         """So a reader can tell these rows from the 2026-03 one-off load,
@@ -180,10 +185,50 @@ class TestPersistRegimeHistory:
         assert conn.execute.call_args[0][1]["source"] == "auto_regime"
         assert "source" in str(conn.execute.call_args[0][0])
 
-    def test_overwrite_false_leaves_existing_row_alone(self):
+    def test_there_is_no_overwrite_flag_any_more(self):
+        engine, _ = _engine_with_features()
+        with pytest.raises(TypeError):
+            persist_regime_history(engine, AS_OF, "NEUTRAL", 0.5, overwrite=True)
+
+    @pytest.mark.parametrize("reason, run_tag", [("", "r"), ("  ", "r"), ("why", ""), (None, "r")])
+    def test_a_replacement_must_say_why_and_by_which_run(self, reason, run_tag):
+        with pytest.raises(ValueError, match="non-empty"):
+            RegimeReplacement(reason, run_tag)
+
+    def test_replacement_records_its_reason_then_updates_then_checks_the_revision(self):
         engine, conn = _engine_with_features()
-        persist_regime_history(engine, AS_OF, "NEUTRAL", 0.5, overwrite=False)
-        assert "DO NOTHING" in str(conn.execute.call_args[0][0])
+        lock, reason, update, archived = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+        lock.first.return_value = ("NEUTRAL", 0.5, REGIME_HISTORY_SOURCE, None)
+        archived.scalar.return_value = 1
+        conn.execute.side_effect = [lock, reason, update, archived]
+        replace = RegimeReplacement("operator re-run", "run-1")
+        assert persist_regime_history(engine, AS_OF, "FRAGILE", 0.7, replace=replace) is True
+        sqls = [str(c[0][0]) for c in conn.execute.call_args_list]
+        assert "FOR UPDATE" in sqls[0]
+        assert "set_config('grid.regime_history_reason'" in sqls[1]
+        assert conn.execute.call_args_list[1][0][1] == {"reason": "operator re-run", "run_tag": "run-1"}
+        assert sqls[2].startswith("UPDATE regime_history SET")
+        assert "regime_history_revisions" in sqls[3]
+
+    def test_replacement_with_identical_values_writes_nothing(self):
+        engine, conn = _engine_with_features()
+        lock = MagicMock()
+        lock.first.return_value = ("NEUTRAL", 0.5, REGIME_HISTORY_SOURCE, None)
+        conn.execute.side_effect = [lock]
+        replace = RegimeReplacement("operator re-run", "run-1")
+        assert persist_regime_history(engine, AS_OF, "NEUTRAL", 0.5, replace=replace) is False
+        assert conn.execute.call_count == 1
+
+    def test_replacement_without_a_revision_row_refuses(self):
+        """A database without the revision trigger must not lose the old version silently."""
+        engine, conn = _engine_with_features()
+        lock, archived = MagicMock(), MagicMock()
+        lock.first.return_value = ("NEUTRAL", 0.5, REGIME_HISTORY_SOURCE, None)
+        archived.scalar.return_value = 0
+        conn.execute.side_effect = [lock, MagicMock(), MagicMock(), archived]
+        with pytest.raises(RuntimeError, match="trigger is missing"):
+            persist_regime_history(engine, AS_OF, "FRAGILE", 0.7,
+                                   replace=RegimeReplacement("operator re-run", "run-1"))
 
     def test_rejects_label_outside_the_vocabulary(self):
         """A label the readers do not recognize is worse than no row —
@@ -294,7 +339,7 @@ class TestBackfill:
 
         with patch("scripts.auto_regime.compute_regime_at", side_effect=fake_compute), \
              patch("scripts.auto_regime.persist_regime_history", return_value=True) as writer:
-            result = backfill_regime_history(engine, start, end, overwrite=True)
+            result = backfill_regime_history(engine, start, end, overwrite=True, reason="test re-backfill")
 
         assert seen_as_of == [start + timedelta(days=i) for i in range(5)]
         assert result["written"] == 5
@@ -341,7 +386,7 @@ class TestBackfill:
                    return_value={"regime": "UNKNOWN", "error": "insufficient data"}), \
              patch("scripts.auto_regime.persist_regime_history") as writer:
             result = backfill_regime_history(
-                engine, date(2026, 9, 1), date(2026, 9, 3), overwrite=True
+                engine, date(2026, 9, 1), date(2026, 9, 3), overwrite=True, reason="test re-backfill"
             )
         assert result["failed"] == 3
         assert result["written"] == 0

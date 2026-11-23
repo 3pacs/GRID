@@ -36,7 +36,7 @@ def test_v8_prereg_is_pinned_and_states_the_design():
                    "**Both must be at least 0.50.**", "factor_t_garch_exposed", v7.E0_SCORECARD_SHA256):
         assert phrase in body
     assert v8.E0_MANIFEST_SHA256 == v7.E0_MANIFEST_SHA256
-    assert v8.SUPERSEDED_BY is None and v7.SUPERSEDED_BY == {"version": "vs1-v8"}
+    assert v8.SUPERSEDED_BY == {"version": "vs1-v9"} and v7.SUPERSEDED_BY == {"version": "vs1-v8"}
 
 
 def test_v8_window_is_scoped_and_holdout_fixed():

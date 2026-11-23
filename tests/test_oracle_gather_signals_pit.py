@@ -25,7 +25,9 @@ def _engine_with(feat_rows, opt_row=None) -> MagicMock:
         if "feature_registry" in sql and "resolved_series" not in sql:
             result.fetchall.return_value = feat_rows
         elif "options_daily_signals" in sql:
-            result.fetchone.return_value = opt_row
+            # The Oracle selects the row's lineage beside its eight values
+            # (False: a public row).
+            result.fetchone.return_value = None if opt_row is None else (*opt_row, False)
         else:
             raise AssertionError(f"unexpected SQL on the live predictor path: {sql}")
         return result
@@ -69,7 +71,7 @@ def test_gather_signals_uses_pit_matrix_and_never_resolved_series_directly() -> 
     (vix,) = [s for s in signals if s.name == "vix_spot"]
     assert vix.family == "vol"
     assert vix.value == 5.0
-    assert vix.direction == "bullish"
+    assert vix.direction == "bearish"  # VIX spike has polarity -1 -> bearish; raw z_score stays positive
     assert vix.z_score > 0.5
     assert vix.freshness_hours == 0
 

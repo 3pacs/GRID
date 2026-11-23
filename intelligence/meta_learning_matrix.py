@@ -90,6 +90,7 @@ from scripts.bootstrap_per_signal_brier import (  # noqa: F401
     extract_signal_contributions,
     verdict_to_outcome,
 )
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Hardcoded thresholds (rationale in docstrings) ──────────────────────────
@@ -794,7 +795,7 @@ _BOOTSTRAP_QUERY = text(
            model_name, signals,
            signals->'signal_contributions' AS signal_contributions,
            model_weights
-    FROM oracle_predictions
+    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND dedup_keep = TRUE
