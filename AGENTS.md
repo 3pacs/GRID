@@ -1052,3 +1052,69 @@ Only `analysis/sector_map_ticker_status.yaml` and tests change.
   filings in place of the news pages, call each `last_session` a vendor cutoff,
   infer no venue date where the vendor gives none, and say that vendor history
   under a successor is not verified point-in-time continuity.
+
+## 2026-11-24 - puller triage: five PRs merged (#1407-#1411), grid-scheduler on e73a6f7f
+
+One entry for the set. Each PR's own entry was taken out before merge because
+appending here made every other PR in the set conflict.
+
+Root causes, read on grid-svr 2026-11-23:
+
+- **Tiingo prices were never stalled.** `smart:tiingo` had no SUCCESS row from
+  11-10 to 11-23 while every run wrote the session's closes. Each run was
+  PARTIAL for a few tickers Tiingo stopped serving.
+- **etf_flows**: a full run took 346 s against a 120 s limit. The limit does not
+  stop the run, and each Hermes retry appended the same 13F change rows again
+  (41,690 an hour).
+- **quiverquant**: runs took 84-124 s against 120.
+- **Drewry WCI**: the 11-22 proof rules refused the live page's own sentence.
+- **GDELT DOC API** refused connections.
+
+What merged:
+
+- **#1407 `e73a6f7f`.** `TiingoPuller.pull_incremental` reads Tiingo's listing
+  for each lapsed ticker and reports it (`lapsed_listing`). Evidence only: the
+  run stays PARTIAL until the ticker is marked in
+  `analysis/sector_map_ticker_status.yaml`. quiverquant `timeout_s` 120 -> 240
+  (a longer limit, not cancellation). Drewry prose: the text from the start of
+  the sentence to the amount must be one clause whose subject is the index
+  (`_DREWRY_WCI_REPORT_LEAD_RE`), with no predictive wording; text after the
+  amount is outside the rule. etf_flows is still 120 s.
+- **#1408 `6def2bcc`.** GDELT DOC retired: `hold_reason` on the registry entry,
+  the same gate in `ingestion/scheduler.py`, no Hermes retries, and migration
+  `gdelt_doc_retire_20261123` marks the 17 DOC features not eligible.
+  `physics/momentum.py` treats tone older than 5 days as missing.
+- **#1409 `22f45030`.** A 13F re-run writes nothing new: change rows are
+  compared with the latest stored row, and an advisory lock keeps two writers
+  apart (`ChangeRowsBusy` -> the manager is `DEFERRED`).
+- **#1410 `07eeea27`.** `ingestion/price_fallback.py` no longer uses Twelve
+  Data. `scripts/close_backfill_universe.py` exists and is **not wired to any
+  unit**; the two `td_backfill_*` scripts and their units are unchanged.
+- **#1411 `0d0c4b9c`.** Sidecar: BKH renamed to HZN; KPTI, GWHT and GWH
+  delisted; ROKU acquired.
+
+Production, 2026-11-24:
+
+- 208,450 surplus 13F change rows set to `QUARANTINED` at 00:38Z on the
+  owner's word. Record and undo statement:
+  `/home/grid/repair-records/20261124-13f-surplus-quarantine/` on grid-svr.
+- The first 13F run on #1409 wrote 0 change rows. One clean run, not proof: no
+  deferral-and-retry and no second run has been read.
+- Drewry: `container_index` 2026-11-19 = 4176 stored at 03:44:44Z by the first
+  pull on #1407.
+- grid-scheduler activated on `e73a6f7f` at 03:47:55Z (deploy run 45321682892,
+  scheduler inputs only). No scheduled job on it had been read when this was
+  written.
+
+Open:
+
+- 73,865 13F duplicates appended between the quarantine pass and the #1409
+  deploy are still `SUCCESS`. A second pass needs the owner's word.
+- `smart:tiingo` is PARTIAL for UTZ only (last close 11-19, not marked).
+- etf_flows timeout: measure a full run on #1409 before raising it.
+- Twelve Data cutover is held: the dry run must first compare expected
+  completed sessions with fillable dates for both cohorts.
+- #1412 (BKH note correction) is open.
+- Not fixed: Wikipedia pageviews 429s; the MarketWatch feed moved; three other
+  GDELT DOC API callers; GLEN, US, WSE, RVI, ANT, AIOK and VFIAX are not served
+  by Tiingo.
