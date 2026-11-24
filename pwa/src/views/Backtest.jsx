@@ -99,8 +99,12 @@ export default function Backtest() {
             const s = await api.getBacktestSummaryPitch();
             // A 404 ("No backtest results. Run /run first.") resolves as {error: true};
             // storing it rendered every metric as 0.0% / 0.00 / $0.
-            if (s && !s.error) setSummary(s);
-            else setSummaryError(s?.message || null);
+            if (s && !s.error) {
+                setSummary(s);
+                setSummaryError(null);
+            } else {
+                setSummaryError(s?.message || 'Backtest summary request failed');
+            }
             const r = await api.getBacktestResults();
             setFullResults(r);
         } catch (e) { console.warn('[GRID] Backtest:', e.message); }
@@ -117,8 +121,11 @@ export default function Backtest() {
         setRunning(true);
         setError(null);
         try {
-            await api.runBacktest(startDate, parseFloat(capital));
-            await loadSummary();
+            const r = await api.runBacktest(startDate, parseFloat(capital));
+            // A resolved {error: true} is a failed run: say so, and do not
+            // reload, which would present the previous results as this run's.
+            if (r && r.error) setError(r.message || 'Backtest run failed');
+            else await loadSummary();
         } catch (e) {
             setError(e.message);
         }
@@ -224,6 +231,12 @@ export default function Backtest() {
                     {/* Performance Metrics */}
                     {summary && (
                         <>
+                            {summaryError && (
+                                <div data-testid="summary-refresh-failed" style={shared.error}>
+                                    {`Latest summary refresh failed: ${summaryError}. Showing the previous results`}
+                                    {summary.generated_at ? ` (generated ${formatFullDateTime(new Date(summary.generated_at))}).` : '.'}
+                                </div>
+                            )}
                             {(summary.note || summary.generated_at) && (
                                 <div style={{
                                     ...shared.card, borderLeft: `3px solid ${colors.yellow || '#F59E0B'}`,

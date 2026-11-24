@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import ConfidenceMeter from '../components/ConfidenceMeter.jsx';
@@ -109,6 +109,9 @@ function MoverCard({ feature, family, change_pct, latest }) {
 
 export default function Regime() {
     const { currentRegime, setCurrentRegime } = useStore();
+    const regimeRef = useRef(currentRegime);
+    regimeRef.current = currentRegime;
+    const [regimeReadFailure, setRegimeReadFailure] = useState(null);
     const [allRegimes, setAllRegimes] = useState(null);
     const [synthesis, setSynthesis] = useState(null);
     const [synthLoading, setSynthLoading] = useState(false);
@@ -125,7 +128,12 @@ export default function Regime() {
             api.getTransitions(),
         ]);
         // api._fetch resolves failures to {error: true}; never store that as the regime.
+        // The store keeps the previous read, so record that this read failed.
+        if (!(current && !current.error)) {
+            setRegimeReadFailure({ regime: regimeRef.current, at: new Date() });
+        }
         if (current && !current.error) {
+            setRegimeReadFailure(null);
             setCurrentRegime(current);
             // Fetch the strategy for the current regime
             const strat = await api.getStrategyForRegime(current.state).catch(() => null);
@@ -145,6 +153,8 @@ export default function Regime() {
     };
 
     const regime = currentRegime || { state: 'UNCALIBRATED' };
+    const regimeLastKnown = currentRegime != null && regimeReadFailure != null
+        && regimeReadFailure.regime === currentRegime;
     const primaryColor = stateColors[regime.state] || '#5A7080';
     const meta = regimeMeta[regime.state];
     const tabs = ['action', 'macro', 'subtypes', 'analysis', 'movers', 'history'];
@@ -182,7 +192,10 @@ export default function Regime() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
                         <div style={{ fontSize: '10px', color: '#5A7080', letterSpacing: '1px',
-                            fontFamily: "'JetBrains Mono', monospace", marginBottom: '4px' }}>CURRENT</div>
+                            fontFamily: "'JetBrains Mono', monospace", marginBottom: '4px' }}
+                            data-testid="regime-banner-label"
+                            title={regimeLastKnown ? `Latest regime read failed at ${regimeReadFailure.at.toLocaleTimeString()}` : undefined}
+                        >{regimeLastKnown ? 'LAST KNOWN · LATEST READ FAILED' : 'CURRENT'}</div>
                         <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '22px',
                             fontWeight: 700, color: primaryColor }}>
                             {meta?.icon || ''} {regime.state}
