@@ -14,13 +14,15 @@ Usage:
     python3 scripts/run_market_state.py --provisional --json    # today's session at its close, display only
 
 ``--provisional`` (#1312) writes a display-only record for today's UTC session, and only at or after that session's
-close in the pinned XNYS calendar (``analysis/factory_session_calendar.PINS``); before the close, or on a day that is
-not a session, it refuses with exit 2. It runs ``compute_market_state`` with ``known_by`` = that close, an exact
-availability cutoff, so a rerun hours later reads only what GRID held at the close. It never refreshes the FRED
+close in the pinned XNYS calendar (``analysis/factory_session_calendar.PINS``). Before the close, or on a day outside
+the pinned parts, it refuses with exit 2. On a day that is not a session (a weekday market holiday such as
+Thanksgiving, or a weekend) there is nothing to write: it says so (``outcome: not_a_session``) and exits 0, so the
+weekday timer does not end failed on a holiday. It runs ``compute_market_state`` with ``known_by`` = that close, an
+exact availability cutoff, so a rerun hours later reads only what GRID held at the close. It never refreshes the FRED
 vintages (``--no-refresh`` is accepted and changes nothing; no flag turns a refresh on). It writes to its own table
 (never ``market_state_daily``), insert-only unless ``--replace``, and never takes ``--from/--to``, ``--as-of`` or
-``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is still the one
-this writer makes the next evening.
+``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is still the one this
+writer makes the next evening.
 
 Each decision record also carries a ``spells`` block (``intelligence/regime/spells.py``, #1309): every variable's
 current label spell and three named spells, derived from the stored labels of earlier sessions plus this record, and
@@ -72,7 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="hold a daily write unless dealer gamma is from the exact target session; exit 3 on hold")
     p.add_argument("--provisional", action="store_true",
                    help="display-only record for today's UTC session, from the inputs held at its close (#1312); "
-                        "refuses before the close or on a non-session (exit 2); never refreshes vintages")
+                        "refuses before the close or outside the pinned calendar (exit 2); on a day that is not a "
+                        "session it writes nothing and exits 0; never refreshes vintages")
     return p
 
 
@@ -280,12 +283,21 @@ def main(argv: list[str] | None = None, engine=None) -> int:
 
 # ── --provisional (#1312): display only, at the close ───────────────────────
 
+class NotASession(ValueError):
+    """Today's UTC day is not an XNYS session in the pinned calendar: nothing to write, which is not a fault."""
+
+    def __init__(self, day: date, calendar_version: str) -> None:
+        super().__init__(f"{day} is not an XNYS session in the pinned calendar")
+        self.day, self.calendar_version = day, calendar_version
+
+
 def provisional_target(now: datetime,
                        calendar: FactoryCalendar | None = None) -> tuple[date, MarketSession, FactoryCalendar]:
     """(session day, its pinned session, the calendar) for today's UTC session once its close has passed.
 
-    ``now`` must be aware. ValueError when the day is outside the pinned XNYS parts, is not a session, or its close
-    (``closes`` in the manifest: 21:00Z or 20:00Z, earlier on an early-close day) is still ahead. Every XNYS close is
+    ``now`` must be aware. ValueError when the day is outside the pinned XNYS parts or its close (``closes`` in the
+    manifest: 21:00Z or 20:00Z, earlier on an early-close day) is still ahead; :class:`NotASession` (a ValueError)
+    when the day is not a session. Every XNYS close is
     before midnight UTC, so the session is the one dated today in UTC; after midnight UTC the next day is targeted
     and refused until its own close.
     """
@@ -298,7 +310,7 @@ def provisional_target(now: datetime,
     day = now.date()
     session = cal.for_day(day.isoformat())       # ValueError outside the pinned parts
     if session is None:
-        raise ValueError(f"{day} is not an XNYS session in the pinned calendar")
+        raise NotASession(day, cal.version)
     if now < session.closes:
         raise ValueError(f"session {day} closes at {session.closes.isoformat()}; it is {now.isoformat()}")
     return day, session, cal
@@ -316,6 +328,22 @@ def existing_provisional_row(engine, target: date) -> dict | None:  # engine: sq
     return dict(row) if row is not None else None
 
 
+def not_a_session(a: argparse.Namespace, now: datetime, exc: NotASession) -> int:
+    """No session today: report it and exit 0. Nothing is computed, read or written, and no table is touched."""
+    from intelligence.regime.market_state import PROVISIONAL_DECISION_USE, PROVISIONAL_MODE, PROVISIONAL_TABLE
+
+    if a.json:
+        print(json.dumps({"job": "run_market_state", "mode": PROVISIONAL_MODE,
+                          "decision_use": PROVISIONAL_DECISION_USE, "table": PROVISIONAL_TABLE,
+                          "day": exc.day.isoformat(), "target_session": None,
+                          "outcome": "not_a_session", "written": 0, "reason": str(exc),
+                          "calendar": exc.calendar_version, "dry_run": a.dry_run, "generated_at": now.isoformat()},
+                         default=str))
+    else:
+        print(f"market-state provisional {exc.day}: not an XNYS session in the pinned calendar; nothing to write")
+    return 0
+
+
 def run_provisional(a: argparse.Namespace, engine=None) -> int:
     """Today's UTC session at or after its close, into market_state_provisional. Display only (#1312).
 
@@ -329,6 +357,8 @@ def run_provisional(a: argparse.Namespace, engine=None) -> int:
     now = utc_now()
     try:
         target, session, cal = provisional_target(now)
+    except NotASession as exc:
+        return not_a_session(a, now, exc)
     except ValueError as exc:
         print(f"market-state: provisional refused: {exc}", file=sys.stderr)
         return 2

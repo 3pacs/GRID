@@ -2,7 +2,8 @@
 # grid-market-state-provisional.service.template. Display only (#1312).
 # Weekdays 21:15Z: after every XNYS close (21:00Z in winter, 20:00Z in summer, 18:00Z or 17:00Z on an early close),
 # and before the 22:20 America/New_York post-close desk brief. Persistent=false: a run missed while the host was
-# down is not caught up, because after midnight UTC the writer targets the next day and refuses (exit 2).
+# down is not caught up, because after midnight UTC the writer targets the next day: it refuses (exit 2) before
+# that day's close, and finds nothing to write (exit 0) when that day is not a session.
 [Unit]
 Description=Run the GRID provisional market-state record once a weekday at the close (display only)
 
