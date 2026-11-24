@@ -81,10 +81,10 @@ def test_is_mutual_fund_symbol(sym, fund):
 
 
 def test_default_tickers_skip_funds_and_stopped_names(monkeypatch):
-    monkeypatch.setattr(tp.TiingoPuller, "oracle_tickers", staticmethod(lambda e: ["ROKU"]))
+    monkeypatch.setattr(tp.TiingoPuller, "oracle_tickers", staticmethod(lambda e: ["NFLX"]))
     monkeypatch.setattr(tp.TiingoPuller, "hypothesis_tickers", staticmethod(lambda e: []))
     monkeypatch.setattr(tp.TiingoPuller, "insider_buyer_tickers", staticmethod(lambda e: ["MOALX", "TPYTX", "LXP"]))
     tickers = set(tp.TiingoPuller.default_tickers(object()))
-    assert "ROKU" in tickers
+    assert "NFLX" in tickers
     assert not tickers & {"MOALX", "TPYTX"}
     assert not tickers & set(STOPPED)   # whichever list brought them in (LXP came via insiders)

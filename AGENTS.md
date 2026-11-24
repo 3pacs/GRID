@@ -1023,35 +1023,32 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
 
-## 2026-11-23 - Twelve Data: replacement path built, cutover held (draft only; reworked 2026-11-24 after Codex HOLD 6031399890)
+## 2026-11-23 - BKH, GWHT, KPTI, ROKU retired in the ticker lifecycle sidecar (draft only)
 
-Branch `claude/drop-twelvedata-20261123`. Anik: "drop the twelve stuff, get it
-from our other sources instead".
+Branch `claude/retire-four-tickers-20261123`. Anik: "mark the four tickers
+retired", then "HZN only" when asked which successor symbols to keep fetching.
+Only `analysis/sector_map_ticker_status.yaml` and tests change.
 
-- **What Twelve Data does:** two daily units fill
-  `ticker_metrics_daily.close_price` for tickers `sec_xbrl_shares` does not
-  cover: `grid-td-universe-backfill` (the freshness-audit universe) and
-  `grid-td-backfill` (gem-alert tickers). grid-svr, 2026-11-23: 324,949 rows for
-  1,323 tickers carry `twelvedata_universe_backfill`, 1,826 rows carry
-  `twelvedata_backfill`.
-- **In this PR:**
-  - `ingestion/price_fallback.py` no longer calls Twelve Data (accepted).
-  - The freshness universe joins the routine Tiingo list
-    (`TiingoPuller.freshness_universe_tickers`): 209 of its 618 tickers had no
-    stored close of their own in 5 days.
-  - New `scripts/close_backfill_universe.py` (`universe` / `gem`). It reads only
-    completed closes (`store.observations.read_completed_closes` with the
-    US-listed 17:00 New York boundary): no same-day provisional price, no
-    TIINGO row after a ticker's last session, no row its payload marks
-    otherwise, and a day whose stored vintages disagree is withheld as
-    ambiguous. It only fills a missing close; an existing close is never
-    replaced. It prints a `RECEIPT {json}` line.
-- **Not in this PR (held):** the cutover. `scripts/td_backfill_universe.py` and
-  `scripts/td_backfill_gem_tickers.py` are unchanged and the units keep calling
-  Twelve Data. Before they are retired: deploy this, let the Tiingo list catch
-  up, run the new script with `DRY_RUN=1` on griddb for both cohorts, and read
-  the receipts. Joining the Tiingo list is not coverage.
-- **Not touched:** existing `twelvedata_*` rows; `TWELVEDATA_API_KEY`; the
-  hand-run research scripts; the policy comment in `sec_xbrl_shares.py`; any
-  unit or env file.
+| Symbol | Mark | Fetched after this | End date from Tiingo's listing (read 2026-11-23) | Source for the event |
+|---|---|---|---|---|
+| BKH | renamed -> HZN | HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07. The issuer's exchange note and OCC memo 60193 answered HTTP 403 and were not read |
+| GWHT | delisted | nothing | none: GWHT is not found | ESS Tech Form 8-K, Item 1.03, 2026-11-13 (Chapter 7 petition) |
+| KPTI | delisted | nothing | 2026-11-10 | Karyopharm Form 8-K, Item 3.01, event date 2026-11-04 (Nasdaq suspension from 11-11, OTC as KPTIQ) |
+| ROKU | acquired by Fox | nothing | 2026-11-06 | Roku Form 8-K, 2026-11-06 (merger closed; Nasdaq halt before the 11-09 open) |
 
+- `GWH` (the map's symbol for ESS Tech) was renamed -> GWHT; it is now
+  delisted too, so the map does not fetch GWHTQ.
+- Tiingo lists the two bankrupt issuers' OTC shares as KPTIQ and GWHTQ. Those
+  symbols are recorded in the notes and are not fetched.
+- GWHT and KPTI are not sector-map tickers; they reach the routine price list
+  from other universes, so the sidecar gains a last section for such symbols
+  and `tests/test_sector_map_ticker_status.py` names the two exceptions.
+- Readers of the sidecar: `price_ticker` (what the routine Tiingo list fetches)
+  and `tiingo_symbol_contract.tiingo_cutoff` (TIINGO rows after `last_session`
+  are dropped by `store/observations.py` and the resolver). Stored rows up to
+  each last session stay readable; BKH, GWHT and GWH have no cutoff; the map
+  keeps its actors.
+- Codex reviews 6031566036 and 6031760181: the notes cite the issuers' Form 8-K
+  filings in place of the news pages, call each `last_session` a vendor cutoff,
+  infer no venue date where the vendor gives none, and say that vendor history
+  under a successor is not verified point-in-time continuity.
