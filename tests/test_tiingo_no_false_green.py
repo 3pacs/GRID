@@ -50,8 +50,8 @@ class _Puller(TiingoPuller):
     def pull_ticker(self, ticker, start_date="2020-01-01", end_date=None, limiter=None):
         return {"ticker": ticker, "rows_inserted": 0, "errors": [], **self.fetch[ticker]}
 
-    def _coverage_end(self, ticker, limiter=None):
-        return False, None   # no listing answer: lapsed stays lapsed (tests/test_tiingo_ended_at_source.py)
+    def _listing(self, ticker, limiter=None):
+        return None, None    # listing not read; it is evidence only (tests/test_tiingo_lapsed_listing.py)
 
 
 _OK = {"status": "SUCCESS", "latest_obs": _SESSION, "rows_inserted": 6}

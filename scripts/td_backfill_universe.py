@@ -96,58 +96,7 @@ def _redact_api_key(text: str) -> str:
     return text.replace(API_KEY, "***REDACTED***") if API_KEY else text
 
 
-class ProviderRejected(Exception):
-    """Twelve Data answered and refused this symbol itself.
-
-    Raised by :func:`fetch_td`; the message is Twelve Data's own reason.
-    ``main`` records the ticker as skipped. It is not a failed fetch: the
-    request reached Twelve Data and got its standing answer for the symbol,
-    so asking again tomorrow returns the same thing.
-    """
-
-
-# Twelve Data's message for a symbol with no bars in the asked window
-# (HTTP 400; measured 2026-11-23 for WBD over a 60-day window).
-_NO_DATA_IN_WINDOW = "no data is available on the specified dates"
-_REASON_MAX_CHARS = 200
-
-
-def provider_rejection(http_status: int, body: object) -> str | None:
-    """Twelve Data's reason when its answer refuses the symbol, else ``None``.
-
-    Only a JSON error body from Twelve Data counts, and only two answers:
-
-    * code 404 with a message about the symbol: not found, or not offered on
-      this plan (measured 2026-11-23 for GLEN: "This symbol is available
-      starting with the Grow or Venture plan").
-    * code 400 with "No data is available on the specified dates".
-
-    Everything else stays a failed fetch: a bad key (401), a plan or credit
-    refusal (403, 429), a server error, a 400 about the request itself, a
-    404 that is not a Twelve Data error body.
-    """
-    if not isinstance(body, dict) or body.get("status") != "error":
-        return None
-    try:
-        code = int(body.get("code") or http_status)
-    except (TypeError, ValueError):
-        return None
-    message = " ".join(str(body.get("message") or "").split())
-    lowered = message.lower()
-    if code == 404 and "symbol" in lowered:
-        return f"HTTP 404: {_redact_api_key(message)[:_REASON_MAX_CHARS]}"
-    if code == 400 and _NO_DATA_IN_WINDOW in lowered:
-        return f"HTTP 400: {_redact_api_key(message)[:_REASON_MAX_CHARS]}"
-    return None
-
-
 def fetch_td(ticker: str, start: date, end: date) -> list[dict]:
-    """Daily closes for ``ticker``; ``[]`` when the fetch failed.
-
-    Raises:
-        ProviderRejected: Twelve Data refused the symbol (see
-            :func:`provider_rejection`).
-    """
     try:
         r = requests.get(
             TD_URL,
@@ -167,21 +116,16 @@ def fetch_td(ticker: str, start: date, end: date) -> list[dict]:
         # URL, including the apikey query param — never log it verbatim.
         print(f"  {ticker}: network error: {_redact_api_key(str(exc))}", file=sys.stderr)
         return []
-    try:
-        body = r.json()
-    except ValueError:
-        body = None
-    reason = provider_rejection(r.status_code, body)
-    if reason is not None:
-        raise ProviderRejected(reason)
     if r.status_code != 200:
         print(f"  {ticker}: HTTP {r.status_code}", file=sys.stderr)
         return []
-    if not isinstance(body, dict):
+    try:
+        body = r.json()
+    except ValueError:
         print(f"  {ticker}: non-JSON response", file=sys.stderr)
         return []
     if body.get("status") == "error":
-        print(f"  {ticker}: TD error: {_redact_api_key(str(body.get('message')))}", file=sys.stderr)
+        print(f"  {ticker}: TD error: {body.get('message')}", file=sys.stderr)
         return []
     out: list[dict] = []
     for v in body.get("values") or []:
@@ -253,32 +197,16 @@ def main() -> int:
     # SEC-XBRL-owned (the ON CONFLICT WHERE guard intentionally skips
     # those) — that's a correct, protective no-op, not a failure, and
     # must not be counted as one.
-    #
-    # A third outcome, kept apart from both (2026-11-23): Twelve Data
-    # answered and refused the symbol itself (not found, not on this plan,
-    # or no bars in the window). That is its standing answer, not a broken
-    # run. On 2026-11-22 the only four targets left were such symbols
-    # (GLEN, SOL, US, WBD), the run exited 1 and the unit sat in failed
-    # state. They are recorded as skipped with Twelve Data's reason and do
-    # not decide the exit code.
     fetched_ok = 0
     inserted_total = 0
     protected_total = 0
     failed: list[str] = []
-    skipped: dict[str, str] = {}
     for i, row in enumerate(work, 1):
         ticker = row["ticker"]
         bucket = row["bucket"]
         days = WINDOW_BY_BUCKET.get(bucket, 60)
         start_d = end_d - timedelta(days=days)
-        try:
-            bars = fetch_td(ticker, start_d, end_d)
-        except ProviderRejected as rejection:
-            skipped[ticker] = str(rejection)
-            print(f"[{i}/{len(work)}] {ticker} ({bucket}): skipped, "
-                  f"Twelve Data refused the symbol ({rejection})")
-            time.sleep(RATE_LIMIT_SEC)
-            continue
+        bars = fetch_td(ticker, start_d, end_d)
         if not bars:
             failed.append(ticker)
             print(f"[{i}/{len(work)}] {ticker} ({bucket}): 0 bars")
@@ -321,11 +249,9 @@ def main() -> int:
         time.sleep(RATE_LIMIT_SEC)
 
     print(f"\nDONE fetched_ok={fetched_ok}/{len(work)} inserted/updated={inserted_total} "
-          f"protected={protected_total} failed={len(failed)} skipped={len(skipped)}")
+          f"protected={protected_total} failed={len(failed)}")
     if failed:
         print(f"failed tickers: {failed[:40]}{'...' if len(failed)>40 else ''}")
-    for ticker, reason in skipped.items():
-        print(f"skipped {ticker}: {reason}")
 
     # Stamp source_catalog so freshness monitoring reflects actual pull
     # cadence from the source — separate from data coverage. A run where
@@ -350,15 +276,14 @@ def main() -> int:
 
     conn.close()
 
-    if failed and fetched_ok == 0:
-        # Every fetch that was not a provider refusal failed — a
-        # scheduler/monitor watching this job's exit code must be able to
-        # tell total failure from success (including the legitimate
-        # all-protected case, and a run whose only targets Twelve Data
-        # refuses, neither of which is a failure), not just read it out of
-        # the log text.
-        print(f"total failure: 0/{len(failed)} attempted tickers had a successful fetch "
-              f"({len(skipped)} skipped)", file=sys.stderr)
+    if work and fetched_ok == 0:
+        # Every ticker in this run failed to fetch — a scheduler/monitor
+        # watching this job's exit code must be able to tell total
+        # failure from success (including the legitimate all-protected
+        # case, which is not a failure), not just read it out of the
+        # log text.
+        print(f"total failure: 0/{len(work)} tickers had a successful fetch",
+              file=sys.stderr)
         return 1
     return 0
 
