@@ -14,7 +14,8 @@ Pipeline:
        stop from gamma flip point
      - Size via Kelly criterion (signal_executor pattern)
      - Run 5-layer sanity pipeline (hundredx_digest pattern)
-  3. Return only recommendations passing all sanity layers
+  3. Return only recommendations passing all gating sanity layers; shadow
+     layers (SHADOW_CHECKS: CROSS_ASSET) are recorded, never gating
 """
 
 from __future__ import annotations
@@ -22,8 +23,9 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from loguru import logger as log
@@ -60,12 +62,20 @@ TARGET_HORIZON_DTE_FRACTION: float = 0.5
 # Required checks guard pricing, data quality, liquidity, or freshness and MUST PASS.
 REQUIRED_CHECKS: frozenset[str] = frozenset({"DATA_QUALITY"})
 # Genuinely optional checks may return SKIP without rejecting a recommendation.
+# A FAIL from one still rejects.
 OPTIONAL_CHECKS: frozenset[str] = frozenset({
     "DEALER_FLOW",
-    "CROSS_ASSET",
     "LLM_REVIEW",
     "HISTORICAL_ANALOG",
 })
+# Shadow checks run and keep their real verdict (PASS/FAIL/SKIP and reason)
+# in ``sanity_status``, marked ``"shadow": True``, but never reject or change
+# a recommendation. The persisted ``sanity_status`` is their forward record.
+# CROSS_ASSET is shadow until a separately approved validation look (its
+# thresholds and its role) says it should veto: Anik's decision of
+# 2026-11-23 on Codex review 6030559940. Separately, a date-only
+# reconstruction never vetoes from any check (``_vetoes``).
+SHADOW_CHECKS: frozenset[str] = frozenset({"CROSS_ASSET"})
 
 
 def min_fresh_snap_date(run_date: date) -> date:
@@ -101,6 +111,193 @@ def _to_date(value: Any) -> date | None:
         except ValueError:
             return None
     return None
+
+
+# ── CROSS_ASSET momentum: the option's own underlying close ─────────
+#
+# Source decision (griddb, read-only, 2026-11-23; 194 tickers with an
+# options_daily_signals row in the last 30 days):
+# * ``{t}_close`` (the old source): CL only, and that is WTI crude
+#   (YF:CL=F), not Colgate, the CL option's underlying. The other 193
+#   tickers had no feature and read a fake +0.00% momentum.
+# * ``{t}_full``: 41 tickers; bare ``{t}``: 38 registered, none with a row
+#   in 30 days.
+# * ``options_daily_signals.spot_price``: every ticker has some row, but it
+#   is an intraday quote (mostly 15:xx ET, some 09-14h; median 0.24 %, p90
+#   2.1 % off the close), overwritten in place by each capture, and no
+#   visible row exists for 2026-11-20 (131-168 tickers on the other days).
+# * ``raw_series`` ``YF:{T}:close`` completed closes (yfinance + TIINGO):
+#   190 tickers; 180 with both newest sessions. Each vintage carries its
+#   pull time, so the read is fenced at the run date by when GRID had the
+#   row, not by its label.
+# The completed close is the official close of the option's own listing,
+# so it is the source here.
+
+#: Momentum is the close-to-close return over this many trading sessions.
+MOMENTUM_SESSIONS: int = 5
+# Calendar days read back from the run date: 5 sessions plus weekends,
+# holidays and a stale newest close fit well inside.
+_MOMENTUM_LOOKBACK_DAYS: int = 21
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class UnderlyingMomentum:
+    """A 5-session return of the underlying's completed close, or why there is none.
+
+    ``momentum`` is None when no return can be measured; ``reason`` then
+    says why (no close, stale, missing base session, ambiguous close).
+    """
+
+    momentum: float | None
+    start: date | None
+    end: date | None
+    reason: str
+
+
+#: ``basis`` of a CROSS_ASSET result fenced at the run's decision instant.
+DECISION_TIME_BASIS = "decision_time"
+#: ``basis`` of a result fenced only at the end of ``run_date`` (a replay that
+#: has no decision instant). It is a reconstruction and never a veto (Codex
+#: reviews 6030559940 and 6030789774): see ``_vetoes``.
+DATE_ONLY_BASIS = "date_only_reconstruction"
+
+
+def _vetoes(name: str, entry: Any) -> bool:
+    """Whether sanity result ``entry`` of check ``name`` can reject a recommendation.
+
+    Shadow checks (``SHADOW_CHECKS``) never can, and neither can a date-only
+    reconstruction (``basis == DATE_ONLY_BASIS``) of a check that is not
+    required, whatever its shadow status. Its verdict is kept as computed
+    either way. Required checks always gate.
+    """
+    if name in REQUIRED_CHECKS:
+        return True
+    if name in SHADOW_CHECKS:
+        return False
+    return not (isinstance(entry, dict) and entry.get("basis") == DATE_ONLY_BASIS)
+
+
+def _as_utc(ts: datetime) -> datetime:
+    """``ts`` as an aware UTC instant; a naive value is taken as UTC (grid-svr runs Etc/UTC)."""
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+
+
+def decision_time(run_date: date | None, decision_ts: datetime | None) -> datetime | None:
+    """The instant a recommendation is decided at, or None for a date-only replay.
+
+    A given ``decision_ts`` is used as is (UTC). With neither argument the run
+    is live and decides now. A ``run_date`` with no ``decision_ts`` is a
+    replay of that date with no recorded instant: None.
+    """
+    if decision_ts is not None:
+        return _as_utc(decision_ts)
+    if run_date is None:
+        return datetime.now(timezone.utc)
+    return None
+
+
+def momentum_cutoff(run_date: date, decided_at: datetime | None = None) -> datetime:
+    """The last instant a recommendation dated ``run_date`` may read.
+
+    With ``decided_at`` (the run's decision instant) it is that instant,
+    capped at the end of ``run_date`` in New York, so a recommendation at
+    11:00 New York never sees the close pulled at 17:05 or a journal entry
+    written that afternoon. Without it, the end of ``run_date`` in New York:
+    a date-only reconstruction (:data:`DATE_ONLY_BASIS`).
+    """
+    day_end = datetime.combine(run_date, time.max, _NEW_YORK)
+    if decided_at is None:
+        return day_end
+    return min(_as_utc(decided_at), day_end.astimezone(timezone.utc))
+
+
+def underlying_momentum(
+    conn: Any, ticker: str, run_date: date, *, as_of_ts: datetime | None = None,
+) -> UnderlyingMomentum:
+    """Return of ``ticker``'s completed close over the last ``MOMENTUM_SESSIONS`` sessions.
+
+    Reads ``YF:{TICKER}:close`` through ``store.observations.read_completed_closes``:
+    SUCCESS rows from yfinance or TIINGO pulled after 17:00 New York on the
+    session day (``evaluation.prices.us_listed_close_boundary``) and by
+    ``momentum_cutoff(run_date, as_of_ts)`` (the decision instant when
+    given), labels up to ``run_date``, TIINGO rows of
+    another listing dropped (``tiingo_symbol_contract``). A label whose
+    completed vintages disagree is ambiguous and is not used.
+
+    The newest completed close must fall in the fresh window
+    (``min_fresh_snap_date(run_date)`` on), and every one of the
+    ``MOMENTUM_SESSIONS + 1`` consecutive sessions ending there (market
+    calendar) needs its own valid, unambiguous completed close. The closes
+    are put on the newest close's share basis with the recorded splits
+    (``store.observations.price_in_basis``); dividends are not adjusted.
+    Momentum is the newest close over the first. Anything missing gives
+    ``momentum=None`` and a reason, never 0.
+
+    Retractions: this reads ``raw_series``, not ``resolved_series``, so
+    ``resolved_series_retractions`` does not key it. The rows such a
+    retraction withdraws are withdrawn here at the source: QUARANTINED rows
+    are not SUCCESS, and TIINGO rows of another listing
+    (``tiingo_symbol_contract``, the rule behind cl_close's 35,223
+    retractions) are dropped by ``read_completed_closes``. A later vintage
+    that revises a close makes that label ambiguous, so the window SKIPs.
+    """
+    from evaluation.prices import COMPLETED_CLOSE_SOURCES, us_listed_close_boundary
+    from ingestion.market_calendar import trading_days_between
+    from store.observations import price_in_basis, read_completed_closes, read_splits
+
+    symbol = (ticker or "").strip().upper()
+    if not symbol:
+        return UnderlyingMomentum(None, None, None, "no ticker")
+    cutoff = momentum_cutoff(run_date, as_of_ts)
+    start = run_date - timedelta(days=_MOMENTUM_LOOKBACK_DAYS)
+    closes = read_completed_closes(
+        conn, f"YF:{symbol}:close", start=start, end=run_date,
+        boundary=us_listed_close_boundary, source=COMPLETED_CLOSE_SOURCES,
+        as_of_ts=cutoff,
+    )
+    if not closes:
+        return UnderlyingMomentum(
+            None, None, None, f"no completed {symbol} close from {start} to {run_date}")
+    end = max(closes)
+    fresh_from = min_fresh_snap_date(run_date)
+    if end < fresh_from:
+        return UnderlyingMomentum(
+            None, None, end,
+            f"newest completed {symbol} close is {end}, before the fresh window from {fresh_from}")
+    sessions = trading_days_between(start, end)
+    if len(sessions) <= MOMENTUM_SESSIONS or sessions[-1] != end:
+        return UnderlyingMomentum(
+            None, None, end, f"fewer than {MOMENTUM_SESSIONS + 1} sessions to {end}")
+    # Every one of the MOMENTUM_SESSIONS + 1 consecutive sessions needs its own
+    # valid close: two end points with a hole between them are not a
+    # measured 5-session path (Codex review 6030034930).
+    window = sessions[-1 - MOMENTUM_SESSIONS:]
+    base = window[0]
+    missing = [d for d in window if d not in closes]
+    if missing:
+        return UnderlyingMomentum(
+            None, base, end,
+            f"no completed {symbol} close for {', '.join(str(d) for d in missing)}"
+            f" (needs all {len(window)} sessions {base} to {end})")
+    ambiguous = [d for d in window if closes[d].ambiguous]
+    if ambiguous:
+        return UnderlyingMomentum(
+            None, base, end,
+            f"completed {symbol} close for {', '.join(str(d) for d in ambiguous)}"
+            " is ambiguous (vintages disagree)")
+    splits = read_splits(conn, symbol, start=base, as_of_ts=cutoff)
+
+    def _on_end_basis(d: date) -> float:
+        obs = closes[d].latest
+        return price_in_basis(obs.value, obs.obs_date, basis_date=end, splits=splits,
+                              source=obs.source, pull_timestamp=obs.pull_timestamp)
+
+    path = [_on_end_basis(d) for d in window]
+    if not all(math.isfinite(p) and p > 0 for p in path):
+        return UnderlyingMomentum(None, base, end, f"{symbol} close is not a positive price")
+    return UnderlyingMomentum(
+        path[-1] / path[0] - 1.0, base, end, f"{symbol} close {base} to {end}")
 
 # Default payout ratio when no explicit R:R is supplied (rule-of-thumb for
 # options tickets: 3:1 target:risk).
@@ -560,10 +757,13 @@ class OptionsRecommendation:
 
     @property
     def all_sanity_passed(self) -> bool:
-        """True only if every required sanity check PASSed and no check FAILed.
+        """True only if every required sanity check PASSed and no gating check FAILed.
 
         SKIP is accepted only for checks explicitly listed in ``OPTIONAL_CHECKS``.
-        An empty ``sanity_status`` or a missing/SKIPped required check fails closed.
+        Checks in ``SHADOW_CHECKS`` and date-only reconstructions are recorded,
+        never gating (``_vetoes``): their verdict does not count either way.
+        An empty ``sanity_status`` or a missing/SKIPped required check fails
+        closed.
         """
         if not self.sanity_status:
             return False
@@ -572,6 +772,8 @@ class OptionsRecommendation:
             if not isinstance(entry, dict) or entry.get("status") != "PASS":
                 return False
         for name, entry in self.sanity_status.items():
+            if not _vetoes(name, entry):
+                continue
             if not isinstance(entry, dict):
                 return False
             status = entry.get("status")
@@ -698,6 +900,7 @@ class OptionsRecommender:
         engine: Engine | None = None,
         tickers: list[str] | None = None,
         run_date: date | None = None,
+        decision_ts: datetime | None = None,
     ) -> list[OptionsRecommendation]:
         """Generate actionable options trade recommendations.
 
@@ -705,6 +908,15 @@ class OptionsRecommender:
             engine: Optional override SQLAlchemy engine (defaults to self.engine).
             tickers: Restrict scan to these tickers (default: all available).
             run_date: Effective run date for freshness and DTE (default: today).
+            decision_ts: The instant this run decides at. Set once per run
+                (default: now for a live run) and stamped on every
+                recommendation's ``generated_at``; CROSS_ASSET reads nothing
+                pulled or written after it. A past ``run_date`` without it is a
+                date-only reconstruction (``DATE_ONLY_BASIS``).
+
+        CROSS_ASSET is a shadow check (``SHADOW_CHECKS``): its verdict is
+        recorded in each recommendation's ``sanity_status`` but changes
+        neither which recommendations are emitted nor the rejection reasons.
 
         Returns:
             list[OptionsRecommendation]: Only recommendations passing all required
@@ -713,6 +925,7 @@ class OptionsRecommender:
             ``self.last_rejection_counts`` and ``self.last_run_summary``.
         """
         db = engine or self.engine
+        decided_at = decision_time(run_date, decision_ts)
         effective_run_date = run_date or date.today()
         self.last_rejection_counts = {}
         self.last_run_summary = {}
@@ -731,6 +944,7 @@ class OptionsRecommender:
         if not opportunities:
             self.last_run_summary = {
                 "run_date": effective_run_date.isoformat(),
+            "decided_at": decided_at.isoformat() if decided_at is not None else None,
                 "opportunities": 0,
                 "emitted": 0,
                 "rejected": 0,
@@ -749,6 +963,7 @@ class OptionsRecommender:
             try:
                 rec = self._build_recommendation(
                     opp, gex_engine, db, run_date=effective_run_date,
+                    decision_ts=decided_at,
                 )
                 if rec is not None:
                     recommendations.append(rec)
@@ -760,6 +975,7 @@ class OptionsRecommender:
 
         self.last_run_summary = {
             "run_date": effective_run_date.isoformat(),
+            "decided_at": decided_at.isoformat() if decided_at is not None else None,
             "opportunities": len(opportunities),
             "emitted": len(recommendations),
             "rejected": sum(self.last_rejection_counts.values()),
@@ -849,8 +1065,13 @@ class OptionsRecommender:
         gex_engine,  # DealerGammaEngine
         db: Engine,
         run_date: date | None = None,
+        decision_ts: datetime | None = None,
     ) -> OptionsRecommendation | None:
         """Build a single recommendation from a scanner opportunity.
+
+        ``decision_ts`` is the run's decision instant (see
+        :func:`decision_time`); it becomes ``generated_at``, so a stored
+        recommendation records the instant its CROSS_ASSET reads were fenced at.
 
         Fails closed: returns None and records a rejection reason code whenever
         the contract cannot be priced on a fresh, existing chain row or fails
@@ -858,6 +1079,7 @@ class OptionsRecommender:
         """
         ticker = opp.ticker
         direction = opp.direction
+        decided_at = decision_time(run_date, decision_ts)
         effective_run_date = run_date or date.today()
         min_snap = min_fresh_snap_date(effective_run_date)
 
@@ -1039,24 +1261,30 @@ class OptionsRecommender:
             sanity_status={},
             supporting_signals=supporting,
             opposing_signals=opposing,
-            generated_at=datetime.utcnow().isoformat() + "Z",
+            generated_at=(
+                decided_at.replace(tzinfo=None).isoformat() + "Z" if decided_at is not None
+                else datetime.utcnow().isoformat() + "Z"
+            ),
         )
 
         # Run 5-layer sanity pipeline
         sanity = self._run_sanity_pipeline(
             rec, db, opp, gex_profile, run_date=effective_run_date, resolved_iv=iv,
+            decision_ts=decided_at,
         )
         rec.sanity_status = sanity
 
-        # Fail closed on any FAIL or on SKIP/absence of a required check
+        # Fail closed on any gating FAIL or on SKIP/absence of a required check.
+        # Shadow checks and date-only reconstructions never reject (_vetoes).
         if not rec.all_sanity_passed:
+            gating = {k: v for k, v in sanity.items() if _vetoes(k, v)}
             skipped_required = [
-                k for k, v in sanity.items()
+                k for k, v in gating.items()
                 if isinstance(v, dict) and v.get("status") == "SKIP" and k not in OPTIONAL_CHECKS
             ]
             missing_required = [k for k in sorted(REQUIRED_CHECKS) if k not in sanity]
             failed = [
-                k for k, v in sanity.items()
+                k for k, v in gating.items()
                 if not isinstance(v, dict) or v.get("status") not in ("PASS", "SKIP")
             ]
             if skipped_required:
@@ -1558,13 +1786,15 @@ class OptionsRecommender:
         *,
         run_date: date | None = None,
         resolved_iv: float | None = None,
+        decision_ts: datetime | None = None,
     ) -> dict:
         """Run 5-layer sanity check on a recommendation.
 
         Layers:
           1. DATA_QUALITY (REQUIRED): fresh snapshot, IV in 5-200%, OI >= 100, valid spread <= 25% of mid
           2. DEALER_FLOW (OPTIONAL): GEX regime supports direction
-          3. CROSS_ASSET (OPTIONAL): momentum + news energy aligned with direction
+          3. CROSS_ASSET (SHADOW): momentum + news energy aligned with direction;
+             recorded with ``"shadow": True``, never gating (``SHADOW_CHECKS``)
           4. LLM_REVIEW (OPTIONAL): structured prompt to LLM, graceful SKIP if unavailable
           5. HISTORICAL_ANALOG (OPTIONAL): query past scanner results with similar setups
 
@@ -1576,16 +1806,26 @@ class OptionsRecommender:
             rec, db, run_date=run_date, resolved_iv=resolved_iv,
         )
         sanity["DEALER_FLOW"] = self._sanity_dealer_flow(rec, gex_profile)
-        sanity["CROSS_ASSET"] = self._sanity_cross_asset(rec, db)
+        sanity["CROSS_ASSET"] = self._sanity_cross_asset(
+            rec, db, run_date=run_date, decision_ts=decision_ts,
+        )
         sanity["LLM_REVIEW"] = self._sanity_llm_review(rec, opp, gex_profile)
         sanity["HISTORICAL_ANALOG"] = self._sanity_historical_analog(rec, db)
 
-        passed = sum(1 for v in sanity.values() if v["status"] == "PASS")
-        skipped = sum(1 for v in sanity.values() if v["status"] == "SKIP")
-        failed = sum(1 for v in sanity.values() if v["status"] == "FAIL")
+        for name in SHADOW_CHECKS:
+            if isinstance(sanity.get(name), dict):
+                sanity[name] = {**sanity[name], "shadow": True}
+        gating = [v for k, v in sanity.items() if k not in SHADOW_CHECKS]
+        passed = sum(1 for v in gating if v["status"] == "PASS")
+        skipped = sum(1 for v in gating if v["status"] == "SKIP")
+        failed = sum(1 for v in gating if v["status"] == "FAIL")
+        shadow_failed = sum(
+            1 for k in SHADOW_CHECKS
+            if isinstance(sanity.get(k), dict) and sanity[k].get("status") == "FAIL"
+        )
         log.info(
-            "Sanity pipeline for {t} {d}: {p} PASS, {s} SKIP, {f} FAIL",
-            t=rec.ticker, d=rec.direction, p=passed, s=skipped, f=failed,
+            "Sanity pipeline for {t} {d}: {p} PASS, {s} SKIP, {f} FAIL, {sf} shadow FAIL",
+            t=rec.ticker, d=rec.direction, p=passed, s=skipped, f=failed, sf=shadow_failed,
         )
 
         return sanity
@@ -1717,43 +1957,50 @@ class OptionsRecommender:
         return {"status": "PASS", "reason": "Neutral gamma regime — no strong headwind or tailwind"}
 
     def _sanity_cross_asset(
-        self, rec: OptionsRecommendation, db: Engine,
+        self, rec: OptionsRecommendation, db: Engine, *,
+        run_date: date | None = None, decision_ts: datetime | None = None,
     ) -> dict[str, str]:
         """Layer 3: Cross-asset alignment (momentum + news energy).
 
         Checks recent price momentum and decision journal sentiment
         to see if they align with the recommended direction.
+
+        Momentum is the 5-session return of the option's own underlying,
+        close to completed close (:func:`underlying_momentum`). Until
+        2026-11-23 it read ``{ticker}_close`` from ``resolved_series``: only
+        CL had one, and that was WTI crude, so every other ticker read +0.00%
+        and passed on a number nobody measured. No measurable momentum is
+        now SKIP (CROSS_ASSET is optional), never 0%.
+
+        Fence (Codex review 6030559940): the price, split and journal reads
+        all stop at the decision instant (:func:`decision_time`; a live run
+        decides now). Each result carries ``as_of`` (that instant) and
+        ``basis``. A replay given only a past ``run_date`` has no decision
+        instant: it reads to the end of that day in New York and is labelled
+        ``DATE_ONLY_BASIS``. Its verdict is kept as computed and it is never
+        a veto (``_vetoes``), independently of CROSS_ASSET being in
+        ``SHADOW_CHECKS``.
         """
+        effective_run_date = run_date or date.today()
+        decided_at = decision_time(run_date, decision_ts)
+        cutoff = momentum_cutoff(effective_run_date, decided_at)
+        basis = DATE_ONLY_BASIS if decided_at is None else DECISION_TIME_BASIS
+        stamp = {"as_of": cutoff.astimezone(timezone.utc).isoformat(), "basis": basis}
         try:
             with db.connect() as conn:
-                # Price momentum: 5-day return
-                feature_name = f"{rec.ticker.lower()}_close"
-                prices = conn.execute(text("""
-                    SELECT rs.value
-                    FROM resolved_series rs
-                    JOIN feature_registry fr ON rs.feature_id = fr.id
-                    WHERE fr.name = :fname
-                    ORDER BY rs.obs_date DESC
-                    LIMIT 6
-                """), {"fname": feature_name}).fetchall()
+                measured = underlying_momentum(conn, rec.ticker, effective_run_date, as_of_ts=decided_at)
+                if measured.momentum is None:
+                    return {"status": "SKIP", "reason": f"No momentum: {measured.reason}", **stamp}
+                momentum = measured.momentum
 
-                if len(prices) >= 2:
-                    latest = float(prices[0][0])
-                    older = float(prices[-1][0])
-                    if older > 0:
-                        momentum = (latest - older) / older
-                    else:
-                        momentum = 0.0
-                else:
-                    momentum = 0.0
-
-                # News energy from decision journal (latest regime)
+                # News energy from decision journal (latest regime known by the cutoff)
                 journal_row = conn.execute(text("""
                     SELECT inferred_state, grid_recommendation
                     FROM decision_journal
+                    WHERE decision_timestamp <= :cutoff
                     ORDER BY decision_timestamp DESC
                     LIMIT 1
-                """)).fetchone()
+                """), {"cutoff": cutoff}).fetchone()
 
                 news_aligned = True  # default: no contradiction
                 if journal_row:
@@ -1770,22 +2017,24 @@ class OptionsRecommender:
             else:
                 momentum_aligned = momentum <= 0.02   # not in sharp rally
 
+            window = measured.reason
             if momentum_aligned and news_aligned:
-                return {
+                result = {
                     "status": "PASS",
-                    "reason": f"Momentum ({momentum:+.2%}) and regime aligned with {rec.direction}",
+                    "reason": f"Momentum ({momentum:+.2%}, {window}) and regime aligned with {rec.direction}",
                 }
             elif not momentum_aligned and not news_aligned:
-                return {
+                result = {
                     "status": "FAIL",
-                    "reason": f"Momentum ({momentum:+.2%}) and regime both contradict {rec.direction}",
+                    "reason": f"Momentum ({momentum:+.2%}, {window}) and regime both contradict {rec.direction}",
                 }
             else:
                 # One aligned, one not — pass with warning
-                return {
+                result = {
                     "status": "PASS",
-                    "reason": f"Partial alignment — momentum={momentum:+.2%}, news_aligned={news_aligned}",
+                    "reason": f"Partial alignment — momentum={momentum:+.2%} ({window}), news_aligned={news_aligned}",
                 }
+            return {**result, **stamp}
 
         except Exception as exc:
             log.debug("Cross-asset check failed: {e}", e=str(exc))
