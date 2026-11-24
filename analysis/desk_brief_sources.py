@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import urllib.request
@@ -715,6 +716,24 @@ def _pick_sector_row(rows, as_of: datetime, problems: list[str]):
 
 _NUM = (int, float)
 _OPT_DICTS = ("market", "fed_balance_sheet", "vix", "events", "overnight_rule")
+# The leaves the section prints, by part: name -> "num" (finite, not bool), "text", "bool" or "date" (YYYY-MM-DD).
+_LEAVES = {"market": {"phase": "text", "trend_pct": "num", "bend_pct": "num"},
+           "fed_balance_sheet": {"phase": "text", "obs_date": "date", "growth_13w_pct": "num"},
+           "vix": {"third": "text", "spike_state": "text", "obs_date": "date", "stale": "bool"},
+           "overnight_rule": {"market_gate": "bool"}}
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _leaf_bad(v: Any, kind: str) -> bool:
+    if v is None:
+        return False
+    if kind == "num":
+        return isinstance(v, bool) or not isinstance(v, _NUM) or not math.isfinite(v)
+    if kind == "bool":
+        return not isinstance(v, bool)
+    if kind == "date":
+        return not (isinstance(v, str) and _DATE.match(v))
+    return not isinstance(v, str)
 
 
 def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
@@ -731,8 +750,8 @@ def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
         return "sectors is not an object of objects"
     for name, sc in sectors.items():
         for f in ("trend_pct", "relative_trend_pct"):
-            if sc.get(f) is not None and (isinstance(sc[f], bool) or not isinstance(sc[f], _NUM)):
-                return f"sector {name!r}: {f} is not a number"
+            if _leaf_bad(sc.get(f), "num"):
+                return f"sector {name!r}: {f} is not a finite number"
         for f in ("group", "phase"):
             if sc.get(f) is not None and not isinstance(sc[f], str):
                 return f"sector {name!r}: {f} is not text"
@@ -741,6 +760,12 @@ def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
     for f in _OPT_DICTS:
         if rec.get(f) is not None and not isinstance(rec[f], dict):
             return f"{f} is not an object"
+    for part, leaves in _LEAVES.items():
+        for f, kind in leaves.items():
+            if _leaf_bad((rec.get(part) or {}).get(f), kind):
+                return f"{part}.{f} is not {'a finite number' if kind == 'num' else 'true or false' if kind == 'bool' else 'a YYYY-MM-DD date' if kind == 'date' else 'text'}"
+    if _leaf_bad(rec.get("sectors_rising"), "num"):
+        return "sectors_rising is not a finite number"
     for f in ("leaders", "laggards"):
         if rec.get(f) is not None and not (isinstance(rec[f], list) and all(isinstance(x, str) for x in rec[f])):
             return f"{f} is not a list of names"
@@ -749,6 +774,9 @@ def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
     ahead = (rec.get("events") or {}).get("within_7_days")
     if ahead is not None and not (isinstance(ahead, list) and all(isinstance(e, dict) for e in ahead)):
         return "events.within_7_days is not a list of objects"
+    if ahead and not all(isinstance(e.get("event"), str) and e["event"] and not _leaf_bad(e.get("date"), "date") and e.get("date")
+                         for e in ahead):
+        return "events.within_7_days has an entry without an event name and a YYYY-MM-DD date"
     sin = (rec.get("overnight_rule") or {}).get("sectors_in")
     if sin is not None and not (isinstance(sin, list) and all(isinstance(x, str) for x in sin)):
         return "overnight_rule.sectors_in is not a list of names"

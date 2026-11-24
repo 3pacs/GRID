@@ -838,12 +838,20 @@ def _malformed(day: str):
     yield "body date", dict(good, data_through="2026-11-18"), "body's data_through"
     yield "sectors list", dict(good, sectors=[]), "sectors is not an object of objects"
     yield "sector not object", dict(good, sectors={"Energy": 4.0}), "sectors is not an object of objects"
-    yield "trend text", dict(good, sectors={"Energy": dict(good["sectors"]["Energy"], trend_pct="4")}), "trend_pct is not a number"
+    yield "trend text", dict(good, sectors={"Energy": dict(good["sectors"]["Energy"], trend_pct="4")}), "trend_pct is not a finite number"
     yield "leading text", dict(good, sectors={"Energy": dict(good["sectors"]["Energy"], leading="yes")}), "leading is not true or false"
     yield "vix list", dict(good, vix=[]), "vix is not an object"
     yield "leaders text", dict(good, leaders="Energy"), "leaders is not a list of names"
     yield "events list of text", dict(good, events={"within_7_days": ["GDP"]}), "within_7_days is not a list of objects"
     yield "sectors_in text", dict(good, overnight_rule={"market_gate": True, "sectors_in": "Energy"}), "sectors_in is not a list"
+    yield "vix stale text", dict(good, vix=dict(good["vix"], stale="false")), "vix.stale is not true or false"
+    yield "vix third number", dict(good, vix=dict(good["vix"], third=2)), "vix.third is not text"
+    yield "fed date", dict(good, fed_balance_sheet={"phase": "flat", "obs_date": "11/11/2026"}), "fed_balance_sheet.obs_date is not a YYYY-MM-DD date"
+    yield "market trend inf", dict(good, market={"phase": "rising", "trend_pct": float("inf")}), "market.trend_pct is not a finite number"
+    yield "sector trend nan", dict(good, sectors={"Energy": dict(good["sectors"]["Energy"], trend_pct=float("nan"))}), "trend_pct is not a finite number"
+    yield "gate text", dict(good, overnight_rule={"market_gate": "yes", "sectors_in": ["Energy"]}), "overnight_rule.market_gate is not true or false"
+    yield "empty event", dict(good, events={"within_7_days": [{}]}), "within_7_days has an entry without an event name"
+    yield "event bad date", dict(good, events={"within_7_days": [{"event": "GDP", "date": None}]}), "within_7_days has an entry without"
 
 
 def test_sector_state_malformed_newer_row_falls_back_to_the_valid_one(tmp_path):
@@ -864,14 +872,12 @@ def test_sector_state_malformed_newer_row_falls_back_to_the_valid_one(tmp_path):
 
 
 def test_sector_state_gate_unstated_is_not_closed(tmp_path):
-    for i, gate in enumerate((None, "yes", 1)):
-        d = tmp_path / str(i)
-        d.mkdir()
-        db = _sector_db(d, [])
-        rule = {"sectors_in": ["Energy"]} if gate is None else {"market_gate": gate, "sectors_in": ["Energy"]}
-        _put_body(db, "2026-11-19", dict(_sector_rec("2026-11-19"), overnight_rule=rule))
-        sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
-        assert "overnight rule's gate: market not stated; sectors let through: Energy" in sec.lines, gate
+    d = tmp_path / "unstated"
+    d.mkdir()
+    db = _sector_db(d, [])
+    _put_body(db, "2026-11-19", dict(_sector_rec("2026-11-19"), overnight_rule={"sectors_in": ["Energy"]}))
+    sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+    assert "overnight rule's gate: market not stated; sectors let through: Energy" in sec.lines
     d = tmp_path / "closed"
     d.mkdir()
     db = _sector_db(d, [])
@@ -889,3 +895,19 @@ def test_sector_state_line_building_failure_is_unknown_not_an_abort(tmp_path, mo
     monkeypatch.setattr(S, "_sector_section", boom)
     sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
     assert sec.status == "unknown" and sec.problems[0] == "row for 2026-11-19 could not be read into lines (TypeError)"
+
+
+def test_sector_state_json_overflow_is_not_a_number(tmp_path):
+    import hashlib
+
+    db = _sector_db(tmp_path, [("2026-11-18", "2026-11-19T06:45:08Z")])
+    body = json.dumps(_sector_rec("2026-11-19")).replace('"trend_pct": 0.06', '"trend_pct": 1e309')
+    assert "1e309" in body
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO desk_state VALUES (?,?,?,?,?,?)", ("2026-11-19", "live", "desk-sector-state/1", body,
+                                                                 hashlib.sha256(body.encode()).hexdigest(), "2026-11-20T06:45:08Z"))
+    con.commit()
+    con.close()
+    sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+    assert sec.facts["record_date"] == "2026-11-18"
+    assert any("market.trend_pct is not a finite number" in p for p in sec.problems)
