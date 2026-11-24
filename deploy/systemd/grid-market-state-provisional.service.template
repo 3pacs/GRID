@@ -1,0 +1,37 @@
+# TEMPLATE — NOT INSTALLED, DISABLED BY DEFAULT. The operator installs it; nothing in a deploy does.
+# Provisional market-state record at the close (#1312): DISPLAY ONLY. It writes market_state_provisional, never
+# market_state_daily, and nothing that decides reads it. #1191's previous-session rule is unchanged: the session's
+# decision record is still written the next evening by grid-market-state.service.
+# The only reader is the post-close desk brief (analysis/desk_brief_sources.py), which labels every line
+# "PROVISIONAL (display only)" and shows it only until the session's decision record exists.
+# The record is computed from the inputs GRID held at the session's close (an exact availability cutoff), and the
+# writer never refreshes the FRED vintages: --no-refresh below is kept for clarity and changes nothing.
+# The table comes from alembic migration market_state_prov_20261122 (deploy.yml runs `alembic upgrade head`);
+# the writer never creates it and refuses while it is missing. Check it exists before enabling the timer:
+#   psql -d griddb -c "SELECT to_regclass('market_state_provisional')"
+# Install (on grid-svr), only after an explicit operator decision:
+#   sudo cp deploy/systemd/grid-market-state-provisional.service.template /etc/systemd/system/grid-market-state-provisional.service
+#   sudo cp deploy/systemd/grid-market-state-provisional.timer.template   /etc/systemd/system/grid-market-state-provisional.timer
+#   sudo install -D -m 0644 deploy/python314/dropins/grid-market-state-provisional.service.d-py314.conf \
+#        /etc/systemd/system/grid-market-state-provisional.service.d/py314.conf   # Python 3.14, like grid-market-state
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-market-state-provisional.timer
+# The writer refuses with exit 2 before the session's close in the pinned XNYS calendar and outside its pinned parts.
+# On a day that is not a session (a weekday market holiday) it writes nothing, logs outcome not_a_session and exits
+# 0, so this unit ends successfully on a holiday. It never runs with
+# --from/--to, --as-of or --require-target-dealer. A rerun for the same session leaves the stored row as it is.
+[Unit]
+Description=GRID provisional market-state record at the close (display only, never read by a decision path)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# Its own lock: a provisional run must never make the nightly decision writer's `flock -n` fail.
+ExecStart=/usr/bin/flock -n /tmp/grid-market-state-provisional.lock /usr/bin/python3 /data/grid_v4/grid_release/scripts/run_market_state.py --provisional --no-refresh --json
+TimeoutStartSec=15min
+Nice=10
+StandardOutput=journal
+StandardError=journal

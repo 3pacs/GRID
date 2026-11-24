@@ -136,6 +136,33 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      # 13F holdings observations (intelligence/holdings_observations_13f.py):
+      # the real 13F writer -> reader -> deep_graph layer 9 -> served route on
+      # PostgreSQL types (JSONB payloads, TIMESTAMPTZ receipts, the window-
+      # function vintage read, graph_overlaps' real DDL). The test fails
+      # instead of skipping when REQUIRE_13F_HOLDINGS_PG=1.
+      - name: 13F holdings observations PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_13F_HOLDINGS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_13f_holdings_graph_pg.py -q -rA
+
+      # Stored-close backfill (scripts/close_backfill_universe.py): the work
+      # queries, the completed-close reader and the fill-only write on
+      # PostgreSQL. The test fails instead of skipping when
+      # REQUIRE_CLOSE_BACKFILL_PG=1.
+      - name: Stored-close backfill PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_CLOSE_BACKFILL_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_close_backfill_universe_pg.py -q -rA
+
       - name: Pipeline health PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -387,6 +414,22 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
+
+      # The bound-id resolved_series readers (store/feature_ids.py) run next
+      # to the legacy feature_registry name-join statements on one seeded
+      # schema. REQUIRE_BOUND_ID_READS_PG turns a missing DB URL into a
+      # failure, so this step cannot pass without running the comparisons.
+      # test_options_sanity_momentum_pg.py pins the options CROSS_ASSET
+      # momentum read: the underlying's own completed raw close (not a
+      # resolved_series feature), fenced at run_date, SKIP when unmeasured.
+      - name: Bound-id resolved_series reads PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BOUND_ID_READS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_resolved_series_bound_id_reads_pg.py tests/test_options_sanity_momentum_pg.py -q -rA
 
       # #1344: scripts/bulk_resolve.py (run by scripts/server_startup.sh)
       # writes resolved_series in SQL, outside normalization/resolver.py, so
@@ -964,6 +1007,50 @@ jobs:
             exit 1
           fi
 
+      # Cboe equity put/call (#1397, Codex review 6026828927): on a fresh
+      # database (schema.sql tables and seeds, no raw rows) the registry
+      # revision registers equity_put_call_ratio, the first pull stores it
+      # with no row stamped before its page was read, and the resolver
+      # resolves it with no ghost mapping. Two overlapping runs on two
+      # connections store one SUCCESS row per session (writer lock, Codex
+      # review 6029448579). A skip must fail this step.
+      - name: Cboe equity put/call fresh-install PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_cboe_equity_pcr_fresh_install_pg.py -q -rA | tee /tmp/grid-cboe-epcr-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-cboe-epcr-pg.txt; then
+            echo "::error::Cboe equity put/call fresh-install PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Signal executor (#1356, Codex review 6011903757): the gross-exposure
+      # reservation and the trade insert are one step under a transaction-
+      # scoped advisory lock. Two runs on two connections: the second waits on
+      # the lock, then sees the first's entry (no duplicate) and its exposure
+      # (the cap holds). Codex review 6031218970: an exit is an atomic
+      # OPEN -> CLOSED claim, so of two overlapping closes of one trade only
+      # the winner writes P&L and moves the strategy's counters. A skip must
+      # fail this step.
+      - name: Signal executor exposure lock and close race PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_signal_executor_exposure_lock_pg.py \
+            tests/test_signal_executor_close_race_pg.py -q -rA | tee /tmp/grid-signal-executor-lock-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-signal-executor-lock-pg.txt; then
+            echo "::error::Signal executor exposure lock or close race PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # E2 forward scoreboard (evals/e2, milestone M2): price resolution is
       # point-in-time against real SQL (no close before its pull or its
       # session close, no revision pulled after the run instant, one named
@@ -1060,6 +1147,24 @@ jobs:
           # (stderr, captured by tee) must never be able to trip this guard.
           if grep -qE "^SKIPPED \[|[0-9]+ skipped" /tmp/grid-full-panel-repair-pg.txt; then
             echo "::error::Full-panel vintage repair PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # #1354 / Codex HOLD 6011907767: the per-signal and regime Brier
+      # bootstraps replace their tables in one transaction. Legacy rows the
+      # replacement rejects or no longer produces are retired, and a failed
+      # insert rolls the whole replacement back. A skip must fail this step.
+      - name: Brier bootstrap replacement PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_brier_bootstrap_replacement_pg.py -q -rA | tee /tmp/grid-brier-replacement-pg.txt
+          if grep -qE "^SKIPPED \[|[0-9]+ skipped" /tmp/grid-brier-replacement-pg.txt; then
+            echo "::error::Brier bootstrap replacement PostgreSQL contract was skipped"
             exit 1
           fi
 

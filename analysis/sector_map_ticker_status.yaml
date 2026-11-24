@@ -6,7 +6,9 @@
 # in it, so historical panels keep every actor (dropping dead names would add
 # survivorship bias). This file only tells the price list what to fetch today.
 #
-# Keys are tickers exactly as sector_map_data.yaml spells them.
+# Keys are tickers exactly as sector_map_data.yaml spells them. The one
+# exception is the last section: symbols no map actor uses but another routine
+# price list (oracle, hypotheses, insider buyers) still holds.
 #   status: renamed          same issuer, now priced under `successor`
 #                            (ticker change, rebrand, Tiingo's share-class spelling)
 #           acquired         absorbed by `acquirer` (a ticker, or a name if private)
@@ -32,6 +34,10 @@ TICKER_STATUS:
     status: renamed
     successor: ONC
     note: BeiGene -> BeOne Medicines (2025); Tiingo ONC history from 2016-02-03
+  BKH:
+    status: renamed
+    successor: HZN
+    note: 'Black Hills and NorthWestern Energy merged to form Bright Horizon Energy (WOWT, 2026-11-16). The issuer''s exchange note (ir.blackhillscorp.com/exchange-shares) answered this session with HTTP 403 and was not read; Codex review 6032263432 names the Black Hills issuer release and NorthWestern''s Form 8-K as corroboration of the BKH/HZN exchange, also not read here. Tiingo lists HZN as Bright Horizon Energy Corp (NYSE) with history from 1984-09-07; that vendor history is not verified point-in-time continuity. Tiingo''s BKH listing has no start or end date (read 2026-11-23), so no last_session is given and no venue date is inferred. Last BKH close GRID stored from Tiingo is 2026-11-13'
   EQR:
     status: renamed
     successor: VMRK
@@ -48,10 +54,6 @@ TICKER_STATUS:
     status: renamed
     successor: TDAY
     note: Gannett -> USA TODAY Co.; Tiingo GCI is the pre-2019 Gannett (ends 2019-11-19), TDAY carries the current company from 2014-02-04
-  GWH:
-    status: renamed
-    successor: GWHT
-    note: ESS Tech delisted from NYSE 2026-10-02, quoted OTC as GWHT from 2026-10-05
   KELY.A:
     status: renamed
     successor: KELYA
@@ -98,6 +100,11 @@ TICKER_STATUS:
     note: U.S. Cellular sold wireless ops to T-Mobile and became Array Digital Infrastructure (2025)
 
   # ── acquired ────────────────────────────────────────────────────────────────
+  ROKU:
+    status: acquired
+    acquirer: Fox
+    last_session: 2026-11-06
+    note: 'The Fox merger closed on 2026-11-06; each Class A share converted into 0.9799 FOX Class A shares plus $95.30 in cash, and Nasdaq trading is halted before the open on 2026-11-09 (Roku Form 8-K dated 2026-11-06, sec.gov/Archives/edgar/data/1428439/000119312526451874/d181620d8k.htm). last_session is the endDate of Tiingo''s ROKU listing (read 2026-11-23): a vendor cutoff that here equals the last Nasdaq session'
   ALTM: {status: acquired, acquirer: RIO, last_session: 2025-03-05}
   ARCH:
     status: acquired
@@ -179,6 +186,9 @@ TICKER_STATUS:
   X: {status: acquired, acquirer: Nippon Steel, last_session: 2025-06-18}
 
   # ── delisted ────────────────────────────────────────────────────────────────
+  GWH:
+    status: delisted
+    note: 'ESS Tech delisted from NYSE 2026-10-02, quoted OTC as GWHT from 2026-10-05; Chapter 7 petition filed 2026-11-13 (see GWHT below). Was renamed -> GWHT here until 2026-11-23. Not priced any more (owner, 2026-11-23): the OTC shares, which Tiingo lists as GWHTQ, are not fetched. Tiingo''s GWH listing has no start or end date (read 2026-11-23), so no last_session is given and no venue date is inferred'
   ELME:
     status: delisted
     last_session: 2026-10-23
@@ -228,3 +238,19 @@ TICKER_STATUS:
   RAMP: {status: delisted, last_session: 2026-10-30, note: LiveRamp}
   # Tiingo 404 (no rows written, so no frozen prices; probably renamed, review):
   # BITF, FI, GREE, HHC.
+
+  # ── not in the sector map (added 2026-11-23) ────────────────────────────────
+  # Symbols Tiingo stopped serving that reach the routine price list from the
+  # oracle, hypothesis or insider-buyer universes (2026-11-10..23: each kept the
+  # Tiingo price run PARTIAL for days). Both issuers' shares moved to the OTC
+  # market under another symbol after a bankruptcy filing. The owner decided on
+  # 2026-11-23 not to follow those symbols, so the entries are `delisted` and
+  # the OTC symbol is kept in the note only. Where Tiingo's listing gives no
+  # end date, no last_session is written.
+  GWHT:
+    status: delisted
+    note: 'ESS Tech ceased operations and filed a voluntary Chapter 7 petition in the US Bankruptcy Court for the District of Delaware on 2026-11-13 (ESS Tech Form 8-K, Item 1.03, dated 2026-11-13, sec.gov/Archives/edgar/data/1819438/000181943826000091/wk-20261113.htm; its cover lists GWHT). Tiingo no longer finds GWHT (read 2026-11-23): the vendor gives no end date, so no last_session is written and no venue date is inferred from that. Last GWHT close GRID stored from Tiingo is 2026-11-13. Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as GWHTQ, ESS Tech Inc (OTCMKTS), history from 2021-01-04'
+  KPTI:
+    status: delisted
+    last_session: 2026-11-10
+    note: 'Nasdaq suspended trading in the common stock at the opening of business on 2026-11-11; it is expected to trade over the counter as KPTIQ (Karyopharm Form 8-K, Item 3.01, event date 2026-11-04, sec.gov/Archives/edgar/data/1503802/000119312526448516/d122780d8k.htm). last_session is the endDate of Tiingo''s KPTI listing (read 2026-11-23): a vendor cutoff, the session before that suspension. Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as KPTIQ, Karyopharm Therapeutics Inc (OTCMKTS), history from 2013-11-06; that vendor history is not verified point-in-time continuity'

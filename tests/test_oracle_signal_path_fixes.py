@@ -53,8 +53,9 @@ def _bare_oracle(
     oracle._get_entry_price_reference = lambda ticker: {"status": "measured", "price": spot}
     oracle._get_journal_feedback = lambda ticker: {}
     oracle._get_convergence_for_ticker = lambda ticker: []
+    oracle._read_options_signal = lambda ticker: oe.OptionsSignalRead(None, False)
     if signals is not None:
-        oracle._gather_signals = lambda ticker, families: list(signals)
+        oracle._gather_signals = lambda ticker, families, options_read=None: list(signals)
     if daily_vol is not None:
         oracle._get_realized_daily_vol = lambda ticker, as_of, window=20: daily_vol
     else:
@@ -71,7 +72,9 @@ def _mock_gather_engine(feat_rows: list[tuple[int, str, str]], opt_row=None) -> 
         if "feature_registry" in sql and "resolved_series" not in sql:
             res.fetchall.return_value = feat_rows
         elif "options_daily_signals" in sql:
-            res.fetchone.return_value = opt_row
+            # The Oracle selects the row's lineage beside its eight values
+            # (False: a public row).
+            res.fetchone.return_value = None if opt_row is None else (*opt_row, False)
         else:
             raise AssertionError(f"Unexpected SQL: {sql}")
         return res
@@ -753,7 +756,7 @@ def test_followup2_regulatory_anti_signals_apply_only_to_bullish_directions(monk
     oracle_mixed = _bare_oracle(models=mixed_models, daily_vol=0.01)
     oracle_mixed.engine = MagicMock()
     oracle_mixed.engine.connect.return_value = conn
-    oracle_mixed._gather_signals = lambda ticker, fams: (
+    oracle_mixed._gather_signals = lambda ticker, fams, options_read=None: (
         list(bull_signals) if "equity" in fams else list(bear_signals)
     )
     mixed_preds = oracle_mixed._oracle_one_ticker(1, "PFE", 1, NOW, {}, horizon_days=1)

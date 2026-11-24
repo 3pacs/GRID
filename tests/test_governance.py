@@ -146,11 +146,43 @@ class TestGateCheckerCandidateToShadow:
         assert any("not found" in d for d in result["details"])
 
 
+def _ok_drift_checker(_model_id: int) -> dict:
+    """Stub drift check returning evaluated non-critical drift."""
+    return {
+        "overall_drift_score": 0.05,
+        "recommended_action": "OK",
+        "data_distribution_drift": {"1": {"drifted": False}},
+    }
+
+
+def _passing_oos_row():
+    """validation_results row with a typed OOS record; passes only under a registered reader."""
+    from validation import gates
+
+    record = {
+        "schema": gates.OOS_EVIDENCE_SCHEMA,
+        "version": 1,
+        "n_scored": 40,
+        "hit_rate": 0.75,
+    }
+    return _row("PASS", {}, {}, {gates.OOS_EVIDENCE_KEY: record})
+
+
+@pytest.fixture
+def stand_in_oos_reader(monkeypatch):
+    """Register a stand-in v1 typed OOS reader (none ships; see validation.gates)."""
+    from validation import gates
+
+    monkeypatch.setitem(
+        gates._OOS_EVIDENCE_READERS, 1, lambda record, _model_id: dict(record)
+    )
+
+
 class TestGateCheckerShadowToStaging:
     """Tests for the SHADOW -> STAGING gate check."""
 
     def test_rule_based_passes(self):
-        """SHADOW -> STAGING passes for rule-based models (soft gates)."""
+        """SHADOW -> STAGING passes for rule-based models when drift check is OK."""
         engine = _mock_engine()
         conn = engine._mock_conn
 
@@ -165,28 +197,31 @@ class TestGateCheckerShadowToStaging:
 
         from validation.gates import GateChecker
 
-        gc = GateChecker(db_engine=engine)
+        gc = GateChecker(db_engine=engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(model_id=1)
 
         assert result["passed"] is True
         assert any("Operator approval" in d for d in result["details"])
 
 
+@pytest.mark.usefixtures("stand_in_oos_reader")
 class TestGateCheckerStagingToProduction:
     """Tests for the STAGING -> PRODUCTION gate check."""
 
     def test_passes_with_sufficient_journal_entries(self):
-        """Gate passes when journal has >= 20 entries and no existing PRODUCTION."""
+        """Gate passes when journal has >= 20 entries and passing OOS evidence."""
         engine = _mock_engine()
         conn = engine._mock_conn
 
         # model lookup -> layer='REGIME'
         # journal count -> 25
         # existing production -> None
+        # OOS validation_results -> passing
         conn.execute.return_value.fetchone.side_effect = [
             _row("REGIME"),
             _row(25),
             None,
+            _passing_oos_row(),
         ]
 
         from validation.gates import GateChecker
@@ -206,6 +241,7 @@ class TestGateCheckerStagingToProduction:
             _row("REGIME"),
             _row(5),
             None,
+            _passing_oos_row(),
         ]
 
         from validation.gates import GateChecker
@@ -217,7 +253,7 @@ class TestGateCheckerStagingToProduction:
         assert any("5/20" in d for d in result["details"])
 
     def test_passes_with_exactly_20_journal_entries(self):
-        """Gate passes at the boundary of exactly 20 journal entries."""
+        """Gate passes at the boundary of exactly 20 journal entries with passing OOS."""
         engine = _mock_engine()
         conn = engine._mock_conn
 
@@ -225,6 +261,7 @@ class TestGateCheckerStagingToProduction:
             _row("TACTICAL"),
             _row(20),
             None,
+            _passing_oos_row(),
         ]
 
         from validation.gates import GateChecker
@@ -243,6 +280,7 @@ class TestGateCheckerStagingToProduction:
             _row("REGIME"),
             _row(30),
             _row(99, "old-model-v1"),  # existing production
+            _passing_oos_row(),
         ]
 
         from validation.gates import GateChecker

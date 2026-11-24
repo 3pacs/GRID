@@ -22,6 +22,10 @@ def make_engine(primary=None, secondary=None):
         result = MagicMock()
         if 'FROM options_daily_signals' in sql:
             result.fetchone.return_value = primary
+        elif 'FROM feature_registry' in sql:
+            # The stored-close read looks its feature ids up first
+            # (store.feature_ids); spy_close is registered as id 7.
+            result.fetchall.return_value = [(7, 'spy_close')]
         elif 'FROM resolved_series' in sql:
             result.fetchone.return_value = secondary
         elif 'SELECT strike FROM options_snapshots' in sql:
@@ -42,7 +46,7 @@ def chain():
 def test_max_oi_strike_is_never_a_spot_price():
     engine, _, queries = make_engine()
     assert engine._get_spot_price('SPY', DAY) == 0.0
-    assert len(queries) == 2
+    assert len(queries) == 3
     assert all('FROM options_snapshots' not in sql for sql, _ in queries)
 
 
@@ -51,7 +55,7 @@ def test_max_oi_strike_is_never_a_spot_price():
 def test_bad_primary_uses_valid_stored_close(invalid):
     engine, _, queries = make_engine((invalid,), (Decimal('749.25'),))
     assert engine._get_spot_price('SPY', DAY) == 749.25
-    assert len(queries) == 2
+    assert len(queries) == 3
 
 
 @pytest.mark.parametrize('invalid', [None, 0, -1, float('nan'), float('inf'),
@@ -59,7 +63,7 @@ def test_bad_primary_uses_valid_stored_close(invalid):
 def test_bad_secondary_is_unavailable(invalid):
     engine, _, queries = make_engine(None, (invalid,))
     assert engine._get_spot_price('SPY', DAY) == 0.0
-    assert len(queries) == 2
+    assert len(queries) == 3
 
 
 def test_valid_primary_preserved_with_bound_identity_and_date():
@@ -73,8 +77,9 @@ def test_valid_primary_preserved_with_bound_identity_and_date():
 def test_valid_secondary_preserved_with_bound_identity_and_date():
     engine, _, queries = make_engine(None, (749.25,))
     assert engine._get_spot_price('SPY', DAY) == 749.25
-    assert queries[1][1] == {'name1': 'spy_close', 'name2': 'spy', 'd': DAY}
-    assert 'rs.obs_date <= :d' in queries[1][0]
+    assert queries[1][1] == {'names': ['spy_close', 'spy']}
+    assert queries[2][1] == {'fids': [7], 'd': DAY}
+    assert 'rs.obs_date <= :d' in queries[2][0]
 
 
 @pytest.mark.parametrize('method, expected', [

@@ -13,6 +13,8 @@ NEW_FRED_IDS: tuple[str, ...] = (
     "IORB", "WRESBAL", "WLCFLPCL", "RPONTSYD", "CPN3M", "DTB3",
     "GACDISA066MSFRBNY", "GACDFSA066MSFRBPHI", "BACTSAMFRBDAL",
 )
+# Appended after NEW_FRED_IDS by later changes, in order (2026-11-22: policy path + foreign custody).
+LATER_FRED_IDS: tuple[str, ...] = ("DFEDTARU", "WMTSECL1")
 
 
 def _fred_series_list() -> list[str]:
@@ -36,4 +38,6 @@ def test_new_ids_are_appended_after_the_existing_defaults() -> None:
     # deadline-bounded bulk pull (FRED_JOB_BUDGET_S): if a run runs out of
     # time, the new ids are the ones skipped, not an existing feed.
     series_list = _fred_series_list()
-    assert series_list[-len(NEW_FRED_IDS):] == list(NEW_FRED_IDS)
+    assert series_list[-len(NEW_FRED_IDS) - len(LATER_FRED_IDS):] == list(NEW_FRED_IDS) + list(LATER_FRED_IDS)
+    for sid in LATER_FRED_IDS:
+        assert series_list.count(sid) == 1

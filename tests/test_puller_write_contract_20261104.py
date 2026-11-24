@@ -116,6 +116,32 @@ class Resp:
 # ── Polygon ─────────────────────────────────────────────────────────────
 
 
+def polygon_chain_page(url: str, params: Any = None, headers: Any = None, timeout: Any = None) -> Resp:
+    """A valid one-page Polygon options snapshot for the ticker the URL names."""
+    ticker = url.rsplit("/", 1)[1].split("?", 1)[0]
+    expiry = (date.today() + timedelta(days=7)).isoformat()
+    chain = [
+        {"details": {"ticker": f"O:{ticker}C1", "contract_type": "call", "expiration_date": expiry},
+         "underlying_asset": {"ticker": ticker}, "open_interest": 100, "day": {"volume": 10},
+         "implied_volatility": 0.2, "greeks": {"delta": 0.5, "gamma": 0.01}},
+        {"details": {"ticker": f"O:{ticker}P1", "contract_type": "put", "expiration_date": expiry},
+         "underlying_asset": {"ticker": ticker}, "open_interest": 50, "day": {"volume": 5},
+         "implied_volatility": 0.3, "greeks": {"delta": -0.4, "gamma": 0.02}},
+    ]
+    return Resp(200, {"status": "OK", "results": chain})
+
+
+@pytest.fixture
+def polygon_writes_on(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """POLYGON_OPTIONS_PULL_ENABLED on (default off) and a private 429 hold file."""
+    import ingestion.altdata.polygon_puller as mod
+
+    monkeypatch.setattr(mod, "options_writes_enabled", lambda: True)
+    monkeypatch.setattr(mod, "_held_until_epoch", 0.0)
+    monkeypatch.setenv("GRID_POLYGON_HOLD_FILE", str(tmp_path / "polygon-hold.json"))
+
+
+@pytest.mark.usefixtures("polygon_writes_on")
 class TestPolygon:
     def _puller(self, **kw: Any) -> Any:
         from ingestion.altdata.polygon_puller import PolygonPuller
@@ -146,20 +172,15 @@ class TestPolygon:
     def test_success_reports_committed_rows(self) -> None:
         import ingestion.altdata.polygon_puller as mod
 
-        chain = [
-            {"details": {"contract_type": "call"}, "open_interest": 100, "day": {"volume": 10},
-             "implied_volatility": 0.2, "greeks": {"delta": 0.5, "gamma": 0.01}},
-            {"details": {"contract_type": "put"}, "open_interest": 50, "day": {"volume": 5},
-             "implied_volatility": 0.3, "greeks": {"delta": -0.4, "gamma": 0.02}},
-        ]
         engine = FakeEngine()
         with patch.object(mod, "OPTIONS_TICKERS", ["SPY", "QQQ"]), \
-             patch.object(mod.requests, "get", return_value=Resp(200, {"results": chain})), \
+             patch.object(mod.requests, "get", side_effect=polygon_chain_page), \
              patch.object(mod.time, "sleep"):
             out = self._puller(engine=engine).pull()
         assert out["status"] == "SUCCESS"
-        assert out["rows_inserted"] == 12 == len(engine.conn.inserts())
-        assert _classify_outcome(out) == ("SUCCESS", 12, None)
+        # put_call_ratio, avg_iv, call_oi, put_oi per ticker (net gamma/delta withheld).
+        assert out["rows_inserted"] == 8 == len(engine.conn.inserts())
+        assert _classify_outcome(out) == ("SUCCESS", 8, None)
 
     def test_no_key_is_skipped(self) -> None:
         out = self._puller(api_key="").pull()

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { api } from '../api.js';
 import useStore from '../store.js';
@@ -333,15 +333,42 @@ export default function Dashboard({ onNavigate }) {
     const [watchlistItems, setWatchlistItems] = useState([]);
     const [intelData, setIntelData] = useState(null);
     const [flowsData, setFlowsData] = useState(null);
+    // The regime lives in the shared store, so a failed refresh keeps the last
+    // good read on screen. Record which regime object the failed read left in
+    // place and when; while that same object is shown, it is labelled last-known.
+    // A later good read, or a websocket push, replaces the object and clears it.
+    const regimeRef = useRef(currentRegime);
+    regimeRef.current = currentRegime;
+    const [regimeReadFailure, setRegimeReadFailure] = useState(null);
+    // Mount and reconnect can issue overlapping reads. Each read takes a
+    // generation and remembers the regime object on screen when it started.
+    // A result is applied only if it is still the newest read AND nothing newer
+    // (e.g. a websocket push) replaced the regime meanwhile. So an older success
+    // never overwrites or clears a newer failure, and an older failure never
+    // stale-marks newer data.
+    const regimeGenRef = useRef(0);
+    const startRegimeRead = useCallback(() => ({ gen: ++regimeGenRef.current, before: regimeRef.current }), []);
+    const applyRegimeRead = useCallback((token, regime) => {
+        if (token.gen !== regimeGenRef.current) return;
+        if (regimeRef.current !== token.before) return;
+        // api._fetch resolves failures to {error: true}; never store that as the regime.
+        if (regime && typeof regime === 'object' && !regime.error) {
+            setCurrentRegime(regime);
+            setRegimeReadFailure(null);
+        } else {
+            setRegimeReadFailure({ regime: token.before, at: new Date() });
+        }
+    }, []);
 
     const refreshLiveSnapshot = useCallback(async () => {
         try {
+            const regimeRead = startRegimeRead();
             const [regime, status, watchlistPriceResponse] = await Promise.all([
-                api.getCurrent().catch(() => null),
+                api.getCurrent({ force: true }).catch(() => null),
                 api.getStatus().catch(() => null),
                 api.getWatchlistPrices().catch(() => null),
             ]);
-            if (regime) setCurrentRegime(regime);
+            applyRegimeRead(regimeRead, regime);
             if (status) setSystemStatus(status);
             if (watchlistPriceResponse?.prices) setPulsePrices(watchlistPriceResponse.prices);
         } catch {
@@ -353,11 +380,12 @@ export default function Dashboard({ onNavigate }) {
         setLoading('dashboard', true);
         try {
             // Fast: regime + status load first (small payloads)
+            const regimeRead = startRegimeRead();
             const [regime, status] = await Promise.all([
-                api.getCurrent().catch(() => null),
+                api.getCurrent({ force: true }).catch(() => null),
                 api.getStatus().catch(() => null),
             ]);
-            if (regime) setCurrentRegime(regime);
+            applyRegimeRead(regimeRead, regime);
             if (status) setSystemStatus(status);
             setLoading('dashboard', false);
 
@@ -391,9 +419,15 @@ export default function Dashboard({ onNavigate }) {
     const dbOnline = systemStatus?.database?.connected;
     const allConnected = wsConnected && dbOnline;
     const regime = currentRegime;
-    const regimeState = regime?.state || 'NEUTRAL';
+    // No reading is not a NEUTRAL reading: say UNAVAILABLE, in the neutral colour.
+    const regimeState = (typeof regime?.state === 'string' && regime.state) || 'UNAVAILABLE';
     const regimeConf = regime?.confidence;
-    const rc = REGIME_COLORS[regimeState.toUpperCase()] || REGIME_COLORS.NEUTRAL;
+    // The newest read failed and the store still holds the read before it.
+    const regimeLastKnown = regimeState !== 'UNAVAILABLE' && regimeReadFailure != null
+        && regimeReadFailure.regime === currentRegime;
+    const rc = regimeLastKnown
+        ? REGIME_COLORS.NEUTRAL
+        : (REGIME_COLORS[regimeState.toUpperCase()] || REGIME_COLORS.NEUTRAL);
 
     const pulse = useMemo(() => PULSE_TICKERS.map(({ key, label }) => {
         const best = livePriceUpdates?.[key] || wsPrices?.[key] || pulsePrices[key];
@@ -433,8 +467,15 @@ export default function Dashboard({ onNavigate }) {
                     }}>
                         <span style={{ width: 5, height: 5, borderRadius: '50%',
                             background: rc.color, boxShadow: `0 0 5px ${rc.color}` }} />
-                        {regimeState}
-                        {regimeConf != null && <span style={{ opacity: 0.7, fontSize: '10px' }}>
+                        <span
+                            data-testid="regime-state"
+                            title={regimeLastKnown
+                                ? `Latest regime read failed at ${regimeReadFailure.at.toLocaleTimeString()}; showing the previous read${regime?.as_of ? ` (as of ${regime.as_of})` : ''}`
+                                : undefined}
+                        >
+                            {regimeState}{regimeLastKnown ? ' · LAST KNOWN' : ''}
+                        </span>
+                        {regimeConf != null && !regimeLastKnown && <span style={{ opacity: 0.7, fontSize: '10px' }}>
                             {(regimeConf * 100).toFixed(0)}%</span>}
                     </div>
                 </div>

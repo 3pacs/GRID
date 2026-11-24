@@ -102,34 +102,11 @@ def track_wealth_migration(
     cutoff = today - timedelta(days=days)
     flows: list = []
 
-    # ── 13F-derived flows (institutional) ─────────────────────────────
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT ss.source_id, ss.ticker, ss.signal_type,
-                       ss.signal_date, ss.signal_value, ss.trust_score
-                FROM signal_sources ss
-                WHERE ss.source_type = 'institutional'
-                  AND ss.signal_date >= :cutoff
-                  AND ss.signal_date <= :today
-                ORDER BY ss.signal_date DESC
-                LIMIT 500
-            """), {"cutoff": cutoff, "today": today}).fetchall()
-
-            for r in rows:
-                value_data = _parse_signal_value(r[4])
-                amount = _institutional_amount(value_data)
-                flows.append(WealthFlow(
-                    from_actor=str(r[0]),
-                    to_actor=str(r[1]),
-                    amount_estimate=amount,
-                    confidence="confirmed" if r[5] and float(r[5]) > 0.7 else "likely",
-                    evidence=["13f_filing"],
-                    timestamp=str(r[3]),
-                    implication=f"Institutional {r[2]} in {r[1]}",
-                ))
-    except Exception as exc:
-        log.debug("13F flow query failed: {e}", e=str(exc))
+    # ── 13F: no wealth flows ──────────────────────────────────────────
+    # 13F is non-directional (owner decision 2026-11-23): a filing change is
+    # an observed holdings change at reference prices, never a dollar flow
+    # from a manager to an issuer. signal_sources 'institutional' rows (legacy
+    # NET_POSITION_DELTA from the 13F puller) are not read.
 
     # ── Congressional disclosures ─────────────────────────────────────
     try:

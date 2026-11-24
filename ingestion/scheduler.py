@@ -1042,9 +1042,17 @@ def _get_pullers_for_group(
             pullers.append(("OppInsights", OppInsightsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("OppInsights puller init failed: {err}", err=str(exc))
+        # GDELT DOC puller: governed by the SmartScheduler registry hold
+        # (retired 2026-11-23: the DOC API refuses grid-svr), so lifting it
+        # there brings it back here too.
         try:
-            from ingestion.altdata.gdelt import GDELTPuller
-            pullers.append(("GDELT", GDELTPuller(db_engine), "pull_recent", {"days_back": 2}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _gdelt_hold = hold_reason_for("gdelt")
+            if _gdelt_hold:
+                log.info("GDELT held: {r}", r=_gdelt_hold)
+            else:
+                from ingestion.altdata.gdelt import GDELTPuller
+                pullers.append(("GDELT", GDELTPuller(db_engine), "pull_recent", {"days_back": 2}))
         except Exception as exc:
             log.warning("GDELT puller init failed: {err}", err=str(exc))
         try:
@@ -1251,10 +1259,15 @@ def _get_pullers_for_group(
         #    "pull"): no raw_series row ever under source 720 since 2026-05-27;
         #    runs FAILED auth_failed, then "SKIPPED: ... plan not entitled (HTTP 403)".
         #  - Polygon (ingestion.altdata.polygon_puller.PolygonPuller, "pull"):
-        #    no raw_series row ever under source 722; options snapshots are not
-        #    in the plan (HTTP 403, then "30 of 30 tickers failed"). Only this
-        #    registration is retired: gex and research read Polygon minute
-        #    history through their own code paths, and the module stays.
+        #    no raw_series row ever under source 722; options snapshots were
+        #    not in the plan (HTTP 403 to 2026-11-10). The "30 of 30 tickers
+        #    failed" runs after that were the puller's own invalid sort=volume
+        #    (HTTP 400), fixed 2026-11-23; the key now gets the snapshot.
+        #    Hermes's stale-source repair still calls the puller (interval 24 h),
+        #    but pull() writes nothing while POLYGON_OPTIONS_PULL_ENABLED is
+        #    off (the default; rollout is a separate decision, GRID#1401).
+        #    Only this registration is retired: gex and research read Polygon
+        #    minute history through their own code paths, and the module stays.
         # NASA FIRMS — active fire/thermal anomaly detection (daily)
         try:
             from ingestion.altdata.nasa_firms_puller import NASAFirmsPuller

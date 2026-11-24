@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from loguru import logger as log
 
-from api.auth import require_auth
+from api.auth import require_auth, require_role, viewer_is_admin
 from api.dependencies import get_db_engine
 from oracle.engine import EnsemblePredictor, OracleEngine
 from oracle.entry_price_policy import (
@@ -23,6 +23,7 @@ from oracle.entry_price_policy import (
 )
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS, include_schwab_rows, visible_sql
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])
@@ -75,8 +76,13 @@ def get_predictions(
     offset: int = Query(0, ge=0),
     cohort: str = Query("all", description="prospective / legacy / external / all"),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict:
-    """Active predictions with confidence, direction, signal/anti-signal."""
+    """Active predictions with confidence, direction, signal/anti-signal.
+
+    Predictions the Oracle built from Schwab captures reach admin requests only
+    (``store.options_provenance.VISIBLE_ORACLE_PREDICTIONS``).
+    """
     engine = get_db_engine()
     request_at = datetime.now(timezone.utc)
     today = request_at.date()
@@ -118,21 +124,23 @@ def get_predictions(
 
     with engine.connect() as conn:
         count_row = conn.execute(
-            text("SELECT COUNT(*) FROM oracle_predictions WHERE " + where_sql),
+            visible_sql("SELECT COUNT(*) FROM " + VISIBLE_ORACLE_PREDICTIONS
+                        + " oracle_predictions WHERE " + where_sql, include_schwab),
             params,
         ).fetchone()
         total = count_row[0] if count_row else 0
 
         rows = conn.execute(
-            text(
+            visible_sql(
                 "SELECT id, created_at, ticker, prediction_type, direction, "
                 "target_price, entry_price, expiry, confidence, "
                 "expected_move_pct, signal_strength, coherence, "
                 "model_name, model_version, signals, anti_signals, "
                 "flow_context, verdict, actual_price, actual_move_pct, "
                 "pnl_pct, scored_at, score_notes, null_write_policy, recording_policy "
-                "FROM oracle_predictions WHERE " + where_sql + " "
-                "ORDER BY created_at DESC LIMIT :lim OFFSET :off"
+                "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions WHERE " + where_sql + " "
+                "ORDER BY created_at DESC LIMIT :lim OFFSET :off",
+                include_schwab,
             ),
             params,
         ).fetchall()
@@ -170,7 +178,9 @@ def get_predictions(
                 try:
                     with engine.connect() as conn2:
                         if r[2] not in quote_cache:
-                            quote_cache[r[2]] = load_quote_reference(conn2, r[2], as_of=request_at)
+                            quote_cache[r[2]] = load_quote_reference(
+                                conn2, r[2], as_of=request_at, include_schwab=include_schwab,
+                            )
                         tracking_quote = quote_cache[r[2]]
                         tracking_pnl, tracking_pnl_basis = tracking_reference_return(
                             conn2, ticker=r[2], direction=r[4], entry_price=entry_raw,
@@ -234,10 +244,15 @@ def get_predictions(
 @router.get("/scoreboard")
 def get_scoreboard(
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict:
-    """Model tournament: overall accuracy, by-model, by-ticker, calibration."""
+    """Model tournament: overall accuracy, by-model, by-ticker, calibration.
+
+    Counts are the public cohort's for every viewer; model weights and Sharpe
+    reach admin requests only (``oracle.scoreboard.MODEL_STATE_ADMIN_ONLY``).
+    """
     engine = get_db_engine()
-    return build_oracle_scoreboard(engine)
+    return build_oracle_scoreboard(engine, include_schwab=include_schwab)
 
 
 # ── GET /evidence ──────────────────────────────────────────────────────────
@@ -255,15 +270,20 @@ def get_evidence(
     the route builds it here (a few seconds) and caches it for 6 h.
     """
     from api.precompute_serving import read_precomputed
-    from oracle.evidence import EVIDENCE_CLASS, build_evidence, load_outcomes
+    from oracle.evidence import EVIDENCE_CLASS, EVIDENCE_COHORT, build_evidence, load_outcomes
+
+    def current(payload: Any) -> bool:
+        return (isinstance(payload, dict) and payload.get("evidence_class") == EVIDENCE_CLASS
+                and payload.get("cohort") == EVIDENCE_COHORT)
 
     stored, meta = read_precomputed("oracle.evidence")
     # A pre-deployment snapshot can outlive its producing worker. Its old
-    # financial-edge verdicts must pass through the current builder first.
-    if stored is not None and stored.get("evidence_class") == EVIDENCE_CLASS:
+    # financial-edge verdicts, or a cohort that still held Schwab-built
+    # predictions, must pass through the current builder first.
+    if current(stored):
         return {**stored, "precompute": meta}
     cached = _evidence_cache.get("evidence")
-    if cached is not None:
+    if current(cached):
         return cached
     built = build_evidence(load_outcomes(get_db_engine()))
     _evidence_cache.set("evidence", built)
@@ -275,17 +295,21 @@ def get_evidence(
 @router.get("/latest")
 def get_latest(
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict:
-    """Most recent prediction cycle results — headline predictions."""
+    """Most recent prediction cycle results — headline predictions.
+
+    Schwab-built predictions reach admin requests only (VISIBLE_ORACLE_PREDICTIONS).
+    """
     engine = get_db_engine()
 
     with engine.connect() as conn:
         # Get the most recent cycle timestamp
-        latest_ts = conn.execute(text("""
-            SELECT created_at FROM oracle_predictions
+        latest_ts = conn.execute(visible_sql("""
+            SELECT created_at FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE dedup_keep = TRUE
             ORDER BY created_at DESC LIMIT 1
-        """)).fetchone()
+        """, include_schwab)).fetchone()
 
         if not latest_ts:
             return {"cycle_time": None, "predictions": [], "streak": None, "recent_scored": []}
@@ -293,12 +317,12 @@ def get_latest(
         cycle_time = latest_ts[0]
 
         # Headline predictions from latest cycle (same created_at within 5 min window)
-        rows = conn.execute(text("""
+        rows = conn.execute(visible_sql("""
             SELECT id, ticker, direction, target_price, entry_price,
                    expiry, confidence, expected_move_pct, model_name,
                    signal_strength, coherence, signals, anti_signals,
                    flow_context, created_at
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE created_at >= :ct - INTERVAL '5 minutes'
               AND dedup_keep = TRUE
             -- A prediction with no stated confidence is unknown, not the
@@ -307,7 +331,7 @@ def get_latest(
             -- headline list.
             ORDER BY confidence DESC NULLS LAST
             LIMIT 20
-        """), {"ct": cycle_time}).fetchall()
+        """, include_schwab), {"ct": cycle_time}).fetchall()
 
         predictions = []
         for r in rows:
@@ -325,16 +349,16 @@ def get_latest(
             })
 
         # Recent scored predictions for track record
-        scored_rows = conn.execute(text("""
+        scored_rows = conn.execute(visible_sql("""
             SELECT id, ticker, direction, entry_price, actual_price,
                    confidence, verdict, pnl_pct, scored_at, score_notes,
                    model_name, expiry
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict IN ('hit', 'miss', 'partial')
               AND dedup_keep = TRUE
             ORDER BY scored_at DESC
             LIMIT 20
-        """)).fetchall()
+        """, include_schwab)).fetchall()
 
         recent_scored = []
         for s in scored_rows:
@@ -349,7 +373,7 @@ def get_latest(
             })
 
         # Compute streak
-        streak = _compute_streak(engine)
+        streak = _compute_streak(engine, include_schwab)
 
     return {
         "cycle_time": cycle_time.isoformat() if cycle_time else None,
@@ -377,16 +401,16 @@ def predict_live(
     return payload
 
 
-def _compute_streak(engine) -> dict:
-    """Compute current win/loss streak."""
+def _compute_streak(engine, include_schwab: Any = False) -> dict:
+    """Compute current win/loss streak over the predictions this viewer may see."""
     with engine.connect() as conn:
-        rows = conn.execute(text("""
-            SELECT verdict FROM oracle_predictions
+        rows = conn.execute(visible_sql("""
+            SELECT verdict FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict IN ('hit', 'miss', 'partial')
               AND dedup_keep = TRUE
             ORDER BY scored_at DESC
             LIMIT 50
-        """)).fetchall()
+        """, include_schwab)).fetchall()
 
     if not rows:
         return {"type": "none", "count": 0, "label": "No scored predictions"}
@@ -431,9 +455,14 @@ def publish_prediction(
 
 @router.post("/evolve")
 def trigger_evolve(
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_role("admin")),
 ) -> dict[str, Any]:
-    """Manually trigger weight evolution based on scored predictions."""
+    """Manually trigger scoring and weight evolution. Admin only.
+
+    A maintenance write, and its response (per-model weight changes and hit
+    rates, scoring summaries) is built from every scored row, the Oracle's
+    private-use verdicts included (Codex review 6030272662).
+    """
     engine = get_db_engine()
     try:
         oracle = OracleEngine(db_engine=engine)
@@ -453,42 +482,62 @@ def trigger_evolve(
 @router.get("/scorecard")
 def get_scorecard(
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
-    """Per-model performance stats: hits, misses, hit_rate, cumulative_pnl."""
+    """Per-model performance stats: hits, misses, hit_rate, cumulative_pnl.
+
+    An admin request reads the running counters in ``oracle_models``, which the
+    scorer and weight evolution update from every scored row, the Oracle's
+    Schwab-built (private-use) predictions included. Every other viewer gets
+    the same fields built from the public cohort (``oracle.scoreboard``), with
+    the model state (weight, Sharpe, last update) withheld, so a private
+    verdict never moves what a contributor sees (Codex review 6029863205).
+    """
+    from oracle.scoreboard import _fetch_model_rows
+
     engine = get_db_engine()
+    admin = include_schwab_rows(include_schwab)
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT name, weight, predictions_made, hits, misses, partials, "
-                "cumulative_pnl, sharpe, last_updated "
-                "FROM oracle_models ORDER BY cumulative_pnl DESC"
-            )).fetchall()
+        records: list[tuple[Any, ...]] = []
+        if admin:
+            with engine.connect() as conn:
+                records = [tuple(r) for r in conn.execute(text(
+                    "SELECT name, weight, predictions_made, hits, misses, partials, "
+                    "cumulative_pnl, sharpe, last_updated "
+                    "FROM oracle_models ORDER BY cumulative_pnl DESC"
+                )).fetchall()]
+        else:
+            public = sorted(_fetch_model_rows(engine), key=lambda m: (-m["cumulative_pnl"], m["name"]))
+            records = [(m["name"], None, m["predictions_made"], m["hits"], m["misses"], m["partials"],
+                        m["cumulative_pnl"], None, None) for m in public]
 
         models = []
         totals = {"predictions": 0, "hits": 0, "misses": 0, "partials": 0, "pnl": 0.0}
 
-        for r in rows:
+        for r in records:
             name, weight, total, hits, misses, partials, pnl, sharpe, updated = r
+            hits, misses, partials = hits or 0, misses or 0, partials or 0
             scored = hits + misses + partials
             hit_rate = (hits + partials * 0.5) / scored if scored > 0 else 0.0
 
             models.append({
                 "model": name,
-                "weight": round(float(weight), 4) if weight else 1.0,
+                "weight": (round(float(weight), 4) if weight else 1.0) if admin else None,
                 "predictions_made": total or 0,
-                "hits": hits or 0,
-                "misses": misses or 0,
-                "partials": partials or 0,
+                "hits": hits,
+                "misses": misses,
+                "partials": partials,
                 "hit_rate": round(hit_rate, 4),
                 "cumulative_pnl": round(float(pnl), 2) if pnl else 0.0,
-                "sharpe": round(float(sharpe), 3) if sharpe else 0.0,
-                "last_updated": updated.isoformat() if updated else None,
+                "sharpe": (round(float(sharpe), 3) if sharpe else 0.0) if admin else None,
+                "last_updated": (updated.isoformat() if hasattr(updated, "isoformat") else updated)
+                if admin else None,
             })
 
             totals["predictions"] += total or 0
-            totals["hits"] += hits or 0
-            totals["misses"] += misses or 0
-            totals["partials"] += partials or 0
+            totals["hits"] += hits
+            totals["misses"] += misses
+            totals["partials"] += partials
             totals["pnl"] += float(pnl) if pnl else 0.0
 
         scored_total = totals["hits"] + totals["misses"] + totals["partials"]
@@ -497,7 +546,9 @@ def get_scorecard(
         ) if scored_total > 0 else 0.0
         totals["pnl"] = round(totals["pnl"], 2)
 
-        return {"models": models, "totals": totals}
+        basis = ("oracle_models running counters (every scored row)" if admin
+                 else "oracle_predictions dedup_keep, public cohort")
+        return {"models": models, "totals": totals, "basis": basis}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Scorecard query failed: {exc}") from exc
 

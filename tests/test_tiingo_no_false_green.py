@@ -50,6 +50,9 @@ class _Puller(TiingoPuller):
     def pull_ticker(self, ticker, start_date="2020-01-01", end_date=None, limiter=None):
         return {"ticker": ticker, "rows_inserted": 0, "errors": [], **self.fetch[ticker]}
 
+    def _listing(self, ticker, limiter=None):
+        return None, None    # listing not read; it is evidence only (tests/test_tiingo_lapsed_listing.py)
+
 
 _OK = {"status": "SUCCESS", "latest_obs": _SESSION, "rows_inserted": 6}
 _EMPTY = {"status": "PARTIAL", "errors": ["No data returned"]}

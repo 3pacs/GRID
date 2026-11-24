@@ -116,17 +116,40 @@ class MockResult:
 
     def fetchall(self):
         if "trade_postmortems" in self._query and "select" in self._query:
+            # Last column: op.model_name (old LEFT JOIN shape) or tp.prediction_id.
+            joined = "op.model_name" in self._query
+            by_id = {p.get("id"): p for p in self._engine._predictions if p.get("id")}
+
+            def _tail(pm):
+                if not joined:
+                    return pm.get("prediction_id")
+                if pm.get("model_name") is not None:
+                    return pm["model_name"]
+                return by_id.get(pm.get("prediction_id"), {}).get("model_name")
+
             return [
                 (pm["ticker"], pm["outcome"], pm["failure_category"],
                  pm["root_cause"], json.dumps(pm["signals_wrong"]),
                  json.dumps(pm["signals_right"]), pm["what_we_missed"],
                  pm["recommended_fix"], pm["confidence"], pm["generated_at"],
-                 pm.get("model_name"))
+                 _tail(pm))
                 for pm in self._engine._postmortems
             ]
         if "oracle_predictions" in self._query and "having" in self._query:
             # Top performer query (_get_top_performer) — must be before scoring match
             return [("flow_momentum", 0.65)]
+        if "select id, verdict, model_name, signals" in self._query and "oracle_predictions" in self._query:
+            return [
+                (p.get("id") or f"op-{i}", p["verdict"], p.get("model_name"), p.get("signals"))
+                for i, p in enumerate(self._engine._predictions)
+                if p.get("verdict") in ("hit", "miss", "partial")
+            ]
+        if "select verdict, signals" in self._query and "oracle_predictions" in self._query:
+            return [
+                (p["verdict"], p.get("signals"))
+                for p in self._engine._predictions
+                if p.get("verdict") in ("hit", "miss", "partial")
+            ]
         if "oracle_predictions" in self._query and "group by model_name" in self._query:
             # Scoring data aggregation
             model_stats = {}
@@ -160,6 +183,22 @@ class MockResult:
             return []
         if "oracle_models" in self._query and "count" in self._query:
             return [(self._engine._active_count,)]
+        if "oracle_models" in self._query and "active" in self._query and "signal_families" in self._query and "where active" in self._query:
+            include_shadow = "description like :shadow_prefix" in self._query
+            shadow_prefix = (
+                str(self._params.get("shadow_prefix", "")).rstrip("%")
+                if include_shadow
+                else None
+            )
+            return [
+                (json.dumps(m["signal_families"]) if isinstance(m["signal_families"], list) else m["signal_families"],)
+                for m in self._engine._models.values()
+                if m.get("active", True)
+                or (
+                    shadow_prefix is not None
+                    and str(m.get("description") or "").startswith(shadow_prefix)
+                )
+            ]
         if "oracle_models" in self._query and "active" in self._query and "signal_sources" in self._query and "select" in self._query:
             return [
                 (json.dumps(m["signal_sources"]) if isinstance(m["signal_sources"], list) else m["signal_sources"],)
@@ -168,10 +207,14 @@ class MockResult:
         if "oracle_models" in self._query and "name = :n" in self._query:
             name = self._params.get("n")
             m = self._engine._models.get(name)
-            if m:
-                return [(m["name"], m["signal_sources"], m["signal_families"],
-                         m["description"], m["parent_model"], m.get("target_horizon_days", 7))]
-            return []
+            if not m:
+                return []
+            if "select active, signal_families" in self._query:
+                return [(m.get("active", True), m["signal_families"])]
+            if "select signal_families" in self._query:
+                return [(m["signal_families"],)]
+            return [(m["name"], m["signal_sources"], m["signal_families"],
+                     m["description"], m["parent_model"], m.get("target_horizon_days", 7))]
         if "signal_registry" in self._query:
             return [("feature:equity",), ("feature:flows",), ("feature:sentiment",),
                     ("feature:vol",), ("feature:rates",), ("feature:credit",),
@@ -251,20 +294,31 @@ class TestTraceAnalyzer:
         assert patterns == []
 
     def test_identifies_failure_category_clustering(self):
-        """Should find patterns when same failure category repeats."""
+        """Should find rate-based patterns when winning+losing denominators exist."""
+        # Each postmortem belongs to one of the 6 scored misses (same ids on
+        # both sides of the rate; Codex review 6011905413).
         self.engine._postmortems = [
             {"ticker": f"T{i}", "outcome": "miss", "failure_category": "wrong_signal",
              "root_cause": "test", "signals_wrong": ["feature:sentiment"],
              "signals_right": ["feature:equity"], "what_we_missed": "",
              "recommended_fix": "fix", "confidence": 0.7, "generated_at": "2026-04-01",
-             "model_name": "flow_momentum"}
+             "prediction_id": f"miss-{i}"}
             for i in range(6)
         ]
+        # 4 winning + 6 losing predictions: feature:sentiment failed 6/8 (75% > 40%)
+        self.engine._predictions = (
+            [{"model_name": "flow_momentum", "verdict": "hit",
+              "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for _ in range(2)]
+            + [{"model_name": "flow_momentum", "verdict": "hit",
+                "signals": [{"name": "feature:equity"}]} for _ in range(2)]
+            + [{"id": f"miss-{i}", "model_name": "flow_momentum", "verdict": "miss",
+                "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for i in range(6)]
+        )
         patterns = self.analyzer.analyze()
-        assert len(patterns) >= 1
-        assert patterns[0].category == "wrong_signal"
-        assert patterns[0].frequency == 6
-        assert "feature:sentiment" in patterns[0].signals_commonly_wrong
+        wrong = [p for p in patterns if p.category == "wrong_signal"]
+        assert len(wrong) == 1
+        assert wrong[0].frequency == 6
+        assert "feature:sentiment" in wrong[0].signals_commonly_wrong
 
     def test_identifies_chronic_bad_signal(self):
         """Should flag signals with high error rate from trust_scorer."""
@@ -352,34 +406,42 @@ class TestTargetedMutator:
         proposals = self.mutator.propose(patterns, max_proposals=2)
         assert len(proposals) <= 2
 
-    def test_apply_remove_signal(self):
+    def test_apply_remove_signal_refused_as_functional_clone(self):
         proposal = _make_proposal(
             parent="flow_momentum",
             mutation_type="remove_signal",
             params={"signals_to_remove": ["feature:sentiment"]},
         )
         name = self.mutator.apply(proposal)
-        assert name is not None
-        assert name.startswith("trace_remove_s")
+        assert name is None
 
-    def test_apply_add_signal(self):
+    def test_apply_add_signal_refused_as_functional_clone(self):
         proposal = _make_proposal(
             parent="flow_momentum",
             mutation_type="add_signal",
             params={"signals_to_add": ["feature:event_risk"]},
         )
         name = self.mutator.apply(proposal)
-        assert name is not None
-        assert name.startswith("trace_add_sign")
+        assert name is None
 
-    def test_apply_adjust_horizon(self):
+    def test_apply_adjust_horizon_refused_as_functional_clone(self):
         proposal = _make_proposal(
             parent="flow_momentum",
             mutation_type="adjust_horizon",
             params={"horizon_multiplier": 1.5},
         )
         name = self.mutator.apply(proposal)
+        assert name is None
+
+    def test_apply_crossover_targeted_with_distinct_families(self):
+        proposal = _make_proposal(
+            parent="flow_momentum",
+            mutation_type="crossover_targeted",
+            params={"donor_model": "regime_contrarian", "take_ratio": 0.5},
+        )
+        name = self.mutator.apply(proposal)
         assert name is not None
+        assert name.startswith("trace_crossove")
 
     def test_apply_returns_none_for_missing_parent(self):
         proposal = _make_proposal(parent="nonexistent_model")
@@ -404,11 +466,11 @@ class TestEvolutionGate:
         self.engine = MockEngine()
         self.gate = EvolutionGate(self.engine)
 
-    def test_passes_valid_remove(self):
+    def test_passes_valid_crossover(self):
         proposal = _make_proposal(
             parent="flow_momentum",
-            mutation_type="remove_signal",
-            params={"signals_to_remove": ["feature:sentiment"]},
+            mutation_type="crossover_targeted",
+            params={"donor_model": "regime_contrarian", "take_ratio": 0.5},
         )
         parent_sources = ["feature:equity", "feature:flows", "feature:sentiment", "feature:vol"]
         passed, reason = self.gate.check(proposal, parent_sources)
@@ -434,7 +496,11 @@ class TestEvolutionGate:
 
     def test_rejects_at_population_cap(self):
         self.engine._active_count = 50
-        proposal = _make_proposal(parent="flow_momentum")
+        proposal = _make_proposal(
+            parent="flow_momentum",
+            mutation_type="crossover_targeted",
+            params={"donor_model": "regime_contrarian", "take_ratio": 0.5},
+        )
         parent_sources = ["feature:equity", "feature:flows", "feature:sentiment", "feature:vol"]
         passed, reason = self.gate.check(proposal, parent_sources)
         assert not passed
@@ -459,9 +525,17 @@ class TestTraceEvolver:
              "root_cause": "sentiment was wrong", "signals_wrong": ["feature:sentiment"],
              "signals_right": ["feature:equity"], "what_we_missed": "",
              "recommended_fix": "remove sentiment", "confidence": 0.8,
-             "generated_at": "2026-04-01", "model_name": "flow_momentum"}
+             "generated_at": "2026-04-01", "prediction_id": f"miss-{i}"}
             for i in range(6)
         ]
+        self.engine._predictions = (
+            [{"model_name": "flow_momentum", "verdict": "hit",
+              "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for _ in range(2)]
+            + [{"model_name": "flow_momentum", "verdict": "hit",
+                "signals": [{"name": "feature:equity"}]} for _ in range(2)]
+            + [{"id": f"miss-{i}", "model_name": "flow_momentum", "verdict": "miss",
+                "signals": [{"name": "feature:equity"}, {"name": "feature:sentiment"}]} for i in range(6)]
+        )
         result = self.evolver.evolve_cycle()
         assert len(result["patterns_found"]) >= 1
         assert len(result["mutations_proposed"]) >= 1

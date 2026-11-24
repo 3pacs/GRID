@@ -1024,6 +1024,8 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 
     # ── CBOE vol self-mappings (puller writes feature name as series_id) ──
     "put_call_ratio": "put_call_ratio",
+    # Same daily options page (migration cboe_equity_pcr_20261123).
+    "equity_put_call_ratio": "equity_put_call_ratio",
     "correlation_index": "correlation_index",
 
     # ── Pump.fun mappings (puller writes PUMP:{signal} as series_id) ──────
@@ -1129,6 +1131,84 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     **{f"REDDIT:{sub}:subscribers": f"reddit_{sub}_subs" for sub in [
         "wallstreetbets", "bitcoin", "cryptocurrency", "stocks", "economics",
     ]},
+    # ── 2026-11-21 intel data path (PR A): NEEDS_REGISTRY, all of them ──
+    # Every target below is a NEW feature name with no feature_registry row
+    # in schema.sql or any migration, and no other static feed
+    # (tests/test_entity_map_intel_mappings.py pins both). get_feature_id only
+    # resolves registered names, so these rows are dropped at resolution (one
+    # warning per process, named in the resolver's per-run summary) until a
+    # registration migration lands; nothing here reaches resolved_series, a
+    # model or a gate. Keys are the ids the named writers produce today.
+    # Deliberately NOT mapped here: NFCI (oracle/prediction_context.py's
+    # fetch_fci_regime reads a feature named chicago_fed_nfci by name, without
+    # a model_eligible check, so registering it would change the oracle's FCI
+    # label), and the series of writers that are not in this change (EIA v2
+    # weekly/electricity, Treasury tenor buckets, S&P 500 breadth, buyback
+    # blackout).
+    # ingestion/altdata/credit_index_proxies.py (ICE BofA tier OAS)
+    "credit_proxy:cat_42_cdx_itraxx:us_hy_ccc_oas": "us_hy_ccc_oas",
+    "credit_proxy:cat_42_cdx_itraxx:us_hy_bb_oas": "us_hy_bb_oas",
+    "credit_proxy:cat_42_cdx_itraxx:us_hy_b_oas": "us_hy_b_oas",
+    "credit_proxy:cat_42_cdx_itraxx:us_bbb_oas": "us_bbb_oas",
+    "credit_proxy:cat_13_euro_at1:euro_hy_oas": "euro_hy_oas",
+    "credit_proxy:cat_7_china_hy:em_hy_oas": "em_hy_oas",
+    # ingestion/physical/ofr.py FSI_COLUMNS (sub-indices; ofr_fsi is mapped above)
+    "ofr_fsi_credit": "ofr_fsi_credit",
+    "ofr_fsi_equity_valuation": "ofr_fsi_equity_valuation",
+    "ofr_fsi_funding": "ofr_fsi_funding",
+    "ofr_fsi_safe_assets": "ofr_fsi_safe_assets",
+    "ofr_fsi_volatility": "ofr_fsi_volatility",
+    # FRED ids: CFNAI is in ingestion/fred.py FRED_SERIES_LIST today; the other
+    # nine are not pulled until the separate FRED-pull change lands, so for now
+    # nothing writes them.
+    "CFNAI": "chicago_fed_cfnai",
+    "IORB": "fed_iorb_rate",
+    "WRESBAL": "fed_reserve_balances_weekly",
+    "WLCFLPCL": "fed_discount_window_primary",
+    "RPONTSYD": "fed_standing_repo_ops",
+    "CPN3M": "commercial_paper_3m_nonfin",
+    "DTB3": "treasury_bill_3m",
+    "GACDISA066MSFRBNY": "empire_mfg_index",
+    "GACDFSA066MSFRBPHI": "philly_fed_mfg_index",
+    "BACTSAMFRBDAL": "dallas_fed_mfg_index",
+    # ingestion/nowcast_puller.py, altdata/refinery_cracks.py,
+    # altdata/container_freight.py, altdata/indeed_hiring_puller.py,
+    # altdata/pboc_omo_official.py, altdata/eia_puller.py (spot prices)
+    "nowcast.gdpnow": "atlanta_fed_gdpnow",
+    "refinery_cracks:crack_321": "refinery_crack_321",
+    "refinery_cracks:diesel_spot_gulf": "gulf_diesel_spot",
+    "refinery_cracks:gasoline_spot_gulf": "gulf_gasoline_spot",
+    "freight:scfi_composite": "scfi_container_freight",
+    "indeed:us:sector:software_development": "indeed_hiring_software_dev",
+    "indeed:us:sector:retail": "indeed_hiring_retail",
+    "pboc_omo_ann:reverse_repo_on_amount_cny_bn": "pboc_omo_on_inject_cny_bn",
+    "eia.wti_spot": "eia_wti_spot_v2",
+    "eia.brent_spot": "eia_brent_spot_v2",
+    # ingestion/altdata/cftc_cot.py (legacy COT, keyed by market code)
+    "cftc.13874A.net_speculative": "cftc_es_net_spec",
+    "cftc.209742.net_speculative": "cftc_nq_net_spec",
+    "cftc.1170E1.net_speculative": "cftc_vx_net_spec",
+    "cftc.042601.net_speculative": "cftc_ust_2y_net_spec",
+    "cftc.044601.net_speculative": "cftc_ust_5y_net_spec",
+    "cftc.043602.net_speculative": "cftc_ust_10y_net_spec",
+    "cftc.020601.net_speculative": "cftc_ust_30y_net_spec",
+    "cftc.088691.net_speculative": "cftc_gold_net_spec",
+    "cftc.084691.net_speculative": "cftc_silver_net_spec",
+    "cftc.085692.net_speculative": "cftc_copper_net_spec",
+    "cftc.067651.net_speculative": "cftc_wti_net_spec",
+    "cftc.023651.net_speculative": "cftc_natgas_net_spec",
+    # ingestion/altdata/cftc_tff.py (not scheduled in this change)
+    "cftc_tff.042601.lev_money_net": "cftc_tff_ust_2y_lev_net",
+    "cftc_tff.044601.lev_money_net": "cftc_tff_ust_5y_lev_net",
+    "cftc_tff.043602.lev_money_net": "cftc_tff_ust_10y_lev_net",
+    "cftc_tff.020601.lev_money_net": "cftc_tff_ust_30y_lev_net",
+    "cftc_tff.13874A.lev_money_net": "cftc_tff_es_lev_net",
+    "cftc_tff.209742.lev_money_net": "cftc_tff_nq_lev_net",
+    "cftc_tff.1170E1.lev_money_net": "cftc_tff_vx_lev_net",
+    # ingestion/options_rates_vol.py (not scheduled in this change)
+    "options_rates_vol:tlt_iv_30d": "rates_vol_tlt_iv_30d",
+    "options_rates_vol:ief_iv_30d": "rates_vol_ief_iv_30d",
+    "options_rates_vol:tlt_iv_term_slope": "rates_vol_tlt_term_slope",
 }
 
 

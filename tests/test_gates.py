@@ -10,7 +10,10 @@ from __future__ import annotations
 from datetime import timedelta
 from unittest.mock import MagicMock
 
+import pytest
+
 from governance.hypothesis_labels import LEGACY_CUTOFF
+from validation import gates
 from validation.gates import GateChecker
 
 # Hypothesis rows are (state, created_at, label): a validated PASSED row is
@@ -44,6 +47,40 @@ def _make_result(row):
 def _make_count_result(n):
     """Return a mock result whose fetchone()[0] is n."""
     return _make_result(_make_row(n))
+
+
+def _ok_drift_checker(_model_id: int) -> dict:
+    """Stub drift check returning evaluated non-critical drift."""
+    return {
+        "overall_drift_score": 0.05,
+        "recommended_action": "OK",
+        "data_distribution_drift": {"1": {"drifted": False}},
+    }
+
+
+def _passing_oos_result():
+    """validation_results row with a typed OOS record (n=40, hit_rate=0.75 -> Wilson lo > 0.5).
+
+    It passes only while a reader for its version is registered (the
+    ``stand_in_oos_reader`` fixture): no typed OOS reader ships.
+    """
+    record = {
+        "schema": gates.OOS_EVIDENCE_SCHEMA,
+        "version": 1,
+        "n_scored": 40,
+        "hit_rate": 0.75,
+    }
+    return _make_result(
+        _make_row("PASS", {}, {}, {gates.OOS_EVIDENCE_KEY: record})
+    )
+
+
+@pytest.fixture
+def stand_in_oos_reader(monkeypatch):
+    """Register a stand-in v1 typed OOS reader that returns the record as proven."""
+    monkeypatch.setitem(
+        gates._OOS_EVIDENCE_READERS, 1, lambda record, _model_id: dict(record)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +287,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(1)
 
         assert result["passed"] is True
@@ -275,7 +312,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is False
@@ -301,7 +338,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is True
@@ -320,7 +357,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(3)
 
         assert result["passed"] is True
@@ -343,7 +380,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is False
@@ -367,7 +404,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is False
@@ -390,7 +427,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_artifact, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(5)
 
         assert result["passed"] is True
@@ -400,7 +437,7 @@ class TestShadowToStaging:
         conn = _get_mock_conn(mock_engine)
         conn.execute.side_effect = [_make_result(None)]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(999)
 
         assert result["passed"] is False
@@ -417,7 +454,7 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(1)
 
         assert any("operator" in d.lower() for d in result["details"])
@@ -434,10 +471,10 @@ class TestShadowToStaging:
 
         conn.execute.side_effect = [result_model, result_val, result_count]
 
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
         result = gc.check_shadow_to_staging(1)
 
-        # Should pass (rule_based soft gates)
+        # Should pass (rule_based soft gates + OK drift check)
         assert result["passed"] is True
 
 
@@ -446,6 +483,7 @@ class TestShadowToStaging:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("stand_in_oos_reader")
 class TestStagingToProduction:
 
     def test_staging_to_production_passes(self, mock_engine):
@@ -467,7 +505,9 @@ class TestStagingToProduction:
         result_no_prod = MagicMock()
         result_no_prod.fetchone.return_value = None
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -491,7 +531,9 @@ class TestStagingToProduction:
         result_no_prod = MagicMock()
         result_no_prod.fetchone.return_value = None
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -518,7 +560,9 @@ class TestStagingToProduction:
         result_existing = MagicMock()
         result_existing.fetchone.return_value = existing_row
 
-        conn.execute.side_effect = [result_model, result_count, result_existing]
+        conn.execute.side_effect = [
+            result_model, result_count, result_existing, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -536,7 +580,9 @@ class TestStagingToProduction:
         result_count = _make_count_result(20)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -552,7 +598,9 @@ class TestStagingToProduction:
         result_count = _make_count_result(0)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_staging_to_production(10)
@@ -580,7 +628,9 @@ class TestStagingToProduction:
         result_count = _make_count_result(25)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         gc.check_staging_to_production(10)
@@ -608,7 +658,7 @@ class TestStagingToProduction:
 class TestCheckAllGates:
 
     def test_check_all_gates_dispatches_correctly(self, mock_engine):
-        gc = GateChecker(db_engine=mock_engine)
+        gc = GateChecker(db_engine=mock_engine, drift_checker=_ok_drift_checker)
 
         # SHADOW dispatches to check_candidate_to_shadow
         # Set up conn to return model not found so we get a quick result
@@ -647,6 +697,7 @@ class TestCheckAllGates:
         assert result["passed"] is True
         assert any("No gates defined" in d for d in result["details"])
 
+    @pytest.mark.usefixtures("stand_in_oos_reader")
     def test_check_all_gates_production_dispatches_correctly(self, mock_engine):
         """check_all_gates(PRODUCTION) must delegate to check_staging_to_production."""
         conn = _get_mock_conn(mock_engine)
@@ -656,7 +707,9 @@ class TestCheckAllGates:
         result_count = _make_count_result(25)
         result_no_prod = _make_result(None)
 
-        conn.execute.side_effect = [result_model, result_count, result_no_prod]
+        conn.execute.side_effect = [
+            result_model, result_count, result_no_prod, _passing_oos_result()
+        ]
 
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_all_gates(10, "PRODUCTION")

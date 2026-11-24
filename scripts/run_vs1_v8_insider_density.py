@@ -97,8 +97,10 @@ def main(argv: list[str] | None = None) -> None:
                           "anchor_line": (log_dir / v8.REGISTRY_ANCHORS).read_text(encoding="utf-8")},
                          indent=2, sort_keys=True))
         return
-    if command in {"stop", "verify-stop"}:
+    if command in {"stop", "stop-superseded", "verify-stop"}:
         # stop --log-dir DIR --vault-repo CLONE --power POWER.json --decision-ref TEXT
+        #      --expected-prev-sha256 HEX --run-at ISO [--execute --expected-stop-head HEX]
+        # stop-superseded --log-dir DIR --vault-repo CLONE --probe-report PROBE.json --decision-ref TEXT
         #      --expected-prev-sha256 HEX --run-at ISO [--execute --expected-stop-head HEX]
         log_dir = Path(_option(args, "--log-dir"))
         v8.check_prereg()
@@ -107,6 +109,23 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(v8.verify_terminal_stop(log_dir, witness), indent=2, sort_keys=True))
             return
         run_at = _run_at(args)
+        if command == "stop-superseded":
+            kwargs = {
+                "probe_report_path": Path(_option(args, "--probe-report")),
+                "decision_ref": _option(args, "--decision-ref"),
+                "expected_prev_sha256": _option(args, "--expected-prev-sha256"),
+                "witness": witness,
+            }
+            out = v8.append_superseded_stop(log_dir, run_at, dry_run=True, **kwargs)
+            if "--execute" in args:
+                if out["would_be_head_sha256"] != _option(args, "--expected-stop-head"):
+                    raise SystemExit("--expected-stop-head differs from the dry-run head: nothing appended")
+                out = v8.append_superseded_stop(log_dir, run_at, **kwargs)
+                out = {"appended": out, "head_sha256": v1._record_sha256(out),
+                       "chain": v8.registry(log_dir).verify_chain(),
+                       "next": f"publish the anchor to {v8.WITNESS_PATH}, then run verify-stop"}
+            print(json.dumps(out, indent=2, sort_keys=True))
+            return
         kwargs = {"power_path": Path(_option(args, "--power")), "decision_ref": _option(args, "--decision-ref"),
                   "expected_prev_sha256": _option(args, "--expected-prev-sha256"), "witness": witness}
         out = v8.append_stop_status(log_dir, run_at, dry_run=True, **kwargs)
@@ -120,6 +139,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(out, indent=2, sort_keys=True))
         return
     if command in {"power", "freeze-inputs", "open-discovery", "discover", "open-holdout", "holdout"}:
+        v1.refuse_superseded(8, v8.SUPERSEDED_BY)
         if "--accept-underpowered" in args:
             raise PermissionError("v8 has no underpowered override")
         check_early_probe(Path(_option(args, "--probe-report")),

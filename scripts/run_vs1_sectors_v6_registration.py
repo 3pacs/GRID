@@ -1,8 +1,11 @@
-"""Register sectors-v6 while v8 sits at its witnessed two-record registration; no sector opens here.
+"""Register or supersede-STOP sectors-v6; no sector opens here.
 
     hash-prereg
     register --log-dir NEW --v8-log-dir V8REG --vault-repo CLONE --code-sha SHA --run-at ISO
              [--execute --expected-head HEX]     (dry run unless --execute; HEX is the dry-run head)
+    stop-superseded --log-dir DIR --v8-log-dir V8REG --vault-repo CLONE --decision-ref TEXT
+             --expected-prev-sha256 HEX --run-at ISO [--execute --expected-stop-head HEX]
+    verify-stop --log-dir DIR --vault-repo CLONE
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("hash-prereg")
+
     reg = sub.add_parser("register")
     reg.add_argument("--log-dir", type=Path, required=True)
     reg.add_argument("--v8-log-dir", type=Path, required=True)
@@ -40,10 +44,54 @@ def main(argv: list[str] | None = None) -> None:
     reg.add_argument("--run-at", required=True)
     reg.add_argument("--execute", action="store_true")
     reg.add_argument("--expected-head")
+
+    stop = sub.add_parser("stop-superseded")
+    stop.add_argument("--log-dir", type=Path, required=True)
+    stop.add_argument("--v8-log-dir", type=Path, required=True)
+    stop.add_argument("--vault-repo", type=Path, required=True)
+    stop.add_argument("--decision-ref", required=True)
+    stop.add_argument("--expected-prev-sha256", required=True)
+    stop.add_argument("--run-at", required=True)
+    stop.add_argument("--execute", action="store_true")
+    stop.add_argument("--expected-stop-head")
+
+    verify = sub.add_parser("verify-stop")
+    verify.add_argument("--log-dir", type=Path, required=True)
+    verify.add_argument("--vault-repo", type=Path, required=True)
+
     args = parser.parse_args(argv)
     if args.command == "hash-prereg":
         print(json.dumps({"body_sha256": v1.prereg_body_sha256(s4.REPO / s6.PREREG_PATH),
                           "pinned": s6.PREREG_BODY_SHA256}, indent=2))
+        return
+    if args.command == "verify-stop":
+        s6.check_prereg()
+        witness = s6.check_offhost(args.vault_repo)
+        print(json.dumps(s6.verify_terminal_stop(args.log_dir, witness), indent=2, sort_keys=True))
+        return
+    if args.command == "stop-superseded":
+        s6.check_prereg()
+        witness = s6.check_offhost(args.vault_repo)
+        run_at = _run_at(args.run_at)
+        kwargs = {
+            "v8_log_dir": args.v8_log_dir,
+            "decision_ref": args.decision_ref,
+            "expected_prev_sha256": args.expected_prev_sha256,
+            "witness": witness,
+        }
+        preview = s6.append_superseded_stop(args.log_dir, run_at, dry_run=True, **kwargs)
+        if not args.execute:
+            print(json.dumps(preview, indent=2, sort_keys=True))
+            return
+        if preview["would_be_head_sha256"] != args.expected_stop_head:
+            raise SystemExit("--expected-stop-head differs from the dry-run head: nothing appended")
+        appended = s6.append_superseded_stop(args.log_dir, run_at, dry_run=False, **kwargs)
+        print(json.dumps({
+            "appended": appended,
+            "head_sha256": v1._record_sha256(appended),
+            "chain": s6.registry(args.log_dir).verify_chain(),
+            "next": f"publish the anchor to {s6.WITNESS_PATH}, then run verify-stop",
+        }, indent=2, sort_keys=True))
         return
     s6.check_prereg()
     witness = v8.check_offhost(args.vault_repo)

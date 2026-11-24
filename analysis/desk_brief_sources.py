@@ -5,6 +5,9 @@ Every adapter reads a record another job already keeps and copies what it says, 
 * ``market_state``: the latest ``market_state_daily`` row (#1191; its own ``rule``, market-state/1 or /2) for an earlier
   session, computed before the brief's clock. Read-only transaction, parameterized SQL. ``computed_at`` is a naive TIMESTAMP written
   with CURRENT_TIMESTAMP; it is read as UTC only when the session's TimeZone is UTC, otherwise the section is unknown.
+  Post-close only, and only while the session's own decision record is not there yet: the provisional record computed
+  at that session's close (#1312), display only. Every line it adds starts with ``PROVISIONAL (display only)`` and its
+  facts sit under their own ``provisional`` key; nothing that decides reads it.
 * ``calendar``: the pinned XNYS parts and the pinned event parts (``analysis/factory_session_calendar``, forward
   parts from #1293), asked "what was known at the brief's clock" (``FactoryEvents.known``). A day the parts do not
   answer is unknown, never quiet. The market-state record's own event list (GDP, PCE, ...) is copied beside it.
@@ -15,6 +18,10 @@ Every adapter reads a record another job already keeps and copies what it says, 
 * ``selector``, ``plays``, ``trader_day``: the session's choices from the selector, the overnight plays table and
   the shadow trader's day state. Choices only; no expected values or P&L.
 * ``desk_health`` / ``desk_evening``: the desk-state jobs' own daily files (desk-health/1, desk-evening/1).
+* ``desk_sector_state``: the desk-state sector layer (desk-sector-state/1, #1209), sqlite ``desk_state`` opened
+  ``mode=ro``: the newest row computed before the brief's clock, its own read sentence and labels copied as written.
+  The writer computes a close's row the next morning (about 06:45 UTC), so both briefs normally show the previous
+  session; only an older row is a data problem.
 * ``gex_state``: gex-watch ``/api/state``: whether current GEX is served or withheld, and why.
 * ``receipts``: the Desk source receipt for the latest closed session (``intelligence/desk_source_receipts``).
 * ``paper_record``: the graded paper record (D4, 3pacs/GRID#14), when it exists. Until then: not supplied.
@@ -26,7 +33,9 @@ the section says how many were dropped.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import re
 import sqlite3
 import urllib.request
@@ -35,7 +44,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 from analysis.desk_brief import Section, SessionTimes, Trial, iso, parse_clock
@@ -89,39 +98,21 @@ def previous_session(day: date, *, calendar=None) -> date:
 
 _MS_SQL = text("SELECT as_of_date, computed_at, rule, record FROM market_state_daily "
                "WHERE as_of_date <= :d ORDER BY as_of_date DESC LIMIT 10")
+# Display only (#1312): the record the provisional writer computed at the session's close. Read for the post-close
+# brief's own session and shown only while that session's decision record is not there yet.
+_MSP_SQL = text("SELECT as_of_date, computed_at, rule, record FROM market_state_provisional WHERE as_of_date = :d")
+PROVISIONAL_PREFIX = "PROVISIONAL (display only)"
 
 
-def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: datetime,
-                 expected: date | None = None) -> Section:
-    """``expected``: the newest session the writer normally has computed by the brief's clock (it writes a session's
-    record the evening after it). An older record is a data problem; the expected lag is only stated."""
-    title, key = "Market state", "market_state"
-    src = "griddb market_state_daily"  # each row names its own rule (market-state/1, /2 since #1303)
-    last = session.day - timedelta(days=1) if kind == "pre_open" else session.day
-    try:
-        with engine.connect() as conn:
-            if conn.dialect.name == "postgresql":
-                conn.execute(text("SET TRANSACTION READ ONLY"))
-                tz = conn.execute(text("SHOW TimeZone")).scalar()
-                if str(tz) not in ("UTC", "Etc/UTC", "GMT"):
-                    return Section(key, title, "unknown", src, problems=(f"session TimeZone {tz}; computed_at not readable as UTC",))
-            rows = conn.execute(_MS_SQL, {"d": last}).fetchall()
-    except Exception as exc:  # noqa: BLE001
-        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
-    chosen = None
-    for r in rows:
-        computed = r[1] if isinstance(r[1], datetime) else datetime.fromisoformat(str(r[1]))
-        computed = computed.replace(tzinfo=UTC) if computed.utcoffset() is None else computed
-        if computed <= as_of:
-            chosen = (r, computed)
-            break
-    if chosen is None:
-        return Section(key, title, "empty", src, problems=("no record computed before the brief's clock",))
-    r, computed = chosen
-    rec = r[3] if isinstance(r[3], dict) else json.loads(r[3])
-    lines, problems = [], []
-    rec_day = str(r[0])
-    lines.append(f"record for session {rec_day} (rule {r[2]}), computed {iso(computed)}")
+def _stored_clock(raw: Any) -> datetime:
+    computed = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+    return computed.replace(tzinfo=UTC) if computed.utcoffset() is None else computed
+
+
+def _record_lines(rec: dict) -> tuple[list[str], list[str]]:
+    """One market-state record's coverage, away-from-normal, not-usable, dealer-gamma and news lines, and the
+    away-from-normal entries alone."""
+    lines: list[str] = []
     cov = rec.get("coverage") or {}
     if cov:
         lines.append("coverage: " + ", ".join(f"{k} {v}" for k, v in sorted(cov.items())))
@@ -146,12 +137,130 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
     ns = rec.get("news_shock") or {}
     if ns:
         lines.append(f"news uncertainty ({ns.get('obs_date')}): {ns.get('kind')}; attribution {ns.get('news_attribution')}")
+    pr = rec.get("policy_response") or {}
+    if pr:
+        lines.append(_policy_line(pr))
+    return lines, notable
+
+
+def _policy_line(pr: dict) -> str:
+    """market-state/3's policy_response (the Fed put composite): descriptive research only, so the line says so."""
+    head = f"policy response ({pr.get('rule')}, descriptive research only, decides nothing): "
+    if pr.get("status") != "ok":
+        return head + f"unknown ({pr.get('reason')})"
+    c = pr.get("controls") or {}
+    end = ((pr.get("windows") or {}).get("vix") or {}).get("end_close")
+    text_ = (f"{pr.get('label')}, VIX z {c.get('vix_only_z'):+.2f}, front-end easing z "
+             f"{c.get('front_end_easing_z'):+.2f}" + (f" (through the {end} close)" if end else ""))
+    nm = pr.get("next_meeting") or {}
+    if nm.get("status") == "ok":
+        text_ += f"; next meeting {str(nm.get('meeting_at'))[:10]} expected upper {nm.get('expected_upper'):.3f}%"
+        odds = nm.get("odds")
+        if odds:
+            text_ += f" (hike {odds['hike']:.0%}, hold {odds['hold']:.0%}, cut {odds['cut']:.0%})"
+        elif nm.get("odds_withheld"):
+            text_ += f" (odds withheld: {nm['odds_withheld']})"
+        avail = (nm.get("snapshot") or {}).get("availability") or "not recorded"
+        text_ += f"; Kalshi availability: {avail}, not exact point-in-time evidence"
+    return head + text_
+
+
+def _provisional(row: Any, session: SessionTimes, as_of: datetime) -> tuple[list[str], dict | None, list[str]]:
+    """Lines, facts and problems for the session's provisional record (#1312). Shown only when it was computed after
+    the session's close and before the brief's clock, declares itself provisional and display only, and names the
+    session's close as its availability cutoff (every input it read was held by then)."""
+    if row is None:
+        return [], None, []
+    day = session.day.isoformat()
+    try:
+        computed = _stored_clock(row[1])
+        rec = row[3] if isinstance(row[3], dict) else json.loads(row[3])
+    except (TypeError, ValueError) as exc:
+        return [], None, [f"provisional record for {day} unreadable ({type(exc).__name__}); not shown"]
+    if computed > as_of:
+        return [], None, []                      # not there yet at the brief's clock
+    if computed < session.closes:
+        return [], None, [(f"provisional record for {day} was computed at {iso(computed)}, before the session's "
+                           f"close {iso(session.closes)}; not shown")]
+    if (rec.get("provisional") is not True or rec.get("decision_use") != "display_only"
+            or rec.get("as_of") != day):
+        return [], None, [(f"provisional record for {day} does not declare itself provisional, display only and "
+                           "for that session; not shown")]
+    if parse_clock(rec.get("availability_cutoff")) != session.closes:
+        return [], None, [(f"provisional record for {day} names availability cutoff {rec.get('availability_cutoff')!r},"
+                           f" not the session's close {iso(session.closes)}; not shown")]
+    body, notable = _record_lines(rec)
+    after = round((computed - session.closes).total_seconds() / 60)
+    lines = [(f"{PROVISIONAL_PREFIX}: record for session {day} (rule {row[2]}), from the inputs GRID held at the close "
+              f"({iso(session.closes)}); computed {iso(computed)}, {after} min after the close. The session's "
+              "decision record is written the next evening (#1191) and nothing that decides reads this one")]
+    lines += [f"{PROVISIONAL_PREFIX}: {line}" for line in body]
+    facts = {"table": "market_state_provisional", "decision_use": "display_only", "record_date": day,
+             "availability_cutoff": iso(session.closes), "computed_at": iso(computed), "minutes_after_close": after,
+             "rule": row[2], "label": rec.get("label"), "notable": notable, "coverage": rec.get("coverage") or {}}
+    return lines, facts, []
+
+
+def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: datetime,
+                 expected: date | None = None) -> Section:
+    """``expected``: the newest session the writer normally has computed by the brief's clock (it writes a session's
+    record the evening after it). An older record is a data problem; the expected lag is only stated.
+
+    Post-close, while the session's own decision record is not there yet (it is written the next evening), the
+    provisional record computed at the session's close is added for display (#1312): each of its lines starts with
+    :data:`PROVISIONAL_PREFIX`, and its facts sit under ``provisional``, apart from the decision record's."""
+    title, key = "Market state", "market_state"
+    src = "griddb market_state_daily"  # each row names its own rule (market-state/1, /2 since #1303)
+    last = session.day - timedelta(days=1) if kind == "pre_open" else session.day
+    prov_row, prov_problems = None, []
+    try:
+        with engine.connect() as conn:
+            if conn.dialect.name == "postgresql":
+                conn.execute(text("SET TRANSACTION READ ONLY"))
+                tz = conn.execute(text("SHOW TimeZone")).scalar()
+                if str(tz) not in ("UTC", "Etc/UTC", "GMT"):
+                    return Section(key, title, "unknown", src, problems=(f"session TimeZone {tz}; computed_at not readable as UTC",))
+            rows = conn.execute(_MS_SQL, {"d": last}).fetchall()
+            if kind == "post_close":
+                # Last read in the transaction: a failure here leaves the decision record's section as it is.
+                try:
+                    if inspect(conn).has_table("market_state_provisional"):
+                        prov_row = conn.execute(_MSP_SQL, {"d": session.day}).first()
+                except Exception as exc:  # noqa: BLE001
+                    prov_problems.append(f"provisional record read failed ({type(exc).__name__})")
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    chosen = None
+    for r in rows:
+        computed = _stored_clock(r[1])
+        if computed <= as_of:
+            chosen = (r, computed)
+            break
+    prov_lines, prov_facts = [], None
+    if kind == "post_close" and (chosen is None or str(chosen[0][0]) != session.day.isoformat()):
+        prov_lines, prov_facts, more = _provisional(prov_row, session, as_of)
+        prov_problems += more
+    else:
+        prov_problems = []                       # the session's decision record is there: nothing provisional is read
+    if prov_lines or prov_problems:
+        src += "; display-only provisional line from griddb market_state_provisional (#1312)"
+    if chosen is None:
+        return Section(key, title, "empty", src, None, tuple(prov_lines),
+                       {"provisional": prov_facts} if prov_facts else {},
+                       ("no record computed before the brief's clock",) + tuple(prov_problems))
+    r, computed = chosen
+    rec = r[3] if isinstance(r[3], dict) else json.loads(r[3])
+    problems = []
+    rec_day = str(r[0])
+    body, notable = _record_lines(rec)
+    lines = [f"record for session {rec_day} (rule {r[2]}), computed {iso(computed)}", *body, *prov_lines]
     if expected is not None and rec_day < expected.isoformat():
         problems.append(f"latest record is for {rec_day}; the writer normally has {expected.isoformat()} by now")
-    return Section(key, title, "ok", src, computed, tuple(lines),
-                   {"record_date": rec_day, "computed_at": iso(computed), "notable": notable,
-                    "events": rec.get("events"), "pending": sorted((rec.get("pending") or {}).keys())},
-                   tuple(problems))
+    facts = {"record_date": rec_day, "computed_at": iso(computed), "notable": notable,
+             "events": rec.get("events"), "pending": sorted((rec.get("pending") or {}).keys())}
+    if prov_facts:
+        facts["provisional"] = prov_facts
+    return Section(key, title, "ok", src, computed, tuple(lines), facts, tuple(problems + prov_problems))
 
 
 # ── event calendar (#1293 forward parts) ─────────────────────────────────────
@@ -564,6 +673,196 @@ def desk_evening(folder: str, kind: str, session: SessionTimes, prev_day: date, 
         problems.append(f"latest evening text is for {d.get('day')}, not {last}")
     return Section(key, title, "ok", src, c, tuple(x for x in body if x.strip()), {"day": d.get("day")},
                    tuple(problems))
+
+
+# ── desk-state sector layer (#1209) ──────────────────────────────────────────
+
+SECTOR_SCHEMA = "desk-sector-state/1"
+_SECTOR_SQL = ("SELECT data_through, kind, schema, record_json, record_sha256, computed_at FROM desk_state "
+               "WHERE data_through <= ? ORDER BY data_through DESC")   # no LIMIT: read lazily until a row qualifies
+
+
+def _pct(v: Any) -> str:
+    return f"{v:+.1f} %" if isinstance(v, (int, float)) else "n/a"
+
+
+def _pick_sector_row(rows, as_of: datetime, problems: list[str]):
+    """The first (newest) row computed at or before ``as_of`` that is usable; each unusable one adds a problem."""
+    for day, row_kind, schema, body, sha, computed_raw in rows:
+        computed = parse_clock(computed_raw)
+        if computed is None:
+            problems.append(f"row for {day}: computed_at {computed_raw!r} has no offset; not used")
+            continue
+        if computed > as_of:
+            continue
+        if schema != SECTOR_SCHEMA:
+            problems.append(f"row for {day}: schema {schema!r}, not {SECTOR_SCHEMA}; not used")
+            continue
+        if hashlib.sha256(str(body).encode()).hexdigest() != sha:
+            problems.append(f"row for {day}: stored hash does not match its body; not used")
+            continue
+        try:
+            rec = json.loads(body)
+        except ValueError:
+            problems.append(f"row for {day}: body is not JSON; not used")
+            continue
+        bad = _sector_body_problem(rec, str(day), row_kind)
+        if bad:
+            problems.append(f"row for {day}: {bad}; not used")
+            continue
+        return str(day), row_kind, rec, computed
+    return None
+
+
+_NUM = (int, float)
+_OPT_DICTS = ("market", "fed_balance_sheet", "vix", "events", "overnight_rule")
+# The leaves the section prints, by part: name -> "num" (finite, not bool), "text", "bool" or "date" (YYYY-MM-DD).
+_LEAVES = {"market": {"phase": "text", "trend_pct": "num", "bend_pct": "num"},
+           "fed_balance_sheet": {"phase": "text", "obs_date": "date", "growth_13w_pct": "num"},
+           "vix": {"third": "text", "spike_state": "text", "obs_date": "date", "stale": "bool"},
+           "overnight_rule": {"market_gate": "bool"}}
+_NUM_BOUND = 1e9                           # no printed figure (percent, count) comes near this
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _leaf_bad(v: Any, kind: str) -> bool:
+    if v is None:
+        return False
+    if kind == "num":
+        if isinstance(v, bool) or not isinstance(v, _NUM):
+            return True
+        try:                                   # a JSON integer is unbounded: 10**309 cannot become a float
+            f = float(v)
+        except OverflowError:
+            return True
+        return not math.isfinite(f) or abs(f) > _NUM_BOUND
+    if kind == "bool":
+        return not isinstance(v, bool)
+    if kind == "date":
+        return not (isinstance(v, str) and _DATE.match(v))
+    return not isinstance(v, str)
+
+
+def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
+    """Why a hash-valid body cannot be shown, or None. The body must be an object whose own schema, kind and
+    data_through are the row's columns, with ``sectors`` a dict of dicts and every other part of the shape it
+    is read with (absent parts are allowed; a part of the wrong type is not)."""
+    if not isinstance(rec, dict):
+        return f"body is a JSON {type(rec).__name__}, not an object"
+    for field, want in (("schema", SECTOR_SCHEMA), ("kind", row_kind), ("data_through", day)):
+        if rec.get(field) != want:
+            return f"body's {field} {rec.get(field)!r} is not the row's {want!r}"
+    sectors = rec.get("sectors")
+    if not isinstance(sectors, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in sectors.items()):
+        return "sectors is not an object of objects"
+    for name, sc in sectors.items():
+        for f in ("trend_pct", "relative_trend_pct"):
+            if _leaf_bad(sc.get(f), "num"):
+                return f"sector {name!r}: {f} is not a finite number"
+        for f in ("group", "phase"):
+            if sc.get(f) is not None and not isinstance(sc[f], str):
+                return f"sector {name!r}: {f} is not text"
+        if sc.get("leading") is not None and not isinstance(sc["leading"], bool):
+            return f"sector {name!r}: leading is not true or false"
+    for f in _OPT_DICTS:
+        if rec.get(f) is not None and not isinstance(rec[f], dict):
+            return f"{f} is not an object"
+    for part, leaves in _LEAVES.items():
+        for f, kind in leaves.items():
+            if _leaf_bad((rec.get(part) or {}).get(f), kind):
+                return f"{part}.{f} is not {'a finite number' if kind == 'num' else 'true or false' if kind == 'bool' else 'a YYYY-MM-DD date' if kind == 'date' else 'text'}"
+    if _leaf_bad(rec.get("sectors_rising"), "num"):
+        return "sectors_rising is not a finite number"
+    for f in ("leaders", "laggards"):
+        if rec.get(f) is not None and not (isinstance(rec[f], list) and all(isinstance(x, str) for x in rec[f])):
+            return f"{f} is not a list of names"
+    if rec.get("read") is not None and not isinstance(rec["read"], str):
+        return "read is not text"
+    ahead = (rec.get("events") or {}).get("within_7_days")
+    if ahead is not None and not (isinstance(ahead, list) and all(isinstance(e, dict) for e in ahead)):
+        return "events.within_7_days is not a list of objects"
+    if ahead and not all(isinstance(e.get("event"), str) and e["event"] and not _leaf_bad(e.get("date"), "date") and e.get("date")
+                         for e in ahead):
+        return "events.within_7_days has an entry without an event name and a YYYY-MM-DD date"
+    sin = (rec.get("overnight_rule") or {}).get("sectors_in")
+    if sin is not None and not (isinstance(sin, list) and all(isinstance(x, str) for x in sin)):
+        return "overnight_rule.sectors_in is not a list of names"
+    return None
+
+
+def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day: date, as_of: datetime,
+                      expected: date | None = None) -> Section:
+    """The sector layer of the desk's state record (desk-sector-state/1, written by 3pacs/gex desk-state).
+
+    The newest row for a session up to the previous one (pre-open) or the session itself (post-close) whose
+    ``computed_at`` is at or before the brief's clock. ``computed_at`` must carry its offset; a naive one is not
+    used. A row whose stored hash does not match its body, or whose schema is another, is not used either.
+    ``expected``: the newest session the writer normally has by the brief's clock; an older row is a data problem.
+
+    ``computed_at`` is the writer's own clock at insert. It is not inside the hashed body, so it is the writer's word,
+    not proof of when the row became visible; the table's insert-only triggers stop a later rewrite, nothing more."""
+    title, key = "Sectors (desk-sector-state/1)", "desk_sector_state"
+    src = f"{db} desk_state" if db else "desk-state state.db"
+    if not db:
+        return Section(key, title, "not_supplied", src, problems=("no desk_state_db configured",))
+    last = prev_day if kind == "pre_open" else session.day
+    problems: list[str] = []
+    chosen = None
+    try:
+        con = ro_sqlite(db)
+        try:
+            chosen = _pick_sector_row(con.execute(_SECTOR_SQL, (last.isoformat(),)), as_of, problems)
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    if chosen is None:
+        return Section(key, title, "empty", src, problems=("no row computed before the brief's clock",) + tuple(problems))
+    try:
+        return _sector_section(key, title, src, chosen, expected, problems)
+    except Exception as exc:  # noqa: BLE001 - no row shape may abort the brief
+        return Section(key, title, "unknown", src,
+                       problems=(f"row for {chosen[0]} could not be read into lines ({type(exc).__name__})",) + tuple(problems))
+
+
+def _sector_section(key: str, title: str, src: str, chosen: tuple, expected: date | None, problems: list[str]) -> Section:
+    day, row_kind, rec, computed = chosen
+    lines = [f"row for session {day} ({row_kind}), computed {iso(computed)}"]
+    if rec.get("read"):
+        lines.append(str(rec["read"]))
+    sectors = rec.get("sectors") or {}
+    for name in sorted(sectors, key=lambda n: -(sectors[n].get("relative_trend_pct") or 0)):
+        sc = sectors[name]
+        lines.append(f"{name} ({sc.get('group')}): {sc.get('phase')}, trend {_pct(sc.get('trend_pct'))}, "
+                     f"against the market {_pct(sc.get('relative_trend_pct'))}" + (", leading" if sc.get("leading") else ""))
+    rule = rec.get("overnight_rule") or {}
+    if rule:
+        gate = {True: "open", False: "closed"}.get(rule.get("market_gate")) if isinstance(rule.get("market_gate"), bool) else "not stated"
+        lines.append("overnight rule's gate: market " + gate
+                     + "; sectors let through: " + (", ".join(rule.get("sectors_in") or []) or "none"))
+    ev = rec.get("events") or {}
+    ahead = [f"{e.get('event')} {e.get('date')}" for e in ev.get("within_7_days") or []]
+    if ahead:
+        lines.append("releases within 7 days: " + ", ".join(ahead))
+    fed, vix = rec.get("fed_balance_sheet") or {}, rec.get("vix") or {}
+    if fed.get("phase"):
+        lines.append(f"Fed balance sheet: {fed['phase']}" + (f" (as of {fed['obs_date']})" if fed.get("obs_date") else ""))
+    if vix.get("third") or vix.get("spike_state"):
+        parts = ([f"{vix['third']} third"] if vix.get("third") else []) + ([str(vix["spike_state"])] if vix.get("spike_state") else [])
+        lines.append("VIX: " + ", ".join(parts) + (f" (close of {vix['obs_date']})" if vix.get("obs_date") else "")
+                     + (", stale" if vix.get("stale") else ""))
+    if vix.get("stale"):
+        problems.append(f"row for {day}: the VIX close in it is marked stale")
+    if expected is not None and day < expected.isoformat():
+        problems.append(f"latest row is for {day}; the writer normally has {expected.isoformat()} by now")
+    facts = {"record_date": day, "kind": row_kind, "computed_at": iso(computed), "for_session": rec.get("for_session"),
+             "market": rec.get("market"), "sectors_rising": rec.get("sectors_rising"),
+             "leaders": rec.get("leaders"), "laggards": rec.get("laggards"),
+             "sectors": {n: {k: sectors[n].get(k) for k in ("group", "phase", "trend_pct", "relative_trend_pct", "leading")}
+                         for n in sorted(sectors)},
+             "fed_balance_sheet": rec.get("fed_balance_sheet"), "vix": rec.get("vix"), "events": ev,
+             "overnight_rule": rule or None, "market_level_record": rec.get("market_level_record")}
+    return Section(key, title, "ok", src, computed, tuple(lines), facts, tuple(problems))
 
 
 # ── live GEX state (withheld or served) ──────────────────────────────────────

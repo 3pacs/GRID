@@ -54,6 +54,8 @@ within the run only (`max_t.multiplicity`): earlier runs and looks are not in it
 - A stock is ranked on day d if it has a valid bar on d, its unadjusted close on d−1 is at least $5, and its median
   dollar volume over the 21 sessions ending d−1 is at least $10M. The floor also screens out price files that hold
   another company (Tiingo reuses tickers).
+- A valid bar has all eight prices of its row present and positive (open, high, low, close and the four adjusted
+  values), with the open and the close inside the day's range (see "All eight prices" below).
 - A run file may set its own floors: `min_price` ($1 to $10,000) and `min_dollar_volume` ($100,000 to $10 billion).
   Left out, they are $5 and $10M, and the run and its report are byte for byte what they were before the fields
   existed. A run that sets either has both written under `coverage.floors` in its report. Lower floors are only safe
@@ -113,12 +115,141 @@ hash is what it was.
 answers which stock may be ranked on which session. `load_panel` builds on it and the small-cap builder's `counts`
 calls it, so a count and a run cannot disagree. "The session before" is the store's previous session, not the
 stock's previous bar: a stock with no bar on that session has no prior close and is out. A valid bar needs positive
-adjusted open and close as well as the unadjusted checks.
+adjusted prices as well as the unadjusted checks.
 
 Tests (synthetic stores only, no run on real data): a no-label store without an export refused before declaration;
 an export dated 2016-01-04 refusing a 2015 window; a window one session early refused; a replaced, added or removed
 file and an edited manifest refused before declaration; a price file, `members.csv` or `sectors.csv` changed after
 declaration abandoning the run; a missing session and a zero adjusted close taking a stock out of the universe.
+
+## All eight prices (2026-11-21, review fixes 2026-11-22)
+
+In short: a blank or a number that is not finite makes the bar invalid; anything that is not a Tiingo daily file
+refuses the store by name; and an invalid bar's prices reach no signal and no outcome.
+
+**The rule.** A Tiingo daily row carries eight prices: `open`, `high`, `low`, `close`, `adjOpen`, `adjHigh`, `adjLow`,
+`adjClose`. `universe()` reads all eight, and a row is a valid bar only when every one of them is present, finite and
+positive, with the open and the close inside the day's range. A cell that is not a finite number (`inf`, `-inf`) is
+read as a blank, in the eight prices and in the volume. Files are otherwise read as served: a blank is never filled.
+
+**A file that is not a Tiingo daily file is refused, not repaired.** Before a price file's rows are used, the reader
+checks its shape, and raises `PriceFileError` (a `RunFileError`) naming the file when:
+
+- a row does not have the header's number of cells, too many or too few;
+- one of the nine columns it reads (the eight prices and the volume) holds a cell that is neither a number nor a
+  blank, such as `not_available` (the error names the column and the first day);
+- the date column does not hold days as text, a column is missing, or the file cannot be parsed at all.
+
+Nothing is coerced. A cell of text is not turned into a blank, because a file that carries one is not what Tiingo
+serves and the rest of it cannot be trusted either. The words CSV readers take for a missing value (an empty cell,
+`NA`, `null`, `NaN`) are blanks, as before. The check runs when the store is loaded, which is after the run is
+declared, so the ledger records such a run as abandoned: check the store before running on the shared ledger.
+
+**An invalid bar reaches no signal and no outcome.** A stock with an invalid bar is out of `universe.ok`,
+`universe.base` and `load_panel(...).base` for that session. Its returns into and out of that session are blank, and
+so is its adjusted close in the panel (`Panel.adj`), which is what the momentum, reversal, 52-week-high and
+sector-momentum signals read. So:
+
+- a momentum or reversal signal has no value on the two sessions whose window starts or ends on the invalid bar;
+- the 52-week high has no value the session after, and later windows take their highest close without that bar;
+- a sector's mean momentum leaves the stock out on those sessions, so no other stock's signal carries its close.
+
+**What still reads an invalid bar.** The two floors. The price floor reads the unadjusted close of the session before,
+and the liquidity floor the median of close times volume over the 21 sessions before, both as served. A day without a
+trade has to count as a day of no volume, or a thin stock would look liquid. So a stock is rankable the session after
+an invalid bar when that session's own bar is valid (tested since #1291). A close or a volume that is not finite does
+not count: it is a blank, so it passes no floor. The residual card's liquidity factor is that same median, so it
+reads what the floor reads; its other factors are built from the masked returns and closes.
+
+**The reason.** Until this change the reader took six prices and never opened `adjHigh` or `adjLow`. A row whose
+only blank was one of those two was a valid, rankable bar. Review of the small-cap builder (#1294) reproduced it on
+two paths that builder does not guard: a directory sealed directly with `seal_export`, and an older sealed generation
+read back. The builder refuses such a row when it fetches, binds or builds, but the rule belongs in the one
+definition of the universe, where every store and every caller meets it. Tiingo does serve blank prices on some days
+without a trade, so the case is real on thinly traded names.
+
+Review of this change (#1326) then found two more gaps in the shared reader, both older than it. `inf` is greater
+than zero, so a row with an infinite price passed every positive-price check and could put an infinite return into a
+spread. And the panel carried every adjusted close as served, so a close on a bar the rule had turned away still fed
+the signals built from closes: on a synthetic store, with a blank `adjHigh` and an adjusted close ten times the true
+one, the stock's 5-session momentum read +895 % the next session and nine other stocks' sector momentum moved with it.
+
+A second review found that a cell of text made the reader fail with a `TypeError` from numpy, an error that names
+neither the file nor the column. Checking that turned up a worse case in the same family: pandas, asked for columns
+by name, reads a row that has one cell too many without complaint and takes every value from one column along. On a
+synthetic store one such row was a valid bar with a close-to-close return of 2,058,000 %.
+
+**What it changes on the index store: nothing.** The three cross-section runs on the factory ledger declared one data
+manifest (`31513c21…`, 814 price files), and the nine scratch runs that wrote a manifest list the same files. The
+store was checked against that manifest by hash, then every row was counted, read-only, on 2026-11-21 and again on
+2026-11-22:
+
+| Measure | Count |
+|---|---|
+| Rows read (814 files, through each file's last row) | 2,867,858 |
+| Rows on or before 2022-12-30, the ones a run loads | 2,224,008 |
+| Rows blank in `adjHigh` or `adjLow` with the other six prices present | 0 |
+| Rows valid under the six-price rule and not valid under the eight-price rule | 0 |
+| Blank cells in any of the eight price columns | 0 |
+| Cells that are `inf` or `-inf`, prices and volume | 0 |
+| Invalid bars among the rows a run loads | 0 |
+| Price files the shape check refuses | 0 of 814 |
+
+The count read price cells in rows after 2022-12-30 for presence, sign and finiteness only; no return was computed
+from them. With main's reader and the changed one, `universe` and `load_panel` on that store give the same `ok`,
+`base`, bar frames, overnight, intraday and close-to-close arrays, adjusted closes and sector placement, and the same
+signal matrix for each of the six signal kinds (compared by hash; 3,357 sessions, 814 files, 1,563,261 rankable
+stock-sessions). No ledgered result can move.
+
+A run on an unchanged store gives the same `report.json`, `discovery-frozen.json`, `report.md` and
+`data-manifest.json` byte for byte on main's factory (3e250cea, residual card included) and the changed one.
+Checked on the synthetic test store with four runs: plain, gated, one with momentum, reversal, 52-week-high and
+intraday signals, and one with sector momentum.
+
+**What it changes on the small-cap store.** The sealed generation `g-55610e73…` (9,471 price files, discovery from
+2016-01-04) was counted the same way on 2026-11-22, on the 16,942,103 rows a run loads:
+
+| Measure | Count |
+|---|---|
+| Cells that are `inf` or `-inf`, prices and volume (all 22,162,940 rows) | 0 |
+| Invalid bars | 1,208 in 35 files |
+| of them with a blank `low` and `adjLow` | 617 |
+| of them with the open or the close outside the day's range | 591 |
+| Invalid bars with an adjusted close present | 1,208 |
+| Price files the shape check refuses | 0 of 9,471 |
+
+By year: 504 in 2010, 469 in 2011, 136 in 2012, 42 in 2013, 10 in 2014, 2 in 2015, 11 in 2016 and 34 in 2017.
+Every one of these bars was already invalid under the six-price rule: no row is blank, zero or negative in `adjHigh`
+or `adjLow` alone (the 617 blank adjusted lows are the 617 rows with a blank low). With no cell to read as a blank,
+`ok`, `base` and the universe counts on this generation are what they were. What changes is that the 1,208 adjusted
+closes on those bars no longer reach the signals built from closes; 45 of them are in the discovery years. No
+cross-section run on this store is on the factory ledger, so no recorded result moves.
+
+**What it costs.** Two more columns per file, the shape check on every file, one pass over the frames for the finite
+check and one mask. On the index store, four loads each on 2026-11-22: `universe()` took 22.2 s against 17.6 s on
+main (+4.6 s, 26 %) and peak memory was 905 MB against 823 MB (+82 MB, 10 %). The bar frames it returns hold 188 MB
+against 146 MB.
+
+Tests (synthetic stores only):
+
+- each of the eight prices blank on its own, at volume 0 and at a positive volume, is out of `ok` and `base` in
+  `universe` and `load_panel` for that session and back the session before;
+- a 25-company store with one row blank only in `adjHigh`, sealed directly with `seal_export` and read through the
+  verified path, loses that company for that session only;
+- each of the eight prices set to `inf` and to `-inf` is read as a blank, and no return, adjusted close or signal in
+  the panel is infinite;
+- a thin stock with `inf` volume on 15 sessions still fails the liquidity floor;
+- an invalid bar (blank `adjHigh`; blank `low` and `adjLow`) whose adjusted close is wrong by a factor of 10 and of
+  100 gives the clean store's panel with that one bar taken out, the same signals for both factors, no signal on the
+  adjacent sessions named above, and a sector mean for the other members worked out by hand without it;
+- on a clean store every cell of every frame is the file's own number and nothing in the panel is masked;
+- `not_available` in each of the eight prices and in the volume refuses the file with an error that names the file,
+  the column and the day, and does not repeat the cell;
+- a missing column, days that are not text, a row with a cell too many (every cell a number), a row cut short and an
+  empty file are each refused by name;
+- `NA`, `null`, `NaN` and an empty cell are blanks: the bar is invalid and the store is read;
+- a run on a store with one such cell is declared, then closed as abandoned with the named error, and writes no
+  report.
 
 ## Signals and horizons
 
@@ -171,6 +302,38 @@ For the best `cards` modules and every selected one, `report.json` holds where t
 state recorded the evening before each decision day in the sector state record (`desk-sector-state/1`, #1209):
 market phase, Fed balance-sheet phase, VIX third, spike state, and for within-sector modules each sector, the three
 groups, the sector's own phase, and leading against lagging sectors. Cuts are descriptions of a searched sample.
+
+**What a cut is charged (2026-11-22).** A cut's cost is a replaced-name cost proxy, conditional on the cut. It is
+not the cost of a book anyone traded on its own.
+- A cut of whole nights (year, market phase and the other night states) is the module on those nights, so it pays
+  the module's cost.
+- A sector cut pays that sector's replaced-name share at the run's rate: the share of its current picks that were not
+  among its picks on the module's previous traded night. It is 1 on the first night of a stretch, or when the sector
+  did not trade the night before.
+- A cut of several sectors (a group, a sector phase, leading or lagging) pays its sectors' shares, weighted by their
+  names like its spread. A sector phase or leading/lagging cut changes its sectors from night to night, and moving
+  between those sets costs nothing here.
+- **The proxy counts entries only.** It divides the names that are new by the current book's size, as the module's
+  own `_turnover` does. A sector or a name that leaves the book, or a book that shrinks, is charged nothing for the
+  exit: `[A, B]` then `[A]` reads 0. Pricing holdings changes, exits included, would be a different measure.
+- **The identity with the module holds only on complete nights.** Weighted by their names, the shares of every
+  sector the module filled give back the module's turnover exactly, since a name stays in its sector. The cuts,
+  though, weight only the sectors with outcomes that night. On a night when a filled sector has none, the module's
+  turnover still counts that sector's picks (its gross does not), and the cuts leave it out. Take an unchanged
+  sector and an equal-sized, fully replaced sector without outcomes: the module's turnover is 0.5, and a cut of the
+  usable sector is charged 0.
+- Overnight and intraday turn over every name, so nothing changes there. On `close_1d` a slow sector used to be
+  charged a fast one's churn and the other way round, which is the gap Codex found in the residual card's liquidity
+  halves (#1363). Only the `net_bp` of those cuts, and the paid / did-not lists built from them, move.
+- **On the monthly reversal's development replay** (grid-svr scratch ledgers, the 11-19 run's 817 files, main
+  `2157fe94` against this change):
+  - only `cards` differed, and within it only sector-based `net_bp`;
+  - the within-sector modules' sector cuts moved by at most 0.12 bp a night (Communication Services, 2.52 to 2.40 at
+    10 %);
+  - their groups and leading / lagging cuts moved by at most 0.03 bp;
+  - the pooled modules and every whole-night cut were unchanged.
+  - That signal's sectors churn at much the same rate; the gap is large only when they do not, as in the test's
+    fixture, where a slow sector paid 0.58 bp a night instead of 0.11.
 
 Every card also carries `where_it_paid` and `where_it_did_not`: each cut with at least 100 traded nights, split by
 the sign of its net return and sorted by size, and `report.md` prints the six largest of each. A run file may list
@@ -284,8 +447,8 @@ sector by correlation over the whole sample, so a sector's membership in 2010 us
   including a known effect the set lacks (value, quality, earnings drift). Its liquidity factor stands in for size.
   Below the condition-number line, collinear factors still share their credit by least squares, so read two named
   parts that both move with one effect as one part between them.
-- The sector cuts on the module cards (`card`) still charge each sector the module's cost. Only the residual card's
-  liquidity halves price their own turnover.
+- A card's sector-based cuts and the residual card's liquidity halves each pay their own turnover (see "What a cut
+  is charged"). A cut of whole nights pays the module's.
 - A night with fewer than `min_session_bars` priced names is dropped, so an overnight or close-to-close return after
   it spans more than one session.
 

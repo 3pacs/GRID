@@ -46,6 +46,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.pit import PITStore
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -667,7 +668,7 @@ def _load_candidate_predictions(
         sql = (
             "SELECT id, ticker, created_at, expiry, confidence, verdict, "
             "signals, realized_return "
-            "FROM oracle_predictions "
+            "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
             "WHERE verdict IN ('hit', 'miss', 'partial') "
             "  AND created_at IS NOT NULL "
             "  AND expiry IS NOT NULL "
@@ -691,7 +692,7 @@ def _load_candidate_predictions(
         try:
             sql = (
                 "SELECT id, ticker, created_at, expiry, confidence, verdict, signals "
-                "FROM oracle_predictions "
+                "FROM " + VISIBLE_ORACLE_PREDICTIONS + " oracle_predictions "
                 "WHERE verdict IN ('hit', 'miss', 'partial') "
                 "  AND created_at IS NOT NULL "
                 "  AND expiry IS NOT NULL "

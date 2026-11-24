@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
 DEFAULT_DAYS = 30
@@ -685,7 +686,7 @@ def load_prediction_rows(
     query = text(
         """
         SELECT id, verdict, confidence, signals, model_weights
-        FROM oracle_predictions
+        FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE verdict IN ('hit', 'miss', 'partial')
           AND created_at >= NOW() - (:days || ' days')::interval
           AND COALESCE(dedup_keep, TRUE) = TRUE

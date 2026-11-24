@@ -309,20 +309,36 @@ const persistedSanityLayers = [
     ['HISTORICAL_ANALOG', 'Historical analog'],
 ];
 
+// A shadow check (``"shadow": true`` in sanity_status, CROSS_ASSET since #1400)
+// is recorded but never gates a recommendation: it is drawn as a hollow,
+// neutral dot whatever its verdict, so a shadow FAIL is not read as a failed gate.
+const SHADOW_DOT = '#7A8A9A';
+
 function SanityDots({ checks }) {
     // The persisted producer stores a keyed sanity_status object; live cards
     // may still supply the legacy positional sanity_checks array.
     const layers = Array.isArray(checks)
-        ? sanityLayerNames.map((name, i) => ({ name, status: checks[i]?.status || checks[i] }))
-        : persistedSanityLayers.map(([key, name]) => ({ name, status: checks?.[key]?.status }));
+        ? sanityLayerNames.map((name, i) => ({ name, status: checks[i]?.status || checks[i], shadow: false }))
+        : persistedSanityLayers.map(([key, name]) => ({
+            name, status: checks?.[key]?.status, shadow: checks?.[key]?.shadow === true,
+        }));
     return (
         <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }} title="Sanity checks">
-            {layers.map(({ name, status }) => {
+            {layers.map(({ name, status, shadow }) => {
+                const label = `${name}: ${status || 'N/A'}`;
+                if (shadow) {
+                    return (
+                        <div key={name} data-shadow="true" title={`${label} (shadow, recorded, not a gate)`} style={{
+                            width: '8px', height: '8px', borderRadius: '50%', boxSizing: 'border-box',
+                            background: 'transparent', border: `1px dashed ${SHADOW_DOT}`, flexShrink: 0,
+                        }} />
+                    );
+                }
                 const bg = status === 'PASS' ? colors.green
                     : status === 'FAIL' ? colors.red
                     : '#3A4A5A';
                 return (
-                    <div key={name} title={`${name}: ${status || 'N/A'}`} style={{
+                    <div key={name} title={label} style={{
                         width: '8px', height: '8px', borderRadius: '50%',
                         background: bg, flexShrink: 0,
                     }} />
@@ -333,10 +349,23 @@ function SanityDots({ checks }) {
 }
 
 function ConfidenceCircle({ value }) {
-    const pct = Math.round((value || 0) * 100);
+    // A saved recommendation may carry no confidence (options.py returns None).
+    // That is "not stated", never a red 0. A real 0 still renders 0.
+    if (value == null || !Number.isFinite(Number(value))) {
+        return (
+            <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }} aria-label="confidence not stated">
+                <circle cx="20" cy="20" r={16} fill="none" stroke={colors.border} strokeWidth="3" strokeDasharray="3 3" />
+                <text x="20" y="21" textAnchor="middle" dominantBaseline="middle"
+                    fontSize="10" fontWeight="700" fill={colors.textMuted}
+                    fontFamily="'JetBrains Mono', monospace"
+                >—</text>
+            </svg>
+        );
+    }
+    const pct = Math.round(value * 100);
     const r = 16;
     const circ = 2 * Math.PI * r;
-    const offset = circ - (circ * (value || 0));
+    const offset = circ - (circ * value);
     const col = pct >= 70 ? colors.green : pct >= 40 ? colors.yellow : colors.red;
     return (
         <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }}>

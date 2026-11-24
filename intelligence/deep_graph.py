@@ -14,10 +14,13 @@ appear across multiple paths, that overlap IS the alpha.
     6. Those politicians' committee assignments + votes
     7. Other companies affected by those committees' legislation
     8. Insiders of THOSE companies (who's trading?)
-    9. Funds that hold positions in BOTH the original AND connected companies
+    9. Funds whose latest 13F filings list BOTH the original AND a connected
+       company (holdings observations, never flows; see layer 9)
    10. The ultimate beneficial owners / family offices behind those funds
 
-At each layer: WHO, HOW MUCH money, WHEN, and CONNECTION TYPE.
+At each layer: WHO, HOW MUCH money, WHEN, and CONNECTION TYPE. Layer 9's
+amounts are 13F holding values at the filing's report date, reported as
+``observed_holdings_value_usd`` and never added to ``dollar_flows``.
 
 Key entry points:
     deep_drill              — traverse outward layer by layer from a ticker
@@ -107,6 +110,9 @@ class LayerResult:
     connections: list[dict] = field(default_factory=list)
     dollar_flows: float = 0.0
     count: int = 0
+    # Layer 9 only: summed 13F holding values (an observation, not a flow).
+    observed_holdings_value_usd: float = 0.0
+    observation_meta: dict = field(default_factory=dict)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -764,73 +770,91 @@ def _layer8_insiders(engine: Engine, company_tickers: list[str]) -> LayerResult:
 
 
 def _layer9_cross_holding_funds(
-    engine: Engine, root_ticker: str, connected_tickers: list[str]
+    engine: Engine,
+    root_ticker: str,
+    connected_tickers: list[str],
+    *,
+    as_of: date | None = None,
 ) -> LayerResult:
-    """Layer 9: Funds holding positions in BOTH the original AND connected companies.
+    """Layer 9: Funds whose latest 13F filings list BOTH the root AND a connected company.
 
-    Sources: 13F filings in signal_sources / raw_series.
+    Source: 13F holdings observations served by
+    ``intelligence.holdings_observations_13f`` (labelled ``raw_series``
+    rows from ``ingestion/altdata/institutional_flows.py``, CUSIPs mapped by
+    the shared ``dollar_flows`` mapping, unmapped CUSIPs left out and
+    counted). A holding is shown from its filing date, the latest filing per
+    (manager, CUSIP) wins, and a CLOSED position is not held.
+
+    13F is non-directional (owner decision 2026-11-23): each edge carries the
+    filing's reported holding value at its report date, labelled as an
+    observation. ``layer.dollar_flows`` stays 0; the summed holding values
+    are ``observed_holdings_value_usd``.
     """
+    from intelligence.holdings_observations_13f import (
+        HOLDING_LABEL,
+        HOLDING_MEASURE,
+        read_13f_holdings_snapshot,
+    )
+
     layer = LayerResult(depth=9, layer_name=LAYER_NAMES[9])
+    root = root_ticker.strip().upper()
+    connected_set = {t.strip().upper() for t in connected_tickers if t and t.strip()} - {root}
+
+    snapshot = read_13f_holdings_snapshot(engine, as_of=as_of, use_cache=True)
+    holders = snapshot.holders_of([root, *connected_set])
+
     seen: set[str] = set()
+    name_collisions = 0
+    for cik, mh in sorted(holders.items(), key=lambda kv: (kv[1].manager_name.lower(), kv[0])):
+        held = set(mh.holdings_by_ticker)
+        if root not in held or not held & connected_set:
+            continue
+        node_id = f"fund:{mh.manager_name.strip().lower().replace(' ', '_')}"
+        if node_id in seen:
+            name_collisions += 1
+            continue
+        seen.add(node_id)
+        shared = sorted(held & (connected_set | {root}))
+        holdings = [h for t in shared for h in mh.holdings_by_ticker[t]]
+        value = sum(h.reported_value_usd for h in holdings)
+        layer.actors.append({
+            "id": node_id,
+            "label": mh.manager_name,
+            "type": "fund",
+            "layer": 9,
+            "connection_type": "cross_holding",
+            "manager_cik": cik,
+            "shared_tickers": shared,
+            "observation": {
+                "label": HOLDING_LABEL,
+                "measure": HOLDING_MEASURE,
+                "directional": False,
+                "observed_holdings_value_usd": value,
+                "held_through_report_date": mh.held_through_report_date.isoformat(),
+                "value_report_dates": sorted({h.value_report_date.isoformat() for h in holdings}),
+            },
+            "holdings": [h.to_dict() for h in holdings],
+        })
+        layer.observed_holdings_value_usd += value
+        for t in shared:
+            obs = mh.holdings_by_ticker[t]
+            layer.connections.append({
+                "from": node_id,
+                "to": f"company:{t}",
+                "type": "holds_position",
+                "label": f"13F filing lists {t} (report {mh.held_through_report_date.isoformat()})",
+                "observation": {
+                    "label": HOLDING_LABEL,
+                    "measure": HOLDING_MEASURE,
+                    "directional": False,
+                    "observed_holding_value_usd": sum(h.reported_value_usd for h in obs),
+                    "held_through_report_date": mh.held_through_report_date.isoformat(),
+                    "positions": [h.to_dict() for h in obs],
+                },
+            })
 
-    # Build a map: fund_name -> set of tickers they hold
-    fund_holdings: dict[str, set[str]] = defaultdict(set)
-    fund_amounts: dict[str, float] = defaultdict(float)
-
-    all_tickers = [root_ticker] + list(set(connected_tickers))[:50]
-
-    for ticker in all_tickers:
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text(
-                    "SELECT source_id, signal_value "
-                    "FROM signal_sources "
-                    "WHERE source_type = '13f' "
-                    "AND ticker = :ticker "
-                    "ORDER BY signal_date DESC "
-                    "LIMIT 100"
-                ), {"ticker": ticker}).fetchall()
-
-                for row in rows:
-                    fund_name = row[0] or ""
-                    val = _parse_json(row[1])
-                    if not fund_name:
-                        fund_name = val.get("manager_name", "") if val else ""
-                    if fund_name:
-                        fund_holdings[fund_name].add(ticker)
-                        amt = float(val.get("value", val.get("market_value", 0)) or 0) if val else 0
-                        fund_amounts[fund_name] += amt
-        except Exception as exc:
-            log.debug("DeepGraph: fund holdings enrichment query failed: {e}", e=str(exc))
-
-    # Find funds that hold BOTH the root ticker and at least one connected ticker
-    connected_set = set(connected_tickers)
-    for fund_name, held_tickers in fund_holdings.items():
-        if root_ticker in held_tickers and held_tickers & connected_set:
-            slug = fund_name.strip().lower().replace(" ", "_")
-            node_id = f"fund:{slug}"
-            if node_id not in seen:
-                seen.add(node_id)
-                shared = sorted(held_tickers & (connected_set | {root_ticker}))
-                layer.actors.append({
-                    "id": node_id,
-                    "label": fund_name,
-                    "type": "fund",
-                    "layer": 9,
-                    "connection_type": "cross_holding",
-                    "shared_tickers": shared,
-                    "total_value": fund_amounts.get(fund_name, 0),
-                })
-                layer.dollar_flows += fund_amounts.get(fund_name, 0)
-                # Add edges to each shared ticker
-                for t in shared:
-                    layer.connections.append({
-                        "from": node_id,
-                        "to": f"company:{t}",
-                        "type": "holds_position",
-                        "label": f"holds {t}",
-                    })
-
+    layer.observation_meta = dict(snapshot.meta(), funds_shown=len(layer.actors),
+                                  fund_name_collisions=name_collisions)
     layer.count = len(layer.actors)
     return layer
 
@@ -938,7 +962,7 @@ def _layer10_beneficial_owners(
 
 
 def deep_drill(
-    engine: Engine, ticker: str, max_depth: int = 10
+    engine: Engine, ticker: str, max_depth: int = 10, *, as_of: date | None = None
 ) -> dict[str, Any]:
     """Start from a ticker, traverse outward layer by layer up to 10 deep.
 
@@ -951,6 +975,9 @@ def deep_drill(
         engine: SQLAlchemy database engine.
         ticker: Root ticker symbol (e.g., "NVDA").
         max_depth: Maximum traversal depth (1-10, default 10).
+        as_of: Graph date for layer 9's 13F holdings observations (filed
+            and received by then). Defaults to now. The other layers keep
+            their own ``date.today()`` windows.
 
     Returns:
         {
@@ -961,6 +988,10 @@ def deep_drill(
             "total_dollar_flow": float,
             "capped": bool,
         }
+        Layer 9 also carries ``observed_holdings_value_usd`` and
+        ``holdings_observation`` (provenance and exclusion counts); its
+        holding values are not part of ``dollar_flows`` or
+        ``total_dollar_flow``.
     """
     ensure_table(engine)
     ticker = ticker.strip().upper()
@@ -1097,13 +1128,16 @@ def deep_drill(
         a.get("ticker", "") for a in all_actors
         if a.get("ticker") and a.get("ticker") != ticker
     })
-    l9 = _layer9_cross_holding_funds(engine, ticker, all_connected_tickers)
+    l9 = _layer9_cross_holding_funds(engine, ticker, all_connected_tickers, as_of=as_of)
     layers.append({"depth": 9, "layer_name": l9.layer_name,
                     "actors": l9.actors, "connections": l9.connections,
-                    "dollar_flows": l9.dollar_flows, "count": l9.count})
+                    "dollar_flows": l9.dollar_flows, "count": l9.count,
+                    "observed_holdings_value_usd": l9.observed_holdings_value_usd,
+                    "holdings_observation": l9.observation_meta})
     all_actors.extend(l9.actors)
     all_connections.extend(l9.connections)
-    total_dollar_flow += l9.dollar_flows
+    # 13F holding values are observations, not flows: nothing from layer 9
+    # is added to total_dollar_flow.
     if max_depth < 10 or len(all_actors) >= _MAX_ACTORS:
         capped = len(all_actors) >= _MAX_ACTORS
         return _build_drill_result(ticker, layers, all_actors, all_connections,
@@ -1516,7 +1550,7 @@ def generate_connection_map(
                 continue
             node_ids.add(aid)
             is_overlap = actor_layer_count.get(aid, 0) > 1
-            nodes.append({
+            node = {
                 "id": aid,
                 "label": actor.get("label", aid),
                 "type": actor.get("type", "unknown"),
@@ -1525,19 +1559,26 @@ def generate_connection_map(
                 "size": 15 if layer_depth == 1 else max(5, 12 - layer_depth),
                 "is_overlap": is_overlap,
                 "dollar_amount": actor.get("dollar_amount", 0),
-            })
+            }
+            # Layer 9's 13F holdings: labelled observation, not dollar_amount.
+            if actor.get("observation"):
+                node["observation"] = actor["observation"]
+            nodes.append(node)
 
         for conn in layer.get("connections", []):
             source = conn.get("from", "")
             target = conn.get("to", "")
             if source and target:
-                links.append({
+                link = {
                     "source": source,
                     "target": target,
                     "type": conn.get("type", ""),
                     "label": conn.get("label", conn.get("type", "")),
                     "amount": conn.get("amount", 0),
-                })
+                }
+                if conn.get("observation"):
+                    link["observation"] = conn["observation"]
+                links.append(link)
 
     # Add implicit links from layer 1 -> layer 2 actors
     root_id = f"company:{ticker}"
@@ -1662,7 +1703,9 @@ def discover_hidden_influence(engine: Engine) -> list[dict[str, Any]]:
                 "significance": min(0.9, 0.2 * len(affected)),
             })
 
-    # Phase 5: Find fund concentration risk
+    # Phase 5: Funds that appear in the graphs of several watchlist tickers.
+    # Fund nodes come from 13F holdings observations (layer 9) and fund
+    # affiliations (layer 3): a shared holder, never a flow or a direction.
     fund_tickers: dict[str, set[str]] = defaultdict(set)
     for overlap in all_overlaps:
         for fund in overlap.shared_funds:
@@ -1676,10 +1719,10 @@ def discover_hidden_influence(engine: Engine) -> list[dict[str, Any]]:
                 "fund": fund,
                 "affected_tickers": sorted(held),
                 "narrative": (
-                    f"{fund} holds significant positions in {len(held)} of your "
-                    f"watchlist tickers: {', '.join(sorted(held))}. A large "
-                    f"rebalancing or redemption event at this fund could create "
-                    f"correlated selling pressure."
+                    f"{fund} appears in the networks of {len(held)} of your "
+                    f"watchlist tickers: {', '.join(sorted(held))}. A shared "
+                    f"holder or affiliate is common exposure, observed from "
+                    f"filings; it says nothing about buying or selling."
                 ),
                 "significance": min(0.85, 0.15 * len(held)),
             })

@@ -500,16 +500,14 @@ def _happy_wikipedia() -> tuple[dict, int]:
 
 def _happy_polygon() -> tuple[dict, int]:
     import ingestion.altdata.polygon_puller as mod
+    from tests.test_puller_write_contract_20261104 import polygon_chain_page
 
-    chain = [
-        {"details": {"contract_type": "call"}, "open_interest": 100, "day": {"volume": 10},
-         "implied_volatility": 0.2, "greeks": {"delta": 0.5, "gamma": 0.01}},
-        {"details": {"contract_type": "put"}, "open_interest": 50, "day": {"volume": 5},
-         "implied_volatility": 0.3, "greeks": {"delta": -0.4, "gamma": 0.02}},
-    ]
     engine = FakeEngine()
+    # POLYGON_OPTIONS_PULL_ENABLED is off by default; the happy path turns it on.
     with patch.object(mod, "OPTIONS_TICKERS", ["SPY"]), \
-         patch.object(mod.requests, "get", return_value=Resp(200, {"results": chain})), \
+         patch.object(mod, "options_writes_enabled", return_value=True), \
+         patch.object(mod, "rate_limit_hold", return_value=None), \
+         patch.object(mod.requests, "get", side_effect=polygon_chain_page), \
          patch.object(mod.time, "sleep"):
         out = _bare(mod.PolygonPuller, engine, api_key="k").pull()
     return out, len(engine.conn.inserts())

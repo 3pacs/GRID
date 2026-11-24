@@ -46,7 +46,8 @@ Rules, each tested (`tests/test_desk_brief.py`):
 
 | Section | Source | Read |
 |---|---|---|
-| Market state | `griddb.market_state_daily` (market-state/1, #1191) | latest row computed before the as-of, read-only transaction. The writer computes a session's record the next evening, so post-close normally shows the previous session and pre-open the one before. Only an older record is a data problem. |
+| Market state | `griddb.market_state_daily` (market-state/1, #1191); post-close also `griddb.market_state_provisional` (#1312, display only) | latest row computed before the as-of, read-only transaction. The writer computes a session's record the next evening, so post-close normally shows the previous session and pre-open the one before. Only an older record is a data problem. Post-close adds the session's provisional record (below). |
+| Sectors | desk-state `desk-sector-state/1` (#1209): sqlite `desk_state` in `/data/agent-home/anikdang/desk-state-data/state.db`, opened `mode=ro` | the newest row computed before the as-of (`computed_at` must carry its offset; a hash or schema mismatch is not used): the row's own read sentence, each sector's group, phase, trend and trend against the market, the overnight rule's gate and the releases ahead, as written. The writer computes a close's row the next morning (about 06:45 UTC), so both briefs normally show the previous session; only an older row is a data problem. Folding it into the market-state record is #1417. |
 | Event calendar | pinned XNYS and factory-events parts (`analysis/factory_session_calendar.py`, forward parts #1293) | `FactoryEvents.known(day, as_of)` for 5 sessions. A day no part answers is printed as unknown, never quiet. Beside it: the market-state record's FRED release list (GDP, PCE, ...), which has no known-at. |
 | Session in prices | desk-state `desk-evening/1` files | the evening text for the session (post-close) or the one before (pre-open) |
 | GEX lane records | gex-watch `/api/records` (gex-records/1) | every gex-signals trial, the factory slots' feature history, the shadow trader, GEX levels v1: counts and look status as published |
@@ -57,6 +58,31 @@ Rules, each tested (`tests/test_desk_brief.py`):
 | Desk health | desk-state `desk-health/1` files | the latest health line and its problems |
 | Factory live slots | gex-signals `panel.json` `factory` block (panel-factory/1, read as live) and `signals.db` (`mode=ro`): `factory_fires`, `factory_feature_values` | slots registered of the family's k ("no slot registered (0 of 10)" while none is), feature history toward its 60 sessions, the session's feature values recorded and eligible; per slot: fired or the abstain reason at the clock, resolved fires of min_n. Only a slot in state `pass` whose `citable` is true is labelled citable. Collecting and look-owed slots read "unproven, n of N" (look_due: "the owner runs the one look"). A slot past its look and not citable reads its state in words ("passed, re-check owed", "passed, then lapsed", "failed its look"), never a plain pass. Any `panel-factory/N` version is read, keyed on `status`: `calendar_exhausted` reads "calendar ended <last_day>: nothing recorded since, nothing citable" and makes no slot citable; `no_tables`/`error` are data problems. Feature history is the block's own `z_history_have_min`, never a count of eligible values. |
 | Paper record | D4 #14: `/data/agent-home/anikdang/desk-paper-data/summary.json` (desk-paper-summary/1, written by the paper-record job in 3pacs/gex) | the summary only, never its ledger: per module the look status and counts, and `stats` where the registration allows; LOOK DUE reads "the owner runs the registered look once (not a pass)", NO LOOK reads "description, not evidence"; `errors` and a summary older than 36 h are data problems. Not supplied until the file exists. Format agreed with its owner on 2026-11-21 (side-session note `paper-record-read-format-20261121.md`). |
+
+### Provisional market state (post-close only, display only, #1312)
+
+The post-close brief runs before the session's decision record exists, which is written the next evening. So it
+also reads the record `scripts/run_market_state.py --provisional` computed at the session's close
+(`market_state_provisional`, `docs/reference/MARKET_STATE_RECORD.md`). It shows that record only when all of these hold:
+
+- the brief is post-close;
+- no decision record for the session was computed before the brief's clock;
+- the provisional record was computed after the session's close and before the brief's clock;
+- the record declares `provisional: true`, `decision_use: display_only` and the session's own date;
+- its `availability_cutoff` is the session's close, so every input it read was held by then.
+
+A row that breaks one of these is a data problem, not a line. No row (the timer is not installed) or no table (the
+migration is not applied yet) is quiet.
+
+How it is shown:
+- Every line it adds starts with `PROVISIONAL (display only)` and comes after the decision record's lines.
+  The first line names the cutoff (the close) and when the row was written, in minutes after the close.
+- Its facts sit under their own `provisional` key. `record_date`, `notable` and `events` stay the decision
+  record's, and the calendar section copies only the decision record's release list.
+- The section's source names `market_state_provisional` when the record contributes.
+- Pre-open briefs never read it.
+
+Nothing that decides reads the provisional record (`tests/test_market_state_provisional_guard.py`).
 
 Identifiers in ledger SQL come from the reviewed config, are checked against `[a-z_][a-z0-9_]*` and against the
 table's own columns. Every value is a bound parameter. The config holds each registration's look count (`need`);

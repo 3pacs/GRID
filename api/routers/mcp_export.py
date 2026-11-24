@@ -13,8 +13,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, viewer_is_admin
 from api.dependencies import get_db_engine
+from store.options_provenance import oracle_predictions_from
 
 router = APIRouter(prefix="/api/v1/mcp", tags=["mcp-export"])
 
@@ -141,6 +142,7 @@ def mcp_predictions(
     lookback_days: int = Query(default=14, ge=1, le=90),
     limit: int = Query(default=20, ge=1, le=100),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Recent predictions with verdict and PnL."""
     engine = get_db_engine()
@@ -155,7 +157,7 @@ def mcp_predictions(
             "SELECT id, ticker, model_name, direction, confidence, "
             "entry_price, target_price, stop_price, verdict, "
             "actual_price, pnl, created_at, scored_at "
-            "FROM oracle_predictions "
+            "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
             "WHERE ticker = :ticker AND created_at >= :cutoff "
             "ORDER BY created_at DESC LIMIT :lim"
         )
@@ -164,7 +166,7 @@ def mcp_predictions(
             "SELECT id, ticker, model_name, direction, confidence, "
             "entry_price, target_price, stop_price, verdict, "
             "actual_price, pnl, created_at, scored_at "
-            "FROM oracle_predictions "
+            "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
             "WHERE created_at >= :cutoff "
             "ORDER BY created_at DESC LIMIT :lim"
         )
@@ -201,6 +203,7 @@ def mcp_prediction_accuracy(
     group_by: str = Query(default="model", description="model | ticker | direction"),
     lookback_days: int = Query(default=30, ge=1, le=365),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Prediction accuracy breakdown by model, ticker, or direction."""
     allowed_groups = {"model": "model_name", "ticker": "ticker", "direction": "direction"}
@@ -217,7 +220,7 @@ def mcp_prediction_accuracy(
         "SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials, "
         "SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses, "
         "AVG(pnl) AS avg_pnl "
-        "FROM oracle_predictions "
+        "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
         "WHERE verdict IS NOT NULL "
         "  AND scored_at >= :cutoff "
         "GROUP BY " + col + " "

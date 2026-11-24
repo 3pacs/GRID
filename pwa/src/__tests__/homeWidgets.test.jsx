@@ -318,3 +318,20 @@ describe('MoneyFlowCard (via WidgetGrid)', () => {
         });
     });
 });
+
+describe('a failed request is an error, never an empty answer (#959)', () => {
+    // api._fetch resolves failures to this truthy object instead of rejecting.
+    const failed = { error: true, status: 500, message: 'Internal Server Error' };
+
+    it.each([
+        ['watchlist', 'No stocks saved yet.', () => api.getWatchlist.mockResolvedValue(failed)],
+        ['news', 'It’s quiet — no big news right now.', () => api.getNewsMomentum.mockResolvedValue(failed)],
+        ['money_flow', 'Nothing notable moving right now.', () => api.getSectorFlows.mockResolvedValue(failed)],
+        ['macro_regime', 'The market read isn’t ready yet — check back shortly.', () => api.getCurrent.mockResolvedValue(failed)],
+    ])('%s shows the retry state, not "%s"', async (type, emptyText, arrange) => {
+        arrange();
+        render(<WidgetGrid widgets={[{ type }]} />);
+        expect(await screen.findByText('Try again')).toBeInTheDocument();
+        expect(screen.queryByText(emptyText)).not.toBeInTheDocument();
+    });
+});

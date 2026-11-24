@@ -624,3 +624,40 @@ Then remove `GRID_OPTIONS_DEDICATED_TIMER` from the `.env` (or set it to anythin
 but `1`) and restart grid-hermes and grid-scheduler as above. Until both restarts,
 the 16:00Z and 20:00Z slots are still handed off and the timer is off, so those
 slots skip. That leaves a gap, not a double run.
+
+## `GRID_ORACLE_SCHWAB=private-use` (grid-hermes; off until set)
+
+Owner decision 2026-11-23: the Oracle forecast engine counts as private use and
+may read Schwab captures (its entry quote and its options-signal row). The
+predictions it builds from them are tagged `flow_context.private_use = "schwab"`
+and reach admin requests only. Every reader that serves people, and every shared
+aggregate, reads `store.options_provenance.VISIBLE_ORACLE_PREDICTIONS`.
+
+That hiding lives in reader code, so a process still running an older release
+would read tagged rows as ordinary ones. Turn the switch on only in this order:
+
+1. Merge and deploy (grid-api, grid-hermes and grid-coordinator restart on the
+   release). The Oracle still reads non-Schwab rows only.
+2. Move every other long-running process that reads `oracle_predictions` onto
+   the same release: grid-intelligence and grid-scheduler through the
+   deploy.yml dispatch flags (each needs the owner's word), plus the long-running
+   grid_release units (for example grid-surfacer-backfill, grid-goal-worker,
+   astrogrid-api). Timers start fresh each run, so they need nothing. Check each
+   unit's process start time against the release switch time.
+3. Set `GRID_ORACLE_SCHWAB=private-use` in grid-hermes's environment and
+   restart grid-hermes.
+4. After the next hourly forward pass (:48), confirm SPY/QQQ rows carry the tag,
+   and that a contributor token's `/api/v1/oracle/predictions` and
+   `/api/v1/oracle/latest` do not return them while an admin token's do.
+
+Roll back: unset the variable and restart grid-hermes. Rows already tagged stay
+hidden from non-admin readers. Once any tagged row exists, never roll a reader
+back to a release older than #1396 (and the model-state fix after it): the
+older readers would serve tagged rows as ordinary ones. Disabling the producer
+is not enough on its own.
+
+Model state counts too. `oracle_models` holds running counters, cumulative
+P&L, weights and timestamps that the scorer and weight evolution update from
+every scored row, private ones included. Only an admin request reads them
+(`/oracle/scorecard` admin branch, scoreboard weights); everyone else gets
+public-cohort counts (`tests/test_oracle_model_state_private.py`).

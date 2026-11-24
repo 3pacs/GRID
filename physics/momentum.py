@@ -30,6 +30,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.availability import freshness
 from store.pit import PITStore
 
 
@@ -91,6 +92,13 @@ GDELT_TENSION_FEATURES = [
 # never run once, reporting "No price features available" instead.
 # tests/test_momentum_feature_contract.py fails on a name with no writer.
 PRICE_FEATURES = ["sp500_full"]
+
+# The tone composite counts as stale once its newest observation is this many
+# days behind as_of_date (same threshold as physics.news_energy). Without it a
+# 90-day window that ended weeks ago still read as the current state: the
+# actor-tone features stopped on 2026-11-06 and the DOC puller that wrote them
+# was retired on 2026-11-23, yet the endpoint kept answering available=True.
+TONE_STALE_AFTER_DAYS = 5
 
 
 class NewsMomentumAnalyzer:
@@ -164,16 +172,47 @@ class NewsMomentumAnalyzer:
             )
 
         details["data_points"] = matrix.shape[0]
-        details["features_available"] = list(tone_ids.keys())
+        # The PIT pivot only has a column for a feature with at least one row
+        # in the window, so a registered actor can be missing altogether.
+        present = {name: fid for name, fid in tone_ids.items() if fid in matrix.columns}
+        details["features_available"] = list(present.keys())
+        if not present:
+            return self._unavailable_result(
+                as_of_date,
+                note="No GDELT actor-tone feature has data in the window",
+                warning="No GDELT actor-tone data in the window",
+            )
 
         # Composite tone: average across whichever actor-tone columns have
         # data on a given date (any one actor query can come back empty).
-        tone_series = matrix[list(tone_ids.values())].mean(axis=1, skipna=True).dropna()
+        tone_series = matrix[list(present.values())].mean(axis=1, skipna=True).dropna()
         if len(tone_series) < 5:
             return self._unavailable_result(
                 as_of_date,
                 note="Insufficient non-null tone data",
                 warning="Too few non-null GDELT tone observations",
+            )
+
+        newest = pd.Timestamp(tone_series.index.max()).date()
+        tone_fresh = freshness(newest, stale_after_days=TONE_STALE_AFTER_DAYS, today=as_of_date)
+        details["tone_last_observed"] = newest.isoformat()
+        if tone_fresh.stale:
+            return self._unavailable_result(
+                as_of_date,
+                note=(
+                    f"GDELT actor-tone features end on {newest.isoformat()}, "
+                    f"{tone_fresh.age_days} days before {as_of_date.isoformat()}; "
+                    "no current news momentum can be computed"
+                ),
+                warning=(
+                    f"GDELT actor tone is stale: newest observation {newest.isoformat()} "
+                    f"(more than {TONE_STALE_AFTER_DAYS} days old)"
+                ),
+                extra_details={
+                    "tone_last_observed": newest.isoformat(),
+                    "tone_age_days": tone_fresh.age_days,
+                    "stale_after_days": TONE_STALE_AFTER_DAYS,
+                },
             )
 
         # 1) Sentiment trend: linear regression slope over lookback
@@ -210,16 +249,19 @@ class NewsMomentumAnalyzer:
             tension_matrix = self._load_matrix(
                 list(tension_ids.values()), start_date, as_of_date
             )
-            if not tension_matrix.empty:
+            tension_present = {
+                name: fid for name, fid in tension_ids.items() if fid in tension_matrix.columns
+            }
+            if not tension_matrix.empty and tension_present:
                 tension_series = (
-                    tension_matrix[list(tension_ids.values())]
+                    tension_matrix[list(tension_present.values())]
                     .mean(axis=1, skipna=True)
                     .dropna()
                 )
                 if len(tension_series) >= 5:
                     conflict_energy = self._compute_energy(tension_series)
                     details["conflict_energy"] = conflict_energy
-                    details["tension_features_available"] = list(tension_ids.keys())
+                    details["tension_features_available"] = list(tension_present.keys())
 
         summary = self._build_summary(
             sentiment_trend, momentum_direction, energy_state, conflict_energy,

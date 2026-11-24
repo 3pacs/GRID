@@ -24,17 +24,19 @@ Designed to be called by hermes_operator or via the API.
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from oracle.entry_price_policy import entry_price_score_note
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_ORACLE_PREDICTIONS, visible_sql
 
 
 # Lessons come from official verdicts (oracle.engine.score_expired_predictions),
@@ -55,6 +57,10 @@ FAILURE_CATEGORIES = [
     # distinct from "bad_data" so these rows can be counted and fixed rather
     # than averaged into the model's failure profile.
     "not_measured",
+    # Underlying spot at decision/entry time could not be resolved from any
+    # PIT-safe price source, so the underlying price path cannot be compared
+    # like-for-like against an entry basis.
+    "insufficient_data",
 ]
 
 
@@ -213,8 +219,25 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     if decision_opposing:
         data_at_decision["decision_signals_opposing"] = decision_opposing
 
-    # Load price path from entry to outcome
-    price_path = _load_price_path(engine, ticker, generated_at, closed_at or expiry)
+    # Load price path from entry to outcome, tracking which source supplied it
+    price_path, price_source = _load_price_path_with_source(
+        engine, ticker, generated_at, closed_at or expiry,
+    )
+
+    # Underlying spot at decision/entry time (PIT-safe, same price source as
+    # the path). options_recommendations.entry_price is the option premium, NOT
+    # underlying spot — never mix units when evaluating the underlying path.
+    # Only data known at generated_at may anchor it (Codex HOLD 6011903681),
+    # and reconstructed scanner context never does (Codex HOLD 6030815214);
+    # when nothing qualifies, the reason is kept with the record, not a guess.
+    underlying_spot, spot_note = _load_underlying_entry_spot(
+        engine, ticker, generated_at, data_at_decision, price_source=price_source,
+    )
+    if underlying_spot is not None:
+        data_at_decision["underlying_entry_spot"] = underlying_spot
+        data_at_decision["underlying_entry_spot_basis"] = spot_note
+    else:
+        data_at_decision["underlying_entry_spot_unavailable"] = spot_note
 
     # Classify the failure
     category, root_cause, signals_wrong, signals_right, what_missed = _classify_failure(
@@ -229,6 +252,8 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         price_path=price_path,
         data_at_decision=data_at_decision,
         sanity=sanity,
+        underlying_entry_price=underlying_spot,
+        generated_at=generated_at,
     )
 
     # What actually happened (factual summary)
@@ -236,7 +261,8 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         ticker, direction, entry_f, strike_f, outcome, actual_ret, price_path,
     )
 
-    # LLM narrative (or rule-based fallback)
+    # LLM narrative (or rule-based fallback). The narrative sees only active
+    # sanity layers; the stored data_at_decision keeps the raw record.
     llm_narrative = _get_llm_postmortem(
         ticker=ticker,
         direction=direction,
@@ -246,7 +272,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         category=category,
         root_cause=root_cause,
         what_happened=what_happened,
-        data_at_decision=data_at_decision,
+        data_at_decision={**data_at_decision, "sanity_status": _active_sanity(sanity)},
         price_path=price_path,
         signals_wrong=signals_wrong,
         signals_right=signals_right,
@@ -321,7 +347,7 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
                    anti_signals, flow_context, verdict, actual_price,
                    actual_move_pct, pnl_pct, scored_at, score_notes,
                    created_at
-            FROM oracle_predictions
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE id = :id
         """), {"id": prediction_id}).fetchone()
 
@@ -447,6 +473,12 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
 
     _store_postmortem(engine, pm, trade_id=None, prediction_id=prediction_id)
 
+    _emit_prediction_postmortem(
+        pm=pm,
+        prediction_id=prediction_id,
+        model_name=model_name,
+    )
+
     log.info(
         "Post-mortem generated for prediction {id} ({t} {d}): {cat}",
         id=prediction_id, t=ticker, d=direction, cat=category,
@@ -500,7 +532,7 @@ def batch_postmortem(
         ORDER BY closed_at DESC
     """
     pred_sql = """
-        SELECT id FROM oracle_predictions
+        SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE verdict = 'miss'
           AND scored_at >= :cutoff
           AND id NOT LIKE 'astrogrid:%'
@@ -661,20 +693,135 @@ def generate_lessons_learned(engine: Engine, postmortems: list[PostMortem]) -> s
 
 # ── Persistence ───────────────────────────────────────────────────────────
 
-_PRODUCER_MODULE = "intelligence.postmortem"
+# Canonical producer tags for PostmortemCompleted events.
+# Options-trade outcomes (options_recommendations / options scanner) are NOT
+# produced by oracle models and must carry OPTIONS_RECOMMENDER_PRODUCER so
+# oracle_weights skips oracle-model decay. Only oracle-prediction outcomes
+# carrying an exact model name use ORACLE_MODEL_PRODUCER_PREFIX.
+OPTIONS_RECOMMENDER_PRODUCER = "trading.options_recommender"
+ORACLE_MODEL_PRODUCER_PREFIX = "oracle.model:"
+_SELF_MODULE_NAME = "intelligence.postmortem"
+
+_OPTIONS_PRODUCER_ALIASES: frozenset[str] = frozenset({
+    "trading.options_recommender",
+    "options_recommender",
+    "options_recommendations",
+    "discovery.options_scanner",
+    "options_scanner",
+})
+
+
+def _oracle_model_producer(model_name: Any) -> str | None:
+    """Format an oracle prediction's ``model_name`` as ``oracle.model:<name>``."""
+    if not isinstance(model_name, str):
+        return None
+    name = model_name.strip()
+    if not name:
+        return None
+    low = name.lower()
+    if low in ("unknown", _SELF_MODULE_NAME) or any(ch.isspace() for ch in name):
+        return None
+    if name.startswith(ORACLE_MODEL_PRODUCER_PREFIX):
+        return _normalize_producer_key(name)
+    return f"{ORACLE_MODEL_PRODUCER_PREFIX}{name}"
+
+
+def _normalize_producer_key(raw: Any) -> str | None:
+    """Normalize a mapped producer identifier onto a canonical producer key.
+
+    Recognizes only:
+      - Options recommender / scanner producers -> ``"trading.options_recommender"``
+      - Explicit oracle-model tags ``"oracle.model:<model_name>"``
+
+    Returns ``None`` (→ skip) for unmapped, blank, or self-attributed values
+    rather than passing arbitrary strings through.
+    """
+    if not isinstance(raw, str):
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    low = val.lower()
+    if low in (_SELF_MODULE_NAME, "unknown"):
+        return None
+    if low in _OPTIONS_PRODUCER_ALIASES:
+        return OPTIONS_RECOMMENDER_PRODUCER
+    if val.startswith(ORACLE_MODEL_PRODUCER_PREFIX):
+        model_name = val[len(ORACLE_MODEL_PRODUCER_PREFIX):].strip()
+        if (
+            not model_name
+            or model_name.lower() in ("unknown", _SELF_MODULE_NAME)
+            or any(ch.isspace() for ch in model_name)
+        ):
+            return None
+        return f"{ORACLE_MODEL_PRODUCER_PREFIX}{model_name}"
+    return None
+
+
+def _resolve_originating_producer(
+    pm: "PostMortem",
+    producer_module: str | None = None,
+    *,
+    is_options_trade: bool = False,
+) -> str:
+    """Resolve the canonical ``producer_module`` for a postmortem event.
+
+    - Options-trade outcomes (derived from ``options_recommendations`` / the
+      scanner) resolve to ``"trading.options_recommender"``.
+    - Oracle-prediction outcomes with a valid ``model_name`` resolve to
+      ``"oracle.model:<model_name>"``.
+    - Unmapped explicit values or unattributed outcomes never pass through and
+      never return ``"intelligence.postmortem"``; they log a warning and return
+      ``"unknown"``.
+    """
+    if producer_module is not None:
+        explicit = _normalize_producer_key(producer_module)
+        if explicit:
+            return explicit
+        log.warning(
+            "postmortem: unmapped producer_module={p!r} for trade {tid} ({t}); "
+            "emitting producer_module='unknown'",
+            p=producer_module, tid=pm.trade_id, t=pm.ticker,
+        )
+        return "unknown"
+
+    if is_options_trade or (isinstance(pm.trade_id, int) and pm.trade_id > 0):
+        return OPTIONS_RECOMMENDER_PRODUCER
+
+    data = pm.data_at_decision if isinstance(pm.data_at_decision, dict) else {}
+
+    oracle_model = _oracle_model_producer(data.get("model_name"))
+    if oracle_model:
+        return oracle_model
+
+    for key in ("producer_module", "source_module"):
+        resolved = _normalize_producer_key(data.get(key))
+        if resolved:
+            return resolved
+
+    if "scanner_signals" in data or "decision_signals" in data:
+        return OPTIONS_RECOMMENDER_PRODUCER
+
+    log.warning(
+        "postmortem: originating producer unknown for trade {tid} ({t}); "
+        "emitting producer_module='unknown'",
+        tid=pm.trade_id, t=pm.ticker,
+    )
+    return "unknown"
 
 
 def _verdict_from_outcome(outcome: str) -> str:
     """Map free-text outcome strings onto the PostmortemCompleted verdict
     enum ({HIT, MISS, PARTIAL}). Trade postmortems only run on failures
-    so the default is ``MISS``.
+    so the default is ``MISS``. ``EXPIRED`` options expired worthless
+    (intrinsic <= 0, -100% return) and map to ``MISS`` (total loss).
     """
     if not outcome:
         return "MISS"
     s = str(outcome).strip().upper()
     if s in {"HIT", "WIN"}:
         return "HIT"
-    if s in {"PARTIAL", "NEUTRAL", "EXPIRED"}:
+    if s in {"PARTIAL", "NEUTRAL"}:
         return "PARTIAL"
     return "MISS"
 
@@ -712,7 +859,12 @@ def _build_signals_used_from_pm(
     return refs
 
 
-def _emit_trade_postmortem(*, pm: "PostMortem", trade_id: int) -> None:
+def _emit_trade_postmortem(
+    *,
+    pm: "PostMortem",
+    trade_id: int,
+    producer_module: str | None = None,
+) -> None:
     """Non-fatal PostmortemCompleted emit for the trade postmortem path."""
     try:
         from decimal import Decimal
@@ -744,11 +896,16 @@ def _emit_trade_postmortem(*, pm: "PostMortem", trade_id: int) -> None:
     # ``contributing_signal_ids`` must be a list of UUIDs only — reuse
     # the signal_id from each SignalRef so the two fields agree.
     contributing_ids = [r.signal_id for r in signals_used]
+    origin_producer = _resolve_originating_producer(
+        pm,
+        producer_module=producer_module,
+        is_options_trade=True,
+    )
 
     try:
         _emit(
             PostmortemCompleted(
-                producer_module=_PRODUCER_MODULE,
+                producer_module=origin_producer,
                 correlation_id=corr_id,
                 prediction_id=prediction_uuid,
                 ticker=str(pm.ticker).upper(),
@@ -763,6 +920,83 @@ def _emit_trade_postmortem(*, pm: "PostMortem", trade_id: int) -> None:
         log.debug(
             "postmortem emit failed for trade {i}: {e}",
             i=trade_id, e=str(exc),
+        )
+
+
+def _emit_prediction_postmortem(
+    *,
+    pm: "PostMortem",
+    prediction_id: str,
+    model_name: str | None = None,
+) -> None:
+    """Non-fatal PostmortemCompleted emit for the oracle-prediction postmortem path.
+
+    Attributes the event to ``oracle.model:<model_name>`` only when the
+    prediction carries a valid oracle model name; otherwise emits ``"unknown"``
+    so ``oracle_weights`` skips decay cleanly.
+    """
+    try:
+        from decimal import Decimal
+        from uuid import UUID, uuid5, NAMESPACE_URL
+
+        from contracts.correlation import (
+            get_current_correlation_id,
+            new_correlation_id,
+        )
+        from contracts.emit import emit as _emit
+        from contracts.schemas import PostmortemCompleted
+    except Exception as exc:  # pragma: no cover — defensive import guard
+        log.debug("postmortem: contracts import failed: {e}", e=str(exc))
+        return
+
+    try:
+        corr_id = get_current_correlation_id() or new_correlation_id()
+    except Exception:
+        return
+
+    try:
+        try:
+            prediction_uuid = UUID(str(prediction_id))
+        except (ValueError, TypeError):
+            prediction_uuid = uuid5(
+                NAMESPACE_URL, f"grid:pm:prediction:{prediction_id}:{pm.ticker}"
+            )
+    except Exception:
+        return
+
+    signals_used = _build_signals_used_from_pm(pm)
+    contributing_ids = [r.signal_id for r in signals_used]
+
+    resolved_model = model_name
+    if not resolved_model and isinstance(pm.data_at_decision, dict):
+        resolved_model = pm.data_at_decision.get("model_name")
+    origin_producer = _oracle_model_producer(resolved_model)
+    if not origin_producer:
+        log.warning(
+            "postmortem: oracle prediction {pid} ({t}) has no valid model_name; "
+            "emitting producer_module='unknown'",
+            pid=prediction_id, t=pm.ticker,
+        )
+        origin_producer = "unknown"
+
+    try:
+        _emit(
+            PostmortemCompleted(
+                producer_module=origin_producer,
+                correlation_id=corr_id,
+                prediction_id=prediction_uuid,
+                ticker=str(pm.ticker).upper(),
+                verdict=_verdict_from_outcome(pm.outcome),
+                realized_pnl=Decimal(str(float(pm.actual_return or 0.0))),
+                signals_used=signals_used,
+                root_cause=str(pm.root_cause or "")[:2000],
+                contributing_signal_ids=contributing_ids,
+            )
+        )
+    except Exception as exc:  # non-fatal per SYNTH-C contract
+        log.debug(
+            "postmortem emit failed for prediction {i}: {e}",
+            i=prediction_id, e=str(exc),
         )
 
 
@@ -1132,6 +1366,221 @@ def _parse_json(val: Any) -> Any:
     return {}
 
 
+def _to_date(val: Any) -> date | None:
+    """Coerce a date, datetime, or ISO string to a ``date``, else None."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    try:
+        s = str(val).strip()
+        if not s:
+            return None
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date() if ("T" in s or " " in s) else date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _finite_positive(val: Any) -> float | None:
+    """Return float(val) if it is a finite positive number (not bool), else None."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0.0:
+        return None
+    return f
+
+
+# ── Decision clock (Codex HOLD 6011903681) ───────────────────────────────
+#
+# A postmortem attributes a failure by comparing the underlying path with an
+# entry anchor. The anchor, and the scanner context beside it, must be what
+# GRID held at ``generated_at``: never that day's later close (an 11:00 ET
+# decision has no 16:00 close), never a vintage pulled after the decision, and
+# never a guess when nothing was known -- then the postmortem abstains
+# (``insufficient_data``) and records why.
+#
+# * raw closes: ``evaluation.prices.CompletedCloseAccessor`` (through
+#   ``store.observations.read_completed_closes``): a label counts only from a
+#   pull at or after 17:00 ET on its session day and at or before the clock,
+#   so a same-day close counts only when the decision came after it, a later
+#   revision is invisible, and disagreeing completed vintages abstain;
+# * ``options_daily_signals``: one mutable row per (ticker, signal_date) whose
+#   ``created_at`` is its last-write time (``ingestion/options.py`` upsert).
+#   Only a row last written by the clock is read for its values; a row
+#   written or revised later is read for its date and write time alone, to
+#   say why an older row is shown.
+#
+# What the reconstruction proves (Codex HOLD 6030815214). ``created_at`` is
+# ``NOW()``, the writing transaction's start, so it can precede the commit;
+# an old visible row can hide a gap in the same session; and
+# options_recommendations records no lineage (scanner row id or capture
+# batch) of the values the recommender consumed (analysis/thesis_scorer.py:
+# not reproducible). So the scanner row, and the regime and capital-flow
+# rows read by date only, go under ``descriptive_context`` with
+# DESCRIPTIVE_CONTEXT_LABEL: shown, dated and explained, but never the
+# consumed row, an entry anchor or an attribution input. Scanner values
+# drive attribution only as ``scanner_signals`` carrying recorded
+# ``lineage``, which nothing in GRID writes today.
+
+_ET = ZoneInfo("America/New_York")
+# Calendar days searched back for the last completed close: any weekend plus
+# a holiday run; older than that is not an entry anchor.
+ENTRY_CLOSE_LOOKBACK_DAYS = 7
+
+DESCRIPTIVE_CONTEXT_LABEL = (
+    "descriptive only: not proven known at decision, not the inputs the "
+    "recommendation consumed, never an entry anchor or an attribution input"
+)
+SCANNER_ATTRIBUTION_ABSTAINED = (
+    "scanner-based attribution abstained: no lineage from the recommendation to an "
+    "options_daily_signals row is recorded, and created_at is a write-start proxy"
+)
+_DATE_ONLY_BASIS = "read by date only, not proven known at decision"
+_SCANNER_NOT_AN_ANCHOR = (
+    "the price path is options_daily_signals, whose spot values are descriptive "
+    "context only (no recorded lineage; created_at is a write-start proxy), so none "
+    "is a decision-quality entry anchor"
+)
+
+_SCANNER_ROW_SQL = (
+    "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price, "
+    "total_oi, term_structure_slope, oi_concentration, signal_date, created_at "
+    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+    "WHERE ticker = :t AND signal_date <= :d AND created_at <= :decision_ts "
+    "ORDER BY signal_date DESC LIMIT 1"
+)
+
+# Date and write time only: never the values of a row written after the clock.
+_SCANNER_NEWEST_SQL = (
+    "SELECT signal_date, created_at FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+    "WHERE ticker = :t AND signal_date <= :d "
+    "ORDER BY signal_date DESC LIMIT 1"
+)
+
+
+def _decision_clock(val: Any) -> datetime | None:
+    """``val`` as an aware UTC instant, or None when it is not a timestamp.
+
+    A naive datetime is taken as UTC (griddb runs Etc/UTC). A bare date (or
+    date-only string) has no time of day, so it cannot say whether that day's
+    close or scanner row existed yet: None, and the caller abstains.
+    """
+    if isinstance(val, datetime):
+        if val.tzinfo is None or val.utcoffset() is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    if isinstance(val, str):
+        s = val.strip()
+        if "T" not in s and " " not in s:
+            return None
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return _decision_clock(parsed)
+    return None
+
+
+def _decision_session_date(clock: datetime) -> date:
+    """The New York calendar date of the decision clock (session dates are ET)."""
+    return clock.astimezone(_ET).date()
+
+
+def _no_clock_note(decision_date: Any) -> str:
+    return (
+        f"decision clock {decision_date!r} is not a timestamp, so no value can be "
+        f"shown to have been known at decision time"
+    )
+
+
+def _scanner_row_known_at(conn: Any, ticker: str, clock: datetime) -> Any:
+    """Newest visible ``options_daily_signals`` row last written by ``clock``.
+
+    Bounded twice: ``signal_date`` on or before the clock's ET date, and
+    ``created_at`` at or before the clock. ``created_at`` is re-checked here
+    so a NULL or unparseable write time never passes.
+    """
+    row = conn.execute(
+        visible_sql(_SCANNER_ROW_SQL),
+        {"t": ticker, "d": _decision_session_date(clock), "decision_ts": clock},
+    ).fetchone()
+    if row is None:
+        return None
+    written = _decision_clock(row[9])
+    if written is None or written > clock:
+        return None
+    return row
+
+
+def _scanner_with_lineage(data_at_decision: dict[str, Any]) -> dict[str, Any]:
+    """``scanner_signals`` when it carries recorded lineage to the recommendation, else ``{}``.
+
+    Only such values may anchor or drive attribution (Codex HOLD 6030815214).
+    A reconstructed options_daily_signals row has none: it is descriptive.
+    """
+    scanner = data_at_decision.get("scanner_signals")
+    if not isinstance(scanner, dict):
+        return {}
+    lineage = scanner.get("lineage")
+    return scanner if isinstance(lineage, str) and lineage.strip() else {}
+
+
+def _scanner_context_at(conn: Any, ticker: str, clock: datetime) -> tuple[dict[str, Any] | None, str]:
+    """The newest scanner row written by ``clock`` as labelled context, or why there is none.
+
+    The row carries its ``signal_date``, ``created_at``, ``age_days`` (calendar
+    days to the decision's ET date) and a ``reason``. ``fallback`` is True when
+    a newer row existed but was written after the clock (or at no recorded
+    time); only that row's date and write time are read.
+    """
+    session = _decision_session_date(clock)
+    row = _scanner_row_known_at(conn, ticker, clock)
+    if row is None:
+        return None, (
+            f"no options_daily_signals row for {ticker} dated on or before "
+            f"{session.isoformat()} was last written by the decision clock {clock.isoformat()}"
+        )
+    signal_date = _to_date(row[8])
+    newest = conn.execute(visible_sql(_SCANNER_NEWEST_SQL), {"t": ticker, "d": session}).fetchone()
+    newest_date = _to_date(newest[0]) if newest is not None else None
+    fallback = newest_date is not None and signal_date is not None and newest_date > signal_date
+    if fallback:
+        newest_written = _decision_clock(newest[1])
+        reason = (
+            f"newest row written after decision: options_daily_signals {newest_date.isoformat()} "
+            f"was written {newest_written.isoformat()}, after decision clock {clock.isoformat()}"
+            if newest_written is not None else
+            f"newest row has no recorded write time: options_daily_signals "
+            f"{newest_date.isoformat()} cannot be shown written by decision clock {clock.isoformat()}"
+        ) + "; this older row is context only"
+    else:
+        reason = (
+            f"newest visible row at decision clock {clock.isoformat()}; created_at is a "
+            f"write-start proxy, so its visibility at the decision is not proven"
+        )
+    return {
+        "put_call_ratio": float(row[0]) if row[0] else None,
+        "iv_atm": float(row[1]) if row[1] else None,
+        "iv_skew": float(row[2]) if row[2] else None,
+        "max_pain": float(row[3]) if row[3] else None,
+        "spot_price": float(row[4]) if row[4] else None,
+        "total_oi": float(row[5]) if row[5] else None,
+        "term_structure_slope": float(row[6]) if row[6] else None,
+        "oi_concentration": float(row[7]) if row[7] else None,
+        "signal_date": str(row[8]) if row[8] else None,
+        "created_at": _decision_clock(row[9]).isoformat(),
+        "age_days": (session - signal_date).days if signal_date is not None else None,
+        "fallback": fallback,
+        "reason": reason,
+    }, ""
+
+
 def _reconstruct_decision_data(
     engine: Engine,
     ticker: str,
@@ -1141,52 +1590,40 @@ def _reconstruct_decision_data(
 ) -> dict[str, Any]:
     """Reconstruct the data state at the time a recommendation was made.
 
-    Gathers scanner signals, GEX data, and regime context that were
-    available on the decision date.
+    ``sanity_status`` and ``dealer_context`` are the recommendation's own
+    record. The scanner row (:func:`_scanner_context_at`) and the regime and
+    capital-flow rows (read by date only) go under ``descriptive_context``
+    with DESCRIPTIVE_CONTEXT_LABEL: they are not proven known at decision and
+    are never an entry anchor or an attribution input (Codex HOLD 6030815214).
+    ``scanner_attribution_unavailable`` records why scanner-based attribution
+    abstains.
     """
+    context: dict[str, Any] = {"label": DESCRIPTIVE_CONTEXT_LABEL}
     data: dict[str, Any] = {
         "sanity_status": sanity,
         "dealer_context": dealer_context,
+        "descriptive_context": context,
+        "scanner_attribution_unavailable": SCANNER_ATTRIBUTION_ABSTAINED,
     }
 
-    if not decision_date:
+    as_of = _to_date(decision_date)
+    if as_of is None:
         return data
-
-    # Coerce to date
-    if isinstance(decision_date, datetime):
-        as_of = decision_date.date()
-    elif isinstance(decision_date, date):
-        as_of = decision_date
-    else:
-        try:
-            as_of = datetime.fromisoformat(str(decision_date)).date()
-        except (ValueError, TypeError):
-            return data
+    data["decision_date"] = as_of.isoformat()
+    clock = _decision_clock(decision_date)
 
     with engine.connect() as conn:
-        # Options scanner signals near decision date
-        opt_row = conn.execute(visible_sql("""
-            SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
-                   total_oi, term_structure_slope, oi_concentration, signal_date
-            FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
-            WHERE ticker = :t AND signal_date <= :d
-            ORDER BY signal_date DESC LIMIT 1
-        """), {"t": ticker, "d": as_of}).fetchone()
+        # Options scanner row written by the decision clock: context only
+        if clock is None:
+            context["scanner_unavailable"] = _no_clock_note(decision_date)
+        else:
+            scanner, why_not = _scanner_context_at(conn, ticker, clock)
+            if scanner is None:
+                context["scanner_unavailable"] = why_not
+            else:
+                context["scanner"] = scanner
 
-        if opt_row:
-            data["scanner_signals"] = {
-                "put_call_ratio": float(opt_row[0]) if opt_row[0] else None,
-                "iv_atm": float(opt_row[1]) if opt_row[1] else None,
-                "iv_skew": float(opt_row[2]) if opt_row[2] else None,
-                "max_pain": float(opt_row[3]) if opt_row[3] else None,
-                "spot_price": float(opt_row[4]) if opt_row[4] else None,
-                "total_oi": float(opt_row[5]) if opt_row[5] else None,
-                "term_structure_slope": float(opt_row[6]) if opt_row[6] else None,
-                "oi_concentration": float(opt_row[7]) if opt_row[7] else None,
-                "signal_date": str(opt_row[8]) if opt_row[8] else None,
-            }
-
-        # Regime at decision time
+        # Regime on or before the decision date: context only
         regime_row = conn.execute(text("""
             SELECT inferred_state, state_confidence, transition_probability
             FROM decision_journal
@@ -1195,13 +1632,14 @@ def _reconstruct_decision_data(
         """), {"d": as_of}).fetchone()
 
         if regime_row:
-            data["regime"] = {
+            context["regime"] = {
                 "state": regime_row[0],
                 "confidence": float(regime_row[1]) if regime_row[1] else None,
                 "transition_prob": float(regime_row[2]) if regime_row[2] else None,
+                "basis": "decision_journal " + _DATE_ONLY_BASIS,
             }
 
-        # Capital flow context at decision time
+        # Capital flow snapshot on or before the decision date: context only
         flow_row = conn.execute(text("""
             SELECT narrative, snapshot_date
             FROM capital_flow_snapshots
@@ -1210,40 +1648,30 @@ def _reconstruct_decision_data(
         """), {"d": as_of}).fetchone()
 
         if flow_row:
-            data["flow_narrative"] = str(flow_row[0])[:500] if flow_row[0] else None
-            data["flow_date"] = str(flow_row[1]) if flow_row[1] else None
+            context["capital_flow"] = {
+                "narrative": str(flow_row[0])[:500] if flow_row[0] else None,
+                "snapshot_date": str(flow_row[1]) if flow_row[1] else None,
+                "basis": "capital_flow_snapshots " + _DATE_ONLY_BASIS,
+            }
 
     return data
 
 
-def _load_price_path(
+def _load_price_path_with_source(
     engine: Engine,
     ticker: str,
     start_date: Any,
     end_date: Any,
-) -> list[dict]:
-    """Load day-by-day price data from entry to exit.
+) -> tuple[list[dict], str | None]:
+    """Load day-by-day underlying price data from entry to exit plus source tag.
 
-    Returns a list of {date, price} dicts.
+    Returns ``(path, source)`` where ``source`` is ``"options_daily_signals"``,
+    ``"raw_series"``, or ``None`` when no rows were found.
     """
-    if not start_date or not end_date:
-        return []
-
-    # Coerce dates
-    def _to_date(val: Any) -> date | None:
-        if isinstance(val, datetime):
-            return val.date()
-        if isinstance(val, date):
-            return val
-        try:
-            return datetime.fromisoformat(str(val)).date()
-        except (ValueError, TypeError):
-            return None
-
     start = _to_date(start_date)
     end = _to_date(end_date)
     if not start or not end:
-        return []
+        return [], None
 
     path: list[dict] = []
 
@@ -1258,22 +1686,152 @@ def _load_price_path(
 
         if rows:
             for r in rows:
-                path.append({"date": str(r[0]), "price": float(r[1])})
-            return path
+                price = _finite_positive(r[1])
+                if price is not None:
+                    path.append({"date": str(r[0]), "price": price})
+            if path:
+                return path, "options_daily_signals"
 
-        # Fallback to raw_series
+        # Fallback to raw_series (latest vintage per obs_date)
         rows = conn.execute(text("""
             SELECT obs_date, value FROM raw_series
             WHERE series_id = :sid
               AND obs_date >= :s AND obs_date <= :e
               AND pull_status = 'SUCCESS'
-            ORDER BY obs_date
+              AND value > 0
+            ORDER BY obs_date ASC, pull_timestamp DESC
         """), {"sid": f"YF:{ticker}:close", "s": start, "e": end}).fetchall()
 
+        seen_dates: set[str] = set()
         for r in rows:
-            path.append({"date": str(r[0]), "price": float(r[1])})
+            d_str = str(r[0])
+            if d_str in seen_dates:
+                continue
+            price = _finite_positive(r[1])
+            if price is not None:
+                seen_dates.add(d_str)
+                path.append({"date": d_str, "price": price})
 
+    return (path, "raw_series") if path else ([], None)
+
+
+def _load_price_path(
+    engine: Engine,
+    ticker: str,
+    start_date: Any,
+    end_date: Any,
+) -> list[dict]:
+    """Load day-by-day price data from entry to exit.
+
+    Returns a list of {date, price} dicts.
+    """
+    path, _ = _load_price_path_with_source(engine, ticker, start_date, end_date)
     return path
+
+
+def _load_underlying_entry_spot(
+    engine: Engine,
+    ticker: str,
+    decision_date: Any,
+    data_at_decision: dict[str, Any],
+    *,
+    price_source: str | None = None,
+) -> tuple[float | None, str]:
+    """Return ``(spot, note)``: the underlying entry anchor known at ``decision_date``.
+
+    ``decision_date`` is the decision clock (``generated_at``). The anchor
+    shares the price source that supplied ``price_path``:
+      - ``"raw_series"`` or ``None`` (no path loaded): the newest completed
+        ``YF:{ticker}:close`` known at the clock
+        (:class:`evaluation.prices.CompletedCloseAccessor`);
+      - ``"options_daily_signals"``: none. Its spot values are descriptive
+        context, not proven known at decision (Codex HOLD 6030815214), and a
+        raw close is not mixed into that path.
+    Scanner values with recorded lineage (:func:`_scanner_with_lineage`) are
+    the one scanner anchor; nothing in GRID records that lineage today.
+
+    ``note`` names the basis when a spot is returned, and otherwise why none
+    was provably known. Never falls back to option premium, to a close of a
+    session that had not ended by the clock, or to a vintage pulled after it.
+    """
+    clock = _decision_clock(decision_date)
+    if clock is None:
+        return None, _no_clock_note(decision_date)
+    unknown = f"no underlying entry spot for {ticker} was known at decision clock {clock.isoformat()}: "
+
+    linked = _scanner_with_lineage(data_at_decision)
+    linked_spot = _finite_positive(linked.get("spot_price"))
+    if price_source != "raw_series" and linked_spot is not None:
+        return linked_spot, (
+            f"options_daily_signals {linked.get('signal_date')} with recorded lineage "
+            f"({linked.get('lineage')})"
+        )
+    if price_source == "options_daily_signals":
+        return None, unknown + _SCANNER_NOT_AN_ANCHOR
+
+    with engine.connect() as conn:
+        spot, note = _completed_close_known_at(conn, ticker, clock)
+    if spot is not None:
+        return spot, note
+    return None, unknown + note
+
+
+def _completed_close_known_at(conn: Any, ticker: str, clock: datetime) -> tuple[float | None, str]:
+    """Newest completed raw close of ``ticker`` known at ``clock``, or why there is none."""
+    from evaluation.prices import (
+        AmbiguousPriceError,
+        CompletedCloseAccessor,
+        UnsupportedInstrumentError,
+    )
+
+    session = _decision_session_date(clock)
+    start = session - timedelta(days=ENTRY_CLOSE_LOOKBACK_DAYS)
+    try:
+        point = CompletedCloseAccessor(conn, start=start, evaluated_at=clock)(ticker, session)
+    except AmbiguousPriceError as exc:
+        return None, f"completed close is ambiguous ({exc})"
+    except UnsupportedInstrumentError as exc:
+        return None, f"no completed-close policy for {ticker!r} ({exc})"
+    if point is None:
+        return None, (
+            f"no completed YF:{ticker}:close from {start.isoformat()} to "
+            f"{session.isoformat()} was pulled by the clock"
+        )
+    spot = _finite_positive(point.value)
+    if spot is None:
+        return None, f"completed close {point.obs_date.isoformat()} is not a positive price"
+    return spot, (
+        f"{point.source_ref} {point.obs_date.isoformat()}, pulled after its close "
+        f"and at or before decision clock {clock.isoformat()}"
+    )
+
+
+def _active_sanity(sanity: dict | None) -> dict:
+    """The sanity layers that count as evidence in a post-mortem.
+
+    A shadow verdict is kept in the raw record (``sanity_results_at_decision``
+    and ``data_at_decision``) but never attributed as a right or wrong signal,
+    never counted toward ``model_error`` and never shown to the narrative LLM
+    as evidence (Codex review 6030902445 on #1400). A layer is shadow when its
+    entry says ``"shadow": true`` (rows written since #1400) or when it is a
+    shadow check by name (``trading.options_recommender.SHADOW_CHECKS``:
+    CROSS_ASSET).
+
+    The name rule also covers the rows persisted before #1400, which carry no
+    flag. On griddb (2026-11-23) all 778 had CROSS_ASSET = PASS (only passing
+    recommendations were stored). Those verdicts came from the momentum read
+    #1400 replaced: WTI crude for CL, a fake 0% for every other ticker. They
+    are no evidence either, so excluding them removes only a
+    ``sanity_CROSS_ASSET_passed`` from ``signals_right`` and can never change
+    a failure category.
+    """
+    from trading.options_recommender import SHADOW_CHECKS
+
+    return {
+        layer: result for layer, result in (sanity or {}).items()
+        if layer not in SHADOW_CHECKS
+        and not (isinstance(result, dict) and result.get("shadow") is True)
+    }
 
 
 def _classify_failure(
@@ -1289,8 +1847,23 @@ def _classify_failure(
     price_path: list[dict],
     data_at_decision: dict,
     sanity: dict,
+    underlying_entry_price: float | None = None,
+    generated_at: Any = None,
 ) -> tuple[str, str, list[str], list[str], str]:
     """Classify a trade failure into a category with root cause analysis.
+
+    ``entry_price`` on ``options_recommendations`` is the OPTION PREMIUM;
+    ``price_path`` is UNDERLYING spot. Directional timing is always computed
+    against ``underlying_entry_price`` (or a lineage-backed scanner
+    ``spot_price``), never against the option premium. If no underlying
+    entry spot is available, fails closed with ``"insufficient_data"``.
+
+    Scanner values (signal names, staleness, spot) count only as
+    ``scanner_signals`` with recorded lineage (:func:`_scanner_with_lineage`);
+    ``descriptive_context`` is never read here (Codex HOLD 6030815214).
+
+    Only active sanity layers (:func:`_active_sanity`) are attributed or
+    counted; shadow verdicts are not evidence.
 
     Returns:
         (failure_category, root_cause, signals_wrong, signals_right, what_we_missed)
@@ -1298,27 +1871,10 @@ def _classify_failure(
     signals_wrong: list[str] = []
     signals_right: list[str] = []
     what_missed = ""
+    active_sanity = _active_sanity(sanity)
 
-    # Check if direction was ever right during the trade. `move_pct` divides
-    # by the entry, so an entry that is None, zero or negative is settled
-    # before the loop: `None > 0` raises and a zero basis is not a 0% move.
-    direction_was_right_at_some_point = False
-    max_favorable_move = 0.0
-    if price_path and entry_price is not None and entry_price > 0:
-        for p in price_path:
-            price = p.get("price", 0)
-            if not price:
-                continue
-            move_pct = (price - entry_price) / entry_price * 100
-            if direction == "CALL" and move_pct > 0:
-                direction_was_right_at_some_point = True
-                max_favorable_move = max(max_favorable_move, move_pct)
-            elif direction == "PUT" and move_pct < 0:
-                direction_was_right_at_some_point = True
-                max_favorable_move = max(max_favorable_move, abs(move_pct))
-
-    # Check scanner signals
-    scanner = data_at_decision.get("scanner_signals", {})
+    # Check scanner signals: only those with recorded lineage to the recommendation
+    scanner = _scanner_with_lineage(data_at_decision)
     if scanner:
         pcr = scanner.get("put_call_ratio")
         if pcr is not None:
@@ -1349,14 +1905,56 @@ def _classify_failure(
             else:
                 signals_wrong.append("max_pain_neutral")
 
-    # Check sanity layers
-    for layer, result in sanity.items():
+    # Check sanity layers (active only: shadow verdicts are not signals)
+    for layer, result in active_sanity.items():
         if isinstance(result, dict):
             status = result.get("status", "")
             if status == "FAIL":
                 signals_wrong.append(f"sanity_{layer}_failed")
             elif status == "PASS":
                 signals_right.append(f"sanity_{layer}_passed")
+
+    # Resolve underlying entry spot — NEVER substitute option premium entry_price.
+    # When the loader recorded why no anchor was known at the decision clock,
+    # that abstention stands: no other price source is tried here.
+    abstained = data_at_decision.get("underlying_entry_spot_unavailable")
+    spot_basis = (
+        _finite_positive(underlying_entry_price)
+        or _finite_positive(data_at_decision.get("underlying_entry_spot"))
+        or (None if abstained else _finite_positive((scanner or {}).get("spot_price")))
+    )
+    if spot_basis is None:
+        log.warning(
+            "Post-mortem: missing underlying entry spot for {t}; "
+            "labeling insufficient_data instead of guessing",
+            t=ticker,
+        )
+        why = f" {abstained}." if abstained else ""
+        return (
+            "insufficient_data",
+            f"Underlying spot price at entry time is unavailable for {ticker}; "
+            f"cannot compare underlying price path against option premium.{why}",
+            signals_wrong,
+            signals_right,
+            "Underlying entry spot price was not available at decision time.",
+        )
+
+    # Check if direction was ever right during the trade (underlying vs underlying)
+    direction_was_right_at_some_point = False
+    max_favorable_move = 0.0
+    dir_upper = (direction or "").strip().upper()
+    if price_path:
+        for p in price_path:
+            price = _finite_positive(p.get("price"))
+            if price is None:
+                continue
+            move_pct = (price - spot_basis) / spot_basis * 100
+            if dir_upper in ("CALL", "LONG") and move_pct > 0:
+                direction_was_right_at_some_point = True
+                max_favorable_move = max(max_favorable_move, move_pct)
+            elif dir_upper in ("PUT", "SHORT") and move_pct < 0:
+                direction_was_right_at_some_point = True
+                max_favorable_move = max(max_favorable_move, abs(move_pct))
 
     # Classify
     # 1. Right direction, wrong timing
@@ -1370,22 +1968,22 @@ def _classify_failure(
         what_missed = "Expiry was too short or position should have been rolled."
         return category, root_cause, signals_wrong, signals_right, what_missed
 
-    # 2. Bad data — check for stale signals
-    scanner_date = data_at_decision.get("scanner_signals", {}).get("signal_date")
-    if scanner_date:
-        try:
-            sig_date = datetime.fromisoformat(str(scanner_date)).date() if "T" in str(scanner_date) else date.fromisoformat(str(scanner_date))
-            expiry_d = datetime.fromisoformat(str(expiry)).date() if isinstance(expiry, str) else expiry
-            if isinstance(expiry_d, date) and (expiry_d - sig_date).days > 7:
+    # 2. Bad data — check for stale signals at decision/entry time (NOT future expiry)
+    scanner_date = (scanner or {}).get("signal_date")
+    decision_ref = generated_at if generated_at is not None else data_at_decision.get("decision_date")
+    if scanner_date and decision_ref is not None:
+        sig_date = _to_date(scanner_date)
+        decision_d = _to_date(decision_ref)
+        if sig_date is not None and decision_d is not None:
+            signal_age_days = (decision_d - sig_date).days
+            if signal_age_days > 7:
                 category = "bad_data"
                 root_cause = (
-                    f"Scanner signals were {(expiry_d - sig_date).days} days old at decision time. "
+                    f"Scanner signals were {signal_age_days} days old at decision time. "
                     f"Data may have been stale."
                 )
                 what_missed = "Data freshness check should have flagged stale signals."
                 return category, root_cause, signals_wrong, signals_right, what_missed
-        except (ValueError, TypeError):
-            pass
 
     # 3. Check for external shock — large sudden move against position
     if price_path and len(price_path) >= 2:
@@ -1407,9 +2005,9 @@ def _classify_failure(
                     )
                     return category, root_cause, signals_wrong, signals_right, what_missed
 
-    # 4. Check sanity failures — potential model error
+    # 4. Check sanity failures — potential model error (shadow FAILs never count)
     failed_sanity_count = sum(
-        1 for v in sanity.values()
+        1 for v in active_sanity.values()
         if isinstance(v, dict) and v.get("status") == "FAIL"
     )
     if failed_sanity_count >= 2:
@@ -1424,7 +2022,7 @@ def _classify_failure(
     # 5. Default: wrong signal
     category = "wrong_signal"
     root_cause = (
-        f"Scanner signals pointed {direction} for {ticker} but the underlying "
+        f"The {direction} recommendation for {ticker} was wrong: the underlying "
         f"moved against the position. Actual return: {actual_return:+.2%}."
     )
     what_missed = "Signal ensemble did not capture the true market direction."
@@ -1576,8 +2174,8 @@ def _summarise_what_happened(
     parts = [f"{ticker} {direction}: {entry_str}, strike ${strike:.2f}."]
 
     if price_path:
-        first_price = price_path[0].get("price", entry_price)
-        last_price = price_path[-1].get("price", entry_price)
+        first_price = price_path[0].get("price")
+        last_price = price_path[-1].get("price")
         if first_price and last_price:
             total_move = (last_price - first_price) / first_price * 100
             parts.append(
@@ -1657,8 +2255,16 @@ def _get_llm_postmortem(
         price_lines = [f"  {p['date']}: ${p['price']:.2f}" for p in sample if p.get("price")]
         price_summary = "\n".join(price_lines)
 
-    # Compact data_at_decision — no pretty-print, hard cap for local model context
-    data_summary = json.dumps(data_at_decision, separators=(",", ":"), default=str)[:800]
+    # Compact data_at_decision — no pretty-print, hard cap for local model context.
+    # Descriptive context gets its own labelled block (Codex HOLD 6030815214).
+    decision_data = {k: v for k, v in data_at_decision.items() if k != "descriptive_context"}
+    data_summary = json.dumps(decision_data, separators=(",", ":"), default=str)[:800]
+    descriptive = data_at_decision.get("descriptive_context")
+    descriptive_block = (
+        "DESCRIPTIVE CONTEXT (not proven known at decision; not the inputs the "
+        "recommendation consumed; do not attribute the failure to it):\n"
+        + json.dumps(descriptive, separators=(",", ":"), default=str)[:600] + "\n\n"
+    ) if descriptive else ""
 
     # RAG: retrieve historical context — past failures, lessons learned
     rag_context = ""
@@ -1718,6 +2324,7 @@ def _get_llm_postmortem(
         f"{top_contrib_block}"
         f"{opposing_block}"
         f"DATA AT DECISION:\n{data_summary}\n\n"
+        f"{descriptive_block}"
         f"SIGNALS WRONG: {', '.join(signals_wrong) or 'none identified'}\n"
         f"SIGNALS RIGHT: {', '.join(signals_right) or 'none identified'}\n\n"
         f"Provide:\n"
@@ -1995,24 +2602,41 @@ def _compute_implied_pct(
     actual_price_move_pct: float,
     shock_magnitude: float,
     pass_through: float = DEFAULT_PASS_THROUGH,
+    predicted_margin_impact_pct: float | None = None,
 ) -> float | None:
     """Return the pct_downstream_cogs that WOULD have produced the actual
-    move, given the shock magnitude and a pass-through assumption.
+    move, given the shock magnitude, pass-through assumption, and predicted
+    direction.
 
-    ``implied = |actual| / (|shock| * pass_through)``
+    Uses the signed actual move relative to the predicted direction:
+      ``signed_move = actual_price_move_pct * pred_sign``
+    where ``pred_sign`` is the sign of ``predicted_margin_impact_pct`` (or,
+    when omitted, ``-1`` for a positive upstream cost shock and ``+1`` for a
+    negative shock, matching ``chain_contagion._edge_impact``).
 
-    Returns None when inputs are invalid or when the implied value blows
-    past 1.0 (which means our pass-through assumption is wrong, not the
-    edge weight).
+    A wrong-direction (or zero) move yields ``signed_move <= 0`` and returns
+    ``0.0`` so the edge decays toward zero instead of being reinforced.
+    Returns ``None`` when inputs are invalid or when ``implied > 1.0``.
     """
     if actual_price_move_pct is None or shock_magnitude is None:
         return None
-    mag = abs(float(shock_magnitude))
+    shock_f = float(shock_magnitude)
+    mag = abs(shock_f)
     if mag < 1e-9:
         return None
+    if predicted_margin_impact_pct is not None:
+        pred_f = float(predicted_margin_impact_pct)
+        if abs(pred_f) < 1e-9:
+            return None
+        pred_sign = 1.0 if pred_f > 0 else -1.0
+    else:
+        pred_sign = -1.0 if shock_f > 0 else 1.0
+    signed_move = float(actual_price_move_pct) * pred_sign
+    if signed_move <= 0.0:
+        return 0.0
     pt = max(1e-6, float(pass_through))
-    implied = abs(float(actual_price_move_pct)) / (mag * pt)
-    if implied > 1.0 or implied < 0.0:
+    implied = signed_move / (mag * pt)
+    if implied > 1.0:
         return None
     return implied
 
@@ -2210,6 +2834,7 @@ def apply_contagion_feedback(
                         implied = _compute_implied_pct(
                             actual_price_move_pct=row["actual_price_move_pct"],
                             shock_magnitude=row["shock_magnitude"],
+                            predicted_margin_impact_pct=row["predicted_margin_impact_pct"],
                         )
                         if implied is None:
                             summary["skipped_no_implied"] += 1

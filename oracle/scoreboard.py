@@ -8,6 +8,16 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS, include_schwab_rows
+
+# ``oracle_models`` columns the scorer and weight evolution write from every
+# scored row, the Oracle's Schwab-built (private-use) predictions included:
+# the running counters, ``cumulative_pnl``, ``weight`` (moved toward each
+# model's hit rate), ``sharpe``, the running calibration and ``last_updated``.
+# A change in any of them after one private verdict tells its outcome, so they
+# reach admin requests only (Codex review 6029863205). Everyone else gets the
+# public cohort's own counts and P&L, and no model-state column.
+MODEL_STATE_ADMIN_ONLY = ("weight", "sharpe", "last_updated")
 
 
 def _coerce_int(value: Any) -> int:
@@ -55,7 +65,7 @@ def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> di
                     SUM(CASE WHEN verdict = 'pending' AND expiry > :today THEN 1 ELSE 0 END) AS active,
                     SUM(CASE WHEN verdict = 'pending' AND expiry <= :today THEN 1 ELSE 0 END) AS awaiting_score,
                     SUM(CASE WHEN verdict = 'no_data' THEN 1 ELSE 0 END) AS unscorable
-                FROM oracle_predictions
+                FROM {VISIBLE_ORACLE_PREDICTIONS} oracle_predictions
                 {where_sql}
                 """
             ),
@@ -95,21 +105,7 @@ def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> di
     }
 
 
-def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
-    """Per-model rows on the same basis as ``overall`` (dedup_keep predictions).
-
-    ``oracle_models.predictions_made/hits/misses/partials/cumulative_pnl`` are
-    running counters the scorer increments over every raw prediction,
-    duplicates and pre-rescore labels included. On 2026-11-07 they showed
-    options_flow 55,964 predictions / +14,776 P&L beside an overall of 24,387
-    predictions / -558, so the table contradicted its own headline. Counts and
-    P&L now come from ``oracle_predictions`` with the ``overall`` filter;
-    ``weight``, ``sharpe`` and ``description`` still come from ``oracle_models``.
-    """
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                """
+_MODEL_ROWS_SQL = """
                 WITH stats AS (
                     SELECT model_name,
                            COUNT(*) AS made,
@@ -118,7 +114,7 @@ def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
                            SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials,
                            SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending,
                            SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS pnl
-                    FROM oracle_predictions
+                    FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
                     WHERE dedup_keep = TRUE
                     GROUP BY model_name
                 )
@@ -127,10 +123,28 @@ def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
                        COALESCE(s.pnl, 0), om.sharpe, om.description, COALESCE(s.pending, 0)
                 FROM oracle_models om
                 LEFT JOIN stats s ON s.model_name = om.name
-                ORDER BY om.weight DESC
-                """
-            )
-        ).fetchall()
+"""
+
+
+def _fetch_model_rows(engine: Engine, include_schwab: Any = False) -> list[dict[str, Any]]:
+    """Per-model rows on the same basis as ``overall`` (dedup_keep predictions).
+
+    ``oracle_models.predictions_made/hits/misses/partials/cumulative_pnl`` are
+    running counters the scorer increments over every raw prediction,
+    duplicates and pre-rescore labels included. On 2026-11-07 they showed
+    options_flow 55,964 predictions / +14,776 P&L beside an overall of 24,387
+    predictions / -558, so the table contradicted its own headline. Counts and
+    P&L now come from ``oracle_predictions`` with the ``overall`` filter (the
+    public cohort, for every viewer); ``description`` comes from
+    ``oracle_models``. ``weight`` and ``sharpe`` (and the weight ordering) are
+    model state written from private verdicts too: an admin request gets them,
+    everyone else gets ``None`` and rows ordered by name
+    (``MODEL_STATE_ADMIN_ONLY``).
+    """
+    admin = include_schwab_rows(include_schwab)
+    order = " ORDER BY om.weight DESC, om.name" if admin else " ORDER BY om.name"
+    with engine.connect() as conn:
+        rows = conn.execute(text(_MODEL_ROWS_SQL + order)).fetchall()
 
     models: list[dict[str, Any]] = []
     for row in rows:
@@ -141,7 +155,7 @@ def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
         models.append(
             {
                 "name": row[0],
-                "weight": float(row[1] or 1.0),
+                "weight": float(row[1] or 1.0) if admin else None,
                 "predictions_made": _coerce_int(row[2]),
                 "hits": hits,
                 "misses": misses,
@@ -149,7 +163,7 @@ def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
                 "pending": _coerce_int(row[9]),
                 "accuracy": _prediction_accuracy(hits, misses, partials),
                 "cumulative_pnl": round(float(row[6] or 0), 2),
-                "sharpe": round(float(row[7] or 0), 2),
+                "sharpe": round(float(row[7] or 0), 2) if admin else None,
                 "description": row[8] or "",
                 "total_scored": total_scored,
                 "basis": "oracle_predictions dedup_keep",
@@ -184,7 +198,7 @@ def _fetch_ticker_rows(
                        SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending,
                        AVG(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct END) AS avg_pnl,
                        SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl
-                FROM oracle_predictions
+                FROM {VISIBLE_ORACLE_PREDICTIONS} oracle_predictions
                 {where_sql}
                 GROUP BY ticker
                 {order_sql}
@@ -263,7 +277,7 @@ def _fetch_recording_cohorts(engine: Engine) -> dict[str, dict[str, Any]]:
                    SUM(CASE WHEN verdict = 'no_data' THEN 1 ELSE 0 END),
                    SUM(CASE WHEN verdict IN ('hit', 'partial', 'miss') THEN 1 ELSE 0 END),
                    AVG(CASE WHEN verdict IN ('hit', 'partial', 'miss') THEN pnl_pct END)
-            FROM oracle_predictions WHERE dedup_keep = TRUE GROUP BY recording_policy
+            FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions WHERE dedup_keep = TRUE GROUP BY recording_policy
         """)).fetchall()
     cohorts = {key: {"total": 0, "pending": 0, "unscorable": 0, "scored": 0,
                      "other": 0, "mean_signed_return_pct": None}
@@ -278,7 +292,8 @@ def _fetch_recording_cohorts(engine: Engine) -> dict[str, dict[str, Any]]:
     return cohorts
 
 
-def build_oracle_scoreboard(engine: Engine, ticker_limit: int = 30) -> dict[str, Any]:
+def build_oracle_scoreboard(engine: Engine, ticker_limit: int = 30, include_schwab: Any = False) -> dict[str, Any]:
+    """The shared scoreboard. Every count is the public cohort's; model state is admin-only."""
     calibration_data = None
     try:
         from oracle.calibration import compute_calibration
@@ -290,7 +305,7 @@ def build_oracle_scoreboard(engine: Engine, ticker_limit: int = 30) -> dict[str,
     ticker_rollup = build_oracle_ticker_rollup(engine, limit=ticker_limit)
     return {
         "overall": ticker_rollup["overall"],
-        "models": _fetch_model_rows(engine),
+        "models": _fetch_model_rows(engine, include_schwab=include_schwab),
         "by_ticker": ticker_rollup["by_ticker"],
         "calibration": calibration_data,
         "recording_cohorts": _fetch_recording_cohorts(engine),

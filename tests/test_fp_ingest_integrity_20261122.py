@@ -171,6 +171,7 @@ class TestDrewryContainerIndexIntegrity:
     def test_uses_transposed_table_header_dates(self):
         html = """
         <html><body>
+          <h2>World Container Index, 19 Nov 2026</h2>
           <table>
             <thead>
               <tr><th>Route</th><th>12 Nov 26</th><th>19 Nov 26</th><th>Weekly change</th></tr>
@@ -218,6 +219,7 @@ class TestDrewryContainerIndexIntegrity:
         valid_past = date(2026, 11, 19)
         html = f"""
         <html><body>
+          <h1>Drewry World Container Index</h1>
           <table>
             <thead><tr><th>Date</th><th>Composite</th></tr></thead>
             <tbody>
@@ -287,7 +289,7 @@ class TestAISGroundTruthFailClosed:
 
     def test_missing_structured_section_does_not_leak_raw_html_attributes(self):
         # Only "In Port" is properly structured; "arrivals" and "departures"
-        # only appear in raw anchor attributes / port codes and must stay 0.
+        # only appear in raw anchor attributes / port codes and must stay None (UNKNOWN).
         html = """
         <html><body>
           <nav>
@@ -303,9 +305,10 @@ class TestAISGroundTruthFailClosed:
         snap = ais._parse_vesselfinder_html(html, ais.AIS_PORTS[0])
         assert snap is not None
         assert snap.ships_at_berth == 12
-        assert snap.ships_at_anchor == 0
-        assert snap.ships_expected == 0
-        assert snap.ships_departed_24h == 0
+        assert snap.ships_at_anchor is None
+        assert snap.ships_expected is None
+        assert snap.ships_departed_24h is None
+        assert snap.capacity_utilization is None
 
     def test_bs4_parse_error_fails_closed_no_raw_fallback(self, captured_warnings):
         html = "<section><h2>In Port</h2><span>12 vessels in port</span></section>"
@@ -386,12 +389,12 @@ class TestEIASeriesAlignmentAndWeeklyStocks:
 
         brent_body = {
             "response": {
-                "data": [{"period": "2026-11-18", "series": "RBRTE", "value": "72.50"}]
+                "data": [{"period": "2026-11-18", "series": "RBRTE", "value": "72.50", "units": "$/BBL"}]
             }
         }
         wti_body = {
             "response": {
-                "data": [{"period": "2026-11-18", "series": "RWTC", "value": "68.90"}]
+                "data": [{"period": "2026-11-18", "series": "RWTC", "value": "68.90", "units": "$/BBL"}]
             }
         }
         stocks_body = {
@@ -475,12 +478,12 @@ class TestEIASeriesAlignmentAndWeeklyStocks:
 
         brent_body = {
             "response": {
-                "data": [{"period": "2026-11-18", "series": "RBRTE", "value": "72.50"}]
+                "data": [{"period": "2026-11-18", "series": "RBRTE", "value": "72.50", "units": "$/BBL"}]
             }
         }
         wti_body = {
             "response": {
-                "data": [{"period": "2026-11-18", "series": "RWTC", "value": "68.90"}]
+                "data": [{"period": "2026-11-18", "series": "RWTC", "value": "68.90", "units": "$/BBL"}]
             }
         }
         leaking_err = ValueError(
