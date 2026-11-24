@@ -49,8 +49,8 @@ def doc() -> str:
 def test_status_is_draft_and_authorises_nothing(lineage: dict, doc: str) -> None:
     assert lineage["status"] == "DRAFT_UNREVIEWED"
     assert lineage["authorises"] == []
-    assert lineage["revision"] == 4
-    assert "DRAFT v0, revision 4" in doc and "authorises nothing" in doc
+    assert lineage["revision"] == 5
+    assert "DRAFT v0, revision 5" in doc and "authorises nothing" in doc
     assert lineage["document"] == str(DOC_PATH.relative_to(ROOT))
 
 
@@ -98,12 +98,25 @@ QUALIFYING_WITNESSES = {"study_read", "timed_grader_confirmation"}
 
 
 def run_visibility(run: dict, read_at: datetime) -> str:
-    """VISIBLE / NOT_VISIBLE / VISIBILITY_UNKNOWN from a post-commit witness; ingested_at is never read."""
+    """VISIBLE on a positive witness by R; NOT_VISIBLE only on negative evidence; else VISIBILITY_UNKNOWN.
+
+    ingested_at is never read. A positive witness after R proves nothing about R.
+    """
     witness = run.get("witness")
-    if (not witness or witness.get("kind") not in QUALIFYING_WITNESSES or witness.get("observed_at") is None
-            or witness.get("run_id") != run["run_id"] or witness.get("review_sha256") != run["review_sha256"]):
-        return "VISIBILITY_UNKNOWN"
-    return "VISIBLE" if datetime.fromisoformat(witness["observed_at"]) <= read_at else "NOT_VISIBLE"
+    if (witness and witness.get("kind") in QUALIFYING_WITNESSES and witness.get("observed_at") is not None
+            and witness.get("run_id") == run["run_id"] and witness.get("review_sha256") == run["review_sha256"]
+            and datetime.fromisoformat(witness["observed_at"]) <= read_at):
+        return "VISIBLE"
+    for read in run.get("negative_reads", []):
+        if (read.get("table") == "publication_review_runs"
+                and read.get("publication_day") == run.get("publication_day")
+                and datetime.fromisoformat(read["observed_at"]) >= read_at
+                and run["run_id"] not in read.get("returned_run_ids", [])):
+            return "NOT_VISIBLE"
+    commit_at = run.get("authoritative_commit_at")
+    if commit_at is not None and datetime.fromisoformat(commit_at) > read_at:
+        return "NOT_VISIBLE"
+    return "VISIBILITY_UNKNOWN"
 
 
 def derive(row: dict, rules: dict, read_at: datetime) -> dict:
@@ -168,8 +181,15 @@ def test_fixtures_cover_every_verdict_and_the_reviewed_cases(lineage: dict, inge
     # Review 6033699395: a transaction straddling R, and runs with no or a mismatched witness.
     straddle = next(f for f in fixtures if f["name"].startswith("transaction straddling R"))
     assert datetime.fromisoformat(straddle["run"]["ingested_at"]) < datetime.fromisoformat(lineage["derivation"]["read_at"])
-    assert straddle["expect"]["state"] == "NOT_VISIBLE"
+    assert straddle["expect"]["state"] == "VISIBILITY_UNKNOWN"
     assert list(states.values()).count("VISIBILITY_UNKNOWN") >= 3
+    # Review 6033821128: NOT_VISIBLE only on genuine negative evidence, in pairs with the unproven case.
+    assert states["pair C1: positive witness only after R, no negative evidence"] == "VISIBILITY_UNKNOWN"
+    assert states["pair C2: same, plus a scoped read at R that did not return the run"] == "NOT_VISIBLE"
+    assert states["pair C3: authoritative commit after R"] == "NOT_VISIBLE"
+    for f in fixtures:
+        if f["expect"]["state"] == "NOT_VISIBLE":
+            assert f["run"]["negative_reads"] or f["run"]["authoritative_commit_at"], f["name"]
 
 
 def test_ingested_at_never_decides_visibility(lineage: dict) -> None:
@@ -185,9 +205,14 @@ def test_supersession_reads_the_newest_run_witnessed_by_r(lineage: dict) -> None
     sup = lineage["derivation"]["supersession_fixture"]
     for case in sup["cases"]:
         read_at = datetime.fromisoformat(case["read_at"])
-        visible = [r for r in sup["runs"] if run_visibility(r, read_at) == "VISIBLE"]
-        chosen = max(visible, key=lambda r: r["run_id"])["run_id"] if visible else None
+        # The run set is frozen at R: only runs positively witnessed by R exist for the study.
+        frozen = [r for r in sup["runs"] if run_visibility(r, read_at) == "VISIBLE"]
+        chosen = max(frozen, key=lambda r: r["run_id"])["run_id"] if frozen else None
         assert chosen == case["expect_run_id"], case
+        # A superseding run first seen after R is never substituted in.
+        for r in sup["runs"]:
+            if r not in frozen:
+                assert run_visibility(r, read_at) != "VISIBLE"
 
 
 def test_pending_and_unknown_never_enter_the_matured_denominator(lineage: dict) -> None:

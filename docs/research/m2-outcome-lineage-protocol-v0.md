@@ -4,8 +4,8 @@ Issue: [#960](https://github.com/3pacs/GRID/issues/960). Milestone: M2, "Evidenc
 Machine-readable companion: [`m2-outcome-lineage-v0.json`](m2-outcome-lineage-v0.json). The companion is held to
 the code by `tests/test_m2_outcome_lineage_map.py`.
 
-**Status: DRAFT v0, revision 4** (answers the reviewer's HOLDs 6033027329 on `393cde73`, 6033670709 on
-`4aa18aee` and 6033699395 on `bc0e85db`; the change maps are §7–§9). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
+**Status: DRAFT v0, revision 5** (answers the reviewer's HOLDs 6033027329 on `393cde73`, 6033670709 on
+`4aa18aee`, 6033699395 on `bc0e85db` and 6033821128 on `3c0c79a9`; the change maps are §7–§10). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
 scoring or learning, evaluation run, DDL, historical rewrite, promotion or trading action. Only the research owner
 can adopt it, and only after the independent reviewer's pass (§6). Adoption is a separate commit that pins this
 file's hash. The D0 contract ([#1129](https://github.com/3pacs/GRID/issues/1129), draft PR #1142) is the first
@@ -73,9 +73,21 @@ and only then assigns a protocol state. Two clocks of the row's run decide wheth
     `packet_sha256` and `run_id`, but it records **no time**. Until it does (gap L8), it cannot serve as a
     historical witness.
 
-  A witness timed after `R` makes the row `NOT_VISIBLE`. A row with no qualifying witness is
-  `VISIBILITY_UNKNOWN`. This is the state of every historical run today. Both states are excluded from the rate and
-  each has its own count. Neither is ever read as an outcome.
+  A positive witness timed after `R` proves nothing about `R`: a first sighting at `R+5` fits a commit at `R−1`
+  as well as one at `R+1`. So a row is `NOT_VISIBLE` only on **negative evidence**, of one of two kinds:
+  - **a cutoff-negative witness:** a read made at or after `R`, scoped to the run's own table and publication day,
+    whose returned run set does not contain the run's `run_id`. A read before `R` that misses the run proves
+    nothing about `R`.
+  - **an authoritative commit time after `R`:** a commit timestamp recorded by the database itself (not
+    `ingested_at`). None exists today.
+
+  Every other row without a positive witness by `R` is `VISIBILITY_UNKNOWN`. That covers a positive witness only
+  after `R`, no witness at all, and a negative read before `R` or scoped elsewhere. Every historical run is in this
+  state today. Both states are excluded from the rate, each has its own count, and neither is ever read as an
+  outcome.
+
+  **No substitution after freezing.** The study freezes its run set at `R`. A run that becomes visible later,
+  including a superseding run, never replaces a frozen run and is never added to the frozen set.
 - **Assessed after the horizon.** Only a grading made at or after the horizon can say an endpoint, or any other input,
   was missing at maturity. A non-resolved row whose run `graded_at` < `horizon_end` is `NOT_ASSESSED` once the
   horizon passes. That means matured but not graded at maturity. It is never `UNAVAILABLE`, and the study waits for
@@ -113,8 +125,8 @@ fixed `root_cause` prefixes, and anything it does not recognise is `UNKNOWN_CAUS
 | `UNAVAILABLE` | `MATURE`, run `graded_at` ≥ `horizon_end`, with `MISSING_BASELINE`, `MISSING_ENDPOINT`, `UNUSABLE_ENDPOINT` or `NO_SOURCE` | yes, as a non-success. It is never dropped. |
 | `UNMEASURABLE` | `NO_HORIZON`, or `NOT_GRADABLE` | no; reported beside the result |
 | `UNKNOWN` | `UNKNOWN_CAUSE`, at any maturity (checked after visibility) | no; reported beside the result, and a non-zero count is a grader-owner defect |
-| `NOT_VISIBLE` | the run's witness is timed after `R` (checked first) | no; counted on its own line |
-| `VISIBILITY_UNKNOWN` | no post-commit witness bound to the run (checked first) | no; counted on its own line. Every historical run is here until L8 closes. |
+| `NOT_VISIBLE` | negative evidence: a scoped read at or after `R` that did not return the run, or an authoritative commit after `R` (checked first) | no; counted on its own line |
+| `VISIBILITY_UNKNOWN` | no positive witness by `R` and no negative evidence (checked first) | no; counted on its own line. Every historical run is here until L8 closes. |
 
 A matured rate's denominator is the **visible, assessed, gradable, mature** rows: `CONFIRMED`, `REFUTED`, `PARTIAL`
 and `UNAVAILABLE`, and nothing else. Every other state has its own count, shown next to the rate: `PENDING`,
@@ -276,4 +288,12 @@ days (rule 2.4.4). The pending, unavailable and unmeasurable counts are always s
 | Test a transaction straddling `R`, and a superseding run before and after the cutoff | Fixtures: a run with `ingested_at` before `R` and its only witness after `R` (`NOT_VISIBLE`); a run with no witness (`VISIBILITY_UNKNOWN`); a day whose superseding run is witnessed after `R`, so the study reads the earlier run; and the same day read after both witnesses, so it reads the superseding run. |
 | §2.4.4 must distinguish the grader's hash-bound `ingest_confirmation` from the underlying ingest result | §2.4.4 now names each separately; the ingest receipt alone is not a confirmation. |
 | S3's production assert is date-grain on covered callers, not enforcement of all six D0 clocks | S3's binding says so. |
+
+## 10. Revision 5 change map (answers HOLD 6033821128 on `3c0c79a9`)
+
+| Reviewer point | Change |
+|---|---|
+| A first positive read at `R+5` fits an `R−1` or an `R+1` commit, so it does not prove `NOT_VISIBLE` at `R` | §2.2: `NOT_VISIBLE` needs negative evidence. That is either a read at or after `R`, scoped to the run's table and day, that did not return the run, or an authoritative commit time after `R`. A positive witness only after `R` is `VISIBILITY_UNKNOWN`. |
+| Add paired cases, with genuine negative evidence | Fixtures: a positive witness only after `R` (`VISIBILITY_UNKNOWN`), and the same with a scoped negative read at `R` (`NOT_VISIBLE`); an authoritative commit after `R` (`NOT_VISIBLE`); a negative read before `R` (`VISIBILITY_UNKNOWN`); a negative read scoped to another day (`VISIBILITY_UNKNOWN`). |
+| Keep both states excluded; no dynamic substitution after the run set is frozen | Both stay out of the denominator, with their own counts. §2.2 adds "No substitution after freezing", and the supersession test checks that a superseding run first seen after `R` is never read. |
 

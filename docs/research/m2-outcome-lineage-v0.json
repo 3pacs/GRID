@@ -298,11 +298,12 @@
       "contains": "def cofiring("
     }
   ],
-  "revision": 4,
+  "revision": 5,
   "answers_review": [
     "GRID #1413 review 6033027329 at 393cde73",
     "GRID #1413 review 6033670709 at 4aa18aee",
-    "GRID #1413 review 6033699395 at bc0e85db"
+    "GRID #1413 review 6033699395 at bc0e85db",
+    "GRID #1413 review 6033821128 at 3c0c79a9"
   ],
   "derivation": {
     "note": "Executable form of doc section 2.2; tests/test_m2_outcome_lineage_map.py applies these rules to the fixtures.",
@@ -352,8 +353,8 @@
       "UNMEASURABLE": "NO_HORIZON or NOT_GRADABLE",
       "UNKNOWN": "UNKNOWN_CAUSE",
       "NOT_ASSESSED": "MATURE, not resolved, graded_at < horizon_end",
-      "NOT_VISIBLE": "witness observed_at > R",
-      "VISIBILITY_UNKNOWN": "no qualifying witness"
+      "NOT_VISIBLE": "negative evidence: scoped read at or after R without the run, or authoritative commit after R",
+      "VISIBILITY_UNKNOWN": "no positive witness by R and no negative evidence"
     },
     "matured_denominator": [
       "CONFIRMED",
@@ -384,7 +385,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -408,7 +412,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -432,7 +439,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -456,7 +466,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -480,7 +493,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -504,7 +520,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -528,7 +547,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -552,7 +574,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -576,7 +601,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -600,7 +628,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -624,7 +655,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -648,7 +682,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-17T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -672,7 +709,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -696,7 +736,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-15T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -720,7 +763,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-19T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -733,7 +779,7 @@
         "expect": {
           "maturity": "MATURE",
           "data": "PRESENT",
-          "state": "NOT_VISIBLE"
+          "state": "VISIBILITY_UNKNOWN"
         },
         "run": {
           "run_id": 100,
@@ -744,7 +790,10 @@
             "run_id": 100,
             "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "observed_at": "2026-11-20T11:36:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         }
       },
       {
@@ -763,12 +812,15 @@
             "run_id": 101,
             "review_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "observed_at": "2026-11-20T00:00:05+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         },
         "expect": {
           "maturity": "MATURE",
           "data": "PRESENT",
-          "state": "NOT_VISIBLE"
+          "state": "VISIBILITY_UNKNOWN"
         }
       },
       {
@@ -782,7 +834,10 @@
           "run_id": 102,
           "review_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
           "ingested_at": "2026-11-19T11:36:00+00:00",
-          "witness": null
+          "witness": null,
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -806,7 +861,10 @@
             "run_id": 103,
             "review_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "observed_at": null
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -830,7 +888,175 @@
             "run_id": 99,
             "review_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "observed_at": "2026-11-19T12:00:00+00:00"
-          }
+          },
+          "publication_day": "2026-11-18",
+          "negative_reads": [],
+          "authoritative_commit_at": null
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "pair C1: positive witness only after R, no negative evidence",
+        "run": {
+          "run_id": 300,
+          "review_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 300,
+            "review_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [],
+          "authoritative_commit_at": null
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "pair C2: same, plus a scoped read at R that did not return the run",
+        "run": {
+          "run_id": 301,
+          "review_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 301,
+            "review_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "observed_at": "2026-11-20T00:00:00+00:00",
+              "returned_run_ids": [
+                90
+              ]
+            }
+          ],
+          "authoritative_commit_at": null
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "NOT_VISIBLE"
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "pair C3: authoritative commit after R",
+        "run": {
+          "run_id": 302,
+          "review_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 302,
+            "review_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [],
+          "authoritative_commit_at": "2026-11-20T00:00:01+00:00"
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "NOT_VISIBLE"
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "negative read before R proves nothing about R",
+        "run": {
+          "run_id": 303,
+          "review_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 303,
+            "review_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "observed_at": "2026-11-19T23:00:00+00:00",
+              "returned_run_ids": [
+                90
+              ]
+            }
+          ],
+          "authoritative_commit_at": null
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "negative read scoped to another publication day",
+        "run": {
+          "run_id": 304,
+          "review_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 304,
+            "review_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-17",
+              "observed_at": "2026-11-20T00:00:00+00:00",
+              "returned_run_ids": [
+                90
+              ]
+            }
+          ],
+          "authoritative_commit_at": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -840,7 +1066,7 @@
       }
     ],
     "run_clocks": {
-      "visible": "post-commit witness bound to run_id + review_sha256 with observed_at <= R; witness after R -> NOT_VISIBLE; none -> VISIBILITY_UNKNOWN; ingested_at is never used",
+      "visible": "VISIBLE: positive post-commit witness bound to run_id + review_sha256 with observed_at <= R. NOT_VISIBLE: negative evidence only (scoped read at >= R that did not return the run, or authoritative commit after R). Otherwise VISIBILITY_UNKNOWN. ingested_at is never used.",
       "assessed": "non-resolved MATURE row needs graded_at >= horizon_end, else NOT_ASSESSED"
     },
     "separate_counts": [
@@ -895,7 +1121,8 @@
           "expect_run_id": null
         }
       ]
-    }
+    },
+    "frozen_run_set": "runs first seen after R never substitute for or join the frozen set"
   },
   "binding_values": [
     "ENFORCED",
