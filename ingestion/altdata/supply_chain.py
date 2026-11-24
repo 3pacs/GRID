@@ -180,26 +180,48 @@ _DREWRY_ASSESSMENT_HEADING_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 _DREWRY_HEADING_TAGS: tuple[str, ...] = ("h1", "h2", "h3", "h4", "h5", "h6")
-# 3. A prose value must be reported, not predicted, and the reporting verb
-#    must belong to the value. Two shapes passed earlier heads (Codex HOLDs
-#    6032263784 and 6032642033):
+# 3. A prose value must be reported, not predicted, and it must be the
+#    index's own value. Three shapes passed earlier heads (Codex HOLDs
+#    6032263784, 6032642033, 6033027424):
 #      "... Index is expected to fall to $4,176 ... due to weak Transpacific rates"
 #      "... Index declined this week, and for next week Drewry sees $4,176 ..."
-#    The second has an assessment verb, but in another clause. So the words
-#    that end at the value must be one reporting clause: an assessment verb,
-#    at most a percentage and three plain words, then "to"/"at" (or a bare
-#    "is/was/stood [at]") directly before the amount, with no punctuation in
-#    between. Predictive or modal wording anywhere before the value refuses the
-#    sentence. A forecast after the value ("... to $4,176 this week, and Drewry
-#    expects rates to fall") does not undo it.
-_DREWRY_REPORTED_CLAUSE_RE = re.compile(
-    r"\b(?:"
+#      "... Index declined this week, and the peak season surcharge stood at $4,176 ..."
+#    The last two have the index and an assessment verb, but the amount belongs
+#    to another clause or another subject. So everything from the start of the
+#    sentence to the amount must be ONE clause whose subject is the index:
+#      [The] [Drewry] World Container Index | WCI [composite] [(WCI)]
+#      [, an appositive between two commas,]
+#      [assessed on <date>]
+#      <assessment verb> [n%] [adverbs from a fixed list] to|at   -- or is/was/stood [at]
+#      $<amount>
+#    with nothing else in between. The words allowed between the verb and
+#    "to|at" are a fixed list ("this week", "sharply", "steady" ...): free
+#    words there let a second subject in ("... Index declined as surcharges
+#    rose to $4,176"). Predictive or modal wording before the
+#    amount refuses the sentence. Text after the amount is not part of the
+#    clause: a forecast or another subject there does not undo a reported value.
+_DREWRY_REPORT_VERBS = (
+    r"(?:"
     r"(?:decreased|increased|declined|dropped|fell|rose|gained|climbed|slipped|dipped|"
     r"eased|jumped|surged|plunged|slid|sank|edged\s+(?:up|down|higher|lower)|"
-    r"remained|held|closed|ended|(?:was\s+|is\s+)?assessed)"
-    r"(?:\s+(?:by\s+)?[\d.,]+\s*%)?(?:\s+[a-z-]+){0,3}?\s+(?:to|at)"
+    r"remained|held|closed|ended|(?:(?:was|is)\s+)?assessed)"
+    r"(?:\s+(?:by\s+)?[\d.,]+\s*%)?"
+    r"(?:\s+(?:this\s+week|last\s+week|week[-\s]on[-\s]week|w/w|wow|"
+    r"year[-\s]on[-\s]year|y/y|yoy|further|again|slightly|sharply|marginally|modestly|"
+    r"steady|stable|flat|unchanged|back|up|down|higher|lower)){0,2}"
+    r"\s+(?:to|at)"
     r"|(?:is|was|stands|stood)(?:\s+(?:now|currently))?(?:\s+at)?"
-    r")\s+(?:US)?\$?\s*$",
+    r")"
+)
+_DREWRY_WCI_REPORT_LEAD_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:drewry(?:['’]s)?\s+)?(?:composite\s+)?"
+    r"(?:world\s+container\s+index|wci)(?:\s+composite(?:\s+index)?)?"
+    r"(?:\s*\(\s*wci\s*\))?"
+    r"(?:\s*,[^,;:$]{1,120},)?"
+    r"(?:\s+(?:as\s+)?assessed\s+(?:on\s+|for\s+)?"
+    r"(?:(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*,?\s*)?"
+    rf"{_DREWRY_DATE_TOKEN})?"
+    rf"\s+{_DREWRY_REPORT_VERBS}\s+(?:US)?\$?\s*$",
     re.IGNORECASE,
 )
 _DREWRY_PREDICTIVE_RE = re.compile(
@@ -544,15 +566,16 @@ def _drewry_lane_is_trailing_cause(sentence: str, value_end: int) -> bool:
 
 
 def _drewry_value_is_reported(sentence: str, value_start: int) -> bool:
-    """True when the words ending at the value are one clause that reports it.
+    """True when the sentence, up to the amount, is one clause in which the
+    index itself reports the amount.
 
     ``value_start`` is where the matched amount's digits begin. See note 3
-    above ``_DREWRY_REPORTED_CLAUSE_RE``.
+    above ``_DREWRY_WCI_REPORT_LEAD_RE``.
     """
     lead = sentence[:value_start]
     if _DREWRY_PREDICTIVE_RE.search(lead):
         return False
-    return _DREWRY_REPORTED_CLAUSE_RE.search(lead) is not None
+    return _DREWRY_WCI_REPORT_LEAD_RE.match(lead) is not None
 
 
 def _drewry_introducing_assessment_date(block: Any) -> date | None:

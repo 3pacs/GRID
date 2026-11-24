@@ -237,15 +237,72 @@ def test_reporting_clauses_that_are_read(sentence):
     assert _parse(HEADING + "<ul><li>" + sentence + "</li></ul>") == [{"date": "2026-11-19", "value": 4176.0}]
 
 
+# The pair from Codex HOLD 6033027424: the index is in the sentence, the
+# dollar figure belongs to another subject.
+FOREIGN_SUBJECT = ("The Drewry World Container Index declined this week, and the peak season surcharge "
+                   "stood at $4,176 per 40ft container.")
+WCI_SUBJECT_CONTROL = ("The Drewry World Container Index stood at $4,176 per 40ft container, and the peak "
+                       "season surcharge rose.")
+
+
+def test_another_subjects_price_is_refused_and_the_indexs_own_is_read(captured_warnings):
+    assert _parse(HEADING + "<ul><li>" + FOREIGN_SUBJECT + "</li></ul>") == []
+    assert captured_warnings
+    assert _parse(HEADING + "<ul><li>" + WCI_SUBJECT_CONTROL + "</li></ul>") == [
+        {"date": "2026-11-19", "value": 4176.0}]
+
+
+@pytest.mark.parametrize("sentence", [
+    FOREIGN_SUBJECT,
+    "The Drewry World Container Index declined this week, and the fuel surcharge was $4,176 per 40ft container.",
+    "The Drewry World Container Index fell this week while the bunker adjustment factor rose to $4,176 per 40ft container.",
+    "The Drewry World Container Index declined this week and spot rates stood at $4,176 per 40ft container.",
+    "The Drewry World Container Index rose, but the carrier's general rate increase was $4,176 per 40ft container.",
+    "Against the Drewry World Container Index, the contract rate was $4,176 per 40ft container.",
+    "Carriers tracking the Drewry World Container Index said their average rate fell to $4,176 per 40ft container.",
+    "This week the peak season surcharge and the Drewry World Container Index both stood at $4,176 per 40ft container.",
+    # No comma to split on: a second subject between the index's verb and "to".
+    "The Drewry World Container Index declined as surcharges rose to $4,176 per 40ft container.",
+    "The Drewry World Container Index fell and rates rose to $4,176 per 40ft container.",
+    "The Drewry World Container Index eased while surcharges climbed to $4,176 per 40ft container.",
+    "The Drewry World Container Index held but surcharges jumped to $4,176 per 40ft container.",
+])
+def test_a_price_whose_subject_is_not_the_index_is_refused(sentence, captured_warnings):
+    assert _parse(HEADING + "<ul><li>" + sentence + "</li></ul>") == []
+
+
+@pytest.mark.parametrize("sentence", [
+    WCI_SUBJECT_CONTROL,
+    ("The Drewry World Container Index (WCI), the benchmark widely referenced by procurement teams, "
+     "decreased 3% to $4,176 per 40ft container this week."),
+    "The WCI composite fell 3% to $4,176 per 40ft container, while the peak season surcharge stood at $600.",
+    "Drewry's World Container Index remained at $4,176 per 40ft container; the fuel surcharge was $350.",
+    "The Drewry World Container Index decreased 3% this week to $4,176 per 40ft container.",
+    "The Drewry World Container Index fell sharply week-on-week to $4,176 per 40ft container.",
+    "The Drewry World Container Index remained steady at $4,176 per 40ft container.",
+    "The Drewry World Container Index was assessed at $4,176 per 40ft container.",
+])
+def test_the_indexs_own_reporting_clause_is_read_whatever_follows(sentence):
+    assert _parse(HEADING + "<ul><li>" + sentence + "</li></ul>") == [{"date": "2026-11-19", "value": 4176.0}]
+
+
 @pytest.mark.parametrize(("lead", "ok"), [
     ("The Drewry World Container Index decreased 3% to $", True),
     ("The World Container Index composite assessed on 19 Nov 2026 stood at $", True),
     ("WCI remained at $", True),
+    ("The Drewry World Container Index (WCI), the benchmark widely referenced by procurement teams, decreased 3% to $", True),
     ("The Drewry World Container Index is expected to fall to $", False),
     ("The World Container Index would have been $", False),
     ("The World Container Index $", False),
     ("The Drewry World Container Index declined this week, and for next week Drewry sees $", False),
     ("The Drewry World Container Index declined, and Drewry puts it at $", False),
+    ("The Drewry World Container Index declined this week, and the peak season surcharge stood at $", False),
+    ("The Drewry World Container Index declined this week, and the fuel surcharge was $", False),
+    ("The peak season surcharge stood at $", False),
+    ("The Drewry World Container Index declined as surcharges rose to $", False),
+    ("The Drewry World Container Index fell and rates rose to $", False),
+    ("The Drewry World Container Index edged lower this week to $", True),
+    ("The Drewry World Container Index, the fuel surcharge was $", False),
 ])
 def test_value_is_reported_rule(lead, ok):
     assert sc._drewry_value_is_reported(lead + "4,176", len(lead)) is ok
