@@ -1031,10 +1031,10 @@ Only `analysis/sector_map_ticker_status.yaml` and tests change.
 
 | Symbol | Mark | Fetched after this | End date from Tiingo's listing (read 2026-11-23) | Source for the event |
 |---|---|---|---|---|
-| BKH | renamed -> HZN | HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07 |
-| GWHT | delisted | nothing | none: GWHT is not found | Panabee 2026-11-13 (Chapter 7 petition; an AI-written summary page) |
-| KPTI | delisted | nothing | 2026-11-10 | Panabee 2026-11-02 (Nasdaq suspension from 11-11; AI-written) |
-| ROKU | acquired by Fox | nothing | 2026-11-06 | TheWrap 2026-11-06 |
+| BKH | renamed -> HZN | HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07. The issuer's exchange note and OCC memo 60193 answered HTTP 403 and were not read |
+| GWHT | delisted | nothing | none: GWHT is not found | ESS Tech Form 8-K, Item 1.03, 2026-11-13 (Chapter 7 petition) |
+| KPTI | delisted | nothing | 2026-11-10 | Karyopharm Form 8-K, Item 3.01, event date 2026-11-04 (Nasdaq suspension from 11-11, OTC as KPTIQ) |
+| ROKU | acquired by Fox | nothing | 2026-11-06 | Roku Form 8-K, 2026-11-06 (merger closed; Nasdaq halt before the 11-09 open) |
 
 - `GWH` (the map's symbol for ESS Tech) was renamed -> GWHT; it is now
   delisted too, so the map does not fetch GWHTQ.
@@ -1048,3 +1048,7 @@ Only `analysis/sector_map_ticker_status.yaml` and tests change.
   are dropped by `store/observations.py` and the resolver). Stored rows up to
   each last session stay readable; BKH, GWHT and GWH have no cutoff; the map
   keeps its actors.
+- Codex reviews 6031566036 and 6031760181: the notes cite the issuers' Form 8-K
+  filings in place of the news pages, call each `last_session` a vendor cutoff,
+  infer no venue date where the vendor gives none, and say that vendor history
+  under a successor is not verified point-in-time continuity.

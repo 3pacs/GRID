@@ -75,7 +75,26 @@ def test_last_session_is_tiingos_end_date_or_absent(ticker, last_session):
 def test_every_note_says_where_its_facts_come_from(ticker):
     note = sm.TICKER_STATUS[ticker]["note"]
     assert "Tiingo" in note and "read 2026-11-23" in note
-    assert any(src in note for src in ("WOWT", "Panabee", "TheWrap"))
+    # An issuer filing where one could be read; the news page for BKH, whose
+    # issuer note and OCC memo refused this session (said in the note).
+    assert ("Form 8-K" in note and "sec.gov/Archives/edgar/data/" in note) or (
+        ticker == "BKH" and "WOWT" in note and "HTTP 403" in note)
+
+
+def test_no_note_rests_on_an_ai_written_summary_page():
+    for ticker in ("BKH", "GWH", "GWHT", "KPTI", "ROKU"):
+        note = sm.TICKER_STATUS[ticker]["note"]
+        assert "Panabee" not in note and "TheWrap" not in note, ticker
+
+
+@pytest.mark.parametrize("ticker", ["BKH", "GWH", "GWHT", "KPTI", "ROKU"])
+def test_vendor_dates_are_not_presented_as_venue_dates(ticker):
+    entry = sm.TICKER_STATUS[ticker]
+    note = entry["note"]
+    if "last_session" in entry:
+        assert "vendor cutoff" in note
+    else:
+        assert "no venue date is inferred" in note
 
 
 def test_stored_history_stays_readable():

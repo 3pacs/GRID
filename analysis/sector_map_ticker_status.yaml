@@ -37,7 +37,7 @@ TICKER_STATUS:
   BKH:
     status: renamed
     successor: HZN
-    note: 'Black Hills and NorthWestern Energy merged to form Bright Horizon Energy (WOWT, 2026-11-16). Tiingo lists HZN as Bright Horizon Energy Corp (NYSE) with history from 1984-09-07; its BKH listing has no start or end date (read 2026-11-23), so no last_session is given. Last BKH close GRID stored from Tiingo is 2026-11-13'
+    note: 'Black Hills and NorthWestern Energy merged to form Bright Horizon Energy (WOWT, 2026-11-16). The issuer''s exchange note (ir.blackhillscorp.com/exchange-shares) and OCC information memo 60193, named in Codex review 6031566036, answered this session with HTTP 403 and were not read. Tiingo lists HZN as Bright Horizon Energy Corp (NYSE) with history from 1984-09-07; that vendor history is not verified point-in-time continuity. Tiingo''s BKH listing has no start or end date (read 2026-11-23), so no last_session is given and no venue date is inferred. Last BKH close GRID stored from Tiingo is 2026-11-13'
   EQR:
     status: renamed
     successor: VMRK
@@ -104,7 +104,7 @@ TICKER_STATUS:
     status: acquired
     acquirer: Fox
     last_session: 2026-11-06
-    note: 'Fox completed its acquisition; Roku stockholders receive $95.30 in cash and 0.9799 shares of Fox Class A common stock per share, and Roku ceases trading on Nasdaq (TheWrap, 2026-11-06). last_session is the endDate of Tiingo''s ROKU listing (read 2026-11-23)'
+    note: 'The Fox merger closed on 2026-11-06; each Class A share converted into 0.9799 FOX Class A shares plus $95.30 in cash, and Nasdaq trading is halted before the open on 2026-11-09 (Roku Form 8-K dated 2026-11-06, sec.gov/Archives/edgar/data/1428439/000119312526451874/d181620d8k.htm). last_session is the endDate of Tiingo''s ROKU listing (read 2026-11-23): a vendor cutoff that here equals the last Nasdaq session'
   ALTM: {status: acquired, acquirer: RIO, last_session: 2025-03-05}
   ARCH:
     status: acquired
@@ -188,7 +188,7 @@ TICKER_STATUS:
   # ── delisted ────────────────────────────────────────────────────────────────
   GWH:
     status: delisted
-    note: 'ESS Tech delisted from NYSE 2026-10-02, quoted OTC as GWHT from 2026-10-05; Chapter 7 petition filed 2026-11-13 (see GWHT below). Was renamed -> GWHT here until 2026-11-23. Not priced any more (owner, 2026-11-23): the OTC shares, which Tiingo lists as GWHTQ, are not fetched. Tiingo''s GWH listing has no start or end date (read 2026-11-23), so no last_session is given'
+    note: 'ESS Tech delisted from NYSE 2026-10-02, quoted OTC as GWHT from 2026-10-05; Chapter 7 petition filed 2026-11-13 (see GWHT below). Was renamed -> GWHT here until 2026-11-23. Not priced any more (owner, 2026-11-23): the OTC shares, which Tiingo lists as GWHTQ, are not fetched. Tiingo''s GWH listing has no start or end date (read 2026-11-23), so no last_session is given and no venue date is inferred'
   ELME:
     status: delisted
     last_session: 2026-10-23
@@ -249,8 +249,8 @@ TICKER_STATUS:
   # end date, no last_session is written.
   GWHT:
     status: delisted
-    note: 'ESS Tech filed a Chapter 7 petition in the District of Delaware on 2026-11-13 (Panabee, 2026-11-13; an AI-written summary page). Tiingo no longer finds GWHT; no end date is given, so no last_session. Last GWHT close GRID stored from Tiingo is 2026-11-13. Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as GWHTQ, ESS Tech Inc (OTCMKTS), history from 2021-01-04 (read 2026-11-23)'
+    note: 'ESS Tech ceased operations and filed a voluntary Chapter 7 petition in the US Bankruptcy Court for the District of Delaware on 2026-11-13 (ESS Tech Form 8-K, Item 1.03, dated 2026-11-13, sec.gov/Archives/edgar/data/1819438/000181943826000091/wk-20261113.htm; its cover lists GWHT). Tiingo no longer finds GWHT (read 2026-11-23): the vendor gives no end date, so no last_session is written and no venue date is inferred from that. Last GWHT close GRID stored from Tiingo is 2026-11-13. Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as GWHTQ, ESS Tech Inc (OTCMKTS), history from 2021-01-04'
   KPTI:
     status: delisted
     last_session: 2026-11-10
-    note: 'Karyopharm filed for Chapter 11; Nasdaq trading suspended from the open on 2026-11-11, shares expected to trade OTC as KPTIQ (Panabee, 2026-11-02; an AI-written summary page). last_session is the endDate of Tiingo''s KPTI listing (read 2026-11-23). Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as KPTIQ, Karyopharm Therapeutics Inc (OTCMKTS), history from 2013-11-06'
+    note: 'Nasdaq suspended trading in the common stock at the opening of business on 2026-11-11; it is expected to trade over the counter as KPTIQ (Karyopharm Form 8-K, Item 3.01, event date 2026-11-04, sec.gov/Archives/edgar/data/1503802/000119312526448516/d122780d8k.htm). last_session is the endDate of Tiingo''s KPTI listing (read 2026-11-23): a vendor cutoff, the session before that suspension. Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as KPTIQ, Karyopharm Therapeutics Inc (OTCMKTS), history from 2013-11-06; that vendor history is not verified point-in-time continuity'
