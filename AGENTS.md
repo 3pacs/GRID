@@ -1044,4 +1044,13 @@ Branch `claude/13f-rerun-dedupe-20261123`. Anik: "fix the 13F duplicates".
   `dollar_flows` take the newest vintage per key, so nothing is counted twice;
   the holdings' `received_at` is the newest copy's time. The two 13F counts in
   `intelligence/actor_discovery.py` (`COUNT(*)`, `SUM(value)`) count every copy.
-- **Production rows:** untouched. Cleanup is a separate owner decision.
+- **Production rows:** untouched by this PR. Cleanup is a separate owner decision.
+- **Codex HOLD 6031396853 (2026-11-24):** two overlapping writers could both
+  look up before either committed and both insert. The lookup and the inserts
+  now run under one transaction-scoped advisory lock per (source, manager,
+  filing date) (`_lock_change_rows`, PostgreSQL only).
+  `tests/test_13f_holdings_graph_pg.py` holds the first writer open inside its
+  transaction on a second connection; without the lock both insert. Quarantined
+  rows are left out before the ranking: an older identical SUCCESS under a newer
+  QUARANTINED copy still counts as stored. A surviving change row is one stored
+  observation of a filing comparison, not a filing.

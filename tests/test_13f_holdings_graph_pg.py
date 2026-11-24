@@ -343,3 +343,96 @@ def test_a_rerun_writes_no_change_row_and_a_changed_filing_writes_one(pg_engine,
 
     assert sum(r["rows_inserted"] for r in third) == 1
     assert change_rows() == stored + 1
+
+
+def test_two_overlapping_writers_add_each_change_row_once(pg_engine, monkeypatch):
+    """Two connections write the same manager's filing at once (grid-svr
+    2026-11-23: a timed-out run's orphaned thread and the repair worker's
+    retry). The first is held open inside its transaction, after its inserts
+    and before its commit. Without the advisory lock the second looks up,
+    sees nothing committed and inserts every row again. With it the second
+    waits, then finds the first writer's rows and adds none. Both receipts
+    survive, and a changed filing is still a new vintage afterwards."""
+    import threading
+
+    from ingestion.altdata import institutional_flows as inst
+
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    edgar = s.two_quarter_scenario()
+    monkeypatch.setattr(inst.requests, "get", edgar.get)
+    monkeypatch.setattr(inst.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(inst, "TOP_13F_FILERS", dict(filers))
+    inst._DEAD_CIKS.clear()
+
+    first_inside = threading.Event()
+    second_at_the_gate = threading.Event()
+    arrivals: list[str] = []
+    gate = threading.Lock()
+    original_receipt = inst.InstitutionalFlowsPuller._insert_receipt
+
+    def second_is_waiting_on_the_lock() -> bool:
+        with pg_engine.connect() as probe:
+            return bool(probe.execute(text(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+                "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            )).scalar_one())
+
+    def held_receipt(self, conn, series_id, obs_date, payload, curr_snap):
+        with gate:
+            arrivals.append(threading.current_thread().name)
+            first = len(arrivals) == 1
+        if first:
+            first_inside.set()
+            deadline = datetime.now(timezone.utc) + timedelta(seconds=20)
+            while datetime.now(timezone.utc) < deadline:
+                if second_at_the_gate.is_set() or second_is_waiting_on_the_lock():
+                    break
+                threading.Event().wait(0.05)
+        else:
+            second_at_the_gate.set()      # reached only if nothing made it wait
+        return original_receipt(self, conn, series_id, obs_date, payload, curr_snap)
+
+    monkeypatch.setattr(inst.InstitutionalFlowsPuller, "_insert_receipt", held_receipt)
+
+    results: dict[str, list[dict]] = {}
+    errors: list[BaseException] = []
+
+    def write(name: str) -> None:
+        try:
+            results[name] = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
+        except BaseException as exc:  # noqa: BLE001 -- surfaced below
+            errors.append(exc)
+
+    one = threading.Thread(target=write, args=("one",), name="writer-one")
+    two = threading.Thread(target=write, args=("two",), name="writer-two")
+    one.start()
+    assert first_inside.wait(20), "the first writer never reached its receipt"
+    two.start()
+    one.join(60)
+    two.join(60)
+    assert not one.is_alive() and not two.is_alive() and not errors, errors
+
+    def count(pattern: str) -> int:
+        with pg_engine.connect() as conn:
+            return conn.execute(text("SELECT COUNT(*) FROM raw_series WHERE series_id LIKE :p"),
+                                {"p": pattern}).scalar_one()
+
+    inserted = {name: sum(r["rows_inserted"] for r in rows) for name, rows in results.items()}
+    unchanged = {name: sum(r["rows_unchanged"] for r in rows) for name, rows in results.items()}
+    stored = count("13F:%")
+    assert stored > 0
+    assert sorted(inserted.values()) == [0, stored]            # one writer wrote them, the other none
+    assert sorted(unchanged.values()) == [0, stored]
+    with pg_engine.connect() as conn:
+        copies = conn.execute(text(
+            "SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM raw_series WHERE series_id LIKE '13F:%' "
+            "GROUP BY series_id, obs_date) per_key")).scalar_one()
+    assert copies == 1
+    assert count("13F-FILING:%") == 2                           # each run's receipt survives
+
+    monkeypatch.setattr(inst.InstitutionalFlowsPuller, "_insert_receipt", original_receipt)
+    edgar.filings[s.CIK_ALPHA][1].holdings[s.ROOT_CUSIP] = ("ROOT HOLDINGS INC", 280_000, 2_000)
+    third = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
+    assert sum(r["rows_inserted"] for r in third) == 1          # a different filing state is still stored
+    assert count("13F:%") == stored + 1
+    assert count("13F-FILING:%") == 3

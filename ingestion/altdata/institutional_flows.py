@@ -547,7 +547,19 @@ _REQUEST_TIMEOUT: int = 30
 # filing pair (filing_accession, prev_filing_accession) and identical content.
 # Anything else is a new vintage and is stored, so point-in-time readers keep
 # every state GRID ever held: an amendment or a different prior filing, a
-# corrected value, a parser change, a quarantined or failed earlier row.
+# corrected value, a parser change, a failed earlier row.
+#
+# QUARANTINED rows are left out before the ranking: a quarantined row is never
+# the stored state. So an older identical SUCCESS under a newer QUARANTINED
+# copy still counts as stored (nothing is written), and a row whose every
+# stored copy is quarantined is written again.
+#
+# Two writers for the same manager and filing date (a timed-out run's orphaned
+# thread and the repair worker's retry, 2026-11-23) could both look up before
+# either committed and both insert: raw_series' uniqueness includes the write
+# timestamp. The lookup and the inserts therefore run under one
+# transaction-scoped advisory lock per (source, manager, filing date); the
+# second writer waits, then looks up what the first committed.
 # (uq_raw_series_composite makes pull_timestamp unique per series, source and
 # obs_date, so "newest" needs no tie-break.)
 _CHANGE_ROW_LOOKUP_CHUNK: int = 500
@@ -1387,11 +1399,24 @@ class InstitutionalFlowsPuller(BasePuller):
             evidence["failure"] = kind
             return FilingSnapshot(accession=accession, status=f"fetch_failed:{kind}", evidence=evidence)
 
+    def _lock_change_rows(self, conn: Any, cik: str, obs_date: date) -> None:
+        """Serialize writers of one manager's change rows for one filing date.
+
+        Must be the first statement of the transaction that looks the stored
+        rows up and inserts (see the note above ``_LATEST_CHANGE_ROWS_SQL``).
+        PostgreSQL only; other dialects (the SQLite test engines) have one
+        writer and no advisory locks.
+        """
+        if conn.dialect.name != "postgresql":
+            return
+        self._file_advisory_lock(conn, "13F-change-rows", cik, obs_date.isoformat())
+
     def _latest_stored_change_rows(
         self, conn: Any, series_ids: list[str], obs_date: date,
     ) -> dict[str, tuple[Any, Any, Any]]:
         """Newest non-quarantined vintage per series for ``obs_date``:
-        ``{series_id: (pull_status, value, raw_payload)}``."""
+        ``{series_id: (pull_status, value, raw_payload)}``. Quarantined rows
+        are excluded before the ranking, not after it."""
         latest: dict[str, tuple[Any, Any, Any]] = {}
         for start in range(0, len(series_ids), _CHANGE_ROW_LOOKUP_CHUNK):
             chunk = series_ids[start:start + _CHANGE_ROW_LOOKUP_CHUNK]
@@ -1601,6 +1626,7 @@ class InstitutionalFlowsPuller(BasePuller):
                 rows_inserted = 0
                 rows_unchanged = 0
                 with self.engine.begin() as conn:
+                    self._lock_change_rows(conn, cik, obs_date)
                     stored_rows = self._latest_stored_change_rows(
                         conn,
                         [f"13F:{cik}:{chg['cusip']}:{chg['action']}" for chg in changes],

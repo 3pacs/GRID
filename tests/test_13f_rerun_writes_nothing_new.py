@@ -212,3 +212,63 @@ def test_is_stored_observation(stored, same):
 def test_a_payload_without_its_filing_identity_is_never_treated_as_stored():
     bare = {k: v for k, v in PAYLOAD.items() if k not in ("filing_accession", "prev_filing_accession")}
     assert inst._is_stored_observation(("SUCCESS", 1500.0, dict(bare)), 1500.0, dict(bare)) is False
+
+
+def test_an_older_identical_accepted_copy_under_a_newer_quarantined_one_is_still_stored(engine, monkeypatch):
+    """Quarantined rows are left out before the ranking, so the comparison is
+    against the newest accepted copy. This is griddb after the 2026-11-24
+    cleanup pass: the first copy SUCCESS, every later identical copy
+    QUARANTINED. A re-run must add nothing."""
+    edgar = s.two_quarter_scenario()
+    s.run_writer(engine, monkeypatch, edgar)
+    stored = _age_stored_rows(engine)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+            "SELECT series_id, source_id, obs_date, value, raw_payload, 'QUARANTINED' "
+            "FROM raw_series WHERE series_id LIKE '13F:%'"))       # newer copies: CURRENT_TIMESTAMP
+
+    second = s.run_writer(engine, monkeypatch, edgar)
+
+    assert sum(r["rows_inserted"] for r in second) == 0
+    assert sum(r["rows_unchanged"] for r in second) == stored
+    assert _count(engine, "13F:%") == 2 * stored
+
+
+def test_a_newer_quarantined_copy_does_not_hide_a_changed_filing(engine, monkeypatch):
+    """Same state, but the filing now says something else: that is a new vintage."""
+    edgar = s.two_quarter_scenario()
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    s.run_writer(engine, monkeypatch, edgar, filers)
+    _age_stored_rows(engine)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+            "SELECT series_id, source_id, obs_date, value, raw_payload, 'QUARANTINED' "
+            "FROM raw_series WHERE series_id LIKE '13F:%'"))
+    edgar.filings[s.CIK_ALPHA][1].holdings[s.ROOT_CUSIP] = ("ROOT HOLDINGS INC", 280_000, 2_000)
+
+    second = s.run_writer(engine, monkeypatch, edgar, filers)
+
+    assert sum(r["rows_inserted"] for r in second) == 1
+
+
+def test_the_lock_is_taken_before_the_lookup_and_only_on_postgresql(monkeypatch):
+    source = (inst.__file__)
+    text_ = open(source, encoding="utf-8").read()
+    block = text_[text_.index("rows_unchanged = 0"):text_.index("for chg in changes:", text_.index("rows_unchanged = 0"))]
+    assert block.index("self._lock_change_rows(conn, cik, obs_date)") < block.index("self._latest_stored_change_rows(")
+
+    calls: list[tuple] = []
+    puller = inst.InstitutionalFlowsPuller.__new__(inst.InstitutionalFlowsPuller)
+    monkeypatch.setattr(puller, "_file_advisory_lock", lambda conn, *parts: calls.append(parts), raising=False)
+
+    class _Conn:
+        def __init__(self, name: str) -> None:
+            self.dialect = type("D", (), {"name": name})()
+
+    from datetime import date as _date
+    puller._lock_change_rows(_Conn("sqlite"), "1067983", _date(2026, 11, 14))
+    assert calls == []
+    puller._lock_change_rows(_Conn("postgresql"), "1067983", _date(2026, 11, 14))
+    assert calls == [("13F-change-rows", "1067983", "2026-11-14")]
