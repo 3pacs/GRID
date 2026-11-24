@@ -45,3 +45,15 @@ def test_schedulers_no_longer_run_the_fallback_writer(rel):
     assert "PriceFallbackPuller" not in source
     assert "pfp.save_to_db" not in source
     assert ".do(_price_fallback)" not in source
+
+
+def test_twelve_data_is_not_a_fallback_source_any_more():
+    """Owner decision 2026-11-23: Twelve Data is dropped from the chain."""
+    from ingestion import price_fallback
+
+    puller = price_fallback.PriceFallbackPuller()
+    assert not hasattr(puller, "_twelve_data") and not hasattr(puller, "td_key")
+    from pathlib import Path
+
+    source = Path(price_fallback.__file__).read_text(encoding="utf-8")
+    assert "twelvedata.com" not in source and "TWELVEDATA_API_KEY" not in source
