@@ -230,14 +230,14 @@ def test_halt_via_patched_singleton_instance():
     assert ticket is None
 
 
-# ── Fail-open on exception ────────────────────────────────────────────
+# ── Fail-closed on exception ──────────────────────────────────────────
 
 
-def test_exception_in_check_recommendation_does_not_block_ticket():
+def test_exception_in_check_recommendation_fails_closed():
     """
     A broken risk module (e.g. someone mutates the breaker into an
-    inconsistent state) must not prevent otherwise-valid tickets from
-    being emitted. The gate catches exceptions and falls through.
+    inconsistent state) MUST fail closed and refuse the ticket rather than
+    letting unvalidated trades through.
     """
     def _boom(*_args, **_kwargs):
         raise RuntimeError("risk module imploded")
@@ -250,14 +250,14 @@ def test_exception_in_check_recommendation_does_not_block_ticket():
             current_price=250.0,
             vol_30d=0.30,
         )
-    assert isinstance(ticket, TradeTicket)
+    assert ticket is None
 
 
-def test_import_error_in_gate_does_not_block_ticket():
+def test_import_error_in_gate_fails_closed():
     """
     If the risk module fails to import (simulated by patching
-    get_global_circuit_breaker to raise), the generator still ships
-    the ticket.
+    get_global_circuit_breaker to raise), the generator fails closed and
+    refuses the ticket.
     """
     def _raise_on_import(*_a, **_kw):
         raise ImportError("oracle.risk unavailable")
@@ -273,7 +273,7 @@ def test_import_error_in_gate_does_not_block_ticket():
             current_price=250.0,
             vol_30d=0.30,
         )
-    assert isinstance(ticket, TradeTicket)
+    assert ticket is None
 
 
 # ── Refusal gates upstream of the risk gate still work ────────────────
