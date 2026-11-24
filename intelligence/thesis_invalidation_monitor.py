@@ -50,8 +50,9 @@ monitor is trivially testable.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -109,6 +110,8 @@ class MonitorRun:
     predictions_scanned: int
     events: list[InvalidationEvent] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    query_failures: int = 0
+    had_query_error: bool = False
 
     @property
     def triggered_count(self) -> int:
@@ -121,6 +124,8 @@ class MonitorRun:
             "triggered_count": self.triggered_count,
             "events": [e.to_dict() for e in self.events],
             "errors": list(self.errors),
+            "query_failures": self.query_failures,
+            "had_query_error": self.had_query_error,
         }
 
 
@@ -274,39 +279,97 @@ def determine_size_down(triggered_type: str) -> float:
 # ── DB I/O ───────────────────────────────────────────────────────────────
 
 
-def _read_active_predictions(engine: Engine) -> list[dict[str, Any]]:
-    """Read active predictions from decision_journal with invalidation metadata."""
+def _parse_flags_dict(raw: Any) -> dict[str, Any]:
+    """Coerce a JSONB payload (dict or JSON string) to a dict; non-objects -> {}."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _read_active_predictions(
+    engine: Engine,
+    *,
+    as_of: datetime | None = None,
+    errors: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Read active (unscored) decisions with invalidation metadata from decision_journal.
+
+    Uses real ``decision_journal`` columns (``decision_timestamp``,
+    ``contradiction_flags``, ``verdict``, ``outcome_recorded_at``) and resolves
+    ``ticker`` via ``agent_runs.decision_journal_id`` with JSONB fallbacks.
+    Strictly read-only.
+    """
+    ref_ts = as_of or datetime.now(timezone.utc)
+    since_ts = ref_ts - timedelta(days=90)
     try:
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
                     """
-                    SELECT id, ticker, metadata, logged_at
-                    FROM decision_journal
-                    WHERE outcome IS NULL
-                      AND metadata IS NOT NULL
-                      AND metadata ? 'invalidation'
-                      AND logged_at >= NOW() - INTERVAL '90 days'
-                    ORDER BY logged_at DESC
+                    SELECT dj.id,
+                           COALESCE(
+                               (
+                                   SELECT ar.ticker
+                                   FROM agent_runs ar
+                                   WHERE ar.decision_journal_id = dj.id
+                                   ORDER BY ar.run_timestamp DESC
+                                   LIMIT 1
+                               ),
+                               dj.contradiction_flags ->> 'ticker',
+                               dj.contradiction_flags -> 'invalidation' ->> 'ticker'
+                           ) AS ticker,
+                           dj.contradiction_flags,
+                           dj.decision_timestamp
+                    FROM decision_journal dj
+                    WHERE dj.verdict IS NULL
+                      AND dj.outcome_recorded_at IS NULL
+                      AND dj.contradiction_flags IS NOT NULL
+                      AND jsonb_typeof(dj.contradiction_flags) = 'object'
+                      AND dj.contradiction_flags ? 'invalidation'
+                      AND dj.decision_timestamp >= :since
+                      AND dj.decision_timestamp <= :as_of
+                    ORDER BY dj.decision_timestamp DESC
                     """
                 ),
+                {"since": since_ts, "as_of": ref_ts},
             ).fetchall()
     except Exception as exc:  # noqa: BLE001
-        log.debug("active predictions read failed: {e}", e=str(exc))
+        msg = f"active predictions read failed: {exc}"
+        log.warning("thesis_invalidation_monitor: {m}", m=msg)
+        if errors is not None:
+            errors.append(msg)
         return []
     out: list[dict[str, Any]] = []
     for r in rows:
+        meta = _parse_flags_dict(r[2])
+        inval = meta.get("invalidation")
+        ticker = r[1] or meta.get("ticker") or (
+            inval.get("ticker") if isinstance(inval, dict) else None
+        )
         out.append({
             "id": r[0],
-            "ticker": r[1],
-            "metadata": r[2] if isinstance(r[2], dict) else {},
-            "logged_at": r[3],
+            "ticker": ticker,
+            "metadata": meta,
+            "decision_timestamp": r[3],
         })
     return out
 
 
-def _read_last_price(engine: Engine, ticker: str) -> tuple[float | None, float | None]:
-    """Return (current_price, last_close_price) for a ticker."""
+def _read_last_price(
+    engine: Engine,
+    ticker: str,
+    *,
+    as_of: datetime | None = None,
+    errors: list[str] | None = None,
+) -> tuple[float | None, float | None]:
+    """Return (current_price, last_close_price) for a ticker at or before ``as_of``."""
+    as_of_date = (as_of or datetime.now(timezone.utc)).date()
     try:
         with engine.connect() as conn:
             row = conn.execute(
@@ -314,17 +377,22 @@ def _read_last_price(engine: Engine, ticker: str) -> tuple[float | None, float |
                     """
                     SELECT close_price
                     FROM ticker_metrics_daily
-                    WHERE ticker = :t AND close_price IS NOT NULL
-                    ORDER BY as_of_date DESC
+                    WHERE ticker = :t
+                      AND close_price IS NOT NULL
+                      AND obs_date <= :as_of_date
+                    ORDER BY obs_date DESC
                     LIMIT 1
                     """
                 ),
-                {"t": ticker.upper()},
+                {"t": ticker.upper(), "as_of_date": as_of_date},
             ).fetchone()
     except Exception as exc:  # noqa: BLE001
-        log.debug("price read failed for {t}: {e}", t=ticker, e=str(exc))
+        msg = f"price read failed for {ticker}: {exc}"
+        log.warning("thesis_invalidation_monitor: {m}", m=msg)
+        if errors is not None:
+            errors.append(msg)
         return None, None
-    if row is None:
+    if row is None or row[0] is None:
         return None, None
     close = float(row[0])
     return close, close
@@ -348,7 +416,10 @@ def run_monitor(
     if as_of is None:
         as_of = datetime.now(timezone.utc)
 
-    predictions = _read_active_predictions(engine)
+    query_errors: list[str] = []
+    predictions = _read_active_predictions(
+        engine, as_of=as_of, errors=query_errors,
+    )
     events: list[InvalidationEvent] = []
     errors: list[str] = []
 
@@ -359,14 +430,16 @@ def run_monitor(
             errors.append(f"pred {pred['id']}: malformed invalidation")
             continue
 
-        ticker = pred.get("ticker")
+        ticker = pred.get("ticker") or invalidation.get("ticker")
         inval_type = invalidation.get("type")
 
         # Price data for price_level path
         current_price: float | None = None
         last_close_price: float | None = None
         if inval_type == INVAL_PRICE_LEVEL and ticker:
-            current_price, last_close_price = _read_last_price(engine, ticker)
+            current_price, last_close_price = _read_last_price(
+                engine, ticker, as_of=as_of, errors=query_errors,
+            )
 
         triggered, reason = evaluate_condition(
             invalidation,
@@ -402,10 +475,20 @@ def run_monitor(
                 auto_size_down_to=determine_size_down(inval_type),
             ))
 
+    all_errors = query_errors + errors
+    query_failures = len(query_errors)
+    had_query_error = query_failures > 0
+
     if events:
         log.warning(
             "thesis_invalidation_monitor: {n} invalidation(s) triggered",
             n=len(events),
+        )
+    elif had_query_error:
+        log.warning(
+            "thesis_invalidation_monitor: completed with {q} query failure(s) "
+            "({n} predictions scanned)",
+            q=query_failures, n=len(predictions),
         )
     else:
         log.debug(
@@ -417,5 +500,7 @@ def run_monitor(
         as_of=as_of,
         predictions_scanned=len(predictions),
         events=events,
-        errors=errors,
+        errors=all_errors,
+        query_failures=query_failures,
+        had_query_error=had_query_error,
     )

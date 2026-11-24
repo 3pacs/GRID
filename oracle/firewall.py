@@ -18,7 +18,11 @@ from sqlalchemy.engine import Engine
 
 from oracle.claim_extractor import extract_claims
 from oracle.claim_verifier import verify_claims
-from oracle.publisher_gate import PublishDecision, gate_decision
+from oracle.publisher_gate import (
+    _AUTO_PUBLISH_CONFIDENCE,
+    PublishDecision,
+    gate_decision,
+)
 from oracle.sanity_checker import CheckedClaim, run_sanity_checks
 
 
@@ -93,24 +97,30 @@ def verify_output(text: str, engine: Engine) -> FirewallResult:
 
 
 def _mark_unverified(text: str, checked: list[CheckedClaim]) -> str:
-    """Insert [UNVERIFIED] markers before flagged claim sentences."""
+    """Insert [UNVERIFIED] markers before flagged, unverified, or low-confidence claims."""
     result = text
     # Process in reverse order of source_span to preserve positions
     flagged = [
         cc for cc in checked
         if cc.critical_fail
-        or cc.verified.verdict in ("contradicted", "ambiguous")
-        or any(r.flag == "warn" for r in cc.checks)
+        or cc.verified.verdict in ("contradicted", "ambiguous", "insufficient")
+        or any(r.flag in ("warn", "fail") for r in cc.checks)
+        or cc.verified.confidence < _AUTO_PUBLISH_CONFIDENCE
     ]
     # Sort by source span start, descending, so insertions don't shift later spans
     flagged.sort(key=lambda cc: cc.verified.claim.source_span[0], reverse=True)
 
+    marked_starts: set[int] = set()
     for cc in flagged:
         span_start = cc.verified.claim.source_span[0]
+        if span_start in marked_starts:
+            continue
         if 0 < span_start <= len(result):
             result = result[:span_start] + "[UNVERIFIED] " + result[span_start:]
+            marked_starts.add(span_start)
         elif span_start == 0:
             result = "[UNVERIFIED] " + result
+            marked_starts.add(span_start)
 
     return result
 
@@ -154,7 +164,7 @@ def _audit_claims(
                     "confidence": v.confidence,
                     "evidence": json.dumps(evidence),
                     "sanity_checks": json.dumps(sanity),
-                    "published": decision.decision == "publish",
+                    "published": decision.decision in ("publish", "review"),
                 })
             conn.commit()
     except Exception as exc:
