@@ -49,8 +49,8 @@ def doc() -> str:
 def test_status_is_draft_and_authorises_nothing(lineage: dict, doc: str) -> None:
     assert lineage["status"] == "DRAFT_UNREVIEWED"
     assert lineage["authorises"] == []
-    assert lineage["revision"] == 5
-    assert "DRAFT v0, revision 5" in doc and "authorises nothing" in doc
+    assert lineage["revision"] == 6
+    assert "DRAFT v0, revision 6" in doc and "authorises nothing" in doc
     assert lineage["document"] == str(DOC_PATH.relative_to(ROOT))
 
 
@@ -108,15 +108,30 @@ def run_visibility(run: dict, read_at: datetime) -> str:
             and datetime.fromisoformat(witness["observed_at"]) <= read_at):
         return "VISIBLE"
     for read in run.get("negative_reads", []):
-        if (read.get("table") == "publication_review_runs"
-                and read.get("publication_day") == run.get("publication_day")
-                and datetime.fromisoformat(read["observed_at"]) >= read_at
-                and run["run_id"] not in read.get("returned_run_ids", [])):
+        if negative_read_proves_absence(read, run, read_at):
             return "NOT_VISIBLE"
-    commit_at = run.get("authoritative_commit_at")
-    if commit_at is not None and datetime.fromisoformat(commit_at) > read_at:
+    commit = run.get("authoritative_commit")
+    if (commit and commit.get("source") == "trusted" and commit.get("run_id") == run["run_id"]
+            and commit.get("review_sha256") == run["review_sha256"] and commit.get("committed_at")
+            and datetime.fromisoformat(commit["committed_at"]) > read_at):
         return "NOT_VISIBLE"
     return "VISIBILITY_UNKNOWN"
+
+
+def negative_read_proves_absence(read: dict, run: dict, read_at: datetime) -> bool:
+    """Every condition must hold; a missing field or an error never proves absence."""
+    acquired = read.get("snapshot_acquired_at")
+    if (read.get("source") != "primary" or read.get("error") is not None or not acquired
+            or datetime.fromisoformat(acquired) < read_at
+            or read.get("table") != "publication_review_runs"):
+        return False
+    if read.get("lookup") == "exact_identity":
+        return read.get("found") is False
+    if read.get("lookup") == "scoped_list":
+        ids = read.get("returned_run_ids")
+        return (read.get("complete") is True and isinstance(ids, list)
+                and read.get("publication_day") == run.get("publication_day") and run["run_id"] not in ids)
+    return False
 
 
 def derive(row: dict, rules: dict, read_at: datetime) -> dict:
@@ -189,7 +204,14 @@ def test_fixtures_cover_every_verdict_and_the_reviewed_cases(lineage: dict, inge
     assert states["pair C3: authoritative commit after R"] == "NOT_VISIBLE"
     for f in fixtures:
         if f["expect"]["state"] == "NOT_VISIBLE":
-            assert f["run"]["negative_reads"] or f["run"]["authoritative_commit_at"], f["name"]
+            assert f["run"]["negative_reads"] or f["run"]["authoritative_commit"], f["name"]
+    # Review 6033941569: stale snapshots, replicas, partial/missing lists, errors and mis-bound commits stay UNKNOWN.
+    for name in ("neg: stale snapshot acquired before R, completed after", "neg: replica read",
+                 "neg: partial (filtered or paginated) list", "neg: list missing returned_run_ids",
+                 "neg: errored read", "neg: exact identity lookup without a found field",
+                 "commit proof bound to another run", "commit proof from an untrusted source"):
+        assert states[name] == "VISIBILITY_UNKNOWN", name
+    assert states["neg: exact identity lookup found no row"] == "NOT_VISIBLE"
 
 
 def test_ingested_at_never_decides_visibility(lineage: dict) -> None:

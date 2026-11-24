@@ -4,8 +4,9 @@ Issue: [#960](https://github.com/3pacs/GRID/issues/960). Milestone: M2, "Evidenc
 Machine-readable companion: [`m2-outcome-lineage-v0.json`](m2-outcome-lineage-v0.json). The companion is held to
 the code by `tests/test_m2_outcome_lineage_map.py`.
 
-**Status: DRAFT v0, revision 5** (answers the reviewer's HOLDs 6033027329 on `393cde73`, 6033670709 on
-`4aa18aee`, 6033699395 on `bc0e85db` and 6033821128 on `3c0c79a9`; the change maps are §7–§10). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
+**Status: DRAFT v0, revision 6** (answers the reviewer's HOLDs 6033027329 on `393cde73`, 6033670709 on
+`4aa18aee`, 6033699395 on `bc0e85db`, 6033821128 on `3c0c79a9` and 6033941569 on `c7be57b6`; the change maps
+are §7–§11). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
 scoring or learning, evaluation run, DDL, historical rewrite, promotion or trading action. Only the research owner
 can adopt it, and only after the independent reviewer's pass (§6). Adoption is a separate commit that pins this
 file's hash. The D0 contract ([#1129](https://github.com/3pacs/GRID/issues/1129), draft PR #1142) is the first
@@ -75,11 +76,18 @@ and only then assigns a protocol state. Two clocks of the row's run decide wheth
 
   A positive witness timed after `R` proves nothing about `R`: a first sighting at `R+5` fits a commit at `R−1`
   as well as one at `R+1`. So a row is `NOT_VISIBLE` only on **negative evidence**, of one of two kinds:
-  - **a cutoff-negative witness:** a read made at or after `R`, scoped to the run's own table and publication day,
-    whose returned run set does not contain the run's `run_id`. A read before `R` that misses the run proves
-    nothing about `R`.
-  - **an authoritative commit time after `R`:** a commit timestamp recorded by the database itself (not
-    `ingested_at`). None exists today.
+  - **a cutoff-negative witness.** Every condition below must hold; if any one fails, or any field is missing or
+    errored, the result reverts to `VISIBILITY_UNKNOWN`:
+    - **Trusted source:** the primary database, not a replica (replica lag can hide a committed run).
+    - **Snapshot timing:** the read's snapshot was **acquired** at or after `R`. The response or completion time
+      does not count, since a snapshot taken before `R` can finish after it.
+    - **Complete lookup:** either an exact-identity lookup of this `run_id` that completed without error and
+      returned no row; or a scoped list of `publication_review_runs` for the run's publication day, marked
+      complete (no filter, limit or pagination), whose `returned_run_ids` is present and omits the `run_id`.
+
+    A read before `R` that misses the run proves nothing about `R`.
+  - **an authoritative commit time after `R`:** a commit timestamp recorded by a trusted database source (not
+    `ingested_at`), bound to this exact `run_id` and `review_sha256`. None exists today.
 
   Every other row without a positive witness by `R` is `VISIBILITY_UNKNOWN`. That covers a positive witness only
   after `R`, no witness at all, and a negative read before `R` or scoped elsewhere. Every historical run is in this
@@ -296,4 +304,12 @@ days (rule 2.4.4). The pending, unavailable and unmeasurable counts are always s
 | A first positive read at `R+5` fits an `R−1` or an `R+1` commit, so it does not prove `NOT_VISIBLE` at `R` | §2.2: `NOT_VISIBLE` needs negative evidence. That is either a read at or after `R`, scoped to the run's table and day, that did not return the run, or an authoritative commit time after `R`. A positive witness only after `R` is `VISIBILITY_UNKNOWN`. |
 | Add paired cases, with genuine negative evidence | Fixtures: a positive witness only after `R` (`VISIBILITY_UNKNOWN`), and the same with a scoped negative read at `R` (`NOT_VISIBLE`); an authoritative commit after `R` (`NOT_VISIBLE`); a negative read before `R` (`VISIBILITY_UNKNOWN`); a negative read scoped to another day (`VISIBILITY_UNKNOWN`). |
 | Keep both states excluded; no dynamic substitution after the run set is frozen | Both stay out of the denominator, with their own counts. §2.2 adds "No substitution after freezing", and the supersession test checks that a superseding run first seen after `R` is never read. |
+
+## 11. Revision 6 change map (answers HOLD 6033941569 on `c7be57b6`)
+
+| Reviewer point | Change |
+|---|---|
+| A pre-`R` snapshot completing after `R`, replica lag, and a filtered, incomplete or missing list can falsely certify `NOT_VISIBLE` | §2.2: a negative witness needs a trusted primary source, a snapshot acquired at or after `R` (not the response time), and either a complete exact-identity lookup or a complete scoped list with `returned_run_ids` present. An error or a missing field reverts to `VISIBILITY_UNKNOWN`. |
+| Bind the authoritative commit proof to the exact run and hash, from a trusted source | §2.2: the commit time must come from a trusted database source and name the same `run_id` and `review_sha256`. |
+| Add stale-snapshot and partial or missing list cases | Fixtures: a stale snapshot (acquired before `R`, completed after); a replica read; a partial list; a missing list; an errored read; an exact-identity lookup with no row (`NOT_VISIBLE`); a commit proof bound to another run. |
 

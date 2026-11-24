@@ -298,12 +298,13 @@
       "contains": "def cofiring("
     }
   ],
-  "revision": 5,
+  "revision": 6,
   "answers_review": [
     "GRID #1413 review 6033027329 at 393cde73",
     "GRID #1413 review 6033670709 at 4aa18aee",
     "GRID #1413 review 6033699395 at bc0e85db",
-    "GRID #1413 review 6033821128 at 3c0c79a9"
+    "GRID #1413 review 6033821128 at 3c0c79a9",
+    "GRID #1413 review 6033941569 at c7be57b6"
   ],
   "derivation": {
     "note": "Executable form of doc section 2.2; tests/test_m2_outcome_lineage_map.py applies these rules to the fixtures.",
@@ -388,7 +389,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -415,7 +416,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -442,7 +443,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -469,7 +470,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -496,7 +497,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -523,7 +524,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -550,7 +551,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -577,7 +578,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -604,7 +605,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -631,7 +632,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -658,7 +659,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -685,7 +686,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -712,7 +713,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -739,7 +740,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -766,7 +767,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -793,7 +794,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         }
       },
       {
@@ -815,7 +816,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -837,7 +838,7 @@
           "witness": null,
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -864,7 +865,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -891,7 +892,7 @@
           },
           "publication_day": "2026-11-18",
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -918,7 +919,7 @@
             "observed_at": "2026-11-20T00:05:00+00:00"
           },
           "negative_reads": [],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -947,15 +948,20 @@
           "negative_reads": [
             {
               "kind": "study_read",
+              "source": "primary",
               "table": "publication_review_runs",
               "publication_day": "2026-11-18",
-              "observed_at": "2026-11-20T00:00:00+00:00",
+              "lookup": "scoped_list",
+              "complete": true,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:00+00:00",
               "returned_run_ids": [
                 90
-              ]
+              ],
+              "error": null
             }
           ],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -982,7 +988,12 @@
             "observed_at": "2026-11-20T00:05:00+00:00"
           },
           "negative_reads": [],
-          "authoritative_commit_at": "2026-11-20T00:00:01+00:00"
+          "authoritative_commit": {
+            "source": "trusted",
+            "run_id": 302,
+            "review_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "committed_at": "2026-11-20T00:00:01+00:00"
+          }
         },
         "expect": {
           "maturity": "MATURE",
@@ -1011,15 +1022,20 @@
           "negative_reads": [
             {
               "kind": "study_read",
+              "source": "primary",
               "table": "publication_review_runs",
               "publication_day": "2026-11-18",
-              "observed_at": "2026-11-19T23:00:00+00:00",
+              "lookup": "scoped_list",
+              "complete": true,
+              "snapshot_acquired_at": "2026-11-19T23:00:00+00:00",
+              "completed_at": "2026-11-19T23:00:00+00:00",
               "returned_run_ids": [
                 90
-              ]
+              ],
+              "error": null
             }
           ],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
@@ -1048,20 +1064,377 @@
           "negative_reads": [
             {
               "kind": "study_read",
+              "source": "primary",
               "table": "publication_review_runs",
               "publication_day": "2026-11-17",
-              "observed_at": "2026-11-20T00:00:00+00:00",
+              "lookup": "scoped_list",
+              "complete": true,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:00+00:00",
               "returned_run_ids": [
                 90
-              ]
+              ],
+              "error": null
             }
           ],
-          "authoritative_commit_at": null
+          "authoritative_commit": null
         },
         "expect": {
           "maturity": "MATURE",
           "data": "PRESENT",
           "state": "VISIBILITY_UNKNOWN"
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "neg: stale snapshot acquired before R, completed after",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 400,
+          "review_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 400,
+            "review_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "source": "primary",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "lookup": "scoped_list",
+              "complete": true,
+              "snapshot_acquired_at": "2026-11-19T23:59:00+00:00",
+              "completed_at": "2026-11-20T00:02:00+00:00",
+              "returned_run_ids": [
+                90
+              ],
+              "error": null
+            }
+          ],
+          "authoritative_commit": null
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "neg: replica read",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 401,
+          "review_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 401,
+            "review_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "source": "replica",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "lookup": "scoped_list",
+              "complete": true,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:01+00:00",
+              "returned_run_ids": [
+                90
+              ],
+              "error": null
+            }
+          ],
+          "authoritative_commit": null
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "neg: partial (filtered or paginated) list",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 402,
+          "review_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 402,
+            "review_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "source": "primary",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "lookup": "scoped_list",
+              "complete": false,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:01+00:00",
+              "returned_run_ids": [
+                90
+              ],
+              "error": null
+            }
+          ],
+          "authoritative_commit": null
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "neg: list missing returned_run_ids",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 403,
+          "review_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 403,
+            "review_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "source": "primary",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "lookup": "scoped_list",
+              "complete": true,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:01+00:00",
+              "error": null
+            }
+          ],
+          "authoritative_commit": null
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "neg: errored read",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 404,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 404,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "source": "primary",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "lookup": "scoped_list",
+              "complete": true,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:01+00:00",
+              "returned_run_ids": [
+                90
+              ],
+              "error": "timeout"
+            }
+          ],
+          "authoritative_commit": null
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "neg: exact identity lookup found no row",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "NOT_VISIBLE"
+        },
+        "run": {
+          "run_id": 405,
+          "review_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 405,
+            "review_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "source": "primary",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "lookup": "exact_identity",
+              "complete": null,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:01+00:00",
+              "returned_run_ids": null,
+              "error": null,
+              "found": false
+            }
+          ],
+          "authoritative_commit": null
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "neg: exact identity lookup without a found field",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 406,
+          "review_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccd",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 406,
+            "review_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccd",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [
+            {
+              "kind": "study_read",
+              "source": "primary",
+              "table": "publication_review_runs",
+              "publication_day": "2026-11-18",
+              "lookup": "exact_identity",
+              "complete": null,
+              "snapshot_acquired_at": "2026-11-20T00:00:00+00:00",
+              "completed_at": "2026-11-20T00:00:01+00:00",
+              "returned_run_ids": null,
+              "error": null
+            }
+          ],
+          "authoritative_commit": null
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "commit proof bound to another run",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 407,
+          "review_sha256": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddde",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 407,
+            "review_sha256": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddde",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [],
+          "authoritative_commit": {
+            "source": "trusted",
+            "run_id": 99,
+            "review_sha256": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddde",
+            "committed_at": "2026-11-20T00:00:01+00:00"
+          }
+        }
+      },
+      {
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "name": "commit proof from an untrusted source",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        },
+        "run": {
+          "run_id": 408,
+          "review_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeef",
+          "publication_day": "2026-11-18",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 408,
+            "review_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeef",
+            "observed_at": "2026-11-20T00:05:00+00:00"
+          },
+          "negative_reads": [],
+          "authoritative_commit": {
+            "source": "ingest_wrapper",
+            "run_id": 408,
+            "review_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeef",
+            "committed_at": "2026-11-20T00:00:01+00:00"
+          }
         }
       }
     ],
@@ -1122,7 +1495,17 @@
         }
       ]
     },
-    "frozen_run_set": "runs first seen after R never substitute for or join the frozen set"
+    "frozen_run_set": "runs first seen after R never substitute for or join the frozen set",
+    "negative_witness": {
+      "requires": [
+        "source == primary",
+        "snapshot_acquired_at >= R",
+        "no error",
+        "lookup exact_identity with found == false, or scoped_list with complete == true and returned_run_ids present and omitting run_id"
+      ],
+      "otherwise": "VISIBILITY_UNKNOWN",
+      "authoritative_commit": "trusted source, same run_id and review_sha256, committed_at > R"
+    }
   },
   "binding_values": [
     "ENFORCED",
