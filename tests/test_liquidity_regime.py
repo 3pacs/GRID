@@ -290,8 +290,10 @@ class TestPredictLiquidityWiring:
                                "window_density": 0}
             result = p.predict("SPY", as_of=datetime(2026, 5, 1, tzinfo=timezone.utc))
         assert result.liquidity_state == STATE_CRISIS
-        # Baseline 0.8 × 0.60 = 0.48
-        assert abs(result.confidence - 0.48) < 0.01
+        # The 0.60 crisis multiplier scales the edge over 0.5, not the whole
+        # probability: 0.5 + 0.3 × 0.60 = 0.68 (0.8 × 0.60 = 0.48 would turn a
+        # bullish call into a below-coin-flip one).
+        assert abs(result.confidence - 0.68) < 0.01
 
     def test_liquidity_failure_non_fatal(self):
         from datetime import datetime, timezone

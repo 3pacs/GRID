@@ -228,6 +228,39 @@ def effective_asset_type(ticker: str, stored: str | None) -> str:
     return _guess_asset_type(ticker)
 
 
+_ASSET_TYPE_SECTOR: dict[str, str] = {
+    "crypto": "Crypto", "etf": "ETF", "commodity": "Commodities",
+}
+
+
+def watchlist_sectors(items: list[tuple[str, str]]) -> dict[str, str]:
+    """Sector label for each ``(ticker, effective_asset_type)`` watchlist item.
+
+    A ticker named as an actor in ``analysis.sector_map.SECTOR_MAP`` gets
+    that sector. A ticker listed under several sectors (AAPL, TSLA, LLY,
+    RTX on 2026-11-23) gets the last one in map order. Any other ticker is
+    labelled from its asset type: Crypto, ETF, Commodities, else Other.
+    The portfolio view and the risk map's concentration block both use
+    this. The watchlist table has no sector column.
+    """
+    tickers = {t for t, _ in items}
+    sectors: dict[str, str] = {}
+    try:
+        from analysis.sector_map import SECTOR_MAP
+        for sector_name, sector in SECTOR_MAP.items():
+            for sub in sector.get("subsectors", {}).values():
+                for actor in sub.get("actors", []):
+                    tk = actor.get("ticker")
+                    if tk and tk in tickers:
+                        sectors[tk] = sector_name
+    except Exception as exc:
+        log.debug("Watchlist: sector map context failed: {e}", e=str(exc))
+    for tk, asset_type in items:
+        if tk not in sectors:
+            sectors[tk] = _ASSET_TYPE_SECTOR.get(asset_type, "Other")
+    return sectors
+
+
 def _row_to_dict(row: Any) -> dict:
     """Convert a DB row to a watchlist item dict."""
     d = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
@@ -582,19 +615,26 @@ def _preload_one(tk: str) -> str | None:
                     if pattern not in like_patterns:
                         like_patterns.append(pattern)
 
+                # Each matched feature's newest obs_date is computed once (LATERAL),
+                # not once per resolved_series row: the correlated MAX ran for every
+                # vintage of every matched feature (1.1-3.9 s for spy%, aapl%, xle% on griddb,
+                # 2026-11-23); this form takes ~2 ms. One row per feature: the newest
+                # vintage of its newest date (the old read returned every vintage of
+                # that date, in no set order).
                 feat_rows = conn.execute(
                     text(
-                        "SELECT fr.name, fr.family, rs.value, rs.obs_date "
-                        "FROM resolved_series rs "
-                        "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                        "SELECT DISTINCT ON (fr.name) fr.name, fr.family, rs.value, rs.obs_date "
+                        "FROM feature_registry fr "
+                        "CROSS JOIN LATERAL ("
+                        "  SELECT MAX(rs2.obs_date) AS max_obs FROM resolved_series rs2 "
+                        "  WHERE rs2.feature_id = fr.id"
+                        ") m "
+                        "JOIN resolved_series rs "
+                        "  ON rs.feature_id = fr.id AND rs.obs_date = m.max_obs "
                         "WHERE (" + " OR ".join(
                             f"fr.name LIKE :p{i}" for i in range(len(like_patterns))
                         ) + ") "
-                        "AND rs.obs_date = ("
-                        "  SELECT MAX(rs2.obs_date) FROM resolved_series rs2 "
-                        "  WHERE rs2.feature_id = rs.feature_id"
-                        ") "
-                        "ORDER BY fr.name"
+                        "ORDER BY fr.name, rs.vintage_date DESC"
                     ),
                     {f"p{i}": p for i, p in enumerate(like_patterns)},
                 ).fetchall()

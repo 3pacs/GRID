@@ -291,9 +291,10 @@ def classify_current_regime(
 def apply_to_confidence(confidence: float, state: str) -> float:
     """Apply the state's confidence multiplier with a [0, 1] clamp.
 
-    Called by ``oracle/engine.py::EnsemblePredictor.predict`` after the
-    catalyst + disagreement dampenings so the liquidity regime has the final
-    say. Used as a multiplier, not an override — direction is untouched.
+    ``oracle/engine.py::EnsemblePredictor.predict`` no longer calls this: it
+    applies ``STATE_CONFIDENCE_MULTIPLIER`` to the edge over 0.5 so a damped
+    call never crosses 0.5 (Codex HOLD 6011902881). Used as a multiplier,
+    not an override — direction is untouched.
     """
     mult = STATE_CONFIDENCE_MULTIPLIER.get(state, 1.0)
     return max(0.0, min(1.0, float(confidence) * mult))

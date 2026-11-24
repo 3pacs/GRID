@@ -34,34 +34,42 @@ from oracle.claim_verifier import (
 # ── Engine-mock helpers ──────────────────────────────────────────────────
 
 
-def _make_engine_for_fetchone(rows: dict[str, tuple | None]) -> MagicMock:
-    """Build a MagicMock engine whose .execute().fetchone() returns
-    ``rows[feature_name]`` based on the bound ``:name`` param."""
+def _two_step_engine(rows: dict) -> MagicMock:
+    """MagicMock engine for the readers' two statements.
+
+    The readers look the feature id up first (``feature_registry`` by the
+    bound ``:name``) and then read ``resolved_series`` by the bound ``:fid``.
+    Every key of *rows* is a registered feature; ``rows[name]`` is what the
+    value read returns for it (``fetchone`` row or ``fetchall`` list).
+    """
     engine = MagicMock()
     conn = engine.connect.return_value.__enter__.return_value
+    ids = {name: 1000 + i for i, name in enumerate(rows)}
+    names = {fid: name for name, fid in ids.items()}
 
     def _execute(_sql, params):
         result = MagicMock()
-        result.fetchone.return_value = rows.get(params["name"])
+        if "fid" in params:
+            data = rows[names[params["fid"]]]
+            result.fetchone.return_value = data
+            result.fetchall.return_value = data if data is not None else []
+        else:
+            fid = ids.get(params["name"])
+            result.fetchone.return_value = (fid,) if fid is not None else None
         return result
 
     conn.execute.side_effect = _execute
     return engine
+
+
+def _make_engine_for_fetchone(rows: dict[str, tuple | None]) -> MagicMock:
+    """Engine whose value read returns ``rows[feature_name]`` (``fetchone``)."""
+    return _two_step_engine(rows)
 
 
 def _make_engine_for_fetchall(rows: dict[str, list[tuple]]) -> MagicMock:
-    """Build a MagicMock engine whose .execute().fetchall() returns
-    ``rows[feature_name]`` (list of row tuples) based on bound ``:name``."""
-    engine = MagicMock()
-    conn = engine.connect.return_value.__enter__.return_value
-
-    def _execute(_sql, params):
-        result = MagicMock()
-        result.fetchall.return_value = rows.get(params["name"], [])
-        return result
-
-    conn.execute.side_effect = _execute
-    return engine
+    """Engine whose value read returns ``rows[feature_name]`` (``fetchall``)."""
+    return _two_step_engine(rows)
 
 
 def _make_engine_raising(exc: Exception) -> MagicMock:
@@ -346,9 +354,14 @@ def test_verify_claims_dispatches_by_claim_type() -> None:
     conn = engine.connect.return_value.__enter__.return_value
 
     def _execute(_sql, params):
+        # Feature id lookup by :name first, then the value read by :fid
+        # (one registered feature, "spy", id 7).
         result = MagicMock()
-        result.fetchone.return_value = fetchone_rows.get(params["name"])
-        result.fetchall.return_value = fetchall_rows.get(params["name"], [])
+        if "fid" in params:
+            result.fetchone.return_value = fetchone_rows.get("spy")
+            result.fetchall.return_value = fetchall_rows.get("spy", [])
+        else:
+            result.fetchone.return_value = (7,) if params["name"] == "spy" else None
         return result
 
     conn.execute.side_effect = _execute

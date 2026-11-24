@@ -25,6 +25,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.feature_ids import feature_id
 from trading.circuit_breaker import StrategyCircuitBreaker
 from trading.paper_engine import PaperTradingEngine
 
@@ -41,15 +42,23 @@ _MIN_VENUE_ORDER_USD = 1.0
 
 
 def _get_latest_prices(conn, feature_name: str, n: int = 2) -> list[tuple[date, float]]:
-    """Get the latest n daily prices for a feature from resolved_series."""
+    """Get the latest n daily prices for a feature from resolved_series.
+
+    The id is bound rather than matched through a feature_registry name
+    join: the active strategies' features are sector ETF panels (xle_full
+    286k rows), which the join read in full on every call (377 ms on griddb,
+    2026-11-23; < 1 ms bound).
+    """
+    fid = feature_id(conn, feature_name)
+    if fid is None:
+        return []
     rows = conn.execute(text(
         "SELECT DISTINCT ON (obs_date) obs_date, value "
         "FROM resolved_series rs "
-        "JOIN feature_registry fr ON fr.id = rs.feature_id "
-        "WHERE fr.name = :feature_name "
+        "WHERE rs.feature_id = :fid "
         "ORDER BY obs_date DESC, vintage_date DESC "
         "LIMIT :n"
-    ), {"feature_name": feature_name, "n": n}).fetchall()
+    ), {"fid": fid, "n": n}).fetchall()
     return [(r[0], float(r[1])) for r in rows]
 
 
