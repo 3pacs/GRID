@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from company_research_quality import diagnose_sec_exhibit_evidence
-from ingestion.company_documents import ingest_document
+from ingestion.company_documents import ingest_document, read_document
 
 CIK = "0000000001"
 ACC = "0000000001-99-000001"
@@ -20,11 +20,12 @@ def stamp(clock):
 
 
 def receipt(root, *, claim="fictional issuer reports earnings", public="12:47", fetched="12:48",
-            visible="12:49", version=1, supersedes=None, url=URL):
+            visible="12:49", version=1, supersedes=None, url=URL, publication_unknown=False):
     raw = f"<p>{claim}</p>".encode()
     doc = ingest_document(root, {
         "company_id": CIK, "source_kind": "sec_filing", "source_url": url, "title": "fabricated exhibit",
-        "published_at": stamp(public), "retrieved_at": stamp(fetched), "media_type": "text/html",
+        "published_at": None if publication_unknown else stamp(public),
+        "retrieved_at": stamp(fetched), "media_type": "text/html",
     }, raw)
     result = {
         "cik": CIK, "accession": ACC, "security_id": SECURITY, "version": version, "supersedes": supersedes,
@@ -142,3 +143,44 @@ class TestSecExhibitEvidence(TestCase):
         (root / (second["snapshot_id"] + ".json")).unlink()
         evidence = inspect(root, first, second, consumer=lambda entries: entries)
         assert tuple(e["version"] for e in evidence) == (1,)
+
+    def test_archived_before_cutoff_without_matching_readback_does_not_dispatch(self):
+        root = self.tmp_path
+        r = receipt(root)
+        assert read_document(root, r["snapshot_id"])["content_sha256"] == r["document_sha256"]
+        missing_readback = {k: val for k, val in r.items() if k != "visibility"}
+        mismatched_readback = deepcopy(r)
+        mismatched_readback["visibility"]["snapshot_id"] = "a" * 64
+        consumer = Mock()
+        for candidate in (missing_readback, mismatched_readback):
+            with self.subTest(candidate=candidate):
+                assert inspect(root, candidate, consumer=consumer) == {
+                    "status": "no_qualifying_evidence", "evidence": (),
+                }
+        consumer.assert_not_called()
+
+    def test_same_snapshot_readback_retry_keeps_original_clocks_in_either_order(self):
+        root = self.tmp_path
+        first = receipt(root, fetched="12:48", visible="12:49")
+        retry = deepcopy(first)
+        retry["visibility"]["observed_at"] = stamp("19:59")
+        consumer = Mock(side_effect=lambda evidence: evidence)
+        forward = inspect(root, first, retry, consumer=consumer)
+        reverse = inspect(root, retry, first, consumer=consumer)
+        assert forward == reverse and len(forward) == 1
+        item = forward[0]
+        assert item["snapshot_id"] == first["snapshot_id"]
+        assert item["retrieved_at"].isoformat() == "2099-01-12T17:48:00+00:00"
+        assert item["visible_at"].isoformat() == "2099-01-12T17:49:00+00:00"
+        assert consumer.call_count == 2
+
+    def test_null_archive_publication_cannot_be_filled_from_acceptance(self):
+        root = self.tmp_path
+        r = receipt(root, public="12:45", publication_unknown=True)
+        assert r["public_observed_at"] == r["accepted_at"]
+        assert read_document(root, r["snapshot_id"])["published_at"] is None
+        consumer = Mock()
+        assert inspect(root, r, consumer=consumer) == {
+            "status": "unusable_visible_version", "evidence": (),
+        }
+        consumer.assert_not_called()
