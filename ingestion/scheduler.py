@@ -1042,9 +1042,17 @@ def _get_pullers_for_group(
             pullers.append(("OppInsights", OppInsightsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("OppInsights puller init failed: {err}", err=str(exc))
+        # GDELT DOC puller: governed by the SmartScheduler registry hold
+        # (retired 2026-11-23: the DOC API refuses grid-svr), so lifting it
+        # there brings it back here too.
         try:
-            from ingestion.altdata.gdelt import GDELTPuller
-            pullers.append(("GDELT", GDELTPuller(db_engine), "pull_recent", {"days_back": 2}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _gdelt_hold = hold_reason_for("gdelt")
+            if _gdelt_hold:
+                log.info("GDELT held: {r}", r=_gdelt_hold)
+            else:
+                from ingestion.altdata.gdelt import GDELTPuller
+                pullers.append(("GDELT", GDELTPuller(db_engine), "pull_recent", {"days_back": 2}))
         except Exception as exc:
             log.warning("GDELT puller init failed: {err}", err=str(exc))
         try:

@@ -15,6 +15,12 @@ Usage:
     python scripts/autoresearch.py --max-iter 10        # more iterations
     python scripts/autoresearch.py --layer TACTICAL     # different layer
     python scripts/autoresearch.py --seed "VIX term structure predicts..."
+
+Behavior notes:
+    No hypothesis currently produced by ``parse_hypothesis_json`` supplies a
+    callable ``predict_fn`` (or ``fit_fn``) or an explicit ``target_feature_id``.
+    ``run_autoresearch`` now refuses to backtest such hypotheses (marking them
+    ``FAILED``) rather than silently validating a constant-long signal.
 """
 
 from __future__ import annotations
@@ -1032,6 +1038,19 @@ def run_autoresearch(
 
         log.info("[3/4] Running walk-forward backtest...")
         try:
+            predict_fn = hyp.get("predict_fn")
+            fit_fn = hyp.get("fit_fn")
+            target_feature_id = hyp.get("target_feature_id")
+            if (not callable(predict_fn) and not callable(fit_fn)) or target_feature_id is None:
+                raise ValueError(
+                    "Refusing backtest: hypothesis must supply a callable predict_fn "
+                    "(or fit_fn) and an explicit target_feature_id"
+                )
+            if target_feature_id not in hyp["feature_ids"]:
+                raise ValueError(
+                    f"Refusing backtest: target_feature_id={target_feature_id} "
+                    f"is not in hypothesis feature_ids={hyp['feature_ids']}"
+                )
             result = backtester.run_validation(
                 hypothesis_id=hyp_id,
                 feature_ids=hyp["feature_ids"],
@@ -1039,6 +1058,9 @@ def run_autoresearch(
                 end_date=backtest_end,
                 n_splits=n_splits,
                 cost_bps=cost_bps,
+                predict_fn=predict_fn,
+                fit_fn=fit_fn,
+                target_feature_id=target_feature_id,
             )
         except Exception as exc:
             log.error("Backtest failed: {e}", e=str(exc))

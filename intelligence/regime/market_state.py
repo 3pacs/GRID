@@ -1023,10 +1023,13 @@ class MarketState:
     writer_provenance: dict[str, Any] | None = None
     source_lineage: dict[str, Any] | None = None
     freshness_calendar: str | None = None   # the pinned XNYS manifests session ages were counted on
+    # Spells and transitions (intelligence/regime/spells.py, #1309): set by the decision writer from the stored
+    # labels of earlier sessions, never by compute_market_state; a provisional record has none.
+    spells: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         ok = [k for k, v in self.variables.items() if v.get("status") == "ok"]
-        return {
+        out = {
             "rule": RECORD_RULE,
             "baseline_rule": BASELINE_RULE,
             "freshness_rule": FRESHNESS_RULE,
@@ -1047,6 +1050,9 @@ class MarketState:
             "writer_provenance": self.writer_provenance,
             "source_lineage": self.source_lineage,
         }
+        if self.spells is not None:
+            out["spells"] = self.spells
+        return out
 
 
 def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, list[date]] | None = None,
