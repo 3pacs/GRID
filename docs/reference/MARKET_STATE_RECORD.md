@@ -131,32 +131,53 @@ with them. Code: `intelligence/regime/spells.py`; tests `tests/test_market_state
 | Transition | the first eligible session whose label differs from the previous eligible one: variable, from, to, date, observation date, value, z, status, `gap_sessions` (ineligible sessions it crossed) and the spell it ended |
 | Length | `spell_sessions` and distinct `observations` (a monthly reading repeats across about 21 sessions). A spell that starts at a variable's first eligible reading is `left_censored`: its length is a lower bound |
 | Named spells | `vix_above_vix3m` (VIX / VIX3M > 1), `spot_below_gamma_flip` (spot_vs_gamma_flip < 0), `hy_spread_above_normal` (HY label above or high); each is `on` or `off` |
-| Origin | `nightly` for a row the nightly writer stored (`writer_provenance.mode = daily`), `reconstruction` for every other row: the 2026-11-13 backfill (no provenance), ranges, explicit sessions, replacements, dry runs. Each transition names its row's origin; each spell counts its sessions by origin |
+| Row origin | `daily_write` for a row the decision writer stored in daily mode with an explicit `writer_provenance.dry_run: false`. That is the writer's mode, not proof the timer ran it (`execution_origin` stays `unverified`; the default command run by hand writes the same). Every other row is `reconstruction`: the 2026-11-13 backfill (no provenance), ranges, explicit sessions, replacements, and provenance without `dry_run`. Each transition names its row's origin; each spell counts its sessions by origin |
+| Block source | `writer`: the block the decision writer stored with the record. `recomputed`: any later derivation from the current store (the CLI). The two are never mixed |
 
-- **Writer.** Each new decision record carries a `spells` block: every variable's spell, the named spells, the
-  transitions read at that session, the first session folded, missing sessions and ignored rows. The writer reads
-  the stored labels once per run, then follows its own records, so a range or a dry run sees its earlier targets. A
-  failed read is reported in the block (`status: unavailable`), and the record is still written. The block is
-  about 14 KB.
-- **The log.** The nightly run appends to it by storing each session's transitions in that session's record. Rows
-  stored before spells existed are folded on read. `scripts/market_state_spells.py` is read-only (a READ ONLY
-  transaction on Postgres):
-  - `--transitions [--from --to --name]` prints the whole log, one JSON object per line;
-  - `--as-of D` prints the block at D;
-  - `--check` compares every stored block with a fresh derivation and exits 1 on a difference. A later `--replace` of
-    an earlier session causes one.
+- **Writer.** Each new decision record carries a `spells` block (`source: writer`): every variable's spell, the named
+  spells, the transitions read at that session, the first session folded, missing sessions and ignored rows. The
+  writer reads the stored rows once per run, then follows the records it stores, so a range sees its earlier targets.
+  A failed read is reported in the block (`status: unavailable`), and the record is still written. The block is
+  about 16 KB.
+- **Dry runs follow the live admission.** A dry run reads which targets already have rows and records, in
+  `writer_provenance.dry_run_admission`, what the same command without `--dry-run` would do: `would_write`,
+  `would_replace`, `would_hold` or `existing_row_preserved`, in the live path's order (an existing row is skipped
+  before the dealer gate). Only `would_write` and `would_replace` records advance later targets' spells, so a dry
+  run's blocks are the live run's (tests compare them over stored, preserved and new targets). A range cannot carry
+  `--require-target-dealer`, so a held target never sits between two targets of one run.
+- **Stored vs recomputed, and what is point-in-time.** A stored block is computed from the rows as stored when the
+  writer ran, so it holds nothing written after it. It does not certify those rows: for sessions through 2026-11-12
+  they are the 2026-11-13 backfill, which its `basis` counts as `reconstruction`. A recomputed block selects the
+  current rows by session date, not by when each was written, so a row backfilled or replaced after a session's own
+  record is folded in. It is a reconstruction from today's store, not what was known that evening. Its `lineage` gives
+  the own record's `computed_at` and origin, and counts the earlier rows written after it. Zero does not make it
+  point-in-time: the 2024-05-01 row and everything before it were all written on 2026-11-13.
+- **The log.** Each writer run appends to it by storing that session's transitions in the session's record.
+  `scripts/market_state_spells.py` is read-only (a READ ONLY transaction on Postgres):
+  - `--transitions [--from --to --name]` recomputes the whole log from the current store, one JSON object per line
+    with `source: recomputed`;
+  - `--transitions --stored` prints only what the writer stored (`source: stored`);
+  - `--as-of D` prints the stored block at D (or why there is none) beside a recomputed block with its `lineage`;
+  - `--check` compares every stored block with a recomputation and exits 1 on a difference. Each difference counts
+    the earlier rows written after the block (a later `--replace` or backfill).
 - **Not here.** A provisional record (#1312) carries no spells: at the close, the previous session's decision record
   is not written yet, and a display-only row never advances a spell. There is no hysteresis either: a spell changes
   exactly when the stored label does. Labels near a boundary flip often (DIX's 5-session change, 853 times since
   2019; VIX, 328). Confirmation rules belong to #1307.
-- **First read of griddb** (2026-11-23, read-only):
-  - 1,981 rows from 2019-01-02 to 2026-11-19: 1,976 reconstruction, 5 nightly.
+- **Read of griddb** (2026-11-24 03:00Z, read-only, branch code staged and removed):
+  - 1,982 rows from 2019-01-02 to 2026-11-20: 1,976 `reconstruction`, 6 `daily_write`. Every daily-mode row has an
+    explicit `dry_run: false` and `execution_origin: unverified`.
   - Three sessions have no row: 2019-06-19, 2020-06-19 and 2021-06-18. The scheduler helpers closed them.
   - One row is ignored: 2025-01-09.
-  - 5,112 transitions: 4,966 of labels and 146 of named spells. 12 of them cross an ineligible gap.
-  - Every eligible reading of the last 60 sessions (1,380) has its stored label as its spell state.
-  - On 2026-11-19, VIX had been `high` for 3 sessions and HY `high` for 15. `hy_spread_above_normal` had been on
-    for 38 sessions (since 2026-09-29) and `spot_below_gamma_flip` for 23.
+  - 5,114 transitions recomputed: 4,968 of labels and 146 of named spells; 20 read in `daily_write` rows; 12 cross
+    an ineligible gap.
+  - Every eligible reading of the last 60 sessions (1,384) has its stored label as its spell state.
+  - No row carries a stored block yet (`--check` rc 0, 0 of 1,982): the first is the writer run after deploy.
+  - On 2026-11-20 (recomputed):
+    - VIX had been `high` for 4 sessions, and HY and IG `high` for 16.
+    - `hy_spread_above_normal` had been on for 39 sessions (since 2026-09-29), `spot_below_gamma_flip` for 23 and
+      `vix_above_vix3m` for 3.
+    - DIX and `news_first_print` moved from `normal` to `below`.
 
 ## Variables (v1)
 

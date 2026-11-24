@@ -49,7 +49,7 @@ def entry(label=None, status="ok", value=None, z=None, obs=None):
             "obs_date": obs}
 
 
-def row(day: date, origin=S.NIGHTLY, **variables) -> S.SpellRow:
+def row(day: date, origin=S.DAILY_WRITE, **variables) -> S.SpellRow:
     for v in variables.values():
         if v.get("obs_date") is None:
             v["obs_date"] = day.isoformat()
@@ -94,7 +94,7 @@ def test_a_change_across_an_ineligible_session_is_one_transition_with_its_gap():
     assert (t["from"], t["to"], t["as_of"], t["gap_sessions"]) == ("high", "normal", ds[3].isoformat(), 1)
     assert t["ended_spell"]["spell_sessions"] == 2 and t["ended_spell"]["ineligible_sessions"] == 0
     assert t["ended_spell"]["last_eligible"] == ds[1].isoformat()
-    assert t["status"] == "ok" and t["robust_z"] == 1.5 and t["origin"] == S.NIGHTLY
+    assert t["status"] == "ok" and t["robust_z"] == 1.5 and t["origin"] == S.DAILY_WRITE
 
 
 def test_trailing_ineligible_sessions_are_reported_not_counted():
@@ -231,25 +231,61 @@ def test_a_non_numeric_value_is_not_eligible():
 # ── Origin ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("prov,origin", [
-    ({"mode": "daily"}, S.NIGHTLY), ({"mode": "daily", "dry_run": True}, S.RECONSTRUCTION),
-    ({"mode": "backfill"}, S.RECONSTRUCTION), ({"mode": "explicit_session"}, S.RECONSTRUCTION),
-    ({"mode": "replacement"}, S.RECONSTRUCTION), (None, S.RECONSTRUCTION)])
-def test_only_the_nightly_writer_rows_are_nightly(prov, origin):
+    ({"mode": "daily", "dry_run": False}, S.DAILY_WRITE),
+    ({"mode": "daily"}, S.RECONSTRUCTION),                       # no dry_run field: not proof of a real write
+    ({"mode": "daily", "dry_run": None}, S.RECONSTRUCTION), ({"mode": "daily", "dry_run": 0}, S.RECONSTRUCTION),
+    ({"mode": "daily", "dry_run": "false"}, S.RECONSTRUCTION), ({"mode": "daily", "dry_run": True}, S.RECONSTRUCTION),
+    ({"mode": "backfill", "dry_run": False}, S.RECONSTRUCTION),
+    ({"mode": "explicit_session", "dry_run": False}, S.RECONSTRUCTION),
+    ({"mode": "replacement", "dry_run": False}, S.RECONSTRUCTION), (None, S.RECONSTRUCTION),
+    ("daily", S.RECONSTRUCTION)])
+def test_only_an_explicit_non_dry_daily_write_is_daily_write(prov, origin):
     assert S.row_origin({"writer_provenance": prov}) == origin
+
+
+def test_daily_write_claims_the_writer_mode_not_the_timer():
+    # The writer stamps every record execution_origin=unverified; the label must not say more than that.
+    assert S.DAILY_WRITE == "daily_write" and "nightly" not in S.DAILY_WRITE
+    assert '"execution_origin": "unverified"' in pyinspect.getsource(W.main)
 
 
 def test_transitions_name_the_origin_of_their_row_and_spells_count_by_origin():
     ds = days(date(2026, 11, 2), 4)
     rows = [row(ds[0], S.RECONSTRUCTION, vix=entry("normal")), row(ds[1], S.RECONSTRUCTION, vix=entry("high")),
-            row(ds[2], S.NIGHTLY, vix=entry("high")), row(ds[3], S.NIGHTLY, vix=entry("low"))]
+            row(ds[2], S.DAILY_WRITE, vix=entry("high")), row(ds[3], S.DAILY_WRITE, vix=entry("low"))]
     f = folded(rows)
-    assert [(t["to"], t["origin"]) for t in f.transitions] == [("high", S.RECONSTRUCTION), ("low", S.NIGHTLY)]
+    assert [(t["to"], t["origin"]) for t in f.transitions] == [("high", S.RECONSTRUCTION), ("low", S.DAILY_WRITE)]
     assert f.spells[(S.LABEL, "vix")].previous["state"] == "high"
     block = S.spells_block(rows[:3], ds[2])
-    assert block["variables"]["vix"]["basis"] == {S.NIGHTLY: 1, S.RECONSTRUCTION: 1}
+    assert block["variables"]["vix"]["basis"] == {S.DAILY_WRITE: 1, S.RECONSTRUCTION: 1}
 
 
 # ── The block ──────────────────────────────────────────────────────────────
+
+def test_a_block_names_its_source_and_only_the_writer_claims_writer():
+    ds = days(date(2026, 11, 2), 2)
+    rows = vix_rows(ds, ["high", "high"])
+    recomputed = S.spells_block(rows, ds[1])
+    assert recomputed["source"] == S.RECOMPUTED and "not what was known" in recomputed["source_detail"]
+    assert S.spells_block(rows, ds[1], source=S.WRITER)["source"] == S.WRITER
+    assert S.record_spells(rows[:1], ds[1], "market-state/3", {"variables": {"vix": entry("high")}})["source"] \
+        == S.WRITER
+    with pytest.raises(ValueError):
+        S.spells_block(rows, ds[1], source="nightly")
+
+
+def test_lineage_counts_earlier_rows_written_after_the_sessions_own_record():
+    ds = days(date(2026, 11, 2), 3)
+    at = [datetime(2026, 11, 13, 9), datetime(2026, 11, 20, 23), datetime(2026, 11, 13, 9, 5)]
+    rows = [S.SpellRow(d, "market-state/3", S.RECONSTRUCTION, {"vix": entry("high", obs=d.isoformat())}, c)
+            for d, c in zip(ds, at)]
+    lin = S.recompute_lineage(rows, ds[2])
+    assert lin == {"rows_folded": 3, "own_record_computed_at": "2026-11-13T09:05:00",
+                   "own_record_origin": S.RECONSTRUCTION, "earlier_rows_written_after_own_record": 1,
+                   "latest_computed_at": "2026-11-20T23:00:00"}
+    assert S.recompute_lineage(rows[:1], ds[0])["earlier_rows_written_after_own_record"] == 0
+    assert S.recompute_lineage(rows[:1], ds[1])["earlier_rows_written_after_own_record"] is None   # no own record
+
 
 def test_a_block_needs_a_session_and_its_own_record():
     ds = days(date(2026, 11, 2), 2)
@@ -314,18 +350,19 @@ def _backfill(engine, labels):
             assert M.store_market_state(engine, _state(d, lab))      # no provenance: reconstruction
 
 
-def test_the_nightly_writer_stores_spells_and_the_sessions_transitions(engine, bounded, capsys):
+def test_a_daily_write_stores_spells_and_the_sessions_transitions(engine, bounded, capsys):
     _backfill(engine, bounded)
     assert W.main(["--no-refresh", "--json"], engine) == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["outcomes"][0]["spells_status"] == "ok"
     sp = _stored(engine, TARGET)["spells"]
     assert sp["rule"] == S.SPELL_RULE and sp["status"] == "ok" and sp["as_of"] == "2026-11-13"
+    assert sp["source"] == S.WRITER
     vix = sp["variables"]["vix"]
     assert (vix["state"], vix["since"], vix["spell_sessions"], vix["left_censored"]) == ("high", "2026-11-13", 1, False)
     assert vix["previous"]["spell_sessions"] == 3 and vix["previous"]["left_censored"] is True
     [t] = sp["transitions"]
-    assert (t["name"], t["from"], t["to"], t["origin"], t["robust_z"]) == ("vix", "normal", "high", S.NIGHTLY, 2.4)
+    assert (t["name"], t["from"], t["to"], t["origin"], t["robust_z"]) == ("vix", "normal", "high", S.DAILY_WRITE, 2.4)
     assert sp["named"]["vix_above_vix3m"]["state"] == "on" and sp["named"]["vix_above_vix3m"]["spell_sessions"] == 4
     assert sp["first_session"] == "2026-11-10" and sp["missing_sessions"] == 0
 
@@ -336,7 +373,7 @@ def test_a_dry_run_range_follows_its_own_earlier_targets_and_writes_nothing(engi
     assert [r["as_of"] for r in records] == ["2026-11-10", "2026-11-11", "2026-11-12", "2026-11-13"]
     last = records[-1]["spells"]
     assert last["first_session"] == "2026-11-10" and [t["to"] for t in last["transitions"]] == ["high"]
-    assert last["transitions"][0]["origin"] == S.RECONSTRUCTION      # a dry run is never nightly
+    assert last["transitions"][0]["origin"] == S.RECONSTRUCTION      # a dry run is never a daily write
     assert not inspect(engine).has_table("market_state_daily")
 
 
@@ -358,11 +395,87 @@ def test_a_spells_failure_never_sinks_the_record(engine, bounded, monkeypatch, c
     assert W.main(["--no-refresh", "--json"], engine) == 0
     rec = _stored(engine, TARGET)
     assert rec["variables"]["vix"]["label"] == "high"
-    assert rec["spells"] == {"rule": S.SPELL_RULE, "as_of": "2026-11-13", "status": "unavailable",
-                             "reason": "error reading stored labels: RuntimeError"}
+    assert rec["spells"] == {"rule": S.SPELL_RULE, "as_of": "2026-11-13", "source": S.WRITER,
+                             "status": "unavailable", "reason": "error reading stored labels: RuntimeError"}
+
+
+# ── A dry run follows the live run's admission ─────────────────────────────
+
+@pytest.mark.parametrize("existing,replace,hold,admission", [
+    (False, False, False, "would_write"), (False, True, False, "would_replace"),
+    (False, False, True, "would_hold"), (True, False, False, "existing_row_preserved"),
+    (True, False, True, "existing_row_preserved")])        # the live run skips an existing row before its gate
+def test_dry_run_admission_follows_the_live_order(existing, replace, hold, admission):
+    assert W.dry_run_admission(existing=existing, replace=replace, hold=hold) == admission
+    assert (admission in W.ADVANCES_SPELLS) == (admission in {"would_write", "would_replace"})
+
+
+def _mixed_store(engine):
+    # 11-10 stored normal (eligible, kept); 11-11 absent (would write normal); 11-12 stored LOW, which a live run
+    # without --replace keeps although it would compute normal; 11-13 absent (would write high).
+    assert M.store_market_state(engine, _state(date(2026, 11, 10), "normal"))
+    assert M.store_market_state(engine, _state(date(2026, 11, 12), "low"))
+
+
+def _dry(engine, capsys, *extra):
+    assert W.main(["--no-refresh", "--json", "--dry-run", "--from", "2026-11-10", "--to", "2026-11-13", *extra],
+                  engine) == 0
+    return {r["as_of"]: r for r in (json.loads(x) for x in capsys.readouterr().out.splitlines() if x.strip())}
+
+
+def test_a_dry_run_range_matches_the_live_range_over_existing_rows(engine, bounded, capsys):
+    _mixed_store(engine)
+    dry = _dry(engine, capsys)
+    assert {d: r["writer_provenance"]["dry_run_admission"] for d, r in dry.items()} == {
+        "2026-11-10": "existing_row_preserved", "2026-11-11": "would_write",
+        "2026-11-12": "existing_row_preserved", "2026-11-13": "would_write"}
+    [t] = dry["2026-11-13"]["spells"]["transitions"]
+    assert (t["from"], t["to"], t["ended_spell"]["spell_sessions"]) == ("low", "high", 1)   # the stored 11-12 label
+    assert W.main(["--no-refresh", "--json", "--from", "2026-11-10", "--to", "2026-11-13"], engine) == 0
+    capsys.readouterr()
+    assert _stored(engine, date(2026, 11, 12))["variables"]["vix"]["label"] == "low"       # preserved
+    assert dry["2026-11-13"]["spells"] == _stored(engine, TARGET)["spells"]
+    assert dry["2026-11-11"]["spells"] == _stored(engine, date(2026, 11, 11))["spells"]
+
+
+def test_a_dry_replace_range_matches_the_live_replace(engine, bounded, capsys):
+    _mixed_store(engine)
+    dry = _dry(engine, capsys, "--replace")
+    assert {r["writer_provenance"]["dry_run_admission"] for r in dry.values()} == {"would_replace"}
+    [t] = dry["2026-11-13"]["spells"]["transitions"]
+    assert (t["from"], t["ended_spell"]["spell_sessions"]) == ("normal", 3)                # 11-12 recomputed
+    assert W.main(["--no-refresh", "--json", "--replace", "--from", "2026-11-10", "--to", "2026-11-13"],
+                  engine) == 0
+    assert dry["2026-11-13"]["spells"] == _stored(engine, TARGET)["spells"]
+
+
+def test_a_held_target_is_labelled_in_the_dry_run_and_never_stored_live(engine, bounded, capsys):
+    _backfill(engine, bounded)
+    args = ["--no-refresh", "--json", "--as-of", "2026-11-13", "--require-target-dealer"]
+    assert W.main([*args, "--dry-run"], engine) == 0
+    rec = json.loads(capsys.readouterr().out)
+    assert rec["writer_provenance"]["dry_run_admission"] == "would_hold"
+    assert W.main(args, engine) == 3                     # synthetic gamma is unavailable: the live run holds
+    assert json.loads(capsys.readouterr().out)["outcomes"][0]["outcome"] == "held_missing_target_dealer"
+    with engine.connect() as c:
+        assert c.execute(text("SELECT COUNT(*) FROM market_state_daily WHERE as_of_date = :d"),
+                         {"d": TARGET}).scalar_one() == 0
+
+
+def test_a_range_cannot_carry_the_dealer_gate(engine, bounded):
+    # So no would-hold target can sit between two targets of one run; the dry run mirrors the hold regardless.
+    assert W.main(["--no-refresh", "--dry-run", "--require-target-dealer", "--from", "2026-11-10",
+                   "--to", "2026-11-13"], engine) == 2
 
 
 # ── Read-only CLI ──────────────────────────────────────────────────────────
+
+def _replace_later(engine, day, label):
+    assert M.store_market_state(engine, _state(day, label), replace=True)
+    with engine.begin() as c:       # SQLite's CURRENT_TIMESTAMP has one-second resolution: make "later" certain
+        c.execute(text("UPDATE market_state_daily SET computed_at = '2099-01-01 00:00:00' WHERE as_of_date = :d"),
+                  {"d": day})
+
 
 def test_cli_check_matches_stored_blocks_and_flags_a_later_replacement(engine, bounded, capsys):
     _backfill(engine, bounded)
@@ -370,11 +483,42 @@ def test_cli_check_matches_stored_blocks_and_flags_a_later_replacement(engine, b
     capsys.readouterr()
     assert CLI.main(["--check"], engine) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out == {"rows": 4, "with_spells": 1, "without_spells": 3, "mismatched": []}
-    assert M.store_market_state(engine, _state(date(2026, 11, 12), "high"), replace=True)
+    assert out.pop("read_at") and out == {"rows": 4, "with_spells": 1, "without_spells": 3, "mismatched": []}
+    _replace_later(engine, date(2026, 11, 12), "high")
     assert CLI.main(["--check"], engine) == 1
     assert json.loads(capsys.readouterr().out)["mismatched"] == [
-        {"as_of": "2026-11-13", "differs": ["variables", "transitions"]}]
+        {"as_of": "2026-11-13", "differs": ["variables", "transitions"], "earlier_rows_written_after_block": 1}]
+
+
+def test_cli_as_of_shows_the_stored_block_beside_a_labelled_recomputation(engine, bounded, capsys):
+    _backfill(engine, bounded)
+    assert W.main(["--no-refresh", "--json"], engine) == 0
+    capsys.readouterr()
+    _replace_later(engine, date(2026, 11, 12), "high")
+    assert CLI.main(["--as-of", "2026-11-13"], engine) == 0
+    out = json.loads(capsys.readouterr().out)
+    stored, recomputed = out["stored"], out["recomputed"]
+    assert stored["source"] == S.WRITER and recomputed["source"] == S.RECOMPUTED
+    assert [t["from"] for t in stored["transitions"]] == ["normal"]       # what the writer saw that evening
+    assert recomputed["transitions"] == []                               # today's store: 11-12 now says high
+    assert recomputed["lineage"]["earlier_rows_written_after_own_record"] == 1
+    assert recomputed["lineage"]["own_record_origin"] == S.DAILY_WRITE
+    assert CLI.main(["--as-of", "2026-11-12"], engine) == 0
+    assert json.loads(capsys.readouterr().out)["stored"]["status"] == "absent"
+
+
+def test_cli_stored_transitions_are_only_what_the_writer_saved(engine, bounded, capsys):
+    _backfill(engine, bounded)
+    assert W.main(["--no-refresh", "--json"], engine) == 0
+    capsys.readouterr()
+    assert CLI.main(["--transitions", "--stored"], engine) == 0
+    captured = capsys.readouterr()
+    lines = [json.loads(x) for x in captured.out.splitlines()]
+    assert [(t["as_of"], t["name"], t["source"], t["origin"]) for t in lines] == [
+        ("2026-11-13", "vix", "stored", S.DAILY_WRITE)]
+    assert "1 of 4 records" in captured.err
+    assert CLI.main(["--transitions", "--stored", "--to", "2026-11-12"], engine) == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_cli_transitions_label_backfilled_rows_reconstruction(engine, capsys):
@@ -385,6 +529,7 @@ def test_cli_transitions_label_backfilled_rows_reconstruction(engine, capsys):
     lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
     assert [(t["from"], t["to"], t["origin"]) for t in lines] == [("normal", "high", S.RECONSTRUCTION),
                                                                 ("high", "low", S.RECONSTRUCTION)]
+    assert {t["source"] for t in lines} == {S.RECOMPUTED}
     assert CLI.main(["--transitions", "--from", "2026-11-05", "--name", "vix"], engine) == 0
     assert [json.loads(x)["to"] for x in capsys.readouterr().out.splitlines()] == ["low"]
 
@@ -394,9 +539,12 @@ def test_cli_as_of_prints_one_block_and_refuses_stray_flags(engine, capsys):
     for d in ds:
         assert M.store_market_state(engine, _state(d, "normal"))
     assert CLI.main(["--as-of", ds[1].isoformat()], engine) == 0
-    block = json.loads(capsys.readouterr().out)
-    assert block["variables"]["vix"]["spell_sessions"] == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["recomputed"]["variables"]["vix"]["spell_sessions"] == 2
+    assert out["stored"] == {"status": "absent",
+                             "reason": "the record was stored without a spells block (before #1309)"}
     assert CLI.main(["--as-of", ds[1].isoformat(), "--name", "vix"], engine) == 2
+    assert CLI.main(["--as-of", ds[1].isoformat(), "--stored"], engine) == 2
 
 
 def test_cli_never_writes(engine, capsys):
