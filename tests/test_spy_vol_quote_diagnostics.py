@@ -103,3 +103,37 @@ class TestQuoteMark(TestCase):
         with localcontext() as ctx:
             ctx.prec = 1
             self.assertEqual(self.check([wide, *self.rows[1:]])["reasons"], {LEGS[0]: "wide_spread"})
+
+
+class TestCbboMinuteClock(TestCase):
+    def setUp(self):
+        self.mark = datetime(2022, 11, 11, 19, tzinfo=timezone.utc)  # 14:00 ET
+        self.others = [
+            Quote(leg, GEN, self.mark - timedelta(seconds=10), self.mark - timedelta(seconds=1),
+                  Decimal("1"), Decimal("1.1"))
+            for leg in LEGS[1:]
+        ]
+
+    def check(self, row):
+        return diagnose_quote_mark(LEGS, [row, *self.others], mark=self.mark, generation=GEN)
+
+    def test_trade_only_minute_does_not_refresh_carried_forward_book(self):
+        # Fabricated cbbo-1m market: the interval ends at 14:00 and its last
+        # trade was 13:59:50. A separate trusted synthetic witness places
+        # the actual carried-forward book update at 13:58:43 and makes it
+        # available to the mark on time. Neither minute field is its age.
+        interval_end = self.mark
+        last_trade = self.mark - timedelta(seconds=10)
+        book_update = self.mark - timedelta(seconds=77)
+        row = Quote(LEGS[0], GEN, book_update, interval_end, Decimal("1"), Decimal("1.1"))
+        self.assertEqual(self.check(row)["reasons"], {LEGS[0]: "stale_quote"})
+        for substituted_clock in (last_trade, interval_end):
+            with self.subTest(substituted_clock=substituted_clock):
+                unsafe = replace(row, observed_at=substituted_clock)
+                self.assertEqual(self.check(unsafe)["status"], "FOUR_QUOTES_QUALIFIED")
+
+    def test_fresh_book_received_after_mark_is_unavailable_at_mark(self):
+        fresh = Quote(LEGS[0], GEN, self.mark - timedelta(seconds=10),
+                      self.mark + timedelta(seconds=1), Decimal("1"), Decimal("1.1"))
+        self.assertEqual(self.check(fresh)["reasons"], {LEGS[0]: "missing_at_mark"})
+        self.assertEqual(self.check(replace(fresh, available_at=self.mark))["status"], "FOUR_QUOTES_QUALIFIED")
