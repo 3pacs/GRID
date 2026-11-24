@@ -107,19 +107,70 @@ def test_after_the_close_writes_todays_session(engine, monkeypatch, capsys, boun
     ("2026-11-20T14:30:00Z", "closes at"),                            # at the open
     ("2026-07-01T19:59:59Z", "closes at 2026-07-01T20:00:00+00:00"),  # summer, before the close
     ("2026-11-27T17:59:59Z", "closes at 2026-11-27T18:00:00+00:00"),  # early-close day, before it
-    ("2026-11-26T21:15:00Z", "not an XNYS session"),                  # Thanksgiving
-    ("2026-07-03T21:15:00Z", "not an XNYS session"),                  # Independence Day observed
-    ("2026-11-21T21:15:00Z", "not an XNYS session"),                  # Saturday
-    ("2026-11-21T00:30:00Z", "not an XNYS session"),                  # Friday evening in New York, Saturday UTC
     ("2026-11-24T00:30:00Z", "closes at 2026-11-24T21:00:00+00:00"),  # after midnight UTC: Monday's session is not targeted
     ("2028-01-03T21:15:00Z", "outside"),                              # past the pinned parts
 ])
-def test_before_the_close_or_not_a_session_refuses(engine, monkeypatch, capsys, bounded, now, why):
+def test_before_the_close_or_outside_the_pinned_parts_refuses(engine, monkeypatch, capsys, bounded, now, why):
     monkeypatch.setattr(W, "utc_now", lambda: z(now))
     code = W.main(["--provisional", "--no-refresh", "--json"], engine)
     captured = capsys.readouterr()
     assert code == 2 and why in captured.err and captured.out == ""
     assert bounded == [] and tables(engine) == set()
+
+
+NOT_SESSIONS = [
+    ("2026-11-26T21:15:00Z", "2026-11-26"),      # Thanksgiving: the weekday timer fires and finds nothing to write
+    ("2026-07-03T21:15:00Z", "2026-07-03"),      # Independence Day observed
+    ("2026-12-25T21:15:00Z", "2026-12-25"),      # Christmas, a Friday
+    ("2026-11-21T21:15:00Z", "2026-11-21"),      # Saturday
+    ("2026-11-21T00:30:00Z", "2026-11-21"),      # Friday evening in New York, Saturday UTC
+]
+
+
+@pytest.mark.parametrize("now, day", NOT_SESSIONS)
+@pytest.mark.parametrize("extra", [(), ("--dry-run",), ("--replace",)])
+def test_a_day_that_is_not_a_session_writes_nothing_and_exits_0(engine, monkeypatch, capsys, bounded, now, day,
+                                                                  extra):
+    monkeypatch.setattr(W, "utc_now", lambda: z(now))
+    code, summary = run(engine, capsys, *extra)
+    assert code == 0                                  # a holiday is not a failed run
+    assert (summary["outcome"], summary["day"], summary["written"], summary["target_session"]) == (
+        "not_a_session", day, 0, None)
+    assert summary["mode"] == M.PROVISIONAL_MODE and summary["decision_use"] == M.PROVISIONAL_DECISION_USE
+    assert summary["dry_run"] == ("--dry-run" in extra) and summary["calendar"]
+    assert bounded == [] and tables(engine) == set()  # nothing computed, no table touched
+
+
+def test_a_day_that_is_not_a_session_says_so_in_text(engine, monkeypatch, capsys, bounded):
+    monkeypatch.setattr(W, "utc_now", lambda: z("2026-11-26T21:15:00Z"))
+    assert W.main(["--provisional", "--no-refresh"], engine) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == ("market-state provisional 2026-11-26: not an XNYS session in the pinned calendar; "
+                                    "nothing to write")
+    assert captured.err == "" and bounded == []
+
+
+def test_not_a_session_is_its_own_refusal_and_still_a_value_error():
+    with pytest.raises(W.NotASession) as caught:
+        W.provisional_target(z("2026-11-26T21:15:00Z"))
+    assert isinstance(caught.value, ValueError) and caught.value.day == date(2026, 11, 26)
+    for now in ("2026-11-20T20:59:59Z", "2028-01-03T21:15:00Z"):   # before the close; past the pinned parts
+        with pytest.raises(ValueError) as other:
+            W.provisional_target(z(now))
+        assert not isinstance(other.value, W.NotASession)
+
+
+def test_bad_flags_are_refused_even_on_a_holiday(engine, monkeypatch, capsys, bounded):
+    monkeypatch.setattr(W, "utc_now", lambda: z("2026-11-26T21:15:00Z"))
+    assert W.main(["--provisional", "--as-of", "2026-11-25"], engine) == 2
+    assert "targets today's session only" in capsys.readouterr().err
+
+
+def test_the_unit_templates_no_longer_expect_a_failed_holiday():
+    service = (ROOT / "deploy/systemd/grid-market-state-provisional.service.template").read_text()
+    timer = (ROOT / "deploy/systemd/grid-market-state-provisional.timer.template").read_text()
+    assert "ends failed" not in service and "not_a_session" in service
+    assert "exit 0" in timer and "Mon..Fri" in timer
 
 
 def test_provisional_target_needs_an_aware_clock():

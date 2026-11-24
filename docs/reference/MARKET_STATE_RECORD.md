@@ -96,7 +96,9 @@ display only (owner's decision, bring-up plan rev 100).
 - **Writer**: `scripts/run_market_state.py --provisional`. It targets today's UTC session, and only at or after
   that session's `closes` in the pinned XNYS parts (`factory_session_calendar.PINS`). That close is 21:00Z, 20:00Z
   in summer, or 18:00Z on an early close.
-  - Before the close, or on a day that is not a session, it refuses with exit 2.
+  - Before the close, or on a day outside the pinned parts, it refuses with exit 2.
+  - On a day that is not a session (a weekday market holiday such as Thanksgiving, or a weekend) it computes and writes
+    nothing, prints `outcome: not_a_session` and exits 0, so the weekday timer does not end failed on a holiday.
   - It never takes `--from/--to`, `--as-of` or `--require-target-dealer`.
   - It never refreshes the FRED vintages, whatever flags are passed. `--no-refresh` is accepted and changes
     nothing, and no flag turns a refresh on (`--refresh` is an argparse usage error).
