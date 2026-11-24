@@ -211,3 +211,25 @@ def test_shard_assignment_partitions_the_plan():
     parts = [cli.assigned(shards, i, [3.0, 1.0, 1.0]) for i in range(3)]
     ids = [s["shard_id"] for part in parts for s in part]
     assert sorted(ids) == sorted(s["shard_id"] for s in shards)
+
+
+def test_gauntlet_full_passes_the_world_session_calendar(monkeypatch):
+    """Codex HOLD 6032280271: ROBUST needs an explicit session calendar. A
+    synthetic world's own index is its complete calendar, so gauntlet_full
+    passes it; without it every verdict would cap at MARGINAL and the farm's
+    ROBUST false-positive rate would read zero by construction."""
+    seen = {}
+
+    def _spy(signal, fwd, **kw):
+        seen.update(kw, index=signal.index)
+        return nf.gauntlet.GauntletResult(
+            verdict="UNSTABLE", permutation_p=0.5, permutation_passed=False,
+            deflated_sharpe_passed=False, observed_sharpe=0.0, deflated_threshold=0.0,
+            subsample_stability=0.0, subsample_passed=False, decay_monotonic=True,
+            cv_consistency=0.0, cv_passed=False, details={},
+        )
+
+    monkeypatch.setattr(nf.gauntlet, "run_gauntlet", _spy)
+    cell = nf.make_cell("gauntlet_full", "iid", 40, reps=1, perms=19, n_assets=10, top_n=2)
+    nf.replicate(cell, 0, 1)
+    assert seen["calendar"].equals(seen["index"])

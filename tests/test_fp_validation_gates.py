@@ -786,6 +786,7 @@ class TestGauntletCalibrationAndVerdict:
             n_permutations=39,
             n_subsample_splits=10,
             seed=42,
+            calendar=dates,
         )
         assert res_unavail.cv_consistency >= 0.75
         assert res_unavail.permutation_p < 0.05
@@ -808,6 +809,7 @@ class TestGauntletCalibrationAndVerdict:
             n_subsample_splits=10,
             seed=42,
             trial_sharpes=wide_trials,
+            calendar=dates,
         )
         assert res_fail_dsr.deflated_sharpe_passed is False
         assert res_fail_dsr.verdict == "MARGINAL"
@@ -823,6 +825,7 @@ class TestGauntletCalibrationAndVerdict:
             n_permutations=39,
             n_subsample_splits=10,
             seed=42,
+            calendar=dates,
         )
         assert res_pass.deflated_sharpe_passed is True
         assert res_pass.verdict == "ROBUST"
@@ -1053,7 +1056,9 @@ class TestFrozenBookCostLedgerAndCoverageLabels:
              [-0.01, -0.02, 0.01, 0.03, 0.0, 0.0]],
         )
         cov = metrics_mod.outcome_coverage(
-            metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+            metrics_mod.long_short_book(
+                signal, fwd, top_n=2, cost_bps=10.0, calendar=signal.index
+            )
         )
         assert cov["gross_coverage"] == "complete"
         assert cov["net_coverage"] == "complete"
@@ -1068,7 +1073,7 @@ class TestFrozenBookCostLedgerAndCoverageLabels:
         cols = [f"T{i:02d}" for i in range(12)]
         sig = pd.DataFrame(rng.normal(size=(40, 12)), index=dates, columns=cols)
         ret = pd.DataFrame(rng.normal(0, 0.01, size=(40, 12)), index=dates, columns=cols)
-        m = compute_signal_metrics(sig, ret, top_n=5, cost_bps=10.0)
+        m = compute_signal_metrics(sig, ret, top_n=5, cost_bps=10.0, calendar=dates)
         assert (m["gross_coverage"], m["net_coverage"], m["estimate"]) == (
             "complete", "complete", "full_book",
         )
@@ -1210,7 +1215,7 @@ class TestEligibilityWindowAndFullBookNet:
         signal, fwd = self._frames([_EF, _EF, _CD], [_OUT, _OUT, _GAP])
         d1, d2, d3 = signal.index
         book = metrics_mod.long_short_book(
-            signal, fwd, top_n=2, cost_bps=10.0, outcome_horizon=1
+            signal, fwd, top_n=2, cost_bps=10.0, outcome_horizon=1, calendar=signal.index
         )
         assert list(book.index) == [d1, d2]
         cov = metrics_mod.outcome_coverage(book)
@@ -1266,21 +1271,21 @@ class TestEligibilityWindowAndFullBookNet:
 
     def test_signal_metrics_partial_book_never_passes_net_threshold(self):
         sig, ret = _strong_alpha_panels()
-        complete = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0)
+        complete = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0, calendar=sig.index)
         assert complete["sharpe_net"] > 1.4
         assert complete["passes_threshold"] is True
         assert complete["net_pass_blocked_reason"] is None
 
         ret = ret.copy()
         ret.loc[ret.index[150], sig.iloc[150].idxmax()] = np.nan  # one partial date
-        partial = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0)
+        partial = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0, calendar=sig.index)
         assert partial["sharpe_net"] > 1.4  # the Sharpe alone would pass
         assert partial["passes_threshold"] is False
         assert "net coverage partial" in partial["net_pass_blocked_reason"]
 
     def test_gauntlet_complete_book_reaches_robust_unchanged(self):
         sig, ret = _strong_alpha_panels()
-        res = gauntlet.run_gauntlet(sig, ret, **_GAUNTLET_KW)
+        res = gauntlet.run_gauntlet(sig, ret, calendar=sig.index, **_GAUNTLET_KW)
         assert res.verdict == "ROBUST"
         assert res.details["passes_net_sharpe_threshold"] is True
         assert res.details["net_coverage"] == "complete"
@@ -1292,7 +1297,7 @@ class TestEligibilityWindowAndFullBookNet:
         sig, ret = _strong_alpha_panels()
         ret = ret.copy()
         ret.loc[ret.index[150], sig.iloc[150].idxmax()] = np.nan  # one partial date
-        res = gauntlet.run_gauntlet(sig, ret, **_GAUNTLET_KW)
+        res = gauntlet.run_gauntlet(sig, ret, calendar=sig.index, **_GAUNTLET_KW)
         assert res.details["net_sharpe"] > 1.4  # the Sharpe alone would pass
         assert res.deflated_sharpe_passed is True
         assert res.verdict == "MARGINAL"
@@ -1308,7 +1313,7 @@ class TestEligibilityWindowAndFullBookNet:
         sig, ret = _strong_alpha_panels()
         ret = ret.copy()
         ret.iloc[-1] = np.nan
-        res = gauntlet.run_gauntlet(sig, ret, **_GAUNTLET_KW)
+        res = gauntlet.run_gauntlet(sig, ret, calendar=sig.index, **_GAUNTLET_KW)
         assert res.details["turnover_cost_uncharged"] > 0.0
         assert res.details["net_coverage"] == "partial"
         assert res.verdict == "MARGINAL"
@@ -1319,7 +1324,9 @@ class TestEligibilityWindowAndFullBookNet:
         sig, ret = _strong_alpha_panels()
         ret = ret.copy()
         ret.iloc[-1] = np.nan  # the last outcome is not yet due
-        res = gauntlet.run_gauntlet(sig, ret, outcome_horizon=1, **_GAUNTLET_KW)
+        res = gauntlet.run_gauntlet(
+            sig, ret, outcome_horizon=1, calendar=sig.index, **_GAUNTLET_KW
+        )
         assert res.details["n_immature_excluded"] == 1
         assert res.details["mature_through"] == str(sig.index[-2])
         assert res.details["net_coverage"] == "complete"
@@ -1453,7 +1460,7 @@ class TestEnsembleEmbargoAndEarlyStopping:
 
         res = ensemble.train_ensemble(
             panels, fwd, train_frac=0.7, label_horizon=5, embargo_days=5,
-            n_rounds=20, early_stopping=5,
+            n_rounds=20, early_stopping=5, calendar=dates,
         )
         val = res.book_coverage["val"]
         assert val["net_coverage"] == "partial"
@@ -1463,3 +1470,296 @@ class TestEnsembleEmbargoAndEarlyStopping:
         assert train["net_coverage"] == "complete"
         assert train["estimate"] == "full_book"
 
+
+    @pytest.mark.parametrize("row", ["absent", "nan"])
+    @pytest.mark.parametrize("with_calendar", [True, False])
+    def test_validation_date_without_labels_stays_in_val_book(self, monkeypatch, row, with_calendar):
+        """Codex HOLD 6032280271: validation dates come from the decision
+        calendar (or the decision-time feature dates), never from the dates
+        that have labels. A validation date with no label at all, its row
+        absent or all NaN, stays in the validation book as missing coverage.
+        Pre-fix it was cut from the split and the val book said complete."""
+        self._mock_lgb(monkeypatch)
+        dates, panels, fwd = self._synthetic_panels(n_dates=100, n_tickers=12)
+        val_day = dates[80]
+        if row == "absent":
+            fwd = fwd.drop(index=val_day)
+        else:
+            fwd = fwd.copy()
+            fwd.loc[val_day] = np.nan
+        kw = {"calendar": dates} if with_calendar else {}
+        res = ensemble.train_ensemble(
+            panels, fwd, train_frac=0.7, label_horizon=5, embargo_days=5,
+            n_rounds=20, early_stopping=5, **kw,
+        )
+        val = res.book_coverage["val"]
+        assert val["n_unscored_days"] == 1
+        assert val["n_missing_outcomes"] == 10  # the whole top_n=5 book on val_day
+        assert val["net_coverage"] == "partial"
+        assert res.val_outcome_coverage == pytest.approx(1 - 10 / 250)  # 25 val dates
+        assert val["net_pass_blocked_reason"] is not None
+        basis = "explicit_calendar" if with_calendar else "label_index"
+        assert val["calendar_basis"] == res.book_coverage["train"]["calendar_basis"] == basis
+
+    def test_split_and_embargo_count_calendar_sessions(self, monkeypatch):
+        # dates[72] is a session with no features and no labels at all. On
+        # the explicit calendar it still counts toward the split: the outer
+        # train window ends at dates[69], so early stopping ends there too.
+        recorded = self._mock_lgb(monkeypatch)
+        dates, panels, fwd = self._synthetic_panels(n_dates=100, n_tickers=12)
+        gap = dates[72]
+        panels = {k: v.drop(index=gap) for k, v in panels.items()}
+        fwd = fwd.drop(index=gap)
+        ensemble.train_ensemble(
+            panels, fwd, train_frac=0.7, label_horizon=5, embargo_days=5,
+            n_rounds=20, early_stopping=5, calendar=dates,
+        )
+        es_ds = recorded["train_calls"][0]["valid_sets"][1]
+        assert es_ds.dates.max() == dates[69]
+
+    def test_decision_date_off_the_calendar_is_refused(self, monkeypatch):
+        self._mock_lgb(monkeypatch)
+        dates, panels, fwd = self._synthetic_panels(n_dates=100, n_tickers=12)
+        with pytest.raises(ValueError, match="calendar"):
+            ensemble.train_ensemble(
+                panels, fwd, train_frac=0.7, label_horizon=5, embargo_days=5,
+                n_rounds=20, early_stopping=5, calendar=dates.delete(40),
+            )
+
+
+# ===========================================================================
+# Codex HOLD 6032280271: an explicit session calendar, independent of labels
+# ===========================================================================
+
+
+class TestExplicitCalendarAbsentOutcomeRows:
+    """Codex HOLD 6032280271: the eligibility window is dated on an explicit
+    session calendar that does not depend on labels. A due outcome row that
+    is ABSENT from forward_returns (not present with NaN) is a missing
+    outcome: its decision forms a book and counts as unscored, exactly as a
+    NaN row does. Without an explicit calendar the window is dated from the
+    outcome rows present (``calendar_basis`` "label_index"): no full-book
+    estimate, no ROBUST and no net-threshold pass."""
+
+    _COLS = ["A", "B", "C", "D", "E", "F"]
+    _ONE_LEG_SWAP = 0.001  # top_n=2, cost_bps=10: one leg fully swapped
+
+    def _frames(self, signal_rows, fwd_rows):
+        dates = pd.bdate_range("2024-06-03", periods=len(signal_rows))
+        signal = pd.DataFrame(signal_rows, index=dates, columns=self._COLS, dtype=float)
+        fwd = pd.DataFrame(fwd_rows, index=dates, columns=self._COLS, dtype=float)
+        return signal, fwd
+
+    def test_absent_last_due_row_forms_book_and_counts_unscored(self):
+        # d3 rebalances into {C, D} and its outcome row is absent from the
+        # frame. Pre-fix the calendar was forward_returns.index (d1, d2): d3
+        # fell past mature_through, formed no book, and the book said complete.
+        signal, fwd = self._frames([_EF, _EF, _CD], [_OUT, _OUT, _OUT])
+        d1, d2, d3 = signal.index
+        fwd = fwd.drop(index=d3)
+        book = metrics_mod.long_short_book(
+            signal, fwd, top_n=2, cost_bps=10.0, calendar=signal.index
+        )
+        assert list(book.index) == [d1, d2, d3]
+        assert book.loc[d3, "n_observed"] == 0
+        assert np.isnan(book.loc[d3, "return"])
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["calendar_basis"] == "explicit_calendar"
+        assert cov["mature_through"] == str(d3)
+        assert cov["n_unscored_days"] == 1
+        assert cov["n_missing_outcomes"] == 4
+        assert cov["turnover_cost_uncharged"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        assert (cov["gross_coverage"], cov["net_coverage"], cov["estimate"]) == (
+            "partial", "partial", "conditional_on_observed_outcomes",
+        )
+        assert cov["net_pass_blocked_reason"] is not None
+
+    @pytest.mark.parametrize("gap", [0, 1, 2])
+    def test_absent_row_books_exactly_as_nan_row(self, gap):
+        signal, fwd = self._frames([_EF, _CD, _EF], [_OUT, _OUT, _OUT])
+        day = signal.index[gap]
+        nan_rows = fwd.copy()
+        nan_rows.loc[day] = np.nan
+        book_absent = metrics_mod.long_short_book(
+            signal, fwd.drop(index=day), top_n=2, cost_bps=10.0, calendar=signal.index
+        )
+        book_nan = metrics_mod.long_short_book(
+            signal, nan_rows, top_n=2, cost_bps=10.0, calendar=signal.index
+        )
+        pd.testing.assert_frame_equal(book_absent, book_nan)
+        cov = metrics_mod.outcome_coverage(book_absent)
+        assert cov == metrics_mod.outcome_coverage(book_nan)
+        assert cov["n_unscored_days"] == 1
+        assert cov["net_pass_blocked_reason"] is not None
+
+    def test_horizon_counts_calendar_sessions_not_outcome_rows(self):
+        # One-session horizon on the calendar d1..d4: d1..d3 are mature by d4.
+        # d4's outcome (not yet due) is absent from the frame. Dated from the
+        # outcome rows (d1..d3) the window shrinks to d2 and drops mature d3.
+        signal, fwd = self._frames([_EF, _EF, _CD, _EF], [_OUT] * 4)
+        d1, d2, d3, d4 = signal.index
+        fwd = fwd.drop(index=d4)
+        book = metrics_mod.long_short_book(
+            signal, fwd, top_n=2, cost_bps=10.0, outcome_horizon=1, calendar=signal.index
+        )
+        assert list(book.index) == [d1, d2, d3]
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["mature_through"] == str(d3)
+        assert cov["n_immature_excluded"] == 1
+        assert (cov["net_coverage"], cov["estimate"]) == ("complete", "full_book")
+        assert cov["net_pass_blocked_reason"] is None
+        label = metrics_mod.long_short_book(
+            signal, fwd, top_n=2, cost_bps=10.0, outcome_horizon=1
+        )
+        assert list(label.index) == [d1, d2]
+        assert metrics_mod.outcome_coverage(label)["calendar_basis"] == "label_index"
+
+    def test_label_index_basis_is_never_full_book_or_net_pass(self):
+        signal, fwd = self._frames([_EF, _CD], [_OUT, _OUT])
+        label = metrics_mod.outcome_coverage(
+            metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        )
+        assert label["calendar_basis"] == "label_index"
+        assert label["gross_coverage"] == "complete"  # complete over the rows present
+        assert label["estimate"] == "conditional_on_observed_outcomes"
+        assert "label_index" in label["net_pass_blocked_reason"]
+        explicit = metrics_mod.outcome_coverage(
+            metrics_mod.long_short_book(
+                signal, fwd, top_n=2, cost_bps=10.0, calendar=signal.index
+            )
+        )
+        assert explicit["calendar_basis"] == "explicit_calendar"
+        assert explicit["estimate"] == "full_book"
+        assert explicit["net_pass_blocked_reason"] is None
+
+    def test_decision_date_off_the_explicit_calendar_is_refused(self):
+        signal, fwd = self._frames([_EF, _EF, _EF], [_OUT] * 3)
+        with pytest.raises(ValueError, match="calendar"):
+            metrics_mod.long_short_book(signal, fwd, top_n=2, calendar=signal.index[[0, 2]])
+
+    def test_signal_metrics_net_pass_needs_explicit_calendar_and_counts_absent_rows(self):
+        sig, ret = _strong_alpha_panels()
+        explicit = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0, calendar=sig.index)
+        assert explicit["passes_threshold"] is True
+        assert explicit["calendar_basis"] == "explicit_calendar"
+        label = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0)
+        assert label["sharpe_net"] > 1.4  # the Sharpe alone would pass
+        assert label["passes_threshold"] is False
+        assert "label_index" in label["net_pass_blocked_reason"]
+        absent = compute_signal_metrics(
+            sig, ret.drop(index=ret.index[-1]), top_n=3, cost_bps=10.0, calendar=sig.index
+        )
+        assert absent["n_unscored_days"] == 1
+        assert absent["turnover_cost_uncharged"] > 0.0
+        assert absent["passes_threshold"] is False
+
+    def test_gauntlet_robust_needs_explicit_calendar(self):
+        sig, ret = _strong_alpha_panels()
+        label = gauntlet.run_gauntlet(sig, ret, **_GAUNTLET_KW)
+        assert label.details["calendar_basis"] == "label_index"
+        assert label.verdict == "MARGINAL"
+        assert label.details["passes_net_sharpe_threshold"] is False
+        assert "label_index" in label.details["verdict_downgrade_reason"]
+        explicit = gauntlet.run_gauntlet(sig, ret, calendar=sig.index, **_GAUNTLET_KW)
+        assert explicit.details["calendar_basis"] == "explicit_calendar"
+        assert explicit.verdict == "ROBUST"
+
+    def test_gauntlet_absent_rows_evaluate_exactly_as_nan_rows(self):
+        # An interior and the last mature outcome row are absent. Pre-fix the
+        # last fell outside the window (ROBUST); every test must also see the
+        # absent rows where the NaN rows sit (CV folds slice by position).
+        sig, ret = _strong_alpha_panels()
+        gone = [ret.index[150], ret.index[-1]]
+        nan_rows = ret.copy()
+        nan_rows.loc[gone] = np.nan
+        a = gauntlet.run_gauntlet(sig, ret.drop(index=gone), calendar=sig.index, **_GAUNTLET_KW)
+        b = gauntlet.run_gauntlet(sig, nan_rows, calendar=sig.index, **_GAUNTLET_KW)
+        assert a.details["n_unscored_days"] == 2
+        assert a.details["turnover_cost_uncharged"] > 0.0
+        assert a.verdict == "MARGINAL"
+        assert "uncharged" in a.details["verdict_downgrade_reason"]
+        for field in (
+            "verdict", "permutation_p", "cv_consistency", "subsample_stability",
+            "observed_sharpe", "decay_monotonic",
+        ):
+            assert getattr(a, field) == getattr(b, field), field
+        assert a.details["decay_ics"] == b.details["decay_ics"]
+        assert a.details["net_sharpe"] == b.details["net_sharpe"]
+
+
+class _FakeToday(date):
+    @classmethod
+    def today(cls) -> date:  # type: ignore[override]
+        return date(2024, 7, 2)
+
+
+class TestGauntletVPDEntryPointCalendar:
+    """Codex HOLD 6032280271: scripts/run_gauntlet_vpd.py no longer drops the
+    dates whose outcomes are wholly missing before the evaluator. It passes
+    the pinned XNYS session calendar, independent of the price rows, and the
+    declared one-session outcome horizon."""
+
+    def test_wholly_missing_mature_dates_reach_the_evaluator_and_are_counted(self, monkeypatch):
+        import scripts.run_gauntlet_vpd as vpd
+
+        sessions = pd.bdate_range("2024-01-02", "2024-07-01")  # as_of: 2024-07-01
+        absent = [sessions[60], sessions[-1]]  # the panel has no row at all on these
+        rng = np.random.default_rng(3)
+        cols = [f"T{i:02d}" for i in range(12)]
+        steps = rng.normal(0.0, 0.01, size=(len(sessions), len(cols)))
+        prices = pd.DataFrame(
+            100.0 * np.exp(np.cumsum(steps, axis=0)), index=sessions, columns=cols
+        ).drop(index=absent)
+
+        seen: dict[str, Any] = {}
+
+        def _metrics(signal, forward_returns, *args, **kw):
+            seen["metrics"] = compute_signal_metrics(signal, forward_returns, *args, **kw)
+            return seen["metrics"]
+
+        def _gauntlet(signal, forward_returns, **kw):
+            seen["gauntlet_kw"] = kw
+            seen["gauntlet_fwd"] = forward_returns
+            book = metrics_mod.long_short_book(
+                signal, forward_returns, kw["top_n"], kw["cost_bps"],
+                outcome_horizon=kw["outcome_horizon"], calendar=kw["calendar"],
+            )
+            seen["gauntlet_cov"] = metrics_mod.outcome_coverage(book)
+            return SimpleNamespace(
+                verdict="MARGINAL", permutation_p=0.5, permutation_passed=False,
+                observed_sharpe=0.0, deflated_threshold=0.0, deflated_sharpe_passed=False,
+                subsample_stability=0.0, subsample_passed=False, decay_monotonic=True,
+                cv_consistency=0.0, cv_passed=False, details=dict(seen["gauntlet_cov"]),
+            )
+
+        stub_cal = (date(2018, 1, 2), date(2027, 12, 31), tuple(d.date() for d in sessions), "test")
+        monkeypatch.setattr(vpd, "date", _FakeToday)
+        monkeypatch.setattr(vpd, "xnys_sessions", lambda: stub_cal, raising=False)
+        monkeypatch.setattr(vpd, "get_engine", lambda: object())
+        monkeypatch.setattr(vpd, "build_price_panel", lambda engine, **kw: prices.copy())
+        monkeypatch.setattr(
+            vpd, "vol_price_divergence",
+            lambda p: pd.DataFrame(
+                np.random.default_rng(4).normal(size=p.shape), index=p.index, columns=p.columns
+            ),
+        )
+        monkeypatch.setattr(vpd, "compute_signal_metrics", _metrics)
+        monkeypatch.setattr(vpd, "run_gauntlet", _gauntlet)
+
+        vpd.main()
+
+        kw = seen["gauntlet_kw"]
+        assert list(kw["calendar"]) == list(sessions)
+        assert kw["outcome_horizon"] == 1
+        # The decision before each absent session has no outcome at all: its
+        # row reaches the evaluator (pre-fix one was dropped and the other
+        # silently scored a two-session return) and is counted unscored.
+        due = [sessions[59], sessions[-2]]
+        fwd = seen["gauntlet_fwd"]
+        assert all(fwd.loc[d].isna().all() for d in due)
+        for cov in (seen["gauntlet_cov"], seen["metrics"]):
+            assert cov["calendar_basis"] == "explicit_calendar"
+            assert cov["mature_through"] == str(sessions[-2])
+            assert cov["n_unscored_days"] == 2
+            assert cov["net_coverage"] == "partial"
+            assert cov["net_pass_blocked_reason"] is not None
