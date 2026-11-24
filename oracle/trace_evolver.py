@@ -597,7 +597,10 @@ class TraceAnalyzer:
             "external_shock": "Add event-risk filter (FOMC, earnings, geopolitical)",
             "bad_data": "Add data freshness gate to affected sources",
             "model_error": "Review model logic for affected models",
+            "insufficient_data": "No-op (ignore): insufficient data to attribute failure",
         }
+        if category == "insufficient_data":
+            return actions["insufficient_data"]
         base = actions.get(category, f"Investigate {category}")
         if missed:
             base += f"; consider adding missed signals: {missed[:3]}"
@@ -642,6 +645,9 @@ class TargetedMutator:
 
     def _proposals_for_pattern(self, pattern: FailurePattern) -> list[MutationProposal]:
         proposals: list[MutationProposal] = []
+
+        if pattern.category == "insufficient_data":
+            return proposals
 
         if pattern.category == "wrong_signal" and pattern.signals_commonly_wrong:
             for model in pattern.affected_models:
