@@ -309,18 +309,31 @@ def execute_signals_now(
 ) -> dict:
     """Manually trigger signal execution.
 
-    Paper-only by default. With *venue* set, LONG signals on tickers the venue
-    reports tradable are also sent to that connector — dry-run until the
-    venue's live-trading flag is on.
+    Paper-only by default. Mirroring to ``robinhood`` is disabled (fail-closed)
+    because automatic close mirroring is not implemented.
     """
-    from trading.signal_executor import SUPPORTED_VENUES, execute_signals
+    from trading.signal_executor import (
+        ROBINHOOD_MIRROR_DISABLED_REASON,
+        SUPPORTED_VENUES,
+        execute_signals,
+    )
 
-    if venue and venue.strip().lower() not in SUPPORTED_VENUES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported venue {venue!r}. Known venues: {', '.join(SUPPORTED_VENUES)}",
-        )
-    return execute_signals(get_db_engine(), venue=venue, venue_wallet_id=wallet_id)
+    if venue:
+        normalized_venue = venue.strip().lower()
+        if normalized_venue not in SUPPORTED_VENUES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported venue {venue!r}. Known venues: {', '.join(SUPPORTED_VENUES)}",
+            )
+        if normalized_venue == "robinhood":
+            raise HTTPException(
+                status_code=400,
+                detail=ROBINHOOD_MIRROR_DISABLED_REASON,
+            )
+    result = execute_signals(get_db_engine(), venue=venue, venue_wallet_id=wallet_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @router.post("/strategies/{strategy_id}/kill")

@@ -16,11 +16,21 @@ with full provenance (hypothesis ID, signal strength, physics score).
 from __future__ import annotations
 
 import json
+import math
+from contextlib import nullcontext
 from datetime import date, datetime
 
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
+
+
+#: Minimum closed trades required before sizing via Kelly criterion
+#: (matches the auto-kill threshold in PaperTradingEngine._check_kill).
+MIN_TRADES_FOR_KELLY: int = 20
+
+#: Maximum single-trade position fraction from half-Kelly sizing.
+MAX_KELLY_FRACTION: float = 0.25
 
 
 class PaperTradingEngine:
@@ -148,12 +158,18 @@ class PaperTradingEngine:
         physics_score: float = 0.0,
         hypothesis_id: int | None = None,
         threshold_used: float = 0.0,
+        conn: Connection | None = None,
     ) -> int:
         """Open a new paper trade.
 
-        Returns trade_id.
+        *conn*, when given, runs the status check and the insert on that
+        connection inside the caller's open transaction (the signal executor's
+        serialized exposure reservation) and leaves the commit to the caller.
+        Without it the trade gets a transaction of its own.
+
+        Returns trade_id, or -1 when the strategy is not ACTIVE.
         """
-        with self.engine.begin() as conn:
+        with (self.engine.begin() if conn is None else nullcontext(conn)) as conn:
             # Check strategy is active
             strat = conn.execute(text(
                 "SELECT status FROM paper_strategies WHERE id = :id"
@@ -183,15 +199,31 @@ class PaperTradingEngine:
         return trade_id
 
     def close_trade(self, trade_id: int, exit_price: float, notes: str = "") -> dict:
-        """Close an open paper trade and compute P&L."""
+        """Close an open paper trade and compute P&L.
+
+        The close is an atomic OPEN -> CLOSED claim (Codex review 6031218970):
+        ``UPDATE ... WHERE id = :id AND status = 'OPEN' RETURNING``. When two
+        runs close the same trade, the second's claim waits on the first's
+        row lock, then re-checks ``status = 'OPEN'`` against the committed
+        row and matches nothing. Only the winner writes P&L, moves the
+        strategy's trade count, wins/losses, P&L, capital, high-water mark
+        and drawdown, and runs the kill check. The loser gets
+        ``{"error": ..., "reason": "already_closed"}`` and changes nothing.
+        A win returns ``strategy_killed``: whether this close's kill check
+        killed the strategy.
+        """
         with self.engine.begin() as conn:
             trade = conn.execute(text(
-                "SELECT strategy_id, direction, entry_price, position_size "
-                "FROM paper_trades WHERE id = :id AND status = 'OPEN'"
-            ), {"id": trade_id}).fetchone()
+                "UPDATE paper_trades SET status = 'CLOSED', exit_price = :price, "
+                "exit_date = :date, notes = :notes "
+                "WHERE id = :id AND status = 'OPEN' "
+                "RETURNING strategy_id, direction, entry_price, position_size"
+            ), {
+                "price": exit_price, "date": date.today(), "notes": notes, "id": trade_id,
+            }).fetchone()
 
             if not trade:
-                return {"error": "Trade not found or already closed"}
+                return {"error": "Trade not found or already closed", "reason": "already_closed"}
 
             strategy_id, direction, entry_price, position_size = trade
 
@@ -204,14 +236,8 @@ class PaperTradingEngine:
             pnl = pnl_pct * position_size * self.initial_capital
 
             conn.execute(text(
-                "UPDATE paper_trades SET exit_price = :price, exit_date = :date, "
-                "pnl = :pnl, pnl_pct = :pnl_pct, status = 'CLOSED', notes = :notes "
-                "WHERE id = :id"
-            ), {
-                "price": exit_price, "date": date.today(),
-                "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6),
-                "notes": notes, "id": trade_id,
-            })
+                "UPDATE paper_trades SET pnl = :pnl, pnl_pct = :pnl_pct WHERE id = :id"
+            ), {"pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6), "id": trade_id})
 
             # Update strategy stats
             is_win = pnl > 0
@@ -235,6 +261,7 @@ class PaperTradingEngine:
                 "SELECT capital, high_water_mark FROM paper_strategies WHERE id = :id"
             ), {"id": strategy_id}).fetchone()
 
+            strategy_killed = False
             if strat:
                 capital, hwm = strat
                 new_hwm = max(hwm, capital)
@@ -247,21 +274,27 @@ class PaperTradingEngine:
                 ), {"hwm": new_hwm, "dd": round(drawdown, 6), "id": strategy_id})
 
                 # Kill check
-                self._check_kill(conn, strategy_id)
+                strategy_killed = self._check_kill(conn, strategy_id)
 
         log.info("Paper trade #{id} closed: {dir} P&L={pnl:+.2f} ({pct:+.2%})",
                  id=trade_id, dir=direction, pnl=pnl, pct=pnl_pct)
-        return {"trade_id": trade_id, "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6)}
+        return {
+            "trade_id": trade_id, "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6),
+            "strategy_killed": strategy_killed,
+        }
 
-    def _check_kill(self, conn, strategy_id: str) -> None:
-        """Check if strategy should be killed based on performance."""
+    def _check_kill(self, conn, strategy_id: str) -> bool:
+        """Check if strategy should be killed based on performance.
+
+        Returns True when this call killed an ACTIVE strategy.
+        """
         strat = conn.execute(text(
             "SELECT total_trades, wins, max_drawdown, total_pnl, capital "
             "FROM paper_strategies WHERE id = :id AND status = 'ACTIVE'"
         ), {"id": strategy_id}).fetchone()
 
         if not strat or strat[0] < 20:
-            return  # Need at least 20 trades before judging
+            return False  # Need at least 20 trades before judging
 
         total, wins, dd, pnl, capital = strat
         win_rate = wins / total if total > 0 else 0
@@ -280,6 +313,8 @@ class PaperTradingEngine:
                 "WHERE id = :id"
             ), {"reason": kill_reason, "id": strategy_id})
             log.warning("Strategy {s} KILLED: {r}", s=strategy_id, r=kill_reason)
+            return True
+        return False
 
     def get_dashboard(self) -> dict:
         """Get paper trading dashboard with all strategies and recent trades."""
@@ -353,23 +388,39 @@ class PaperTradingEngine:
 
     def kelly_position_size(
         self, win_rate: float, avg_win: float, avg_loss: float,
-        max_fraction: float = 0.25,
+        max_fraction: float = MAX_KELLY_FRACTION,
     ) -> float:
         """Compute Kelly criterion position size.
 
-        Returns fraction of capital to risk (capped at max_fraction).
+        Returns fraction of capital to risk (capped at max_fraction), or 0.0
+        when edge is non-positive or inputs are invalid/non-finite.
         """
-        if avg_loss == 0 or win_rate <= 0:
+        if not (
+            math.isfinite(win_rate)
+            and math.isfinite(avg_win)
+            and math.isfinite(avg_loss)
+            and math.isfinite(max_fraction)
+        ):
+            return 0.0
+        if max_fraction <= 0 or win_rate <= 0 or win_rate > 1.0 or avg_win <= 0:
+            return 0.0
+        if avg_loss == 0:
+            # Valid only with zero losses (win_rate == 1.0): f* = p - q/b = 1.0
+            # -> half-Kelly = 0.5, capped at max_fraction.
+            if win_rate == 1.0:
+                return float(min(0.5, max_fraction))
             return 0.0
 
         # Kelly: f* = (bp - q) / b
-        # b = avg_win / avg_loss, p = win_rate, q = 1 - p
+        # b = avg_win / |avg_loss|, p = win_rate, q = 1 - p
         b = abs(avg_win / avg_loss)
+        if b <= 0 or not math.isfinite(b):
+            return 0.0
         p = win_rate
-        q = 1 - p
+        q = 1.0 - p
 
         kelly = (b * p - q) / b
         # Half-Kelly for safety
-        half_kelly = kelly / 2
+        half_kelly = kelly / 2.0
 
-        return max(0, min(half_kelly, max_fraction))
+        return float(max(0.0, min(half_kelly, max_fraction)))
