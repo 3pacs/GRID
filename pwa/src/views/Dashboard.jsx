@@ -353,7 +353,7 @@ export default function Dashboard({ onNavigate }) {
     const refreshLiveSnapshot = useCallback(async () => {
         try {
             const [regime, status, watchlistPriceResponse] = await Promise.all([
-                api.getCurrent().catch(() => null),
+                api.getCurrent({ force: true }).catch(() => null),
                 api.getStatus().catch(() => null),
                 api.getWatchlistPrices().catch(() => null),
             ]);
@@ -370,7 +370,7 @@ export default function Dashboard({ onNavigate }) {
         try {
             // Fast: regime + status load first (small payloads)
             const [regime, status] = await Promise.all([
-                api.getCurrent().catch(() => null),
+                api.getCurrent({ force: true }).catch(() => null),
                 api.getStatus().catch(() => null),
             ]);
             applyRegimeRead(regime);

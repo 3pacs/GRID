@@ -63,6 +63,9 @@ async function goodThenRefresh(second) {
     useWebSocket.mockReturnValue({ connected: true, prices: {} });
     view.rerender(<Dashboard onNavigate={vi.fn()} />);
     await waitFor(() => expect(api.getCurrent).toHaveBeenCalledTimes(2));
+    // Review 6033672549: both reads must be fresh network reads, never the 60 s cache.
+    expect(api.getCurrent).toHaveBeenNthCalledWith(1, { force: true });
+    expect(api.getCurrent).toHaveBeenNthCalledWith(2, { force: true });
     return view;
 }
 

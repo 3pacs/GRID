@@ -382,7 +382,15 @@ class GRIDApi {
     }
 
     // Regime
-    async getCurrent() { return this._fetch('/api/v1/regime/current'); }
+    /**
+     * Current regime. `force: true` skips the 60 s GET cache and any in-flight
+     * request, so the reply is a fresh network observation. Callers that use a
+     * read to clear a "last known" mark, or that act on an explicit refresh,
+     * must force it; a cached success is not a new observation.
+     */
+    async getCurrent({ force = false } = {}) {
+        return this._fetch('/api/v1/regime/current', force ? { gridForce: true } : {});
+    }
     async getHistory(days = 90) { return this._fetch(`/api/v1/regime/history?days=${days}`); }
     async getTransitions() { return this._fetch('/api/v1/regime/transitions'); }
     async getAllActiveRegimes() { return this._fetch('/api/v1/regime/all-active'); }
