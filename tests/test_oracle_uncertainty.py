@@ -58,18 +58,19 @@ class TestVoteConfidenceValues:
 
 
 class TestComputeConfidenceInterval:
-    def test_singleton_zero_width(self):
+    def test_singleton_has_wide_wilson_interval(self):
         votes = [{"confidence": 0.6}]
         ci = compute_confidence_interval(votes, point_confidence=0.6)
-        assert ci.lower == 0.6
-        assert ci.upper == 0.6
-        assert ci.width == 0
+        assert 0.0 <= ci.lower < 0.6 < ci.upper <= 1.0
+        assert ci.width > 0.5
+        assert ci.sem > 0.0
         assert ci.n == 1
 
-    def test_uniform_confidence_zero_width(self):
+    def test_uniform_confidence_has_nonzero_wilson_floor(self):
         votes = [{"confidence": 0.5}] * 5
         ci = compute_confidence_interval(votes, point_confidence=0.5)
-        assert ci.width == 0.0
+        assert ci.width > 0.0
+        assert ci.lower < 0.5 < ci.upper
 
     def test_bimodal_wide_interval(self):
         votes = [{"confidence": 0.2}, {"confidence": 0.8}] * 3
@@ -101,8 +102,8 @@ class TestComputeConfidenceInterval:
 
     def test_empty_votes(self):
         ci = compute_confidence_interval([], 0.5)
-        assert ci.lower == 0.5
-        assert ci.upper == 0.5
+        assert 0.0 <= ci.lower < 0.5 < ci.upper <= 1.0
+        assert ci.width > 0.0
         assert ci.n == 0
 
 
@@ -150,15 +151,20 @@ def _stub_predictor(confs):
 
 
 class TestPredictBoundsWiring:
-    def test_uniform_votes_narrow_bounds(self):
-        p = _stub_predictor([0.7, 0.7, 0.7, 0.7])
+    def test_uniform_votes_narrower_than_spread_but_nonzero(self):
+        p_uniform = _stub_predictor([0.7, 0.7, 0.7, 0.7])
+        p_spread = _stub_predictor([0.2, 0.4, 0.6, 0.9])
         with patch("intelligence.catalyst_aggregator.proximity_score") as ps, \
              patch("intelligence.liquidity_regime.classify_current_regime", side_effect=RuntimeError("no db")):
             ps.return_value = {"score": 0.0, "catalyst_type": None,
                                "nearest": None, "days_to_event": None,
                                "window_density": 0}
-            result = p.predict("AAPL", as_of=datetime(2026, 5, 1, tzinfo=timezone.utc))
-        assert abs(result.confidence_upper - result.confidence_lower) < 0.01
+            res_u = p_uniform.predict("AAPL", as_of=datetime(2026, 5, 1, tzinfo=timezone.utc))
+            res_s = p_spread.predict("AAPL", as_of=datetime(2026, 5, 1, tzinfo=timezone.utc))
+        width_u = res_u.confidence_upper - res_u.confidence_lower
+        width_s = res_s.confidence_upper - res_s.confidence_lower
+        assert width_u > 0.0
+        assert width_u < width_s
 
     def test_spread_votes_wider_bounds(self):
         p = _stub_predictor([0.2, 0.4, 0.6, 0.9])

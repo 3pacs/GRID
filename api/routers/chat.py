@@ -159,6 +159,37 @@ def _auto_label_failure(
     threading.Thread(target=_push, daemon=True).start()
 
 
+def _should_auto_label_firewall_failure(fw: Any) -> bool:
+    """Return True only for real firewall failures worth pushing to the
+    Langfuse regression dataset: ``reject``, or ``review`` where at least one
+    claim is flagged (sanity warn/fail, critical_fail, or verification=flagged)
+    or contradicted. Clean unverified / low-confidence ``review`` answers reach
+    the user with ``[UNVERIFIED]`` markers and must not flood the dataset.
+    """
+    decision = getattr(fw, "decision", None)
+    decision_str = getattr(decision, "decision", None)
+    if decision_str == "reject":
+        return True
+    if decision_str != "review":
+        return False
+    if int(getattr(fw, "flagged_count", 0) or 0) > 0:
+        return True
+    if getattr(decision, "verification", None) == "flagged":
+        return True
+    for cc in getattr(decision, "claims", ()) or ():
+        if getattr(cc, "critical_fail", False):
+            return True
+        verified = getattr(cc, "verified", None)
+        if getattr(verified, "verdict", None) == "contradicted":
+            return True
+        if any(
+            getattr(r, "flag", None) in ("warn", "fail")
+            for r in (getattr(cc, "checks", ()) or ())
+        ):
+            return True
+    return False
+
+
 router = APIRouter(
     prefix="/api/v1/chat",
     tags=["chat"],
@@ -1971,19 +2002,20 @@ def _ask_grid_impl(
                                 "Firewall flagged for REVIEW ({n} claims, {f} flagged)",
                                 n=fw.claim_count, f=fw.flagged_count,
                             )
-                        # Auto-label this failure into the regression dataset
-                        # BEFORE we overwrite `answer` with the firewall's
-                        # sanitized output — we want the original LLM text.
-                        _auto_label_failure(
-                            question=question,
-                            ticker=ticker,
-                            timeframe=timeframe,
-                            answer=answer,
-                            fw_decision=fw.decision.decision,
-                            fw_reasons=list(fw.decision.reasons or []),
-                            claim_count=fw.claim_count,
-                            flagged_count=fw.flagged_count,
-                        )
+                        # Auto-label real failures (reject, or review with at
+                        # least one flagged/contradicted claim) BEFORE we
+                        # overwrite `answer` with the sanitized output.
+                        if _should_auto_label_firewall_failure(fw):
+                            _auto_label_failure(
+                                question=question,
+                                ticker=ticker,
+                                timeframe=timeframe,
+                                answer=answer,
+                                fw_decision=fw.decision.decision,
+                                fw_reasons=list(fw.decision.reasons or []),
+                                claim_count=fw.claim_count,
+                                flagged_count=fw.flagged_count,
+                            )
                         answer = fw.output_text
                         if sanity_warnings is None:
                             sanity_warnings = []

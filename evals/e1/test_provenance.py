@@ -344,7 +344,6 @@ _RESOLVED_WRITERS = vintage_scan.all_writers()
 _KNOWN_BACKDATING_WRITERS = {
     "analysis/research_agent.py": "E1-V7a",
     "scripts/backfill_celestial_ephemeris.py": "E1-V7b",
-    "scripts/backfill_resolved_series_from_ticker_metrics.sql": "E1-V7c",
     "scripts/bridge_crucix.py": "E1-V7d",
     "scripts/load_alt_data.py": "E1-V7e",
     "scripts/load_more_data.py": "E1-V7f",

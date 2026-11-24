@@ -329,12 +329,12 @@ class TestAuditClaims:
         params = conn.execute.call_args[0][1]
         assert params["published"] is True
 
-    def test_published_flag_false_when_decision_is_review_or_reject(self) -> None:
+    def test_published_flag_true_for_review_and_false_for_reject(self) -> None:
         engine = MagicMock()
         conn = engine.connect.return_value.__enter__.return_value
         cc = _checked(_verified(_claim("$500", "price")))
         _audit_claims(engine, [cc], _decision("review", claims=(cc,)))
-        assert conn.execute.call_args[0][1]["published"] is False
+        assert conn.execute.call_args[0][1]["published"] is True
 
         engine2 = MagicMock()
         conn2 = engine2.connect.return_value.__enter__.return_value

@@ -434,35 +434,42 @@ def generate_ticket(
     # ── Refusal gates ──
     if report is None:
         return None
-    if current_price is None or current_price <= 0:
+    if current_price is None or not math.isfinite(current_price) or current_price <= 0:
         return None
-    if account_size_usd is None or account_size_usd < 0:
+    if account_size_usd is None or not math.isfinite(account_size_usd) or account_size_usd < 0:
         return None
 
     verdict = (report.verdict or "").strip().lower()
     if verdict not in MIN_VERDICT_FOR_TICKET:
         return None
-    if report.aggregate_conviction < MIN_CONVICTION_FOR_TICKET:
+    if (
+        report.aggregate_conviction is None
+        or not math.isfinite(report.aggregate_conviction)
+        or report.aggregate_conviction < MIN_CONVICTION_FOR_TICKET
+    ):
         return None
 
     direction = (report.direction or "").strip().lower()
     if direction not in (_BULLISH, _BEARISH):
         return None
 
-    # ── Pre-trade risk gate ──
-    # Refuse any ticket when the global kill switch is active or exposure
-    # limits would be breached. Defensive try/except: a broken risk module
-    # must not block otherwise-valid trades (fail-open for the gate check
-    # itself — the gate exists to refuse trades, not to break them).
+    # ── Sizing (computed before risk gate so exposure reflects actual ticket size) ──
+    kelly_pct, kelly_dollars = kelly_size_from_report(report, account_size_usd)
+
+    # ── Pre-trade risk gate (FAIL CLOSED) ──
+    # Refuse any ticket when the global kill switch is active, exposure limits
+    # would be breached, or the risk gate itself errors ("risk_check_error").
     try:
         from oracle.risk import get_global_circuit_breaker
         breaker = get_global_circuit_breaker()
         _action = "BUY" if direction == _BULLISH else "SELL"
+        _shares = kelly_dollars / float(current_price)
         _check = breaker.check_recommendation(
             regime=report.regime or "UNKNOWN",
             confidence=float(report.confidence or 0.0),
             recommended_action=_action,
-            position_size=max(1.0, account_size_usd * 0.05),
+            position_size=_shares,
+            current_price=float(current_price),
         )
         if not _check.passed:
             log.warning(
@@ -470,11 +477,12 @@ def generate_ticket(
                 r=_check.reason,
             )
             return None
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "trade_ticket_generator: circuit breaker check skipped: {e}",
+    except Exception as exc:  # noqa: BLE001 — fail closed on risk gate error
+        log.error(
+            "trade_ticket_generator: risk_check_error (failing closed) — {e}",
             e=str(exc),
         )
+        return None
 
     # ── Vol fallback ──
     effective_vol = vol_30d
@@ -495,9 +503,6 @@ def generate_ticket(
         vol_30d=effective_vol,
         horizon_days=int(report.horizon_days or DEFAULT_TARGET_HORIZON_DAYS),
     )
-
-    # ── Sizing ──
-    kelly_pct, kelly_dollars = kelly_size_from_report(report, account_size_usd)
 
     # ── SOP narrative ──
     lever_text = (

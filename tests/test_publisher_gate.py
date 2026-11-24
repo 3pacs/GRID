@@ -70,7 +70,8 @@ class TestEmptyClaims:
     def test_empty_list_publishes_passthrough(self):
         d = gate_decision([])
         assert d.decision == "publish"
-        assert d.score == 1.0
+        assert d.verification == "no_claims"
+        assert d.score is None
         assert d.claims == ()
         assert "pass-through" in d.reasons[0]
 
@@ -138,13 +139,13 @@ class TestAutoPublish:
         assert "All verifiable claims supported" in d.reasons[0]
 
     def test_confidence_just_below_threshold_falls_to_default_publish(self):
-        # supported, no flags, but avg confidence < 0.85 -> not auto-publish,
-        # falls through to the default "mixed verdicts" publish branch.
+        # supported, no flags, but avg confidence < 0.85 -> marked review
         claims = [_checked("supported", 0.84)]
         d = gate_decision(claims)
-        assert d.decision == "publish"
+        assert d.decision == "review"
+        assert d.verification == "low_confidence"
         assert d.score == pytest.approx(0.84)
-        assert "Mixed verdicts" in d.reasons[0]
+        assert "0.85" in d.reasons[0]
 
     def test_supported_with_warn_flag_does_not_auto_publish(self):
         warn = _sanity("warn")
@@ -152,12 +153,11 @@ class TestAutoPublish:
         assert d.decision == "review"
 
     def test_supported_plus_insufficient_blocks_auto_publish_when_avg_low(self):
-        # verifiable == supported (insufficient excluded), so supported == verifiable,
-        # but the insufficient claim's 0.5 confidence drags avg below 0.85.
+        # avg confidence 0.725 < 0.85 -> marked review
         claims = [_checked("supported", 0.95), _checked("insufficient", 0.5)]
         d = gate_decision(claims)
-        assert d.decision == "publish"
-        assert "Mixed verdicts" in d.reasons[0]
+        assert d.decision == "review"
+        assert d.verification == "low_confidence"
         assert d.score == pytest.approx(0.725)
 
 
@@ -168,14 +168,16 @@ class TestAllInsufficient:
     def test_all_insufficient_publishes_at_half_score(self):
         claims = [_checked("insufficient", 0.4), _checked("insufficient", 0.6)]
         d = gate_decision(claims)
-        assert d.decision == "publish"
-        assert d.score == 0.5
+        assert d.decision == "review"
+        assert d.verification == "unverified"
+        assert d.score is None
         assert "insufficient data" in d.reasons[0]
 
     def test_single_insufficient_publishes_at_half_score(self):
         d = gate_decision([_checked("insufficient", 0.9)])
-        assert d.decision == "publish"
-        assert d.score == 0.5
+        assert d.decision == "review"
+        assert d.verification == "unverified"
+        assert d.score is None
 
 
 # ── Human review ─────────────────────────────────────────────────────────
@@ -226,9 +228,9 @@ class TestDefaultPublish:
     def test_supported_plus_insufficient_no_flags_publishes(self):
         claims = [_checked("supported", 0.7), _checked("insufficient", 0.7)]
         d = gate_decision(claims)
-        assert d.decision == "publish"
+        assert d.decision == "review"
+        assert d.verification == "low_confidence"
         assert d.score == pytest.approx(0.7)
-        assert "Mixed verdicts" in d.reasons[0]
 
 
 # ── Result shape ─────────────────────────────────────────────────────────
