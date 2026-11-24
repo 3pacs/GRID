@@ -1021,10 +1021,12 @@ class TestFrozenBookCostLedgerAndCoverageLabels:
         assert metrics_mod.outcome_coverage(book)["n_unscored_days"] == 1
 
     def test_cost_after_last_scored_day_is_reported_uncharged(self):
-        # Day 2 swaps the long leg into names with no outcome and is the last
-        # date with any realized outcome; day 3 has none (not yet scorable)
-        # and forms no book. The day-2 cost has no later scored date to land
-        # on: it is reported as uncharged and the net series is partial.
+        # Day 2 swaps the long leg into names with no outcome; day 3 is not
+        # yet scorable, declared as a one-row outcome horizon (Codex HOLD
+        # 6031771955: the window is declared, never read from which outcomes
+        # are null), so it forms no book. The day-2 cost has no later scored
+        # date to land on: it is reported as uncharged and the net series is
+        # partial.
         nan_row = [np.nan] * 6
         signal, fwd = self._frames(
             [[1, 2, 3, 4, 5, 6], [1, 2, 5, 6, 3, 4], [1, 2, 3, 4, 5, 6]],
@@ -1032,9 +1034,12 @@ class TestFrozenBookCostLedgerAndCoverageLabels:
              [-0.01, -0.02, np.nan, np.nan, 0.03, 0.02],
              nan_row],
         )
-        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        book = metrics_mod.long_short_book(
+            signal, fwd, top_n=2, cost_bps=10.0, outcome_horizon=1
+        )
         assert list(book.index) == list(signal.index[:2])
         cov = metrics_mod.outcome_coverage(book)
+        assert cov["n_immature_excluded"] == 1
         assert cov["turnover_cost_uncharged"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
         assert cov["turnover_cost_total"] == pytest.approx(
             self._ENTRY + self._ONE_LEG_SWAP, abs=1e-12
@@ -1114,6 +1119,212 @@ class TestFrozenBookCostLedgerAndCoverageLabels:
         assert res.details["gross_coverage"] == "partial"
         assert res.details["estimate"] == "conditional_on_observed_outcomes"
         assert res.details["n_partial_days"] == 1
+
+
+_EF = [1, 2, 3, 4, 5, 6]  # top_n=2: long {E, F}, short {A, B}
+_CD = [1, 2, 5, 6, 3, 4]  # top_n=2: long {C, D}, short {A, B}
+_OUT = [-0.01, -0.02, 0.0, 0.01, 0.03, 0.02]  # E, F mean 0.025; A, B mean -0.015
+_GAP = [np.nan] * 6  # no outcome observed for any name
+
+
+def _strong_alpha_panels(n: int = 300, k: int = 12) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """A planted cross-sectional alpha strong enough for an unqualified ROBUST."""
+    rng = np.random.default_rng(99)
+    dates = pd.bdate_range("2021-01-04", periods=n)
+    cols = [f"T{i:02d}" for i in range(k)]
+    sig_arr = rng.normal(size=(n, k))
+    fwd_arr = 0.008 * sig_arr + rng.normal(0.0, 0.01, size=(n, k))
+    return (
+        pd.DataFrame(sig_arr, index=dates, columns=cols),
+        pd.DataFrame(fwd_arr, index=dates, columns=cols),
+    )
+
+
+_GAUNTLET_KW: dict[str, Any] = dict(
+    n_models_tested=1, top_n=3, cost_bps=10.0, n_permutations=39,
+    n_subsample_splits=10, seed=42,
+)
+
+
+class TestEligibilityWindowAndFullBookNet:
+    """Codex HOLD 6031771955: the evaluation window is chronological and
+    declared, never the first or last non-null realized outcome. A wholly
+    missing mature first or last decision forms its book and pays its
+    turnover; only a declared immature tail is excluded, and it is
+    labelled. A partial or uncharged book never yields an unqualified ROBUST
+    or a net-threshold pass, and the net Sharpe is labelled carried-cost
+    accounting, not daily executable P&L."""
+
+    _COLS = ["A", "B", "C", "D", "E", "F"]
+    _ONE_LEG_SWAP = 0.001  # top_n=2, cost_bps=10: one leg fully swapped
+    _ENTRY = 0.002  # first book: both legs enter from flat
+
+    def _frames(self, signal_rows, fwd_rows):
+        dates = pd.bdate_range("2024-05-01", periods=len(signal_rows))
+        signal = pd.DataFrame(signal_rows, index=dates, columns=self._COLS, dtype=float)
+        fwd = pd.DataFrame(fwd_rows, index=dates, columns=self._COLS, dtype=float)
+        return signal, fwd
+
+    def test_wholly_missing_mature_first_date_forms_book_and_pays_its_entry(self):
+        # d1 enters long {C, D} and has no observed outcome at all; d2
+        # rebalances into {E, F}. Pre-fix the window began at d2 (the first
+        # realized outcome): d1 vanished and d2 paid a flat entry instead.
+        signal, fwd = self._frames([_CD, _EF, _EF], [_GAP, _OUT, _OUT])
+        d1, d2, d3 = signal.index
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        assert list(book.index) == [d1, d2, d3]
+        assert book.loc[d1, "n_observed"] == 0
+        assert book.loc[d1, "cost"] == pytest.approx(self._ENTRY, abs=1e-12)
+        assert book.loc[d2, "cost"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        assert book.loc[d2, "cost_charged"] == pytest.approx(
+            self._ENTRY + self._ONE_LEG_SWAP, abs=1e-12
+        )
+        ls = long_short_returns(signal, fwd, top_n=2, cost_bps=10.0)
+        assert ls.loc[d2] == pytest.approx(0.04 - self._ENTRY - self._ONE_LEG_SWAP, abs=1e-12)
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["n_unscored_days"] == 1
+        assert (cov["gross_coverage"], cov["net_coverage"]) == ("partial", "partial")
+        assert cov["turnover_cost_carried"] == pytest.approx(self._ENTRY, abs=1e-12)
+        assert cov["n_immature_excluded"] == 0
+
+    def test_wholly_missing_mature_last_date_forms_book_with_cost_uncharged(self):
+        # d3 rebalances into {C, D} and has no observed outcome. It is a
+        # mature row of the outcome calendar (no horizon declared). Pre-fix
+        # the window ended at d2, d3 vanished and the book said complete.
+        signal, fwd = self._frames([_EF, _EF, _CD], [_OUT, _OUT, _GAP])
+        d1, d2, d3 = signal.index
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        assert list(book.index) == [d1, d2, d3]
+        assert book.loc[d3, "cost"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["n_unscored_days"] == 1
+        assert cov["turnover_cost_uncharged"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        assert (cov["gross_coverage"], cov["net_coverage"], cov["estimate"]) == (
+            "partial", "partial", "conditional_on_observed_outcomes",
+        )
+        assert cov["net_pass_blocked_reason"] is not None
+
+    def test_declared_immature_tail_stays_excluded_and_is_labelled(self):
+        # The same panel, but d3's outcome is declared not yet due (a
+        # one-row outcome horizon): d3 forms no book and the book is complete.
+        signal, fwd = self._frames([_EF, _EF, _CD], [_OUT, _OUT, _GAP])
+        d1, d2, d3 = signal.index
+        book = metrics_mod.long_short_book(
+            signal, fwd, top_n=2, cost_bps=10.0, outcome_horizon=1
+        )
+        assert list(book.index) == [d1, d2]
+        cov = metrics_mod.outcome_coverage(book)
+        assert (cov["gross_coverage"], cov["net_coverage"], cov["estimate"]) == (
+            "complete", "complete", "full_book",
+        )
+        assert cov["outcome_horizon"] == 1
+        assert cov["mature_through"] == str(d2)
+        assert cov["n_immature_excluded"] == 1
+        assert cov["turnover_cost_uncharged"] == 0.0
+        assert cov["net_pass_blocked_reason"] is None
+
+    def test_as_of_bounds_the_window_on_the_calendar(self):
+        # Every outcome row holds a value, but by as_of=d3 with a one-row
+        # horizon only d1 and d2 are mature: d3 and d4 form no book, whatever
+        # their outcome rows hold.
+        signal, fwd = self._frames([_EF] * 4, [_OUT] * 4)
+        d1, d2, d3, d4 = signal.index
+        book = metrics_mod.long_short_book(
+            signal, fwd, top_n=2, cost_bps=10.0, outcome_horizon=1, as_of=d3
+        )
+        assert list(book.index) == [d1, d2]
+        assert metrics_mod.outcome_coverage(book)["n_immature_excluded"] == 2
+        # The calendar cannot date a horizon past its own last row.
+        with pytest.raises(ValueError, match="as_of"):
+            metrics_mod.long_short_book(
+                signal, fwd, top_n=2, outcome_horizon=1, as_of=d4 + pd.Timedelta(days=3)
+            )
+        with pytest.raises(ValueError, match="outcome_horizon"):
+            metrics_mod.long_short_book(signal, fwd, top_n=2, outcome_horizon=-1)
+
+    @pytest.mark.parametrize("gap", [0, 1, 2])
+    def test_coverage_partial_whenever_an_eligible_date_is_unscored(self, gap):
+        fwd_rows = [_OUT, _OUT, _OUT]
+        fwd_rows[gap] = _GAP
+        signal, fwd = self._frames([_EF, _CD, _EF], fwd_rows)
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        assert len(book) == 3
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["n_unscored_days"] == 1
+        assert (cov["gross_coverage"], cov["net_coverage"]) == ("partial", "partial")
+        assert cov["net_pass_blocked_reason"] is not None
+
+    def test_net_series_is_labelled_carried_cost_accounting(self):
+        signal, fwd = self._frames([_EF, _CD], [_OUT, _OUT])
+        cov = metrics_mod.outcome_coverage(
+            metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        )
+        assert cov["net_basis"] == "carried_cost_accounting"
+        sig, ret = _strong_alpha_panels(n=40)
+        m = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0)
+        assert m["net_basis"] == "carried_cost_accounting"
+
+    def test_signal_metrics_partial_book_never_passes_net_threshold(self):
+        sig, ret = _strong_alpha_panels()
+        complete = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0)
+        assert complete["sharpe_net"] > 1.4
+        assert complete["passes_threshold"] is True
+        assert complete["net_pass_blocked_reason"] is None
+
+        ret = ret.copy()
+        ret.loc[ret.index[150], sig.iloc[150].idxmax()] = np.nan  # one partial date
+        partial = compute_signal_metrics(sig, ret, top_n=3, cost_bps=10.0)
+        assert partial["sharpe_net"] > 1.4  # the Sharpe alone would pass
+        assert partial["passes_threshold"] is False
+        assert "net coverage partial" in partial["net_pass_blocked_reason"]
+
+    def test_gauntlet_complete_book_reaches_robust_unchanged(self):
+        sig, ret = _strong_alpha_panels()
+        res = gauntlet.run_gauntlet(sig, ret, **_GAUNTLET_KW)
+        assert res.verdict == "ROBUST"
+        assert res.details["passes_net_sharpe_threshold"] is True
+        assert res.details["net_coverage"] == "complete"
+        assert res.details["net_pass_blocked_reason"] is None
+        assert res.details["net_basis"] == "carried_cost_accounting"
+        assert "verdict_downgrade_reason" not in res.details
+
+    def test_gauntlet_partial_book_cannot_reach_robust_or_net_pass(self):
+        sig, ret = _strong_alpha_panels()
+        ret = ret.copy()
+        ret.loc[ret.index[150], sig.iloc[150].idxmax()] = np.nan  # one partial date
+        res = gauntlet.run_gauntlet(sig, ret, **_GAUNTLET_KW)
+        assert res.details["net_sharpe"] > 1.4  # the Sharpe alone would pass
+        assert res.deflated_sharpe_passed is True
+        assert res.verdict == "MARGINAL"
+        assert res.details["passes_net_sharpe_threshold"] is False
+        reason = res.details["verdict_downgrade_reason"]
+        assert reason.startswith("Downgraded from ROBUST to MARGINAL")
+        assert "net coverage partial" in reason
+
+    def test_gauntlet_uncharged_book_cannot_reach_robust_or_net_pass(self):
+        # The last decision is mature but wholly missing: its rebalance cost
+        # has no later scored date. Pre-fix it fell outside the window and the
+        # remaining book said complete and ROBUST.
+        sig, ret = _strong_alpha_panels()
+        ret = ret.copy()
+        ret.iloc[-1] = np.nan
+        res = gauntlet.run_gauntlet(sig, ret, **_GAUNTLET_KW)
+        assert res.details["turnover_cost_uncharged"] > 0.0
+        assert res.details["net_coverage"] == "partial"
+        assert res.verdict == "MARGINAL"
+        assert res.details["passes_net_sharpe_threshold"] is False
+        assert "uncharged" in res.details["verdict_downgrade_reason"]
+
+    def test_gauntlet_declared_immature_tail_keeps_robust(self):
+        sig, ret = _strong_alpha_panels()
+        ret = ret.copy()
+        ret.iloc[-1] = np.nan  # the last outcome is not yet due
+        res = gauntlet.run_gauntlet(sig, ret, outcome_horizon=1, **_GAUNTLET_KW)
+        assert res.details["n_immature_excluded"] == 1
+        assert res.details["mature_through"] == str(sig.index[-2])
+        assert res.details["net_coverage"] == "complete"
+        assert res.verdict == "ROBUST"
+        assert res.details["passes_net_sharpe_threshold"] is True
 
 
 class TestEnsembleEmbargoAndEarlyStopping:
