@@ -21,6 +21,9 @@ and mocks (no database, no network):
      regime-calibrated (each row reports its calibration source), and the
      builder dates its layers from the prediction's clock and refuses a
      clock outside the live window.
+  8. Codex review 6031562705: a zero-evidence fixture through the real
+     decision gateway pins today's outcome in each confidence band, pending
+     the owner's evidence-floor decision (``TestZeroEvidenceGatewayPin``).
 """
 from __future__ import annotations
 
@@ -43,6 +46,7 @@ from intelligence.confidence_bucket_tracker import (
     record_scored_prediction,
 )
 from intelligence.signal_convergence_scanner import ConvergenceReport
+from oracle.risk import CircuitBreaker
 from tests.test_confidence_bucket_tracker import FakeEngine as BucketFakeEngine
 from tests.test_signal_cooccurrence import FakeEngine as CoocFakeEngine
 
@@ -1451,3 +1455,337 @@ class TestCodexHold6030789643EvidenceFence:
         assert report.layer_coverage["fudge_alerts"] is True
         # One fenced alert -> 1.0 - 0.15 = 0.85.
         assert report.aggregate_conviction == pytest.approx(1.4 * 0.85)
+
+
+# ── Codex review 6031562705: zero-evidence gateway pin ─────────────────────
+#
+# Codex scoped-ACCEPTed the clock fence and alias priority at 6296e9cb and
+# held the live verdict rollout as a separate decision: under the current
+# verdict policy HIGH is unreachable, and confidence above 0.85 still lands
+# at MEDIUM with no eligible provenance. ``TestZeroEvidenceGatewayPin``
+# drives the real ``should_i_trade`` path with a live prediction that has no
+# eligible evidence and pins what each confidence band returns today.
+
+_ZERO_EVIDENCE_CLOCK = _LIVE_NOW - timedelta(minutes=2)
+_ZERO_EVIDENCE_CONTRIBUTIONS: dict[str, float] = {
+    "jodi_oil": 0.5,
+    "pcr": 0.3,
+    "ghost_signal": 0.2,
+}
+# What every one of the 11 unfenced layers answers: a non-neutral value, so
+# a pinned neutral number shows the fence held, not that the layer was quiet.
+_UNFENCED_LAYER_VALUE = 0.9
+
+
+def _zero_evidence_cards() -> dict[str, SignalScorecard]:
+    """Scorecards none of which is eligible at the decision clock.
+
+    ``jodi_oil`` was rewritten five minutes after the clock, ``pcr`` has no
+    stamp, and ``ghost_signal`` has no scorecard at all.
+    """
+    return {
+        "jodi_oil": _card_at("jodi_oil", 1.4, _ZERO_EVIDENCE_CLOCK + timedelta(minutes=5)),
+        "pcr": _card_at("pcr", 1.3, None),
+    }
+
+
+def _late_or_unstamped_fudge_engine() -> MagicMock:
+    """An engine whose shipping fudge alerts are all ineligible.
+
+    The statement binds ``checked_at <= :clock``, so a real database would
+    not return the late row; the stub returns it to exercise the row fence
+    behind the statement as well.
+    """
+    return _fudge_engine(
+        [
+            {
+                "name": "late",
+                "assessment": "contradiction",
+                "checked_at": _ZERO_EVIDENCE_CLOCK + timedelta(minutes=1),
+            },
+            {"name": "unstamped", "assessment": "major_divergence", "checked_at": None},
+        ]
+    )
+
+
+def _gateway_decision(
+    *,
+    confidence: float,
+    ticker: str = "NVDA",
+    cards: dict[str, SignalScorecard] | None = None,
+) -> dg.DecisionResponse:
+    """Run ``should_i_trade`` as production calls it, stubbing only the reads.
+
+    Stubbed: the oracle (it returns the live prediction), the red-team LLM (a
+    completed, advisory report), the pattern library (the degraded no-analog
+    report, ``confidence_signal=0.0``), every adjuster read behind the 11
+    unfenced layers, the two scorecard tables and, for ``XOM``, the fudge
+    alert rows. Real: the gateway, ``build_provenance_report`` with its clock
+    and fence, the counterfactual stress test and the ticket generator, given
+    a fresh circuit breaker so no other test's breaker state can reach it.
+    """
+    pred = _prediction(
+        ticker=ticker,
+        confidence=confidence,
+        signal_contributions=dict(_ZERO_EVIDENCE_CONTRIBUTIONS),
+    )
+    pred.as_of = _ZERO_EVIDENCE_CLOCK
+    red_team = llm_red_team.RedTeamReport(
+        ticker=ticker,
+        prediction_score=confidence,
+        counters=(llm_red_team.CounterArgument("Valuation risk", 0.2, 0.2, 0.2),),
+        epistemic_risk_score=0.2,
+    )
+    engine = _late_or_unstamped_fudge_engine() if ticker == "XOM" else MagicMock()
+    with ExitStack() as stack:
+        _patch_all_non_fudge_adapters(stack, value=_UNFENCED_LAYER_VALUE)
+        stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW))
+        _patch_calibration_tables(
+            stack,
+            regime_cards=_zero_evidence_cards() if cards is None else cards,
+            flat_cards={},
+        )
+        predictor = stack.enter_context(patch("oracle.engine.EnsemblePredictor"))
+        predictor.return_value.predict.return_value = pred
+        stack.enter_context(
+            patch("intelligence.llm_red_team.red_team_prediction", return_value=red_team)
+        )
+        stack.enter_context(
+            patch(
+                "intelligence.pattern_library.build_pattern_match_report",
+                return_value=SimpleNamespace(confidence_signal=0.0),
+            )
+        )
+        stack.enter_context(
+            patch("oracle.risk.get_global_circuit_breaker", lambda: CircuitBreaker())
+        )
+        return dg.should_i_trade(
+            engine,
+            ticker,
+            account_size_usd=100_000,
+            current_price=120.0,
+            vol_30d=0.35,
+        )
+
+
+def _pinned_band_outcome(confidence: float) -> tuple[str, str, bool]:
+    """Today's (provenance verdict, unified verdict, ticket) with zero evidence."""
+    if confidence < 0.55:
+        return "low", "low", False
+    if confidence <= 0.85:
+        return "low", "no_trade", False
+    return "medium", "medium", True
+
+
+# (ticker, layers_present, layers_total, layer_coverage["fudge_alerts"])
+_FUDGE_VARIANTS = [
+    pytest.param("NVDA", 0, 11, sp.LAYER_NOT_APPLICABLE, id="fudge-not-applicable"),
+    # A shipping ticker whose every alert is after the clock or unstamped:
+    # the fenced layer is checked and finds nothing, so it counts as present.
+    pytest.param("XOM", 1, 12, True, id="fudge-alerts-all-late-or-unstamped"),
+]
+
+
+class TestZeroEvidenceGatewayPin:
+    """A pin awaiting the owner's evidence-floor decision.
+
+    Codex review 6031562705 (at 6296e9cb) held the live verdict rollout:
+    "Under current verdict policy HIGH is unreachable and confidence >0.85
+    can still land at MEDIUM with no eligible provenance. Pin a
+    zero-evidence gateway fixture and agree the required evidence floor
+    before relying on this live."
+
+    The fixture is a live prediction (a valid decision clock) with zero
+    eligible evidence: every scorecard is absent, stamped after the clock or
+    unstamped; no fudge alert is fenced to the clock; and all 11 unfenced
+    layers are advisory. These tests record today's behaviour in each
+    confidence band; they do not endorse it. Changing a pinned value needs
+    the owner's decision on the required evidence floor, and the pin changes
+    in the same commit that implements that decision.
+    """
+
+    @pytest.mark.parametrize(
+        ("ticker", "layers_present", "layers_total", "fudge_status"), _FUDGE_VARIANTS
+    )
+    @pytest.mark.parametrize(
+        (
+            "confidence",
+            "provenance_verdict",
+            "verdict_reason",
+            "stress_label",
+            "stress_score",
+            "unified_verdict",
+            "unified_reason",
+            "ticket",
+        ),
+        [
+            pytest.param(
+                0.40, "low", "confidence 0.40 < 0.55", "robust", 1.0,
+                "low", "pattern evidence unavailable", False,
+                id="below-0.55",
+            ),
+            # Provenance says LOW (the HIGH coverage floor). Counterfactual
+            # stress re-derives each perturbed verdict without that floor,
+            # so every perturbation reads as HIGH, i.e. a flip: fragile at
+            # 0.00, and the gateway downgrades LOW to NO_TRADE.
+            pytest.param(
+                0.55, "low", "adjuster layers computed (floor 60%)", "fragile", 0.0,
+                "no_trade", "counterfactual stress fragile", False,
+                id="at-0.55",
+            ),
+            pytest.param(
+                0.72, "low", "adjuster layers computed (floor 60%)", "fragile", 0.0,
+                "no_trade", "counterfactual stress fragile", False,
+                id="0.55-0.85",
+            ),
+            pytest.param(
+                0.85, "low", "adjuster layers computed (floor 60%)", "fragile", 0.0,
+                "no_trade", "counterfactual stress fragile", False,
+                id="at-0.85",
+            ),
+            # The saturated zone: MEDIUM, and a ticket, with no eligible
+            # evidence at all (the case Codex flagged).
+            pytest.param(
+                0.8501, "medium", "in the saturated > 0.85 zone", "robust", 1.0,
+                "medium", "pattern evidence unavailable", True,
+                id="just-above-0.85",
+            ),
+            pytest.param(
+                0.92, "medium", "confidence 0.92 in the saturated > 0.85 zone", "robust", 1.0,
+                "medium", "pattern evidence unavailable", True,
+                id="above-0.85",
+            ),
+        ],
+    )
+    def test_band_outcome_is_pinned(
+        self,
+        confidence: float,
+        provenance_verdict: str,
+        verdict_reason: str,
+        stress_label: str,
+        stress_score: float,
+        unified_verdict: str,
+        unified_reason: str,
+        ticket: bool,
+        ticker: str,
+        layers_present: int,
+        layers_total: int,
+        fudge_status: Any,
+    ) -> None:
+        resp = _gateway_decision(confidence=confidence, ticker=ticker)
+        prov = resp.provenance_report
+        assert prov is not None, resp.stage_errors
+
+        # The fixture really is live and has zero eligible evidence.
+        assert prov.decision_clock == _ZERO_EVIDENCE_CLOCK.isoformat()
+        assert {ev.signal_source: ev.classification for ev in prov.signal_evidence} == {
+            "jodi_oil": sp.EVIDENCE_ADVISORY,
+            "pcr": sp.EVIDENCE_ADVISORY,
+            "ghost_signal": "no_history",
+        }
+        assert all(ev.scorecard is None for ev in prov.signal_evidence)
+        assert prov.shipping_fudge_alerts == []
+        assert prov.layer_coverage["fudge_alerts"] == fudge_status
+        assert prov.layer_coverage["edge_signal"] == sp.LAYER_NOT_APPLICABLE
+
+        # Coverage, advisory layers and the neutral aggregate.
+        assert len(_ADVISORY_LAYERS_NVDA) == 11
+        assert prov.evidence_coverage == 0.0
+        assert prov.layers_present == layers_present
+        assert prov.layers_total == layers_total
+        assert prov.layers_advisory == 11
+        assert prov.advisory_layers == {
+            name: pytest.approx(_UNFENCED_LAYER_VALUE) for name in _ADVISORY_LAYERS_NVDA
+        }
+        for name in _ADVISORY_LAYERS_NVDA:
+            assert prov.layer_coverage[name] == sp.LAYER_ADVISORY
+        assert prov.aggregate_conviction == pytest.approx(1.0)
+
+        # The pinned verdicts and ticket outcome.
+        assert prov.verdict == provenance_verdict
+        assert verdict_reason in prov.verdict_reason
+        assert resp.stress_report.robustness_label == stress_label
+        assert resp.stress_report.robustness_score == pytest.approx(stress_score)
+        assert resp.unified_verdict == unified_verdict
+        assert any(unified_reason in reason for reason in resp.verdict_reasons)
+        if ticket:
+            assert resp.trade_ticket is not None
+            assert resp.trade_ticket.verdict == "medium"
+            assert resp.trade_ticket.direction == "bullish"
+            assert resp.trade_ticket.aggregate_conviction == pytest.approx(1.0)
+            assert resp.stage_errors == {}
+        else:
+            assert resp.trade_ticket is None
+            assert set(resp.stage_errors) == {"trade_ticket"}
+            assert "below ticket threshold" in resp.stage_errors["trade_ticket"]
+        assert "high" not in (prov.verdict, resp.unified_verdict)
+
+        # The serialised response carries the same numbers.
+        out = resp.to_dict()["provenance_report"]
+        assert out["aggregate_conviction"] == pytest.approx(1.0)
+        assert out["evidence_coverage"] == 0.0
+        assert out["layers_present"] == layers_present
+        assert out["layers_advisory"] == 11
+        assert set(out["advisory_layers"]) == set(_ADVISORY_LAYERS_NVDA)
+
+    @pytest.mark.parametrize("ticker", ["NVDA", "XOM"])
+    def test_high_never_appears_at_any_confidence(self, ticker: str) -> None:
+        confidences = [round(0.30 + 0.05 * i, 2) for i in range(14)] + [0.8501]
+        seen = {}
+        for confidence in confidences:
+            resp = _gateway_decision(confidence=confidence, ticker=ticker)
+            seen[confidence] = (
+                resp.provenance_report.verdict,
+                resp.unified_verdict,
+                resp.trade_ticket is not None,
+            )
+
+        assert all("high" not in outcome[:2] for outcome in seen.values()), seen
+        assert seen == {c: _pinned_band_outcome(c) for c in confidences}
+
+    @pytest.mark.parametrize(
+        "confidence",
+        [
+            pytest.param(0.40, id="below-0.55"),
+            pytest.param(0.72, id="0.55-0.85"),
+            pytest.param(0.92, id="above-0.85"),
+        ],
+    )
+    def test_one_fenced_strong_scorecard_raises_conviction_and_coverage(
+        self, confidence: float
+    ) -> None:
+        cards = _zero_evidence_cards()
+        cards["jodi_oil"] = _card_at("jodi_oil", 1.3, _ZERO_EVIDENCE_CLOCK - timedelta(days=1))
+        zero = _gateway_decision(confidence=confidence).provenance_report
+        one_resp = _gateway_decision(confidence=confidence, cards=cards)
+        one = one_resp.provenance_report
+
+        assert _evidence_rows(one)["jodi_oil"]["classification"] == "strong"
+        assert zero.evidence_coverage == 0.0
+        assert one.evidence_coverage == pytest.approx(0.5)
+        assert zero.aggregate_conviction == pytest.approx(1.0)
+        assert one.aggregate_conviction == pytest.approx(0.5 * 1.3 + 0.3 + 0.2)
+        # A scorecard is not an adjuster layer: layer coverage is unchanged,
+        # so the band outcome is the same and HIGH is still out of reach.
+        assert one.layers_present == zero.layers_present == 0
+        assert one.verdict == zero.verdict
+        assert (one.verdict, one_resp.unified_verdict, one_resp.trade_ticket is not None) == (
+            _pinned_band_outcome(confidence)
+        )
+        if one_resp.trade_ticket is not None:
+            assert one_resp.trade_ticket.aggregate_conviction == pytest.approx(1.15)
+
+    def test_one_fenced_weak_scorecard_drops_the_saturated_ticket(self) -> None:
+        cards = _zero_evidence_cards()
+        cards["jodi_oil"] = _card_at("jodi_oil", 0.2, _ZERO_EVIDENCE_CLOCK - timedelta(days=1))
+        zero = _gateway_decision(confidence=0.92)
+        one = _gateway_decision(confidence=0.92, cards=cards)
+
+        assert (zero.unified_verdict, zero.trade_ticket is not None) == ("medium", True)
+        assert _evidence_rows(one.provenance_report)["jodi_oil"]["classification"] == "weak"
+        assert one.provenance_report.evidence_coverage == pytest.approx(0.5)
+        assert one.provenance_report.aggregate_conviction == pytest.approx(0.5 * 0.2 + 0.3 + 0.2)
+        assert one.provenance_report.verdict == "low"
+        assert "aggregate conviction 0.60 < 0.70" in one.provenance_report.verdict_reason
+        assert one.unified_verdict == "low"
+        assert one.trade_ticket is None
