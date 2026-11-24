@@ -678,36 +678,15 @@ def desk_evening(folder: str, kind: str, session: SessionTimes, prev_day: date, 
 
 SECTOR_SCHEMA = "desk-sector-state/1"
 _SECTOR_SQL = ("SELECT data_through, kind, schema, record_json, record_sha256, computed_at FROM desk_state "
-               "WHERE data_through <= ? ORDER BY data_through DESC LIMIT 10")
+               "WHERE data_through <= ? ORDER BY data_through DESC")   # no LIMIT: read lazily until a row qualifies
 
 
 def _pct(v: Any) -> str:
     return f"{v:+.1f} %" if isinstance(v, (int, float)) else "n/a"
 
 
-def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day: date, as_of: datetime,
-                      expected: date | None = None) -> Section:
-    """The sector layer of the desk's state record (desk-sector-state/1, written by 3pacs/gex desk-state).
-
-    The newest row for a session up to the previous one (pre-open) or the session itself (post-close) whose
-    ``computed_at`` is at or before the brief's clock. ``computed_at`` must carry its offset; a naive one is not
-    used. A row whose stored hash does not match its body, or whose schema is another, is not used either.
-    ``expected``: the newest session the writer normally has by the brief's clock; an older row is a data problem."""
-    title, key = "Sectors (desk-sector-state/1)", "desk_sector_state"
-    src = f"{db} desk_state" if db else "desk-state state.db"
-    if not db:
-        return Section(key, title, "not_supplied", src, problems=("no desk_state_db configured",))
-    last = prev_day if kind == "pre_open" else session.day
-    try:
-        con = ro_sqlite(db)
-        try:
-            rows = con.execute(_SECTOR_SQL, (last.isoformat(),)).fetchall()
-        finally:
-            con.close()
-    except Exception as exc:  # noqa: BLE001
-        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
-    problems: list[str] = []
-    chosen = None
+def _pick_sector_row(rows, as_of: datetime, problems: list[str]):
+    """The first (newest) row computed at or before ``as_of`` that is usable; each unusable one adds a problem."""
     for day, row_kind, schema, body, sha, computed_raw in rows:
         computed = parse_clock(computed_raw)
         if computed is None:
@@ -726,8 +705,33 @@ def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day
         except ValueError:
             problems.append(f"row for {day}: body is not JSON; not used")
             continue
-        chosen = (str(day), row_kind, rec, computed)
-        break
+        return str(day), row_kind, rec, computed
+    return None
+
+
+def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day: date, as_of: datetime,
+                      expected: date | None = None) -> Section:
+    """The sector layer of the desk's state record (desk-sector-state/1, written by 3pacs/gex desk-state).
+
+    The newest row for a session up to the previous one (pre-open) or the session itself (post-close) whose
+    ``computed_at`` is at or before the brief's clock. ``computed_at`` must carry its offset; a naive one is not
+    used. A row whose stored hash does not match its body, or whose schema is another, is not used either.
+    ``expected``: the newest session the writer normally has by the brief's clock; an older row is a data problem."""
+    title, key = "Sectors (desk-sector-state/1)", "desk_sector_state"
+    src = f"{db} desk_state" if db else "desk-state state.db"
+    if not db:
+        return Section(key, title, "not_supplied", src, problems=("no desk_state_db configured",))
+    last = prev_day if kind == "pre_open" else session.day
+    problems: list[str] = []
+    chosen = None
+    try:
+        con = ro_sqlite(db)
+        try:
+            chosen = _pick_sector_row(con.execute(_SECTOR_SQL, (last.isoformat(),)), as_of, problems)
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
     if chosen is None:
         return Section(key, title, "empty", src, problems=("no row computed before the brief's clock",) + tuple(problems))
     day, row_kind, rec, computed = chosen
@@ -747,7 +751,13 @@ def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day
     ahead = [f"{e.get('event')} {e.get('date')}" for e in ev.get("within_7_days") or []]
     if ahead:
         lines.append("releases within 7 days: " + ", ".join(ahead))
-    if (rec.get("vix") or {}).get("stale"):
+    fed, vix = rec.get("fed_balance_sheet") or {}, rec.get("vix") or {}
+    if fed.get("phase"):
+        lines.append(f"Fed balance sheet: {fed['phase']}" + (f" (as of {fed['obs_date']})" if fed.get("obs_date") else ""))
+    if vix.get("third") or vix.get("spike_state"):
+        lines.append(f"VIX: {vix.get('third')} third, {vix.get('spike_state')}"
+                     + (f" (close of {vix['obs_date']})" if vix.get("obs_date") else "") + (", stale" if vix.get("stale") else ""))
+    if vix.get("stale"):
         problems.append(f"row for {day}: the VIX close in it is marked stale")
     if expected is not None and day < expected.isoformat():
         problems.append(f"latest row is for {day}; the writer normally has {expected.isoformat()} by now")

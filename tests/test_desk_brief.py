@@ -792,3 +792,11 @@ def test_sector_state_opens_read_only(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         con.execute("DELETE FROM desk_state")
     con.close()
+
+
+def test_sector_state_finds_an_old_row_behind_many_later_ones(tmp_path):
+    rows = [("2026-10-01", "2026-10-02T06:45:08Z")]
+    rows += [(f"2026-11-{d:02d}", "2026-11-21T06:45:08Z") for d in range(1, 20)]   # all written after the clock
+    sec = S.desk_sector_state(_sector_db(tmp_path, rows), "pre_open", SESSION, PREV, PRE, PREV)
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-10-01"
+    assert "Fed balance sheet: flat" in sec.lines and "VIX: middle third, none" in sec.lines
