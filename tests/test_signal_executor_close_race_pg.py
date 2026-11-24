@@ -27,8 +27,9 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import date, timedelta
-from typing import Any, Callable
+from typing import Any
 from unittest.mock import MagicMock
 from uuid import uuid4
 

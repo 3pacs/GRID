@@ -199,15 +199,31 @@ class PaperTradingEngine:
         return trade_id
 
     def close_trade(self, trade_id: int, exit_price: float, notes: str = "") -> dict:
-        """Close an open paper trade and compute P&L."""
+        """Close an open paper trade and compute P&L.
+
+        The close is an atomic OPEN -> CLOSED claim (Codex review 6031218970):
+        ``UPDATE ... WHERE id = :id AND status = 'OPEN' RETURNING``. When two
+        runs close the same trade, the second's claim waits on the first's
+        row lock, then re-checks ``status = 'OPEN'`` against the committed
+        row and matches nothing. Only the winner writes P&L, moves the
+        strategy's trade count, wins/losses, P&L, capital, high-water mark
+        and drawdown, and runs the kill check. The loser gets
+        ``{"error": ..., "reason": "already_closed"}`` and changes nothing.
+        A win returns ``strategy_killed``: whether this close's kill check
+        killed the strategy.
+        """
         with self.engine.begin() as conn:
             trade = conn.execute(text(
-                "SELECT strategy_id, direction, entry_price, position_size "
-                "FROM paper_trades WHERE id = :id AND status = 'OPEN'"
-            ), {"id": trade_id}).fetchone()
+                "UPDATE paper_trades SET status = 'CLOSED', exit_price = :price, "
+                "exit_date = :date, notes = :notes "
+                "WHERE id = :id AND status = 'OPEN' "
+                "RETURNING strategy_id, direction, entry_price, position_size"
+            ), {
+                "price": exit_price, "date": date.today(), "notes": notes, "id": trade_id,
+            }).fetchone()
 
             if not trade:
-                return {"error": "Trade not found or already closed"}
+                return {"error": "Trade not found or already closed", "reason": "already_closed"}
 
             strategy_id, direction, entry_price, position_size = trade
 
@@ -220,14 +236,8 @@ class PaperTradingEngine:
             pnl = pnl_pct * position_size * self.initial_capital
 
             conn.execute(text(
-                "UPDATE paper_trades SET exit_price = :price, exit_date = :date, "
-                "pnl = :pnl, pnl_pct = :pnl_pct, status = 'CLOSED', notes = :notes "
-                "WHERE id = :id"
-            ), {
-                "price": exit_price, "date": date.today(),
-                "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6),
-                "notes": notes, "id": trade_id,
-            })
+                "UPDATE paper_trades SET pnl = :pnl, pnl_pct = :pnl_pct WHERE id = :id"
+            ), {"pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6), "id": trade_id})
 
             # Update strategy stats
             is_win = pnl > 0
@@ -251,6 +261,7 @@ class PaperTradingEngine:
                 "SELECT capital, high_water_mark FROM paper_strategies WHERE id = :id"
             ), {"id": strategy_id}).fetchone()
 
+            strategy_killed = False
             if strat:
                 capital, hwm = strat
                 new_hwm = max(hwm, capital)
@@ -263,21 +274,27 @@ class PaperTradingEngine:
                 ), {"hwm": new_hwm, "dd": round(drawdown, 6), "id": strategy_id})
 
                 # Kill check
-                self._check_kill(conn, strategy_id)
+                strategy_killed = self._check_kill(conn, strategy_id)
 
         log.info("Paper trade #{id} closed: {dir} P&L={pnl:+.2f} ({pct:+.2%})",
                  id=trade_id, dir=direction, pnl=pnl, pct=pnl_pct)
-        return {"trade_id": trade_id, "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6)}
+        return {
+            "trade_id": trade_id, "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 6),
+            "strategy_killed": strategy_killed,
+        }
 
-    def _check_kill(self, conn, strategy_id: str) -> None:
-        """Check if strategy should be killed based on performance."""
+    def _check_kill(self, conn, strategy_id: str) -> bool:
+        """Check if strategy should be killed based on performance.
+
+        Returns True when this call killed an ACTIVE strategy.
+        """
         strat = conn.execute(text(
             "SELECT total_trades, wins, max_drawdown, total_pnl, capital "
             "FROM paper_strategies WHERE id = :id AND status = 'ACTIVE'"
         ), {"id": strategy_id}).fetchone()
 
         if not strat or strat[0] < 20:
-            return  # Need at least 20 trades before judging
+            return False  # Need at least 20 trades before judging
 
         total, wins, dd, pnl, capital = strat
         win_rate = wins / total if total > 0 else 0
@@ -296,6 +313,8 @@ class PaperTradingEngine:
                 "WHERE id = :id"
             ), {"reason": kill_reason, "id": strategy_id})
             log.warning("Strategy {s} KILLED: {r}", s=strategy_id, r=kill_reason)
+            return True
+        return False
 
     def get_dashboard(self) -> dict:
         """Get paper trading dashboard with all strategies and recent trades."""

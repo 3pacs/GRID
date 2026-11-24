@@ -6,8 +6,11 @@ Runs periodically (hourly during market hours) to:
 2. For each strategy: compare leader's latest daily return to threshold (1%)
 3. If signal fires: compute Kelly position size, then reserve gross exposure and
    open the paper trade on the follower as one serialized step (advisory lock)
-4. For EVERY open trade past its holding period — whatever its strategy's
-   status (ACTIVE, PAUSED or KILLED) — close at current price
+4. For every open trade past its holding period, close at current price.
+   Each close is an atomic OPEN -> CLOSED claim: only the run that wins it
+   counts the close. Positions opened before ``LEGACY_POSITION_CUTOVER`` or
+   belonging to a PAUSED/KILLED strategy are reported and kept open unless
+   the caller passes ``close_legacy_positions=True``
 5. Log everything to decision journal for audit trail
 
 An optional **venue tag** (``execute_signals(engine, venue="robinhood")``)
@@ -56,6 +59,13 @@ MAX_GROSS_EXPOSURE: float = 1.0
 EXPOSURE_LOCK_KEY: str = "trading.signal_executor.gross_exposure"
 _EXPOSURE_LOCK = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
 _EXPOSURE_LOCK_TIMEOUT = text("SET LOCAL lock_timeout = '30s'")
+
+#: Open paper positions entered before this date were opened by the executor
+#: before #1356 (8 open on griddb since 2026-03-26), whose exits could
+#: double-account under overlapping runs (Codex review 6031218970). The exit
+#: pass lists them, and any open position of a strategy that is not ACTIVE,
+#: and closes them only when the caller passes ``close_legacy_positions=True``.
+LEGACY_POSITION_CUTOVER: date = date(2026, 11, 23)
 
 #: Fail-closed reason for refusing Robinhood mirror opens until close mirroring exists.
 ROBINHOOD_MIRROR_DISABLED_REASON = "robinhood mirror disabled: close mirroring not implemented"
@@ -501,10 +511,54 @@ def _list_open_positions(conn: Connection) -> list[Any]:
     )).fetchall()
 
 
+def _legacy_reason(entry_date: date | datetime | None, strategy_status: str | None) -> str | None:
+    """Why an open position needs the owner's decision before an exit, else None."""
+    if strategy_status is None:
+        return "strategy_missing"
+    if strategy_status != "ACTIVE":
+        return "strategy_not_active"
+    entry = entry_date.date() if isinstance(entry_date, datetime) else entry_date
+    if entry is None or entry < LEGACY_POSITION_CUTOVER:
+        return "opened_before_cutover"
+    return None
+
+
+def _legacy_report(positions: list[Any]) -> list[dict]:
+    """The rows of :func:`_list_open_positions` that need the owner's decision."""
+    report: list[dict] = []
+    for trade_id, strategy_id, ticker, entry_date, strategy_status, *_ in positions:
+        reason = _legacy_reason(entry_date, strategy_status)
+        if reason is not None:
+            report.append({
+                "trade_id": trade_id,
+                "strategy_id": strategy_id,
+                "ticker": ticker,
+                "entry_date": entry_date.isoformat() if entry_date is not None else None,
+                "strategy_status": strategy_status,
+                "legacy_reason": reason,
+            })
+    return report
+
+
+def legacy_position_preflight(engine: Engine) -> list[dict]:
+    """Read-only preflight: the open positions a default run will not exit.
+
+    The report lists positions opened before ``LEGACY_POSITION_CUTOVER``,
+    positions of a PAUSED or KILLED strategy, and positions with no strategy
+    row. ``execute_signals`` closes the first two kinds only with
+    ``close_legacy_positions=True``. A position with no strategy row has no
+    holding rule and is never closed.
+    """
+    with engine.connect() as conn:
+        return _legacy_report(_list_open_positions(conn))
+
+
 def execute_signals(
     engine: Engine,
     venue: str | None = None,
     venue_wallet_id: str | None = None,
+    *,
+    close_legacy_positions: bool = False,
 ) -> dict:
     """Execute paper trading signals for all ACTIVE strategies.
 
@@ -512,6 +566,11 @@ def execute_signals(
     the paper trade (see :class:`VenueTag`); *venue_wallet_id* names the
     ``trading_wallets`` row that sizes and risk-gates those orders.
     ``venue="robinhood"`` fails closed because close mirroring is not implemented.
+
+    *close_legacy_positions* (default off) is the owner's explicit opt-in to
+    exit legacy positions (see :func:`legacy_position_preflight`). Without it
+    they stay open, are listed in ``legacy_positions``, and each is reported
+    as ``SKIP_CLOSE`` / ``legacy_position_needs_owner_decision``.
 
     Returns summary dict with signals_checked, trades_opened, trades_closed, etc.
     """
@@ -530,6 +589,8 @@ def execute_signals(
             "venue": "robinhood",
             "venue_mode": None,
             "venue_orders": [],
+            "close_legacy_positions": close_legacy_positions,
+            "legacy_positions": [],
             "details": [],
         }
 
@@ -543,7 +604,7 @@ def execute_signals(
     signals_checked = 0
     trades_opened = 0
     trades_closed = 0
-    strategies_killed = 0
+    killed_strategy_ids: set[str] = set()  # kills made by this run's winning closes
     strategies_halted = 0
 
     # ------------------------------------------------------------------
@@ -836,10 +897,12 @@ def execute_signals(
                 })
 
     # ------------------------------------------------------------------
-    # 6. Close trades past the holding period, for EVERY open position
-    #    (Codex review 6011903757): listed from paper_trades, not from the
-    #    ACTIVE strategies above, so a PAUSED or KILLED strategy's open trade
-    #    is still closed. ALWAYS runs, even when the circuit breaker is
+    # 6. Close trades past the holding period. Open positions are listed
+    #    from paper_trades, not from the ACTIVE strategies above (Codex
+    #    review 6011903757). Legacy positions, those opened before
+    #    LEGACY_POSITION_CUTOVER or belonging to a PAUSED/KILLED strategy,
+    #    are closed only with close_legacy_positions=True (Codex review
+    #    6031218970). ALWAYS runs, even when the circuit breaker is
     #    OPEN/errored or leader data is missing/stale. Strategy horizon_days
     #    beats the hypothesis expected_lag so long-horizon paper trades are
     #    not closed next day. The exit price is the strategy follower's.
@@ -855,6 +918,15 @@ def execute_signals(
         log.warning("Open-position listing for the exit pass failed: {e}", e=str(exc))
         details.append({"action": "ERROR", "stage": "exit_pass", "error": str(exc)})
 
+    legacy_positions = _legacy_report(positions)
+    legacy_reasons = {p["trade_id"]: p["legacy_reason"] for p in legacy_positions}
+    if legacy_positions and not close_legacy_positions:
+        log.warning(
+            "Exit pass: {n} legacy open position(s) kept open pending the owner's decision "
+            "(close_legacy_positions=False): trades {ids}",
+            n=len(legacy_positions), ids=sorted(legacy_reasons),
+        )
+
     exits_by_strategy: dict[str, tuple] = {}
     for (trade_id, strategy_id, ticker, entry_date, strategy_status,
          hypothesis_id, follower, strategy_horizon_days) in positions:
@@ -869,6 +941,16 @@ def execute_signals(
                 "trade_id": trade_id,
                 "ticker": ticker,
                 "reason": "strategy_missing",
+            })
+            continue
+        if trade_id in legacy_reasons and not close_legacy_positions:
+            details.append({
+                "action": "SKIP_CLOSE",
+                "strategy_id": strategy_id,
+                "trade_id": trade_id,
+                "ticker": ticker,
+                "reason": "legacy_position_needs_owner_decision",
+                "legacy_reason": legacy_reasons[trade_id],
             })
             continue
         exits_by_strategy.setdefault(
@@ -918,7 +1000,11 @@ def execute_signals(
                         )
 
                         if "error" not in result:
+                            # This run won the OPEN -> CLOSED claim: the
+                            # only run that counts the close or its kill.
                             trades_closed += 1
+                            if result.get("strategy_killed"):
+                                killed_strategy_ids.add(strategy_id)
                             details.append({
                                 "action": "CLOSE",
                                 "strategy_id": strategy_id,
@@ -928,6 +1014,18 @@ def execute_signals(
                                 "exit_price": exit_price,
                                 "pnl": result.get("pnl"),
                                 "pnl_pct": result.get("pnl_pct"),
+                            })
+                        else:
+                            log.info(
+                                "Strategy {s}: trade #{id} was closed by an overlapping run — not counted",
+                                s=strategy_id, id=trade_id,
+                            )
+                            details.append({
+                                "action": "SKIP_CLOSE",
+                                "strategy_id": strategy_id,
+                                "trade_id": trade_id,
+                                "ticker": ticker,
+                                "reason": result.get("reason") or "already_closed",
                             })
         except Exception as exc:  # noqa: BLE001
             close_errors[strategy_id] = exc
@@ -954,19 +1052,12 @@ def execute_signals(
             )
 
     # ------------------------------------------------------------------
-    # 7. Count strategies killed during this run (from close_trade). Only
-    #    strategies ACTIVE at the start count: closing an already-KILLED
-    #    strategy's trade also bumps its updated_at.
+    # 7. Strategies killed by this run: only kills made by the kill check of
+    #    a close this run won (close_trade's strategy_killed), never "KILLED
+    #    recently", which counted an overlapping run's kill (Codex review
+    #    6031218970).
     # ------------------------------------------------------------------
-    active_ids = [s[0] for s in strategies]
-    if active_ids:
-        with engine.connect() as conn:
-            killed = conn.execute(text(
-                "SELECT COUNT(*) FROM paper_strategies "
-                "WHERE status = 'KILLED' AND id = ANY(CAST(:active_ids AS TEXT[])) "
-                "AND updated_at >= NOW() - INTERVAL '5 minutes'"
-            ), {"active_ids": active_ids}).fetchone()
-            strategies_killed = killed[0] if killed else 0
+    strategies_killed = len(killed_strategy_ids)
 
     summary = {
         "signals_checked": signals_checked,
@@ -977,6 +1068,8 @@ def execute_signals(
         "venue": venue_tag.venue if venue_tag else None,
         "venue_mode": venue_tag.trader.mode if venue_tag else None,
         "venue_orders": venue_orders,
+        "close_legacy_positions": close_legacy_positions,
+        "legacy_positions": legacy_positions,
         "details": details,
     }
 
