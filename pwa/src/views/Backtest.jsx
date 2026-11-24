@@ -122,10 +122,11 @@ export default function Backtest() {
         setError(null);
         try {
             const r = await api.runBacktest(startDate, parseFloat(capital));
-            // A resolved {error: true} is a failed run: say so, and do not
-            // reload, which would present the previous results as this run's.
-            if (r && r.error) setError(r.message || 'Backtest run failed');
-            else await loadSummary();
+            // Only the route's typed success ({status: "complete"}) is a finished run.
+            // Anything else ({error: true}, null, an untyped object) is not, and
+            // reloading would present the previous results as this run's.
+            if (r && r.status === 'complete' && !r.error) await loadSummary();
+            else setError((r && r.message) || 'Backtest run did not report completion');
         } catch (e) {
             setError(e.message);
         }

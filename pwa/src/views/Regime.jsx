@@ -112,6 +112,10 @@ export default function Regime() {
     const regimeRef = useRef(currentRegime);
     regimeRef.current = currentRegime;
     const [regimeReadFailure, setRegimeReadFailure] = useState(null);
+    // Mount and REFRESH reads can overlap. A result is applied only if it is the
+    // newest read and the store still holds the regime it started from, so a
+    // late older result never overwrites, clears or stale-marks newer state.
+    const regimeGenRef = useRef(0);
     const [allRegimes, setAllRegimes] = useState(null);
     const [synthesis, setSynthesis] = useState(null);
     const [synthLoading, setSynthLoading] = useState(false);
@@ -121,16 +125,19 @@ export default function Regime() {
     const [activeStrategy, setActiveStrategy] = useState(null);
 
     const { data, loading, error, refetch: loadData } = useAsyncData(async () => {
+        const token = { gen: ++regimeGenRef.current, before: regimeRef.current };
         const [current, all, hist, trans] = await Promise.all([
             api.getCurrent({ force: true }),
             api.getAllActiveRegimes(),
             api.getHistory(90),
             api.getTransitions(),
         ]);
+        const newest = token.gen === regimeGenRef.current && regimeRef.current === token.before;
+        if (!newest) return { current, all, hist, trans, superseded: true };
         // api._fetch resolves failures to {error: true}; never store that as the regime.
         // The store keeps the previous read, so record that this read failed.
         if (!(current && !current.error)) {
-            setRegimeReadFailure({ regime: regimeRef.current, at: new Date() });
+            setRegimeReadFailure({ regime: token.before, at: new Date() });
         }
         if (current && !current.error) {
             setRegimeReadFailure(null);
@@ -152,7 +159,9 @@ export default function Regime() {
         setSynthLoading(false);
     };
 
-    const regime = currentRegime || { state: 'UNCALIBRATED' };
+    // No verified read is not the backend's UNCALIBRATED reply: that one is a real
+    // answer ("no regime row yet"); a cold 503/null is no answer at all.
+    const regime = currentRegime || { state: 'UNAVAILABLE' };
     const regimeLastKnown = currentRegime != null && regimeReadFailure != null
         && regimeReadFailure.regime === currentRegime;
     const primaryColor = stateColors[regime.state] || '#5A7080';
@@ -195,7 +204,7 @@ export default function Regime() {
                             fontFamily: "'JetBrains Mono', monospace", marginBottom: '4px' }}
                             data-testid="regime-banner-label"
                             title={regimeLastKnown ? `Latest regime read failed at ${regimeReadFailure.at.toLocaleTimeString()}` : undefined}
-                        >{regimeLastKnown ? 'LAST KNOWN · LATEST READ FAILED' : 'CURRENT'}</div>
+                        >{regimeLastKnown ? 'LAST KNOWN · LATEST READ FAILED' : (currentRegime ? 'CURRENT' : 'NO VERIFIED READ')}</div>
                         <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '22px',
                             fontWeight: 700, color: primaryColor }}>
                             {meta?.icon || ''} {regime.state}

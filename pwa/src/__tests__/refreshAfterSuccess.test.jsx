@@ -51,7 +51,7 @@ describe('Backtest after a good summary', () => {
     it('a failed summary refresh is shown above the previous results', async () => {
         api.getBacktestSummaryPitch.mockResolvedValueOnce(GOOD_SUMMARY)
             .mockResolvedValueOnce({ error: true, status: 500, message: 'Internal Server Error' });
-        api.runBacktest.mockResolvedValue({ status: 'ok' });
+        api.runBacktest.mockResolvedValue({ status: 'complete' });
         render(<Backtest />);
         await waitFor(() => expect(screen.getByText('GRID Performance')).toBeInTheDocument());
         fireEvent.click(screen.getByText('Run Pitch Backtest'));
