@@ -1336,8 +1336,9 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
         "timeout_s": 360,
         # Not scheduled, not deleted: the module, its tests and the stored
         # history stay. To bring it back, remove this hold (grid-scheduler
-        # follows it through hold_reason_for) and add a migration that undoes
-        # gdelt_doc_retire_20261123.
+        # follows it through hold_reason_for) and add a forward migration that
+        # re-enables the features wanted (gdelt_doc_retire_20261123 cannot be
+        # downgraded).
         "hold_reason": "Retired 2026-11-23 (owner): no SUCCESS since 2026-11-04; the GDELT DOC API answered 429 on most runs since October and refused TCP connections from grid-svr, precision5520 and i7gen10 at 22:30Z on 2026-11-23. The daily GDELT event features come from the bulk files (gdelt_bulk), which still answer",
         "kwargs": {
             "days_back": 1,

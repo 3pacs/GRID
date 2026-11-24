@@ -20,8 +20,12 @@ The 12 daily event features written from GDELT's bulk files
 (ingestion/altdata/gdelt_bulk.py: gdelt_avg_tone, gdelt_conflict_count, ...)
 are not touched: that loader still runs.
 
-Downgrade restores the flags as 0062 registered them, for bringing the DOC
-puller back (remove the registry hold first).
+Downgrade is refused. The upgrade does not record each row's prior flags: a
+row that was already deprecated is left alone, and a row that had opted out
+of model use (model_eligible FALSE) only gains deprecated_at. Restoring
+"defaults" would erase an earlier deprecation and re-enable those opt-outs.
+To bring DOC features back, write a new forward migration that names the
+features to re-enable and the reason, after lifting the registry hold.
 """
 from alembic import op
 from sqlalchemy import bindparam, text
@@ -67,12 +71,6 @@ _RETIRE = text(
     "SET model_eligible = FALSE, deprecated_at = CURRENT_TIMESTAMP "
     "WHERE deprecated_at IS NULL AND name IN :names"
 ).bindparams(bindparam("names", expanding=True))
-_UNDEPRECATE = text(
-    "UPDATE feature_registry SET deprecated_at = NULL WHERE name IN :names"
-).bindparams(bindparam("names", expanding=True))
-_RE_ENABLE = text(
-    "UPDATE feature_registry SET model_eligible = TRUE WHERE name IN :names"
-).bindparams(bindparam("names", expanding=True))
 
 
 def upgrade() -> None:
@@ -80,6 +78,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    bind.execute(_UNDEPRECATE, {"names": list(DOC_FEATURES)})
-    bind.execute(_RE_ENABLE, {"names": list(ACTOR_AND_TENSION_FEATURES)})
+    raise RuntimeError(
+        "Downgrade of gdelt_doc_retire_20261123 is refused: the prior "
+        "model_eligible and deprecated_at values of each row are not recorded, "
+        "so restoring defaults would erase earlier deprecations and re-enable "
+        "features that had opted out. Write a forward migration that names "
+        "the features to re-enable."
+    )

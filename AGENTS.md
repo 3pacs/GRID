@@ -1032,7 +1032,7 @@ deleted: `ingestion/altdata/gdelt.py`, its tests and all stored rows stay.
   429, 5-10 rows a week). On 11-23 at 22:30Z `api.gdeltproject.org:443` refused
   TCP from grid-svr, precision5520 and i7gen10.
 - **Scheduling:** `hold_reason` on the `gdelt` entry of `PULLER_REGISTRY`
-  (SCHED re-pin 08c0356f -> 08f8db79 in `tests/test_hermes_sec_only.py`; #1407
+  (SCHED re-pin 08c0356f -> 44a4eadc in `tests/test_hermes_sec_only.py`; #1407
   re-pins the same base, so the second to merge re-pins again).
   `ingestion/scheduler.py` follows it through `hold_reason_for("gdelt")`.
   `scripts/hermes_fixers.py` drops the `GDELT -> gdelt` retry route.
@@ -1049,5 +1049,10 @@ deleted: `ingestion/altdata/gdelt.py`, its tests and all stored rows stay.
 - **To turn it back on:** remove the `hold_reason`, restore the
   `"GDELT": "gdelt"` line in `hermes_fixers._CATALOG_TO_REGISTRY`, move GDELT
   back to `_PRODUCING` in `tests/test_scheduler_daily_outcomes_20261117.py`, add
-  a migration that undoes `gdelt_doc_retire_20261123` (its downgrade shows the
-  flags), and re-pin SCHED.
+  a forward migration that names the features to re-enable, and re-pin SCHED.
+- **Codex HOLD 6031396980 (2026-11-24):** the migration's downgrade is refused.
+  The upgrade leaves a row that was already deprecated exactly as it was, and a
+  row that had opted out of model use only gains `deprecated_at`; no prior
+  value is recorded, so restoring defaults would erase and re-enable them.
+  This is not a complete removal of the DOC API: three other callers remain
+  and the bulk-file loader stays.

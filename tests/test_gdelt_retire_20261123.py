@@ -114,22 +114,37 @@ def test_the_staleness_edge(age_days: int, available: bool) -> None:
 
 # ── registry migration ──────────────────────────────────────────────────────
 
-def _registry(conn) -> None:
+PRE_DEPRECATED = "2026-01-01 00:00:00"
+# Rows whose state before the migration must be provable afterwards.
+PRE_DEPRECATED_ROWS = {
+    "gdelt_opec_tone": (False, PRE_DEPRECATED),             # theme, already deprecated
+    "gdelt_actor_ueda_tone": (True, PRE_DEPRECATED),        # actor, already deprecated but still eligible
+}
+OPTED_OUT_ROWS = {
+    "gdelt_actor_yellen_tone": (False, None),               # actor, opted out of model use before
+    "gdelt_tension_india_china": (False, None),             # tension, opted out before
+}
+UNTOUCHED_ROWS = {
+    "gdelt_avg_tone": (True, None),                         # bulk-file features
+    "gdelt_conflict_count": (False, None),
+    "gdelt_actor_powell_tone_v2": (True, None),             # not in the list
+    "sp500_full": (True, None),
+}
+
+
+def _registry(conn) -> dict[str, tuple[bool, object]]:
     conn.exec_driver_sql(
         "CREATE TABLE feature_registry (name TEXT UNIQUE, model_eligible BOOLEAN, deprecated_at TIMESTAMP)"
     )
-    rows = [(n, True, None) for n in revision.ACTOR_AND_TENSION_FEATURES]
-    rows += [(n, False, None) for n in revision.THEME_FEATURES if n != "gdelt_opec_tone"]
-    rows += [
-        ("gdelt_opec_tone", False, "2026-01-01 00:00:00"),   # already deprecated: left as it is
-        ("gdelt_avg_tone", True, None),                      # bulk-file features: untouched
-        ("gdelt_conflict_count", False, None),
-        ("gdelt_actor_powell_tone_v2", True, None),          # not in the list
-        ("sp500_full", True, None),
-    ]
-    for name, eligible, deprecated in rows:
+    rows: dict[str, tuple[bool, object]] = {n: (True, None) for n in revision.ACTOR_AND_TENSION_FEATURES}
+    rows.update({n: (False, None) for n in revision.THEME_FEATURES})
+    rows.update(PRE_DEPRECATED_ROWS)
+    rows.update(OPTED_OUT_ROWS)
+    rows.update(UNTOUCHED_ROWS)
+    for name, (eligible, deprecated) in rows.items():
         conn.execute(text("INSERT INTO feature_registry VALUES (:n, :e, :d)"),
                      {"n": name, "e": eligible, "d": deprecated})
+    return rows
 
 
 def _rows(conn) -> dict[str, tuple[bool, object]]:
@@ -137,37 +152,57 @@ def _rows(conn) -> dict[str, tuple[bool, object]]:
             conn.exec_driver_sql("SELECT name, model_eligible, deprecated_at FROM feature_registry")}
 
 
+def _upgraded(monkeypatch: pytest.MonkeyPatch, times: int = 1):
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        before = _registry(conn)
+        monkeypatch.setattr(revision, "op", Operations(MigrationContext.configure(conn)))
+        for _ in range(times):
+            revision.upgrade()
+        return before, _rows(conn)
+
+
 def test_upgrade_retires_exactly_the_doc_features(monkeypatch: pytest.MonkeyPatch) -> None:
-    engine = create_engine("sqlite://")
-    with engine.begin() as conn:
-        _registry(conn)
-        monkeypatch.setattr(revision, "op", Operations(MigrationContext.configure(conn)))
-        revision.upgrade()
-        revision.upgrade()  # idempotent
-        rows = _rows(conn)
+    before, after = _upgraded(monkeypatch, times=2)      # idempotent
 
+    assert set(after) == set(before)
     for name in revision.DOC_FEATURES:
-        assert rows[name][0] is False and rows[name][1] is not None, name
-    assert rows["gdelt_opec_tone"] == (False, "2026-01-01 00:00:00")
-    for name in ("gdelt_avg_tone", "gdelt_actor_powell_tone_v2", "sp500_full"):
-        assert rows[name] == (True, None), name
-    assert rows["gdelt_conflict_count"] == (False, None)
+        if name in PRE_DEPRECATED_ROWS:
+            continue
+        assert after[name][0] is False and after[name][1] is not None, name
+    for name, state in UNTOUCHED_ROWS.items():
+        assert after[name] == state, name
 
 
-def test_downgrade_restores_the_flags_0062_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_row_deprecated_before_is_left_exactly_as_it_was(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Its earlier deprecation date stays, and so does its model_eligible flag:
+    the migration does not touch a row someone already retired."""
+    before, after = _upgraded(monkeypatch)
+    for name, state in PRE_DEPRECATED_ROWS.items():
+        assert before[name] == state and after[name] == state, name
+
+
+def test_a_row_that_had_opted_out_stays_out_and_gains_the_deprecation(monkeypatch: pytest.MonkeyPatch) -> None:
+    before, after = _upgraded(monkeypatch)
+    for name in OPTED_OUT_ROWS:
+        assert before[name] == (False, None)
+        assert after[name][0] is False and after[name][1] is not None, name
+
+
+def test_downgrade_is_refused_and_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restoring defaults would erase the earlier deprecations and re-enable
+    the opt-outs above (Codex HOLD 6031396980), so there is no downgrade."""
     engine = create_engine("sqlite://")
     with engine.begin() as conn:
         _registry(conn)
         monkeypatch.setattr(revision, "op", Operations(MigrationContext.configure(conn)))
         revision.upgrade()
-        revision.downgrade()
-        rows = _rows(conn)
-
-    for name in revision.ACTOR_AND_TENSION_FEATURES:
-        assert rows[name] == (True, None), name
-    for name in revision.THEME_FEATURES:
-        assert rows[name] == (False, None), name
-    assert rows["gdelt_avg_tone"] == (True, None) and rows["gdelt_conflict_count"] == (False, None)
+        upgraded = _rows(conn)
+        with pytest.raises(RuntimeError, match="refused"):
+            revision.downgrade()
+        assert _rows(conn) == upgraded
+    for name, state in PRE_DEPRECATED_ROWS.items():
+        assert upgraded[name] == state, name
 
 
 def test_the_retired_list_is_the_doc_pullers_own_feature_set() -> None:
