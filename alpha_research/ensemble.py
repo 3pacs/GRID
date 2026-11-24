@@ -89,6 +89,7 @@ def train_ensemble(
     label_horizon: int = 5,
     embargo_days: int | None = None,
     inner_val_frac: float = 0.2,
+    calendar: Any = None,
 ) -> EnsembleResult:
     """
     Train LightGBM ensemble on stacked factor signals.
@@ -99,6 +100,15 @@ def train_ensemble(
     the split boundary. Early stopping monitors an inner holdout carved from
     the END of the training window (separated from the inner fit set by the
     same embargo), never the outer validation set.
+
+    The split's dates are fixed before any label is read: the sessions of
+    ``calendar`` (the complete decision calendar, independent of labels)
+    over the span of decision dates, else the decision dates themselves
+    (every date with all factor values known). A date is never dropped from
+    the split, or from the validation book, because its labels are missing:
+    it shows as missing coverage. The train and validation books are dated
+    on ``calendar``; without it their ``calendar_basis`` is ``"label_index"``
+    and neither can carry a full-book or net pass.
     """
     if not _HAS_LGB:
         raise ImportError("lightgbm not installed. Run: pip install lightgbm")
@@ -122,10 +132,27 @@ def train_ensemble(
     params = {**_DEFAULT_LGB_PARAMS, **(lgb_params or {})}
     feature_names = list(features.columns)
 
+    from alpha_research.validation.metrics import (
+        as_session_calendar,
+        long_short_book,
+        outcome_coverage,
+        sharpe_ratio,
+    )
+
     # Expanding-window split by date with outer embargo >= label_horizon.
     # Outer train: dates[:split_idx]; dropped embargo: dates[split_idx : split_idx + embargo];
-    # outer validation: dates[split_idx + embargo :].
-    dates = features.index[labeled].get_level_values(0).unique().sort_values()
+    # outer validation: dates[split_idx + embargo :]. Dates come from the
+    # decision calendar, never from which rows carry a label.
+    dates = features.index.get_level_values(0).unique().sort_values()
+    if calendar is not None:
+        cal = as_session_calendar(calendar, dates)
+        off_calendar = dates.difference(cal)
+        if len(off_calendar):
+            raise ValueError(
+                f"{len(off_calendar)} decision dates are not sessions of the calendar "
+                f"(first {off_calendar[0]}): the calendar is not complete"
+            )
+        dates = cal[(cal >= dates[0]) & (cal <= dates[-1])]
     split_idx = int(len(dates) * train_frac)
     train_dates = dates[:split_idx]
     val_dates = dates[split_idx + embargo :]
@@ -189,19 +216,15 @@ def train_ensemble(
     ranked = pred_panel.rank(axis=1, pct=True)
 
     # Compute train/val Sharpe from long-short (val_dates untouched during training/ES)
-    from alpha_research.validation.metrics import (
-        long_short_book,
-        outcome_coverage,
-        sharpe_ratio,
-    )
-
     train_pred = ranked.loc[ranked.index.isin(fit_dates)]
     val_pred = ranked.loc[ranked.index.isin(val_dates)]
     train_fwd = forward_returns.unstack() if isinstance(forward_returns, pd.Series) else forward_returns
     train_fwd_aligned = train_fwd.reindex(index=ranked.index, columns=ranked.columns)
 
-    train_book = long_short_book(train_pred, train_fwd_aligned.loc[train_pred.index])
-    val_book = long_short_book(val_pred, train_fwd_aligned.loc[val_pred.index])
+    train_book = long_short_book(
+        train_pred, train_fwd_aligned.loc[train_pred.index], calendar=calendar
+    )
+    val_book = long_short_book(val_pred, train_fwd_aligned.loc[val_pred.index], calendar=calendar)
     train_ls = train_book["return"].dropna().astype(float)
     val_ls = val_book["return"].dropna().astype(float)
     book_coverage = {"train": outcome_coverage(train_book), "val": outcome_coverage(val_book)}

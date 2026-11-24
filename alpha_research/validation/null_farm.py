@@ -386,10 +386,11 @@ def replicate(cell: Mapping[str, Any], rep: int, base_seed: int) -> dict[str, An
                 **_gauntlet_psr(signal, fwd, top_n, cost),
             )
         else:
+            # The world's own index is its complete session calendar.
             result = gauntlet.run_gauntlet(
                 signal, fwd, n_models_tested=1, top_n=top_n, cost_bps=cost,
                 n_permutations=perms, seed=perm_seed, block=cell["block"],
-                overlap_depth=depth,
+                overlap_depth=depth, calendar=signal.index,
             )
             record.update(
                 p=result.permutation_p,

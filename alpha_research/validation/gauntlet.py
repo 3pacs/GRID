@@ -3,10 +3,11 @@ False Discovery Gauntlet — 5 statistical tests to prevent self-deception.
 
 From QuantaAlpha v2 research:
   - ROBUST: CV >= 75%, permutation p < 0.05, subsample > 50%, val net Sharpe > 0.3,
-    AND deflated_sharpe_passed is True, AND a full-book net series
-    (``net_coverage`` complete, no uncharged turnover cost)
+    AND deflated_sharpe_passed is True, AND a full-book net series on an
+    explicit session calendar (``calendar_basis`` explicit_calendar,
+    ``net_coverage`` complete, no uncharged turnover cost)
   - MARGINAL: CV >= 50%, permutation p < 0.10 (or ROBUST downgraded when DSR fails
-    or cannot be computed, or the net book is partial or uncharged)
+    or cannot be computed, or the net book is partial, uncharged or label-index)
   - UNSTABLE: everything else
 
 The net Sharpe is carried-cost accounting (``net_basis``), not daily
@@ -482,6 +483,7 @@ def run_gauntlet(
     permutation_alpha: float = PERMUTATION_ALPHA,
     outcome_horizon: int = 0,
     as_of: Any = None,
+    calendar: Any = None,
 ) -> GauntletResult:
     """
     Run the full 5-test False Discovery Gauntlet.
@@ -493,12 +495,15 @@ def run_gauntlet(
     and ``deflated_sharpe_passed`` is False. ``n_permutations=None`` derives
     the count from ``permutation_alpha`` (see :func:`permutation_test`).
 
-    ``outcome_horizon`` and ``as_of`` declare the eligibility window
+    ``outcome_horizon``, ``as_of`` and ``calendar`` (the complete session
+    calendar, independent of labels) declare the eligibility window
     (:func:`~alpha_research.validation.metrics.long_short_book`); every test
-    reads only the eligible dates. The net book's coverage is computed
-    before the verdict: a partial or uncharged book (``net_pass_blocked_reason``
-    set) is never ROBUST (downgraded to MARGINAL with the reason in
-    ``verdict_downgrade_reason``) and never passes the net Sharpe threshold.
+    reads only the eligible dates, with ``forward_returns`` aligned to the
+    decision dates so an absent outcome row is a NaN row. The net book's
+    coverage is computed before the verdict: a partial, uncharged or
+    label-index book (``net_pass_blocked_reason`` set) is never ROBUST
+    (downgraded to MARGINAL with the reason in ``verdict_downgrade_reason``)
+    and never passes the net Sharpe threshold.
     The net Sharpe is carried-cost accounting, not daily executable P&L.
 
     Returns GauntletResult with verdict: ROBUST, MARGINAL, or UNSTABLE.
@@ -511,7 +516,8 @@ def run_gauntlet(
     # 0. The net book over the eligibility window (chronological, declared,
     # never read from outcomes) and its coverage, which the verdict consults.
     book = long_short_book(
-        signal, forward_returns, top_n, cost_bps, outcome_horizon=outcome_horizon, as_of=as_of
+        signal, forward_returns, top_n, cost_bps,
+        outcome_horizon=outcome_horizon, as_of=as_of, calendar=calendar,
     )
     coverage = outcome_coverage(book)
     if book.attrs["mature_through"] is None:
@@ -519,6 +525,9 @@ def run_gauntlet(
     signal, forward_returns = eligible_panels(
         signal, forward_returns, book.attrs["mature_through"]
     )
+    # One outcome row per decision date: an absent row becomes a NaN row, so
+    # the positional CV folds and decay shifts read the dates the book read.
+    forward_returns = forward_returns.reindex(index=signal.index)
 
     # 1. Permutation test (block null)
     perm = permutation_test(
