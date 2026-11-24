@@ -180,24 +180,33 @@ _DREWRY_ASSESSMENT_HEADING_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 _DREWRY_HEADING_TAGS: tuple[str, ...] = ("h1", "h2", "h3", "h4", "h5", "h6")
-# 3. A prose value must be reported, not predicted. "The Drewry World
-#    Container Index is expected to fall to $4,176 ... due to weak Transpacific
-#    rates" has the same shape as the assessed sentence (Codex HOLD 6032263784):
-#    the causal check places the lane, it does not show the value was observed.
-#    So the words up to the value must carry a past or present assessment verb
-#    and no predictive or modal wording. A forecast after the value ("... to
-#    $4,176 this week, and Drewry expects rates to fall") does not undo it.
-_DREWRY_REALIZED_VERB_RE = re.compile(
-    r"\b(?:decreased|increased|declined|dropped|fell|rose|gained|climbed|slipped|dipped|"
-    r"eased|jumped|surged|plunged|slid|sank|lost|added|"
-    r"edged\s+(?:up|down|higher|lower)|remained|held|was|stood|stands|is|"
-    r"assessed|closed|ended|reached)\b",
+# 3. A prose value must be reported, not predicted, and the reporting verb
+#    must belong to the value. Two shapes passed earlier heads (Codex HOLDs
+#    6032263784 and 6032642033):
+#      "... Index is expected to fall to $4,176 ... due to weak Transpacific rates"
+#      "... Index declined this week, and for next week Drewry sees $4,176 ..."
+#    The second has an assessment verb, but in another clause. So the words
+#    that end at the value must be one reporting clause: an assessment verb,
+#    at most a percentage and three plain words, then "to"/"at" (or a bare
+#    "is/was/stood [at]") directly before the amount, with no punctuation in
+#    between. Predictive or modal wording anywhere before the value refuses the
+#    sentence. A forecast after the value ("... to $4,176 this week, and Drewry
+#    expects rates to fall") does not undo it.
+_DREWRY_REPORTED_CLAUSE_RE = re.compile(
+    r"\b(?:"
+    r"(?:decreased|increased|declined|dropped|fell|rose|gained|climbed|slipped|dipped|"
+    r"eased|jumped|surged|plunged|slid|sank|edged\s+(?:up|down|higher|lower)|"
+    r"remained|held|closed|ended|(?:was\s+|is\s+)?assessed)"
+    r"(?:\s+(?:by\s+)?[\d.,]+\s*%)?(?:\s+[a-z-]+){0,3}?\s+(?:to|at)"
+    r"|(?:is|was|stands|stood)(?:\s+(?:now|currently))?(?:\s+at)?"
+    r")\s+(?:US)?\$?\s*$",
     re.IGNORECASE,
 )
 _DREWRY_PREDICTIVE_RE = re.compile(
     r"\b(?:expect(?:s|ed|ing)?|forecast(?:s|ed|ing)?|predict(?:s|ed|ing)?|project(?:s|ed|ing)?|"
     r"anticipat(?:e|es|ed|ing)|estimat(?:e|es|ed|ing)|target(?:s|ed|ing)?|likely|unlikely|"
-    r"will|would|could|may|might|should|shall|outlook|"
+    r"will|would|could|may|might|should|shall|outlook|sees?|seeing|"
+    r"next\s+(?:week|month|quarter|year)|coming\s+(?:days?|weeks?|months?)|"
     r"(?:is|are|was|were)\s+(?:set|due|poised|seen|tipped)\s+to|"
     r"going\s+to|on\s+course\s+to|on\s+track\s+to)\b",
     re.IGNORECASE,
@@ -534,15 +543,16 @@ def _drewry_lane_is_trailing_cause(sentence: str, value_end: int) -> bool:
     return _DREWRY_CAUSAL_RE.search(sentence[value_end:lane.start()]) is not None
 
 
-def _drewry_value_is_reported(sentence: str, value_end: int) -> bool:
-    """True when the words up to the value report it rather than predict it.
+def _drewry_value_is_reported(sentence: str, value_start: int) -> bool:
+    """True when the words ending at the value are one clause that reports it.
 
-    See note 3 above ``_DREWRY_REALIZED_VERB_RE``.
+    ``value_start`` is where the matched amount's digits begin. See note 3
+    above ``_DREWRY_REPORTED_CLAUSE_RE``.
     """
-    lead = sentence[:value_end]
+    lead = sentence[:value_start]
     if _DREWRY_PREDICTIVE_RE.search(lead):
         return False
-    return _DREWRY_REALIZED_VERB_RE.search(lead) is not None
+    return _DREWRY_REPORTED_CLAUSE_RE.search(lead) is not None
 
 
 def _drewry_introducing_assessment_date(block: Any) -> date | None:
@@ -761,19 +771,19 @@ def _parse_drewry_wci_html(
                     continue
 
                 val: float | None = None
-                value_end = 0
+                value_start = value_end = 0
                 for pattern in _DREWRY_PROSE_VALUE_PATTERNS:
                     val_match = pattern.search(sentence)
                     if val_match:
                         val = _parse_drewry_usd(val_match.group(1))
                         if val is not None:
-                            value_end = val_match.end()
+                            value_start, value_end = val_match.start(1), val_match.end()
                             break
                 if val is None:
                     continue
                 if not _drewry_lane_is_trailing_cause(sentence, value_end):
                     continue
-                if not _drewry_value_is_reported(sentence, value_end):
+                if not _drewry_value_is_reported(sentence, value_start):
                     continue
 
                 assessment_date: date | None = None
