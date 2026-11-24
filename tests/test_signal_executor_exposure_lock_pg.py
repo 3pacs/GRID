@@ -15,8 +15,8 @@ on a second connection, must wait on that lock, then see A's committed entry
 (no duplicate s1) and the exposure it added (s2 refused at the cap).
 
 Throwaway schema per test, dropped afterwards. Skips without
-``GRID_TEST_DB_URL``; the CI step "Signal executor exposure lock PostgreSQL
-contract" fails on any skip. No production table, position or venue is touched.
+``GRID_TEST_DB_URL``; the CI step "Signal executor exposure lock and close
+race PostgreSQL contract" fails on any skip. No production table, position or venue is touched.
 """
 
 from __future__ import annotations

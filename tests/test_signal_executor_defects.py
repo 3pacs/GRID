@@ -15,10 +15,16 @@ Covers:
    serialized step (advisory lock, re-read, re-check, then insert), and the exit
    pass runs over every open position whatever its strategy's status.
    (The two-connection proof is tests/test_signal_executor_exposure_lock_pg.py.)
+8. Codex review 6031218970: an exit is an atomic OPEN -> CLOSED claim and only
+   the winner writes P&L, counters and kills; a loser reports SKIP_CLOSE /
+   already_closed. Open positions from before the cutover or of non-ACTIVE
+   strategies are reported and closed only on an explicit opt-in.
+   (The two-connection proof is tests/test_signal_executor_close_race_pg.py.)
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
@@ -38,6 +44,19 @@ os.environ.setdefault(
     "GRID_MASTER_PASSWORD_HASH",
     "$2b$12$abcdefghijklmnopqrstuuFb1mY3p5oXq0rN8sxqf6vV2QcVx1zSi",
 )
+
+#: The module's real cutover, read before any test pins it.
+_REAL_LEGACY_CUTOVER = getattr(se, "LEGACY_POSITION_CUTOVER", None)
+
+
+@pytest.fixture(autouse=True)
+def _post_cutover_positions(monkeypatch):
+    """Open positions in these tests are post-cutover unless a test says otherwise.
+
+    Their entry dates are relative to today while the real cutover is a fixed
+    date, so pin it far back; the legacy-guard tests set their own.
+    """
+    monkeypatch.setattr(se, "LEGACY_POSITION_CUTOVER", date(2000, 1, 1), raising=False)
 
 
 # ── Helpers / Fakes ────────────────────────────────────────────────────────
@@ -868,10 +887,12 @@ class TestCodexHold6011903757:
         # No reservation statement ran on the plain read connection.
         assert not any("pg_advisory" in sql for sql, _ in read_conn.queries)
 
-    def test_open_positions_of_paused_and_killed_strategies_are_exited(self, monkeypatch):
+    def test_open_positions_of_paused_and_killed_strategies_exit_on_opt_in(self, monkeypatch):
         # Exits are enumerated from open positions, not from ACTIVE strategies.
         # Pre-fix only ACTIVE strategies' trades were walked, so the PAUSED and
-        # KILLED strategies' expired trades stayed open forever.
+        # KILLED strategies' expired trades stayed open forever. Since Codex
+        # review 6031218970 they close only on the explicit legacy opt-in
+        # (the default keeps them open: TestCodexHold6031218970).
         d0, d1 = _fresh_dates()
         expired = d0 - timedelta(days=5)
         conn = _FakeConn(
@@ -896,7 +917,7 @@ class TestCodexHold6011903757:
         breaker = _passing_breaker()
         _entry_signal_patches(monkeypatch, stub_pe, breaker, prices)
 
-        summary = se.execute_signals(engine)
+        summary = se.execute_signals(engine, close_legacy_positions=True)
 
         assert summary["trades_closed"] == 2
         assert sorted(c["trade_id"] for c in stub_pe.closed) == [201, 202]
@@ -910,9 +931,10 @@ class TestCodexHold6011903757:
         assert [t["strategy_id"] for t in stub_pe.opened] == ["s_active"]
         assert [c.args[0] for c in breaker.should_execute.call_args_list] == ["s_active"]
         # Closing a KILLED strategy's trade bumps its updated_at; the run's kill
-        # count only looks at strategies that were ACTIVE when the run began.
-        kill_counts = [p for sql, p in conn.queries if "COUNT(*) FROM paper_strategies" in sql]
-        assert kill_counts == [{"active_ids": ["s_active"]}]
+        # count comes from its own winning closes (close_trade's
+        # strategy_killed), never from a recently-updated window.
+        assert summary["strategies_killed"] == 0
+        assert not any("COUNT(*) FROM paper_strategies" in sql for sql, _ in conn.queries)
 
     def test_open_position_without_a_strategy_row_is_reported_not_closed(self, monkeypatch):
         d0, d1 = _fresh_dates()
@@ -932,3 +954,275 @@ class TestCodexHold6011903757:
             "action": "SKIP_CLOSE", "strategy_id": "s_gone", "trade_id": 301,
             "ticker": "qqq_close", "reason": "strategy_missing",
         } in summary["details"]
+
+
+# ── Codex review 6031218970: winner-only exits, legacy positions ───────────
+
+
+class _CloseConn:
+    """Routes ``PaperTradingEngine.close_trade``'s statements and records them.
+
+    *claim_wins* False is the loser of a race: another run committed the
+    close first, so a ``status = 'OPEN'``-guarded UPDATE matches no row. The
+    pre-fix read ``SELECT ... WHERE status = 'OPEN'`` ran before that commit
+    and still saw the trade OPEN, so it returns the row either way.
+    """
+
+    _TRADE = ("s1", "LONG", 100.0, 0.10)
+
+    def __init__(self, *, claim_wins: bool, kill_row: tuple | None = None) -> None:
+        self.claim_wins = claim_wins
+        self.kill_row = kill_row
+        self.queries: list[tuple[str, dict | None]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, stmt, params=None):
+        sql = " ".join(str(stmt).split())
+        self.queries.append((sql, params))
+        res = MagicMock()
+        res.fetchone.return_value = None
+        if sql.startswith("UPDATE paper_trades") and "RETURNING" in sql:
+            res.fetchone.return_value = self._TRADE if self.claim_wins else None
+        elif sql.startswith("SELECT strategy_id, direction, entry_price, position_size FROM paper_trades"):
+            res.fetchone.return_value = self._TRADE
+        elif sql.startswith("SELECT capital, high_water_mark"):
+            res.fetchone.return_value = (10_100.0, 10_000.0)
+        elif sql.startswith("SELECT total_trades, wins"):
+            res.fetchone.return_value = self.kill_row
+        return res
+
+
+def _paper_engine_on(conn: _CloseConn) -> pe_mod.PaperTradingEngine:
+    engine = MagicMock()
+    engine.begin.return_value = conn
+    eng = pe_mod.PaperTradingEngine.__new__(pe_mod.PaperTradingEngine)
+    eng.engine = engine
+    eng.initial_capital = 10_000.0
+    return eng
+
+
+class _LostClosePaperEngine(_StubPaperEngine):
+    """Every close loses the OPEN -> CLOSED claim to an overlapping run."""
+
+    def close_trade(self, trade_id: int, exit_price: float, notes: str = "") -> dict:
+        self.closed.append({"trade_id": trade_id, "exit_price": exit_price, "notes": notes})
+        return {"error": "Trade not found or already closed", "reason": "already_closed"}
+
+
+class _KillingPaperEngine(_StubPaperEngine):
+    """Every close wins and its kill check kills the strategy."""
+
+    def close_trade(self, trade_id: int, exit_price: float, notes: str = "") -> dict:
+        out = super().close_trade(trade_id, exit_price, notes)
+        return {**out, "strategy_killed": True}
+
+
+def _legacy_book(d0: date) -> _FakeConn:
+    """Four expired open positions; only s_new's is a post-cutover ACTIVE one."""
+    return _FakeConn(
+        strategies=[
+            ("s_new", None, "spy_close", "dia_close", None),
+            ("s_old", None, "spy_close", "xlf_close", None),
+        ],
+        inactive_strategies=[
+            ("s_paused", None, "spy_close", "qqq_close", None, "PAUSED"),
+            ("s_killed", None, "spy_close", "iwm_close", None, "KILLED"),
+        ],
+        open_trades_by_sid={
+            "s_new": [(401, "dia_close", d0 - timedelta(days=2), 0.10)],
+            "s_old": [(402, "xlf_close", d0 - timedelta(days=200), 0.10)],
+            "s_paused": [(403, "qqq_close", d0 - timedelta(days=2), 0.10)],
+            "s_killed": [(404, "iwm_close", d0 - timedelta(days=200), 0.10)],
+        },
+    )
+
+
+def _legacy_prices(d0: date, d1: date) -> dict:
+    return {
+        "spy_close": [(d0, 100.1), (d1, 100.0)],  # no entry signal
+        "dia_close": [(d0, 400.0)],
+        "xlf_close": [(d0, 40.0)],
+        "qqq_close": [(d0, 510.0)],
+        "iwm_close": [(d0, 210.0)],
+    }
+
+
+class TestCodexHold6031218970:
+    """Overlapping exits double-accounted a close; legacy positions need an owner."""
+
+    # ── 1. Only the winning close writes ────────────────────────────────
+
+    def test_close_trade_loser_of_the_claim_changes_nothing(self):
+        # Pre-fix close_trade read the trade with status = 'OPEN', then updated
+        # it WHERE id = :id alone and moved the strategy's counters, so the
+        # loser of an overlapping close rewrote the exit and counted it twice.
+        conn = _CloseConn(claim_wins=False)
+        result = _paper_engine_on(conn).close_trade(7, 120.0, notes="run B")
+
+        assert "error" in result and result.get("reason") == "already_closed"
+        writes = [sql for sql, _ in conn.queries if sql.startswith("UPDATE")]
+        assert len(writes) == 1, writes
+        assert "WHERE id = :id AND status = 'OPEN'" in writes[0]
+        assert "RETURNING" in writes[0]
+        assert not any("paper_strategies" in sql for sql, _ in conn.queries)
+
+    def test_close_trade_claims_open_row_then_writes_pnl_and_counters_once(self):
+        conn = _CloseConn(claim_wins=True)
+        result = _paper_engine_on(conn).close_trade(7, 110.0, notes="run A")
+
+        assert result == {"trade_id": 7, "pnl": 100.0, "pnl_pct": 0.1, "strategy_killed": False}
+        sqls = [sql for sql, _ in conn.queries]
+        # The claim is the first statement: no unguarded read-then-write.
+        assert sqls[0].startswith("UPDATE paper_trades SET status = 'CLOSED'")
+        assert "WHERE id = :id AND status = 'OPEN'" in sqls[0] and "RETURNING" in sqls[0]
+        assert conn.queries[0][1]["price"] == 110.0 and conn.queries[0][1]["id"] == 7
+        assert not any(s.startswith("SELECT") and "FROM paper_trades" in s for s in sqls)
+        pnl_writes = [p for sql, p in conn.queries if "SET pnl = :pnl" in sql]
+        assert pnl_writes == [{"pnl": 100.0, "pnl_pct": 0.1, "id": 7}]
+        counters = [s for s in sqls if s.startswith("UPDATE paper_strategies SET total_trades")]
+        assert len(counters) == 1
+
+    def test_close_trade_reports_a_kill_made_by_its_own_close(self):
+        # 20 trades, 5 wins: the winner's kill check kills the strategy.
+        conn = _CloseConn(claim_wins=True, kill_row=(20, 5, 0.01, -100.0, 9_900.0))
+        result = _paper_engine_on(conn).close_trade(7, 110.0)
+
+        assert result["strategy_killed"] is True
+        kills = [p for sql, p in conn.queries if "SET status = 'KILLED'" in sql]
+        assert len(kills) == 1 and kills[0]["id"] == "s1"
+
+    def test_executor_reports_a_lost_close_as_skip_close_already_closed(self, monkeypatch):
+        d0, d1 = _fresh_dates()
+        conn = _FakeConn(
+            strategies=[("s1", None, "spy_close", "qqq_close", None)],
+            open_trades_by_sid={"s1": [(501, "qqq_close", d0 - timedelta(days=5), 0.10)]},
+        )
+        engine = _make_engine(lambda: conn)
+        stub_pe = _LostClosePaperEngine()
+        prices = {"spy_close": [(d0, 100.1), (d1, 100.0)], "qqq_close": [(d0, 510.0)]}
+        _entry_signal_patches(monkeypatch, stub_pe, _passing_breaker(), prices)
+
+        summary = se.execute_signals(engine)
+
+        assert [c["trade_id"] for c in stub_pe.closed] == [501]  # it tried
+        assert summary["trades_closed"] == 0
+        assert not [d for d in summary["details"] if d.get("action") == "CLOSE"]
+        assert {
+            "action": "SKIP_CLOSE", "strategy_id": "s1", "trade_id": 501,
+            "ticker": "qqq_close", "reason": "already_closed",
+        } in summary["details"]
+
+    def test_strategies_killed_counts_only_this_runs_winning_closes(self, monkeypatch):
+        # Pre-fix the count was "KILLED with updated_at in the last 5 minutes",
+        # so a run that closed nothing reported an overlapping run's kill.
+        class _RecentKillConn(_FakeConn):
+            def execute(self, stmt, params=None):
+                if "COUNT(*) FROM paper_strategies" in str(stmt):
+                    self.queries.append((str(stmt), params))
+                    res = MagicMock()
+                    res.fetchone.return_value = (1,)
+                    return res
+                return super().execute(stmt, params)
+
+        d0, d1 = _fresh_dates()
+        prices = {"spy_close": [(d0, 100.1), (d1, 100.0)], "qqq_close": [(d0, 510.0)]}
+        lost = _RecentKillConn(
+            strategies=[("s1", None, "spy_close", "qqq_close", None)],
+            open_trades_by_sid={"s1": [(601, "qqq_close", d0 - timedelta(days=5), 0.10)]},
+        )
+        _entry_signal_patches(monkeypatch, _LostClosePaperEngine(), _passing_breaker(), prices)
+        assert se.execute_signals(_make_engine(lambda: lost))["strategies_killed"] == 0
+
+        won = _RecentKillConn(
+            strategies=[("s1", None, "spy_close", "qqq_close", None)],
+            open_trades_by_sid={"s1": [(602, "qqq_close", d0 - timedelta(days=5), 0.10)]},
+        )
+        _entry_signal_patches(monkeypatch, _KillingPaperEngine(), _passing_breaker(), prices)
+        summary = se.execute_signals(_make_engine(lambda: won))
+        assert summary["trades_closed"] == 1
+        assert summary["strategies_killed"] == 1
+
+    # ── 3. Existing open positions are handled explicitly ────────────────
+
+    def test_legacy_positions_are_reported_and_kept_open_by_default(self, monkeypatch):
+        d0, d1 = _fresh_dates()
+        monkeypatch.setattr(se, "LEGACY_POSITION_CUTOVER", d0 - timedelta(days=3), raising=False)
+        conn = _legacy_book(d0)
+        engine = _make_engine(lambda: conn)
+        stub_pe = _StubPaperEngine()
+        _entry_signal_patches(monkeypatch, stub_pe, _passing_breaker(), _legacy_prices(d0, d1))
+
+        summary = se.execute_signals(engine)
+
+        # Only the post-cutover position of an ACTIVE strategy is exited.
+        assert [c["trade_id"] for c in stub_pe.closed] == [401]
+        assert summary["trades_closed"] == 1
+        assert summary["close_legacy_positions"] is False
+        held = {
+            d["trade_id"]: d for d in summary["details"]
+            if d.get("reason") == "legacy_position_needs_owner_decision"
+        }
+        assert sorted(held) == [402, 403, 404]
+        assert all(d["action"] == "SKIP_CLOSE" for d in held.values())
+        assert held[402]["legacy_reason"] == "opened_before_cutover"
+        assert held[403]["legacy_reason"] == "strategy_not_active"
+        assert held[404]["legacy_reason"] == "strategy_not_active"
+        assert summary["legacy_positions"] == [
+            {"trade_id": 402, "strategy_id": "s_old", "ticker": "xlf_close",
+             "entry_date": str(d0 - timedelta(days=200)), "strategy_status": "ACTIVE",
+             "legacy_reason": "opened_before_cutover"},
+            {"trade_id": 403, "strategy_id": "s_paused", "ticker": "qqq_close",
+             "entry_date": str(d0 - timedelta(days=2)), "strategy_status": "PAUSED",
+             "legacy_reason": "strategy_not_active"},
+            {"trade_id": 404, "strategy_id": "s_killed", "ticker": "iwm_close",
+             "entry_date": str(d0 - timedelta(days=200)), "strategy_status": "KILLED",
+             "legacy_reason": "strategy_not_active"},
+        ]
+
+    def test_legacy_positions_close_only_with_the_explicit_opt_in(self, monkeypatch):
+        d0, d1 = _fresh_dates()
+        monkeypatch.setattr(se, "LEGACY_POSITION_CUTOVER", d0 - timedelta(days=3), raising=False)
+        conn = _legacy_book(d0)
+        engine = _make_engine(lambda: conn)
+        stub_pe = _StubPaperEngine()
+        _entry_signal_patches(monkeypatch, stub_pe, _passing_breaker(), _legacy_prices(d0, d1))
+
+        summary = se.execute_signals(engine, close_legacy_positions=True)
+
+        assert sorted(c["trade_id"] for c in stub_pe.closed) == [401, 402, 403, 404]
+        assert summary["trades_closed"] == 4
+        assert summary["close_legacy_positions"] is True
+        # Still reported, so the run says which closes were owner-approved.
+        assert [p["trade_id"] for p in summary["legacy_positions"]] == [402, 403, 404]
+        assert not [
+            d for d in summary["details"]
+            if d.get("reason") == "legacy_position_needs_owner_decision"
+        ]
+
+    def test_opt_in_defaults_off_and_the_preflight_only_reads(self, monkeypatch):
+        params = inspect.signature(se.execute_signals).parameters
+        assert params["close_legacy_positions"].default is False
+        assert params["close_legacy_positions"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert _REAL_LEGACY_CUTOVER == date(2026, 11, 23)
+
+        d0, _ = _fresh_dates()
+        monkeypatch.setattr(se, "LEGACY_POSITION_CUTOVER", d0 - timedelta(days=3), raising=False)
+        conn = _legacy_book(d0)
+        conn.open_trades_by_sid["s_gone"] = [(405, "spy_close", d0, 0.10)]  # no strategy row
+        engine = _make_engine(lambda: conn)
+
+        report = se.legacy_position_preflight(engine)
+
+        assert [(p["trade_id"], p["legacy_reason"]) for p in report] == [
+            (402, "opened_before_cutover"),
+            (403, "strategy_not_active"),
+            (404, "strategy_not_active"),
+            (405, "strategy_missing"),
+        ]
+        engine.begin.assert_not_called()
+        assert conn.queries and all(sql.lstrip().startswith("SELECT") for sql, _ in conn.queries)
