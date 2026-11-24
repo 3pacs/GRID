@@ -49,8 +49,8 @@ def doc() -> str:
 def test_status_is_draft_and_authorises_nothing(lineage: dict, doc: str) -> None:
     assert lineage["status"] == "DRAFT_UNREVIEWED"
     assert lineage["authorises"] == []
-    assert lineage["revision"] == 2
-    assert "DRAFT v0, revision 2" in doc and "authorises nothing" in doc
+    assert lineage["revision"] == 3
+    assert "DRAFT v0, revision 3" in doc and "authorises nothing" in doc
     assert lineage["document"] == str(DOC_PATH.relative_to(ROOT))
 
 
@@ -113,7 +113,10 @@ def derive(row: dict, rules: dict, read_at: datetime) -> dict:
         cause = row.get("root_cause") or ""
         data = next((r["data"] for r in rules["unscorable_root_cause_prefixes"] if cause.startswith(r["prefix"])),
                     "UNKNOWN_CAUSE")
-    if data == "UNKNOWN_CAUSE":
+    graded_at = datetime.fromisoformat(row["graded_at"])
+    if datetime.fromisoformat(row["run_visible_at"]) > read_at:
+        state = "NOT_VISIBLE"
+    elif data == "UNKNOWN_CAUSE":
         state = "UNKNOWN"
     elif maturity == "IMMATURE":
         state = "PENDING"
@@ -122,7 +125,8 @@ def derive(row: dict, rules: dict, read_at: datetime) -> dict:
     elif data == "PRESENT":
         state = RESOLVED_STATE[verdict]
     elif data in UNAVAILABLE_DATA:
-        state = "UNAVAILABLE"
+        # Only a grading at or after the horizon can say the input was missing at maturity.
+        state = "UNAVAILABLE" if graded_at >= datetime.fromisoformat(horizon) else "NOT_ASSESSED"
     else:
         raise AssertionError(f"no state for {maturity}/{data}")
     return {"maturity": maturity, "data": data, "state": state}
@@ -143,17 +147,30 @@ def test_fixtures_cover_every_verdict_and_the_reviewed_cases(lineage: dict, inge
     assert ("MATURE", "MISSING_ENDPOINT") in expects
     assert ("IMMATURE", "AWAITING_ENDPOINT") in expects
     assert ("IMMATURE", "MISSING_BASELINE") in expects
+    # Review 6033670709: paired same-cause pre/post-horizon gradings, and a row recorded after R.
+    states = {f["name"]: f["expect"]["state"] for f in fixtures}
+    assert {states[n] for n in states if n.startswith("pair A")} == {"NOT_ASSESSED", "UNAVAILABLE"}
+    assert {states[n] for n in states if n.startswith("pair B")} == {"NOT_ASSESSED", "UNAVAILABLE"}
+    assert "NOT_VISIBLE" in states.values()
 
 
 def test_pending_and_unknown_never_enter_the_matured_denominator(lineage: dict) -> None:
     rules = lineage["derivation"]
     read_at = datetime.fromisoformat(rules["read_at"])
     denominator = set(rules["matured_denominator"])
-    assert {"PENDING", "UNMEASURABLE", "UNKNOWN"}.isdisjoint(denominator)
+    separate = set(rules["separate_counts"])
+    assert denominator == {"CONFIRMED", "REFUTED", "PARTIAL", "UNAVAILABLE"}
+    assert separate.isdisjoint(denominator)
     for fixture in rules["fixtures"]:
         got = derive(fixture, rules, read_at)
-        assert (got["state"] in denominator) == (got["maturity"] == "MATURE"
-                                                 and got["data"] not in {"NOT_GRADABLE", "UNKNOWN_CAUSE"}), fixture["name"]
+        # Every derived state is either in the denominator or has its own count; nothing falls between.
+        assert got["state"] in denominator | separate, fixture["name"]
+        visible = datetime.fromisoformat(fixture["run_visible_at"]) <= read_at
+        assessed = (got["data"] == "PRESENT" or fixture["horizon_end"] is None
+                    or datetime.fromisoformat(fixture["graded_at"]) >= datetime.fromisoformat(fixture["horizon_end"]))
+        expected_in = (visible and assessed and got["maturity"] == "MATURE"
+                       and got["data"] not in {"NOT_GRADABLE", "UNKNOWN_CAUSE"})
+        assert (got["state"] in denominator) == expected_in, fixture["name"]
 
 
 def test_root_cause_prefixes_are_the_graders_own(lineage: dict) -> None:

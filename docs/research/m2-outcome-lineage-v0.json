@@ -293,8 +293,11 @@
       "contains": "def cofiring("
     }
   ],
-  "revision": 2,
-  "answers_review": "GRID #1413 review 6033027329 at 393cde73",
+  "revision": 3,
+  "answers_review": [
+    "GRID #1413 review 6033027329 at 393cde73",
+    "GRID #1413 review 6033670709 at 4aa18aee"
+  ],
   "derivation": {
     "note": "Executable form of doc section 2.2; tests/test_m2_outcome_lineage_map.py applies these rules to the fixtures.",
     "maturity": [
@@ -339,9 +342,11 @@
     "states": {
       "resolved": "MATURE + PRESENT -> verdict state",
       "PENDING": "IMMATURE, any data value",
-      "UNAVAILABLE": "MATURE + MISSING_BASELINE | MISSING_ENDPOINT | UNUSABLE_ENDPOINT | NO_SOURCE",
+      "UNAVAILABLE": "MATURE + graded_at >= horizon_end + MISSING_BASELINE | MISSING_ENDPOINT | UNUSABLE_ENDPOINT | NO_SOURCE",
       "UNMEASURABLE": "NO_HORIZON or NOT_GRADABLE",
-      "UNKNOWN": "UNKNOWN_CAUSE"
+      "UNKNOWN": "UNKNOWN_CAUSE",
+      "NOT_ASSESSED": "MATURE, not resolved, graded_at < horizon_end",
+      "NOT_VISIBLE": "run ingested_at > R"
     },
     "matured_denominator": [
       "CONFIRMED",
@@ -361,7 +366,9 @@
           "maturity": "IMMATURE",
           "data": "AWAITING_ENDPOINT",
           "state": "PENDING"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "due horizon, endpoint close missing",
@@ -373,7 +380,9 @@
           "maturity": "MATURE",
           "data": "MISSING_ENDPOINT",
           "state": "UNAVAILABLE"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "missing baseline graded before maturity",
@@ -385,7 +394,9 @@
           "maturity": "IMMATURE",
           "data": "MISSING_BASELINE",
           "state": "PENDING"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "missing baseline after maturity",
@@ -397,7 +408,9 @@
           "maturity": "MATURE",
           "data": "MISSING_BASELINE",
           "state": "UNAVAILABLE"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "unusable endpoint",
@@ -409,7 +422,9 @@
           "maturity": "MATURE",
           "data": "UNUSABLE_ENDPOINT",
           "state": "UNAVAILABLE"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "resolved confirmed",
@@ -421,7 +436,9 @@
           "maturity": "MATURE",
           "data": "PRESENT",
           "state": "CONFIRMED"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "resolved refuted",
@@ -433,7 +450,9 @@
           "maturity": "MATURE",
           "data": "PRESENT",
           "state": "REFUTED"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "resolved partially confirmed",
@@ -445,7 +464,9 @@
           "maturity": "MATURE",
           "data": "PRESENT",
           "state": "PARTIAL"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "causal claim, no horizon",
@@ -457,7 +478,9 @@
           "maturity": "NO_HORIZON",
           "data": "NOT_GRADABLE",
           "state": "UNMEASURABLE"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "alias level",
@@ -469,7 +492,9 @@
           "maturity": "NO_HORIZON",
           "data": "NOT_GRADABLE",
           "state": "UNMEASURABLE"
-        }
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
       },
       {
         "name": "unrecognised unscorable cause",
@@ -481,8 +506,91 @@
           "maturity": "NO_HORIZON",
           "data": "UNKNOWN_CAUSE",
           "state": "UNKNOWN"
+        },
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00"
+      },
+      {
+        "name": "pair A1: unresolved graded before the horizon, read after it",
+        "verdict": "unresolved",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-17T11:35:00+00:00",
+        "run_visible_at": "2026-11-17T11:36:00+00:00",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "MISSING_ENDPOINT",
+          "state": "NOT_ASSESSED"
+        }
+      },
+      {
+        "name": "pair A2: unresolved graded after the horizon (same cause)",
+        "verdict": "unresolved",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "MISSING_ENDPOINT",
+          "state": "UNAVAILABLE"
+        }
+      },
+      {
+        "name": "pair B1: missing baseline graded before the horizon, read after it",
+        "verdict": "unscorable",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": "no usable TIINGO close for SPY on 2026-11-14",
+        "graded_at": "2026-11-15T11:35:00+00:00",
+        "run_visible_at": "2026-11-15T11:36:00+00:00",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "MISSING_BASELINE",
+          "state": "NOT_ASSESSED"
+        }
+      },
+      {
+        "name": "pair B2: missing baseline graded after the horizon (same cause)",
+        "verdict": "unscorable",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": "no usable TIINGO close for SPY on 2026-11-14",
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run_visible_at": "2026-11-19T11:36:00+00:00",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "MISSING_BASELINE",
+          "state": "UNAVAILABLE"
+        }
+      },
+      {
+        "name": "recorded after R",
+        "verdict": "refuted",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": "SPY moved -1.20% ...",
+        "graded_at": "2026-11-20T11:35:00+00:00",
+        "run_visible_at": "2026-11-20T11:36:00+00:00",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "NOT_VISIBLE"
         }
       }
+    ],
+    "run_clocks": {
+      "visible": "ingested_at <= R, else NOT_VISIBLE",
+      "assessed": "non-resolved MATURE row needs graded_at >= horizon_end, else NOT_ASSESSED"
+    },
+    "separate_counts": [
+      "PENDING",
+      "NOT_ASSESSED",
+      "UNMEASURABLE",
+      "UNKNOWN",
+      "NOT_VISIBLE"
     ]
   },
   "binding_values": [

@@ -4,8 +4,8 @@ Issue: [#960](https://github.com/3pacs/GRID/issues/960). Milestone: M2, "Evidenc
 Machine-readable companion: [`m2-outcome-lineage-v0.json`](m2-outcome-lineage-v0.json). The companion is held to
 the code by `tests/test_m2_outcome_lineage_map.py`.
 
-**Status: DRAFT v0, revision 2** (answers the reviewer's HOLD 6033027329 on revision 1, `393cde73`; the change map
-is §7). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
+**Status: DRAFT v0, revision 3** (answers the reviewer's HOLDs 6033027329 on `393cde73` and 6033670709 on
+`4aa18aee`; the change maps are §7 and §8). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
 scoring or learning, evaluation run, DDL, historical rewrite, promotion or trading action. Only the research owner
 can adopt it, and only after the independent reviewer's pass (§6). Adoption is a separate commit that pins this
 file's hash. The D0 contract ([#1129](https://github.com/3pacs/GRID/issues/1129), draft PR #1142) is the first
@@ -60,7 +60,14 @@ The grader's `verdict` mixes three questions, so a study must not read it alone:
   matured denominator.
 
 A study therefore derives three axes for each row, at a fixed read instant `R` (the study's own, recorded at S1),
-and only then assigns a protocol state.
+and only then assigns a protocol state. Two clocks of the row's run decide whether the row can be used at all:
+
+- **Visible by R.** The row's `publication_review_runs.ingested_at` must be ≤ `R`. A row recorded after `R` is
+  `NOT_VISIBLE`: excluded from every count except its own, and never read.
+- **Assessed after the horizon.** Only a grading made at or after the horizon can say an endpoint, or any other input,
+  was missing at maturity. A non-resolved row whose run `graded_at` < `horizon_end` is `NOT_ASSESSED` once the
+  horizon passes. That means matured but not graded at maturity. It is never `UNAVAILABLE`, and the study waits for
+  the superseding run graded after the horizon.
 
 **Maturity**, from `horizon_end` and `R`:
 
@@ -90,12 +97,16 @@ fixed `root_cause` prefixes, and anything it does not recognise is `UNKNOWN_CAUS
 |---|---|---|
 | `CONFIRMED` / `REFUTED` / `PARTIAL` | `MATURE`, `PRESENT` | yes |
 | `PENDING` | `IMMATURE`, any data value, including `MISSING_BASELINE`, which is known before maturity | no. It is never read as a negative. |
-| `UNAVAILABLE` | `MATURE` with `MISSING_BASELINE`, `MISSING_ENDPOINT`, `UNUSABLE_ENDPOINT` or `NO_SOURCE` | yes, as a non-success. It is never dropped. |
+| `NOT_ASSESSED` | `MATURE`, not resolved, run `graded_at` < `horizon_end` | no; reported beside the result |
+| `UNAVAILABLE` | `MATURE`, run `graded_at` ≥ `horizon_end`, with `MISSING_BASELINE`, `MISSING_ENDPOINT`, `UNUSABLE_ENDPOINT` or `NO_SOURCE` | yes, as a non-success. It is never dropped. |
 | `UNMEASURABLE` | `NO_HORIZON`, or `NOT_GRADABLE` | no; reported beside the result |
-| `UNKNOWN` | `UNKNOWN_CAUSE`, at any maturity (checked first) | no; reported beside the result, and a non-zero count is a grader-owner defect |
+| `UNKNOWN` | `UNKNOWN_CAUSE`, at any maturity (checked after visibility) | no; reported beside the result, and a non-zero count is a grader-owner defect |
+| `NOT_VISIBLE` | run `ingested_at` > `R` (checked first) | no; counted on its own line |
 
-A matured rate's denominator is every `MATURE` row (resolved plus `UNAVAILABLE`). The rate is reported with the
-`UNAVAILABLE`, `PENDING`, `UNMEASURABLE` and `UNKNOWN` counts next to it. The companion JSON carries one fixture
+A matured rate's denominator is the **visible, assessed, gradable, mature** rows: `CONFIRMED`, `REFUTED`, `PARTIAL`
+and `UNAVAILABLE`, and nothing else. Every other state has its own count, shown next to the rate: `PENDING`,
+`NOT_ASSESSED`, `UNMEASURABLE` (a mature `NOT_GRADABLE` row included), `UNKNOWN` and `NOT_VISIBLE`. None of these
+can pass as observed missing data. The companion JSON carries one fixture
 per derivation rule; the test applies the rules to those fixtures, as the executable form of this table.
 
 ### 2.3 Lineage gaps (each blocks only what it names)
@@ -226,4 +237,12 @@ days (rule 2.4.4). The pending, unavailable and unmeasurable counts are always s
 | (2) Dated close evidence is an observation date, not vintage availability; separate production enforcement, fixture-only checks, operator policy and missing bindings per stage | Link O is now `PARTIAL`, and new gap L7 covers outcome-vintage lineage. Each stage in §3 has a "Binding today" column (`ENFORCED` / `CI_GATE` / `FIXTURE_ONLY` / `POLICY` / `MISSING`). |
 | (3) Highest observed t is an outcome-selected representative | §3.1: an outcome-independent representative is chosen at S1, or the selection is accounted for with a max-statistic cluster null plus a separate frozen forward check; otherwise the result is exploratory. |
 | (4) An absent successor is a negative only on a mature window with verified coverage | §3.2: `BROKEN_LINK` requires a matured window and receipted coverage; otherwise the link is `LINK_PENDING` or `LINK_UNOBSERVABLE`. |
+
+## 8. Revision 3 change map (answers HOLD 6033670709 on `4aa18aee`)
+
+| Reviewer point | Change |
+|---|---|
+| Endpoint-missing came from the study's later read clock `R`, without requiring that the unresolved verdict was graded at or after the horizon, or that its run was visible by `R` | §2.2 binds two run clocks. A row is used only if `ingested_at` ≤ `R` (otherwise `NOT_VISIBLE`). A non-resolved mature row counts as `UNAVAILABLE` only if its run's `graded_at` ≥ `horizon_end`; otherwise it is `NOT_ASSESSED`. |
+| The denominator prose (every mature claim) disagreed with the fixtures (which excluded mature `NOT_GRADABLE` / `UNKNOWN_CAUSE`) | The prose now names exactly the four states in the denominator and lists each excluded state's own count. The JSON `matured_denominator` and the test agree with it. |
+| Add paired pre-/post-horizon cases with the same cause, and a recorded-after-`R` case | Fixtures: unresolved graded before vs after the horizon; missing baseline graded before vs after the horizon, both read after it; one row whose run was ingested after `R`. |
 
