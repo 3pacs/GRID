@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import ConfidenceMeter from '../components/ConfidenceMeter.jsx';
@@ -109,6 +109,13 @@ function MoverCard({ feature, family, change_pct, latest }) {
 
 export default function Regime() {
     const { currentRegime, setCurrentRegime } = useStore();
+    const regimeRef = useRef(currentRegime);
+    regimeRef.current = currentRegime;
+    const [regimeReadFailure, setRegimeReadFailure] = useState(null);
+    // Mount and REFRESH reads can overlap. A result is applied only if it is the
+    // newest read and the store still holds the regime it started from, so a
+    // late older result never overwrites, clears or stale-marks newer state.
+    const regimeGenRef = useRef(0);
     const [allRegimes, setAllRegimes] = useState(null);
     const [synthesis, setSynthesis] = useState(null);
     const [synthLoading, setSynthLoading] = useState(false);
@@ -118,13 +125,22 @@ export default function Regime() {
     const [activeStrategy, setActiveStrategy] = useState(null);
 
     const { data, loading, error, refetch: loadData } = useAsyncData(async () => {
+        const token = { gen: ++regimeGenRef.current, before: regimeRef.current };
         const [current, all, hist, trans] = await Promise.all([
-            api.getCurrent(),
+            api.getCurrent({ force: true }),
             api.getAllActiveRegimes(),
             api.getHistory(90),
             api.getTransitions(),
         ]);
-        if (current) {
+        const newest = token.gen === regimeGenRef.current && regimeRef.current === token.before;
+        if (!newest) return { current, all, hist, trans, superseded: true };
+        // api._fetch resolves failures to {error: true}; never store that as the regime.
+        // The store keeps the previous read, so record that this read failed.
+        if (!(current && !current.error)) {
+            setRegimeReadFailure({ regime: token.before, at: new Date() });
+        }
+        if (current && !current.error) {
+            setRegimeReadFailure(null);
             setCurrentRegime(current);
             // Fetch the strategy for the current regime
             const strat = await api.getStrategyForRegime(current.state).catch(() => null);
@@ -143,7 +159,11 @@ export default function Regime() {
         setSynthLoading(false);
     };
 
-    const regime = currentRegime || { state: 'UNCALIBRATED' };
+    // No verified read is not the backend's UNCALIBRATED reply: that one is a real
+    // answer ("no regime row yet"); a cold 503/null is no answer at all.
+    const regime = currentRegime || { state: 'UNAVAILABLE' };
+    const regimeLastKnown = currentRegime != null && regimeReadFailure != null
+        && regimeReadFailure.regime === currentRegime;
     const primaryColor = stateColors[regime.state] || '#5A7080';
     const meta = regimeMeta[regime.state];
     const tabs = ['action', 'macro', 'subtypes', 'analysis', 'movers', 'history'];
@@ -181,7 +201,10 @@ export default function Regime() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
                         <div style={{ fontSize: '10px', color: '#5A7080', letterSpacing: '1px',
-                            fontFamily: "'JetBrains Mono', monospace", marginBottom: '4px' }}>CURRENT</div>
+                            fontFamily: "'JetBrains Mono', monospace", marginBottom: '4px' }}
+                            data-testid="regime-banner-label"
+                            title={regimeLastKnown ? `Latest regime read failed at ${regimeReadFailure.at.toLocaleTimeString()}` : undefined}
+                        >{regimeLastKnown ? 'LAST KNOWN · LATEST READ FAILED' : (currentRegime ? 'CURRENT' : 'NO VERIFIED READ')}</div>
                         <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '22px',
                             fontWeight: 700, color: primaryColor }}>
                             {meta?.icon || ''} {regime.state}
@@ -261,7 +284,14 @@ export default function Regime() {
 
             {/* Transition risk */}
             <div style={{ marginBottom: '14px' }}>
-                <TransitionGauge probability={regime.transition_probability || 0} horizon="shift risk" />
+                {/* UNCALIBRATED carries 0.0 placeholders from regime.py, not a measured 0 % risk. */}
+                {regime.state !== 'UNCALIBRATED' && typeof regime.transition_probability === 'number'
+                    ? <TransitionGauge probability={regime.transition_probability} horizon="shift risk" />
+                    : (
+                        <div data-testid="shift-risk-unavailable" style={{ fontSize: '12px', color: '#5A7080', padding: '10px 4px' }}>
+                            Shift risk: no regime reading yet{regime.baseline_comparison ? ` — ${regime.baseline_comparison}` : ''}
+                        </div>
+                    )}
             </div>
 
             {/* Tabs */}

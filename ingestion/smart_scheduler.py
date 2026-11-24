@@ -1413,7 +1413,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env",
      "hold_reason": "Retired 2026-11-08 (owner): the Tiingo plan covers only the DOW 30 (89 of 138 tickers refused); market cap and shares come from sec_xbrl_shares (ticker_metrics_daily) for the full universe"},
-    {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
+    {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 240, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},  # 10 endpoints take 84-124 s; 120 s failed 5 of 13 runs (2026-11-19..23) that then finished and stored their rows
 
     # ── Crypto (DexScreener) ──
     # PumpFun is deliberately not registered (E1-V3): the entry named a

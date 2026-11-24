@@ -5,6 +5,7 @@
   "gex_state_url": "http://127.0.0.1:8769/api/state",
   "desk_health_dir": "/data/agent-home/anikdang/desk-health-data",
   "desk_evening_dir": "/data/agent-home/anikdang/desk-evening-data",
+  "desk_state_db": "/data/agent-home/anikdang/desk-state-data/state.db",
   "receipts_dir": "/data/grid_ledgers/desk-receipts",
   "factory": {
     "panel": "/data/agent-home/anikdang/gex-signals-data/panel.json",

@@ -40,21 +40,52 @@ def _easter_sunday(year: int) -> date:
     return date(year, month, day + 1)
 
 
-@lru_cache(maxsize=16)
+#: MLK Day became an NYSE holiday in 1998; before that the third Monday of
+#: January was an ordinary session.
+MLK_FIRST_YEAR = 1998
+#: Juneteenth became an NYSE holiday in 2022; before that June 19 (and its
+#: weekday observance) was an ordinary session.
+JUNETEENTH_FIRST_YEAR = 2022
+
+#: One-off NYSE weekday closures since 1985 that no recurring rule produces.
+#: Every date from 2007-11-01 on is cross-checked against the pinned
+#: exchange_calendars XNYS manifests in ``docs/reference/calendar-manifests``
+#: (``tests/test_market_calendar_history.py``).
+SPECIAL_CLOSURES: dict[date, str] = {
+    date(1985, 9, 27): "Hurricane Gloria",
+    date(1994, 4, 27): "Day of mourning, President Nixon",
+    date(2001, 9, 11): "September 11 attacks",
+    date(2001, 9, 12): "September 11 attacks",
+    date(2001, 9, 13): "September 11 attacks",
+    date(2001, 9, 14): "September 11 attacks",
+    date(2004, 6, 11): "Day of mourning, President Reagan",
+    date(2007, 1, 2): "Day of mourning, President Ford",
+    date(2012, 10, 29): "Hurricane Sandy",
+    date(2012, 10, 30): "Hurricane Sandy",
+    date(2018, 12, 5): "Day of mourning, President G. H. W. Bush",
+    date(2025, 1, 9): "Day of mourning, President Carter",
+}
+
+
+@lru_cache(maxsize=64)
 def market_holidays(year: int) -> set[date]:
     """Return the set of NYSE/NASDAQ market holidays for a given year.
 
     Covers all standard US market closures:
     - New Year's Day (Jan 1, or observed)
-    - MLK Day (3rd Monday in Jan)
+    - MLK Day (3rd Monday in Jan, from 1998)
     - Presidents' Day (3rd Monday in Feb)
     - Good Friday (Friday before Easter)
     - Memorial Day (last Monday in May)
-    - Juneteenth (Jun 19, or observed)
+    - Juneteenth (Jun 19, or observed, from 2022)
     - Independence Day (Jul 4, or observed)
     - Labor Day (1st Monday in Sep)
     - Thanksgiving (4th Thursday in Nov)
     - Christmas Day (Dec 25, or observed)
+
+    plus the one-off closures in ``SPECIAL_CLOSURES`` that fall in ``year``.
+    The rules are checked from 1985 on; earlier years get the modern rules
+    and may be wrong.
     """
     holidays: set[date] = set()
 
@@ -84,8 +115,9 @@ def market_holidays(year: int) -> set[date]:
     # New Year's Day
     holidays.add(_observed(date(year, 1, 1)))
 
-    # MLK Day — 3rd Monday in January
-    holidays.add(_nth_weekday(year, 1, 0, 3))
+    # MLK Day — 3rd Monday in January (NYSE holiday from 1998)
+    if year >= MLK_FIRST_YEAR:
+        holidays.add(_nth_weekday(year, 1, 0, 3))
 
     # Presidents' Day — 3rd Monday in February
     holidays.add(_nth_weekday(year, 2, 0, 3))
@@ -97,8 +129,9 @@ def market_holidays(year: int) -> set[date]:
     # Memorial Day — last Monday in May
     holidays.add(_last_weekday(year, 5, 0))
 
-    # Juneteenth — June 19
-    holidays.add(_observed(date(year, 6, 19)))
+    # Juneteenth — June 19 (NYSE holiday from 2022)
+    if year >= JUNETEENTH_FIRST_YEAR:
+        holidays.add(_observed(date(year, 6, 19)))
 
     # Independence Day — July 4
     holidays.add(_observed(date(year, 7, 4)))
@@ -112,6 +145,7 @@ def market_holidays(year: int) -> set[date]:
     # Christmas — December 25
     holidays.add(_observed(date(year, 12, 25)))
 
+    holidays.update(d for d in SPECIAL_CLOSURES if d.year == year)
     return holidays
 
 

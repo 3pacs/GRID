@@ -15,8 +15,9 @@
 #   sudo install -D -m 0644 deploy/python314/dropins/grid-market-state-provisional.service.d-py314.conf \
 #        /etc/systemd/system/grid-market-state-provisional.service.d/py314.conf   # Python 3.14, like grid-market-state
 #   sudo systemctl daemon-reload && sudo systemctl enable --now grid-market-state-provisional.timer
-# The writer refuses with exit 2 before the session's close in the pinned XNYS calendar and on a day that is not a
-# session (a weekday holiday): on those days this unit ends failed, and that is expected. It never runs with
+# The writer refuses with exit 2 before the session's close in the pinned XNYS calendar and outside its pinned parts.
+# On a day that is not a session (a weekday market holiday) it writes nothing, logs outcome not_a_session and exits
+# 0, so this unit ends successfully on a holiday. It never runs with
 # --from/--to, --as-of or --require-target-dealer. A rerun for the same session leaves the stored row as it is.
 [Unit]
 Description=GRID provisional market-state record at the close (display only, never read by a decision path)

@@ -351,6 +351,8 @@ class TestIdempotentRetry:
             "layer": "REGIME",
             "proposed_metric": "sharpe",
             "proposed_threshold": 0.5,
+            "target_feature_id": 1,
+            "predict_fn": lambda features: features.iloc[:, 0] * 0.0 + 1.0,
         }
 
         import psycopg2

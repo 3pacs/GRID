@@ -100,6 +100,10 @@ def on_signal_fired(evt: "SignalFired", *, engine: "Engine") -> None:
 
     try:
         with engine.begin() as conn:
+            # Provisional rows are pinned to the oldest model_registry row because
+            # emitters carry no model_version_id; validation/gates.py no longer
+            # trusts this count alone (it requires OOS evidence per model version).
+            # Fix when emitters carry the id.
             mv_row = conn.execute(
                 text(
                     "SELECT id FROM model_registry "
