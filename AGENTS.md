@@ -1092,6 +1092,8 @@ What merged:
   unit**; the two `td_backfill_*` scripts and their units are unchanged.
 - **#1411 `0d0c4b9c`.** Sidecar: BKH renamed to HZN; KPTI, GWHT and GWH
   delisted; ROKU acquired.
+- **#1412 `c4c49c11`** (merged 04:01Z on 11-24, after the set). Removes an
+  unrelated OCC memo from the BKH note. Text only; no status or date change.
 
 Production, 2026-11-24:
 
@@ -1114,7 +1116,6 @@ Open:
 - etf_flows timeout: measure a full run on #1409 before raising it.
 - Twelve Data cutover is held: the dry run must first compare expected
   completed sessions with fillable dates for both cohorts.
-- #1412 (BKH note correction) is open.
 - Not fixed: Wikipedia pageviews 429s; the MarketWatch feed moved; three other
   GDELT DOC API callers; GLEN, US, WSE, RVI, ANT, AIOK and VFIAX are not served
   by Tiingo.
