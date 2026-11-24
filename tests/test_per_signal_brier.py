@@ -15,9 +15,11 @@ from features.per_signal_brier import (
     MIN_CALIBRATED_SAMPLES,
     SignalScorecard,
     _canonical_horizon,
+    _reset_skipped_live_update_counts,
     compute_conviction_weight,
     get_full_scorecard_table,
     get_signal_scorecard,
+    get_skipped_live_update_counts,
     rank_signals_by_horizon,
     record_scored_prediction,
 )
@@ -101,6 +103,27 @@ class _FakeEngine:
         self.store: dict[tuple[str, int], dict] = {}
         self._ddl_seen: list[str] = []
 
+    def seed_row(
+        self,
+        source: str,
+        horizon_days: int,
+        *,
+        scored_count: int,
+        running_brier: float,
+        running_ece: float = 0.0,
+        hit_count: int = 0,
+        last_updated: datetime | None = None,
+    ) -> None:
+        self.store[(source, int(horizon_days))] = {
+            "signal_source": source,
+            "horizon_days": int(horizon_days),
+            "scored_count": int(scored_count),
+            "running_brier": float(running_brier),
+            "running_ece": float(running_ece),
+            "hit_count": int(hit_count),
+            "last_updated": last_updated or datetime.now(timezone.utc),
+        }
+
     def begin(self) -> "_FakeEngine._Ctx":
         return _FakeEngine._Ctx(self)
 
@@ -162,17 +185,23 @@ class _FakeEngine:
                     )
                 )
 
+            if sql.startswith("DELETE FROM per_signal_brier_history"):
+                keys = sorted(self.parent.store)
+                self.parent.store.clear()
+                return _FakeResult(fetchall_value=keys)
+
             if sql.startswith("INSERT INTO per_signal_brier_history"):
                 key = (params["s"], int(params["h"]))
-                if key in self.parent.store:
+                if key in self.parent.store and "DO NOTHING" in sql:
                     return MagicMock()
-                # Mirror SQL ``COALESCE(:scored_at, NOW())`` — backdated
-                # value wins when provided, else fall back to wall clock.
                 stamp = params.get("scored_at") or datetime.now(timezone.utc)
+                existing = self.parent.store.get(key)
+                if existing is not None and existing.get("last_updated") is not None and stamp < existing["last_updated"]:
+                    stamp = existing["last_updated"]
                 self.parent.store[key] = {
                     "signal_source": params["s"],
                     "horizon_days": int(params["h"]),
-                    "scored_count": 1,
+                    "scored_count": int(params.get("n", 1)),
                     "running_brier": float(params["b"]),
                     "running_ece": float(params["e"]),
                     "hit_count": int(params["hit"]),
@@ -184,7 +213,6 @@ class _FakeEngine:
                 key = (params["s"], int(params["hz"]))
                 if key not in self.parent.store:
                     return MagicMock()
-                # Mirror SQL ``GREATEST(last_updated, COALESCE(:scored_at, NOW()))``.
                 proposed = params.get("scored_at") or datetime.now(timezone.utc)
                 existing = self.parent.store[key].get("last_updated")
                 if existing is not None and proposed < existing:
@@ -232,6 +260,7 @@ def _row_tuple(d: dict) -> tuple:
 
 class TestRecordScoredPrediction:
     def test_empty_contributions_noop(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
         updates = record_scored_prediction(
             engine,
@@ -242,88 +271,57 @@ class TestRecordScoredPrediction:
         )
         assert updates == {}
         assert engine.store == {}
+        assert get_skipped_live_update_counts() == {}
 
-    def test_single_signal_first_insert(self):
+    def test_live_path_skips_new_and_existing_without_inserting_count1(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
         updates = record_scored_prediction(
             engine,
             horizon_days=7,
             confidence=0.7,
-            outcome=1.0,  # hit
+            outcome=1.0,
             signal_contributions={"jodi_oil": 1.0},
         )
-        assert "jodi_oil" in updates
-        assert updates["jodi_oil"]["scored_count"] == 1
-        # squared error weighted by 1.0 = (0.7-1.0)^2 = 0.09
-        assert abs(updates["jodi_oil"]["running_brier"] - 0.09) < 1e-9
+        assert updates == {}
+        assert ("jodi_oil", 7) not in engine.store
+        assert get_skipped_live_update_counts() == {("jodi_oil", 7): 1}
 
-    def test_multi_signal_proportional_attribution(self):
+    def test_multi_signal_skips_and_counts_each_contributor(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
-        # 60/40 split, big error so differences are visible
         updates = record_scored_prediction(
             engine,
             horizon_days=7,
             confidence=0.2,
-            outcome=1.0,  # hit but low confidence — squared error = 0.64
+            outcome=1.0,
             signal_contributions={"sge_premium": 0.6, "reddit_options_pulse": 0.4},
         )
-        assert abs(updates["sge_premium"]["running_brier"] - 0.64 * 0.6) < 1e-9
-        assert abs(updates["reddit_options_pulse"]["running_brier"] - 0.64 * 0.4) < 1e-9
+        assert updates == {}
+        assert engine.store == {}
+        assert get_skipped_live_update_counts() == {
+            ("sge_premium", 7): 1,
+            ("reddit_options_pulse", 7): 1,
+        }
 
-    def test_welford_running_average(self):
+    def test_existing_row_is_never_mutated_without_weight_sum_column(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
-        # First: conf=0.7, outcome=1.0 → err=0.09
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"jodi_oil": 1.0},
-        )
-        # Second: conf=0.8, outcome=0.0 → err=0.64
-        record_scored_prediction(
+        engine.seed_row("jodi_oil", 7, scored_count=25, running_brier=0.09, hit_count=20)
+        before = dict(engine.store[("jodi_oil", 7)])
+        updates = record_scored_prediction(
             engine,
             horizon_days=7,
             confidence=0.8,
             outcome=0.0,
             signal_contributions={"jodi_oil": 1.0},
         )
-        row = engine.store[("jodi_oil", 7)]
-        assert row["scored_count"] == 2
-        # Running mean of {0.09, 0.64} = 0.365
-        assert abs(row["running_brier"] - 0.365) < 1e-6
+        assert updates == {}
+        assert engine.store[("jodi_oil", 7)] == before
+        assert get_skipped_live_update_counts() == {("jodi_oil", 7): 1}
 
-    def test_directional_hit_counter(self):
-        engine = _FakeEngine()
-        # conf >= 0.5 AND outcome >= 0.5 → hit
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.8,
-            outcome=1.0,
-            signal_contributions={"jodi_oil": 1.0},
-        )
-        # conf < 0.5 AND outcome < 0.5 → hit (correctly bearish)
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.3,
-            outcome=0.0,
-            signal_contributions={"jodi_oil": 1.0},
-        )
-        # conf >= 0.5 AND outcome < 0.5 → miss
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.7,
-            outcome=0.0,
-            signal_contributions={"jodi_oil": 1.0},
-        )
-        row = engine.store[("jodi_oil", 7)]
-        assert row["hit_count"] == 2
-        assert row["scored_count"] == 3
-
-    def test_horizon_snapping(self):
+    def test_horizon_snapping_in_skip_counter(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
         # horizon=10 should snap to 7
         record_scored_prediction(
@@ -333,10 +331,11 @@ class TestRecordScoredPrediction:
             outcome=1.0,
             signal_contributions={"jodi_oil": 1.0},
         )
-        assert ("jodi_oil", 7) in engine.store
-        assert ("jodi_oil", 10) not in engine.store
+        assert engine.store == {}
+        assert get_skipped_live_update_counts() == {("jodi_oil", 7): 1}
 
-    def test_zero_weight_skipped(self):
+    def test_zero_weight_not_counted_as_skip(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
         updates = record_scored_prediction(
             engine,
@@ -345,8 +344,10 @@ class TestRecordScoredPrediction:
             outcome=1.0,
             signal_contributions={"jodi_oil": 0.0, "sge_premium": 1.0},
         )
-        assert "jodi_oil" not in updates
-        assert "sge_premium" in updates
+        assert updates == {}
+        counts = get_skipped_live_update_counts()
+        assert ("jodi_oil", 7) not in counts
+        assert counts[("sge_premium", 7)] == 1
 
 
 # ── get_signal_scorecard ─────────────────────────────────────────────────
@@ -359,13 +360,7 @@ class TestGetSignalScorecard:
 
     def test_cold_start_not_calibrated(self):
         engine = _FakeEngine()
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"jodi_oil": 1.0},
-        )
+        engine.seed_row("jodi_oil", 7, scored_count=1, running_brier=0.09, hit_count=1)
         card = get_signal_scorecard(engine, "jodi_oil", 7)
         assert card is not None
         assert card.scored_count == 1
@@ -374,15 +369,13 @@ class TestGetSignalScorecard:
 
     def test_calibrated_with_good_brier_gets_high_conviction(self):
         engine = _FakeEngine()
-        # Seed MIN_CALIBRATED_SAMPLES predictions with ~perfect accuracy
-        for _ in range(MIN_CALIBRATED_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,  # weighted brier = 0.01
-                signal_contributions={"jodi_oil": 1.0},
-            )
+        engine.seed_row(
+            "jodi_oil",
+            7,
+            scored_count=MIN_CALIBRATED_SAMPLES,
+            running_brier=0.01,
+            hit_count=MIN_CALIBRATED_SAMPLES,
+        )
         card = get_signal_scorecard(engine, "jodi_oil", 7)
         assert card is not None
         assert card.is_calibrated is True
@@ -391,14 +384,13 @@ class TestGetSignalScorecard:
 
     def test_calibrated_with_bad_brier_gets_zero_conviction(self):
         engine = _FakeEngine()
-        for _ in range(MIN_CALIBRATED_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=0.0,  # squared error = 0.81
-                signal_contributions={"jodi_oil": 1.0},
-            )
+        engine.seed_row(
+            "jodi_oil",
+            7,
+            scored_count=MIN_CALIBRATED_SAMPLES,
+            running_brier=0.81,
+            hit_count=0,
+        )
         card = get_signal_scorecard(engine, "jodi_oil", 7)
         assert card is not None
         assert card.is_calibrated is True
@@ -414,24 +406,20 @@ class TestRanking:
 
     def test_sorted_best_first(self):
         engine = _FakeEngine()
-        # Good signal
-        for _ in range(MIN_CALIBRATED_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"jodi_oil": 1.0},
-            )
-        # Bad signal
-        for _ in range(MIN_CALIBRATED_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=0.0,
-                signal_contributions={"reddit_options_pulse": 1.0},
-            )
+        engine.seed_row(
+            "jodi_oil",
+            7,
+            scored_count=MIN_CALIBRATED_SAMPLES,
+            running_brier=0.01,
+            hit_count=MIN_CALIBRATED_SAMPLES,
+        )
+        engine.seed_row(
+            "reddit_options_pulse",
+            7,
+            scored_count=MIN_CALIBRATED_SAMPLES,
+            running_brier=0.81,
+            hit_count=0,
+        )
         ranked = rank_signals_by_horizon(engine, 7)
         assert len(ranked) == 2
         assert ranked[0].signal_source == "jodi_oil"  # best first
@@ -440,15 +428,7 @@ class TestRanking:
 
     def test_min_samples_filter(self):
         engine = _FakeEngine()
-        # Only 5 samples — below default MIN_CALIBRATED_SAMPLES
-        for _ in range(5):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"jodi_oil": 1.0},
-            )
+        engine.seed_row("jodi_oil", 7, scored_count=5, running_brier=0.01, hit_count=5)
         # Default threshold hides it
         assert rank_signals_by_horizon(engine, 7) == []
         # min_samples=0 shows cold-start
@@ -457,20 +437,8 @@ class TestRanking:
 
     def test_full_scorecard_table_returns_all_sources(self):
         engine = _FakeEngine()
-        record_scored_prediction(
-            engine,
-            horizon_days=1,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"sge_premium": 1.0},
-        )
-        record_scored_prediction(
-            engine,
-            horizon_days=30,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"jodi_oil": 1.0},
-        )
+        engine.seed_row("sge_premium", 1, scored_count=1, running_brier=0.09, hit_count=1)
+        engine.seed_row("jodi_oil", 30, scored_count=1, running_brier=0.09, hit_count=1)
         table = get_full_scorecard_table(engine)
         sources = {c.signal_source for c in table}
         assert sources == {"sge_premium", "jodi_oil"}
@@ -503,23 +471,87 @@ class TestScorecardDataclass:
         assert d["is_calibrated"] is True
 
 
-# ── record_scored_prediction: backdated last_updated ──────────────────────
+# ── Backdated last_updated on bootstrap write path ────────────────────────
 
 
 class TestRecordScoredPredictionBackdated:
-    """The bootstrap replays historical predictions in chronological order.
-    Walk-forward audits later filter scorecards by ``last_updated <= as_of``
-    to prevent lookahead leak. If the bootstrap stamps every row with NOW(),
-    every historical replay sees zero scorecards (the substrate is invisible
-    to the very replay it was built for). The ``scored_at`` parameter
-    backdates the per-bucket ``last_updated`` to when the prediction was
-    actually scored against reality so the substrate becomes consumable.
+    """The bootstrap replays historical predictions in chronological order and
+    backdates ``last_updated`` to the latest ``scored_at`` so walk-forward
+    audits filtering ``last_updated <= as_of`` see the scorecards. Live
+    ``record_scored_prediction`` accepts ``scored_at`` without inserting dead
+    count=1 rows.
     """
 
-    def test_insert_uses_scored_at_when_provided(self):
+    def test_bootstrap_insert_uses_scored_at_when_provided(self):
+        from scripts import bootstrap_per_signal_brier as boot
+
         engine = _FakeEngine()
         backdate = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
-        record_scored_prediction(
+        boot._write_bootstrapped_buckets(
+            engine,
+            {
+                ("jodi_oil", 7): {
+                    "scored_count": 20,
+                    "weight_sum": 10.0,
+                    "weighted_brier_sum": 0.9,
+                    "weighted_ece_sum": 3.0,
+                    "hit_count": 20,
+                    "last_updated": backdate,
+                }
+            },
+        )
+        row = engine.store[("jodi_oil", 7)]
+        assert row["last_updated"] == backdate
+
+    def test_bootstrap_insert_defaults_to_now_when_scored_at_none(self):
+        from scripts import bootstrap_per_signal_brier as boot
+
+        engine = _FakeEngine()
+        before = datetime.now(timezone.utc)
+        boot._write_bootstrapped_buckets(
+            engine,
+            {
+                ("jodi_oil", 7): {
+                    "scored_count": 20,
+                    "weight_sum": 10.0,
+                    "weighted_brier_sum": 0.9,
+                    "weighted_ece_sum": 3.0,
+                    "hit_count": 20,
+                    "last_updated": None,
+                }
+            },
+        )
+        after = datetime.now(timezone.utc)
+        stamp = engine.store[("jodi_oil", 7)]["last_updated"]
+        assert before <= stamp <= after
+
+    def test_bootstrap_replacement_stamps_each_bucket_with_its_own_latest_scored_at(self):
+        """Each run replaces the table, so a retired row's timestamp is never carried
+        onto the new row: last_updated is the replayed bucket's latest scored_at."""
+        from scripts import bootstrap_per_signal_brier as boot
+
+        engine = _FakeEngine()
+        older = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        newer = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        latest = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        base_bucket = {
+            "scored_count": 20,
+            "weight_sum": 10.0,
+            "weighted_brier_sum": 0.9,
+            "weighted_ece_sum": 3.0,
+            "hit_count": 20,
+        }
+        boot._write_bootstrapped_buckets(engine, {("jodi_oil", 7): {**base_bucket, "last_updated": newer}})
+        boot._write_bootstrapped_buckets(engine, {("jodi_oil", 7): {**base_bucket, "last_updated": older}})
+        assert engine.store[("jodi_oil", 7)]["last_updated"] == older
+        boot._write_bootstrapped_buckets(engine, {("jodi_oil", 7): {**base_bucket, "last_updated": latest}})
+        assert engine.store[("jodi_oil", 7)]["last_updated"] == latest
+
+    def test_live_record_scored_prediction_accepts_scored_at_and_skips(self):
+        _reset_skipped_live_update_counts()
+        engine = _FakeEngine()
+        backdate = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+        updates = record_scored_prediction(
             engine,
             horizon_days=7,
             confidence=0.7,
@@ -527,55 +559,5 @@ class TestRecordScoredPredictionBackdated:
             signal_contributions={"jodi_oil": 1.0},
             scored_at=backdate,
         )
-        row = engine.store[("jodi_oil", 7)]
-        assert row["last_updated"] == backdate
-
-    def test_insert_defaults_to_now_when_scored_at_none(self):
-        engine = _FakeEngine()
-        before = datetime.now(timezone.utc)
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"jodi_oil": 1.0},
-        )
-        after = datetime.now(timezone.utc)
-        stamp = engine.store[("jodi_oil", 7)]["last_updated"]
-        assert before <= stamp <= after
-
-    def test_update_takes_greatest_of_existing_and_scored_at(self):
-        engine = _FakeEngine()
-        older = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        newer = datetime(2026, 2, 1, tzinfo=timezone.utc)
-        # First call backdates to NEWER (so the bucket carries that)
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"jodi_oil": 1.0},
-            scored_at=newer,
-        )
-        # Second call tries to backdate to OLDER — must not go backwards
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.8,
-            outcome=0.0,
-            signal_contributions={"jodi_oil": 1.0},
-            scored_at=older,
-        )
-        row = engine.store[("jodi_oil", 7)]
-        assert row["last_updated"] == newer
-        # And conversely, when the new scored_at is strictly later, it wins
-        latest = datetime(2026, 3, 1, tzinfo=timezone.utc)
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.6,
-            outcome=1.0,
-            signal_contributions={"jodi_oil": 1.0},
-            scored_at=latest,
-        )
-        assert engine.store[("jodi_oil", 7)]["last_updated"] == latest
+        assert updates == {}
+        assert engine.store == {}

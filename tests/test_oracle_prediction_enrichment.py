@@ -420,18 +420,27 @@ def test_engine_store_writes_normalized_signal_contributions(monkeypatch):
 
 
 def test_per_signal_brier_consumes_engine_written_contributions(monkeypatch):
-    """The row the engine writes feeds the per-signal Brier path unchanged:
-    the bootstrap's Layer 1 picks the nested dict (not the family/aggregate
-    fallbacks) and record_scored_prediction attributes error by share."""
-    from features import per_signal_brier
+    """The row the engine writes feeds the per-signal Brier bootstrap path:
+    Layer 1 picks the nested dict (not the family/aggregate fallbacks) and
+    bootstrap writes the exact weighted Brier without count-dilution."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
     from scripts import bootstrap_per_signal_brier as boot
 
     params = _store_one_fixture_prediction(monkeypatch)
+    now = datetime(2026, 5, 1, tzinfo=timezone.utc)
     row = {
         "id": params["id"],
+        "ticker": "SPY",
+        "created_at": now,
+        "expiry": now + timedelta(days=7),
+        "confidence": 0.7,
+        "verdict": "hit",
         "model_name": params["mn"],
         "signals": params["sig"],  # JSON text, as psycopg returns for ::text
         "signal_contributions": None,
+        "model_weights": None,
+        "scored_at": now + timedelta(days=7),
     }
     contributions = boot.extract_signal_contributions(
         row, oracle_models_lookup={"fixture_model": ["family_a", "family_b"]}
@@ -440,15 +449,15 @@ def test_per_signal_brier_consumes_engine_written_contributions(monkeypatch):
         {"sector_network": 0.5, "timesfm_direction_7d": 0.5}
     )
 
-    updates = per_signal_brier.record_scored_prediction(
-        _RecordingEngine(),
-        horizon_days=7,
-        confidence=0.7,
-        outcome=1.0,
-        signal_contributions=contributions,
-    )
-    assert set(updates) == {"sector_network", "timesfm_direction_7d"}
-    # (0.7 - 1.0)^2 = 0.09, attributed by a 0.5 share each.
-    for source in updates:
-        assert updates[source]["scored_count"] == 1
-        assert updates[source]["running_brier"] == pytest.approx(0.045)
+    rec = _RecordingEngine()
+    with patch.object(boot, "_fetch_scored_predictions", return_value=[row]), patch.object(
+        boot, "_load_oracle_models_lookup", return_value={"fixture_model": ["family_a", "family_b"]}
+    ):
+        boot.replay_predictions(rec, days=30)
+
+    inserts = [p for p in rec.params if "s" in p and "b" in p]
+    assert {p["s"] for p in inserts} == {"sector_network", "timesfm_direction_7d"}
+    # (0.7 - 1.0)^2 = 0.09; weighted mean for N=1 is (w*se)/w == se == 0.09.
+    for p in inserts:
+        assert p["n"] == 1
+        assert p["b"] == pytest.approx(0.09)

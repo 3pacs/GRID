@@ -276,14 +276,28 @@ class TestPredictDisagreementDampening:
         assert result.confidence < 0.6
 
     def test_disagreement_stacks_with_catalyst(self):
+        # 2 bulls + 1 bear at 0.8 → p_up = 0.6. Both dampers scale the edge
+        # over 0.5, so they compound on the edge and never cross 0.5.
+        p = _stub_predictor(["bullish", "bullish", "bearish"])
+        with patch("intelligence.catalyst_aggregator.proximity_score") as ps:
+            ps.return_value = {"score": 1.0, "catalyst_type": "fomc",
+                               "nearest": object(), "days_to_event": 0,
+                               "window_density": 1}
+            result = p.predict("SPY", as_of=datetime(2026, 4, 29, tzinfo=timezone.utc))
+        d = result.disagreement_score
+        assert d > 0.3
+        assert result.catalyst_proximity == 1.0
+        # catalyst-only would be 0.5 + 0.1 × 0.5 = 0.55
+        assert result.confidence == pytest.approx(0.5 + 0.1 * (1 - 0.4 * d) * 0.5, abs=2e-4)
+        assert 0.5 < result.confidence < 0.55
+        assert result.direction == "bullish"
+
+    def test_split_call_is_not_damped_below_a_coin_flip(self):
         p = _stub_predictor(["bullish", "bearish"])
         with patch("intelligence.catalyst_aggregator.proximity_score") as ps:
             ps.return_value = {"score": 1.0, "catalyst_type": "fomc",
                                "nearest": object(), "days_to_event": 0,
                                "window_density": 1}
             result = p.predict("SPY", as_of=datetime(2026, 4, 29, tzinfo=timezone.utc))
-        # Catalyst 50% × disagreement ~30% → compounded ~35% of baseline
-        # baseline 0.8 → ~0.28 (below the catalyst-only 0.4)
-        assert result.confidence < 0.35
-        assert result.catalyst_proximity == 1.0
-        assert result.disagreement_score > 0.3
+        assert result.direction == "neutral"
+        assert result.confidence == pytest.approx(0.5, abs=1e-4)
