@@ -34,11 +34,19 @@ and mocks (no database, no network):
      (``TestCodexHold6032982233DecisionInstant``); clockless research
      reports are labelled and never ticket
      (``TestCodexHold6032982233ResearchReports``).
+ 11. Codex HOLD 6033471347, decided by Anik on 2026-11-24 ("Abstain now
+     (B)"): eligible evidence needs a complete signed per-family receipt,
+     which nothing in production builds, so no live report tickets; the
+     aggregate head vote is labelled context and never counts; and a ticket
+     must issue within a bounded age of its decision instant
+     (``TestCodexHold6033471347SignedFamilyReceipts``). The positive paths
+     elsewhere in this file are contract tests that pass test-constructed
+     receipts (``_receipt``, ``_inject_receipts``).
 """
 from __future__ import annotations
 
 from contextlib import ExitStack
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -1530,6 +1538,58 @@ def _zero_evidence_cards() -> dict[str, SignalScorecard]:
     }
 
 
+def _receipt(
+    family: str,
+    call: str = "bullish",
+    *,
+    ticker: str = "NVDA",
+    clock: datetime = _ZERO_EVIDENCE_CLOCK,
+    heads: tuple[tuple[str, str], ...] | None = None,
+    consumed: tuple[str, ...] | None = None,
+    complete: Any = True,
+) -> Any:
+    """CONTRACT FIXTURE, not live: a signed per-family receipt.
+
+    Nothing in production builds one (Codex HOLD 6033471347; Anik, "Abstain
+    now (B)", 2026-11-24). Tests pass these to show the evidence floor is
+    passable once an engine change exports receipts. The default is
+    complete, signed ``call`` by its one contributing head, and bound to
+    ``ticker`` and ``clock``. Built at call time, so the module still
+    imports where the contract class is missing.
+    """
+    return sp.SignedFamilyReceipt(
+        signal_source=family,
+        direction=call,
+        ticker=ticker,
+        decision_clock=clock,
+        consumed_signals=(f"{family}:obs-1",) if consumed is None else consumed,
+        head_directions=(("head_a", call),) if heads is None else heads,
+        complete_contributing_set=complete,
+    )
+
+
+def _receipts(
+    *families: str,
+    call: str = "bullish",
+    ticker: str = "NVDA",
+    clock: datetime = _ZERO_EVIDENCE_CLOCK,
+) -> dict[str, Any]:
+    """CONTRACT FIXTURE: one complete, agreeing receipt per family."""
+    return {f: _receipt(f, call, ticker=ticker, clock=clock) for f in families}
+
+
+def _inject_receipts(stack: ExitStack, receipts: dict[str, Any] | None) -> None:
+    """CONTRACT FIXTURE: hand the live builder test-constructed receipts.
+
+    Production's ``sp._family_receipts`` returns none; only a contract test
+    replaces it, and only when it passes ``receipts``.
+    """
+    if receipts is not None:
+        stack.enter_context(
+            patch.object(sp, "_family_receipts", lambda *_a, **_k: dict(receipts))
+        )
+
+
 def _late_or_unstamped_fudge_engine() -> MagicMock:
     """An engine whose shipping fudge alerts are all ineligible.
 
@@ -1555,6 +1615,7 @@ def _gateway_decision(
     ticker: str = "NVDA",
     cards: dict[str, SignalScorecard] | None = None,
     contributions: dict[str, float] | None = None,
+    receipts: dict[str, Any] | None = None,
 ) -> dg.DecisionResponse:
     """Run ``should_i_trade`` as production calls it, stubbing only the reads.
 
@@ -1565,6 +1626,7 @@ def _gateway_decision(
     alert rows. Real: the gateway, ``build_provenance_report`` with its clock
     and fence, the counterfactual stress test and the ticket generator, given
     a fresh circuit breaker so no other test's breaker state can reach it.
+    ``receipts`` makes it a contract test (``_inject_receipts``).
     """
     pred = _prediction(
         ticker=ticker,
@@ -1572,13 +1634,16 @@ def _gateway_decision(
         signal_contributions=dict(contributions or _ZERO_EVIDENCE_CONTRIBUTIONS),
     )
     pred.as_of = _ZERO_EVIDENCE_CLOCK
-    return _run_gateway(pred, cards=cards)
+    return _run_gateway(pred, cards=cards, receipts=receipts)
 
 
 def _run_gateway(
-    pred: SimpleNamespace,
+    pred: Any,
     *,
     cards: dict[str, SignalScorecard] | None = None,
+    receipts: dict[str, Any] | None = None,
+    engine: Any = None,
+    flat_cards: dict[str, SignalScorecard] | None = None,
 ) -> dg.DecisionResponse:
     """``_gateway_decision``'s body for a caller-built live prediction."""
     ticker = pred.ticker
@@ -1589,14 +1654,16 @@ def _run_gateway(
         counters=(llm_red_team.CounterArgument("Valuation risk", 0.2, 0.2, 0.2),),
         epistemic_risk_score=0.2,
     )
-    engine = _late_or_unstamped_fudge_engine() if ticker == "XOM" else MagicMock()
+    if engine is None:
+        engine = _late_or_unstamped_fudge_engine() if ticker == "XOM" else MagicMock()
     with ExitStack() as stack:
         _patch_all_non_fudge_adapters(stack, value=_UNFENCED_LAYER_VALUE)
+        _inject_receipts(stack, receipts)
         stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW))
         _patch_calibration_tables(
             stack,
             regime_cards=_zero_evidence_cards() if cards is None else cards,
-            flat_cards={},
+            flat_cards=flat_cards or {},
         )
         predictor = stack.enter_context(patch("oracle.engine.EnsemblePredictor"))
         predictor.return_value.predict.return_value = pred
@@ -1638,7 +1705,8 @@ def _pinned_band_outcome(confidence: float) -> tuple[str, str, bool]:
 
     Under the evidence floor every band is LOW with no ticket; before it the
     0.55-0.85 band was NO_TRADE and confidence above 0.85 was MEDIUM with a
-    ticket (``_PRE_FLOOR_BAND_OUTCOMES``).
+    ticket (``_PRE_FLOOR_BAND_OUTCOMES``). Abstaining on receipts (round 7)
+    leaves it LOW with no ticket.
     """
     del confidence
     return "low", "low", False
@@ -1683,6 +1751,12 @@ class TestZeroEvidenceGatewayPin:
     first-hand on 2026-11-24, and the pin changed in the commit that
     implements it: zero eligible evidence is LOW with no ticket in every
     band, and the reason is recorded.
+
+    Round 7 (Codex HOLD 6033471347; Anik, "Abstain now (B)", 2026-11-24):
+    eligibility also needs a signed per-family receipt, which nothing in
+    production builds. The pinned outcome is unchanged, LOW with no ticket in
+    every band; every row now has no receipt, and the reason also records
+    ``no_signed_family_receipt`` on all three rows.
     """
 
     @pytest.mark.parametrize(
@@ -1743,6 +1817,9 @@ class TestZeroEvidenceGatewayPin:
         assert prov.verdict == "low"
         assert prov.verdict_reason.startswith(sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE)
         assert "0 eligible" in prov.verdict_reason
+        # Round 7: no row has a receipt, and the reason says so.
+        assert all(ev.receipt is None for ev in prov.signal_evidence)
+        assert f"{sp.NO_SIGNED_FAMILY_RECEIPT}: 3 of 3 rows" in prov.verdict_reason
         # Stress re-derives every perturbation under the same floor, so none
         # of them flips the LOW call (before the floor, 0.55-0.85 read as
         # fragile at 0.00 and was downgraded to NO_TRADE).
@@ -1770,6 +1847,7 @@ class TestZeroEvidenceGatewayPin:
         assert set(out["advisory_layers"]) == set(_ADVISORY_LAYERS_NVDA)
         assert out["verdict"] == "low"
         assert out["verdict_reason"].startswith(sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE)
+        assert [row["receipt"] for row in out["signal_evidence"]] == [None, None, None]
 
     @pytest.mark.parametrize("ticker", ["NVDA", "XOM"])
     def test_high_never_appears_at_any_confidence(self, ticker: str) -> None:
@@ -1808,6 +1886,7 @@ def _live_report(
     confidence: float,
     cards: dict[str, SignalScorecard],
     contributions: dict[str, float] | None = None,
+    receipts: dict[str, Any] | None = None,
 ) -> sp.TradeProvenanceReport:
     """``build_provenance_report`` on the zero-evidence fixture's clock."""
     pred = _prediction(
@@ -1816,25 +1895,44 @@ def _live_report(
         signal_contributions=dict(contributions or _ZERO_EVIDENCE_CONTRIBUTIONS),
     )
     pred.as_of = _ZERO_EVIDENCE_CLOCK
-    return _build_live(pred, cards=cards)
+    return _build_live(pred, cards=cards, receipts=receipts)
 
 
 def _build_live(
-    pred: SimpleNamespace, *, cards: dict[str, SignalScorecard]
+    pred: Any,
+    *,
+    cards: dict[str, SignalScorecard],
+    receipts: dict[str, Any] | None = None,
+    engine: Any = None,
 ) -> sp.TradeProvenanceReport:
-    """``build_provenance_report`` on a caller-built live prediction."""
+    """``build_provenance_report`` on a caller-built live prediction;
+    ``receipts`` makes it a contract test (``_inject_receipts``)."""
     with ExitStack() as stack:
         _patch_all_non_fudge_adapters(stack, value=_UNFENCED_LAYER_VALUE)
+        _inject_receipts(stack, receipts)
         stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW))
         _patch_calibration_tables(stack, regime_cards=cards, flat_cards={})
-        return sp.build_provenance_report(MagicMock(), prediction=pred)
+        return sp.build_provenance_report(
+            MagicMock() if engine is None else engine, prediction=pred
+        )
 
 
-def _ticket(report: sp.TradeProvenanceReport) -> Any:
-    with patch("oracle.risk.get_global_circuit_breaker", lambda: CircuitBreaker()):
+def _ticket_at(report: Any, now: datetime) -> Any:
+    """``generate_ticket`` with the wall clock at ``now``."""
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("oracle.risk.get_global_circuit_breaker", lambda: CircuitBreaker())
+        )
+        stack.enter_context(patch.object(sp, "_utc_now", lambda: now))
         return generate_ticket(
             report, account_size_usd=100_000, current_price=120.0, vol_30d=0.35
         )
+
+
+def _ticket(report: Any) -> Any:
+    """``generate_ticket`` at the fixtures' wall clock, two minutes after
+    their decision clock (inside the issuance bound)."""
+    return _ticket_at(report, _LIVE_NOW)
 
 
 def _outcome(resp: dg.DecisionResponse) -> tuple[str, str, bool]:
@@ -1881,6 +1979,12 @@ class TestEvidenceFloor:
     direction its signal pushed. Fudge alerts dampen risk and are not
     directional evidence. The floor is one such row
     (``sp.MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE``).
+
+    Round 7 (Codex HOLD 6033471347; Anik, "Abstain now (B)", 2026-11-24): an
+    eligible row also needs a complete signed per-family receipt, which
+    nothing in production builds. The positive controls here are contract
+    tests: they pass test-constructed receipts (``_receipts``). The same
+    fixtures without receipts, the live case, are LOW with no ticket.
     """
 
     def test_the_floor_is_one_eligible_row_and_fudge_alerts_are_not_evidence(self) -> None:
@@ -1897,8 +2001,14 @@ class TestEvidenceFloor:
     def test_one_eligible_card_in_the_direction_still_gives_a_ticket(
         self, confidence: float
     ) -> None:
+        cards = _cards_with(jodi_oil=_fenced_card("jodi_oil", 1.3))
+        # Live (no receipt): the card alone abstains.
+        live = _gateway_decision(confidence=confidence, cards=cards)
+        assert _outcome(live) == ("low", "low", False)
+        assert _eligible_count(live.provenance_report) == 0
+        # Contract: the same card with a complete, agreeing receipt.
         resp = _gateway_decision(
-            confidence=confidence, cards=_cards_with(jodi_oil=_fenced_card("jodi_oil", 1.3))
+            confidence=confidence, cards=cards, receipts=_receipts("jodi_oil")
         )
         prov = resp.provenance_report
         assert _evidence_rows(prov)["jodi_oil"]["classification"] == "strong"
@@ -1923,8 +2033,11 @@ class TestEvidenceFloor:
     def test_one_card_against_the_direction_gives_no_ticket(
         self, weight: float, classification: str
     ) -> None:
+        # Contract: a receipt does not rescue a card against the direction.
         resp = _gateway_decision(
-            confidence=0.92, cards=_cards_with(jodi_oil=_fenced_card("jodi_oil", weight))
+            confidence=0.92,
+            cards=_cards_with(jodi_oil=_fenced_card("jodi_oil", weight)),
+            receipts=_receipts("jodi_oil"),
         )
         prov = resp.provenance_report
         assert _evidence_rows(prov)["jodi_oil"]["classification"] == classification
@@ -1937,7 +2050,10 @@ class TestEvidenceFloor:
     def test_advisory_late_unstamped_or_cold_start_card_alone_gives_no_ticket(
         self, card: SignalScorecard, classification: str
     ) -> None:
-        resp = _gateway_decision(confidence=0.92, cards={"jodi_oil": card})
+        # Contract: a receipt does not rescue an ineligible card.
+        resp = _gateway_decision(
+            confidence=0.92, cards={"jodi_oil": card}, receipts=_receipts("jodi_oil")
+        )
         prov = resp.provenance_report
         assert _evidence_rows(prov)["jodi_oil"]["classification"] == classification
         assert _outcome(resp) == ("low", "low", False)
@@ -1964,7 +2080,12 @@ class TestEvidenceFloor:
             "pcr": _fenced_card("pcr", 1.2),
         }
         cards = _cards_with(**dict(list(extra.items())[:eligible]))
-        resp = _gateway_decision(confidence=confidence, cards=cards)
+        # Contract: every family carries a complete, agreeing receipt, so the
+        # count is the cards' (pcr's unstamped card and ghost_signal's
+        # missing one stay ineligible).
+        resp = _gateway_decision(
+            confidence=confidence, cards=cards, receipts=_receipts(*_ZERO_EVIDENCE_CONTRIBUTIONS)
+        )
         assert _outcome(resp) == expected
         assert resp.stress_report.robustness_label == "robust"
         assert _eligible_count(resp.provenance_report) == eligible
@@ -1976,6 +2097,8 @@ class TestEvidenceFloor:
     def test_stress_imports_the_shared_policy(self) -> None:
         assert cs.decide_verdict is sp.decide_verdict
 
+    # Live (no receipts) and contract (a receipt on every family).
+    @pytest.mark.parametrize("receipted", [False, True], ids=["live", "contract-receipts"])
     @pytest.mark.parametrize("confidence", [0.85, 0.8501, 0.92])
     @pytest.mark.parametrize(
         "cards",
@@ -1990,9 +2113,13 @@ class TestEvidenceFloor:
         ],
     )
     def test_stress_and_provenance_agree_on_the_floor(
-        self, cards: dict[str, SignalScorecard] | None, confidence: float
+        self, cards: dict[str, SignalScorecard] | None, confidence: float, receipted: bool
     ) -> None:
-        resp = _gateway_decision(confidence=confidence, cards=cards)
+        resp = _gateway_decision(
+            confidence=confidence,
+            cards=cards,
+            receipts=_receipts(*_ZERO_EVIDENCE_CONTRIBUTIONS) if receipted else None,
+        )
         prov = resp.provenance_report
         # Perturbing a row that holds no decision-bearing scorecard moves
         # neither conviction nor eligibility, so stress must reach the
@@ -2023,10 +2150,12 @@ class TestEvidenceFloor:
         # perturbed, it turns weak or anti-predictive, and the call loses its
         # only eligible row even though conviction stays at or above 0.80.
         card = _fenced_card("jodi_oil", 0.75, running_brier=0.15)
+        # Contract: jodi_oil carries a complete, agreeing receipt.
         report = _live_report(
             confidence=0.92,
             cards={"jodi_oil": card},
             contributions={"jodi_oil": 0.2, "pcr": 0.5, "ghost_signal": 0.3},
+            receipts=_receipts("jodi_oil"),
         )
         assert report.aggregate_conviction == pytest.approx(0.2 * 0.75 + 0.8)
         assert report.verdict == "medium"
@@ -2043,16 +2172,26 @@ class TestEvidenceFloor:
 
     def test_ticket_generator_refuses_a_medium_report_without_eligible_evidence(self) -> None:
         zero = _live_report(confidence=0.92, cards=_zero_evidence_cards())
-        one = _live_report(
+        live_one = _live_report(
             confidence=0.92, cards=_cards_with(jodi_oil=_fenced_card("jodi_oil", 1.3))
+        )
+        # Contract: the same card with a complete, agreeing receipt.
+        one = _live_report(
+            confidence=0.92,
+            cards=_cards_with(jodi_oil=_fenced_card("jodi_oil", 1.3)),
+            receipts=_receipts("jodi_oil"),
         )
         # Forced to MEDIUM, as a report from another path could arrive.
         assert _ticket(replace(zero, verdict="medium")) is None
+        assert _ticket(replace(live_one, verdict="medium")) is None
         assert _ticket(one) is not None
 
     def test_ticket_generator_rechecks_each_card_against_the_report_clock(self) -> None:
+        # Contract: jodi_oil carries a complete, agreeing receipt.
         report = _live_report(
-            confidence=0.92, cards=_cards_with(jodi_oil=_fenced_card("jodi_oil", 1.3))
+            confidence=0.92,
+            cards=_cards_with(jodi_oil=_fenced_card("jodi_oil", 1.3)),
+            receipts=_receipts("jodi_oil"),
         )
         late = [
             replace(
@@ -2071,17 +2210,10 @@ class TestEvidenceFloor:
 
     def test_gateway_records_the_floor_when_a_medium_report_has_no_evidence(self) -> None:
         zero = replace(_live_report(confidence=0.92, cards=_zero_evidence_cards()), verdict="medium")
-        with patch("oracle.risk.get_global_circuit_breaker", lambda: CircuitBreaker()):
-            ticket, err = dg._run_trade_ticket(
-                zero,
-                account_size_usd=100_000,
-                current_price=120.0,
-                vol_30d=0.35,
-                instrument="equity",
-                unified_verdict="medium",
-            )
+        ticket, err = _gateway_ticket_stage(zero)
         assert ticket is None
         assert err is not None and err.startswith(sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE)
+        assert f"{sp.NO_SIGNED_FAMILY_RECEIPT}: 3 of 3 rows" in err
 
 
 # ── Codex HOLD 6032982233: a signed input from the decision, and its instant ─
@@ -2100,6 +2232,17 @@ class TestEvidenceFloor:
 # reach a ticket. Actionable entry points now need an explicit,
 # timezone-aware decision instant; clockless research reports are labelled
 # non-actionable and never ticket, and their stress test is not live parity.
+#
+# Round 7 (Codex HOLD 6033471347, at cbfd8301): a head's direction is the
+# aggregate over everything that head consumed, so spreading it to the
+# head's configured families signs a family that was unused, or bearish,
+# as bullish; and ``model_votes`` keeps the top ten heads, so a dissenting
+# eleventh head cannot veto. Anik decided "Abstain now (B)" on 2026-11-24:
+# the head vote stays on each row as labelled context (``signed_input``,
+# ``basis="aggregate_head_vote_not_a_receipt"``) and never counts, and
+# eligibility needs a complete signed per-family receipt instead. The live
+# outcomes below are the abstain outcomes; the positive paths are contract
+# tests with test-constructed receipts.
 
 _SIGNED_CLOCK = _ZERO_EVIDENCE_CLOCK
 
@@ -2147,8 +2290,13 @@ def _restamp(report: sp.TradeProvenanceReport, stamp: datetime) -> list[sp.Signa
     ]
 
 
-def _gateway_ticket_stage(report: Any) -> tuple[Any, str | None]:
-    with patch("oracle.risk.get_global_circuit_breaker", lambda: CircuitBreaker()):
+def _stage_at(report: Any, now: datetime) -> tuple[Any, str | None]:
+    """The gateway's ticket stage with the wall clock at ``now``."""
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("oracle.risk.get_global_circuit_breaker", lambda: CircuitBreaker())
+        )
+        stack.enter_context(patch.object(sp, "_utc_now", lambda: now))
         return dg._run_trade_ticket(
             report,
             account_size_usd=100_000,
@@ -2159,24 +2307,47 @@ def _gateway_ticket_stage(report: Any) -> tuple[Any, str | None]:
         )
 
 
+def _gateway_ticket_stage(report: Any) -> tuple[Any, str | None]:
+    """The gateway's ticket stage at the fixtures' wall clock."""
+    return _stage_at(report, _LIVE_NOW)
+
+
 class TestCodexHold6032982233SignedInput:
-    """Point (1): eligible evidence is a signed input bound to the decision."""
+    """Point (1): eligible evidence is a signed input bound to the decision.
+
+    Round 7 (Codex HOLD 6033471347; "Abstain now (B)"): the head-vote sign
+    built here is the aggregate head vote, kept as labelled context. It no
+    longer makes a row eligible, so the live outcomes are LOW with no ticket;
+    the positive paths pass test-constructed receipts (contract tests).
+    """
 
     @pytest.mark.parametrize("sign", ["bullish", "bearish"])
     def test_paired_same_card_and_input_only_the_matching_call_tickets(self, sign: str) -> None:
         votes = [_vote("head_a", sign, ["jodi_oil"])]
         other = "bearish" if sign == "bullish" else "bullish"
-        match = _run_gateway(_signed_prediction(call=sign, votes=votes), cards=_strong_jodi())
-        against = _run_gateway(_signed_prediction(call=other, votes=votes), cards=_strong_jodi())
+        # Live: the head vote agrees with ``sign``, but it is not a receipt,
+        # so neither call tickets (round 6 ticketed the matching call).
+        for call in (sign, other):
+            live = _run_gateway(_signed_prediction(call=call, votes=votes), cards=_strong_jodi())
+            assert _outcome(live) == ("low", "low", False), call
+            assert _eligible_count(live.provenance_report) == 0, call
+        # Contract: the same card with a receipt signed ``sign``.
+        receipt = {"jodi_oil": _receipt("jodi_oil", sign)}
+        match = _run_gateway(
+            _signed_prediction(call=sign, votes=votes), cards=_strong_jodi(), receipts=receipt
+        )
+        against = _run_gateway(
+            _signed_prediction(call=other, votes=votes), cards=_strong_jodi(), receipts=receipt
+        )
 
-        # Only the call the input agrees with qualifies...
+        # Only the call the receipt agrees with qualifies...
         assert _outcome(match) == ("medium", "medium", True)
         assert match.trade_ticket.direction == sign
         assert _outcome(against) == ("low", "low", False)
         assert against.provenance_report.verdict_reason.startswith(
             sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
         )
-        # ...from the same card, the same row weight and the same signed input.
+        # ...from the same card, row weight, head vote and receipt.
         m_row = _evidence_rows(match.provenance_report)["jodi_oil"]
         a_row = _evidence_rows(against.provenance_report)["jodi_oil"]
         assert m_row["scorecard"] == a_row["scorecard"]
@@ -2184,10 +2355,14 @@ class TestCodexHold6032982233SignedInput:
         assert m_row["shapley_weight"] == a_row["shapley_weight"] == pytest.approx(1.0)
         assert m_row["signed_input"] == a_row["signed_input"]
         assert m_row["signed_input"]["direction"] == sign
+        assert m_row["receipt"] == a_row["receipt"]
+        assert m_row["receipt"]["direction"] == sign
         assert _eligible_count(match.provenance_report) == 1
         assert _eligible_count(against.provenance_report) == 0
 
     def test_the_signed_input_is_the_head_vote_bound_to_ticker_and_clock(self) -> None:
+        # Round 7: kept as labelled context; it is not a receipt and does
+        # not count, so the strong card behind it abstains.
         report = _build_live(
             _signed_prediction(
                 call="bullish",
@@ -2195,6 +2370,10 @@ class TestCodexHold6032982233SignedInput:
             ),
             cards=_strong_jodi(),
         )
+        assert report.verdict == "low"
+        assert _eligible_count(report) == 0
+        assert report.signal_evidence[0].receipt is None
+        assert _evidence_rows(report)["jodi_oil"]["receipt"] is None
         si = report.signal_evidence[0].signed_input
         assert si == sp.SignedInput(
             signal_source="jodi_oil",
@@ -2206,6 +2385,7 @@ class TestCodexHold6032982233SignedInput:
             models=("head_a",),
         )
         assert _evidence_rows(report)["jodi_oil"]["signed_input"] == {
+            "basis": "aggregate_head_vote_not_a_receipt",
             "signal_source": "jodi_oil",
             "direction": "bullish",
             "ticker": "NVDA",
@@ -2249,12 +2429,26 @@ class TestCodexHold6032982233SignedInput:
         # The ticket backstop refuses the same report forced to MEDIUM.
         forced = replace(prov, verdict="medium")
         assert _ticket(forced) is None
-        assert sp.actionable_refusal_reason(forced).startswith(
+        assert sp.actionable_refusal_reason(forced, now=_LIVE_NOW).startswith(
             sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
         )
+        # Contract: a receipt that says the same as this input is refused too.
+        if signed_direction is not None:
+            receipt = (
+                _receipt("jodi_oil", heads=(("head_a", "bullish"), ("head_b", "bearish")))
+                if signed_direction == sp.SIGNED_INPUT_MIXED
+                else _receipt("jodi_oil", signed_direction)
+            )
+            contract = _run_gateway(
+                _signed_prediction(call="bullish", votes=votes),
+                cards=_strong_jodi(),
+                receipts={"jodi_oil": receipt},
+            )
+            assert _outcome(contract) == ("low", "low", False)
+            assert _eligible_count(contract.provenance_report) == 0
 
-    def test_positive_control_matching_sign_gives_a_robust_ticket(self) -> None:
-        resp = _run_gateway(
+    def _positive_control(self, receipts: dict[str, Any] | None) -> dg.DecisionResponse:
+        return _run_gateway(
             _signed_prediction(
                 call="bullish",
                 votes=[
@@ -2266,34 +2460,55 @@ class TestCodexHold6032982233SignedInput:
                 ],
             ),
             cards=_strong_jodi(),
+            receipts=receipts,
         )
+
+    def test_positive_control_matching_sign_gives_no_ticket_live(self) -> None:
+        # Round 6's positive control: a matching head vote alone. Round 7
+        # abstains: the aggregate head vote is not a receipt.
+        resp = self._positive_control(None)
+        prov = resp.provenance_report
+        assert _outcome(resp) == ("low", "low", False)
+        assert _evidence_rows(prov)["jodi_oil"]["signed_input"]["direction"] == "bullish"
+        assert _eligible_count(prov) == 0
+        assert sp.actionable_refusal_reason(prov, now=_LIVE_NOW).startswith(
+            sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+        )
+
+    def test_positive_control_matching_sign_gives_a_robust_ticket(self) -> None:
+        # Contract: the same prediction with a complete, agreeing receipt.
+        resp = self._positive_control(_receipts("jodi_oil"))
         prov = resp.provenance_report
         assert _outcome(resp) == ("medium", "medium", True)
         assert resp.stage_errors == {}
-        assert sp.actionable_refusal_reason(prov) is None
+        assert sp.actionable_refusal_reason(prov, now=_LIVE_NOW) is None
         jodi = _evidence_rows(prov)["jodi_oil"]["signed_input"]
         assert (jodi["direction"], jodi["models"]) == ("bullish", ["head_a"])
         assert _eligible_count(prov) == 1
         # Stress perturbs the card's skill, not what the signal said at the
-        # decision: each perturbed row keeps its signed input, the card
-        # stays neutral or better at every sigma, and the call holds.
+        # decision: each perturbed row keeps its receipt and head vote, the
+        # card stays neutral or better at every sigma, and the call holds.
         (idx,) = [i for i, ev in enumerate(prov.signal_evidence) if ev.signal_source == "jodi_oil"]
         swapped = cs._swap_signal_evidence(prov.signal_evidence, idx, 0.6)
         assert swapped[idx].signed_input == prov.signal_evidence[idx].signed_input
+        assert swapped[idx].receipt == prov.signal_evidence[idx].receipt is not None
         assert resp.stress_report.robustness_label == "robust"
         assert resp.stress_report.break_count == 0
         assert resp.stress_report.live_parity is True
 
     def test_an_input_from_another_ticker_or_decision_is_refused(self) -> None:
+        # Contract: each report carries a receipt for its own ticker.
         nvda = _build_live(
             _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]),
             cards=_strong_jodi(),
+            receipts=_receipts("jodi_oil"),
         )
         amd = _build_live(
             _signed_prediction(
                 call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])], ticker="AMD"
             ),
             cards=_strong_jodi(),
+            receipts=_receipts("jodi_oil", ticker="AMD"),
         )
         assert nvda.verdict == amd.verdict == "medium"
         assert _ticket(nvda) is not None
@@ -2304,14 +2519,14 @@ class TestCodexHold6032982233SignedInput:
             # The NVDA report relabelled as another ticker.
             "report-for-another-ticker": replace(nvda, ticker="AMD"),
             # The same rows under an earlier decision clock: the card is
-            # still fenced, but the input was signed at the later decision.
+            # still fenced, but the receipt is from the later decision.
             "another-decision": replace(
                 nvda, decision_clock=(_SIGNED_CLOCK - timedelta(minutes=1)).isoformat()
             ),
         }
         for name, forged in cases.items():
             assert _ticket(forged) is None, name
-            assert sp.actionable_refusal_reason(forged).startswith(
+            assert sp.actionable_refusal_reason(forged, now=_LIVE_NOW).startswith(
                 sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
             ), name
 
@@ -2348,12 +2563,13 @@ class TestCodexHold6032982233SignedInput:
                     ev, direction=call, decision_clock=_SIGNED_CLOCK, ticker="NVDA"
                 )
             }
-            expected = {"equity", "flows", "breadth"} if call == "bullish" else {
-                "rates", "credit", "macro"
-            }
-            # Same cards behind both calls; each call keeps only the families
-            # its heads signed its way, and "vol" (both heads) is mixed.
-            assert eligible == expected, call
+            # Round 6 kept, behind each call, the families its heads signed
+            # its way (bullish: equity, flows, breadth; bearish: rates,
+            # credit, macro). That is the aggregate spread Codex HOLD
+            # 6033471347 refused: round 7 counts none of them.
+            assert eligible == set(), call
+            assert all(ev.receipt is None for ev in report.signal_evidence), call
+            assert report.verdict == "low", call
         assert signs["bullish"] == signs["bearish"] == {
             "equity": "bullish",
             "flows": "bullish",
@@ -2365,9 +2581,11 @@ class TestCodexHold6032982233SignedInput:
         }
 
     def test_eligibility_reads_the_sign_ticker_and_clock(self) -> None:
+        # Contract: the sign, ticker and clock read are now the receipt's.
         report = _build_live(
             _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]),
             cards=_strong_jodi(),
+            receipts=_receipts("jodi_oil"),
         )
         (ev,) = report.signal_evidence
 
@@ -2387,14 +2605,23 @@ class TestCodexHold6032982233SignedInput:
         assert not eligible(ticker="")
         assert not eligible(decision_clock=_SIGNED_CLOCK + timedelta(seconds=1))
         assert not eligible(decision_clock=None)
+        # The agreeing head vote alone (no receipt) does not count.
+        assert ev.signed_input.direction == "bullish"
         assert not sp.is_eligible_directional_evidence(
-            replace(ev, signed_input=None),
+            replace(ev, receipt=None),
             direction="bullish",
             decision_clock=_SIGNED_CLOCK,
             ticker="NVDA",
         )
         assert not sp.is_eligible_directional_evidence(
-            replace(ev, signed_input=replace(ev.signed_input, signal_source="pcr")),
+            replace(ev, receipt=replace(ev.receipt, signal_source="pcr")),
+            direction="bullish",
+            decision_clock=_SIGNED_CLOCK,
+            ticker="NVDA",
+        )
+        # The receipt alone carries it: without the head vote it still counts.
+        assert sp.is_eligible_directional_evidence(
+            replace(ev, signed_input=None),
             direction="bullish",
             decision_clock=_SIGNED_CLOCK,
             ticker="NVDA",
@@ -2402,9 +2629,12 @@ class TestCodexHold6032982233SignedInput:
 
 
 def _ticketable_report() -> sp.TradeProvenanceReport:
+    """CONTRACT FIXTURE: a live-built report that tickets because its one
+    row carries a test-constructed receipt (live rows have none)."""
     report = _build_live(
         _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]),
         cards=_strong_jodi(),
+        receipts=_receipts("jodi_oil"),
     )
     assert report.verdict == "medium"
     assert _ticket(report) is not None
@@ -2479,7 +2709,7 @@ class TestCodexHold6032982233DecisionInstant:
         )
         assert forged.verdict == "medium"
         assert _ticket(forged) is None
-        reason = sp.actionable_refusal_reason(forged)
+        reason = sp.actionable_refusal_reason(forged, now=_LIVE_NOW)
         assert reason is not None and reason.startswith(code)
         ticket, err = _gateway_ticket_stage(forged)
         assert ticket is None
@@ -2505,7 +2735,7 @@ class TestCodexHold6032982233DecisionInstant:
         report = _ticketable_report()
         forged = replace(report, signal_evidence=_restamp(report, _SIGNED_CLOCK + late))
         assert _ticket(forged) is None
-        assert sp.actionable_refusal_reason(forged).startswith(
+        assert sp.actionable_refusal_reason(forged, now=_LIVE_NOW).startswith(
             sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
         )
 
@@ -2649,3 +2879,394 @@ class TestCodexHold6032982233ResearchReports:
         assert "research_no_clock" in out
         assert "not actionable" in out
         assert "TRADE TICKET" not in out
+
+
+# ── Codex HOLD 6033471347: abstain on the signed-evidence floor; issuance age ─
+#
+# Codex review 6033471347 (at cbfd8301) accepted the explicit decision
+# instant and the research separation, and held live use on the signed
+# evidence floor. ``oracle/engine.py`` exports each head's aggregate
+# direction and count, not the family, sign, IDs or decision-time
+# eligibility of the inputs that head consumed; spreading that aggregate
+# over the head's configured families (``_vote_family_shares``) can sign an
+# unused or bearish family bullish; and ``model_votes`` keeps the top ten
+# heads, so a dissenting head beyond them cannot veto. "Require actual
+# signed per-family input receipts or abstain." Anik decided first-hand on
+# 2026-11-24: "Abstain now (B)". Codex also asked for a bounded, documented
+# issuance freshness, with delayed issuance tested.
+
+
+def _ensemble_prediction(
+    heads: list[tuple[str, float, list[tuple[str, str, float]]]],
+    *,
+    ticker: str = "NVDA",
+    as_of: datetime = _SIGNED_CLOCK,
+) -> Any:
+    """The real ``EnsemblePredictor.predict`` over synthetic heads.
+
+    Each head is ``(name, hit_rate, consumed)``; ``consumed`` lists the
+    ``(family, sign, size)`` inputs the head read at ``as_of``. The head's
+    direction is the sign of their net, as an aggregator nets what a head
+    consumed, and its exported vote keeps that direction and nothing about
+    which family moved it. Stubbed as ``tests/test_fp_ensemble_risk_fixes``
+    stubs them: the registry, the signal reads, the aggregator and the
+    SWEEP context. Real: ``predict`` and its top-ten ``model_votes``.
+    """
+    from oracle.engine import EnsemblePredictor
+    from tests.test_fp_ensemble_risk_fixes import _neutral_context_patches
+
+    consumed = {name: list(inputs) for name, _rate, inputs in heads}
+    hit_rates = {name: rate for name, rate, _inputs in heads}
+
+    def _aggregate(signals: list[Any], _config: Any, _as_of: Any) -> SimpleNamespace:
+        net = sum(size if sign == "bullish" else -size for _family, sign, size in signals)
+        direction = "bullish" if net > 0 else "bearish" if net < 0 else "neutral"
+        return SimpleNamespace(
+            direction=direction,
+            strength=0.8,
+            confidence=0.95,
+            coherence=1.0,
+            signal_count=len(signals),
+        )
+
+    predictor = EnsemblePredictor.__new__(EnsemblePredictor)
+    predictor.engine = MagicMock()
+    predictor.factory = MagicMock()
+    predictor.factory.list_active_models.return_value = [
+        SimpleNamespace(name=name, min_signals=1, weight_config={}) for name, _r, _i in heads
+    ]
+    predictor.factory.get_signals_for_model.side_effect = lambda name, *_a, **_k: consumed[name]
+    predictor.aggregator = MagicMock()
+    predictor.aggregator.aggregate.side_effect = _aggregate
+    predictor._get_hit_rate = lambda name, *, horizon=None: hit_rates[name]
+    predictor._get_bucket_weight = lambda name, *, horizon=None: 1.0
+    with ExitStack() as stack:
+        for context in _neutral_context_patches():
+            stack.enter_context(context)
+        stack.enter_context(
+            patch(
+                "intelligence.market_implied_prob.options_implied_probability",
+                return_value=None,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "oracle.model_factory.ModelFactory.active_model_names",
+                lambda conn, names, **kw: set(names),
+            )
+        )
+        stack.enter_context(
+            patch("oracle.contrast_distillation.compute_divergence", lambda rollouts: 0.0)
+        )
+        return predictor.predict(ticker, as_of=as_of)
+
+
+def _oracle_models_engine(families: dict[str, list[str]]) -> MagicMock:
+    """An engine whose ``oracle_models`` read maps each head to its
+    configured families, as production's registry does."""
+    engine = MagicMock()
+    conn = engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchall.return_value = [
+        (name, list(fams), None) for name, fams in families.items()
+    ]
+    return engine
+
+
+_EXACT_CASES = (
+    "unconsumed-family",
+    "opposite-family",
+    "truncated-dissenting-head",
+    "aggregate-head-vote-alone",
+)
+
+
+def _exact_case(case: str) -> tuple[Any, dict[str, list[str]], str]:
+    """``(prediction, oracle_models map, family)`` for one exact-ensemble
+    case; ``family`` holds the strong fenced card and is the one the
+    aggregate head vote signs bullish."""
+    # Codex's example is a vol+macro head. ``vol`` carries a 0.30 production
+    # weight override (intelligence.signal_weight_overrides), which would
+    # hold conviction under 0.70 on its own, so the card family is credit.
+    credit_macro = {"credit_macro": ["credit", "macro"]}
+    if case == "unconsumed-family":
+        # A credit+macro head bullish from macro alone: it read no credit input.
+        heads = [("credit_macro", 0.6, [("macro", "bullish", 2.0), ("macro", "bullish", 1.0)])]
+        return _ensemble_prediction(heads), credit_macro, "credit"
+    if case == "opposite-family":
+        # The same head read a bearish credit input, outweighed by macro.
+        heads = [("credit_macro", 0.6, [("credit", "bearish", 1.0), ("macro", "bullish", 3.0)])]
+        return _ensemble_prediction(heads), credit_macro, "credit"
+    if case == "truncated-dissenting-head":
+        # Ten flows heads bullish; an eleventh, the lightest, read a bearish
+        # flows input. model_votes keeps the top ten, so it is not there.
+        heads = [(f"flows_{i:02d}", 0.6, [("flows", "bullish", 1.0)]) for i in range(10)]
+        heads.append(("flows_dissent", 0.05, [("flows", "bearish", 1.0)]))
+        return _ensemble_prediction(heads), {name: ["flows"] for name, _r, _i in heads}, "flows"
+    if case == "aggregate-head-vote-alone":
+        # One head on one family that it read, bullish: the aggregate is
+        # right here, and is still only an aggregate.
+        heads = [("credit_only", 0.6, [("credit", "bullish", 1.0)])]
+        return _ensemble_prediction(heads), {"credit_only": ["credit"]}, "credit"
+    raise AssertionError(case)
+
+
+def _exact_gateway(
+    case: str, receipts: dict[str, Any] | None = None
+) -> tuple[Any, str, dg.DecisionResponse]:
+    """Run ``should_i_trade`` on an exact-ensemble case's prediction."""
+    pred, families, family = _exact_case(case)
+    # predict() leaves the regime blank here, so the card is the flat one.
+    resp = _run_gateway(
+        pred,
+        cards={},
+        flat_cards={family: _fenced_card(family, 1.3)},
+        receipts=receipts,
+        engine=_oracle_models_engine(families),
+    )
+    return pred, family, resp
+
+
+class TestCodexHold6033471347SignedFamilyReceipts:
+    """Abstain until signed per-family receipts exist; bounded issuance age."""
+
+    @pytest.mark.parametrize("case", _EXACT_CASES)
+    def test_exact_ensemble_gives_no_ticket_on_the_aggregate_head_vote(self, case: str) -> None:
+        from oracle.engine import EnsemblePrediction
+
+        pred, family, resp = _exact_gateway(case)
+        assert isinstance(pred, EnsemblePrediction)
+        assert (pred.direction, pred.as_of) == ("bullish", _SIGNED_CLOCK)
+        assert pred.confidence > 0.85
+        prov = resp.provenance_report
+        assert prov is not None, resp.stage_errors
+        # Round 6 counted the aggregate spread here: MEDIUM and a ticket.
+        assert _outcome(resp) == ("low", "low", False)
+        row = _evidence_rows(prov)[family]
+        assert row["classification"] == "strong"
+        assert row["signed_input"]["direction"] == "bullish"
+        assert row["signed_input"]["basis"] == "aggregate_head_vote_not_a_receipt"
+        assert row["receipt"] is None
+        assert _eligible_count(prov) == 0
+        assert prov.verdict_reason.startswith("no_eligible_directional_evidence")
+        assert "no_signed_family_receipt" in prov.verdict_reason
+        # The backstops refuse the same report forced to MEDIUM, and say why.
+        forced = replace(prov, verdict="medium")
+        reason = sp.actionable_refusal_reason(forced, now=_LIVE_NOW)
+        assert reason.startswith("no_eligible_directional_evidence")
+        assert "no_signed_family_receipt" in reason
+        assert _ticket(forced) is None
+        ticket, err = _gateway_ticket_stage(forced)
+        assert ticket is None and err.startswith("no_eligible_directional_evidence")
+        if case == "truncated-dissenting-head":
+            assert pred.model_count == 11
+            assert len(pred.model_votes) == 10
+            assert "flows_dissent" not in {v["model_name"] for v in pred.model_votes}
+
+    def test_receipt_contract_fields(self) -> None:
+        assert [f.name for f in fields(sp.SignedFamilyReceipt)] == [
+            "signal_source",
+            "direction",
+            "ticker",
+            "decision_clock",
+            "consumed_signals",
+            "head_directions",
+            "complete_contributing_set",
+        ]
+        receipt = _receipt(
+            "jodi_oil", heads=(("head_a", "bullish"), ("head_b", "bullish"))
+        )
+        assert receipt.to_dict() == {
+            "signal_source": "jodi_oil",
+            "direction": "bullish",
+            "ticker": "NVDA",
+            "decision_clock": _ZERO_EVIDENCE_CLOCK.isoformat(),
+            "consumed_signals": ["jodi_oil:obs-1"],
+            "head_directions": [["head_a", "bullish"], ["head_b", "bullish"]],
+            "complete_contributing_set": True,
+        }
+        assert (
+            sp.NO_SIGNED_FAMILY_RECEIPT,
+            sp.AGGREGATE_HEAD_VOTE_BASIS,
+            sp.DECISION_EXPIRED,
+        ) == (
+            "no_signed_family_receipt",
+            "aggregate_head_vote_not_a_receipt",
+            "decision_expired",
+        )
+
+    @pytest.mark.parametrize(
+        ("variant", "eligible"),
+        [
+            pytest.param("as-built", True, id="complete-and-agreeing"),
+            pytest.param("incomplete", False, id="incomplete-contributing-set"),
+            pytest.param("complete-not-a-bool", False, id="complete-is-not-True"),
+            pytest.param("head-dissents", False, id="one-head-dissents"),
+            pytest.param("head-neutral", False, id="one-head-neutral"),
+            pytest.param("no-heads", False, id="no-heads"),
+            pytest.param("blank-head", False, id="blank-head-name"),
+            pytest.param("no-consumed", False, id="no-consumed-signals"),
+            pytest.param("blank-consumed", False, id="blank-consumed-signal"),
+            pytest.param("opposite-sign", False, id="opposite-sign"),
+            pytest.param("another-family", False, id="another-family"),
+            pytest.param("another-ticker", False, id="another-ticker"),
+            pytest.param("another-clock", False, id="another-decision-clock"),
+            pytest.param("naive-clock", False, id="naive-clock"),
+        ],
+    )
+    def test_only_a_receipt_meeting_the_contract_is_eligible_contract(
+        self, variant: str, eligible: bool
+    ) -> None:
+        # Contract, not live: test-constructed receipts on a fenced strong card.
+        receipt = _receipt("jodi_oil", clock=_SIGNED_CLOCK)
+        changes: dict[str, dict[str, Any]] = {
+            "as-built": {},
+            "incomplete": {"complete_contributing_set": False},
+            "complete-not-a-bool": {"complete_contributing_set": 1},
+            "head-dissents": {"head_directions": (("head_a", "bullish"), ("head_b", "bearish"))},
+            "head-neutral": {"head_directions": (("head_a", "bullish"), ("head_b", "neutral"))},
+            "no-heads": {"head_directions": ()},
+            "blank-head": {"head_directions": ((" ", "bullish"),)},
+            "no-consumed": {"consumed_signals": ()},
+            "blank-consumed": {"consumed_signals": ("  ",)},
+            "opposite-sign": {"direction": "bearish"},
+            "another-family": {"signal_source": "pcr"},
+            "another-ticker": {"ticker": "AMD"},
+            "another-clock": {"decision_clock": _SIGNED_CLOCK + timedelta(seconds=1)},
+            "naive-clock": {"decision_clock": _SIGNED_CLOCK.replace(tzinfo=None)},
+        }
+        row = sp.SignalEvidence(
+            "jodi_oil",
+            1.0,
+            _fenced_card("jodi_oil", 1.3),
+            "strong",
+            receipt=replace(receipt, **changes[variant]),
+        )
+        assert sp.is_eligible_directional_evidence(
+            row, direction="bullish", decision_clock=_SIGNED_CLOCK, ticker="NVDA"
+        ) is eligible
+
+    def test_a_complete_agreeing_receipt_passes_the_floor_contract(self) -> None:
+        # Contract, not live: once an engine change exports receipts, a
+        # complete, agreeing receipt behind a fenced strong card at
+        # confidence above 0.85 tickets; an incomplete one does not.
+        pred, family, _ = _exact_case("aggregate-head-vote-alone")
+        receipt = _receipt(
+            family,
+            clock=_SIGNED_CLOCK,
+            heads=(("credit_only", "bullish"),),
+            consumed=("credit:obs-1",),
+        )
+        assert pred.confidence > 0.85
+        _, _, resp = _exact_gateway("aggregate-head-vote-alone", {family: receipt})
+        assert _outcome(resp) == ("medium", "medium", True)
+        assert resp.trade_ticket.direction == "bullish"
+        assert resp.stage_errors == {}
+        assert _eligible_count(resp.provenance_report) == 1
+        assert sp.actionable_refusal_reason(resp.provenance_report, now=_LIVE_NOW) is None
+
+        incomplete = replace(receipt, complete_contributing_set=False)
+        _, _, refused = _exact_gateway("aggregate-head-vote-alone", {family: incomplete})
+        assert _outcome(refused) == ("low", "low", False)
+        assert _eligible_count(refused.provenance_report) == 0
+
+    def test_a_dissenting_head_beyond_the_top_ten_vetoes_contract(self) -> None:
+        # Disagreement is judged over the complete contributing set: the
+        # eleventh head that model_votes dropped still vetoes.
+        pred, _, _ = _exact_case("truncated-dissenting-head")
+        top_ten = tuple((v["model_name"], "bullish") for v in pred.model_votes)
+        cases = {
+            "complete-set-with-the-dissent": _receipt(
+                "flows", clock=_SIGNED_CLOCK, heads=top_ten + (("flows_dissent", "bearish"),)
+            ),
+            "top-ten-only-not-complete": _receipt(
+                "flows", clock=_SIGNED_CLOCK, heads=top_ten, complete=False
+            ),
+        }
+        for name, receipt in cases.items():
+            _, _, resp = _exact_gateway("truncated-dissenting-head", {"flows": receipt})
+            assert _outcome(resp) == ("low", "low", False), name
+            assert _eligible_count(resp.provenance_report) == 0, name
+        # Control: the complete set, every head agreeing, would ticket.
+        agreeing = _receipt(
+            "flows", clock=_SIGNED_CLOCK, heads=top_ten + (("flows_dissent", "bullish"),)
+        )
+        _, _, resp = _exact_gateway("truncated-dissenting-head", {"flows": agreeing})
+        assert _outcome(resp) == ("medium", "medium", True)
+
+    def test_production_builds_no_receipt(self) -> None:
+        pred, _, _ = _exact_case("aggregate-head-vote-alone")
+        assert sp._family_receipts(pred, ticker="NVDA", clock=_SIGNED_CLOCK) == {}
+        # Receipt-shaped data riding on a prediction is not read either.
+        carrier = _signed_prediction(
+            call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]
+        )
+        carrier.family_receipts = _receipts("jodi_oil")
+        carrier.receipts = _receipts("jodi_oil")
+        assert sp._family_receipts(carrier, ticker="NVDA", clock=_SIGNED_CLOCK) == {}
+        report = _build_live(carrier, cards=_strong_jodi())
+        assert all(ev.receipt is None for ev in report.signal_evidence)
+        assert (report.verdict, _ticket(replace(report, verdict="medium"))) == ("low", None)
+
+    def test_an_expired_report_is_refused_as_expired(self) -> None:
+        # Live (no receipt): before the bound, the floor refuses it; one
+        # microsecond past an hour after its decision, the age does first.
+        report = _build_live(
+            _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]),
+            cards=_strong_jodi(),
+        )
+        inside = sp.actionable_refusal_reason(report, now=_SIGNED_CLOCK + timedelta(hours=1))
+        past = sp.actionable_refusal_reason(
+            report, now=_SIGNED_CLOCK + timedelta(hours=1, microseconds=1)
+        )
+        assert inside.startswith("no_eligible_directional_evidence")
+        assert past.startswith("decision_expired")
+
+    def test_the_issuance_bound_is_named_and_documented(self) -> None:
+        assert sp.ISSUANCE_MAX_AGE == sp.LIVE_CLOCK_MAX_AGE == timedelta(hours=1)
+        assert "ISSUANCE_MAX_AGE" in (sp.actionable_refusal_reason.__doc__ or "")
+
+    @pytest.mark.parametrize(
+        ("delay", "issued"),
+        [
+            pytest.param(timedelta(0), True, id="at-the-decision"),
+            pytest.param(timedelta(minutes=59, seconds=59), True, id="1s-inside"),
+            pytest.param(timedelta(hours=1), True, id="at-the-bound"),
+            pytest.param(timedelta(hours=1, microseconds=1), False, id="1us-past"),
+            pytest.param(timedelta(hours=1, seconds=1), False, id="1s-past"),
+            pytest.param(timedelta(days=1), False, id="1d-past"),
+        ],
+    )
+    def test_delayed_issuance(self, delay: timedelta, issued: bool) -> None:
+        # Contract: eligible evidence exists (a test-constructed receipt), so
+        # only the issuance age decides.
+        report = _ticketable_report()
+        now = _SIGNED_CLOCK + delay
+        reason = sp.actionable_refusal_reason(report, now=now)
+        ticket = _ticket_at(report, now)
+        stage_ticket, err = _stage_at(report, now)
+        if issued:
+            assert reason is None
+            assert ticket is not None
+            assert stage_ticket is not None and err is None
+        else:
+            assert reason is not None and reason.startswith("decision_expired")
+            assert ticket is None
+            assert stage_ticket is None
+            assert err is not None and err.startswith("decision_expired")
+
+    def test_the_bound_runs_from_the_decision_not_the_build(self) -> None:
+        # Contract: built 59 minutes after its decision (inside the builder's
+        # live window), the report has one minute left to issue.
+        clock = _LIVE_NOW - timedelta(minutes=59)
+        pred = _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])])
+        pred.as_of = clock
+        report = _build_live(
+            pred,
+            cards={"jodi_oil": _card_at("jodi_oil", 1.3, clock - timedelta(days=1))},
+            receipts=_receipts("jodi_oil", clock=clock),
+        )
+        assert report.verdict == "medium"
+        assert _ticket_at(report, _LIVE_NOW + timedelta(minutes=1)) is not None
+        assert _ticket_at(report, _LIVE_NOW + timedelta(minutes=1, seconds=1)) is None
+        late = sp.actionable_refusal_reason(report, now=_LIVE_NOW + timedelta(minutes=2))
+        assert late is not None and late.startswith("decision_expired")
