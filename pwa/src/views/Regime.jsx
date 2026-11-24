@@ -122,7 +122,7 @@ export default function Regime() {
 
     const { data, loading, error, refetch: loadData } = useAsyncData(async () => {
         const [current, all, hist, trans] = await Promise.all([
-            api.getCurrent(),
+            api.getCurrent({ force: true }),
             api.getAllActiveRegimes(),
             api.getHistory(90),
             api.getTransitions(),

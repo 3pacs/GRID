@@ -90,6 +90,9 @@ describe('Regime after a good read', () => {
         expect(screen.getByTestId('regime-banner-label')).toHaveTextContent('CURRENT');
         fireEvent.click(screen.getByText('REFRESH'));
         await waitFor(() => expect(api.getCurrent).toHaveBeenCalledTimes(2));
+        // Review 6033672651: mount and REFRESH are fresh network reads, never the 60 s cache.
+        expect(api.getCurrent).toHaveBeenNthCalledWith(1, { force: true });
+        expect(api.getCurrent).toHaveBeenNthCalledWith(2, { force: true });
         await waitFor(() => expect(screen.getByTestId('regime-banner-label'))
             .toHaveTextContent('LAST KNOWN · LATEST READ FAILED'));
         expect(storeState.setCurrentRegime).toHaveBeenCalledTimes(1);
