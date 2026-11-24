@@ -237,7 +237,7 @@ def test_three_lost_morning_minutes_withhold_that_day_and_the_next(run):
     assert doc["live_availability"]["signal_eligible"] == 4
     assert doc["comparison"]["features"]["F1"]["matched_sessions"] == 4
     assert doc["research_only"] == sorted(mf.FEATURES)
-    assert doc["schema"] == "factory-live-parity-v4"
+    assert doc["schema"] == "factory-live-parity-v5"
 
 
 def test_one_lost_minute_keeps_the_return_features_and_withholds_the_range_that_reads_it(run):
@@ -543,6 +543,7 @@ def test_the_verdict_is_taken_on_the_five_most_recent_sessions_and_an_older_fail
     assert f1["verdict_on"] == {"sessions": LONGER[-5:], "matched": 5, "required": 5,
                                 "missing": {"research": [], "live": []}, "not_recorded_under_the_rule": [],
                                 "recorded_values_differ_from_the_bars": [],
+                                "recorded_outside_the_decision_window": [],
                                 "values_out_of_tolerance": 0, "eligible_rows_with_no_value": 0,
                                 "sessions_with_an_availability_disagreement": [],
                                 "sessions_with_no_research_spread": [],
@@ -987,3 +988,239 @@ def test_the_command_takes_a_candidate(tmp_path, capsys, monkeypatch):
     assert [(g["feature"], g["decision"], g["op"], g["k"], g["status"]) for g in gate["candidates"]] == [("F1", "15:00", ">=", 0.5, "not_ready")]
     with pytest.raises(flp.ParityError):
         flp.main(args[:-6] + ["--candidate", "F1", "09:45", ">=", "0.5"])
+
+
+# ── version 5 and the 2026-11-16 addendum to #1160: a value is a decision input only if it was there at the decision ──
+
+
+def _restamped(hm, second=0, when=lambda r: True):
+    """The recorder's rows as written at ``hm`` New York time on their own day, value and binding together."""
+    def change(rows):
+        for r in rows:
+            if when(r):
+                r["recorded_at"] = r["terms_recorded_at"] = _utc(r["day"], hm, second)
+    return change
+
+
+def test_what_a_decision_stamp_must_be():
+    """An eligible value is a decision input only when stamped at or after the decision time and under 120 seconds after it."""
+    day = "2026-11-06"
+
+    def row(at, eligible=True):
+        return {"raw": 0.1, "eligible": eligible, "recorded_at": at}
+
+    assert flp.DECISION_WINDOW_S == 120                   # gex-signals factory_slots.DECISION_WINDOW_S: change both or neither
+    assert flp.stamp_problem(row(_utc(day, "15:00")), day, "15:00") is None
+    assert flp.stamp_problem(row(_utc(day, "15:01", 59)), day, "15:00") is None
+    assert flp.stamp_problem(row(_utc(day, "15:01", 59).replace("+00:00", ".900000+00:00")), day, "15:00") is None   # whole seconds, as the recorder counts
+    assert flp.stamp_problem(row(_utc(day, "15:02")), day, "15:00") == "value_stamped_after_the_decision_window"
+    assert flp.stamp_problem(row(_utc(day, "14:59", 59)), day, "15:00") == "value_stamped_before_the_decision_time"
+    assert flp.stamp_problem(row(_utc("2026-11-09", "15:00", 20)), day, "15:00") == "value_stamped_after_the_decision_window"   # another day's 15:00
+    assert flp.stamp_problem(row("2026-11-06T20:00:20"), day, "15:00") is None             # no zone is read as UTC, as the recorder reads it
+    assert flp.stamp_problem(row("15:00"), day, "15:00") == "value_stamp_unreadable"
+    assert flp.stamp_problem(row(None), day, "15:00") == "value_stamp_unreadable"
+    assert flp.stamp_problem(row(_utc(day, "18:30"), eligible=False), day, "15:00") is None   # no value is claimed
+    assert flp.stamp_problem(None, day, "15:00") is None
+
+
+@pytest.mark.parametrize(("hm", "second", "stamp"), [
+    ("15:02", 0, "value_stamped_after_the_decision_window"),
+    ("18:30", 0, "value_stamped_after_the_decision_window"),
+    ("14:59", 59, "value_stamped_before_the_decision_time"),
+])
+def test_an_equal_value_written_outside_the_decision_window_is_not_a_decision_input(run, hm, second, stamp):
+    """The addendum: equivalent values delivered after a decision are not equivalent decision inputs."""
+    day = "2026-11-06"
+
+    doc = run(_days(), _days(), recorded=_restamped(hm, second, when=lambda r: r["day"] == day and r["feature"] == "F1"))
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert doc["live_ready"] == ["F10", "F11", "F1_shift30"] and doc["schema"] == "factory-live-parity-v5"
+    assert f1["reasons"] == [flp.RECORDED_LATE, "insufficient_matched_sessions"]
+    assert f1["verdict_on"]["recorded_outside_the_decision_window"] == [day]
+    assert f1["values_recorded_outside_the_decision_window"] == 1 and f1["matched_sessions"] == 5
+    row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["day"] == day)
+    # Everything else about the row is in order: the bars agree with research, the value is the one the bars give,
+    # and it is bound to these terms with its own stamp. Only the time it was written is wrong.
+    assert row["within_tolerance"] is True and row["binding"] == "bound_to_these_terms"
+    assert row["recorded_agrees_with_bars"] is True and row["recorded_value"] == row["live"] == row["research"]
+    assert row["decision_stamp"] == stamp and row["matched"] is False
+    others = {r["decision_stamp"] for r in doc["comparison"]["value_rows"] if r["day"] > SESSIONS[0] and r is not row}
+    assert others == {"inside_the_decision_window"}
+    assert doc["live_rule"]["decision_window_s"] == 120
+
+
+def test_no_feature_becomes_ready_by_a_matching_later_recomputation(run):
+    """The addendum: no research-only feature becomes live-ready through backward filling. Every value recomputed
+    that evening from complete bars equals research, is bound to the terms, and is what the bars give."""
+    doc = run(_days(), _days(), recorded=_restamped("18:30"))
+
+    assert doc["live_ready"] == []
+    for f in mf.FEATURES:
+        feature = doc["comparison"]["features"][f]
+        assert feature["reasons"] == [flp.RECORDED_LATE, "insufficient_matched_sessions"]
+        assert feature["values_matched"] == 0 and feature["values_out_of_tolerance"] == 0
+        assert feature["values_bound_to_the_terms"] == feature["values_required"] == 7
+        assert feature["values_recorded_outside_the_decision_window"] == 6          # the first session has no prior: no value claimed
+    gate = run(_days(), _days(), recorded=_restamped("18:30"), candidates=[("F1", "15:00", ">=", "0.5")])["slot_gate"]
+    assert gate["ready"] == [] and flp.VALUE_NOT_MATCHED in gate["candidates"][0]["reasons"]
+
+
+def test_replay_a_live_bar_that_arrived_after_the_decision(run):
+    """Late arrival: at 15:00 the bar closing at the decision was not there, so the recorder withheld the session and
+    wrote no value. The bar came later and the recording is now complete. The bars agree with research; the decision
+    did not have them."""
+    day = "2026-11-06"
+    at_the_time = _days()
+    del at_the_time[day]["14:59"]
+    _, withheld, _ = flp.live_features(at_the_time, None, day, "15:00")
+    assert set(map(tuple, withheld.values())) == {(flp.PREFIX_INCOMPLETE,)}
+
+    def as_first_recorded(rows):
+        for r in rows:
+            if r["day"] == day:
+                r["raw"], r["eligible"] = None, 0
+                r["recorded_at"] = r["terms_recorded_at"] = _utc(day, "15:02")       # the window was over: missed_decision_window
+
+    doc = run(_days(), _days(), recorded=as_first_recorded)
+
+    assert doc["live_ready"] == [] and doc["comparison"]["availability_mismatch"] == []   # on today's bars the two sides agree
+    for f in mf.FEATURES:
+        feature = doc["comparison"]["features"][f]
+        assert feature["reasons"] == [flp.RECORDED_DIFFERS, "insufficient_matched_sessions"]
+        assert feature["verdict_on"]["recorded_values_differ_from_the_bars"] == [day]
+        row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == f and r["day"] == day)
+        assert row["within_tolerance"] is True and row["live"] is not None
+        assert row["recorded_value"] is None and row["recorded_agrees_with_bars"] is False and row["matched"] is False
+        assert row["decision_stamp"] is None              # the recorder claimed no value, so there is no stamp to judge
+
+
+def test_replay_a_live_bar_revised_after_the_decision_keeps_the_value_first_recorded(run):
+    """Revision: the bar closing at the decision was corrected after the recorder wrote. The report shows the value
+    as first recorded beside what the corrected bars give, and the corrected one is never taken in its place."""
+    day = "2026-11-06"
+    first, _, _ = flp.live_features(_days(), None, day, "15:00")
+    revised = _days()
+    _nudged(revised, day, "14:59", _f1_dollars(day, 0.05))                # a correction well inside the tolerance
+
+    def as_first_recorded(rows):
+        for r in rows:
+            if r["day"] == day:
+                r["raw"] = first[r["feature"]]
+
+    doc = run(_days(), revised, recorded=as_first_recorded)
+
+    assert doc["live_ready"] == []
+    for f in mf.FEATURES:
+        feature = doc["comparison"]["features"][f]
+        row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == f and r["day"] == day)
+        assert row["recorded_value"] == first[f] == row["research"] and row["live"] != first[f]
+        assert row["binding"] == "bound_to_these_terms" and row["decision_stamp"] == "inside_the_decision_window"
+        assert row["recorded_agrees_with_bars"] is False and row["matched"] is False
+        assert flp.RECORDED_DIFFERS in feature["reasons"] and feature["recorded_values_that_differ_from_the_bars"] == 1
+    f1 = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["day"] == day)
+    assert f1["within_tolerance"] is True and f1["diff_in_spreads"] == pytest.approx(0.05, rel=1e-3)
+
+
+def test_only_the_recorded_price_features_can_be_judged_and_level_features_are_tagged_unchecked(run):
+    """The addendum's watch and contact clocks apply when a level feature (#1158, #1132) is integrated. None is: this
+    report judges four price features, and no other feature can be named ready, whatever its tag says. A level
+    feature's tag changing from "parity unchecked" fails here, which is when those clock tests are owed."""
+    assert set(flp.FEATURE_TYPE) == set(mf.FEATURES) == {"F1", "F10", "F11", "F1_shift30"}
+    doc = run(_days(), _days())
+    assert set(doc["comparison"]["features"]) == set(mf.FEATURES)
+    assert set(doc["live_ready"]) | set(doc["research_only"]) == set(mf.FEATURES)
+    outside = [f for f in mf.REGISTRY if f not in mf.FEATURES]
+    assert len(outside) == len(mf.REGISTRY) - 4
+    for f in outside:
+        with pytest.raises(flp.ParityError, match="is not a factory feature"):
+            flp.parse_candidate(f, "15:00", ">=", 1.0, ["15:00"])
+    levels = [f for f in mf.REGISTRY if mf.FEATURE_CLASS[f] == "options"]
+    assert levels and all("parity unchecked" in mf.REGISTRY[f]["live_source"] and "#1160" in mf.REGISTRY[f]["live_source"]
+                          for f in levels)
+    # Two features carry the SPY live tag and are not recorded live: the tag is a claim this report never tested.
+    tagged_live = sorted(f for f in outside if mf.REGISTRY[f]["live_source"] == mf.FEATURE_SPECS["F1"]["live_source"])
+    assert tagged_live == ["F10_shift30", "F11_shift30"]
+
+
+def test_the_report_reads_intraday_receipts_and_no_daily_context(run, monkeypatch):
+    """The addendum: daily context (#1191) is kept apart from intraday receipts. The report reads the research bars,
+    the live bars, the backstop bars and the recorder's own rows, and nothing else in either database."""
+    read: set[str] = set()
+    real = flp._connect
+
+    def watched(path):
+        con = real(path)
+
+        def note(action, table, *_):
+            if action == sqlite3.SQLITE_READ:
+                read.add(table)
+            return sqlite3.SQLITE_OK
+
+        con.set_authorizer(note)
+        return con
+
+    monkeypatch.setattr(flp, "_connect", watched)
+    run(_days(), _days(), backstop={}, candidates=[("F1", "15:00", ">=", "0.5")])
+
+    assert read == {"bars", "bars_1m_live", "factory_backstop_bars", "factory_feature_values", "factory_feature_terms",
+                    "sqlite_master"}
+
+
+def test_every_count_has_its_denominator_and_every_excluded_row_its_cause(run):
+    """The addendum: valid matched rows, and excluded, missing and late cases, each against a denominator. One window
+    with a lost minute, a session the feed lacks, a value out of tolerance, an unbound value and a late one."""
+    live = _days(LONGER)
+    del live["2026-11-04"]["10:01"]                                           # a lost minute, no backstop
+    del live["2026-11-06"]                                                    # a session the feed lacks
+    _nudged(live, "2026-11-10", "14:59", _f1_dollars("2026-11-10", 0.12, LONGER))    # out of tolerance
+
+    def recorder(rows):
+        for r in rows:
+            if r["feature"] == "F1" and r["day"] == "2026-11-11":
+                r["terms_sha256"] = None                                      # an older generation's value
+            if r["feature"] == "F1" and r["day"] == "2026-11-12":
+                r["recorded_at"] = r["terms_recorded_at"] = _utc(r["day"], "15:05")   # late
+
+    doc = run(_days(LONGER), live, last=LONGER[-1], recorded=recorder)
+
+    held = [d for d in LONGER if d != "2026-11-06"]
+    assert doc["expected_sessions_missing"] == {"research": [], "live": ["2026-11-06"]}
+    assert doc["comparison"]["overlapping_sessions"] == held and doc["research_sessions"] == len(LONGER)
+    assert doc["live_ready"] == []
+    for f in mf.FEATURES:
+        feature = doc["comparison"]["features"][f]
+        rows = [r for r in doc["comparison"]["value_rows"] if r["feature"] == f]
+        assert len(rows) == len(held) and all(r["applicable"] for r in rows)
+        matched = [r for r in rows if r["matched"]]
+        excluded = [r for r in rows if not r["matched"]]
+        assert feature["values_required"] == len(rows) == len(matched) + len(excluded)
+        assert feature["values_matched"] == len(matched)
+        assert feature["values_compared"] == sum(r["abs_diff"] is not None for r in rows)
+        assert feature["values_out_of_tolerance"] == sum(r["within_tolerance"] is False for r in rows)
+        assert feature["values_not_bound"] == sum(r["binding"] != "bound_to_these_terms" for r in rows)
+        assert feature["values_bound_to_the_terms"] + feature["values_not_bound"] == len(rows)
+        assert feature["values_recorded_outside_the_decision_window"] == sum((r["decision_stamp"] or "").startswith("value_") for r in rows)
+        assert feature["recorded_values_that_differ_from_the_bars"] == sum(
+            r["binding"] == "bound_to_these_terms" and r["recorded_agrees_with_bars"] is False for r in rows)
+        for r in excluded:                                # no row is dropped without a stated cause
+            assert (not r["both_eligible"] or r["within_tolerance"] is not True or r["binding"] != "bound_to_these_terms"
+                    or r["recorded_agrees_with_bars"] is not True or (r["decision_stamp"] or "").startswith("value_")), r
+        verdict = feature["verdict_on"]
+        assert verdict["sessions"] == LONGER[-5:] and verdict["required"] == 5
+        assert verdict["matched"] == sum(all(r["matched"] for r in rows if r["day"] == d) for d in LONGER[-5:] if d in held)
+        assert verdict["missing"] == {"research": [], "live": ["2026-11-06"]}
+    f1 = doc["comparison"]["features"]["F1"]
+    assert (f1["values_out_of_tolerance"], f1["values_not_bound"], f1["values_recorded_outside_the_decision_window"]) == (1, 1, 1)
+    assert f1["reasons"] == [flp.SESSION_MISSING, flp.RULE_NOT_RECORDED, flp.RECORDED_LATE, "insufficient_matched_sessions",
+                             "value_out_of_tolerance", "availability_mismatch"]
+    live_side = doc["live_availability"]
+    withheld = sum(bool(r["signal_withheld"]) for r in live_side["rows"])
+    assert live_side["sessions"] == len(held) and live_side["signal_rows"] == len(held) == live_side["signal_eligible"] + withheld
+    assert live_side["label_rows"] == live_side["label_available"] + sum(bool(r["label_missing"]) for r in live_side["rows"])
+    assert sum(live_side["signal_withheld_reasons"].values()) == withheld == 2         # the first session, and the one after the gap
+    for f in mf.FEATURES:
+        per_feature = sum(f in r["feature_withheld"] for r in live_side["rows"])
+        assert live_side["feature_eligible"][f] == live_side["signal_eligible"] - per_feature
+    labels = doc["comparison"]["labels"]
+    assert labels["rows"] == labels["compared"] + labels["missing_on_a_side"] == len(held)
