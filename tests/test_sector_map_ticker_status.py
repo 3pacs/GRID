@@ -59,12 +59,13 @@ def test_successors_are_tiingo_equities_and_live() -> None:
 
 @pytest.mark.parametrize("old, new", [("NYCB", "FLG"), ("SJW", "HTO"), ("TPX", "SGI"), ("ERJ", "EMBJ"),
                                       ("MOG.A", "MOG-A"), ("KELY.A", "KELYA"), ("EQR", "VMRK"),
-                                      ("BKH", "HZN"), ("KPTI", "KPTIQ"), ("GWHT", "GWHTQ"), ("GWH", "GWHTQ")])
+                                      ("BKH", "HZN")])
 def test_renamed_symbols_price_under_the_successor(old: str, new: str) -> None:
     assert sm.price_ticker(old) == new
 
 
-@pytest.mark.parametrize("dead", ["HES", "JNPR", "DFS", "WBA", "SKX", "CFLT", "PTR", "UMG", "FCPO", "ROKU"])
+@pytest.mark.parametrize("dead", ["HES", "JNPR", "DFS", "WBA", "SKX", "CFLT", "PTR", "UMG", "FCPO", "ROKU",
+                                  "KPTI", "GWHT", "GWH"])
 def test_dead_and_foreign_symbols_price_nothing(dead: str) -> None:
     assert sm.price_ticker(dead) is None
 

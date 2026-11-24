@@ -54,10 +54,6 @@ TICKER_STATUS:
     status: renamed
     successor: TDAY
     note: Gannett -> USA TODAY Co.; Tiingo GCI is the pre-2019 Gannett (ends 2019-11-19), TDAY carries the current company from 2014-02-04
-  GWH:
-    status: renamed
-    successor: GWHTQ
-    note: 'ESS Tech delisted from NYSE 2026-10-02, quoted OTC as GWHT from 2026-10-05; Chapter 7 petition filed 2026-11-13 (see GWHT below). Tiingo lists GWHTQ as ESS Tech Inc (OTCMKTS) with history from 2021-01-04 (read 2026-11-23)'
   KELY.A:
     status: renamed
     successor: KELYA
@@ -190,6 +186,9 @@ TICKER_STATUS:
   X: {status: acquired, acquirer: Nippon Steel, last_session: 2025-06-18}
 
   # ── delisted ────────────────────────────────────────────────────────────────
+  GWH:
+    status: delisted
+    note: 'ESS Tech delisted from NYSE 2026-10-02, quoted OTC as GWHT from 2026-10-05; Chapter 7 petition filed 2026-11-13 (see GWHT below). Was renamed -> GWHT here until 2026-11-23. Not priced any more (owner, 2026-11-23): the OTC shares, which Tiingo lists as GWHTQ, are not fetched. Tiingo''s GWH listing has no start or end date (read 2026-11-23), so no last_session is given'
   ELME:
     status: delisted
     last_session: 2026-10-23
@@ -243,15 +242,15 @@ TICKER_STATUS:
   # ── not in the sector map (added 2026-11-23) ────────────────────────────────
   # Symbols Tiingo stopped serving that reach the routine price list from the
   # oracle, hypothesis or insider-buyer universes (2026-11-10..23: each kept the
-  # Tiingo price run PARTIAL for days). Successors are the symbols Tiingo's own
-  # listing carries the issuer under; where its listing gives no end date, no
-  # last_session is written.
+  # Tiingo price run PARTIAL for days). Both issuers' shares moved to the OTC
+  # market under another symbol after a bankruptcy filing. The owner decided on
+  # 2026-11-23 not to follow those symbols, so the entries are `delisted` and
+  # the OTC symbol is kept in the note only. Where Tiingo's listing gives no
+  # end date, no last_session is written.
   GWHT:
-    status: renamed
-    successor: GWHTQ
-    note: 'ESS Tech filed a Chapter 7 petition in the District of Delaware on 2026-11-13 (Panabee, 2026-11-13; an AI-written summary page). Tiingo no longer finds GWHT and lists GWHTQ as ESS Tech Inc (OTCMKTS) with history from 2021-01-04 (read 2026-11-23); no end date is given for GWHT, so no last_session. Last GWHT close GRID stored from Tiingo is 2026-11-13'
+    status: delisted
+    note: 'ESS Tech filed a Chapter 7 petition in the District of Delaware on 2026-11-13 (Panabee, 2026-11-13; an AI-written summary page). Tiingo no longer finds GWHT; no end date is given, so no last_session. Last GWHT close GRID stored from Tiingo is 2026-11-13. Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as GWHTQ, ESS Tech Inc (OTCMKTS), history from 2021-01-04 (read 2026-11-23)'
   KPTI:
-    status: renamed
-    successor: KPTIQ
+    status: delisted
     last_session: 2026-11-10
-    note: 'Karyopharm filed for Chapter 11; Nasdaq trading suspended from the open on 2026-11-11, shares expected to trade OTC as KPTIQ (Panabee, 2026-11-02; an AI-written summary page). Tiingo lists KPTIQ as Karyopharm Therapeutics Inc (OTCMKTS) with history from 2013-11-06. last_session is the endDate of Tiingo''s KPTI listing (read 2026-11-23)'
+    note: 'Karyopharm filed for Chapter 11; Nasdaq trading suspended from the open on 2026-11-11, shares expected to trade OTC as KPTIQ (Panabee, 2026-11-02; an AI-written summary page). last_session is the endDate of Tiingo''s KPTI listing (read 2026-11-23). Not followed (owner, 2026-11-23): Tiingo lists the OTC shares as KPTIQ, Karyopharm Therapeutics Inc (OTCMKTS), history from 2013-11-06'

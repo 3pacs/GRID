@@ -7,6 +7,10 @@ Tiingo stopped serving the four symbols between 2026-11-06 and 2026-11-13
 PARTIAL for days. Three live on under another symbol in Tiingo's own listing
 (HZN, KPTIQ, GWHTQ); ROKU was acquired.
 
+Owner decision 2026-11-23: "HZN only". BKH is followed to HZN, a live merged
+utility with continuous history. KPTIQ and GWHTQ, the OTC shares of two
+companies in bankruptcy, are named in the notes and never fetched.
+
 The sidecar has two readers: ``analysis.sector_map.price_ticker`` (what to
 fetch today) and ``tiingo_symbol_contract.tiingo_cutoff`` (TIINGO rows after
 ``last_session`` are not this instrument).
@@ -31,15 +35,24 @@ def _fresh_cutoffs():
 
 
 @pytest.mark.parametrize(("ticker", "status", "today"), [
-    ("BKH", "renamed", "HZN"),
-    ("GWHT", "renamed", "GWHTQ"),
-    ("GWH", "renamed", "GWHTQ"),      # was GWH -> GWHT; the chain ends at a live symbol again
-    ("KPTI", "renamed", "KPTIQ"),
+    ("BKH", "renamed", "HZN"),        # the one successor that is followed
+    ("GWHT", "delisted", None),
+    ("GWH", "delisted", None),        # the map's symbol for ESS Tech; was renamed -> GWHT
+    ("KPTI", "delisted", None),
     ("ROKU", "acquired", None),
 ])
 def test_the_four_symbols_are_retired(ticker, status, today):
     assert sm.TICKER_STATUS[ticker]["status"] == status
     assert sm.price_ticker(ticker) == today
+
+
+@pytest.mark.parametrize(("ticker", "otc_symbol"), [("KPTI", "KPTIQ"), ("GWHT", "GWHTQ"), ("GWH", "GWHTQ")])
+def test_the_otc_symbols_are_recorded_but_never_followed(ticker, otc_symbol):
+    entry = sm.TICKER_STATUS[ticker]
+    assert "successor" not in entry
+    assert otc_symbol in entry["note"] and "owner, 2026-11-23" in entry["note"]
+    assert otc_symbol not in sm.TICKER_STATUS
+    assert otc_symbol not in sm.price_tickers()
 
 
 def test_roku_names_its_acquirer_and_no_successor():
@@ -86,11 +99,11 @@ def test_map_actors_keep_their_place_in_the_map():
     assert {"BKH", "ROKU", "GWH"} <= tickers
 
 
-def test_the_routine_price_list_fetches_the_successors_not_the_retired_symbols(monkeypatch):
+def test_the_routine_price_list_fetches_hzn_and_none_of_the_others(monkeypatch):
     monkeypatch.setattr(tp.TiingoPuller, "oracle_tickers", staticmethod(lambda e: ["KPTI", "ROKU"]))
     monkeypatch.setattr(tp.TiingoPuller, "hypothesis_tickers", staticmethod(lambda e: ["GWHT"]))
     monkeypatch.setattr(tp.TiingoPuller, "insider_buyer_tickers", staticmethod(lambda e: ["BKH"]))
     monkeypatch.setattr(tp.TiingoPuller, "supply_chain_tickers", staticmethod(lambda e: []))
     tickers = set(tp.TiingoPuller.default_tickers(object()))
-    assert {"HZN", "KPTIQ", "GWHTQ"} <= tickers
-    assert not tickers & {"BKH", "GWHT", "GWH", "KPTI", "ROKU"}
+    assert "HZN" in tickers
+    assert not tickers & {"BKH", "GWHT", "GWH", "KPTI", "ROKU", "KPTIQ", "GWHTQ"}
