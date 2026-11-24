@@ -13,6 +13,12 @@ shadow verdict between FAIL, PASS, SKIP and absent: category, root cause and
 both signal lists must not move. Rows written before #1400 carry no flag;
 their CROSS_ASSET verdict (always PASS on griddb, from the replaced momentum
 read) is excluded by name.
+
+Composed with #1355: ``entry_price`` is the option premium and the classifier
+fails closed with ``insufficient_data`` when no underlying entry anchor is
+known, before any sanity-based category. The fixtures give it the underlying
+anchor (a completed close) so the pairs reach the sanity branches, and the
+fail-closed result is held to the same rule.
 """
 
 from __future__ import annotations
@@ -34,11 +40,15 @@ SHADOW_FLIPS = [
 FLIP_IDS = ["shadow-FAIL", "shadow-PASS", "shadow-SKIP", "absent"]
 
 
-def _classify(sanity: dict) -> tuple:
+# Underlying SPY spot at entry (a completed close); entry_price=1.0 is the premium.
+UNDERLYING_ENTRY = 700.0
+
+
+def _classify(sanity: dict, *, underlying_entry_price: float | None = UNDERLYING_ENTRY) -> tuple:
     return _classify_failure(
         ticker="SPY", direction="CALL", entry_price=1.0, strike=700.0, target=2.0,
         expiry="2026-12-18", outcome="LOSS", actual_return=-0.6, price_path=[],
-        data_at_decision={}, sanity=sanity,
+        data_at_decision={}, sanity=sanity, underlying_entry_price=underlying_entry_price,
     )
 
 
@@ -76,6 +86,17 @@ def test_legacy_row_without_flag_excludes_cross_asset_by_name():
     legacy = {**ONE_REAL_FAIL, "CROSS_ASSET": {"status": "PASS", "reason": "Momentum (+0.00%) and regime aligned with CALL"}}
     assert _classify(legacy) == _classify(ONE_REAL_FAIL)
     assert "sanity_CROSS_ASSET_passed" not in _classify(legacy)[3]
+
+
+@pytest.mark.parametrize("real", [ONE_REAL_FAIL, TWO_REAL_FAILS], ids=["one-real-FAIL", "two-real-FAILs"])
+def test_shadow_flip_does_not_change_the_fail_closed_result_without_an_anchor(real):
+    # #1355: no underlying entry anchor -> insufficient_data. The shadow verdict
+    # changes neither that result nor the signal lists it carries.
+    results = [_classify({**real, **flip}, underlying_entry_price=None) for flip in SHADOW_FLIPS]
+    assert all(r == results[0] for r in results), dict(zip(FLIP_IDS, results, strict=True))
+    category, _root, wrong, right, _missed = results[0]
+    assert category == "insufficient_data"
+    assert not any("CROSS_ASSET" in name for name in wrong + right)
 
 
 def test_active_sanity_excludes_by_flag_and_by_name_and_never_mutates():
@@ -125,7 +146,10 @@ def _generate(monkeypatch: pytest.MonkeyPatch, sanity: dict) -> tuple[Any, dict]
     monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
     monkeypatch.setattr(pm_mod, "_reconstruct_decision_data",
                         lambda _e, _t, _g, s, d: {"sanity_status": s, "dealer_context": d})
-    monkeypatch.setattr(pm_mod, "_load_price_path", lambda *_a, **_k: [])
+    # #1355 reads the path with its source and anchors on a completed close.
+    monkeypatch.setattr(pm_mod, "_load_price_path_with_source", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(pm_mod, "_load_underlying_entry_spot",
+                        lambda *_a, **_k: (UNDERLYING_ENTRY, "fixture: completed close known at decision"))
     monkeypatch.setattr(pm_mod, "_get_llm_postmortem", lambda **kw: seen.update(kw) or {})
     monkeypatch.setattr(pm_mod, "_store_postmortem", lambda _e, pm, **_k: stored.update(pm=pm))
     monkeypatch.setattr(pm_mod, "_emit_trade_postmortem", lambda **_k: None)
