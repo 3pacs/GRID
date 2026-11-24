@@ -18,6 +18,10 @@ Covers:
    (date, age, reason) and is never the consumed row, an entry anchor or an
    attribution input without recorded lineage; regime and capital-flow context
    is read by date only and labelled descriptive.
+9. Composed with #1400 (shadow sanity verdicts are recorded, never evidence):
+   a shadow verdict next to descriptive scanner, regime and flow context. Neither
+   becomes evidence, the completed-close anchor is unchanged, and the narrative
+   sees active sanity layers only, with the context under its own label.
 
 All tests are offline (synthetic inputs, mocks, or in-memory SQLite).
 """
@@ -706,6 +710,162 @@ class TestReconstructedContextIsDescriptive:
         assert "not proven known at decision" in descriptive_part.split("\n", 1)[0]
         assert "CRISIS_MARKER" in descriptive_part and "FLOW_MARKER" in descriptive_part
 
+
+
+class TestDescriptiveContextWithShadowSanity:
+    """#1355 composed with #1400: a shadow sanity verdict and descriptive context.
+
+    #1400 keeps a shadow verdict (``"shadow": true``, or CROSS_ASSET by name) in
+    the raw record but never as evidence. #1355 keeps the reconstructed scanner,
+    regime and capital-flow rows under ``descriptive_context``, never an entry
+    anchor or an attribution input without lineage. With both present, the
+    category, root cause and signal lists equal those of the same trade with
+    neither, the completed close stays the anchor, and the narrative's DATA AT
+    DECISION holds active sanity layers only.
+    """
+
+    WED = date(2026, 4, 15)
+    REAL_ONE = {
+        "DATA_QUALITY": {"status": "PASS", "reason": "fresh"},
+        "DEALER_FLOW": {"status": "FAIL", "reason": "long gamma, low confidence"},
+    }
+    REAL_TWO = {**REAL_ONE, "HISTORICAL_ANALOG": {"status": "FAIL", "reason": "analogs lost"}}
+    SHADOW_FAIL = {"CROSS_ASSET": {"status": "FAIL", "reason": "momentum contradicts CALL",
+                                   "shadow": True}}
+    REALS = pytest.mark.parametrize(
+        "real, category",
+        [(REAL_ONE, "wrong_signal"), (REAL_TWO, "model_error")],
+        ids=["one-real-FAIL", "two-real-FAILs"],
+    )
+
+    @staticmethod
+    def _descriptive_data() -> dict:
+        """A reconstruction carrying a stale, bearish, unlinked scanner row,
+        regime and flow, all under the descriptive label."""
+        return {
+            "decision_date": "2026-04-15",
+            "descriptive_context": {
+                "label": pm_mod.DESCRIPTIVE_CONTEXT_LABEL,
+                "scanner": {"signal_date": "2026-04-03", "age_days": 12, "fallback": False,
+                            "put_call_ratio": 1.5, "iv_skew": 0.0, "max_pain": 120.0,
+                            "spot_price": 100.0, "reason": "newest row written by the clock"},
+                "regime": {"state": "CRISIS"},
+                "capital_flow": {"narrative": "risk-off rotation"},
+            },
+            "scanner_attribution_unavailable": pm_mod.SCANNER_ATTRIBUTION_ABSTAINED,
+        }
+
+    @staticmethod
+    def _classify(data: dict, sanity: dict, underlying: float | None) -> tuple:
+        return _classify_failure(
+            ticker="AAPL", direction="CALL", entry_price=2.50, strike=100.0, target=5.00,
+            expiry=date(2026, 4, 17), outcome="EXPIRED", actual_return=-1.0,
+            price_path=[{"date": "2026-04-16", "price": 98.0},
+                        {"date": "2026-04-17", "price": 97.0}],
+            data_at_decision=data, sanity=sanity, underlying_entry_price=underlying,
+        )
+
+    @REALS
+    def test_classifier_attributes_neither_shadow_verdict_nor_descriptive_scanner(self, real, category):
+        plain = self._classify({"decision_date": "2026-04-15"}, real, 100.0)
+        composed = self._classify(self._descriptive_data(), {**real, **self.SHADOW_FAIL}, 100.0)
+        assert composed == plain
+        got_category, root, wrong, right, _missed = composed
+        assert got_category == category, root
+        assert "days old" not in root
+        assert not any("CROSS_ASSET" in n for n in wrong + right)
+        assert _scanner_attributions((right, wrong)) == []
+
+    @REALS
+    def test_without_an_anchor_neither_one_moves_the_fail_closed_result(self, real, category):
+        """The descriptive scanner spot is no anchor and the shadow verdict is no
+        signal: both trades abstain alike."""
+        plain = self._classify({"decision_date": "2026-04-15"}, real, None)
+        composed = self._classify(self._descriptive_data(), {**real, **self.SHADOW_FAIL}, None)
+        assert composed == plain
+        assert composed[0] == "insufficient_data"
+        assert not any("CROSS_ASSET" in n for n in composed[2] + composed[3])
+
+    def _run(self, monkeypatch, *, sanity: dict, with_context: bool) -> tuple[PostMortem, list[str]]:
+        """generate_postmortem on one EXPIRED CALL, through the real narrative
+        prompt builder with a fake LLM; returns the post-mortem and its prompts."""
+        gen_ts = _ny(self.WED, 11).astimezone(timezone.utc)
+        row = list(_trade_row(31, "AAPL", "CALL", date(2026, 4, 17), gen_ts,
+                              _ny(date(2026, 4, 17), 17)))
+        row[10] = json.dumps(sanity)  # sanity_status
+        db = _ClockFakeDB(tuple(row))
+        for d, v in ((date(2026, 4, 14), 100.0), (self.WED, 99.0),
+                     (date(2026, 4, 16), 98.0), (date(2026, 4, 17), 97.0)):
+            db.add_close("AAPL", d, v, _ny(d, 17, 30))
+        if with_context:
+            db.add_signal("AAPL", date(2026, 4, 3), 100.0, _ny(date(2026, 4, 3), 16, 30),
+                          pcr=1.5, iv_skew=0.0)
+            db.regime = ("CRISIS", 0.9, 0.4)
+            db.flow = ("risk-off rotation into treasuries", date(2026, 4, 15))
+
+        prompts: list[str] = []
+
+        class _LLM:
+            is_available = True
+
+            def generate(self, prompt, **_kw):
+                prompts.append(prompt)
+                return "MISSED: x\nFIX: y\nCONFIDENCE: 0.4"
+
+        monkeypatch.setattr("llm.router.get_llm", lambda _tier: _LLM())
+        monkeypatch.setitem(sys.modules, "intelligence.rag",
+                            types.SimpleNamespace(get_rag_context=lambda *a, **k: ""))
+        monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: None))
+        monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
+        monkeypatch.setattr(pm_mod, "_store_postmortem", lambda *a, **k: None)
+        monkeypatch.setattr(pm_mod, "_emit_trade_postmortem", lambda **k: None)
+        return generate_postmortem(db, trade_id=31), prompts
+
+    @REALS
+    def test_generate_postmortem_keeps_both_in_the_record_and_out_of_evidence(
+        self, monkeypatch, real, category,
+    ):
+        plain, _ = self._run(monkeypatch, sanity=real, with_context=False)
+        raw_sanity = {**real, **self.SHADOW_FAIL}
+        composed, prompts = self._run(monkeypatch, sanity=raw_sanity, with_context=True)
+
+        # Neither one is evidence: the classification equals the plain trade's.
+        fields = ("failure_category", "root_cause", "which_signals_were_wrong",
+                  "which_signals_were_right")
+        assert [getattr(composed, f) for f in fields] == [getattr(plain, f) for f in fields]
+        assert composed.failure_category == category, composed.root_cause
+        assert "sanity_CROSS_ASSET_failed" not in composed.which_signals_were_wrong
+        assert _scanner_attributions((composed.which_signals_were_right,
+                                      composed.which_signals_were_wrong)) == []
+
+        # The completed-close anchor is unchanged by the scanner row.
+        data = composed.data_at_decision
+        assert data["underlying_entry_spot"] == pytest.approx(100.0)
+        assert data["underlying_entry_spot_basis"] == plain.data_at_decision["underlying_entry_spot_basis"]
+        assert "scanner_signals" not in data
+
+        # Both stay in the raw record: the shadow verdict as stored, the
+        # context under its descriptive label.
+        assert composed.sanity_results_at_decision == raw_sanity
+        assert data["sanity_status"] == raw_sanity
+        context = data["descriptive_context"]
+        assert context["label"] == pm_mod.DESCRIPTIVE_CONTEXT_LABEL
+        assert context["scanner"]["signal_date"] == "2026-04-03"
+        assert context["regime"]["state"] == "CRISIS"
+        assert context["capital_flow"]["snapshot_date"] == "2026-04-15"
+
+        # The narrative: DATA AT DECISION holds active sanity layers and no
+        # descriptive context; the context sits under its own label.
+        assert prompts
+        decision_part = prompts[0].split("DATA AT DECISION:", 1)[1].split("\n\n", 1)[0]
+        assert "DEALER_FLOW" in decision_part
+        assert "CROSS_ASSET" not in decision_part
+        for marker in ("2026-04-03", "CRISIS", "risk-off rotation"):  # scanner, regime, flow
+            assert marker not in decision_part, marker
+        # The labelled block is capped at 600 chars; scanner and regime fit in it.
+        descriptive_part = prompts[0].split("DESCRIPTIVE CONTEXT", 1)[1]
+        assert "2026-04-03" in descriptive_part and "CRISIS" in descriptive_part
+        assert "CROSS_ASSET" not in prompts[0]
 
 # ── Defect 2: Staleness check uses future expiry instead of decision time ──
 
