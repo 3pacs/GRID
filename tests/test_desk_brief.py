@@ -693,3 +693,102 @@ def test_factory_block_error_is_a_problem(tmp_path):
     panel, db = _panel(tmp_path, [], status="error", error="signals.db locked")
     sec, _ = S.factory_slots(panel, db, "post_close", SESSION, POST)
     assert sec.problems == ("factory block status error: signals.db locked",)
+
+
+# ── desk-state sector layer (#1209) ──────────────────────────────────────────
+
+def _sector_rec(day: str) -> dict:
+    return {"schema": "desk-sector-state/1", "data_through": day, "kind": "live", "for_session": "2026-11-20",
+            "read": "Market rising, speeding up (+0.1 % over 63 sessions); 3 of 11 sectors rising.",
+            "market": {"phase": "rising, speeding up", "trend_pct": 0.06}, "sectors_rising": 1,
+            "leaders": ["Energy"], "laggards": ["Utilities"],
+            "sectors": {"Energy": {"group": "cyclical", "phase": "rising, slowing", "trend_pct": 4.0,
+                                   "relative_trend_pct": 3.9, "leading": True},
+                        "Utilities": {"group": "defensive", "phase": "falling, speeding up", "trend_pct": -2.0,
+                                      "relative_trend_pct": -2.1, "leading": False}},
+            "fed_balance_sheet": {"phase": "flat", "growth_13w_pct": -0.02},
+            "vix": {"third": "middle", "spike_state": "none", "stale": False},
+            "events": {"next_session": [], "within_7_days": [{"date": "2026-11-25", "event": "GDP"}]},
+            "overnight_rule": {"market_gate": True, "sectors_in": ["Energy"]}}
+
+
+def _sector_db(tmp_path, rows) -> str:
+    import hashlib
+
+    p = tmp_path / "state.db"
+    con = sqlite3.connect(p)
+    con.execute("CREATE TABLE desk_state (data_through TEXT PRIMARY KEY, kind TEXT NOT NULL, schema TEXT NOT NULL, "
+                "record_json TEXT NOT NULL, record_sha256 TEXT NOT NULL, computed_at TEXT NOT NULL)")
+    for day, computed, *rest in rows:
+        body = json.dumps(_sector_rec(day), sort_keys=True)
+        sha = rest[0] if rest else hashlib.sha256(body.encode()).hexdigest()
+        schema = rest[1] if len(rest) > 1 else "desk-sector-state/1"
+        con.execute("INSERT INTO desk_state VALUES (?,?,?,?,?,?)", (day, "live", schema, body, sha, computed))
+    con.commit()
+    con.close()
+    return str(p)
+
+
+def test_sector_state_previous_close_before_the_clock(tmp_path):
+    db = _sector_db(tmp_path, [("2026-11-18", "2026-11-19T06:45:08Z"), ("2026-11-19", "2026-11-20T06:45:08Z"),
+                               ("2026-11-20", "2026-11-21T06:45:08Z")])
+    for kind, as_of in (("pre_open", PRE), ("post_close", POST)):
+        sec = B.clocked(S.desk_sector_state(db, kind, SESSION, PREV, as_of, PREV), as_of)
+        assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-19" and not sec.problems, (kind, sec)
+        assert sec.source_clock == z("2026-11-20T06:45:08Z")
+        assert sec.lines[0] == "row for session 2026-11-19 (live), computed 2026-11-20T06:45:08Z"
+        assert sec.lines[1].startswith("Market rising, speeding up")
+        assert "Energy (cyclical): rising, slowing, trend +4.0 %, against the market +3.9 %, leading" in sec.lines
+        assert "overnight rule's gate: market open; sectors let through: Energy" in sec.lines
+        assert "releases within 7 days: GDP 2026-11-25" in sec.lines
+        assert sec.facts["sectors"]["Utilities"]["phase"] == "falling, speeding up"
+        assert not any(B.FINDING_WORDS.search(x) for x in sec.lines)
+
+
+def test_sector_state_older_row_is_a_problem_the_lag_is_not(tmp_path):
+    db = _sector_db(tmp_path, [("2026-11-18", "2026-11-19T06:45:08Z")])
+    sec = S.desk_sector_state(db, "post_close", SESSION, PREV, POST, PREV)
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-18"
+    assert sec.problems == ("latest row is for 2026-11-18; the writer normally has 2026-11-19 by now",)
+
+
+def test_sector_state_refuses_naive_clock_bad_hash_and_other_schema(tmp_path):
+    db = _sector_db(tmp_path, [("2026-11-17", "2026-11-18T06:45:08Z"), ("2026-11-18", "2026-11-19 06:45:08"),
+                               ("2026-11-19", "2026-11-20T06:45:08Z", "0" * 64)])
+    sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+    assert sec.facts["record_date"] == "2026-11-17"
+    assert any("stored hash does not match" in p for p in sec.problems)
+    assert any("has no offset" in p for p in sec.problems)
+    assert any("normally has 2026-11-19" in p for p in sec.problems)
+
+
+def test_sector_state_other_schema_not_used(tmp_path):
+    import hashlib
+
+    db = _sector_db(tmp_path, [])
+    body = json.dumps(_sector_rec("2026-11-19"))
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO desk_state VALUES (?,?,?,?,?,?)", ("2026-11-19", "live", "desk-sector-state/2", body,
+                                                                 hashlib.sha256(body.encode()).hexdigest(), "2026-11-20T06:45:08Z"))
+    con.commit()
+    con.close()
+    sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+    assert sec.status == "empty" and any("not desk-sector-state/1" in p for p in sec.problems)
+
+
+def test_sector_state_missing_empty_unread_and_not_configured(tmp_path):
+    assert S.desk_sector_state(None, "pre_open", SESSION, PREV, PRE, PREV).status == "not_supplied"
+    assert S.desk_sector_state(str(tmp_path / "nope.db"), "pre_open", SESSION, PREV, PRE, PREV).status == "unknown"
+    empty = S.desk_sector_state(_sector_db(tmp_path, []), "pre_open", SESSION, PREV, PRE, PREV)
+    assert empty.status == "empty" and empty.problems == ("no row computed before the brief's clock",)
+    (tmp_path / "late").mkdir()
+    late = _sector_db(tmp_path / "late", [("2026-11-19", "2026-11-20T23:00:00Z")])
+    assert S.desk_sector_state(late, "pre_open", SESSION, PREV, PRE, PREV).status == "empty"
+
+
+def test_sector_state_opens_read_only(tmp_path):
+    db = _sector_db(tmp_path, [("2026-11-19", "2026-11-20T06:45:08Z")])
+    con = S.ro_sqlite(db)
+    with pytest.raises(sqlite3.OperationalError):
+        con.execute("DELETE FROM desk_state")
+    con.close()

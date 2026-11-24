@@ -18,6 +18,10 @@ Every adapter reads a record another job already keeps and copies what it says, 
 * ``selector``, ``plays``, ``trader_day``: the session's choices from the selector, the overnight plays table and
   the shadow trader's day state. Choices only; no expected values or P&L.
 * ``desk_health`` / ``desk_evening``: the desk-state jobs' own daily files (desk-health/1, desk-evening/1).
+* ``desk_sector_state``: the desk-state sector layer (desk-sector-state/1, #1209), sqlite ``desk_state`` opened
+  ``mode=ro``: the newest row computed before the brief's clock, its own read sentence and labels copied as written.
+  The writer computes a close's row the next morning (about 06:45 UTC), so both briefs normally show the previous
+  session; only an older row is a data problem.
 * ``gex_state``: gex-watch ``/api/state``: whether current GEX is served or withheld, and why.
 * ``receipts``: the Desk source receipt for the latest closed session (``intelligence/desk_source_receipts``).
 * ``paper_record``: the graded paper record (D4, 3pacs/GRID#14), when it exists. Until then: not supplied.
@@ -29,6 +33,7 @@ the section says how many were dropped.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -667,6 +672,93 @@ def desk_evening(folder: str, kind: str, session: SessionTimes, prev_day: date, 
         problems.append(f"latest evening text is for {d.get('day')}, not {last}")
     return Section(key, title, "ok", src, c, tuple(x for x in body if x.strip()), {"day": d.get("day")},
                    tuple(problems))
+
+
+# ── desk-state sector layer (#1209) ──────────────────────────────────────────
+
+SECTOR_SCHEMA = "desk-sector-state/1"
+_SECTOR_SQL = ("SELECT data_through, kind, schema, record_json, record_sha256, computed_at FROM desk_state "
+               "WHERE data_through <= ? ORDER BY data_through DESC LIMIT 10")
+
+
+def _pct(v: Any) -> str:
+    return f"{v:+.1f} %" if isinstance(v, (int, float)) else "n/a"
+
+
+def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day: date, as_of: datetime,
+                      expected: date | None = None) -> Section:
+    """The sector layer of the desk's state record (desk-sector-state/1, written by 3pacs/gex desk-state).
+
+    The newest row for a session up to the previous one (pre-open) or the session itself (post-close) whose
+    ``computed_at`` is at or before the brief's clock. ``computed_at`` must carry its offset; a naive one is not
+    used. A row whose stored hash does not match its body, or whose schema is another, is not used either.
+    ``expected``: the newest session the writer normally has by the brief's clock; an older row is a data problem."""
+    title, key = "Sectors (desk-sector-state/1)", "desk_sector_state"
+    src = f"{db} desk_state" if db else "desk-state state.db"
+    if not db:
+        return Section(key, title, "not_supplied", src, problems=("no desk_state_db configured",))
+    last = prev_day if kind == "pre_open" else session.day
+    try:
+        con = ro_sqlite(db)
+        try:
+            rows = con.execute(_SECTOR_SQL, (last.isoformat(),)).fetchall()
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    problems: list[str] = []
+    chosen = None
+    for day, row_kind, schema, body, sha, computed_raw in rows:
+        computed = parse_clock(computed_raw)
+        if computed is None:
+            problems.append(f"row for {day}: computed_at {computed_raw!r} has no offset; not used")
+            continue
+        if computed > as_of:
+            continue
+        if schema != SECTOR_SCHEMA:
+            problems.append(f"row for {day}: schema {schema!r}, not {SECTOR_SCHEMA}; not used")
+            continue
+        if hashlib.sha256(str(body).encode()).hexdigest() != sha:
+            problems.append(f"row for {day}: stored hash does not match its body; not used")
+            continue
+        try:
+            rec = json.loads(body)
+        except ValueError:
+            problems.append(f"row for {day}: body is not JSON; not used")
+            continue
+        chosen = (str(day), row_kind, rec, computed)
+        break
+    if chosen is None:
+        return Section(key, title, "empty", src, problems=("no row computed before the brief's clock",) + tuple(problems))
+    day, row_kind, rec, computed = chosen
+    lines = [f"row for session {day} ({row_kind}), computed {iso(computed)}"]
+    if rec.get("read"):
+        lines.append(str(rec["read"]))
+    sectors = rec.get("sectors") or {}
+    for name in sorted(sectors, key=lambda n: -(sectors[n].get("relative_trend_pct") or 0)):
+        sc = sectors[name]
+        lines.append(f"{name} ({sc.get('group')}): {sc.get('phase')}, trend {_pct(sc.get('trend_pct'))}, "
+                     f"against the market {_pct(sc.get('relative_trend_pct'))}" + (", leading" if sc.get("leading") else ""))
+    rule = rec.get("overnight_rule") or {}
+    if rule:
+        lines.append("overnight rule's gate: market " + ("open" if rule.get("market_gate") else "closed")
+                     + "; sectors let through: " + (", ".join(rule.get("sectors_in") or []) or "none"))
+    ev = rec.get("events") or {}
+    ahead = [f"{e.get('event')} {e.get('date')}" for e in ev.get("within_7_days") or []]
+    if ahead:
+        lines.append("releases within 7 days: " + ", ".join(ahead))
+    if (rec.get("vix") or {}).get("stale"):
+        problems.append(f"row for {day}: the VIX close in it is marked stale")
+    if expected is not None and day < expected.isoformat():
+        problems.append(f"latest row is for {day}; the writer normally has {expected.isoformat()} by now")
+    facts = {"record_date": day, "kind": row_kind, "computed_at": iso(computed), "for_session": rec.get("for_session"),
+             "market": rec.get("market"), "sectors_rising": rec.get("sectors_rising"),
+             "leaders": rec.get("leaders"), "laggards": rec.get("laggards"),
+             "sectors": {n: {k: sectors[n].get(k) for k in ("group", "phase", "trend_pct", "relative_trend_pct", "leading")}
+                         for n in sorted(sectors)},
+             "fed_balance_sheet": rec.get("fed_balance_sheet"), "vix": rec.get("vix"), "events": ev,
+             "overnight_rule": rule or None, "market_level_record": rec.get("market_level_record")}
+    return Section(key, title, "ok", src, computed, tuple(lines), facts, tuple(problems))
 
 
 # ── live GEX state (withheld or served) ──────────────────────────────────────
