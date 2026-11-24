@@ -27,8 +27,10 @@ import pytest
 
 from features.per_signal_brier import SignalScorecard
 from intelligence.signal_provenance import (
+    REPORT_BASIS_LIVE,
     CausationChain,
     SignalEvidence,
+    SignedInput,
     TradeProvenanceReport,
 )
 from oracle.risk import (
@@ -70,6 +72,24 @@ def _fenced_card(source: str, weight: float) -> SignalScorecard:
     )
 
 
+# A live report's decision instant, after the cards' stamp and before now.
+_DECISION_CLOCK = datetime(2026, 4, 13, tzinfo=timezone.utc)
+
+
+def _signed(source: str, direction: str, ticker: str) -> SignedInput:
+    """A signed input from the report's own decision, in ``direction``
+    (Codex HOLD 6032982233: eligible evidence needs one)."""
+    return SignedInput(
+        signal_source=source,
+        direction=direction,
+        ticker=ticker,
+        decision_clock=_DECISION_CLOCK,
+        bullish_weight=1.0 if direction == "bullish" else 0.0,
+        bearish_weight=1.0 if direction == "bearish" else 0.0,
+        models=("head",),
+    )
+
+
 def _make_report(
     *,
     ticker: str = "TSLA",
@@ -95,6 +115,7 @@ def _make_report(
             shapley_weight=round(0.4 / max(1, i + 1), 4),
             scorecard=_fenced_card(f"signal_{i}", 1.3 if i == 0 else 1.0),
             classification="strong" if i == 0 else "neutral",
+            signed_input=_signed(f"signal_{i}", direction, ticker),
         )
         for i in range(n_evidence)
     ]
@@ -137,6 +158,9 @@ def _make_report(
         money_flow_multiplier=1.0,
         aggregate_conviction=aggregate_conviction,
         verdict=verdict,
+        decision_clock=_DECISION_CLOCK.isoformat(),
+        actionable=True,
+        basis=REPORT_BASIS_LIVE,
     )
 
 

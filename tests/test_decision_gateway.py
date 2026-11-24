@@ -18,7 +18,7 @@ from intelligence.decision_gateway import (
     combine_verdict,
     should_i_trade,
 )
-from intelligence.signal_provenance import SignalEvidence
+from intelligence.signal_provenance import REPORT_BASIS_LIVE, SignalEvidence, SignedInput
 
 
 # ── combine_verdict (pure function) ──────────────────────────────────────
@@ -138,6 +138,10 @@ def _mock_prediction() -> SimpleNamespace:
     )
 
 
+# The mocked live report's decision instant, after its card's stamp.
+_PROVENANCE_CLOCK = datetime(2026, 11, 21, 15, 0, tzinfo=timezone.utc)
+
+
 def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
     obj = SimpleNamespace(
         ticker="NVDA",
@@ -158,9 +162,12 @@ def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
         market_implied_prob=0.78,
         red_team_epistemic_risk=0.0,
         shipping_fudge_alerts=[],
-        # One calibrated, stamped, in-direction card: the evidence floor
+        # A live report with one calibrated, stamped card and a signed input
+        # in the call's direction from the same decision: the evidence floor
         # passes, so these tests exercise the stages after it.
-        decision_clock="",
+        actionable=True,
+        basis=REPORT_BASIS_LIVE,
+        decision_clock=_PROVENANCE_CLOCK.isoformat(),
         signal_evidence=[
             SignalEvidence(
                 signal_source="regime_contrarian",
@@ -177,6 +184,15 @@ def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
                     conviction_weight=1.3,
                 ),
                 classification="strong",
+                signed_input=SignedInput(
+                    signal_source="regime_contrarian",
+                    direction="bullish",
+                    ticker="NVDA",
+                    decision_clock=_PROVENANCE_CLOCK,
+                    bullish_weight=1.0,
+                    bearish_weight=0.0,
+                    models=("regime_contrarian",),
+                ),
             )
         ],
         causation=SimpleNamespace(

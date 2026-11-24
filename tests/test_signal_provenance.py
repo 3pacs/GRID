@@ -374,8 +374,8 @@ class TestBuildReport:
                 regime="EXPANSION",
                 fci_regime="EASY",
                 model_votes=[
-                    {"model_name": "flow_momentum", "weight": 2.0},
-                    {"model_name": "regime_contrarian", "weight": 3.0},
+                    {"model_name": "flow_momentum", "weight": 2.0, "direction": "bullish"},
+                    {"model_name": "regime_contrarian", "weight": 3.0, "direction": "bullish"},
                 ],
                 shapley_top_contributor="regime_contrarian",
                 shapley_top_share=0.6,
@@ -467,7 +467,9 @@ class TestBuildReport:
                 horizon=7,
                 regime="NEUTRAL",
                 fci_regime="",
-                model_votes=[{"model_name": "flow_momentum", "weight": 1.0}],
+                model_votes=[
+                    {"model_name": "flow_momentum", "weight": 1.0, "direction": "bullish"}
+                ],
                 shapley_top_contributor="flow_momentum",
                 shapley_top_share=0.9,
                 fragility_multiplier=0.5,  # displayed only (already in confidence)
@@ -565,7 +567,9 @@ class TestBuildReport:
                 horizon=7,
                 regime="NEUTRAL",
                 fci_regime="",
-                model_votes=[{"model_name": "flow_momentum", "weight": 1.0}],
+                model_votes=[
+                    {"model_name": "flow_momentum", "weight": 1.0, "direction": "bullish"}
+                ],
                 shapley_top_contributor="flow_momentum",
                 shapley_top_share=0.9,
                 fragility_multiplier=1.0,

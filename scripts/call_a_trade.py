@@ -31,6 +31,11 @@ SYNTHESIZED from plausible current-state values:
 
 Everything downstream of those inputs is the actual confidence stack
 computing over the real code paths.
+
+The report is hand-built with no decision clock, so it is a research report
+(``actionable=False``, ``basis="research_no_clock"``): the ticket generator
+refuses it, and the script prints why and exits 1. Only the live gateway
+(``decision_gateway.should_i_trade``) can produce a ticket.
 """
 from __future__ import annotations
 
@@ -39,11 +44,13 @@ from datetime import datetime, timezone
 from features.per_signal_brier import SignalScorecard, compute_conviction_weight
 from intelligence.counterfactual_stress import run_stress_test
 from intelligence.signal_provenance import (
+    REPORT_BASIS_RESEARCH,
     CausationChain,
     SignalEvidence,
     TradeProvenanceReport,
     _is_shipping_exposed_ticker,
     _verdict_from_aggregate,
+    actionable_refusal_reason,
     compute_aggregate_conviction,
 )
 from trading.trade_ticket_generator import generate_ticket
@@ -160,6 +167,8 @@ def main() -> int:
         memory_lesson_multiplier=1.0,
         aggregate_conviction=aggregate,
         verdict=verdict,
+        actionable=False,
+        basis=REPORT_BASIS_RESEARCH,
     )
 
     # ─── STAGE 3: run counterfactual stress test ────────────────────
@@ -230,6 +239,9 @@ def main() -> int:
     print("=" * 72)
     if ticket is None:
         print("  NO TICKET — the generator refused to produce an actionable call")
+        refusal = actionable_refusal_reason(provenance)
+        if refusal is not None:
+            print(f"  Reason: {refusal} (a research report is not actionable)")
         print("=" * 72)
         return 1
 

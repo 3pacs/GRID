@@ -90,11 +90,16 @@ def _prediction(
     signals: Any = None,
     signal_contributions: dict[str, float] | None = None,
 ) -> SimpleNamespace:
-    votes = (
-        model_votes
-        if model_votes is not None
-        else [{"model_name": "flow_momentum", "vote_weight": 1.0}]
-    )
+    # The default head votes the call's direction (a signed input) and, when
+    # explicit contributions are given, signs exactly those families.
+    default_vote: dict[str, Any] = {
+        "model_name": "flow_momentum",
+        "vote_weight": 1.0,
+        "direction": direction,
+    }
+    if signal_contributions:
+        default_vote["signal_sources"] = list(signal_contributions)
+    votes = model_votes if model_votes is not None else [default_vote]
     ns = SimpleNamespace(
         ticker=ticker,
         direction=direction,
@@ -660,16 +665,28 @@ class TestDefect4RedTeamAdvisoryOnly:
     def test_should_i_trade_keeps_red_team_advisory_without_veto(self) -> None:
         engine = MagicMock()
         pred = _prediction(ticker="NVDA", confidence=0.78)
+        clock = datetime.now(timezone.utc) - timedelta(minutes=1)
         prov = SimpleNamespace(
             ticker="NVDA",
             verdict="high",
             aggregate_conviction=1.3,
             red_team_epistemic_risk=0.95,
-            # One fenced in-direction card, so the evidence floor passes.
+            # A live report with one fenced card and a signed input in the
+            # call's direction from the same decision: the floor passes.
+            actionable=True,
+            basis=sp.REPORT_BASIS_LIVE,
             direction="bullish",
-            decision_clock="",
+            decision_clock=clock.isoformat(),
             signal_evidence=[
-                sp.SignalEvidence("flow_momentum", 1.0, _card("flow_momentum"), "strong")
+                sp.SignalEvidence(
+                    "flow_momentum",
+                    1.0,
+                    _card("flow_momentum"),
+                    "strong",
+                    signed_input=sp.SignedInput(
+                        "flow_momentum", "bullish", "NVDA", clock, 1.0, 0.0, ("flow_momentum",)
+                    ),
+                )
             ],
         )
         rt_report = llm_red_team.RedTeamReport(
@@ -783,8 +800,8 @@ class TestDefect5ScorecardKeyMapping:
             ticker="NVDA",
             confidence=0.72,
             model_votes=[
-                {"model_name": "flow_momentum", "vote_weight": 0.4},
-                {"model_name": "regime_contrarian", "vote_weight": 0.6},
+                {"model_name": "flow_momentum", "vote_weight": 0.4, "direction": "bullish"},
+                {"model_name": "regime_contrarian", "vote_weight": 0.6, "direction": "bullish"},
             ],
         )
 
@@ -909,7 +926,8 @@ class TestScriptsMatchProductionMath:
 
         rc = call_a_trade.main()
         out = capsys.readouterr().out
-        assert rc == 0
+        # A research report: no ticket since Codex HOLD 6032982233.
+        assert rc == 1
         assert "Disagreement penalty:" not in out
         assert "Red-team penalty:" not in out
         assert "Fragility multiplier:  ×" not in out
@@ -1106,21 +1124,20 @@ class TestCodexHold6011905360PredictionClock:
         assert all(value == expected for value in seen.values()), seen
         assert report.generated_at == _LIVE_NOW.isoformat()
 
-    def test_naive_clock_is_read_as_utc(self) -> None:
+    def test_naive_clock_is_refused(self) -> None:
+        # Read as UTC until Codex HOLD 6032982233, which requires an
+        # explicit, timezone-aware decision instant for actionable use.
         pred = _prediction(ticker="NVDA", signal_contributions={"jodi_oil": 1.0})
-        # 00:10 UTC on 2026-03-06, written without tzinfo.
         late_now = datetime(2026, 3, 6, 0, 20, tzinfo=timezone.utc)
         pred.as_of = datetime(2026, 3, 6, 0, 10)  # noqa: DTZ001 - naive on purpose
         with ExitStack() as stack:
             _patch_all_non_fudge_adapters(stack, value=1.0)
             seen = _capture_dated_layers(stack)
             stack.enter_context(patch.object(sp, "_utc_now", lambda: late_now, create=True))
-            _patch_calibration_tables(
-                stack, regime_cards={}, flat_cards={"jodi_oil": _card("jodi_oil", 1.3)}
-            )
-            sp.build_provenance_report(MagicMock(), prediction=pred)
+            with pytest.raises(ValueError, match="timezone-aware"):
+                sp.build_provenance_report(MagicMock(), prediction=pred)
 
-        assert all(value == late_now.date() for value in seen.values()), seen
+        assert seen == {}
 
     @pytest.mark.parametrize(
         "clock",
@@ -1632,6 +1649,7 @@ def _eligible_count(report: Any) -> int:
         report.signal_evidence,
         direction=report.direction,
         decision_clock=report.decision_clock,
+        ticker=report.ticker,
     )
 
 
@@ -1994,6 +2012,7 @@ class TestEvidenceFloor:
             prov.confidence,
             prov.signal_evidence,
             direction=prov.direction,
+            ticker=prov.ticker,
             decision_clock=prov.decision_clock,
             layer_coverage_ratio=prov.layers_present / prov.layers_total,
             layers_advisory=prov.layers_advisory,
@@ -2088,14 +2107,14 @@ _SIGNED_CLOCK = _ZERO_EVIDENCE_CLOCK
 def _vote(
     model: str,
     direction: str | None,
-    families: list[str],
+    families: list[str] | dict[str, float],
     weight: float = 1.0,
 ) -> dict[str, Any]:
     """One oracle head vote; ``direction=None`` is an unsigned vote."""
     vote: dict[str, Any] = {
         "model_name": model,
         "vote_weight": weight,
-        "signal_sources": list(families),
+        "signal_sources": dict(families) if isinstance(families, dict) else list(families),
     }
     if direction is not None:
         vote["direction"] = direction
@@ -2239,20 +2258,31 @@ class TestCodexHold6032982233SignedInput:
             _signed_prediction(
                 call="bullish",
                 votes=[
-                    _vote("head_a", "bullish", ["jodi_oil"]),
-                    _vote("head_b", "neutral", ["jodi_oil"], weight=0.5),
+                    # The zero-evidence fixture's shares: the card is on half
+                    # the weight, so a perturbed card keeps conviction >= 0.70.
+                    _vote("head_a", "bullish", {"jodi_oil": 0.5, "pcr": 0.3, "ghost_signal": 0.2}),
+                    # A neutral vote on the family does not unsign it.
+                    _vote("head_b", "neutral", ["jodi_oil"], weight=0.1),
                 ],
             ),
             cards=_strong_jodi(),
         )
+        prov = resp.provenance_report
         assert _outcome(resp) == ("medium", "medium", True)
         assert resp.stage_errors == {}
-        assert sp.actionable_refusal_reason(resp.provenance_report) is None
-        # Stress perturbs the card, not the signed input, so the strong card
-        # still qualifies at every sigma: the call holds.
+        assert sp.actionable_refusal_reason(prov) is None
+        jodi = _evidence_rows(prov)["jodi_oil"]["signed_input"]
+        assert (jodi["direction"], jodi["models"]) == ("bullish", ["head_a"])
+        assert _eligible_count(prov) == 1
+        # Stress perturbs the card's skill, not what the signal said at the
+        # decision: each perturbed row keeps its signed input, the card
+        # stays neutral or better at every sigma, and the call holds.
+        (idx,) = [i for i, ev in enumerate(prov.signal_evidence) if ev.signal_source == "jodi_oil"]
+        swapped = cs._swap_signal_evidence(prov.signal_evidence, idx, 0.6)
+        assert swapped[idx].signed_input == prov.signal_evidence[idx].signed_input
         assert resp.stress_report.robustness_label == "robust"
+        assert resp.stress_report.break_count == 0
         assert resp.stress_report.live_parity is True
-        assert _eligible_count(resp.provenance_report) == 1
 
     def test_an_input_from_another_ticker_or_decision_is_refused(self) -> None:
         nvda = _build_live(
@@ -2284,6 +2314,55 @@ class TestCodexHold6032982233SignedInput:
             assert sp.actionable_refusal_reason(forged).startswith(
                 sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
             ), name
+
+    def test_head_votes_sign_families_through_the_oracle_models_map(self) -> None:
+        # The live shape: predict() votes carry only model_name, direction
+        # and weight; oracle_models maps each head to its families.
+        engine = MagicMock()
+        conn = engine.connect.return_value.__enter__.return_value
+        conn.execute.return_value.fetchall.return_value = [
+            ("flow_momentum", ["equity", "flows", "breadth", "vol"], None),
+            ("regime_contrarian", ["rates", "credit", "vol", "macro"], None),
+        ]
+        families = ("equity", "flows", "breadth", "vol", "rates", "credit", "macro")
+        cards = {name: _fenced_card(name, 1.3) for name in families}
+        votes = [
+            {"model_name": "flow_momentum", "vote_weight": 0.4, "direction": "bullish"},
+            {"model_name": "regime_contrarian", "vote_weight": 0.6, "direction": "bearish"},
+        ]
+        signs: dict[str, dict[str, Any]] = {}
+        for call in ("bullish", "bearish"):
+            pred = _signed_prediction(call=call, votes=votes)
+            with ExitStack() as stack:
+                _patch_all_non_fudge_adapters(stack, value=_UNFENCED_LAYER_VALUE)
+                stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW))
+                _patch_calibration_tables(stack, regime_cards=cards, flat_cards={})
+                report = sp.build_provenance_report(engine, prediction=pred)
+            signs[call] = {
+                ev.signal_source: ev.signed_input.direction for ev in report.signal_evidence
+            }
+            eligible = {
+                ev.signal_source
+                for ev in report.signal_evidence
+                if sp.is_eligible_directional_evidence(
+                    ev, direction=call, decision_clock=_SIGNED_CLOCK, ticker="NVDA"
+                )
+            }
+            expected = {"equity", "flows", "breadth"} if call == "bullish" else {
+                "rates", "credit", "macro"
+            }
+            # Same cards behind both calls; each call keeps only the families
+            # its heads signed its way, and "vol" (both heads) is mixed.
+            assert eligible == expected, call
+        assert signs["bullish"] == signs["bearish"] == {
+            "equity": "bullish",
+            "flows": "bullish",
+            "breadth": "bullish",
+            "vol": sp.SIGNED_INPUT_MIXED,
+            "rates": "bearish",
+            "credit": "bearish",
+            "macro": "bearish",
+        }
 
     def test_eligibility_reads_the_sign_ticker_and_clock(self) -> None:
         report = _build_live(

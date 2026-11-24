@@ -34,8 +34,10 @@ from intelligence.market_implied_prob import (
     options_implied_probability_from_iv,
 )
 from intelligence.signal_provenance import (
+    REPORT_BASIS_LIVE,
     CausationChain,
     SignalEvidence,
+    SignedInput,
     TradeProvenanceReport,
 )
 from oracle.risk import (
@@ -146,6 +148,10 @@ def _neutral_context_patches(fci_score: float = 0.0):
     )
 
 
+# A live report's decision instant, after the card's stamp and before now.
+_REPORT_CLOCK = datetime(2026, 11, 21, tzinfo=timezone.utc)
+
+
 def _make_report(
     *,
     direction: str = "bullish",
@@ -182,6 +188,17 @@ def _make_report(
                     conviction_weight=1.3,
                 ),
                 classification="strong",
+                # A signed input from the report's own decision, in the
+                # call's direction (Codex HOLD 6032982233).
+                signed_input=SignedInput(
+                    signal_source="sig_0",
+                    direction=direction,
+                    ticker="AAPL",
+                    decision_clock=_REPORT_CLOCK,
+                    bullish_weight=1.0 if direction == "bullish" else 0.0,
+                    bearish_weight=1.0 if direction == "bearish" else 0.0,
+                    models=("head",),
+                ),
             )
         ],
         top_shapley_contributor="sig_0",
@@ -208,6 +225,9 @@ def _make_report(
         money_flow_multiplier=1.0,
         aggregate_conviction=1.30,
         verdict="high",
+        decision_clock=_REPORT_CLOCK.isoformat(),
+        actionable=True,
+        basis=REPORT_BASIS_LIVE,
     )
 
 

@@ -159,7 +159,9 @@ class TestBuildProvenanceReportCoverage:
             horizon=7,
             regime="NEUTRAL",
             fci_regime="EASY",
-            model_votes=[{"model_name": "flow_momentum", "weight": 1.0}],
+            # A signed head vote, so the evidence floor passes and these tests
+            # reach the coverage gate.
+            model_votes=[{"model_name": "flow_momentum", "weight": 1.0, "direction": "bullish"}],
             shapley_top_contributor="flow_momentum",
             shapley_top_share=1.0,
             fragility_multiplier=1.0,

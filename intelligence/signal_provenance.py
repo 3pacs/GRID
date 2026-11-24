@@ -102,6 +102,45 @@ def _classify_evidence(scorecard: SignalScorecard | None) -> str:
 # ── Data classes ──────────────────────────────────────────────────────────
 
 
+# Signed-input direction when the head votes that weight a family disagree.
+SIGNED_INPUT_MIXED: str = "mixed"
+
+
+@dataclass(frozen=True)
+class SignedInput:
+    """A signal family's signed observation at one decision (Codex HOLD
+    6032982233).
+
+    Its only source is the live prediction's oracle head votes
+    (``EnsemblePrediction.model_votes``): ``predict(ticker, as_of)`` computes
+    each head's ``direction`` from that head's signals valid at ``as_of`` for
+    ``ticker``. A family is signed by the votes that weight it, decomposed
+    as for the evidence weights: ``bullish`` or ``bearish`` when every
+    directional vote on it agrees, ``mixed`` when they disagree, ``neutral``
+    when none is directional. ``ticker`` and ``decision_clock`` bind it to
+    that prediction.
+    """
+
+    signal_source: str
+    direction: str                # bullish / bearish / mixed / neutral
+    ticker: str
+    decision_clock: datetime      # the prediction's as_of, UTC
+    bullish_weight: float
+    bearish_weight: float
+    models: tuple[str, ...]       # heads whose directional votes signed it
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "signal_source": self.signal_source,
+            "direction": self.direction,
+            "ticker": self.ticker,
+            "decision_clock": self.decision_clock.isoformat(),
+            "bullish_weight": round(self.bullish_weight, 4),
+            "bearish_weight": round(self.bearish_weight, 4),
+            "models": list(self.models),
+        }
+
+
 @dataclass(frozen=True)
 class SignalEvidence:
     """One contributing signal's evidence row in the provenance report."""
@@ -118,6 +157,9 @@ class SignalEvidence:
     # clock. Reported only: the row is then classified "advisory", its
     # ``scorecard`` is None, and it weighs as no history.
     advisory_scorecard: SignalScorecard | None = None
+    # This family's signed input at the decision, or None when no signed
+    # vote weights it. Eligible evidence needs one that agrees with the call.
+    signed_input: SignedInput | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +174,9 @@ class SignalEvidence:
                 self.advisory_scorecard.to_dict()
                 if self.advisory_scorecard is not None
                 else None
+            ),
+            "signed_input": (
+                self.signed_input.to_dict() if self.signed_input is not None else None
             ),
         }
 
@@ -161,12 +206,20 @@ class CausationChain:
         }
 
 
+# What a report was built on. Only ``build_provenance_report`` builds a live
+# report (``actionable=True``): a validated, timezone-aware decision clock.
+# Every hand-built report (walk-forward replays, ``call_a_trade``) defaults
+# to research with no clock, and research reports never ticket.
+REPORT_BASIS_LIVE: str = "live_decision_clock"
+REPORT_BASIS_RESEARCH: str = "research_no_clock"
+
+
 @dataclass(frozen=True)
 class TradeProvenanceReport:
     """Full per-ticker evidence report. Serialized to the API layer.
 
-    Keep the single defaulted field at the end so Python 3.9 can import
-    this dataclass on the live audit host.
+    Defaulted fields go at the end so Python 3.9 can import this dataclass
+    on the live audit host.
     """
 
     ticker: str
@@ -219,11 +272,17 @@ class TradeProvenanceReport:
     decision_clock: str = ""
     advisory_layers: dict[str, float] = field(default_factory=dict)
     layers_advisory: int = 0
+    # Fail closed: a report is research, and cannot ticket, unless the live
+    # builder says otherwise (see REPORT_BASIS_*).
+    actionable: bool = False
+    basis: str = REPORT_BASIS_RESEARCH
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ticker": self.ticker,
             "generated_at": self.generated_at,
+            "actionable": self.actionable,
+            "basis": self.basis,
             "decision_clock": self.decision_clock,
             "direction": self.direction,
             "score": self.score,
@@ -680,7 +739,8 @@ def _verdict_reason(
         return (
             f"{NO_ELIGIBLE_DIRECTIONAL_EVIDENCE}: {eligible_directional_evidence} eligible "
             "rows (calibrated strong/neutral scorecards fenced to the decision "
-            f"clock; floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE})"
+            "clock, each with a signed input from the same decision that agrees "
+            f"with the call; floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE})"
         )
     if conviction < 0.7:
         return f"aggregate conviction {conviction:.2f} < 0.70"
@@ -711,30 +771,82 @@ def _verdict_reason(
 # No ticket without eligible directional evidence. A row is eligible when:
 # - the call is bullish or bearish and the row has positive weight;
 # - it has a calibrated scorecard (not advisory, cold_start or no_history)
-#   stamped with a datetime at or before the report's decision clock (a
-#   report without a clock relies on its builder's fence; a clock that does
-#   not parse admits nothing);
+#   stamped with a datetime at or before the report's decision clock, an
+#   explicit timezone-aware instant (``parse_decision_instant``): a missing,
+#   blank, date-only, naive or unparseable clock admits nothing;
 # - that card, classified from its own conviction weight, is strong or
-#   neutral. Cards are per signal, not per direction, and each row is a
-#   signal that pushed toward the call: a weak or anti-predictive card says
-#   not to trust that signal's direction, so it is against the call.
+#   neutral (a weak or anti-predictive card says not to trust the signal);
+# - and (Codex HOLD 6032982233) the row carries a signed input for the same
+#   family, bound to the report's ticker and decision clock, whose sign is
+#   the call's. A card is historical skill, the same behind a bullish and a
+#   bearish call; the signed input is what the signal said at the decision.
+#   An opposite, mixed, neutral or absent input is not eligible.
 # Fudge alerts only dampen conviction and are not directional evidence.
 MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE: int = 1
 NO_ELIGIBLE_DIRECTIONAL_EVIDENCE: str = "no_eligible_directional_evidence"
 DIRECTION_SUPPORTING_CLASSIFICATIONS: frozenset[str] = frozenset({"strong", "neutral"})
 _TRADE_DIRECTIONS: frozenset[str] = frozenset({"bullish", "bearish"})
+_VOTE_DIRECTIONS: frozenset[str] = frozenset({"bullish", "bearish", "neutral"})
+
+# Why an actionable entry point (the gateway's ticket stage, generate_ticket)
+# refuses a report. Each reason string starts with one of these codes.
+NOT_ACTIONABLE: str = "not_actionable"
+DECISION_CLOCK_MISSING: str = "decision_clock_missing"
+DECISION_CLOCK_BLANK: str = "decision_clock_blank"
+DECISION_CLOCK_DATE_ONLY: str = "decision_clock_date_only"
+DECISION_CLOCK_NOT_AWARE: str = "decision_clock_not_timezone_aware"
+DECISION_CLOCK_UNPARSEABLE: str = "decision_clock_unparseable"
+DECISION_CLOCK_IN_FUTURE: str = "decision_clock_in_future"
 
 
-def _parse_decision_clock(raw: datetime | str | None) -> tuple[bool, datetime | None]:
-    """``(usable, clock)``: no clock is usable (``None``); a bad one is not."""
-    if raw is None or raw == "":
-        return True, None
+def parse_decision_instant(raw: Any) -> tuple[datetime | None, str | None]:
+    """``(clock in UTC, None)`` for an explicit, timezone-aware instant (a
+    datetime or its ISO string), else ``(None, reason)``: None, blank,
+    date-only, naive and unparseable values are refused."""
+    if raw is None:
+        return None, f"{DECISION_CLOCK_MISSING}: no decision instant"
     if isinstance(raw, datetime):
-        return True, _as_utc(raw)
+        if raw.tzinfo is None or raw.utcoffset() is None:
+            return None, f"{DECISION_CLOCK_NOT_AWARE}: {raw.isoformat()} has no timezone"
+        return raw.astimezone(timezone.utc), None
+    if isinstance(raw, date):
+        return None, f"{DECISION_CLOCK_DATE_ONLY}: {raw.isoformat()} has no time"
+    if not isinstance(raw, str):
+        return None, f"{DECISION_CLOCK_UNPARSEABLE}: a {type(raw).__name__}"
+    value = raw.strip()
+    if not value:
+        return None, f"{DECISION_CLOCK_BLANK}: empty decision instant"
+    shown = repr(value[:64])
     try:
-        return True, _as_utc(datetime.fromisoformat(str(raw)))
+        date.fromisoformat(value)
     except ValueError:
-        return False, None
+        pass
+    else:
+        return None, f"{DECISION_CLOCK_DATE_ONLY}: {shown} has no time"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None, f"{DECISION_CLOCK_UNPARSEABLE}: {shown}"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, f"{DECISION_CLOCK_NOT_AWARE}: {shown} has no timezone"
+    return parsed.astimezone(timezone.utc), None
+
+
+def _signed_input_supports(
+    ev: SignalEvidence, *, call: str, clock: datetime, ticker: str
+) -> bool:
+    """True iff ``ev``'s signed input is this family's, from this ticker and
+    decision clock, and signed in the call's direction."""
+    si = getattr(ev, "signed_input", None)
+    if not isinstance(si, SignedInput) or si.signal_source != ev.signal_source:
+        return False
+    want = str(ticker or "").strip().upper()
+    if not want or str(si.ticker or "").strip().upper() != want:
+        return False
+    stamp = si.decision_clock
+    if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
+        return False
+    return stamp.astimezone(timezone.utc) == clock and si.direction == call
 
 
 def is_eligible_directional_evidence(
@@ -742,9 +854,14 @@ def is_eligible_directional_evidence(
     *,
     direction: str,
     decision_clock: datetime | None,
+    ticker: str,
 ) -> bool:
     """True iff ``ev`` is eligible directional evidence (rules above)."""
-    if str(direction or "").strip().lower() not in _TRADE_DIRECTIONS:
+    call = str(direction or "").strip().lower()
+    if call not in _TRADE_DIRECTIONS:
+        return False
+    clock, refused = parse_decision_instant(decision_clock)
+    if refused is not None or not isinstance(decision_clock, datetime):
         return False
     weight = _finite_float_or_none(ev.shapley_weight)
     if weight is None or weight <= 0.0:
@@ -752,40 +869,82 @@ def is_eligible_directional_evidence(
     card = ev.scorecard
     if card is None or ev.classification not in _CALIBRATED_CLASSIFICATIONS:
         return False
-    if not isinstance(card.last_updated, datetime):
-        return False
-    if decision_clock is not None and not _stamped_at_or_before(
-        card.last_updated, decision_clock
-    ):
+    if not _stamped_at_or_before(card.last_updated, clock):
         return False
     if _finite_float_or_none(card.conviction_weight) is None:
         return False
-    return _classify_evidence(card) in DIRECTION_SUPPORTING_CLASSIFICATIONS
+    if _classify_evidence(card) not in DIRECTION_SUPPORTING_CLASSIFICATIONS:
+        return False
+    return _signed_input_supports(ev, call=call, clock=clock, ticker=ticker)
 
 
 def count_eligible_directional_evidence(
     signal_evidence: Iterable[SignalEvidence],
     *,
     direction: str,
-    decision_clock: datetime | str | None,
+    decision_clock: Any,
+    ticker: str,
 ) -> int:
-    """Number of eligible directional evidence rows; 0 on a bad clock."""
-    usable, clock = _parse_decision_clock(decision_clock)
-    if not usable:
+    """Number of eligible directional evidence rows; 0 unless the clock is
+    an explicit, timezone-aware instant."""
+    clock, refused = parse_decision_instant(decision_clock)
+    if refused is not None:
         return 0
     return sum(
         1 for ev in signal_evidence
-        if is_eligible_directional_evidence(ev, direction=direction, decision_clock=clock)
+        if is_eligible_directional_evidence(
+            ev, direction=direction, decision_clock=clock, ticker=ticker
+        )
     )
 
 
+def live_decision_clock(report: Any) -> datetime | None:
+    """The report's decision clock when it is a live, actionable report with
+    an explicit, timezone-aware instant; None for research and bad clocks."""
+    if getattr(report, "actionable", False) is not True:
+        return None
+    clock, refused = parse_decision_instant(getattr(report, "decision_clock", None))
+    return None if refused is not None else clock
+
+
+def actionable_refusal_reason(report: Any, *, now: datetime | None = None) -> str | None:
+    """Why an actionable entry point must refuse ``report``, or None.
+
+    Refused: a research report (``actionable`` is not True, e.g.
+    ``basis="research_no_clock"``); a decision clock that is not an explicit,
+    timezone-aware instant, or is after ``now``; and fewer than
+    ``MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE`` eligible rows on that clock.
+    """
+    if getattr(report, "actionable", False) is not True:
+        basis = getattr(report, "basis", REPORT_BASIS_RESEARCH)
+        return f"{NOT_ACTIONABLE}: basis={basis}; research reports never ticket"
+    clock, refused = parse_decision_instant(getattr(report, "decision_clock", None))
+    if refused is not None:
+        return refused
+    current = _utc_now() if now is None else _as_utc(now)
+    if clock - current > LIVE_CLOCK_MAX_FUTURE_SKEW:
+        return (
+            f"{DECISION_CLOCK_IN_FUTURE}: {clock.isoformat()} is after now "
+            f"({current.isoformat()})"
+        )
+    eligible = count_eligible_directional_evidence(
+        getattr(report, "signal_evidence", None) or [],
+        direction=getattr(report, "direction", ""),
+        decision_clock=clock,
+        ticker=getattr(report, "ticker", ""),
+    )
+    if eligible < MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE:
+        return (
+            f"{NO_ELIGIBLE_DIRECTIONAL_EVIDENCE}: {eligible} eligible rows "
+            f"(floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE})"
+        )
+    return None
+
+
 def has_eligible_directional_evidence(report: TradeProvenanceReport) -> bool:
-    """True iff ``report`` clears the evidence floor (the ticket gate)."""
-    return count_eligible_directional_evidence(
-        report.signal_evidence,
-        direction=report.direction,
-        decision_clock=report.decision_clock,
-    ) >= MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE
+    """True iff ``report`` may ticket: actionable, on a valid decision
+    instant, and clearing the evidence floor (``actionable_refusal_reason``)."""
+    return actionable_refusal_reason(report) is None
 
 
 def decide_verdict(
@@ -794,18 +953,20 @@ def decide_verdict(
     signal_evidence: Iterable[SignalEvidence],
     *,
     direction: str,
-    decision_clock: datetime | str | None,
+    ticker: str,
+    decision_clock: Any,
     layer_coverage_ratio: float,
     layers_advisory: int = 0,
 ) -> tuple[str, str]:
     """The verdict policy: ``(verdict, reason)`` with the coverage gate and
     the evidence floor. ``build_provenance_report`` decides with it and the
-    counterfactual stress test re-decides every perturbation with it.
+    counterfactual stress test re-decides every perturbation of a live
+    report with it.
     """
     rows = list(signal_evidence)
     evidence_coverage = compute_evidence_coverage(rows)
     eligible = count_eligible_directional_evidence(
-        rows, direction=direction, decision_clock=decision_clock
+        rows, direction=direction, decision_clock=decision_clock, ticker=ticker
     )
     verdict = _verdict_from_aggregate(
         conviction,
@@ -953,6 +1114,95 @@ def _load_model_signal_map(
     return mapping
 
 
+def _source_family_shares(
+    name: str, weight: float, lookup: dict[str, list[str]]
+) -> dict[str, float]:
+    """``weight`` split over ``name``'s mapped families, or kept on ``name``."""
+    shares: dict[str, float] = {}
+    mapped = lookup.get(name)
+    for sig in mapped or [name]:
+        shares[sig] = shares.get(sig, 0.0) + (weight / len(mapped) if mapped else weight)
+    return shares
+
+
+def _vote_family_shares(vote: Any, lookup: dict[str, list[str]]) -> dict[str, float]:
+    """``{signal family: weight}`` one model vote puts on its families: its
+    own ``signal_sources`` / ``signal_families`` (a weight dict or a list),
+    else its model name mapped through ``lookup``. Empty for a vote with no
+    positive finite weight or no name."""
+    if not isinstance(vote, dict):
+        return {}
+    try:
+        weight = float(vote.get("weight") or vote.get("vote_weight") or 0.0)
+    except (TypeError, ValueError):
+        return {}
+    if not math.isfinite(weight) or weight <= 0.0:
+        return {}
+    vote_signals = vote.get("signal_sources") or vote.get("signal_families")
+    if isinstance(vote_signals, dict):
+        norm_vote = _normalize_weight_dict(vote_signals)
+        if norm_vote:
+            return {sig: weight * share for sig, share in norm_vote.items()}
+    else:
+        parsed = _parse_string_list(vote_signals)
+        if parsed:
+            shares: dict[str, float] = {}
+            for sig in parsed:
+                shares[sig] = shares.get(sig, 0.0) + weight / len(parsed)
+            return shares
+    source = vote.get("model_name") or vote.get("model") or vote.get("source")
+    if not source:
+        return {}
+    return _source_family_shares(str(source), weight, lookup)
+
+
+def _extract_signed_inputs(
+    prediction: Any,
+    *,
+    model_signal_map: dict[str, list[str]],
+    ticker: str,
+    clock: datetime,
+) -> dict[str, SignedInput]:
+    """Each family's ``SignedInput`` from the prediction's head votes, split
+    over families as ``_extract_signal_contributions`` splits their weight.
+    A vote without a bullish/bearish/neutral ``direction`` signs nothing."""
+    bullish: dict[str, float] = {}
+    bearish: dict[str, float] = {}
+    models: dict[str, list[str]] = {}
+    for vote in list(getattr(prediction, "model_votes", []) or []):
+        if not isinstance(vote, dict):
+            continue
+        sign = str(vote.get("direction") or "").strip().lower()
+        if sign not in _VOTE_DIRECTIONS:
+            continue
+        name = str(vote.get("model_name") or vote.get("model") or vote.get("source") or "")
+        for family, weight in _vote_family_shares(vote, model_signal_map).items():
+            bullish[family] = bullish.get(family, 0.0) + (weight if sign == "bullish" else 0.0)
+            bearish[family] = bearish.get(family, 0.0) + (weight if sign == "bearish" else 0.0)
+            signers = models.setdefault(family, [])
+            if sign != "neutral" and name and name not in signers:
+                signers.append(name)
+    signed: dict[str, SignedInput] = {}
+    for family, up in bullish.items():
+        down = bearish[family]
+        if up > 0.0 and down > 0.0:
+            direction = SIGNED_INPUT_MIXED
+        elif up > 0.0 or down > 0.0:
+            direction = "bullish" if up > 0.0 else "bearish"
+        else:
+            direction = "neutral"
+        signed[family] = SignedInput(
+            signal_source=family,
+            direction=direction,
+            ticker=ticker,
+            decision_clock=clock,
+            bullish_weight=up,
+            bearish_weight=down,
+            models=tuple(models[family]),
+        )
+    return signed
+
+
 def _extract_signal_contributions(
     prediction: Any,
     *,
@@ -985,55 +1235,18 @@ def _extract_signal_contributions(
     contributions: dict[str, float] = {}
     lookup = model_signal_map or {}
 
-    def _add_source_weight(name: str, weight: float) -> None:
-        mapped = lookup.get(name)
-        if mapped:
-            share = weight / len(mapped)
-            for sig in mapped:
-                contributions[sig] = contributions.get(sig, 0.0) + share
-        else:
-            contributions[name] = contributions.get(name, 0.0) + weight
+    def _add(shares: dict[str, float]) -> None:
+        for sig, weight in shares.items():
+            contributions[sig] = contributions.get(sig, 0.0) + weight
 
     top_source = getattr(prediction, "shapley_top_contributor", "") or ""
     top_share = float(getattr(prediction, "shapley_top_share", 0.0) or 0.0)
 
-    model_votes = list(getattr(prediction, "model_votes", []) or [])
-    for vote in model_votes:
-        if not isinstance(vote, dict):
-            continue
-        weight_raw = vote.get("weight") or vote.get("vote_weight") or 0.0
-        try:
-            weight = float(weight_raw)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(weight) or weight <= 0.0:
-            continue
-
-        vote_signals = (
-            vote.get("signal_sources")
-            or vote.get("signal_families")
-        )
-        if isinstance(vote_signals, dict):
-            norm_vote = _normalize_weight_dict(vote_signals)
-            if norm_vote:
-                for sig, share in norm_vote.items():
-                    contributions[sig] = contributions.get(sig, 0.0) + weight * share
-                continue
-        else:
-            parsed_vote_signals = _parse_string_list(vote_signals)
-            if parsed_vote_signals:
-                share = weight / len(parsed_vote_signals)
-                for sig in parsed_vote_signals:
-                    contributions[sig] = contributions.get(sig, 0.0) + share
-                continue
-
-        source = vote.get("model_name") or vote.get("model") or vote.get("source")
-        if not source:
-            continue
-        _add_source_weight(str(source), weight)
+    for vote in list(getattr(prediction, "model_votes", []) or []):
+        _add(_vote_family_shares(vote, lookup))
 
     if not contributions and top_source:
-        _add_source_weight(str(top_source), top_share)
+        _add(_source_family_shares(str(top_source), top_share, lookup))
         if top_share < 1.0:
             contributions["other"] = contributions.get("other", 0.0) + (1.0 - top_share)
 
@@ -1043,13 +1256,8 @@ def _extract_signal_contributions(
     return {k: v / total for k, v in contributions.items()}
 
 
-def _resolve_signal_contributions(
-    engine: Engine,
-    prediction: Any,
-) -> dict[str, float]:
-    """Resolve per-signal/family contributions for ``prediction`` using
-    ``oracle_models`` to translate model names into their signal key space.
-    """
+def _prediction_model_names(prediction: Any) -> list[str]:
+    """Model names on the prediction's votes and its top Shapley source."""
     raw_names: list[str] = []
     for vote in list(getattr(prediction, "model_votes", []) or []):
         if isinstance(vote, dict):
@@ -1059,8 +1267,21 @@ def _resolve_signal_contributions(
     top_source = getattr(prediction, "shapley_top_contributor", "") or ""
     if isinstance(top_source, str) and top_source.strip():
         raw_names.append(top_source.strip())
+    return raw_names
 
-    model_signal_map = _load_model_signal_map(engine, raw_names)
+
+def _resolve_signal_contributions(
+    engine: Engine,
+    prediction: Any,
+    *,
+    model_signal_map: dict[str, list[str]] | None = None,
+) -> dict[str, float]:
+    """Resolve per-signal/family contributions for ``prediction`` using
+    ``oracle_models`` to translate model names into their signal key space
+    (loaded here unless the caller passes the map it already loaded).
+    """
+    if model_signal_map is None:
+        model_signal_map = _load_model_signal_map(engine, _prediction_model_names(prediction))
     return _extract_signal_contributions(prediction, model_signal_map=model_signal_map)
 
 
@@ -1338,7 +1559,9 @@ def _lookup_convergence(
 #   predict(), with only the red-team LLM call in between, and the
 #   advisory layers read current state, so a replay is not served;
 # - a missing clock, or a date without a time, is refused: it cannot fence
-#   an input that arrived later on the same day.
+#   an input that arrived later on the same day;
+# - a naive datetime is refused (Codex HOLD 6032982233): an actionable
+#   decision needs an explicit, timezone-aware instant.
 LIVE_CLOCK_MAX_AGE: timedelta = timedelta(hours=1)
 LIVE_CLOCK_MAX_FUTURE_SKEW: timedelta = timedelta(seconds=60)
 
@@ -1380,7 +1603,12 @@ def _decision_clock(prediction: Any, now: datetime) -> datetime:
             "signal_provenance is live-only: the decision clock (as_of) must be "
             f"a datetime, got {kind}"
         )
-    clock = _as_utc(raw)
+    clock, refused = parse_decision_instant(raw)
+    if refused is not None or clock is None:
+        raise ValueError(
+            "signal_provenance is live-only: the decision clock (as_of) must be "
+            f"a timezone-aware instant ({refused})"
+        )
     if clock - now > LIVE_CLOCK_MAX_FUTURE_SKEW:
         raise ValueError(
             "signal_provenance is live-only: decision clock "
@@ -1415,8 +1643,11 @@ def build_provenance_report(
     it in so provenance is testable in isolation.
 
     Live-only, with one decision clock: ``prediction.as_of``, validated by
-    ``_decision_clock`` (missing, date-only, future or stale clocks raise
-    ``ValueError`` before any layer is read). Only evidence stamped at or
+    ``_decision_clock`` (missing, date-only, naive, future or stale clocks
+    raise ``ValueError`` before any layer is read). The report is labelled
+    ``actionable=True``, ``basis="live_decision_clock"``. Each evidence row
+    carries its family's signed input from the prediction's head votes,
+    bound to the ticker and clock. Only evidence stamped at or
     before that clock moves a decision-bearing number: scorecards whose
     ``last_updated`` is at or before it, and the layers in
     ``CLOCK_FENCED_LAYERS``. Every other layer is still computed and
@@ -1433,7 +1664,13 @@ def build_provenance_report(
     horizon_days = int(getattr(prediction, "horizon", 7) or 7)
     regime = getattr(prediction, "regime", None) or None
 
-    contributions = _resolve_signal_contributions(engine, prediction)
+    model_signal_map = _load_model_signal_map(engine, _prediction_model_names(prediction))
+    contributions = _resolve_signal_contributions(
+        engine, prediction, model_signal_map=model_signal_map
+    )
+    signed_inputs = _extract_signed_inputs(
+        prediction, model_signal_map=model_signal_map, ticker=ticker, clock=clock
+    )
 
     signal_evidence: list[SignalEvidence] = []
     regime_calibrated_count = 0
@@ -1460,6 +1697,7 @@ def build_provenance_report(
                     classification=EVIDENCE_ADVISORY,
                     calibration_source=calibration_source,
                     advisory_scorecard=scorecard,
+                    signed_input=signed_inputs.get(source),
                 )
             )
             continue
@@ -1470,6 +1708,7 @@ def build_provenance_report(
                 scorecard=scorecard,
                 classification=_classify_evidence(scorecard),
                 calibration_source=calibration_source,
+                signed_input=signed_inputs.get(source),
             )
         )
 
@@ -1722,6 +1961,7 @@ def build_provenance_report(
         conf_value,
         signal_evidence,
         direction=direction_str,
+        ticker=ticker,
         decision_clock=clock,
         layer_coverage_ratio=agg.layer_coverage_ratio,
         layers_advisory=agg.layers_advisory,
@@ -1785,4 +2025,6 @@ def build_provenance_report(
         decision_clock=clock.isoformat(),
         advisory_layers=advisory_values,
         layers_advisory=agg.layers_advisory,
+        actionable=True,
+        basis=REPORT_BASIS_LIVE,
     )

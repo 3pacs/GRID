@@ -67,6 +67,7 @@ from features.per_signal_brier import (
 )
 from intelligence.counterfactual_stress import run_stress_test
 from intelligence.signal_provenance import (
+    REPORT_BASIS_RESEARCH,
     CausationChain,
     SignalEvidence,
     TradeProvenanceReport,
@@ -521,7 +522,9 @@ def build_time_frozen_provenance(
     A fully-populated ``TradeProvenanceReport`` whose ``aggregate_conviction``
     and ``verdict`` were computed via the same
     ``compute_aggregate_conviction`` / ``_verdict_from_aggregate`` that the
-    live gateway uses.
+    live gateway uses. It is a research report with no decision clock
+    (``actionable=False``, ``basis="research_no_clock"``): it never tickets,
+    and its stress test is not live parity.
     """
     horizon = _coerce_horizon_days(prediction_row)
     confidence = _coerce_confidence(prediction_row.get("confidence")) or 0.0
@@ -671,6 +674,8 @@ def build_time_frozen_provenance(
         memory_lesson_multiplier=1.0,
         aggregate_conviction=aggregate,
         verdict=verdict,
+        actionable=False,
+        basis=REPORT_BASIS_RESEARCH,
     )
 
 
@@ -1294,7 +1299,8 @@ def walk_forward(
             # Ticket generation happens against the provenance report —
             # we don't care whether it succeeds (we only need verdict +
             # robustness for the aggregation). But we still call it to
-            # ensure the whole stack runs end-to-end.
+            # ensure the whole stack runs end-to-end. The report is
+            # research (no decision clock), so the generator refuses it.
             try:
                 generate_ticket(
                     provenance,
