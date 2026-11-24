@@ -22,10 +22,19 @@ from oracle.publish import publish_astrogrid_prediction
 from oracle.sanity_checker import CheckedClaim
 
 Decision = Literal["publish", "review", "reject"]
+VerificationStatus = Literal[
+    "verified",
+    "no_claims",
+    "unverified",
+    "flagged",
+    "low_confidence",
+    "rejected",
+]
 
 __all__ = [
     "Decision",
     "PublishDecision",
+    "VerificationStatus",
     "gate_decision",
     "publish_astrogrid_prediction",
 ]
@@ -36,9 +45,10 @@ class PublishDecision:
     """Final gate decision for an LLM output."""
 
     decision: Decision
-    score: float
+    score: float | None
     claims: tuple[CheckedClaim, ...]
     reasons: tuple[str, ...]
+    verification: VerificationStatus = "verified"
 
 
 # ── Thresholds ───────────────────────────────────────────────────────────
@@ -55,18 +65,26 @@ def gate_decision(claims: list[CheckedClaim]) -> PublishDecision:
       - Any sanity check failure on a critical claim (price/percentage)
       - Price/number that fails range check
 
-    Auto-publish rules:
-      - All claims supported, all checks pass, confidence > 0.85
+    No verifiable claims extracted:
+      - Publish pass-through with ``verification="no_claims"`` and ``score=None``
 
-    Human review:
-      - Mixed verdicts, source disagreement, >30% claims flagged
+    Clean auto-publish (unmarked):
+      - All claims supported, zero sanity flags, avg confidence >= 0.85
+
+    Marked review (publishes WITH ``[UNVERIFIED]`` markers — never blocks chat):
+      - Any flagged claim (sanity warn or non-critical fail) — checked before
+        all-insufficient so warned claims are never masked
+      - All claims insufficient (no DB evidence)
+      - Avg confidence < 0.85
+      - Mixed verdicts containing any unverified (insufficient/ambiguous) claim
     """
     if not claims:
         return PublishDecision(
             decision="publish",
-            score=1.0,
+            score=None,
             claims=tuple(claims),
             reasons=("No verifiable claims found — pass-through",),
+            verification="no_claims",
         )
 
     reasons: list[str] = []
@@ -103,6 +121,7 @@ def gate_decision(claims: list[CheckedClaim]) -> PublishDecision:
             score=0.0,
             claims=tuple(claims),
             reasons=tuple(reasons or ["Contradicted claims detected"]),
+            verification="rejected",
         )
 
     if critical_fails > 0:
@@ -111,38 +130,15 @@ def gate_decision(claims: list[CheckedClaim]) -> PublishDecision:
             score=0.0,
             claims=tuple(claims),
             reasons=tuple(reasons or ["Critical sanity check failures"]),
+            verification="rejected",
         )
 
-    # --- Auto-publish ---
-    verifiable = supported + contradicted
     avg_confidence = (
         sum(cc.verified.confidence for cc in claims) / total
     )
 
-    if (
-        supported == verifiable
-        and verifiable > 0
-        and flagged == 0
-        and avg_confidence >= _AUTO_PUBLISH_CONFIDENCE
-    ):
-        return PublishDecision(
-            decision="publish",
-            score=avg_confidence,
-            claims=tuple(claims),
-            reasons=("All verifiable claims supported, checks pass",),
-        )
-
-    # All claims insufficient (no verifiable data) — still publish with lower score
-    if insufficient == total:
-        return PublishDecision(
-            decision="publish",
-            score=0.5,
-            claims=tuple(claims),
-            reasons=("No verifiable claims — insufficient data for verification",),
-        )
-
-    # --- Review ---
-    rewrite_ratio = flagged / total if total > 0 else 0
+    # --- Flagged claims (checked BEFORE all-insufficient) ---
+    rewrite_ratio = flagged / total if total > 0 else 0.0
     if rewrite_ratio > _REVIEW_REWRITE_RATIO or flagged > 0:
         reasons.append(f"{flagged}/{total} claims flagged ({rewrite_ratio:.0%})")
         return PublishDecision(
@@ -150,12 +146,49 @@ def gate_decision(claims: list[CheckedClaim]) -> PublishDecision:
             score=avg_confidence,
             claims=tuple(claims),
             reasons=tuple(reasons),
+            verification="flagged",
         )
 
-    # Default: publish with moderate confidence
+    # --- All claims insufficient (no DB evidence) → publish with [UNVERIFIED] ---
+    if insufficient == total:
+        return PublishDecision(
+            decision="review",
+            score=None,
+            claims=tuple(claims),
+            reasons=("No verifiable claims — insufficient data for verification",),
+            verification="unverified",
+        )
+
+    # --- Clean auto-publish (all claims supported, unflagged, >= 0.85) ---
+    if supported == total and avg_confidence >= _AUTO_PUBLISH_CONFIDENCE:
+        return PublishDecision(
+            decision="publish",
+            score=avg_confidence,
+            claims=tuple(claims),
+            reasons=("All verifiable claims supported, checks pass",),
+            verification="verified",
+        )
+
+    # --- Below confidence threshold → publish with [UNVERIFIED] markers ---
+    if avg_confidence < _AUTO_PUBLISH_CONFIDENCE:
+        reasons.append(
+            f"Average confidence {avg_confidence:.2f} below auto-publish "
+            f"threshold {_AUTO_PUBLISH_CONFIDENCE:.2f}"
+        )
+        return PublishDecision(
+            decision="review",
+            score=avg_confidence,
+            claims=tuple(claims),
+            reasons=tuple(reasons),
+            verification="low_confidence",
+        )
+
+    # --- Mixed verdicts containing unverified (insufficient/ambiguous) claims ---
+    reasons.append("Mixed verdicts include unverified claims")
     return PublishDecision(
-        decision="publish",
+        decision="review",
         score=avg_confidence,
         claims=tuple(claims),
-        reasons=("Mixed verdicts but no contradictions or failures",),
+        reasons=tuple(reasons),
+        verification="unverified",
     )

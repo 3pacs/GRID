@@ -51,6 +51,8 @@ Schema
 
 from __future__ import annotations
 
+import math
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -69,6 +71,11 @@ CANONICAL_HORIZONS: tuple[int, ...] = (1, 7, 30, 90)
 # below this, downstream consumers should treat the signal as cold-start
 # and fall back to equal weighting.
 MIN_CALIBRATED_SAMPLES: int = 20
+
+# Minimum effective sample weight Σw before the conviction multiplier moves
+# off neutral (1.0). Prevents tiny-weight noise signals from earning a boost
+# off high raw row counts with negligible total attribution share.
+MIN_EFFECTIVE_WEIGHT_SUM: float = 5.0
 
 # Brier ceiling beyond which a signal is considered anti-predictive
 # (worse than a 50/50 coin flip on the confidence scale).
@@ -94,6 +101,7 @@ class SignalScorecard:
     last_updated: datetime | None
     is_calibrated: bool
     conviction_weight: float  # 0.0 (useless) → 1.5 (best-in-class)
+    weight_sum: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +116,9 @@ class SignalScorecard:
             ),
             "is_calibrated": self.is_calibrated,
             "conviction_weight": round(self.conviction_weight, 4),
+            "weight_sum": (
+                round(self.weight_sum, 6) if self.weight_sum is not None else None
+            ),
         }
 
 
@@ -145,6 +156,37 @@ def ensure_tables(engine: Engine) -> None:
         log.warning("per_signal_brier: ensure_tables failed: {e}", e=str(exc))
 
 
+# ── Live-skip tracking (no weight_sum column on current schema) ───────────
+
+_SKIPPED_LIVE_UPDATES_LOCK = threading.Lock()
+_SKIPPED_LIVE_UPDATE_COUNTS: dict[tuple[str, int], int] = {}
+
+
+def _record_live_skip(source: str, horizon: int) -> bool:
+    """Increment the skipped-live-update count for ``(source, horizon)``.
+
+    Returns True on the first skip per process for that key so callers can
+    log once at INFO instead of spamming per prediction.
+    """
+    key = (source, int(horizon))
+    with _SKIPPED_LIVE_UPDATES_LOCK:
+        prev = _SKIPPED_LIVE_UPDATE_COUNTS.get(key, 0)
+        _SKIPPED_LIVE_UPDATE_COUNTS[key] = prev + 1
+        return prev == 0
+
+
+def get_skipped_live_update_counts() -> dict[tuple[str, int], int]:
+    """Return a snapshot of skipped live update counts keyed by ``(source, horizon)``."""
+    with _SKIPPED_LIVE_UPDATES_LOCK:
+        return dict(_SKIPPED_LIVE_UPDATE_COUNTS)
+
+
+def _reset_skipped_live_update_counts() -> None:
+    """Clear process-local skip counts and log deduplication state (for tests)."""
+    with _SKIPPED_LIVE_UPDATES_LOCK:
+        _SKIPPED_LIVE_UPDATE_COUNTS.clear()
+
+
 # ── Core update path ──────────────────────────────────────────────────────
 
 
@@ -172,143 +214,42 @@ def record_scored_prediction(
     signal_contributions: dict[str, float],
     scored_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Update per-signal running Brier / ECE / hit counters after a
-    prediction is scored.
+    """Live incremental updater hook for per-signal Brier tracking.
 
-    Parameters
-    ----------
-    horizon_days
-        The horizon of the scored prediction (will be snapped to the
-        canonical bucket {1, 7, 30, 90}).
-    confidence
-        The oracle's reported confidence in [0, 1] at prediction time.
-    outcome
-        The observed outcome in [0, 1] (1 = hit, 0.5 = partial, 0 = miss).
-    signal_contributions
-        Normalized Shapley contribution per contributing signal source,
-        summing to 1.0. Produced by ``intelligence.shapley_attribution``.
-    scored_at
-        Optional timestamp marking when this prediction's outcome became
-        known. When provided, ``last_updated`` on the bucket row is set
-        to ``scored_at`` (or ``GREATEST(existing, scored_at)`` on UPDATE)
-        instead of ``NOW()``. This is the critical knob for the historical
-        bootstrap: walk-forward audits filter scorecards by
-        ``last_updated <= as_of`` (PIT-lookahead guard), so a bootstrap
-        run that stamps every row with NOW() produces scorecards that
-        are invisible to every historical replay until the next scored
-        prediction lands.
+    Proper incremental weighted averaging ``Σ(w·se) / Σw`` requires a
+    persisted ``weight_sum`` (Σw) column. Because the current
+    ``per_signal_brier_history`` schema has no ``weight_sum`` column (and no
+    schema change is assumed here), the live path refuses both incremental
+    UPDATEs (which would drift) and brand-new ``count=1`` INSERTs (which
+    could never advance on subsequent calls). Every valid contributor is
+    skipped, counted in ``get_skipped_live_update_counts()``, and logged once
+    per process per ``(source, horizon)`` at INFO. Recompute exact weighted
+    means via ``scripts/bootstrap_per_signal_brier.py``.
 
-    Returns
-    -------
-    Dict with per-source updates: ``{source: {scored_count, running_brier}}``.
+    Returns an empty dict when skipped.
     """
+    del engine, confidence, outcome, scored_at  # unused while schema lacks Σw
     if not signal_contributions:
         return {}
 
-    confidence = float(max(0.0, min(1.0, confidence)))
-    outcome = float(max(0.0, min(1.0, outcome)))
     horizon = _canonical_horizon(horizon_days)
-    squared_error = (confidence - outcome) ** 2
-    absolute_error = abs(confidence - outcome)
-    directional_hit = 1 if (confidence >= 0.5) == (outcome >= 0.5) else 0
+    for source, weight in signal_contributions.items():
+        try:
+            w = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(w) or w <= 0.0:
+            continue
+        if _record_live_skip(source, horizon):
+            log.info(
+                "per_signal_brier.record_scored_prediction: skipping live "
+                "incremental write for ({s}, {h}d) — table has no persisted "
+                "weight_sum (Σw) column; recompute via bootstrap",
+                s=source,
+                h=horizon,
+            )
 
-    ensure_tables(engine)
-    updates: dict[str, Any] = {}
-
-    try:
-        with engine.begin() as conn:
-            for source, weight in signal_contributions.items():
-                if weight <= 0:
-                    continue
-                # Each signal's prediction-attributed Brier is the full
-                # squared error weighted by its Shapley share. This is
-                # NOT a per-signal squared-error reconstruction (which
-                # would require the counterfactual) — it's the share
-                # of the total error we attribute to this source.
-                weighted_brier = squared_error * float(weight)
-                weighted_ece = absolute_error * float(weight)
-
-                row = conn.execute(
-                    text(
-                        "SELECT scored_count, running_brier, running_ece, hit_count "
-                        "FROM per_signal_brier_history "
-                        "WHERE signal_source = :s AND horizon_days = :h"
-                    ),
-                    {"s": source, "h": horizon},
-                ).fetchone()
-
-                if row is None:
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO per_signal_brier_history
-                                (signal_source, horizon_days, scored_count,
-                                 running_brier, running_ece, hit_count,
-                                 last_updated)
-                            VALUES (:s, :h, 1, :b, :e, :hit,
-                                    COALESCE(:scored_at, NOW()))
-                            ON CONFLICT (signal_source, horizon_days) DO NOTHING
-                            """
-                        ),
-                        {
-                            "s": source,
-                            "h": horizon,
-                            "b": weighted_brier,
-                            "e": weighted_ece,
-                            "hit": directional_hit,
-                            "scored_at": scored_at,
-                        },
-                    )
-                    updates[source] = {
-                        "scored_count": 1,
-                        "running_brier": weighted_brier,
-                    }
-                    continue
-
-                old_count = int(row[0] or 0)
-                old_brier = float(row[1] or 0.0)
-                old_ece = float(row[2] or 0.0)
-                old_hits = int(row[3] or 0)
-                new_count = old_count + 1
-                # Welford incremental mean
-                new_brier = old_brier + (weighted_brier - old_brier) / new_count
-                new_ece = old_ece + (weighted_ece - old_ece) / new_count
-                new_hits = old_hits + directional_hit
-
-                conn.execute(
-                    text(
-                        """
-                        UPDATE per_signal_brier_history
-                        SET scored_count  = :n,
-                            running_brier = :b,
-                            running_ece   = :e,
-                            hit_count     = :h,
-                            last_updated  = GREATEST(last_updated,
-                                                     COALESCE(:scored_at, NOW()))
-                        WHERE signal_source = :s AND horizon_days = :hz
-                        """
-                    ),
-                    {
-                        "n": new_count,
-                        "b": new_brier,
-                        "e": new_ece,
-                        "h": new_hits,
-                        "s": source,
-                        "hz": horizon,
-                        "scored_at": scored_at,
-                    },
-                )
-                updates[source] = {
-                    "scored_count": new_count,
-                    "running_brier": new_brier,
-                }
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "per_signal_brier.record_scored_prediction failed: {e}",
-            e=str(exc),
-        )
-
-    return updates
+    return {}
 
 
 # ── Conviction weighter ───────────────────────────────────────────────────
@@ -317,12 +258,16 @@ def record_scored_prediction(
 def compute_conviction_weight(
     running_brier: float,
     scored_count: int,
+    *,
+    weight_sum: float | None = None,
 ) -> float:
     """Translate a running Brier into a conviction weight in [0.0, 1.5].
 
     Rules (hard-coded, deterministic):
 
     - Below MIN_CALIBRATED_SAMPLES → 1.0 (neutral — insufficient history)
+    - When ``weight_sum`` (Σw) is provided and below MIN_EFFECTIVE_WEIGHT_SUM
+      (5.0) → 1.0 (neutral — insufficient effective sample weight)
     - Brier >= ANTI_PREDICTIVE_BRIER_THRESHOLD (0.25) → 0.0 (useless)
     - Brier <= 0.05 (very well-calibrated) → 1.5 (max weight-up)
     - Linear interpolation in between
@@ -330,6 +275,11 @@ def compute_conviction_weight(
     Pure function — no engine required.
     """
     if scored_count < MIN_CALIBRATED_SAMPLES:
+        return 1.0
+    if weight_sum is not None and (
+        not math.isfinite(weight_sum)
+        or weight_sum + 1e-12 < MIN_EFFECTIVE_WEIGHT_SUM
+    ):
         return 1.0
     if running_brier >= ANTI_PREDICTIVE_BRIER_THRESHOLD:
         return 0.0
@@ -346,6 +296,22 @@ def compute_conviction_weight(
 
 
 def _row_to_scorecard(row: Any) -> SignalScorecard:
+    """Reconstruct a SignalScorecard from a 7-column ``per_signal_brier_history`` row.
+
+    Conservative read-time floor: ``per_signal_brier_history`` has no
+    ``weight_sum`` (Σw) or JSON/metadata column on the current schema, so
+    read-time enforces ``scored_count < MIN_CALIBRATED_SAMPLES (20)`` →
+    ``is_calibrated=False`` and neutral ``conviction_weight=1.0``. The
+    bootstrap writer enforces the ``Σw >= MIN_EFFECTIVE_WEIGHT_SUM (5.0)``
+    floor fail-closed before persisting any row with ``scored_count >= 20``.
+
+    A row cannot be checked for Σw or metric version here, so trust rests on
+    the only writer that creates rows: ``scripts/bootstrap_per_signal_brier``
+    replaces the whole table in one transaction and retires every row it
+    rejects or no longer produces. Rows from before that cutover stay readable
+    until the first replacement run. The live updater writes nothing, and
+    ``intelligence.forensic_journal`` can only raise an existing row's Brier.
+    """
     source = row[0]
     horizon = int(row[1])
     count = int(row[2] or 0)
@@ -355,7 +321,11 @@ def _row_to_scorecard(row: Any) -> SignalScorecard:
     last_updated = row[6]
     hit_rate = (hits / count) if count > 0 else 0.0
     is_calibrated = count >= MIN_CALIBRATED_SAMPLES
-    conviction = compute_conviction_weight(brier, count) if is_calibrated else 1.0
+    conviction = (
+        compute_conviction_weight(brier, count)
+        if is_calibrated
+        else 1.0
+    )
     return SignalScorecard(
         signal_source=source,
         horizon_days=horizon,
@@ -366,6 +336,7 @@ def _row_to_scorecard(row: Any) -> SignalScorecard:
         last_updated=last_updated,
         is_calibrated=is_calibrated,
         conviction_weight=conviction,
+        weight_sum=None,
     )
 
 

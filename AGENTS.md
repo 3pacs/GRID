@@ -1023,43 +1023,32 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
 
-## 2026-11-23 - 13F change rows: a re-run writes nothing new (draft only)
+## 2026-11-23 - BKH, GWHT, KPTI, ROKU retired in the ticker lifecycle sidecar (draft only)
 
-Branch `claude/13f-rerun-dedupe-20261123`. Anik: "fix the 13F duplicates".
+Branch `claude/retire-four-tickers-20261123`. Anik: "mark the four tickers
+retired", then "HZN only" when asked which successor symbols to keep fetching.
+Only `analysis/sector_map_ticker_status.yaml` and tests change.
 
-- **Cause:** the 13F change-row loop in
-  `ingestion/altdata/institutional_flows.py` used `BasePuller._row_exists`,
-  whose window is one hour. Every `etf_flows` run more than an hour after the
-  last appended every row again. grid-svr, 2026-11-23 23:30Z, source 280:
-  166,760 `13F:%` rows for 41,690 distinct `(series_id, obs_date)`, exactly four
-  identical copies each, all written since 17:24Z (the first run after #1393).
-- **Fix:** the writer reads the newest stored vintage of each change row
-  (one `IN` lookup per 500 series) and skips the row only when that vintage is
-  the same observation: same `filing_accession` and `prev_filing_accession`,
-  same value, identical payload. Anything else is stored as a new vintage.
-  `BasePuller` is unchanged; no other puller is affected.
-- **Not changed:** filing receipts (`13F-FILING:...`) stay one per run (#1393:
-  the holdings reader ranks filings by receipt time). No reader is touched.
-- **Readers and the existing copies:** `holdings_observations_13f` and
-  `dollar_flows` take the newest vintage per key, so nothing is counted twice;
-  the holdings' `received_at` is the newest copy's time. The two 13F counts in
-  `intelligence/actor_discovery.py` (`COUNT(*)`, `SUM(value)`) count every copy.
-- **Production rows:** untouched by this PR. Cleanup is a separate owner decision.
-- **Codex HOLD 6031396853 (2026-11-24):** two overlapping writers could both
-  look up before either committed and both insert. The lookup and the inserts
-  now run under one transaction-scoped advisory lock per (source, manager,
-  filing date) (`_lock_change_rows`, PostgreSQL only).
-  `tests/test_13f_holdings_graph_pg.py` holds the first writer open inside its
-  transaction on a second connection; without the lock both insert. Quarantined
-  rows are left out before the ranking: an older identical SUCCESS under a newer
-  QUARANTINED copy still counts as stored. A surviving change row is one stored
-  observation of a filing comparison, not a filing.
-- **Codex review 6031901092 (2026-11-24):** the lock wait is bounded: 5 s for
-  one manager and 20 s over a run, inside the repair worker's 60 s per-source
-  deadline; after that the lock is only tried. A manager whose lock is not
-  obtained is `DEFERRED` for the run (no change row, no receipt). Not claimed:
-  ordered vintages. Each writer fetches before it locks and the DB stamps the
-  write, so two overlapping writers with different payloads store both and the
-  later commit is the newest vintage. Open for the owner: whether a quarantine
-  should also act as an exclusion (today every-copy-quarantined is written
-  again).
+| Symbol | Mark | Fetched after this | End date from Tiingo's listing (read 2026-11-23) | Source for the event |
+|---|---|---|---|---|
+| BKH | renamed -> HZN | HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07. The issuer's exchange note and OCC memo 60193 answered HTTP 403 and were not read |
+| GWHT | delisted | nothing | none: GWHT is not found | ESS Tech Form 8-K, Item 1.03, 2026-11-13 (Chapter 7 petition) |
+| KPTI | delisted | nothing | 2026-11-10 | Karyopharm Form 8-K, Item 3.01, event date 2026-11-04 (Nasdaq suspension from 11-11, OTC as KPTIQ) |
+| ROKU | acquired by Fox | nothing | 2026-11-06 | Roku Form 8-K, 2026-11-06 (merger closed; Nasdaq halt before the 11-09 open) |
+
+- `GWH` (the map's symbol for ESS Tech) was renamed -> GWHT; it is now
+  delisted too, so the map does not fetch GWHTQ.
+- Tiingo lists the two bankrupt issuers' OTC shares as KPTIQ and GWHTQ. Those
+  symbols are recorded in the notes and are not fetched.
+- GWHT and KPTI are not sector-map tickers; they reach the routine price list
+  from other universes, so the sidecar gains a last section for such symbols
+  and `tests/test_sector_map_ticker_status.py` names the two exceptions.
+- Readers of the sidecar: `price_ticker` (what the routine Tiingo list fetches)
+  and `tiingo_symbol_contract.tiingo_cutoff` (TIINGO rows after `last_session`
+  are dropped by `store/observations.py` and the resolver). Stored rows up to
+  each last session stay readable; BKH, GWHT and GWH have no cutoff; the map
+  keeps its actors.
+- Codex reviews 6031566036 and 6031760181: the notes cite the issuers' Form 8-K
+  filings in place of the news pages, call each `last_session` a vendor cutoff,
+  infer no venue date where the vendor gives none, and say that vendor history
+  under a successor is not verified point-in-time continuity.

@@ -745,6 +745,29 @@ class ModelRegistry:
         )
         return aggregate_weight, True
 
+    def decay_model_by_name(self, model_name: str, factor: float) -> int:
+        """Multiplicatively decay a single oracle model by exact ``name``."""
+        if not isinstance(model_name, str):
+            return 0
+        name = model_name.strip()
+        if not name or factor <= 0:
+            return 0
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET weight = GREATEST(:min_w, weight * :f), "
+                    "    last_updated = NOW() "
+                    "WHERE name = :name"
+                ),
+                {
+                    "f": float(factor),
+                    "min_w": self._MIN_WEIGHT,
+                    "name": name,
+                },
+            )
+            return result.rowcount or 0
+
     def decay_model_by_source(self, source: str, factor: float) -> int:
         if not source or factor <= 0:
             return 0
