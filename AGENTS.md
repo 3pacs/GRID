@@ -1023,38 +1023,32 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
 
-## 2026-11-23 - puller triage: stalled sources (draft only; reworked 2026-11-24 after Codex HOLD 6031219314)
+## 2026-11-23 - BKH, GWHT, KPTI, ROKU retired in the ticker lifecycle sidecar (draft only)
 
-Branch `claude/puller-triage-20261123-a5d8fb`. Read-only on grid-svr; nothing
-deployed, restarted or run by hand.
+Branch `claude/retire-four-tickers-20261123`. Anik: "mark the four tickers
+retired", then "HZN only" when asked which successor symbols to keep fetching.
+Only `analysis/sector_map_ticker_status.yaml` and tests change.
 
-- **Tiingo prices were never stalled.** `smart:tiingo` / `Tiingo_Prices` had no
-  SUCCESS row from 11-10 to 11-23 while each run wrote the session's closes
-  (SPY and about 1,700 others current to 11-20). Each run was PARTIAL for a few
-  tickers Tiingo itself stopped serving (KPTI `endDate` 11-10, ROKU 11-06, BKH
-  no dates, GWHT not found). `pull_incremental` now reads Tiingo's listing
-  (`/tiingo/daily/{ticker}`) for each lapsed ticker and reports it next to the
-  name (`lapsed_listing`, and in the error text). **Evidence only: the status
-  is not changed.** A listing without dates can be an incomplete record of a
-  live ticker and an old `endDate` can be a late vendor, so the run stays
-  PARTIAL until the ticker is marked in `analysis/sector_map_ticker_status.yaml`
-  (#1411 marks the four).
-- **quiverquant**: runs take 84-124 s against 120; `timeout_s` raised to 240.
-  `PULLER_REGISTRY` data, so `tests/test_hermes_sec_only.py` carries a dated
-  SCHED re-pin (08c0356f -> a71d6f62) that needs reviewer acceptance. #1408
-  re-pins the same base; the second to merge recomputes on the merged tail.
-- **etf_flows is not raised here.** Its full run takes 346 s against 120 s, but
-  a timeout does not stop the run (the thread is orphaned and keeps writing),
-  and until #1409 is live every completed run appends the same 13F change rows
-  again. Raise it after #1409 deploys.
-- **Drewry WCI**: the 11-22 proof rules refused the live page's own sentence
-  (the date sits in an `<h4>` above a list; the sentence names the Transpacific
-  as the cause). Two narrow allowances read it; `tests/test_drewry_live_page_shape.py`
-  holds the live structure and one refusal per changed detail. A prose value
-  must also be reported, not predicted (Codex HOLD 6032263784): the words up to
-  the value need an assessment verb and no predictive or modal wording, so
-  "is expected to fall to $4,176" is refused where "decreased 3% to $4,176" is
-  read.
-- **GDELT**: no code change here (#1408 retires it).
-- **Twelve Data backfill**: no change here. #1410 replaces that script.
+| Symbol | Mark | Fetched after this | End date from Tiingo's listing (read 2026-11-23) | Source for the event |
+|---|---|---|---|---|
+| BKH | renamed -> HZN | HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07. The issuer's exchange note and OCC memo 60193 answered HTTP 403 and were not read |
+| GWHT | delisted | nothing | none: GWHT is not found | ESS Tech Form 8-K, Item 1.03, 2026-11-13 (Chapter 7 petition) |
+| KPTI | delisted | nothing | 2026-11-10 | Karyopharm Form 8-K, Item 3.01, event date 2026-11-04 (Nasdaq suspension from 11-11, OTC as KPTIQ) |
+| ROKU | acquired by Fox | nothing | 2026-11-06 | Roku Form 8-K, 2026-11-06 (merger closed; Nasdaq halt before the 11-09 open) |
 
+- `GWH` (the map's symbol for ESS Tech) was renamed -> GWHT; it is now
+  delisted too, so the map does not fetch GWHTQ.
+- Tiingo lists the two bankrupt issuers' OTC shares as KPTIQ and GWHTQ. Those
+  symbols are recorded in the notes and are not fetched.
+- GWHT and KPTI are not sector-map tickers; they reach the routine price list
+  from other universes, so the sidecar gains a last section for such symbols
+  and `tests/test_sector_map_ticker_status.py` names the two exceptions.
+- Readers of the sidecar: `price_ticker` (what the routine Tiingo list fetches)
+  and `tiingo_symbol_contract.tiingo_cutoff` (TIINGO rows after `last_session`
+  are dropped by `store/observations.py` and the resolver). Stored rows up to
+  each last session stay readable; BKH, GWHT and GWH have no cutoff; the map
+  keeps its actors.
+- Codex reviews 6031566036 and 6031760181: the notes cite the issuers' Form 8-K
+  filings in place of the news pages, call each `last_session` a vendor cutoff,
+  infer no venue date where the vendor gives none, and say that vendor history
+  under a successor is not verified point-in-time continuity.

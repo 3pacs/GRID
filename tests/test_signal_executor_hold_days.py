@@ -39,6 +39,9 @@ def test_executor_reads_horizon_days_with_the_strategy_row() -> None:
     assert '"SELECT id, hypothesis_id, leader, follower, horizon_days "' in src
     assert "strategy_id, hypothesis_id, leader, follower, strategy_horizon_days = strat" in src
     assert "resolve_hold_days(\n                    strategy_horizon_days, _get_expected_lag(conn, hypothesis_id)\n                )" in src
+    # The exit pass lists every open position with its strategy's horizon_days
+    # (Codex review 6011903757), so PAUSED/KILLED trades keep their horizon too.
+    assert '"ps.status, ps.hypothesis_id, ps.follower, ps.horizon_days "' in src
 
 
 def _engine_capturing_inserts() -> tuple[MagicMock, list]:
