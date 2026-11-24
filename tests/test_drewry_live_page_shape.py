@@ -152,3 +152,58 @@ def test_an_assessment_heading_dated_after_the_pull_is_refused(captured_warnings
 def test_trailing_cause_rule(sentence, value_text, ok):
     value_end = sentence.index(value_text) + len(value_text)
     assert sc._drewry_lane_is_trailing_cause(sentence, value_end) is ok
+
+
+# ── reported, not predicted (Codex HOLD 6032263784) ─────────────────────────
+
+ACTUAL = ("The Drewry World Container Index decreased 3% to $4,176 per 40ft container this week "
+          "due to declining rates on the Transpacific trade route.")
+FORECAST = ("The Drewry World Container Index is expected to fall to $4,176 per 40ft container "
+            "due to weak Transpacific rates.")
+
+
+def test_the_same_number_is_read_when_reported_and_refused_when_forecast(captured_warnings):
+    """The pair Codex asked for: same heading, same value, same lane clause."""
+    assert _parse(HEADING + "<ul><li>" + ACTUAL + "</li></ul>") == [{"date": "2026-11-19", "value": 4176.0}]
+    assert _parse(HEADING + "<ul><li>" + FORECAST + "</li></ul>") == []
+    assert captured_warnings
+
+
+@pytest.mark.parametrize("sentence", [
+    FORECAST,
+    "The Drewry World Container Index will fall to $4,176 per 40ft container next week.",
+    "The Drewry World Container Index could reach $4,176 per 40ft container by December.",
+    "The Drewry World Container Index is likely to drop to $4,176 per 40ft container.",
+    "The Drewry World Container Index is set to decline to $4,176 per 40ft container.",
+    "Drewry forecasts the World Container Index at $4,176 per 40ft container for next week.",
+    "The World Container Index may ease to $4,176 per 40ft container.",
+    "The World Container Index target of $4,176 per 40ft container was repeated.",
+    # no assessment verb at all before the value
+    "The World Container Index, $4,176 per 40ft container.",
+])
+def test_predictive_or_verbless_prose_is_refused(sentence, captured_warnings):
+    assert _parse(HEADING + "<ul><li>" + sentence + "</li></ul>") == []
+    assert captured_warnings
+
+
+def test_a_forecast_item_does_not_stop_the_reported_item_from_being_read():
+    body = HEADING + "<ul><li>" + FORECAST + "</li><li>" + ACTUAL + "</li></ul>"
+    assert _parse(body) == [{"date": "2026-11-19", "value": 4176.0}]
+
+
+def test_a_forecast_after_the_reported_value_does_not_undo_it():
+    sentence = ("The Drewry World Container Index decreased 3% to $4,176 per 40ft container this week, "
+                "and Drewry expects rates to fall further.")
+    assert _parse(HEADING + "<ul><li>" + sentence + "</li></ul>") == [{"date": "2026-11-19", "value": 4176.0}]
+
+
+@pytest.mark.parametrize(("lead", "ok"), [
+    ("The Drewry World Container Index decreased 3% to $4,176", True),
+    ("The World Container Index composite assessed on 19 Nov 2026 stood at $2,145", True),
+    ("WCI remained at $4,176", True),
+    ("The Drewry World Container Index is expected to fall to $4,176", False),
+    ("The World Container Index would have been $4,176", False),
+    ("The World Container Index $4,176", False),
+])
+def test_value_is_reported_rule(lead, ok):
+    assert sc._drewry_value_is_reported(lead, len(lead)) is ok

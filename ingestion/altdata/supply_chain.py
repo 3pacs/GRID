@@ -180,6 +180,28 @@ _DREWRY_ASSESSMENT_HEADING_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 _DREWRY_HEADING_TAGS: tuple[str, ...] = ("h1", "h2", "h3", "h4", "h5", "h6")
+# 3. A prose value must be reported, not predicted. "The Drewry World
+#    Container Index is expected to fall to $4,176 ... due to weak Transpacific
+#    rates" has the same shape as the assessed sentence (Codex HOLD 6032263784):
+#    the causal check places the lane, it does not show the value was observed.
+#    So the words up to the value must carry a past or present assessment verb
+#    and no predictive or modal wording. A forecast after the value ("... to
+#    $4,176 this week, and Drewry expects rates to fall") does not undo it.
+_DREWRY_REALIZED_VERB_RE = re.compile(
+    r"\b(?:decreased|increased|declined|dropped|fell|rose|gained|climbed|slipped|dipped|"
+    r"eased|jumped|surged|plunged|slid|sank|lost|added|"
+    r"edged\s+(?:up|down|higher|lower)|remained|held|was|stood|stands|is|"
+    r"assessed|closed|ended|reached)\b",
+    re.IGNORECASE,
+)
+_DREWRY_PREDICTIVE_RE = re.compile(
+    r"\b(?:expect(?:s|ed|ing)?|forecast(?:s|ed|ing)?|predict(?:s|ed|ing)?|project(?:s|ed|ing)?|"
+    r"anticipat(?:e|es|ed|ing)|estimat(?:e|es|ed|ing)|target(?:s|ed|ing)?|likely|unlikely|"
+    r"will|would|could|may|might|should|shall|outlook|"
+    r"(?:is|are|was|were)\s+(?:set|due|poised|seen|tipped)\s+to|"
+    r"going\s+to|on\s+course\s+to|on\s+track\s+to)\b",
+    re.IGNORECASE,
+)
 _DREWRY_USD_CELL_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)")
 _DREWRY_JS_PROP_STR_RE = re.compile(
     r"(?:[\"']?(?:label|name|title|id|seriesName|caption|metric|index)[\"']?)"
@@ -512,6 +534,17 @@ def _drewry_lane_is_trailing_cause(sentence: str, value_end: int) -> bool:
     return _DREWRY_CAUSAL_RE.search(sentence[value_end:lane.start()]) is not None
 
 
+def _drewry_value_is_reported(sentence: str, value_end: int) -> bool:
+    """True when the words up to the value report it rather than predict it.
+
+    See note 3 above ``_DREWRY_REALIZED_VERB_RE``.
+    """
+    lead = sentence[:value_end]
+    if _DREWRY_PREDICTIVE_RE.search(lead):
+        return False
+    return _DREWRY_REALIZED_VERB_RE.search(lead) is not None
+
+
 def _drewry_introducing_assessment_date(block: Any) -> date | None:
     """Assessment date from the heading that directly introduces ``block``.
 
@@ -739,6 +772,8 @@ def _parse_drewry_wci_html(
                 if val is None:
                     continue
                 if not _drewry_lane_is_trailing_cause(sentence, value_end):
+                    continue
+                if not _drewry_value_is_reported(sentence, value_end):
                     continue
 
                 assessment_date: date | None = None

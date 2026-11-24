@@ -1050,7 +1050,11 @@ deployed, restarted or run by hand.
 - **Drewry WCI**: the 11-22 proof rules refused the live page's own sentence
   (the date sits in an `<h4>` above a list; the sentence names the Transpacific
   as the cause). Two narrow allowances read it; `tests/test_drewry_live_page_shape.py`
-  holds the live structure and one refusal per changed detail.
+  holds the live structure and one refusal per changed detail. A prose value
+  must also be reported, not predicted (Codex HOLD 6032263784): the words up to
+  the value need an assessment verb and no predictive or modal wording, so
+  "is expected to fall to $4,176" is refused where "decreased 3% to $4,176" is
+  read.
 - **GDELT**: no code change here (#1408 retires it).
 - **Twelve Data backfill**: no change here. #1410 replaces that script.
 
