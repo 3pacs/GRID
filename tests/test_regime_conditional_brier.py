@@ -729,15 +729,33 @@ class TestRegimeSourceAPI:
     callers can count only regime-specific hits."""
 
     def _seed(self, engine: _FakeEngine, *, count: int) -> None:
-        for _ in range(count):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"flow_momentum": 1.0},
-                regime="EXPANSION",
+        # Seed the way production writes regime rows. Since #1354,
+        # record_scored_prediction skips live writes (no persisted Σw
+        # column); bootstrap_from_oracle_predictions is the only writer.
+        # Replay ``count`` scored oracle_predictions rows: confidence 0.9,
+        # verdict hit, all weight on flow_momentum, regime EXPANSION, and a
+        # 7-day horizon.
+        from datetime import timedelta
+
+        start = datetime.now(timezone.utc) - timedelta(days=20)
+        created = [start + timedelta(minutes=i) for i in range(count)]
+        engine.oracle_rows = [
+            (
+                f"pred-{i}",
+                c,
+                (c + timedelta(days=7)).date(),
+                0.9,
+                "hit",
+                "model_a",
+                None,
+                '{"flow_momentum": 1.0}',
+                "EXPANSION",
             )
+            for i, c in enumerate(created)
+        ]
+        summary = bootstrap_from_oracle_predictions(engine, days=30)
+        assert summary["replaced"] is True
+        assert summary["replayed_count"] == count
         # The seeded row must exist at the requested count. Otherwise a
         # "thin row" test passes on a missing row and tests nothing.
         row = engine.store.get(("flow_momentum", 7, "EXPANSION"))
