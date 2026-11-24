@@ -3,10 +3,14 @@ False Discovery Gauntlet — 5 statistical tests to prevent self-deception.
 
 From QuantaAlpha v2 research:
   - ROBUST: CV >= 75%, permutation p < 0.05, subsample > 50%, val net Sharpe > 0.3,
-    AND deflated_sharpe_passed is True
+    AND deflated_sharpe_passed is True, AND a full-book net series
+    (``net_coverage`` complete, no uncharged turnover cost)
   - MARGINAL: CV >= 50%, permutation p < 0.10 (or ROBUST downgraded when DSR fails
-    or cannot be computed)
+    or cannot be computed, or the net book is partial or uncharged)
   - UNSTABLE: everything else
+
+The net Sharpe is carried-cost accounting (``net_basis``), not daily
+executable P&L; see :func:`alpha_research.validation.metrics.long_short_book`.
 
 Key finding: 0/7 runs achieved ROBUST in 2024 OOS. CV consistency is the real blocker.
 
@@ -44,6 +48,7 @@ import pandas as pd
 from scipy import stats
 
 from alpha_research.validation.metrics import (
+    eligible_panels,
     long_short_book,
     long_short_returns,
     outcome_coverage,
@@ -76,7 +81,7 @@ class GauntletResult:
     permutation_p: float
     permutation_passed: bool
     deflated_sharpe_passed: bool
-    observed_sharpe: float
+    observed_sharpe: float  # net Sharpe: carried-cost accounting, not daily executable P&L
     deflated_threshold: float
     subsample_stability: float
     subsample_passed: bool
@@ -475,6 +480,8 @@ def run_gauntlet(
     block: int = 0,
     overlap_depth: int = 0,
     permutation_alpha: float = PERMUTATION_ALPHA,
+    outcome_horizon: int = 0,
+    as_of: Any = None,
 ) -> GauntletResult:
     """
     Run the full 5-test False Discovery Gauntlet.
@@ -486,12 +493,32 @@ def run_gauntlet(
     and ``deflated_sharpe_passed`` is False. ``n_permutations=None`` derives
     the count from ``permutation_alpha`` (see :func:`permutation_test`).
 
+    ``outcome_horizon`` and ``as_of`` declare the eligibility window
+    (:func:`~alpha_research.validation.metrics.long_short_book`); every test
+    reads only the eligible dates. The net book's coverage is computed
+    before the verdict: a partial or uncharged book (``net_pass_blocked_reason``
+    set) is never ROBUST (downgraded to MARGINAL with the reason in
+    ``verdict_downgrade_reason``) and never passes the net Sharpe threshold.
+    The net Sharpe is carried-cost accounting, not daily executable P&L.
+
     Returns GauntletResult with verdict: ROBUST, MARGINAL, or UNSTABLE.
     """
     if int(n_models_tested) != n_models_tested or n_models_tested < 1:
         raise ValueError("n_models_tested must be a positive integer")
     if trial_sharpes is not None and len(trial_sharpes) != n_models_tested:
         raise ValueError("trial_sharpes must hold one per-period Sharpe per tested model")
+
+    # 0. The net book over the eligibility window (chronological, declared,
+    # never read from outcomes) and its coverage, which the verdict consults.
+    book = long_short_book(
+        signal, forward_returns, top_n, cost_bps, outcome_horizon=outcome_horizon, as_of=as_of
+    )
+    coverage = outcome_coverage(book)
+    if book.attrs["mature_through"] is None:
+        raise ValueError("no decision date is mature by as_of: nothing to evaluate")
+    signal, forward_returns = eligible_panels(
+        signal, forward_returns, book.attrs["mature_through"]
+    )
 
     # 1. Permutation test (block null)
     perm = permutation_test(
@@ -509,7 +536,6 @@ def run_gauntlet(
 
     # 2. Deflated Sharpe (per-period Sharpe, cross-trial variance). The net
     # series comes from the frozen book, whose coverage labels are reported.
-    book = long_short_book(signal, forward_returns, top_n, cost_bps)
     ls_ret = book["return"].dropna().astype(float)
     returns_arr = ls_ret.dropna().values
     skew = float(stats.skew(returns_arr)) if len(returns_arr) > 10 else 0.0
@@ -551,29 +577,34 @@ def run_gauntlet(
     net_sharpe = sharpe_ratio(ls_ret)
     dsr_passed = bool(dsr is not None and dsr.passed)
 
-    # Verdict: ROBUST requires deflated_sharpe_passed is True; if DSR fails or
-    # cannot be computed (e.g. multi-trial without trial_sharpes), cap at the
+    # Verdict: ROBUST requires deflated_sharpe_passed is True and a full-book
+    # net series; if DSR fails or cannot be computed (e.g. multi-trial without
+    # trial_sharpes), or the net book is partial or uncharged, cap at the
     # next-lower verdict (MARGINAL) and record why.
+    net_blocked = coverage["net_pass_blocked_reason"]
     base_robust_ok = (
         cv_con >= 0.75 and perm_p < 0.05 and sub_stab > 0.50 and net_sharpe > 0.3
     )
+    downgrades: list[str] = []
+    if base_robust_ok and not dsr_passed:
+        if dsr is None:
+            downgrades.append(f"deflated Sharpe ratio unavailable ({dsr_note})")
+        else:
+            downgrades.append(
+                f"deflated Sharpe ratio failed (dsr={dsr.dsr:.4f} <= {dsr.confidence:.2f}, "
+                f"sr0_per_period={dsr.sr0:.4f})"
+            )
+    if base_robust_ok and net_blocked is not None:
+        downgrades.append(net_blocked)
     verdict_downgrade_reason: str | None = None
-    if base_robust_ok and dsr_passed:
+    if base_robust_ok and not downgrades:
         verdict = "ROBUST"
     elif cv_con >= 0.50 and perm_p < 0.10:
         verdict = "MARGINAL"
-        if base_robust_ok and not dsr_passed:
-            if dsr is None:
-                verdict_downgrade_reason = (
-                    f"Downgraded from ROBUST to MARGINAL: deflated Sharpe ratio "
-                    f"unavailable ({dsr_note})"
-                )
-            else:
-                verdict_downgrade_reason = (
-                    f"Downgraded from ROBUST to MARGINAL: deflated Sharpe ratio "
-                    f"failed (dsr={dsr.dsr:.4f} <= {dsr.confidence:.2f}, "
-                    f"sr0_per_period={dsr.sr0:.4f})"
-                )
+        if downgrades:
+            verdict_downgrade_reason = "Downgraded from ROBUST to MARGINAL: " + "; ".join(
+                downgrades
+            )
     else:
         verdict = "UNSTABLE"
 
@@ -582,12 +613,12 @@ def run_gauntlet(
         "permutation_gross_sharpe": observed_sr,
         "decay_ics": decay_ics,
         "n_days": len(ls_ret),
-        "passes_net_sharpe_threshold": net_sharpe > 1.4,
+        "passes_net_sharpe_threshold": net_sharpe > 1.4 and net_blocked is None,
         "permutation_block_basis": perm.block_basis,
         "permutation_resolution_ok": perm.min_attainable_p * PERMS_MARGIN
         <= permutation_alpha,
         "per_period_sharpe": per_period_sr,
-        **outcome_coverage(book),
+        **coverage,
     }
     if dsr is not None:
         details["deflated_sharpe"] = {
