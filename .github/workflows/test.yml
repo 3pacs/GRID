@@ -1090,6 +1090,24 @@ jobs:
             exit 1
           fi
 
+      # #1354 / Codex HOLD 6011907767: the per-signal and regime Brier
+      # bootstraps replace their tables in one transaction. Legacy rows the
+      # replacement rejects or no longer produces are retired, and a failed
+      # insert rolls the whole replacement back. A skip must fail this step.
+      - name: Brier bootstrap replacement PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_brier_bootstrap_replacement_pg.py -q -rA | tee /tmp/grid-brier-replacement-pg.txt
+          if grep -qE "^SKIPPED \[|[0-9]+ skipped" /tmp/grid-brier-replacement-pg.txt; then
+            echo "::error::Brier bootstrap replacement PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
