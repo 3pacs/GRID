@@ -147,6 +147,11 @@
       "id": "L7",
       "blocks": "outcome-vintage availability; revision-sensitive outcomes",
       "owner": "grader owner (proposed)"
+    },
+    {
+      "id": "L8",
+      "blocks": "historical run visibility (all historical rows VISIBILITY_UNKNOWN)",
+      "owner": "grader owner (proposed): timed ingest_confirmation"
     }
   ],
   "released_suites": [
@@ -293,10 +298,11 @@
       "contains": "def cofiring("
     }
   ],
-  "revision": 3,
+  "revision": 4,
   "answers_review": [
     "GRID #1413 review 6033027329 at 393cde73",
-    "GRID #1413 review 6033670709 at 4aa18aee"
+    "GRID #1413 review 6033670709 at 4aa18aee",
+    "GRID #1413 review 6033699395 at bc0e85db"
   ],
   "derivation": {
     "note": "Executable form of doc section 2.2; tests/test_m2_outcome_lineage_map.py applies these rules to the fixtures.",
@@ -346,7 +352,8 @@
       "UNMEASURABLE": "NO_HORIZON or NOT_GRADABLE",
       "UNKNOWN": "UNKNOWN_CAUSE",
       "NOT_ASSESSED": "MATURE, not resolved, graded_at < horizon_end",
-      "NOT_VISIBLE": "run ingested_at > R"
+      "NOT_VISIBLE": "witness observed_at > R",
+      "VISIBILITY_UNKNOWN": "no qualifying witness"
     },
     "matured_denominator": [
       "CONFIRMED",
@@ -368,7 +375,17 @@
           "state": "PENDING"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "due horizon, endpoint close missing",
@@ -382,7 +399,17 @@
           "state": "UNAVAILABLE"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "missing baseline graded before maturity",
@@ -396,7 +423,17 @@
           "state": "PENDING"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "missing baseline after maturity",
@@ -410,7 +447,17 @@
           "state": "UNAVAILABLE"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "unusable endpoint",
@@ -424,7 +471,17 @@
           "state": "UNAVAILABLE"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "resolved confirmed",
@@ -438,7 +495,17 @@
           "state": "CONFIRMED"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "resolved refuted",
@@ -452,7 +519,17 @@
           "state": "REFUTED"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "resolved partially confirmed",
@@ -466,7 +543,17 @@
           "state": "PARTIAL"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "causal claim, no horizon",
@@ -480,7 +567,17 @@
           "state": "UNMEASURABLE"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "alias level",
@@ -494,7 +591,17 @@
           "state": "UNMEASURABLE"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "unrecognised unscorable cause",
@@ -508,7 +615,17 @@
           "state": "UNKNOWN"
         },
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00"
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
+        }
       },
       {
         "name": "pair A1: unresolved graded before the horizon, read after it",
@@ -517,11 +634,21 @@
         "horizon_end": "2026-11-18T21:00:00+00:00",
         "root_cause": null,
         "graded_at": "2026-11-17T11:35:00+00:00",
-        "run_visible_at": "2026-11-17T11:36:00+00:00",
         "expect": {
           "maturity": "MATURE",
           "data": "MISSING_ENDPOINT",
           "state": "NOT_ASSESSED"
+        },
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-17T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-17T11:36:00+00:00"
+          }
         }
       },
       {
@@ -531,11 +658,21 @@
         "horizon_end": "2026-11-18T21:00:00+00:00",
         "root_cause": null,
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00",
         "expect": {
           "maturity": "MATURE",
           "data": "MISSING_ENDPOINT",
           "state": "UNAVAILABLE"
+        },
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
         }
       },
       {
@@ -545,11 +682,21 @@
         "horizon_end": "2026-11-18T21:00:00+00:00",
         "root_cause": "no usable TIINGO close for SPY on 2026-11-14",
         "graded_at": "2026-11-15T11:35:00+00:00",
-        "run_visible_at": "2026-11-15T11:36:00+00:00",
         "expect": {
           "maturity": "MATURE",
           "data": "MISSING_BASELINE",
           "state": "NOT_ASSESSED"
+        },
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-15T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-15T11:36:00+00:00"
+          }
         }
       },
       {
@@ -559,11 +706,21 @@
         "horizon_end": "2026-11-18T21:00:00+00:00",
         "root_cause": "no usable TIINGO close for SPY on 2026-11-14",
         "graded_at": "2026-11-19T11:35:00+00:00",
-        "run_visible_at": "2026-11-19T11:36:00+00:00",
         "expect": {
           "maturity": "MATURE",
           "data": "MISSING_BASELINE",
           "state": "UNAVAILABLE"
+        },
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-19T11:36:00+00:00"
+          }
         }
       },
       {
@@ -573,16 +730,117 @@
         "horizon_end": "2026-11-18T21:00:00+00:00",
         "root_cause": "SPY moved -1.20% ...",
         "graded_at": "2026-11-20T11:35:00+00:00",
-        "run_visible_at": "2026-11-20T11:36:00+00:00",
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "NOT_VISIBLE"
+        },
+        "run": {
+          "run_id": 100,
+          "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ingested_at": "2026-11-20T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 100,
+            "review_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-11-20T11:36:00+00:00"
+          }
+        }
+      },
+      {
+        "name": "transaction straddling R: stamped before R, first witnessed after it",
+        "verdict": "refuted",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": "SPY moved -1.20% ...",
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run": {
+          "run_id": 101,
+          "review_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "ingested_at": "2026-11-19T23:59:59+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 101,
+            "review_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "observed_at": "2026-11-20T00:00:05+00:00"
+          }
+        },
         "expect": {
           "maturity": "MATURE",
           "data": "PRESENT",
           "state": "NOT_VISIBLE"
         }
+      },
+      {
+        "name": "historical run with no witness (ingested_at alone)",
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run": {
+          "run_id": 102,
+          "review_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": null
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        }
+      },
+      {
+        "name": "untimed grader confirmation is not a witness",
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run": {
+          "run_id": 103,
+          "review_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "grader_confirmation",
+            "run_id": 103,
+            "review_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "observed_at": null
+          }
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        }
+      },
+      {
+        "name": "witness bound to a different run",
+        "verdict": "confirmed",
+        "claim_type": "direction",
+        "horizon_end": "2026-11-18T21:00:00+00:00",
+        "root_cause": null,
+        "graded_at": "2026-11-19T11:35:00+00:00",
+        "run": {
+          "run_id": 104,
+          "review_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "ingested_at": "2026-11-19T11:36:00+00:00",
+          "witness": {
+            "kind": "study_read",
+            "run_id": 99,
+            "review_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "observed_at": "2026-11-19T12:00:00+00:00"
+          }
+        },
+        "expect": {
+          "maturity": "MATURE",
+          "data": "PRESENT",
+          "state": "VISIBILITY_UNKNOWN"
+        }
       }
     ],
     "run_clocks": {
-      "visible": "ingested_at <= R, else NOT_VISIBLE",
+      "visible": "post-commit witness bound to run_id + review_sha256 with observed_at <= R; witness after R -> NOT_VISIBLE; none -> VISIBILITY_UNKNOWN; ingested_at is never used",
       "assessed": "non-resolved MATURE row needs graded_at >= horizon_end, else NOT_ASSESSED"
     },
     "separate_counts": [
@@ -590,8 +848,54 @@
       "NOT_ASSESSED",
       "UNMEASURABLE",
       "UNKNOWN",
-      "NOT_VISIBLE"
-    ]
+      "NOT_VISIBLE",
+      "VISIBILITY_UNKNOWN"
+    ],
+    "witness_kinds": [
+      "study_read",
+      "timed_grader_confirmation"
+    ],
+    "supersession_fixture": {
+      "note": "Rule 2.4.3 with visibility: per day, read the newest run whose witness is timed <= R.",
+      "runs": [
+        {
+          "run_id": 200,
+          "supersedes_run_id": null,
+          "witness": {
+            "kind": "study_read",
+            "run_id": 200,
+            "review_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "observed_at": "2026-11-19T11:40:00+00:00"
+          },
+          "review_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        {
+          "run_id": 201,
+          "supersedes_run_id": 200,
+          "witness": {
+            "kind": "study_read",
+            "run_id": 201,
+            "review_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "observed_at": "2026-11-20T11:40:00+00:00"
+          },
+          "review_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "cases": [
+        {
+          "read_at": "2026-11-20T00:00:00+00:00",
+          "expect_run_id": 200
+        },
+        {
+          "read_at": "2026-11-21T00:00:00+00:00",
+          "expect_run_id": 201
+        },
+        {
+          "read_at": "2026-11-19T00:00:00+00:00",
+          "expect_run_id": null
+        }
+      ]
+    }
   },
   "binding_values": [
     "ENFORCED",

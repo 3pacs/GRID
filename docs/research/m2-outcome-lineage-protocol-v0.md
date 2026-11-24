@@ -4,8 +4,8 @@ Issue: [#960](https://github.com/3pacs/GRID/issues/960). Milestone: M2, "Evidenc
 Machine-readable companion: [`m2-outcome-lineage-v0.json`](m2-outcome-lineage-v0.json). The companion is held to
 the code by `tests/test_m2_outcome_lineage_map.py`.
 
-**Status: DRAFT v0, revision 3** (answers the reviewer's HOLDs 6033027329 on `393cde73` and 6033670709 on
-`4aa18aee`; the change maps are §7 and §8). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
+**Status: DRAFT v0, revision 4** (answers the reviewer's HOLDs 6033027329 on `393cde73`, 6033670709 on
+`4aa18aee` and 6033699395 on `bc0e85db`; the change maps are §7–§9). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
 scoring or learning, evaluation run, DDL, historical rewrite, promotion or trading action. Only the research owner
 can adopt it, and only after the independent reviewer's pass (§6). Adoption is a separate commit that pins this
 file's hash. The D0 contract ([#1129](https://github.com/3pacs/GRID/issues/1129), draft PR #1142) is the first
@@ -62,8 +62,20 @@ The grader's `verdict` mixes three questions, so a study must not read it alone:
 A study therefore derives three axes for each row, at a fixed read instant `R` (the study's own, recorded at S1),
 and only then assigns a protocol state. Two clocks of the row's run decide whether the row can be used at all:
 
-- **Visible by R.** The row's `publication_review_runs.ingested_at` must be ≤ `R`. A row recorded after `R` is
-  `NOT_VISIBLE`: excluded from every count except its own, and never read.
+- **Visible by R, by a post-commit witness.** `publication_review_runs.ingested_at` is `DEFAULT NOW()`, which is
+  PostgreSQL's transaction-start time. A run stamped before `R` can commit after it, so `ingested_at` never shows
+  visibility, and neither does the ingest wrapper's own stamp. A row is visible by `R` only when a **witness**
+  exists. A witness is an observation made after commit, bound to the run's `run_id` and `review_sha256`, and timed
+  at or before `R`. Two kinds qualify:
+  - **the study's own read at `R`** (forward studies): the study records the `run_id` and `review_sha256` of every
+    run its read returned, with the read time. A reader sees only committed rows.
+  - **a timed grader confirmation**: the grader's `ingest_confirmation` already binds `review_sha256`,
+    `packet_sha256` and `run_id`, but it records **no time**. Until it does (gap L8), it cannot serve as a
+    historical witness.
+
+  A witness timed after `R` makes the row `NOT_VISIBLE`. A row with no qualifying witness is
+  `VISIBILITY_UNKNOWN`. This is the state of every historical run today. Both states are excluded from the rate and
+  each has its own count. Neither is ever read as an outcome.
 - **Assessed after the horizon.** Only a grading made at or after the horizon can say an endpoint, or any other input,
   was missing at maturity. A non-resolved row whose run `graded_at` < `horizon_end` is `NOT_ASSESSED` once the
   horizon passes. That means matured but not graded at maturity. It is never `UNAVAILABLE`, and the study waits for
@@ -101,11 +113,13 @@ fixed `root_cause` prefixes, and anything it does not recognise is `UNKNOWN_CAUS
 | `UNAVAILABLE` | `MATURE`, run `graded_at` ≥ `horizon_end`, with `MISSING_BASELINE`, `MISSING_ENDPOINT`, `UNUSABLE_ENDPOINT` or `NO_SOURCE` | yes, as a non-success. It is never dropped. |
 | `UNMEASURABLE` | `NO_HORIZON`, or `NOT_GRADABLE` | no; reported beside the result |
 | `UNKNOWN` | `UNKNOWN_CAUSE`, at any maturity (checked after visibility) | no; reported beside the result, and a non-zero count is a grader-owner defect |
-| `NOT_VISIBLE` | run `ingested_at` > `R` (checked first) | no; counted on its own line |
+| `NOT_VISIBLE` | the run's witness is timed after `R` (checked first) | no; counted on its own line |
+| `VISIBILITY_UNKNOWN` | no post-commit witness bound to the run (checked first) | no; counted on its own line. Every historical run is here until L8 closes. |
 
 A matured rate's denominator is the **visible, assessed, gradable, mature** rows: `CONFIRMED`, `REFUTED`, `PARTIAL`
 and `UNAVAILABLE`, and nothing else. Every other state has its own count, shown next to the rate: `PENDING`,
-`NOT_ASSESSED`, `UNMEASURABLE` (a mature `NOT_GRADABLE` row included), `UNKNOWN` and `NOT_VISIBLE`. None of these
+`NOT_ASSESSED`, `UNMEASURABLE` (a mature `NOT_GRADABLE` row included), `UNKNOWN`, `NOT_VISIBLE` and
+`VISIBILITY_UNKNOWN`. None of these
 can pass as observed missing data. The companion JSON carries one fixture
 per derivation rule; the test applies the rules to those fixtures, as the executable form of this table.
 
@@ -120,6 +134,7 @@ per derivation rule; the test applies the rules to those fixtures, as the execut
 | L5 | M0 (#958) proved one designed refusal, not a reasoned use of an input | any accuracy claim that depends on lineage | research owner. A reasoned-use proof (e.g. the 2026-10-26 briefing 4756) needs the receipt-format decision noted on #958. |
 | L6 | Verdict rows are not E2 predictions. E2 needs a logged entry before the outcome and registration in `rules.json`. | scoring publications on the E2 scoreboard | owner decision. A publication stream would be a new E2 version, never an edit of `e2-v1`. |
 | L7 | Close evidence is dated by observation date (`obs_date`, session close). It records neither the selected vintage nor its availability time. | any claim that an outcome was knowable at the grading instant from first-release data; revision-sensitive outcomes | grader owner (record the vintage and pull timestamp of each close used) |
+| L8 | No timed post-commit witness of run visibility. `ingested_at` is transaction start, and the grader's `ingest_confirmation` has no time. | any historical study: its rows are `VISIBILITY_UNKNOWN` | grader owner: stamp `observed_at` on `ingest_confirmation` when the ingest's committed result is returned (bound to `run_id` and `review_sha256`). Forward studies can use their own read. |
 
 ### 2.4 Lineage rules
 
@@ -130,10 +145,17 @@ per derivation rule; the test applies the rules to those fixtures, as the execut
    did not extract is out of scope; it is not added later.
 3. **Pin the run.** A study names the `publication_review_runs.id` values it reads. A later superseding run is a new
    observation with its own result; it never silently replaces the one read.
-4. **Day eligibility.** A publication day is eligible only when its three runtime receipts exist (packet
-   `receipt.json`, grader receipt `WRITTEN`/`UNCHANGED`, ingest receipt `INGESTED` with a bound
-   `ingest_confirmation`). Hand-produced late captures keep their `late_capture: true` flag. They are reported
-   separately and never pooled silently.
+4. **Day eligibility.** A publication day is eligible only when all three hold:
+   - the producer's `receipt.json` exists;
+   - the grader's receipt is `WRITTEN` or `UNCHANGED` and carries an `ingest_confirmation`. This is the grader's own
+     check that the ingest's returned result binds the same `review_sha256`, `packet_sha256` and a positive `run_id`,
+     with no rejected rows.
+   - that run passes the visibility rule of §2.2.
+
+   The ingest's own receipt (`state: INGESTED` or `PRESENT`) is the underlying result. It is necessary, but on its
+   own it is not a confirmation: the grader records `ingest_confirmation_error` when the result does not bind its
+   file. Hand-produced late captures keep their `late_capture: true` flag; they are reported separately and never
+   pooled silently.
 5. **No accuracy from lineage that M0 has not proven.** Until L1 and L5 close, publication outcomes describe how
    often a published sentence held. They do not show that GRID's inputs or reasoning produced it.
 
@@ -155,7 +177,7 @@ Binding, per stage, says what actually makes a study comply today:
 | S0 Explore | Anything goes, labelled `EXPLORATORY`. It can propose a candidate but never supply evidence for one. The data it read is recorded as spent. | `analysis/research_findings.py` catalogue; D0 §4 spent periods | `POLICY`: the catalogue records spent looks, and nothing refuses re-reading them |
 | S1 Register | One candidate record **before any data is read**: rule, variants, horizons, instruments, controls, outcome definition, thresholds, the fixed look and the read instant `R`. Abandonment counts as a failure. | `evals/e3` E3A ledger, S11 allocation (`record_hypothesis_batch`), edge-stream registration | `ENFORCED` inside the edge stream and hypothesis scoring v2; E3A is a released library with no production caller verified here; elsewhere `POLICY` |
 | S2 Custody | A holdout or walk-forward split declared at S1, never chosen after a look. Holdout reads go through custody. | E3B `holdout.py` (`e3-v2`), factory pre-screen (one older-data look), D0 §5.2 / §8 | E3B `FIXTURE_ONLY`; the D0 admission verifier is inert (`VERIFIER_ACCEPTED = False`); elsewhere `POLICY` |
-| S3 Leakage | Every input passes the six clocks of D0 §2.1. The study runs a look-ahead canary and a late/revised/missing/duplicate fixture. | `evals/e1`, `assert_no_lookahead()`, `read_window_known_at`, D0 §5.6 | `CI_GATE` (E1) and `ENFORCED` on the inference paths that call `assert_no_lookahead()`; the per-study fixture is `POLICY` |
+| S3 Leakage | Every input passes the six clocks of D0 §2.1. The study runs a look-ahead canary and a late/revised/missing/duplicate fixture. | `evals/e1`, `assert_no_lookahead()`, `read_window_known_at`, D0 §5.6 | `CI_GATE` for E1's integrity gates. `assert_no_lookahead()` is a date-grain check on the callers that use it: it is `ENFORCED` there, but it does not enforce D0's six clocks. Clock 4 visibility, and everything outside those callers, is `POLICY` |
 | S4 Costs | Results are net of a cost model declared at S1. A gross-only result is labelled gross and cannot pass. | E2 cost model, edge-stream cost floor, D0 §6.3 | `ENFORCED` inside the edge stream; E2 applies its cost model whenever it scores; elsewhere `POLICY` |
 | S5 Uncertainty | Block-permutation or block-bootstrap intervals that respect the serial and cross-sectional dependence; BH-FDR across the declared family. Effect size ± interval comes first, then the verdict. | `offline_research_proof.py`, `hypothesis_trials.py`, E2 bootstrap | `ENFORCED` in hypothesis scoring v2 (BH per batch); E2 applies its bootstrap whenever it scores; library functions otherwise, so `POLICY` |
 | S6 Regimes | Regime splits are declared at S1 from the market-state record as of each decision. Results are reported per regime. A regime is never picked after the look. | `intelligence/regime/market_state.py` | `MISSING`: the record exists, but nothing binds a study's splits to its registration |
@@ -245,4 +267,13 @@ days (rule 2.4.4). The pending, unavailable and unmeasurable counts are always s
 | Endpoint-missing came from the study's later read clock `R`, without requiring that the unresolved verdict was graded at or after the horizon, or that its run was visible by `R` | §2.2 binds two run clocks. A row is used only if `ingested_at` ≤ `R` (otherwise `NOT_VISIBLE`). A non-resolved mature row counts as `UNAVAILABLE` only if its run's `graded_at` ≥ `horizon_end`; otherwise it is `NOT_ASSESSED`. |
 | The denominator prose (every mature claim) disagreed with the fixtures (which excluded mature `NOT_GRADABLE` / `UNKNOWN_CAUSE`) | The prose now names exactly the four states in the denominator and lists each excluded state's own count. The JSON `matured_denominator` and the test agree with it. |
 | Add paired pre-/post-horizon cases with the same cause, and a recorded-after-`R` case | Fixtures: unresolved graded before vs after the horizon; missing baseline graded before vs after the horizon, both read after it; one row whose run was ingested after `R`. |
+
+## 9. Revision 4 change map (answers HOLD 6033699395 on `bc0e85db`)
+
+| Reviewer point | Change |
+|---|---|
+| `ingested_at DEFAULT NOW()` is the transaction-start time, not commit or read visibility; the ingest wrapper's stamp is not a post-commit witness | §2.2: visibility needs a post-commit witness bound to `run_id` and `review_sha256` and timed by `R`. Without one the row is `VISIBILITY_UNKNOWN` (every historical run today); with a witness after `R`, `NOT_VISIBLE`. New gap L8, for a timed grader confirmation. |
+| Test a transaction straddling `R`, and a superseding run before and after the cutoff | Fixtures: a run with `ingested_at` before `R` and its only witness after `R` (`NOT_VISIBLE`); a run with no witness (`VISIBILITY_UNKNOWN`); a day whose superseding run is witnessed after `R`, so the study reads the earlier run; and the same day read after both witnesses, so it reads the superseding run. |
+| §2.4.4 must distinguish the grader's hash-bound `ingest_confirmation` from the underlying ingest result | §2.4.4 now names each separately; the ingest receipt alone is not a confirmation. |
+| S3's production assert is date-grain on covered callers, not enforcement of all six D0 clocks | S3's binding says so. |
 

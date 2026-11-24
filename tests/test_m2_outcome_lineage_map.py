@@ -49,8 +49,8 @@ def doc() -> str:
 def test_status_is_draft_and_authorises_nothing(lineage: dict, doc: str) -> None:
     assert lineage["status"] == "DRAFT_UNREVIEWED"
     assert lineage["authorises"] == []
-    assert lineage["revision"] == 3
-    assert "DRAFT v0, revision 3" in doc and "authorises nothing" in doc
+    assert lineage["revision"] == 4
+    assert "DRAFT v0, revision 4" in doc and "authorises nothing" in doc
     assert lineage["document"] == str(DOC_PATH.relative_to(ROOT))
 
 
@@ -94,6 +94,18 @@ RESOLVED_STATE = {"confirmed": "CONFIRMED", "refuted": "REFUTED", "partially_con
 UNAVAILABLE_DATA = {"MISSING_BASELINE", "MISSING_ENDPOINT", "UNUSABLE_ENDPOINT", "NO_SOURCE"}
 
 
+QUALIFYING_WITNESSES = {"study_read", "timed_grader_confirmation"}
+
+
+def run_visibility(run: dict, read_at: datetime) -> str:
+    """VISIBLE / NOT_VISIBLE / VISIBILITY_UNKNOWN from a post-commit witness; ingested_at is never read."""
+    witness = run.get("witness")
+    if (not witness or witness.get("kind") not in QUALIFYING_WITNESSES or witness.get("observed_at") is None
+            or witness.get("run_id") != run["run_id"] or witness.get("review_sha256") != run["review_sha256"]):
+        return "VISIBILITY_UNKNOWN"
+    return "VISIBLE" if datetime.fromisoformat(witness["observed_at"]) <= read_at else "NOT_VISIBLE"
+
+
 def derive(row: dict, rules: dict, read_at: datetime) -> dict:
     """Doc section 2.2 as code: maturity, data and state for one verdict row at read instant R."""
     horizon = row["horizon_end"]
@@ -114,8 +126,9 @@ def derive(row: dict, rules: dict, read_at: datetime) -> dict:
         data = next((r["data"] for r in rules["unscorable_root_cause_prefixes"] if cause.startswith(r["prefix"])),
                     "UNKNOWN_CAUSE")
     graded_at = datetime.fromisoformat(row["graded_at"])
-    if datetime.fromisoformat(row["run_visible_at"]) > read_at:
-        state = "NOT_VISIBLE"
+    visibility = run_visibility(row["run"], read_at)
+    if visibility != "VISIBLE":
+        state = visibility
     elif data == "UNKNOWN_CAUSE":
         state = "UNKNOWN"
     elif maturity == "IMMATURE":
@@ -152,6 +165,29 @@ def test_fixtures_cover_every_verdict_and_the_reviewed_cases(lineage: dict, inge
     assert {states[n] for n in states if n.startswith("pair A")} == {"NOT_ASSESSED", "UNAVAILABLE"}
     assert {states[n] for n in states if n.startswith("pair B")} == {"NOT_ASSESSED", "UNAVAILABLE"}
     assert "NOT_VISIBLE" in states.values()
+    # Review 6033699395: a transaction straddling R, and runs with no or a mismatched witness.
+    straddle = next(f for f in fixtures if f["name"].startswith("transaction straddling R"))
+    assert datetime.fromisoformat(straddle["run"]["ingested_at"]) < datetime.fromisoformat(lineage["derivation"]["read_at"])
+    assert straddle["expect"]["state"] == "NOT_VISIBLE"
+    assert list(states.values()).count("VISIBILITY_UNKNOWN") >= 3
+
+
+def test_ingested_at_never_decides_visibility(lineage: dict) -> None:
+    rules = lineage["derivation"]
+    read_at = datetime.fromisoformat(rules["read_at"])
+    for fixture in rules["fixtures"]:
+        moved = json.loads(json.dumps(fixture))
+        moved["run"]["ingested_at"] = "1970-01-01T00:00:00+00:00"
+        assert derive(moved, rules, read_at)["state"] == derive(fixture, rules, read_at)["state"], fixture["name"]
+
+
+def test_supersession_reads_the_newest_run_witnessed_by_r(lineage: dict) -> None:
+    sup = lineage["derivation"]["supersession_fixture"]
+    for case in sup["cases"]:
+        read_at = datetime.fromisoformat(case["read_at"])
+        visible = [r for r in sup["runs"] if run_visibility(r, read_at) == "VISIBLE"]
+        chosen = max(visible, key=lambda r: r["run_id"])["run_id"] if visible else None
+        assert chosen == case["expect_run_id"], case
 
 
 def test_pending_and_unknown_never_enter_the_matured_denominator(lineage: dict) -> None:
@@ -165,7 +201,7 @@ def test_pending_and_unknown_never_enter_the_matured_denominator(lineage: dict) 
         got = derive(fixture, rules, read_at)
         # Every derived state is either in the denominator or has its own count; nothing falls between.
         assert got["state"] in denominator | separate, fixture["name"]
-        visible = datetime.fromisoformat(fixture["run_visible_at"]) <= read_at
+        visible = run_visibility(fixture["run"], read_at) == "VISIBLE"
         assessed = (got["data"] == "PRESENT" or fixture["horizon_end"] is None
                     or datetime.fromisoformat(fixture["graded_at"]) >= datetime.fromisoformat(fixture["horizon_end"]))
         expected_in = (visible and assessed and got["maturity"] == "MATURE"
