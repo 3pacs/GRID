@@ -911,3 +911,22 @@ def test_sector_state_json_overflow_is_not_a_number(tmp_path):
     sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
     assert sec.facts["record_date"] == "2026-11-18"
     assert any("market.trend_pct is not a finite number" in p for p in sec.problems)
+
+
+def test_sector_state_huge_json_integer_is_skipped_not_unknown(tmp_path):
+    import hashlib
+
+    for i, lit in enumerate(("1" + "0" * 309, "10000000000")):
+        d = tmp_path / str(i)
+        d.mkdir()
+        db = _sector_db(d, [("2026-11-18", "2026-11-19T06:45:08Z")])
+        body = json.dumps(_sector_rec("2026-11-19")).replace('"trend_pct": 0.06', '"trend_pct": ' + lit)
+        assert lit in body
+        con = sqlite3.connect(db)
+        con.execute("INSERT INTO desk_state VALUES (?,?,?,?,?,?)", ("2026-11-19", "live", "desk-sector-state/1", body,
+                                                                     hashlib.sha256(body.encode()).hexdigest(), "2026-11-20T06:45:08Z"))
+        con.commit()
+        con.close()
+        sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+        assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-18", lit[:5]
+        assert any("market.trend_pct is not a finite number" in p for p in sec.problems)

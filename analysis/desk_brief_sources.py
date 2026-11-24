@@ -721,6 +721,7 @@ _LEAVES = {"market": {"phase": "text", "trend_pct": "num", "bend_pct": "num"},
            "fed_balance_sheet": {"phase": "text", "obs_date": "date", "growth_13w_pct": "num"},
            "vix": {"third": "text", "spike_state": "text", "obs_date": "date", "stale": "bool"},
            "overnight_rule": {"market_gate": "bool"}}
+_NUM_BOUND = 1e9                           # no printed figure (percent, count) comes near this
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -728,7 +729,13 @@ def _leaf_bad(v: Any, kind: str) -> bool:
     if v is None:
         return False
     if kind == "num":
-        return isinstance(v, bool) or not isinstance(v, _NUM) or not math.isfinite(v)
+        if isinstance(v, bool) or not isinstance(v, _NUM):
+            return True
+        try:                                   # a JSON integer is unbounded: 10**309 cannot become a float
+            f = float(v)
+        except OverflowError:
+            return True
+        return not math.isfinite(f) or abs(f) > _NUM_BOUND
     if kind == "bool":
         return not isinstance(v, bool)
     if kind == "date":
