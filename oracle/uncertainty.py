@@ -134,61 +134,133 @@ def _vote_confidence_values(votes: Sequence[dict[str, Any]]) -> list[float]:
     return out
 
 
+def _vote_signed_probabilities(votes: Sequence[dict[str, Any]]) -> list[float]:
+    """Extract per-head signed P(up) values in [0, 1].
+
+    Bullish confidence ``c`` maps to ``c``; bearish maps to ``1 - c``;
+    neutral/unknown maps to ``0.5``. Votes without a ``direction`` key are
+    treated as same-side (bullish) for backward compatibility with legacy
+    unit-test payloads.
+    """
+    out: list[float] = []
+    for v in votes:
+        c = v.get("confidence")
+        if c is None:
+            continue
+        try:
+            cf = float(c)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(cf):
+            continue
+        cf = max(0.0, min(1.0, cf))
+        raw_dir = v.get("direction")
+        if raw_dir is None or str(raw_dir).strip() == "":
+            out.append(cf)
+        else:
+            d = str(raw_dir).strip().lower()
+            if d == "bullish":
+                out.append(cf)
+            elif d == "bearish":
+                out.append(1.0 - cf)
+            else:
+                out.append(0.5)
+    return out
+
+
+def _wilson_interval(p: float, n_eff: int, z: float) -> tuple[float, float, float]:
+    """Wilson score interval around ``p`` with effective sample size ``n_eff``.
+
+    Returns ``(lower, upper, effective_se)``. Strictly non-degenerate for every
+    ``p in [0, 1]`` and ``n_eff >= 1``, and guaranteed to bracket ``p``.
+    """
+    n = max(1, int(n_eff))
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    rad = math.sqrt((p * (1.0 - p)) / n + z2 / (4.0 * n * n))
+    margin = (z * rad) / denom
+    lower = max(0.0, center - margin)
+    upper = min(1.0, center + margin)
+    effective_se = rad / denom
+    return lower, upper, effective_se
+
+
 def compute_confidence_interval(
     votes: Sequence[dict[str, Any]],
     point_confidence: float,
     *,
     alpha: float = 0.10,
 ) -> ConfidenceInterval:
-    """Return a symmetric confidence interval for the ensemble's point estimate.
+    """Return a confidence interval for the ensemble's max-side probability.
 
-    Uses the t-distribution critical value for n<30 ensembles and the normal
-    approximation for larger ones. The interval is centered on ``point_confidence``
-    (not on the mean of the per-head confidences) so it stays consistent with
-    whatever dampening the oracle has already applied.
+    Disagreement across heads is measured on signed ``p_up`` (bullish ``c`` →
+    ``c``, bearish ``c`` → ``1 - c``, neutral → ``0.5``) so opposing heads
+    widen the interval rather than collapsing variance to zero. A Wilson score
+    minimum-width floor (at ``n_eff = max(1, n)``) ensures small or uniform
+    ensembles never report a zero-width interval.
 
     Parameters
     ----------
     votes:
-        Sequence of per-head vote dicts (must have a ``confidence`` key).
+        Sequence of per-head vote dicts (``confidence`` and optional
+        ``direction`` keys).
     point_confidence:
-        The oracle's post-dampening point estimate — becomes the center of
-        the interval.
+        The oracle's post-dampening max-side probability estimate.
     alpha:
         Two-sided significance level. ``0.10`` = 90% CI, ``0.05`` = 95%,
         ``0.01`` = 99%. Unknown values fall back to 0.10.
 
     Returns
     -------
-    A :class:`ConfidenceInterval` with both bounds clamped to ``[0, 1]``.
-    Singleton ensembles (n=1) collapse to a zero-width interval around the
-    point.
+    A :class:`ConfidenceInterval` with both bounds clamped to ``[0, 1]`` and
+    strictly positive width.
     """
-    confs = _vote_confidence_values(votes)
-    n = len(confs)
-    if n <= 1:
+    norm_alpha = alpha if alpha in (0.10, 0.05, 0.01) else 0.10
+    p_ups = _vote_signed_probabilities(votes)
+    n = len(p_ups)
+
+    if not math.isfinite(point_confidence):
         return ConfidenceInterval(
-            point=point_confidence,
-            lower=max(0.0, min(1.0, point_confidence)),
-            upper=max(0.0, min(1.0, point_confidence)),
+            point=0.0,
+            lower=0.0,
+            upper=1.0,
             alpha=alpha,
             n=n,
-            sem=0.0,
+            sem=0.5,
         )
 
-    mean = sum(confs) / n
-    var = sum((c - mean) ** 2 for c in confs) / (n - 1)  # sample variance
+    pt = max(0.0, min(1.0, float(point_confidence)))
+    z = _Z_CRITICAL[norm_alpha]
+    w_lower, w_upper, w_se = _wilson_interval(pt, max(1, n), z)
+
+    if n <= 1:
+        return ConfidenceInterval(
+            point=pt,
+            lower=w_lower,
+            upper=w_upper,
+            alpha=alpha,
+            n=n,
+            sem=w_se,
+        )
+
+    mean_p = sum(p_ups) / n
+    var = sum((p - mean_p) ** 2 for p in p_ups) / (n - 1)  # sample variance on signed p_up
     std = math.sqrt(var)
-    sem = std / math.sqrt(n)
+    sem_emp = std / math.sqrt(n)
 
-    crit = _critical_value(n - 1, alpha)
-    half_width = crit * sem
+    crit = _critical_value(n - 1, norm_alpha)
+    half_width = crit * sem_emp
 
-    lower = max(0.0, point_confidence - half_width)
-    upper = min(1.0, point_confidence + half_width)
+    emp_lower = max(0.0, pt - half_width)
+    emp_upper = min(1.0, pt + half_width)
+
+    lower = min(emp_lower, w_lower)
+    upper = max(emp_upper, w_upper)
+    sem = max(sem_emp, w_se)
 
     return ConfidenceInterval(
-        point=point_confidence,
+        point=pt,
         lower=lower,
         upper=upper,
         alpha=alpha,
