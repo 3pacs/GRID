@@ -23,6 +23,7 @@ Fully self-contained — no external dependencies beyond loguru.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -256,65 +257,114 @@ class CircuitBreaker:
         confidence: float,
         recommended_action: str,
         position_size: float = 1.0,
+        current_price: float | None = None,
     ) -> RiskCheckResult:
         """Check if a recommendation should be allowed through.
 
         Parameters:
             regime: Predicted regime (e.g. "GROWTH").
-            confidence: Model confidence (0-1).
+            confidence: Model confidence (0-1) — logged for audit only, never
+                used as a price proxy for exposure calculation.
             recommended_action: GRID action (BUY/SELL/HOLD/REDUCE).
-            position_size: Notional position size.
+            position_size: Position quantity (shares/contracts) when
+                ``current_price`` is supplied, or direct notional exposure in
+                USD when ``current_price`` is ``None``.
+            current_price: Actual instrument price in USD. When ``None``,
+                exposure is computed directly from ``position_size`` (price=1).
 
         Returns:
-            RiskCheckResult — check .passed before logging.
+            RiskCheckResult — check .passed before logging. Fails closed with
+            reason ``risk_check_error`` on any internal error.
         """
-        # HOLD doesn't add exposure, always allow
-        if recommended_action in ("HOLD",):
-            return RiskCheckResult(passed=True, reason="HOLD — no new exposure")
+        try:
+            # HOLD doesn't add exposure, always allow
+            if recommended_action in ("HOLD",):
+                return RiskCheckResult(passed=True, reason="HOLD — no new exposure")
 
-        # Check cooldown
-        if self._in_cooldown():
-            result = RiskCheckResult(
-                passed=False,
-                reason=f"Cooldown active — {self.config.cooldown_after_halt_minutes}min after last halt",
+            # Check cooldown
+            if self._in_cooldown():
+                result = RiskCheckResult(
+                    passed=False,
+                    reason=f"Cooldown active — {self.config.cooldown_after_halt_minutes}min after last halt",
+                )
+                self._record_event("cooldown", result.reason)
+                return result
+
+            # Check kill switch
+            if self._risk_mgr.is_kill_switch_active():
+                result = RiskCheckResult(
+                    passed=False,
+                    reason="Kill switch is active",
+                )
+                self._record_event("blocked", result.reason)
+                return result
+
+            size_val = float(position_size)
+            if not math.isfinite(size_val) or size_val < 0.0:
+                reason = f"risk_check_error: invalid position_size ({position_size!r})"
+                self._record_event("blocked", reason, {"regime": regime, "action": recommended_action})
+                log.error("CircuitBreaker BLOCKED — {r}", r=reason)
+                return RiskCheckResult(passed=False, reason=reason)
+
+            if current_price is not None:
+                price_val = float(current_price)
+                if not math.isfinite(price_val) or price_val <= 0.0:
+                    reason = f"risk_check_error: invalid current_price ({current_price!r})"
+                    self._record_event("blocked", reason, {"regime": regime, "action": recommended_action})
+                    log.error("CircuitBreaker BLOCKED — {r}", r=reason)
+                    return RiskCheckResult(passed=False, reason=reason)
+                effective_price = price_val
+                exposure_basis = "price_x_size"
+            else:
+                # No instrument price supplied — treat position_size directly as
+                # notional exposure rather than multiplying by confidence.
+                effective_price = 1.0
+                exposure_basis = "notional_position_size"
+                log.debug(
+                    "CircuitBreaker: current_price not supplied for regime={reg}; "
+                    "computing exposure directly from position_size={s}",
+                    reg=regime,
+                    s=size_val,
+                )
+
+            side = "buy" if recommended_action in ("BUY",) else "sell"
+
+            result = self._risk_mgr.check_order(
+                market_id=f"regime_{regime}",
+                side=side,
+                size=size_val,
+                current_price=effective_price,
             )
-            self._record_event("cooldown", result.reason)
+
+            if not result.passed:
+                self._record_event("blocked", result.reason, {
+                    "regime": regime,
+                    "action": recommended_action,
+                    "position_size": size_val,
+                    "current_price": current_price,
+                    "exposure_basis": exposure_basis,
+                })
+                log.warning(
+                    "CircuitBreaker BLOCKED — {r} | regime={reg}, action={a}",
+                    r=result.reason, reg=regime, a=recommended_action,
+                )
+            elif result.warnings:
+                for w in result.warnings:
+                    self._record_event("warning", w, {"regime": regime})
+                    log.warning("CircuitBreaker warning: {w}", w=w)
+
             return result
-
-        # Check kill switch
-        if self._risk_mgr.is_kill_switch_active():
-            result = RiskCheckResult(
-                passed=False,
-                reason="Kill switch is active",
+        except Exception as exc:  # noqa: BLE001 — fail closed on any internal error
+            reason = f"risk_check_error: {exc}"
+            log.error(
+                "CircuitBreaker internal error (failing closed) — {r} | regime={reg}",
+                r=reason, reg=regime,
             )
-            self._record_event("blocked", result.reason)
-            return result
-
-        side = "buy" if recommended_action in ("BUY",) else "sell"
-
-        result = self._risk_mgr.check_order(
-            market_id=f"regime_{regime}",
-            side=side,
-            size=position_size,
-            current_price=confidence,
-        )
-
-        if not result.passed:
-            self._record_event("blocked", result.reason, {
-                "regime": regime,
-                "action": recommended_action,
-                "position_size": position_size,
-            })
-            log.warning(
-                "CircuitBreaker BLOCKED — {r} | regime={reg}, action={a}",
-                r=result.reason, reg=regime, a=recommended_action,
-            )
-        elif result.warnings:
-            for w in result.warnings:
-                self._record_event("warning", w, {"regime": regime})
-                log.warning("CircuitBreaker warning: {w}", w=w)
-
-        return result
+            try:
+                self._record_event("blocked", reason, {"regime": regime, "action": recommended_action})
+            except Exception:
+                pass
+            return RiskCheckResult(passed=False, reason=reason)
 
     # ── Post-trade updates ────────────────────────────────────────────
 

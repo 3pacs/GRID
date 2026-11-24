@@ -27,11 +27,13 @@ from features.regime_conditional_brier import (
     CANONICAL_REGIMES,
     MIN_REGIME_SAMPLES,
     _canonical_regime,
+    _reset_skipped_live_update_counts,
     _row_to_scorecard,
     bootstrap_from_oracle_predictions,
     ensure_regime_brier_table,
     get_regime_conditional_scorecard,
     get_scorecard_with_regime_fallback,
+    get_skipped_live_update_counts,
     rank_signals_by_regime,
     record_scored_prediction,
 )
@@ -108,6 +110,29 @@ class _FakeEngine:
         self._ddl_seen: list[str] = []
         self.oracle_rows: list[tuple] = []
 
+    def seed_row(
+        self,
+        source: str,
+        horizon_days: int,
+        regime: str,
+        *,
+        scored_count: int,
+        running_brier: float,
+        running_ece: float = 0.0,
+        hit_count: int = 0,
+    ) -> None:
+        canonical = _canonical_regime(regime)
+        self.store[(source, int(horizon_days), canonical)] = {
+            "signal_source": source,
+            "horizon_days": int(horizon_days),
+            "regime": canonical,
+            "scored_count": int(scored_count),
+            "running_brier": float(running_brier),
+            "running_ece": float(running_ece),
+            "hit_count": int(hit_count),
+            "last_updated": datetime.now(timezone.utc),
+        }
+
     def begin(self) -> "_FakeEngine._Ctx":
         return _FakeEngine._Ctx(self)
 
@@ -165,7 +190,25 @@ class _FakeEngine:
                 rows.sort(key=lambda r_: r_[3])
                 return _FakeResult(fetchall_value=rows)
 
-            # Read: get_regime_conditional_scorecard (single row).
+            # Update-path lookup inside record_scored_prediction (4-column SELECT).
+            if (
+                sql.startswith("SELECT scored_count, running_brier, running_ece, hit_count")
+                and "last_updated" not in sql
+            ):
+                key = (params["s"], int(params["h"]), params["r"])
+                row = self.parent.store.get(key)
+                if row is None:
+                    return _FakeResult(fetchone_value=None)
+                return _FakeResult(
+                    fetchone_value=(
+                        row["scored_count"],
+                        row["running_brier"],
+                        row["running_ece"],
+                        row["hit_count"],
+                    )
+                )
+
+            # Read: get_regime_conditional_scorecard (single row, 5-column SELECT).
             if (
                 sql.startswith(
                     "SELECT scored_count, running_brier, running_ece"
@@ -186,35 +229,21 @@ class _FakeEngine:
                     )
                 )
 
-            # Update-path lookup inside record_scored_prediction.
-            if sql.startswith("SELECT scored_count, running_brier, running_ece, hit_count"):
-                key = (params["s"], int(params["h"]), params["r"])
-                row = self.parent.store.get(key)
-                if row is None:
-                    return _FakeResult(fetchone_value=None)
-                return _FakeResult(
-                    fetchone_value=(
-                        row["scored_count"],
-                        row["running_brier"],
-                        row["running_ece"],
-                        row["hit_count"],
-                    )
-                )
-
-            # INSERT.
+            # INSERT (handles both N=1 insert and bootstrap upsert with :n).
             if sql.startswith("INSERT INTO regime_conditional_brier_history"):
                 key = (params["s"], int(params["h"]), params["r"])
-                if key in self.parent.store:
+                if key in self.parent.store and "DO NOTHING" in sql:
                     return MagicMock()
                 self.parent.store[key] = {
                     "signal_source": params["s"],
                     "horizon_days": int(params["h"]),
                     "regime": params["r"],
-                    "scored_count": 1,
+                    "scored_count": int(params.get("n", 1)),
                     "running_brier": float(params["b"]),
                     "running_ece": float(params["e"]),
                     "hit_count": int(params["hit"]),
                     "last_updated": datetime.now(timezone.utc),
+                    "weight_sum": 1.0,
                 }
                 return MagicMock()
 
@@ -230,6 +259,7 @@ class _FakeEngine:
                         "running_ece": float(params["e"]),
                         "hit_count": int(params["h"]),
                         "last_updated": datetime.now(timezone.utc),
+                        "weight_sum": self.parent.store[key].get("weight_sum", 1.0) + 1.0,
                     }
                 )
                 return MagicMock()
@@ -278,7 +308,8 @@ class TestEnsureTable:
 
 
 class TestRecordScoredPrediction:
-    def test_first_insert(self):
+    def test_live_path_does_not_insert_count1_and_counts_skip(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
         updates = record_scored_prediction(
             engine,
@@ -288,26 +319,16 @@ class TestRecordScoredPrediction:
             signal_contributions={"flow_momentum": 1.0},
             regime="EXPANSION",
         )
-        assert "flow_momentum" in updates
-        assert updates["flow_momentum"]["scored_count"] == 1
-        assert updates["flow_momentum"]["regime"] == "EXPANSION"
-        # squared error = (0.7 - 1.0)^2 = 0.09
-        assert abs(updates["flow_momentum"]["running_brier"] - 0.09) < 1e-9
-        assert ("flow_momentum", 7, "EXPANSION") in engine.store
+        assert updates == {}
+        assert engine.store == {}
+        assert get_skipped_live_update_counts() == {("flow_momentum", 7): 1}
 
-    def test_welford_update_same_bucket(self):
+    def test_existing_bucket_is_not_mutated_without_weight_sum_column(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
-        # First: err = 0.09
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"flow_momentum": 1.0},
-            regime="EXPANSION",
-        )
-        # Second: err = 0.64
-        record_scored_prediction(
+        engine.seed_row("flow_momentum", 7, "EXPANSION", scored_count=20, running_brier=0.09, hit_count=18)
+        before = dict(engine.store[("flow_momentum", 7, "EXPANSION")])
+        updates = record_scored_prediction(
             engine,
             horizon_days=7,
             confidence=0.8,
@@ -315,40 +336,12 @@ class TestRecordScoredPrediction:
             signal_contributions={"flow_momentum": 1.0},
             regime="EXPANSION",
         )
-        row = engine.store[("flow_momentum", 7, "EXPANSION")]
-        assert row["scored_count"] == 2
-        # Running mean of {0.09, 0.64} = 0.365
-        assert abs(row["running_brier"] - 0.365) < 1e-6
+        assert updates == {}
+        assert engine.store[("flow_momentum", 7, "EXPANSION")] == before
+        assert get_skipped_live_update_counts() == {("flow_momentum", 7): 1}
 
-    def test_different_regimes_are_separate_rows(self):
-        engine = _FakeEngine()
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.9,
-            outcome=1.0,
-            signal_contributions={"flow_momentum": 1.0},
-            regime="EXPANSION",
-        )
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.9,
-            outcome=0.0,
-            signal_contributions={"flow_momentum": 1.0},
-            regime="CRISIS",
-        )
-        assert ("flow_momentum", 7, "EXPANSION") in engine.store
-        assert ("flow_momentum", 7, "CRISIS") in engine.store
-        # They must be distinct — EXPANSION had outcome=1 (hit) with
-        # conf=0.9, so brier=(0.9-1.0)^2 = 0.01; CRISIS had outcome=0
-        # with conf=0.9, so brier=(0.9-0.0)^2 = 0.81.
-        expansion = engine.store[("flow_momentum", 7, "EXPANSION")]
-        crisis = engine.store[("flow_momentum", 7, "CRISIS")]
-        assert abs(expansion["running_brier"] - 0.01) < 1e-9
-        assert abs(crisis["running_brier"] - 0.81) < 1e-9
-
-    def test_zero_weight_skipped(self):
+    def test_zero_weight_not_counted_as_skip(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
         updates = record_scored_prediction(
             engine,
@@ -358,12 +351,14 @@ class TestRecordScoredPrediction:
             signal_contributions={"flow_momentum": 0.0, "jodi_oil": 1.0},
             regime="EXPANSION",
         )
-        assert "flow_momentum" not in updates
-        assert "jodi_oil" in updates
-        assert ("flow_momentum", 7, "EXPANSION") not in engine.store
-        assert ("jodi_oil", 7, "EXPANSION") in engine.store
+        assert updates == {}
+        assert engine.store == {}
+        counts = get_skipped_live_update_counts()
+        assert ("flow_momentum", 7) not in counts
+        assert counts[("jodi_oil", 7)] == 1
 
     def test_empty_contributions_noop(self):
+        _reset_skipped_live_update_counts()
         engine = _FakeEngine()
         updates = record_scored_prediction(
             engine,
@@ -375,18 +370,7 @@ class TestRecordScoredPrediction:
         )
         assert updates == {}
         assert engine.store == {}
-
-    def test_unknown_regime_normalized_to_neutral(self):
-        engine = _FakeEngine()
-        record_scored_prediction(
-            engine,
-            horizon_days=7,
-            confidence=0.7,
-            outcome=1.0,
-            signal_contributions={"flow_momentum": 1.0},
-            regime="mystery_state",
-        )
-        assert ("flow_momentum", 7, "NEUTRAL") in engine.store
+        assert get_skipped_live_update_counts() == {}
 
     def test_db_error_returns_empty_dict(self):
         class BrokenEngine:
@@ -396,9 +380,6 @@ class TestRecordScoredPrediction:
             def connect(self):  # used by ensure_tables path
                 raise RuntimeError("connection lost")
 
-        # ensure_regime_brier_table swallows its exception, but then
-        # the record path tries to open a transaction and fails. The
-        # outer try/except must catch it and return {}.
         result = record_scored_prediction(
             BrokenEngine(),
             horizon_days=7,
@@ -425,16 +406,14 @@ class TestGetRegimeConditionalScorecard:
         # Row exists but has fewer than MIN_REGIME_SAMPLES — we want the
         # caller to fall back, not expose the noisy bucket.
         engine = _FakeEngine()
-        # Seed fewer than MIN_REGIME_SAMPLES records
-        for _ in range(MIN_REGIME_SAMPLES - 1):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"flow_momentum": 1.0},
-                regime="EXPANSION",
-            )
+        engine.seed_row(
+            "flow_momentum",
+            7,
+            "EXPANSION",
+            scored_count=MIN_REGIME_SAMPLES - 1,
+            running_brier=0.01,
+            hit_count=MIN_REGIME_SAMPLES - 1,
+        )
         # Row exists:
         assert ("flow_momentum", 7, "EXPANSION") in engine.store
         # But API reports None because it's below the fallback threshold.
@@ -447,18 +426,14 @@ class TestGetRegimeConditionalScorecard:
 
     def test_calibrated_row_returns_scorecard(self):
         engine = _FakeEngine()
-        # Seed enough samples to pass BOTH MIN_REGIME_SAMPLES AND
-        # MIN_CALIBRATED_SAMPLES so conviction_weight is populated from
-        # the compute_conviction_weight curve.
-        for _ in range(MIN_CALIBRATED_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"flow_momentum": 1.0},
-                regime="EXPANSION",
-            )
+        engine.seed_row(
+            "flow_momentum",
+            7,
+            "EXPANSION",
+            scored_count=MIN_CALIBRATED_SAMPLES,
+            running_brier=0.01,
+            hit_count=MIN_CALIBRATED_SAMPLES,
+        )
         card = get_regime_conditional_scorecard(
             engine, "flow_momentum", 7, "EXPANSION"
         )
@@ -473,15 +448,14 @@ class TestGetRegimeConditionalScorecard:
 
     def test_regime_is_case_insensitive(self):
         engine = _FakeEngine()
-        for _ in range(MIN_REGIME_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"flow_momentum": 1.0},
-                regime="expansion",  # lowercase
-            )
+        engine.seed_row(
+            "flow_momentum",
+            7,
+            "expansion",  # lowercase normalized to EXPANSION
+            scored_count=MIN_REGIME_SAMPLES,
+            running_brier=0.01,
+            hit_count=MIN_REGIME_SAMPLES,
+        )
         # Stored as EXPANSION
         assert ("flow_momentum", 7, "EXPANSION") in engine.store
         # Read can use any case
@@ -503,15 +477,14 @@ class TestFallbackAPI:
     def _seed_regime_bucket(
         self, engine: _FakeEngine, *, source: str, regime: str, count: int
     ) -> None:
-        for _ in range(count):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={source: 1.0},
-                regime=regime,
-            )
+        engine.seed_row(
+            source,
+            7,
+            regime,
+            scored_count=count,
+            running_brier=0.01,
+            hit_count=count,
+        )
 
     def test_warm_regime_returns_regime_scorecard(self):
         engine = _FakeEngine()
@@ -609,36 +582,18 @@ class TestFallbackAPI:
 class TestRankSignalsByRegime:
     def test_sorted_best_first(self):
         engine = _FakeEngine()
-        # "good" signal: low brier
-        for _ in range(MIN_REGIME_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"good_signal": 1.0},
-                regime="EXPANSION",
-            )
-        # "bad" signal: high brier
-        for _ in range(MIN_REGIME_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=0.0,
-                signal_contributions={"bad_signal": 1.0},
-                regime="EXPANSION",
-            )
-        # Unrelated regime — should NOT appear in the result
-        for _ in range(MIN_REGIME_SAMPLES):
-            record_scored_prediction(
-                engine,
-                horizon_days=7,
-                confidence=0.9,
-                outcome=1.0,
-                signal_contributions={"other_signal": 1.0},
-                regime="CRISIS",
-            )
+        engine.seed_row(
+            "good_signal", 7, "EXPANSION",
+            scored_count=MIN_REGIME_SAMPLES, running_brier=0.01, hit_count=MIN_REGIME_SAMPLES,
+        )
+        engine.seed_row(
+            "bad_signal", 7, "EXPANSION",
+            scored_count=MIN_REGIME_SAMPLES, running_brier=0.81, hit_count=0,
+        )
+        engine.seed_row(
+            "other_signal", 7, "CRISIS",
+            scored_count=MIN_REGIME_SAMPLES, running_brier=0.01, hit_count=MIN_REGIME_SAMPLES,
+        )
         ranked = rank_signals_by_regime(engine, "EXPANSION", 7)
         sources = [c.signal_source for c in ranked]
         # best-first, no cross-regime leakage

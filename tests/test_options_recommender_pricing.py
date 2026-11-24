@@ -271,6 +271,38 @@ def _contract_row(
     }
 
 
+# ── Decision instant (Codex review 6030559940 on #1400) ──────────────────────
+
+
+def test_decision_instant_is_generated_at_and_reaches_cross_asset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run's decision instant is stamped on ``generated_at`` and passed to CROSS_ASSET.
+
+    A stored recommendation then records the exact instant its CROSS_ASSET
+    price, split and journal reads were fenced at, so it can be reproduced.
+    """
+    from datetime import datetime, timezone
+
+    _freeze_date(monkeypatch, RUN_WED)
+    db = _FakeDb(_FakeConn(snapshots=[_contract_row(strike=105.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.28)]))
+    rec_engine = OptionsRecommender(db)
+    _disable_llm(rec_engine, monkeypatch)
+    seen: dict[str, Any] = {}
+
+    def _cross_asset(rec, db_, *, run_date=None, decision_ts=None):
+        seen.update(run_date=run_date, decision_ts=decision_ts)
+        return {"status": "PASS", "reason": "stub"}
+
+    monkeypatch.setattr(rec_engine, "_sanity_cross_asset", _cross_asset)
+    decided = datetime(2026, 11, 18, 16, 0, tzinfo=timezone.utc)  # 11:00 New York
+    opp = _make_opp(direction="CALL", spot=100.0, score=8.5)
+    gex = _make_gex_engine({"regime": "SHORT_GAMMA", "call_wall": 110.0, "put_wall": 90.0})
+
+    rec = rec_engine._build_recommendation(opp, gex, db, run_date=RUN_WED, decision_ts=decided)
+    assert rec is not None
+    assert rec.generated_at == "2026-11-18T16:00:00Z"
+    assert seen == {"run_date": RUN_WED, "decision_ts": decided}
+
+
 # ── Defect 1: Target price must reprice via Black-Scholes (not delta=1) ─────
 
 
@@ -485,6 +517,228 @@ def test_defect4_optional_checks_constant_and_skip_allowed() -> None:
         },
     )
     assert rec_ok.all_sanity_passed is True
+
+
+# ── CROSS_ASSET is a shadow check (Anik 2026-11-23, Codex review 6030559940) ──
+
+
+def _gated_engine(monkeypatch: pytest.MonkeyPatch, **checks: dict) -> tuple[OptionsRecommender, Any, Any]:
+    """A recommender on the fake DB whose named sanity layers return fixed verdicts."""
+    _freeze_date(monkeypatch, RUN_WED)
+    db = _FakeDb(_FakeConn(snapshots=[_contract_row(strike=105.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.28)]))
+    rec_engine = OptionsRecommender(db)
+    _disable_llm(rec_engine, monkeypatch)
+    layer = {
+        "DATA_QUALITY": "_sanity_data_quality",
+        "DEALER_FLOW": "_sanity_dealer_flow",
+        "CROSS_ASSET": "_sanity_cross_asset",
+        "HISTORICAL_ANALOG": "_sanity_historical_analog",
+    }
+    defaults = {"DATA_QUALITY": {"status": "PASS", "reason": "ok"},
+                "DEALER_FLOW": {"status": "PASS", "reason": "ok"},
+                "CROSS_ASSET": {"status": "PASS", "reason": "ok"},
+                "HISTORICAL_ANALOG": {"status": "SKIP", "reason": "cold start"}}
+    for name, verdict in {**defaults, **checks}.items():
+        monkeypatch.setattr(rec_engine, layer[name], lambda *_a, _v=verdict, **_k: dict(_v))
+    gex = _make_gex_engine({"regime": "SHORT_GAMMA", "call_wall": 110.0, "put_wall": 90.0})
+    return rec_engine, db, gex
+
+
+def test_check_classes_are_disjoint_and_cross_asset_is_shadow() -> None:
+    required = recommender_mod.REQUIRED_CHECKS
+    optional = recommender_mod.OPTIONAL_CHECKS
+    shadow = recommender_mod.SHADOW_CHECKS
+    assert shadow == frozenset({"CROSS_ASSET"})
+    assert not (required & optional) and not (required & shadow) and not (optional & shadow)
+    assert "DEALER_FLOW" in optional  # its FAIL still rejects
+
+
+def test_cross_asset_fail_alone_does_not_reject_and_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    fail = {"status": "FAIL", "reason": "Momentum (-5.00%, SPY close 2026-11-10 to 2026-11-17) and regime both contradict CALL"}
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=fail)
+    rec = rec_engine._build_recommendation(_make_opp(direction="CALL", spot=100.0, score=8.5), gex, db)
+    assert rec is not None
+    assert rec.sanity_status["CROSS_ASSET"] == {**fail, "shadow": True}
+    assert rec.all_sanity_passed is True
+    assert rec_engine.last_rejection_counts == {}
+
+
+_SHADOW_VERDICTS = [{"status": "FAIL", "reason": "shadow"}, {"status": "SKIP", "reason": "shadow"}]
+
+
+@pytest.mark.parametrize("shadow", _SHADOW_VERDICTS, ids=["shadow-FAIL", "shadow-SKIP"])
+@pytest.mark.parametrize(("dq", "code"), [
+    ({"status": "FAIL", "reason": "stale snapshot"}, "sanity_failed:DATA_QUALITY"),
+    ({"status": "SKIP", "reason": "no snapshot"}, "required_check_skipped:DATA_QUALITY"),
+])
+def test_data_quality_still_rejects_beside_a_shadow_verdict(monkeypatch: pytest.MonkeyPatch, dq, code, shadow) -> None:
+    rec_engine, db, gex = _gated_engine(monkeypatch, DATA_QUALITY=dq, CROSS_ASSET=shadow)
+    assert rec_engine._build_recommendation(_make_opp(), gex, db) is None
+    assert rec_engine.last_rejection_counts == {code: 1}
+
+
+@pytest.mark.parametrize("shadow", _SHADOW_VERDICTS, ids=["shadow-FAIL", "shadow-SKIP"])
+def test_dealer_flow_fail_still_rejects_and_is_named(monkeypatch: pytest.MonkeyPatch, shadow) -> None:
+    # The rejection reason is DEALER_FLOW's, never the shadow check's (a
+    # shadow SKIP is not a "required check skipped").
+    rec_engine, db, gex = _gated_engine(
+        monkeypatch, DEALER_FLOW={"status": "FAIL", "reason": "long gamma, low confidence"}, CROSS_ASSET=shadow)
+    assert rec_engine._build_recommendation(_make_opp(), gex, db) is None
+    assert rec_engine.last_rejection_counts == {"sanity_failed:DEALER_FLOW": 1}
+
+
+def test_shadow_does_not_leak_into_required_check_handling(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A shadow SKIP is not a "required check skipped", and a missing or
+    # malformed shadow entry neither passes nor fails a recommendation.
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET={"status": "SKIP", "reason": "No momentum: stale"})
+    rec = rec_engine._build_recommendation(_make_opp(), gex, db)
+    assert rec is not None and rec_engine.last_rejection_counts == {}
+    assert rec.sanity_status["CROSS_ASSET"] == {"status": "SKIP", "reason": "No momentum: stale", "shadow": True}
+    base = {"DATA_QUALITY": {"status": "PASS", "reason": "ok"}, "DEALER_FLOW": {"status": "PASS", "reason": "ok"}}
+    for shadow_entry in ({}, {"CROSS_ASSET": "garbage"}, {"CROSS_ASSET": {"status": "FAIL", "reason": "x"}}):
+        rec_x = OptionsRecommendation(ticker="SPY", direction="CALL", strike=105.0, expiry=EXP_21D.isoformat(),
+                                      entry_price=1.06, sanity_status={**base, **shadow_entry})
+        assert rec_x.all_sanity_passed is True
+    only_shadow = OptionsRecommendation(ticker="SPY", direction="CALL", strike=105.0, expiry=EXP_21D.isoformat(),
+                                        entry_price=1.06, sanity_status={"CROSS_ASSET": {"status": "PASS", "reason": "x"}})
+    assert only_shadow.all_sanity_passed is False  # DATA_QUALITY is still required
+
+
+def test_pipeline_log_counts_shadow_fail_separately(monkeypatch: pytest.MonkeyPatch) -> None:
+    from loguru import logger
+
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(str(m)), format="{message}")
+    try:
+        rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET={"status": "FAIL", "reason": "shadow"})
+        assert rec_engine._build_recommendation(_make_opp(), gex, db) is not None
+    finally:
+        logger.remove(sink)
+    pipeline = [line for line in lines if line.startswith("Sanity pipeline for")]
+    assert pipeline and pipeline[-1].strip().endswith("2 PASS, 2 SKIP, 0 FAIL, 1 shadow FAIL")
+
+
+def _without_cross_asset(rec: OptionsRecommendation) -> dict:
+    from dataclasses import asdict
+
+    out = asdict(rec)
+    out["sanity_status"] = {k: v for k, v in out["sanity_status"].items() if k != "CROSS_ASSET"}
+    return out
+
+
+@pytest.mark.parametrize("verdict", [
+    {"status": "FAIL", "reason": "Momentum (-9.00%) and regime both contradict CALL"},
+    {"status": "SKIP", "reason": "No momentum: no completed SPY close"},
+], ids=["FAIL", "SKIP"])
+def test_output_parity_build_recommendation_with_or_without_cross_asset_fail(
+    monkeypatch: pytest.MonkeyPatch, verdict,
+) -> None:
+    """Same inputs, CROSS_ASSET PASS vs FAIL/SKIP: the same recommendation is emitted (Codex 6030789774)."""
+    from datetime import datetime, timezone
+
+    decided = datetime(2026, 11, 18, 16, 0, tzinfo=timezone.utc)
+    built = {}
+    for label, ca in (("pass", {"status": "PASS", "reason": "aligned"}), ("other", verdict)):
+        rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=ca)
+        built[label] = (rec_engine._build_recommendation(_make_opp(direction="CALL", spot=100.0, score=8.5), gex, db,
+                                                         run_date=RUN_WED, decision_ts=decided),
+                        dict(rec_engine.last_rejection_counts))
+    (rec_pass, rej_pass), (rec_other, rej_other) = built["pass"], built["other"]
+    assert rec_pass is not None and rec_other is not None
+    assert _without_cross_asset(rec_pass) == _without_cross_asset(rec_other)
+    assert rej_pass == rej_other == {}
+    assert rec_other.sanity_status["CROSS_ASSET"] == {**verdict, "shadow": True}
+
+
+def _generate_with_cross_asset(monkeypatch: pytest.MonkeyPatch, verdict: dict, decided) -> tuple[list, dict, dict]:
+    """The rejection-counts fixture (AAA emits, BBB stale, CCC rejected) with a fixed CROSS_ASSET verdict."""
+    import sys
+    import discovery.options_scanner as scanner_mod
+    import physics.dealer_gamma as gex_mod
+
+    _freeze_date(monkeypatch, RUN_WED)
+    snapshots = [
+        _contract_row(ticker="AAA", strike=105.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.28),
+        _contract_row(ticker="BBB", strike=105.0, expiry=EXP_21D, snap_date=date(2026, 11, 10)),
+        _contract_row(ticker="CCC", strike=103.0, expiry=EXP_21D, bid=0.95, ask=1.05, implied_vol=0.25),
+    ]
+    db = _FakeDb(_FakeConn(snapshots=snapshots))
+    rec_engine = OptionsRecommender(db)
+    _disable_llm(rec_engine, monkeypatch)
+    monkeypatch.setattr(rec_engine, "_persist_recommendations", lambda _db, recs: len(recs))
+    monkeypatch.setattr(rec_engine, "_sanity_cross_asset", lambda *_a, **_k: dict(verdict))
+    opps = [
+        _make_opp(ticker="AAA", direction="CALL", spot=100.0, score=8.5),
+        _make_opp(ticker="BBB", direction="CALL", spot=100.0, score=8.5),
+        _make_opp(ticker="CCC", direction="CALL", spot=100.0, score=2.0, confidence="LOW"),
+    ]
+    profiles = {"AAA": {"regime": "SHORT_GAMMA", "call_wall": 110.0},
+                "BBB": {"regime": "SHORT_GAMMA", "call_wall": 110.0},
+                "CCC": {"regime": "NEUTRAL", "call_wall": 104.0}}
+
+    class _FakeScanner:
+        def __init__(self, db_engine):
+            pass
+
+        def scan_all(self, tickers=None, min_score=0.0):
+            return opps
+
+    class _FakeGex:
+        def __init__(self, db_engine):
+            pass
+
+        def compute_gex_profile(self, ticker):
+            return profiles[ticker]
+
+    monkeypatch.setattr(scanner_mod, "OptionsScanner", _FakeScanner)
+    monkeypatch.setattr(gex_mod, "DealerGammaEngine", _FakeGex)
+    monkeypatch.setitem(sys.modules, "api.main", SimpleNamespace(broadcast_event=lambda *_a, **_k: None))
+    recs = rec_engine.generate_recommendations(engine=db, run_date=RUN_WED, decision_ts=decided)
+    return recs, dict(rec_engine.last_rejection_counts), dict(rec_engine.last_run_summary)
+
+
+def test_output_parity_generate_recommendations_with_or_without_cross_asset_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The emitted set, rejection counts and run summary do not depend on CROSS_ASSET's verdict."""
+    from datetime import datetime, timezone
+
+    decided = datetime(2026, 11, 18, 16, 0, tzinfo=timezone.utc)
+    recs_p, rej_p, sum_p = _generate_with_cross_asset(monkeypatch, {"status": "PASS", "reason": "aligned"}, decided)
+    recs_f, rej_f, sum_f = _generate_with_cross_asset(
+        monkeypatch, {"status": "FAIL", "reason": "both contradict CALL"}, decided)
+    assert [r.ticker for r in recs_p] == [r.ticker for r in recs_f] == ["AAA"]
+    assert [_without_cross_asset(r) for r in recs_p] == [_without_cross_asset(r) for r in recs_f]
+    assert rej_p == rej_f and sum(rej_f.values()) == 2
+    assert sum_p == sum_f
+    assert recs_f[0].sanity_status["CROSS_ASSET"] == {"status": "FAIL", "reason": "both contradict CALL", "shadow": True}
+
+
+def test_date_only_reconstruction_never_vetoes_even_outside_shadow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Codex 6030789774: a date-only reconstruction cannot produce a veto, independently of shadow.
+
+    Simulates CROSS_ASSET promoted out of SHADOW_CHECKS into OPTIONAL_CHECKS:
+    a FAIL fenced at a decision instant then rejects, a date-only one does not.
+    """
+    monkeypatch.setattr(recommender_mod, "SHADOW_CHECKS", frozenset())
+    monkeypatch.setattr(recommender_mod, "OPTIONAL_CHECKS", recommender_mod.OPTIONAL_CHECKS | {"CROSS_ASSET"})
+    live_fail = {"status": "FAIL", "reason": "contradict CALL", "basis": "decision_time"}
+    replay_fail = {"status": "FAIL", "reason": "contradict CALL", "basis": "date_only_reconstruction"}
+
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=live_fail)
+    assert rec_engine._build_recommendation(_make_opp(), gex, db) is None
+    assert rec_engine.last_rejection_counts == {"sanity_failed:CROSS_ASSET": 1}
+
+    rec_engine, db, gex = _gated_engine(monkeypatch, CROSS_ASSET=replay_fail)
+    rec = rec_engine._build_recommendation(_make_opp(), gex, db)
+    assert rec is not None and rec_engine.last_rejection_counts == {}
+    assert rec.sanity_status["CROSS_ASSET"] == replay_fail  # the verdict is kept, not relabelled
+
+
+def test_required_checks_gate_even_when_marked_date_only() -> None:
+    assert recommender_mod._vetoes("DATA_QUALITY", {"status": "FAIL", "basis": "date_only_reconstruction"}) is True
+    assert recommender_mod._vetoes("CROSS_ASSET", {"status": "FAIL", "basis": "decision_time"}) is False  # shadow
+    assert recommender_mod._vetoes("DEALER_FLOW", {"status": "FAIL"}) is True
 
 
 # ── Defect 5: Data-quality SQL must filter by expiry with bound params ──────

@@ -382,6 +382,9 @@ jobs:
       # to the legacy feature_registry name-join statements on one seeded
       # schema. REQUIRE_BOUND_ID_READS_PG turns a missing DB URL into a
       # failure, so this step cannot pass without running the comparisons.
+      # test_options_sanity_momentum_pg.py pins the options CROSS_ASSET
+      # momentum read: the underlying's own completed raw close (not a
+      # resolved_series feature), fenced at run_date, SKIP when unmeasured.
       - name: Bound-id resolved_series reads PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -389,7 +392,7 @@ jobs:
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
-        run: python -m pytest tests/test_resolved_series_bound_id_reads_pg.py -q -rA
+        run: python -m pytest tests/test_resolved_series_bound_id_reads_pg.py tests/test_options_sanity_momentum_pg.py -q -rA
 
       # #1344: scripts/bulk_resolve.py (run by scripts/server_startup.sh)
       # writes resolved_series in SQL, outside normalization/resolver.py, so
@@ -1084,6 +1087,24 @@ jobs:
           # (stderr, captured by tee) must never be able to trip this guard.
           if grep -qE "^SKIPPED \[|[0-9]+ skipped" /tmp/grid-full-panel-repair-pg.txt; then
             echo "::error::Full-panel vintage repair PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # #1354 / Codex HOLD 6011907767: the per-signal and regime Brier
+      # bootstraps replace their tables in one transaction. Legacy rows the
+      # replacement rejects or no longer produces are retired, and a failed
+      # insert rolls the whole replacement back. A skip must fail this step.
+      - name: Brier bootstrap replacement PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_brier_bootstrap_replacement_pg.py -q -rA | tee /tmp/grid-brier-replacement-pg.txt
+          if grep -qE "^SKIPPED \[|[0-9]+ skipped" /tmp/grid-brier-replacement-pg.txt; then
+            echo "::error::Brier bootstrap replacement PostgreSQL contract was skipped"
             exit 1
           fi
 
