@@ -124,7 +124,8 @@ export default function Regime() {
             api.getHistory(90),
             api.getTransitions(),
         ]);
-        if (current) {
+        // api._fetch resolves failures to {error: true}; never store that as the regime.
+        if (current && !current.error) {
             setCurrentRegime(current);
             // Fetch the strategy for the current regime
             const strat = await api.getStrategyForRegime(current.state).catch(() => null);
@@ -261,7 +262,14 @@ export default function Regime() {
 
             {/* Transition risk */}
             <div style={{ marginBottom: '14px' }}>
-                <TransitionGauge probability={regime.transition_probability || 0} horizon="shift risk" />
+                {/* UNCALIBRATED carries 0.0 placeholders from regime.py, not a measured 0 % risk. */}
+                {regime.state !== 'UNCALIBRATED' && typeof regime.transition_probability === 'number'
+                    ? <TransitionGauge probability={regime.transition_probability} horizon="shift risk" />
+                    : (
+                        <div data-testid="shift-risk-unavailable" style={{ fontSize: '12px', color: '#5A7080', padding: '10px 4px' }}>
+                            Shift risk: no regime reading yet{regime.baseline_comparison ? ` — ${regime.baseline_comparison}` : ''}
+                        </div>
+                    )}
             </div>
 
             {/* Tabs */}

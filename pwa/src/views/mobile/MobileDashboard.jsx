@@ -297,7 +297,8 @@ export default function MobileDashboard({ subTab, onNavigate }) {
     const totalSources = pipeline.total_sources ?? 0;
     const brokenSources = pipeline.broken ?? 0;
     const staleSources = pipeline.stale ?? 0;
-    const pipelineHealthPct = totalSources > 0 ? healthySources / totalSources : null;
+    const pipelineUnavailable = pipelineHealth?.availability === 'unavailable';
+    const pipelineHealthPct = !pipelineUnavailable && totalSources > 0 ? healthySources / totalSources : null;
     const pipelineLastRun = pipelineHealth?.resolver_status?.last_run || null;
     const pendingOutcomes = Math.max(
         (grid.journal_entries_total ?? 0) - (grid.journal_entries_with_outcomes ?? 0),
@@ -446,15 +447,19 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                         <div style={s.metricCard}>
                             <div style={s.metricTop}>
                                 <span style={s.metricValue}>
+                                    {/* The DB being up says nothing about the pipeline. With no
+                                        sources (or availability 'unavailable') there is no health %. */}
                                     {pipelineHealthPct != null
                                         ? `${(pipelineHealthPct * 100).toFixed(0)}%`
-                                        : (db.connected ? 'OK' : '--')}
+                                        : (pipelineUnavailable ? 'N/A' : '--')}
                                 </span>
-                                <span style={s.dot(db.connected ? colors.green : colors.red)} />
+                                <span style={s.dot(pipelineHealthPct != null ? colors.green : colors.textMuted)} />
                             </div>
                             <div style={s.metricLabel}>Pipeline</div>
                             <div style={s.metricSub}>
-                                {pipelineLastRun ? timeAgo(pipelineLastRun) : `${brokenSources} broken / ${staleSources} stale`}
+                                {pipelineUnavailable
+                                    ? (pipelineHealth?.stale_reason || 'pipeline health unavailable')
+                                    : (pipelineLastRun ? timeAgo(pipelineLastRun) : `${brokenSources} broken / ${staleSources} stale`)}
                             </div>
                         </div>
 

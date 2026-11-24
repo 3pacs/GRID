@@ -538,8 +538,9 @@ export function PredictionCard({ pred }) {
                         </>
                     )}
                     <div style={{ marginTop: '8px', fontSize: '10px', color: colors.textMuted, fontFamily: mono }}>
-                        Coherence: {((pred.coherence || 0) * 100).toFixed(0)}%
-                        {' | '}Signal: {(pred.signal_strength || 0).toFixed(2)}
+                        {/* Same rule as confidence (D-H11): null is unscored, a real 0 prints 0. */}
+                        Coherence: {pred.coherence == null ? 'unscored' : `${(pred.coherence * 100).toFixed(0)}%`}
+                        {' | '}Signal: {pred.signal_strength == null ? 'unscored' : Number(pred.signal_strength).toFixed(2)}
                         {pred.score_notes ? ` | ${pred.score_notes}` : ''}
                     </div>
                 </div>

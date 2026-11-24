@@ -76,6 +76,7 @@ function MetricCard({ label, value, sub, color }) {
 export default function Backtest() {
     const [activeTab, setActiveTab] = useState('results');
     const [summary, setSummary] = useState(null);
+    const [summaryError, setSummaryError] = useState(null);
     const [fullResults, setFullResults] = useState(null);
     const [charts, setCharts] = useState(null);
     const [paperTrades, setPaperTrades] = useState([]);
@@ -96,7 +97,10 @@ export default function Backtest() {
     const loadSummary = async () => {
         try {
             const s = await api.getBacktestSummaryPitch();
-            setSummary(s);
+            // A 404 ("No backtest results. Run /run first.") resolves as {error: true};
+            // storing it rendered every metric as 0.0% / 0.00 / $0.
+            if (s && !s.error) setSummary(s);
+            else setSummaryError(s?.message || null);
             const r = await api.getBacktestResults();
             setFullResults(r);
         } catch (e) { console.warn('[GRID] Backtest:', e.message); }
@@ -151,6 +155,10 @@ export default function Backtest() {
         } catch (e) { console.warn('[GRID] Backtest:', e.message); }
     };
 
+    // Missing metric -> '—', never a computed-looking 0. A real 0 still prints 0.
+    const has = (v) => typeof v === 'number' && Number.isFinite(v);
+    const pctOr = (v) => (has(v) ? `${(v * 100).toFixed(1)}%` : '—');
+    const numOr = (v) => (has(v) ? v.toFixed(2) : '—');
     const gm = summary?.grid || {};
     const spyM = summary?.spy || {};
     const sfM = summary?.sixty_forty || {};
@@ -231,16 +239,16 @@ export default function Backtest() {
                             )}
                             <div style={{ ...shared.sectionTitle }}>GRID Performance</div>
                             <div style={shared.metricGrid}>
-                                <MetricCard label="Total Return" value={`${((gm.cumulative_return || 0) * 100).toFixed(1)}%`}
+                                <MetricCard label="Total Return" value={pctOr(gm.cumulative_return)}
                                     color={gm.cumulative_return > 0 ? colors.green : colors.red} />
-                                <MetricCard label="Annual Return" value={`${((gm.annualized_return || 0) * 100).toFixed(1)}%`} />
-                                <MetricCard label="Sharpe" value={(gm.sharpe || 0).toFixed(2)}
+                                <MetricCard label="Annual Return" value={pctOr(gm.annualized_return)} />
+                                <MetricCard label="Sharpe" value={numOr(gm.sharpe)}
                                     color={gm.sharpe > 1 ? colors.green : colors.textDim} />
-                                <MetricCard label="Sortino" value={(gm.sortino || 0).toFixed(2)} />
-                                <MetricCard label="Max DD" value={`${((gm.max_drawdown || 0) * 100).toFixed(1)}%`}
+                                <MetricCard label="Sortino" value={numOr(gm.sortino)} />
+                                <MetricCard label="Max DD" value={pctOr(gm.max_drawdown)}
                                     color={colors.red} />
-                                <MetricCard label="Calmar" value={(gm.calmar || 0).toFixed(2)} />
-                                <MetricCard label="Final Value" value={`$${(gm.final_value || summary.grid?.final_value || 0).toLocaleString()}`} />
+                                <MetricCard label="Calmar" value={numOr(gm.calmar)} />
+                                <MetricCard label="Final Value" value={has(gm.final_value) ? `$${gm.final_value.toLocaleString()}` : '—'} />
                             </div>
 
                             <div style={{ ...shared.sectionTitle }}>vs Benchmarks</div>
@@ -248,17 +256,17 @@ export default function Backtest() {
                                 <div style={shared.row}>
                                     <span style={{ fontSize: '13px', fontWeight: 600 }}>SPY (Buy & Hold)</span>
                                     <div style={{ display: 'flex', gap: '16px', fontSize: '12px', fontFamily: colors.mono }}>
-                                        <span>Return: {((spyM.cumulative_return || 0) * 100).toFixed(1)}%</span>
-                                        <span>Sharpe: {(spyM.sharpe || 0).toFixed(2)}</span>
-                                        <span>Max DD: {((spyM.max_drawdown || 0) * 100).toFixed(1)}%</span>
+                                        <span>Return: {pctOr(spyM.cumulative_return)}</span>
+                                        <span>Sharpe: {numOr(spyM.sharpe)}</span>
+                                        <span>Max DD: {pctOr(spyM.max_drawdown)}</span>
                                     </div>
                                 </div>
                                 <div style={{ ...shared.row, borderBottom: 'none' }}>
                                     <span style={{ fontSize: '13px', fontWeight: 600 }}>60/40 Portfolio</span>
                                     <div style={{ display: 'flex', gap: '16px', fontSize: '12px', fontFamily: colors.mono }}>
-                                        <span>Return: {((sfM.cumulative_return || 0) * 100).toFixed(1)}%</span>
-                                        <span>Sharpe: {(sfM.sharpe || 0).toFixed(2)}</span>
-                                        <span>Max DD: {((sfM.max_drawdown || 0) * 100).toFixed(1)}%</span>
+                                        <span>Return: {pctOr(sfM.cumulative_return)}</span>
+                                        <span>Sharpe: {numOr(sfM.sharpe)}</span>
+                                        <span>Max DD: {pctOr(sfM.max_drawdown)}</span>
                                     </div>
                                 </div>
                             </div>
@@ -291,7 +299,7 @@ export default function Backtest() {
 
                     {!summary && !running && (
                         <div style={{ ...shared.card, textAlign: 'center', color: colors.textMuted, padding: '40px' }}>
-                            No backtest results yet. Run one above.
+                            {summaryError || 'No backtest results yet. Run one above.'}
                         </div>
                     )}
                 </>
