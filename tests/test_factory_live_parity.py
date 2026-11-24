@@ -1224,3 +1224,72 @@ def test_every_count_has_its_denominator_and_every_excluded_row_its_cause(run):
         assert live_side["feature_eligible"][f] == live_side["signal_eligible"] - per_feature
     labels = doc["comparison"]["labels"]
     assert labels["rows"] == labels["compared"] + labels["missing_on_a_side"] == len(held)
+
+
+def test_the_receipt_rule_terms_and_their_sha256_are_the_pinned_ones(run):
+    """The decision window and the history admission rule are frozen in this report's own terms. The recorder's terms
+    do not carry the window, so a change to either is a change of this text and digest, in review."""
+    assert flp.RECEIPT_RULE_TERMS_JSON == (
+        '{"decision_window":"an eligible value counts only if decision time <= recorded_at < decision time + '
+        'decision_window_s, by whole seconds, on the row\'s New York day","decision_window_s":120,'
+        '"history_admission":"a candidate\'s trigger is taken on the recorder\'s own history (eligible, a number, bound '
+        'to the live rule terms with the value\'s stamp); a history holding a value recorded outside the decision window '
+        'certifies no trigger","live_rule_terms_sha256":"31e017f78c4d676ce6e405b1beb708cde9fbc370448a4a6c923b3e39db4b50d9",'
+        '"stamp_limit":"a stamp is when the value row was written; it does not show which vintage of a bar was read",'
+        '"terms":"factory-live-parity-receipt/1"}')
+    assert flp.RECEIPT_RULE_TERMS_SHA256 == "9a617ca7c7d8afbb965a9209de4a36c74daae8c006da550117732ef90cb8677a"
+    assert flp.RECEIPT_RULE_TERMS["decision_window_s"] == flp.DECISION_WINDOW_S
+    assert flp.RECEIPT_RULE_TERMS["live_rule_terms_sha256"] == flp.LIVE_RULE_TERMS_SHA256
+    rule = run(_days(), _days())["live_rule"]["receipt_rule"]
+    assert rule == {"terms": flp.RECEIPT_RULE_TERMS, "terms_sha256": flp.RECEIPT_RULE_TERMS_SHA256}
+
+
+def test_one_late_value_in_the_earlier_history_changes_a_ready_candidate_to_not_ready(run):
+    """Codex on e20cd7d1: the history behind a trigger lies mostly outside the verdict sessions. One equal value there,
+    recorded after its decision window, would feed the z that the verdict sessions certify."""
+    op, k = _a_threshold_research_crosses(run)
+    earlier = HISTORY_DAYS[-10]                           # well before the verdict sessions, inside every one's history
+    history = _recorder_history()
+
+    def one_late(rows):
+        history(rows)
+        for r in rows:
+            if r["day"] == earlier and r["feature"] == "F1":
+                r["recorded_at"] = r["terms_recorded_at"] = _utc(earlier, "18:30")
+
+    ready = run(_days(), _days(), candidates=[("F1", "15:00", op, k)], recorded=history)["slot_gate"]["candidates"][0]
+    doc = run(_days(), _days(), candidates=[("F1", "15:00", op, k)], recorded=one_late)
+
+    gate = doc["slot_gate"]["candidates"][0]
+    assert ready["status"] == "ready" and ready["recorder_history_not_admitted"] == []
+    assert gate["status"] == "not_ready" and gate["reasons"] == [flp.HISTORY_NOT_ADMITTED]
+    assert gate["recorder_history_not_admitted"] == SESSIONS[-5:] and doc["slot_gate"]["ready"] == []
+    # Nothing else moved: the value is equal, bound and in the recorder's own history, so every z and every
+    # agreement is what it was. Only the time that one earlier value was written differs.
+    assert gate["value_not_matched"] == [] and gate["trigger_unavailable"] == [] and gate["trigger_disagrees"] == []
+    for was, now in zip(ready["sessions"], gate["sessions"]):
+        assert now["recorder_history_recorded_outside_the_decision_window"] == [earlier]
+        assert was["recorder_history_recorded_outside_the_decision_window"] == []
+        assert (now["live_z"], now["research_z"], now["agree"]) == (was["live_z"], was["research_z"], was["agree"])
+    assert "F1" in doc["live_ready"], "the feature diagnostic does not read the history, and judges no slot"
+
+
+def test_a_late_value_blocks_only_while_it_is_in_the_history():
+    days = flp.expected_sessions_between("2026-06-01", "2026-10-30")
+
+    def at(day, hm="15:00"):
+        return _utc(day, hm, 20)
+
+    def row(day, stamp):
+        return {"raw": 0.001, "eligible": True, "recorded_at": stamp, "terms_sha256": flp.LIVE_RULE_TERMS_SHA256,
+                "terms_recorded_at": stamp}
+
+    recorded = {(d, "15:00", "F1"): row(d, at(d)) for d in days}
+    late = days[5]
+    recorded[(late, "15:00", "F1")] = row(late, at(late, "18:30"))
+
+    assert flp.recorder_history_not_admitted(recorded, "F1", "15:00", days[40]) == [late]
+    assert len(flp.recorder_history(recorded, "F1", "15:00", days[40])) == 40             # the recorder's own history keeps it
+    assert flp.recorder_history_not_admitted(recorded, "F1", "15:00", days[66]) == []    # sixty later values: it has left
+    assert flp.recorder_history_not_admitted(recorded, "F1", "15:00", late) == []        # not before its own day
+    assert flp.recorder_history_not_admitted(None, "F1", "15:00", days[40]) == []
