@@ -6,16 +6,19 @@ no LLM, no DB.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
+from features.per_signal_brier import SignalScorecard
 from intelligence.decision_gateway import (
     DecisionResponse,
     _downgrade_verdict,
     combine_verdict,
     should_i_trade,
 )
+from intelligence.signal_provenance import SignalEvidence
 
 
 # ── combine_verdict (pure function) ──────────────────────────────────────
@@ -155,7 +158,27 @@ def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
         market_implied_prob=0.78,
         red_team_epistemic_risk=0.0,
         shipping_fudge_alerts=[],
-        signal_evidence=[],
+        # One calibrated, stamped, in-direction card: the evidence floor
+        # passes, so these tests exercise the stages after it.
+        decision_clock="",
+        signal_evidence=[
+            SignalEvidence(
+                signal_source="regime_contrarian",
+                shapley_weight=1.0,
+                scorecard=SignalScorecard(
+                    signal_source="regime_contrarian",
+                    horizon_days=7,
+                    scored_count=50,
+                    running_brier=0.08,
+                    running_ece=0.06,
+                    hit_rate=0.65,
+                    last_updated=datetime(2026, 11, 20, tzinfo=timezone.utc),
+                    is_calibrated=True,
+                    conviction_weight=1.3,
+                ),
+                classification="strong",
+            )
+        ],
         causation=SimpleNamespace(
             lever="earnings",
             flow_direction="open",

@@ -49,6 +49,7 @@ from intelligence.signal_provenance import (
     TradeProvenanceReport,
     _verdict_from_aggregate,
     compute_aggregate_conviction,
+    decide_verdict,
 )
 
 
@@ -213,6 +214,9 @@ def _stress_verdict_from_aggregate(
     conviction: float,
     confidence: float,
     original_verdict: str,
+    *,
+    report: TradeProvenanceReport | None = None,
+    signal_evidence: list[SignalEvidence] | None = None,
 ) -> str:
     """Return the verdict used for counterfactual break detection.
 
@@ -221,8 +225,27 @@ def _stress_verdict_from_aggregate(
     support after the perturbation? The 1.15 floor is the documented high
     conviction support boundary that provenance plans to restore once the
     calibration substrate is populated again.
+
+    A report from ``build_provenance_report`` (it carries a decision clock)
+    was decided by ``signal_provenance.decide_verdict``, so each perturbed
+    ``signal_evidence`` is re-decided by it: same layer coverage, same
+    evidence floor. A hand-built report with no clock (walk-forward,
+    call_a_trade) keeps the pre-floor path; ``generate_ticket`` still floors it.
     """
-    verdict = _verdict_from_aggregate(conviction, confidence)
+    if report is not None and signal_evidence is not None and report.decision_clock:
+        verdict, _ = decide_verdict(
+            conviction,
+            confidence,
+            signal_evidence,
+            direction=report.direction,
+            decision_clock=report.decision_clock,
+            layer_coverage_ratio=(
+                report.layers_present / report.layers_total if report.layers_total else 0.0
+            ),
+            layers_advisory=report.layers_advisory,
+        )
+    else:
+        verdict = _verdict_from_aggregate(conviction, confidence)
     if (
         str(original_verdict).lower() == "high"
         and verdict == "high"
@@ -472,6 +495,8 @@ def run_stress_test(report: TradeProvenanceReport) -> StressTestReport:
                 new_aggregate,
                 report.confidence,
                 report.verdict,
+                report=report,
+                signal_evidence=swapped,
             )
             perturbations.append(
                 SignalPerturbation(

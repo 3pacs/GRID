@@ -586,6 +586,7 @@ def _verdict_from_aggregate(
     *,
     layer_coverage_ratio: float = 1.0,
     evidence_coverage: float = 1.0,
+    eligible_directional_evidence: int | None = None,
 ) -> str:
     """Classify the final trade verdict.
 
@@ -630,6 +631,11 @@ def _verdict_from_aggregate(
        whose layers silently defaulted to neutral is demoted to LOW — the
        pivot's rule that a signal whose layers cannot compute is not
        surfaced. Callers that pass no coverage keep the pre-gate behaviour.
+
+    4. Evidence floor (Codex review 6032024752, adopted by Anik 2026-11-24):
+       fewer than ``MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE`` eligible rows is LOW
+       in every band. Callers that pass no count keep the pre-floor verdict;
+       ``generate_ticket`` applies the floor to every report.
     """
     # Single-use axis note: ``confidence`` already incorporates engine-level
     # disagreement and Shapley fragility dampening (oracle/engine.py ~L3014,
@@ -637,6 +643,11 @@ def _verdict_from_aggregate(
     # verdict axes therefore stay orthogonal without double counting.
     if conviction < 0.3:
         return "no_trade"
+    if (
+        eligible_directional_evidence is not None
+        and eligible_directional_evidence < MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE
+    ):
+        return "low"
     if conviction < 0.7 or confidence < 0.55:
         return "low"
     if 0.55 <= confidence <= 0.85:
@@ -657,10 +668,20 @@ def _verdict_reason(
     layer_coverage_ratio: float,
     evidence_coverage: float,
     layers_advisory: int = 0,
+    eligible_directional_evidence: int | None = None,
 ) -> str:
     """One-line, operator-readable reason for the verdict."""
     if conviction < 0.3:
         return f"aggregate conviction {conviction:.2f} < 0.30"
+    if (
+        eligible_directional_evidence is not None
+        and eligible_directional_evidence < MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE
+    ):
+        return (
+            f"{NO_ELIGIBLE_DIRECTIONAL_EVIDENCE}: {eligible_directional_evidence} eligible "
+            "rows (calibrated strong/neutral scorecards fenced to the decision "
+            f"clock; floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE})"
+        )
     if conviction < 0.7:
         return f"aggregate conviction {conviction:.2f} < 0.70"
     if confidence < 0.55:
@@ -683,6 +704,126 @@ def _verdict_reason(
             f"scorecard (floor {MIN_EVIDENCE_COVERAGE_FOR_HIGH:.0%})"
         )
     return f"{verdict}: conviction {conviction:.2f}, confidence {confidence:.2f}, coverage ok"
+
+
+# ── Evidence floor (Codex review 6032024752; Anik, 2026-11-24) ──────────────
+#
+# No ticket without eligible directional evidence. A row is eligible when:
+# - the call is bullish or bearish and the row has positive weight;
+# - it has a calibrated scorecard (not advisory, cold_start or no_history)
+#   stamped with a datetime at or before the report's decision clock (a
+#   report without a clock relies on its builder's fence; a clock that does
+#   not parse admits nothing);
+# - that card, classified from its own conviction weight, is strong or
+#   neutral. Cards are per signal, not per direction, and each row is a
+#   signal that pushed toward the call: a weak or anti-predictive card says
+#   not to trust that signal's direction, so it is against the call.
+# Fudge alerts only dampen conviction and are not directional evidence.
+MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE: int = 1
+NO_ELIGIBLE_DIRECTIONAL_EVIDENCE: str = "no_eligible_directional_evidence"
+DIRECTION_SUPPORTING_CLASSIFICATIONS: frozenset[str] = frozenset({"strong", "neutral"})
+_TRADE_DIRECTIONS: frozenset[str] = frozenset({"bullish", "bearish"})
+
+
+def _parse_decision_clock(raw: datetime | str | None) -> tuple[bool, datetime | None]:
+    """``(usable, clock)``: no clock is usable (``None``); a bad one is not."""
+    if raw is None or raw == "":
+        return True, None
+    if isinstance(raw, datetime):
+        return True, _as_utc(raw)
+    try:
+        return True, _as_utc(datetime.fromisoformat(str(raw)))
+    except ValueError:
+        return False, None
+
+
+def is_eligible_directional_evidence(
+    ev: SignalEvidence,
+    *,
+    direction: str,
+    decision_clock: datetime | None,
+) -> bool:
+    """True iff ``ev`` is eligible directional evidence (rules above)."""
+    if str(direction or "").strip().lower() not in _TRADE_DIRECTIONS:
+        return False
+    weight = _finite_float_or_none(ev.shapley_weight)
+    if weight is None or weight <= 0.0:
+        return False
+    card = ev.scorecard
+    if card is None or ev.classification not in _CALIBRATED_CLASSIFICATIONS:
+        return False
+    if not isinstance(card.last_updated, datetime):
+        return False
+    if decision_clock is not None and not _stamped_at_or_before(
+        card.last_updated, decision_clock
+    ):
+        return False
+    if _finite_float_or_none(card.conviction_weight) is None:
+        return False
+    return _classify_evidence(card) in DIRECTION_SUPPORTING_CLASSIFICATIONS
+
+
+def count_eligible_directional_evidence(
+    signal_evidence: Iterable[SignalEvidence],
+    *,
+    direction: str,
+    decision_clock: datetime | str | None,
+) -> int:
+    """Number of eligible directional evidence rows; 0 on a bad clock."""
+    usable, clock = _parse_decision_clock(decision_clock)
+    if not usable:
+        return 0
+    return sum(
+        1 for ev in signal_evidence
+        if is_eligible_directional_evidence(ev, direction=direction, decision_clock=clock)
+    )
+
+
+def has_eligible_directional_evidence(report: TradeProvenanceReport) -> bool:
+    """True iff ``report`` clears the evidence floor (the ticket gate)."""
+    return count_eligible_directional_evidence(
+        report.signal_evidence,
+        direction=report.direction,
+        decision_clock=report.decision_clock,
+    ) >= MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE
+
+
+def decide_verdict(
+    conviction: float,
+    confidence: float,
+    signal_evidence: Iterable[SignalEvidence],
+    *,
+    direction: str,
+    decision_clock: datetime | str | None,
+    layer_coverage_ratio: float,
+    layers_advisory: int = 0,
+) -> tuple[str, str]:
+    """The verdict policy: ``(verdict, reason)`` with the coverage gate and
+    the evidence floor. ``build_provenance_report`` decides with it and the
+    counterfactual stress test re-decides every perturbation with it.
+    """
+    rows = list(signal_evidence)
+    evidence_coverage = compute_evidence_coverage(rows)
+    eligible = count_eligible_directional_evidence(
+        rows, direction=direction, decision_clock=decision_clock
+    )
+    verdict = _verdict_from_aggregate(
+        conviction,
+        confidence,
+        layer_coverage_ratio=layer_coverage_ratio,
+        evidence_coverage=evidence_coverage,
+        eligible_directional_evidence=eligible,
+    )
+    reason = _verdict_reason(
+        verdict,
+        conviction,
+        confidence,
+        layer_coverage_ratio=layer_coverage_ratio,
+        evidence_coverage=evidence_coverage,
+        layers_advisory=layers_advisory,
+        eligible_directional_evidence=eligible,
+    )
+    return verdict, reason
 
 
 # ── Shapley contribution extraction & model→signal key mapping ────────────
@@ -1281,7 +1422,9 @@ def build_provenance_report(
     ``CLOCK_FENCED_LAYERS``. Every other layer is still computed and
     reported in ``advisory_layers``, but its report field stays at the
     neutral 1.0, it multiplies nothing into ``aggregate_conviction``, and it
-    cannot count toward the HIGH coverage floor.
+    cannot count toward the HIGH coverage floor. The verdict comes from
+    ``decide_verdict``: with no eligible directional evidence it is LOW in
+    every confidence band (or NO_TRADE on conviction below 0.30).
     """
     now = _utc_now()
     clock = _decision_clock(prediction, now)
@@ -1574,18 +1717,13 @@ def build_provenance_report(
     )
     aggregate = agg.value
 
-    verdict = _verdict_from_aggregate(
+    verdict, reason = decide_verdict(
         aggregate,
         conf_value,
+        signal_evidence,
+        direction=direction_str,
+        decision_clock=clock,
         layer_coverage_ratio=agg.layer_coverage_ratio,
-        evidence_coverage=agg.evidence_coverage,
-    )
-    reason = _verdict_reason(
-        verdict,
-        aggregate,
-        conf_value,
-        layer_coverage_ratio=agg.layer_coverage_ratio,
-        evidence_coverage=agg.evidence_coverage,
         layers_advisory=agg.layers_advisory,
     )
 

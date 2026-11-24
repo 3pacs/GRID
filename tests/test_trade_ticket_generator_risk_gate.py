@@ -20,10 +20,12 @@ tests/test_oracle_risk.py at the breaker level.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
 
+from features.per_signal_brier import SignalScorecard
 from intelligence.signal_provenance import (
     CausationChain,
     SignalEvidence,
@@ -52,6 +54,22 @@ def _reset_singleton():
     reset_global_circuit_breaker()
 
 
+def _fenced_card(source: str, weight: float) -> SignalScorecard:
+    """A calibrated scorecard stamped before the report, so each row is
+    eligible directional evidence and the evidence floor passes."""
+    return SignalScorecard(
+        signal_source=source,
+        horizon_days=7,
+        scored_count=50,
+        running_brier=0.08,
+        running_ece=0.06,
+        hit_rate=0.65,
+        last_updated=datetime(2026, 4, 12, tzinfo=timezone.utc),
+        is_calibrated=True,
+        conviction_weight=weight,
+    )
+
+
 def _make_report(
     *,
     ticker: str = "TSLA",
@@ -75,7 +93,7 @@ def _make_report(
         SignalEvidence(
             signal_source=f"signal_{i}",
             shapley_weight=round(0.4 / max(1, i + 1), 4),
-            scorecard=None,
+            scorecard=_fenced_card(f"signal_{i}", 1.3 if i == 0 else 1.0),
             classification="strong" if i == 0 else "neutral",
         )
         for i in range(n_evidence)

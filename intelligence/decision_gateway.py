@@ -40,6 +40,9 @@ Inputs:
 
 Rule:
   - If provenance.verdict == 'no_trade' → 'no_trade'
+  - No eligible directional evidence → provenance.verdict is LOW, and the
+    ticket stage refuses as well (the evidence floor, Codex review
+    6032024752, adopted by Anik on 2026-11-24).
   - Missing/invalid counterfactual stress checks → 'no_trade'.
   - Invalid supplied pattern confidence → 'no_trade'; an explicitly absent
     pattern estimate is optional and never described as agreement.
@@ -338,6 +341,14 @@ def _run_trade_ticket(
     if current_price is None or current_price <= 0:
         return None, "current_price missing or non-positive"
     try:
+        # The evidence floor (Codex review 6032024752; Anik, 2026-11-24): no
+        # ticket without eligible directional evidence, in any band.
+        from intelligence.signal_provenance import (
+            NO_ELIGIBLE_DIRECTIONAL_EVIDENCE,
+            has_eligible_directional_evidence,
+        )
+        if not has_eligible_directional_evidence(provenance_report):
+            return None, f"{NO_ELIGIBLE_DIRECTIONAL_EVIDENCE}: no ticket"
         from trading.trade_ticket_generator import generate_ticket
         ticket = generate_ticket(
             provenance_report,

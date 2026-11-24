@@ -659,6 +659,12 @@ class TestDefect4RedTeamAdvisoryOnly:
             verdict="high",
             aggregate_conviction=1.3,
             red_team_epistemic_risk=0.95,
+            # One fenced in-direction card, so the evidence floor passes.
+            direction="bullish",
+            decision_clock="",
+            signal_evidence=[
+                sp.SignalEvidence("flow_momentum", 1.0, _card("flow_momentum"), "strong")
+            ],
         )
         rt_report = llm_red_team.RedTeamReport(
             ticker="NVDA",
@@ -1927,7 +1933,6 @@ class TestEvidenceFloor:
 
     def test_stress_imports_the_shared_policy(self) -> None:
         assert cs.decide_verdict is sp.decide_verdict
-        assert cs.count_eligible_directional_evidence is sp.count_eligible_directional_evidence
 
     @pytest.mark.parametrize("confidence", [0.85, 0.8501, 0.92])
     @pytest.mark.parametrize(

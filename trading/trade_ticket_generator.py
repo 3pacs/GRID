@@ -48,6 +48,7 @@ from loguru import logger as log
 from intelligence.signal_provenance import (
     SignalEvidence,
     TradeProvenanceReport,
+    has_eligible_directional_evidence,
 )
 
 
@@ -423,6 +424,8 @@ def generate_ticket(
       - ``aggregate_conviction`` < ``MIN_CONVICTION_FOR_TICKET``
       - ``current_price`` ≤ 0 (no anchor for stops/targets)
       - direction is neither bullish nor bearish
+      - no eligible directional evidence
+        (``signal_provenance.has_eligible_directional_evidence``)
       - account_size_usd < 0
 
     Otherwise, returns a ``TradeTicket`` with every SOP field populated.
@@ -451,6 +454,10 @@ def generate_ticket(
 
     direction = (report.direction or "").strip().lower()
     if direction not in (_BULLISH, _BEARISH):
+        return None
+    # The evidence floor (Codex review 6032024752; Anik, 2026-11-24): no
+    # ticket without eligible directional evidence, whatever the verdict.
+    if not has_eligible_directional_evidence(report):
         return None
 
     # ── Sizing (computed before risk gate so exposure reflects actual ticket size) ──

@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from features.per_signal_brier import SignalScorecard
 from intelligence.liquidity_regime import STATE_CRISIS, LiquidityRegimeResult
 from intelligence.market_implied_prob import (
     MarketImpliedProb,
@@ -167,7 +168,19 @@ def _make_report(
             SignalEvidence(
                 signal_source="sig_0",
                 shapley_weight=0.5,
-                scorecard=None,
+                # Calibrated and stamped, so the evidence floor passes and
+                # the risk-gate refusals below are the risk gate's.
+                scorecard=SignalScorecard(
+                    signal_source="sig_0",
+                    horizon_days=7,
+                    scored_count=50,
+                    running_brier=0.08,
+                    running_ece=0.06,
+                    hit_rate=0.65,
+                    last_updated=datetime(2026, 11, 20, tzinfo=timezone.utc),
+                    is_calibrated=True,
+                    conviction_weight=1.3,
+                ),
                 classification="strong",
             )
         ],
