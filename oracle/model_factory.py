@@ -22,16 +22,16 @@ from sqlalchemy.engine import Connection, Engine
 from oracle.signal_aggregator import WeightConfig, WeightMode
 
 
-def _signal_registry_enabled() -> bool:
-    """Signal registry path is ON by default.
+def signal_registry_enabled() -> bool:
+    """Return True iff ``GRID_SIGNAL_REGISTRY`` is explicitly enabled (``"1"``).
 
-    ALPHA-14: flipped from opt-in to opt-out because the full adapter
-    fleet (flow_thesis, trust_scorer, lever_pullers, forensics, sector
-    network, etc.) now feeds real signals that oracle.predict() needs.
-    Set ``GRID_SIGNAL_REGISTRY=0`` to explicitly disable (e.g. for
-    isolation tests that want to bypass the registry path).
+    Shared helper used by both ``oracle.model_factory`` and ``oracle.engine``
+    so both paths agree on the same default (``"0"``, disabled).
     """
-    return os.getenv("GRID_SIGNAL_REGISTRY", "1") != "0"
+    return os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
+
+
+_signal_registry_enabled = signal_registry_enabled
 
 
 _DEFAULT_SIGNAL_SOURCES: dict[str, list[str]] = {
