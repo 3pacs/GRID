@@ -33,6 +33,9 @@ class EnsembleResult:
     n_features: int
     n_train_samples: int
     val_outcome_coverage: float     # observed val book slots / val book slots
+    # outcome_coverage() of the "train" and "val" books behind the Sharpes:
+    # gross/net coverage labels, estimate label, cost-ledger totals
+    book_coverage: dict[str, dict[str, Any]]
 
 
 _DEFAULT_LGB_PARAMS: dict[str, Any] = {
@@ -188,7 +191,6 @@ def train_ensemble(
     # Compute train/val Sharpe from long-short (val_dates untouched during training/ES)
     from alpha_research.validation.metrics import (
         long_short_book,
-        long_short_returns,
         outcome_coverage,
         sharpe_ratio,
     )
@@ -198,18 +200,21 @@ def train_ensemble(
     train_fwd = forward_returns.unstack() if isinstance(forward_returns, pd.Series) else forward_returns
     train_fwd_aligned = train_fwd.reindex(index=ranked.index, columns=ranked.columns)
 
-    train_ls = long_short_returns(train_pred, train_fwd_aligned.loc[train_pred.index])
+    train_book = long_short_book(train_pred, train_fwd_aligned.loc[train_pred.index])
     val_book = long_short_book(val_pred, train_fwd_aligned.loc[val_pred.index])
-    val_ls = val_book["return"].dropna()
-    val_coverage = float(outcome_coverage(val_book)["outcome_coverage"])
+    train_ls = train_book["return"].dropna().astype(float)
+    val_ls = val_book["return"].dropna().astype(float)
+    book_coverage = {"train": outcome_coverage(train_book), "val": outcome_coverage(val_book)}
+    val_coverage = float(book_coverage["val"]["outcome_coverage"])
 
     train_sr = sharpe_ratio(train_ls)
     val_sr = sharpe_ratio(val_ls)
 
     log.info(
         "Ensemble trained: train Sharpe={ts:.3f}, val Sharpe={vs:.3f}, "
-        "val outcome coverage={vc:.4f}",
+        "val outcome coverage={vc:.4f} (net {nc}, {est})",
         ts=train_sr, vs=val_sr, vc=val_coverage,
+        nc=book_coverage["val"]["net_coverage"], est=book_coverage["val"]["estimate"],
     )
     log.info("Feature importance: {fi}", fi=importance)
 
@@ -221,4 +226,5 @@ def train_ensemble(
         n_features=len(feature_names),
         n_train_samples=len(X_fit),
         val_outcome_coverage=val_coverage,
+        book_coverage=book_coverage,
     )

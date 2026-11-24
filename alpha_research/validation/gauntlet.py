@@ -44,7 +44,9 @@ import pandas as pd
 from scipy import stats
 
 from alpha_research.validation.metrics import (
+    long_short_book,
     long_short_returns,
+    outcome_coverage,
     rank_ic,
     sharpe_ratio,
 )
@@ -505,8 +507,10 @@ def run_gauntlet(
     )
     perm_p, observed_sr = perm.p_value, perm.observed_sharpe
 
-    # 2. Deflated Sharpe (per-period Sharpe, cross-trial variance)
-    ls_ret = long_short_returns(signal, forward_returns, top_n, cost_bps)
+    # 2. Deflated Sharpe (per-period Sharpe, cross-trial variance). The net
+    # series comes from the frozen book, whose coverage labels are reported.
+    book = long_short_book(signal, forward_returns, top_n, cost_bps)
+    ls_ret = book["return"].dropna().astype(float)
     returns_arr = ls_ret.dropna().values
     skew = float(stats.skew(returns_arr)) if len(returns_arr) > 10 else 0.0
     kurt = float(stats.kurtosis(returns_arr, fisher=False)) if len(returns_arr) > 10 else 3.0
@@ -583,6 +587,7 @@ def run_gauntlet(
         "permutation_resolution_ok": perm.min_attainable_p * PERMS_MARGIN
         <= permutation_alpha,
         "per_period_sharpe": per_period_sr,
+        **outcome_coverage(book),
     }
     if dsr is not None:
         details["deflated_sharpe"] = {
