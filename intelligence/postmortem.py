@@ -236,7 +236,8 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         ticker, direction, entry_f, strike_f, outcome, actual_ret, price_path,
     )
 
-    # LLM narrative (or rule-based fallback)
+    # LLM narrative (or rule-based fallback). The narrative sees only active
+    # sanity layers; the stored data_at_decision keeps the raw record.
     llm_narrative = _get_llm_postmortem(
         ticker=ticker,
         direction=direction,
@@ -246,7 +247,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         category=category,
         root_cause=root_cause,
         what_happened=what_happened,
-        data_at_decision=data_at_decision,
+        data_at_decision={**data_at_decision, "sanity_status": _active_sanity(sanity)},
         price_path=price_path,
         signals_wrong=signals_wrong,
         signals_right=signals_right,
@@ -1276,6 +1277,34 @@ def _load_price_path(
     return path
 
 
+def _active_sanity(sanity: dict | None) -> dict:
+    """The sanity layers that count as evidence in a post-mortem.
+
+    A shadow verdict is kept in the raw record (``sanity_results_at_decision``
+    and ``data_at_decision``) but never attributed as a right or wrong signal,
+    never counted toward ``model_error`` and never shown to the narrative LLM
+    as evidence (Codex review 6030902445 on #1400). A layer is shadow when its
+    entry says ``"shadow": true`` (rows written since #1400) or when it is a
+    shadow check by name (``trading.options_recommender.SHADOW_CHECKS``:
+    CROSS_ASSET).
+
+    The name rule also covers the rows persisted before #1400, which carry no
+    flag. On griddb (2026-11-23) all 778 had CROSS_ASSET = PASS (only passing
+    recommendations were stored). Those verdicts came from the momentum read
+    #1400 replaced: WTI crude for CL, a fake 0% for every other ticker. They
+    are no evidence either, so excluding them removes only a
+    ``sanity_CROSS_ASSET_passed`` from ``signals_right`` and can never change
+    a failure category.
+    """
+    from trading.options_recommender import SHADOW_CHECKS
+
+    return {
+        layer: result for layer, result in (sanity or {}).items()
+        if layer not in SHADOW_CHECKS
+        and not (isinstance(result, dict) and result.get("shadow") is True)
+    }
+
+
 def _classify_failure(
     *,
     ticker: str,
@@ -1292,12 +1321,16 @@ def _classify_failure(
 ) -> tuple[str, str, list[str], list[str], str]:
     """Classify a trade failure into a category with root cause analysis.
 
+    Only active sanity layers (:func:`_active_sanity`) are attributed or
+    counted; shadow verdicts are not evidence.
+
     Returns:
         (failure_category, root_cause, signals_wrong, signals_right, what_we_missed)
     """
     signals_wrong: list[str] = []
     signals_right: list[str] = []
     what_missed = ""
+    active_sanity = _active_sanity(sanity)
 
     # Check if direction was ever right during the trade. `move_pct` divides
     # by the entry, so an entry that is None, zero or negative is settled
@@ -1349,8 +1382,8 @@ def _classify_failure(
             else:
                 signals_wrong.append("max_pain_neutral")
 
-    # Check sanity layers
-    for layer, result in sanity.items():
+    # Check sanity layers (active only: shadow verdicts are not signals)
+    for layer, result in active_sanity.items():
         if isinstance(result, dict):
             status = result.get("status", "")
             if status == "FAIL":
@@ -1407,9 +1440,9 @@ def _classify_failure(
                     )
                     return category, root_cause, signals_wrong, signals_right, what_missed
 
-    # 4. Check sanity failures — potential model error
+    # 4. Check sanity failures — potential model error (shadow FAILs never count)
     failed_sanity_count = sum(
-        1 for v in sanity.values()
+        1 for v in active_sanity.values()
         if isinstance(v, dict) and v.get("status") == "FAIL"
     )
     if failed_sanity_count >= 2:
