@@ -1054,3 +1054,12 @@ Branch `claude/13f-rerun-dedupe-20261123`. Anik: "fix the 13F duplicates".
   rows are left out before the ranking: an older identical SUCCESS under a newer
   QUARANTINED copy still counts as stored. A surviving change row is one stored
   observation of a filing comparison, not a filing.
+- **Codex review 6031901092 (2026-11-24):** the lock wait is bounded: 5 s for
+  one manager and 20 s over a run, inside the repair worker's 60 s per-source
+  deadline; after that the lock is only tried. A manager whose lock is not
+  obtained is `DEFERRED` for the run (no change row, no receipt). Not claimed:
+  ordered vintages. Each writer fetches before it locks and the DB stamps the
+  write, so two overlapping writers with different payloads store both and the
+  later commit is the newest vintage. Open for the owner: whether a quarantine
+  should also act as an exclusion (today every-copy-quarantined is written
+  again).

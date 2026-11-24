@@ -253,22 +253,76 @@ def test_a_newer_quarantined_copy_does_not_hide_a_changed_filing(engine, monkeyp
     assert sum(r["rows_inserted"] for r in second) == 1
 
 
-def test_the_lock_is_taken_before_the_lookup_and_only_on_postgresql(monkeypatch):
-    source = (inst.__file__)
-    text_ = open(source, encoding="utf-8").read()
-    block = text_[text_.index("rows_unchanged = 0"):text_.index("for chg in changes:", text_.index("rows_unchanged = 0"))]
+class _LockConn:
+    """A connection that records what the lock helper sends."""
+
+    def __init__(self, name: str, try_lock: bool = True, timeout: bool = False) -> None:
+        self.dialect = type("D", (), {"name": name})()
+        self.sent: list[tuple[str, dict]] = []
+        self._try_lock, self._timeout = try_lock, timeout
+
+    def execute(self, sql, params=None):
+        statement = str(sql)
+        self.sent.append((statement, dict(params or {})))
+        if "pg_advisory_xact_lock" in statement and "try" not in statement and self._timeout:
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError(statement, params, type("E", (Exception,), {"pgcode": "55P03"})())
+        return type("R", (), {"scalar": lambda _self: self._try_lock})()
+
+
+def _puller() -> inst.InstitutionalFlowsPuller:
+    return inst.InstitutionalFlowsPuller.__new__(inst.InstitutionalFlowsPuller)
+
+
+FILED = __import__("datetime").date(2026, 11, 14)
+
+
+def test_the_lock_is_taken_before_the_lookup_and_only_on_postgresql():
+    text_ = open(inst.__file__, encoding="utf-8").read()
+    start = text_.index("rows_unchanged = 0")
+    block = text_[start:text_.index("for chg in changes:", start)]
     assert block.index("self._lock_change_rows(conn, cik, obs_date)") < block.index("self._latest_stored_change_rows(")
 
-    calls: list[tuple] = []
-    puller = inst.InstitutionalFlowsPuller.__new__(inst.InstitutionalFlowsPuller)
-    monkeypatch.setattr(puller, "_file_advisory_lock", lambda conn, *parts: calls.append(parts), raising=False)
+    sqlite = _LockConn("sqlite")
+    _puller()._lock_change_rows(sqlite, "1067983", FILED)
+    assert sqlite.sent == []
 
-    class _Conn:
-        def __init__(self, name: str) -> None:
-            self.dialect = type("D", (), {"name": name})()
+    pg = _LockConn("postgresql")
+    _puller()._lock_change_rows(pg, "1067983", FILED)
+    statements = [s for s, _p in pg.sent]
+    assert "set_config('lock_timeout'" in statements[0] and pg.sent[0][1] == {"ms": "5000ms"}
+    assert "pg_advisory_xact_lock" in statements[1] and "try" not in statements[1]
+    assert "set_config('lock_timeout', '0', true)" in statements[2]      # the inserts run without it
 
-    from datetime import date as _date
-    puller._lock_change_rows(_Conn("sqlite"), "1067983", _date(2026, 11, 14))
-    assert calls == []
-    puller._lock_change_rows(_Conn("postgresql"), "1067983", _date(2026, 11, 14))
-    assert calls == [("13F-change-rows", "1067983", "2026-11-14")]
+
+def test_the_lock_wait_is_bounded_per_manager_and_per_run_inside_the_repair_deadline():
+    from scripts import hermes_fixers as hf
+
+    assert 0 < inst._CHANGE_ROW_LOCK_WAIT_S <= inst._CHANGE_ROW_LOCK_BUDGET_S
+    assert inst._CHANGE_ROW_LOCK_BUDGET_S < hf.PER_SOURCE_REPAIR_SECONDS / 2
+
+
+def test_a_lock_that_times_out_defers_the_manager():
+    puller = _puller()
+    with pytest.raises(inst.ChangeRowsBusy, match="held by another writer"):
+        puller._lock_change_rows(_LockConn("postgresql", timeout=True), "1067983", FILED)
+    assert puller._change_row_lock_wait_s >= 0.0
+
+
+def test_with_the_budget_spent_the_lock_is_only_tried(monkeypatch):
+    puller = _puller()
+    puller._change_row_lock_wait_s = inst._CHANGE_ROW_LOCK_BUDGET_S
+    free = _LockConn("postgresql", try_lock=True)
+    puller._lock_change_rows(free, "1067983", FILED)
+    assert [("pg_try_advisory_xact_lock" in s) for s, _p in free.sent] == [True]     # no wait, no timeout set
+    with pytest.raises(inst.ChangeRowsBusy):
+        puller._lock_change_rows(_LockConn("postgresql", try_lock=False), "1067983", FILED)
+
+
+def test_the_last_wait_is_cut_to_what_is_left_of_the_budget():
+    puller = _puller()
+    puller._change_row_lock_wait_s = inst._CHANGE_ROW_LOCK_BUDGET_S - 1.5
+    conn = _LockConn("postgresql")
+    puller._lock_change_rows(conn, "1067983", FILED)
+    assert conn.sent[0][1] == {"ms": "1500ms"}

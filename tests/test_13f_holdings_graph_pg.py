@@ -436,3 +436,133 @@ def test_two_overlapping_writers_add_each_change_row_once(pg_engine, monkeypatch
     assert sum(r["rows_inserted"] for r in third) == 1          # a different filing state is still stored
     assert count("13F:%") == stored + 1
     assert count("13F-FILING:%") == 3
+
+
+def _patch_writer(monkeypatch, get):
+    from ingestion.altdata import institutional_flows as inst
+
+    monkeypatch.setattr(inst.requests, "get", get)
+    monkeypatch.setattr(inst.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(inst, "TOP_13F_FILERS", {s.CIK_ALPHA: s.ALPHA})
+    inst._DEAD_CIKS.clear()
+    return inst
+
+
+def _count(pg_engine, pattern: str) -> int:
+    with pg_engine.connect() as conn:
+        return conn.execute(text("SELECT COUNT(*) FROM raw_series WHERE series_id LIKE :p"),
+                            {"p": pattern}).scalar_one()
+
+
+def test_a_writer_does_not_queue_behind_a_held_lock(pg_engine, monkeypatch):
+    """Another connection holds the manager's lock for the whole run (an
+    orphaned writer that never finishes). The writer waits its bound, defers
+    the manager and returns: no change row, no receipt, no error. With the
+    run's budget already spent it does not wait at all."""
+    import time as _time
+
+    from ingestion.base import _stable_lock_key
+
+    edgar = s.two_quarter_scenario()
+    inst = _patch_writer(monkeypatch, edgar.get)
+    monkeypatch.setattr(inst, "_CHANGE_ROW_LOCK_WAIT_S", 0.3)
+    _report, filed = s.quarter_dates(0)
+    key = _stable_lock_key(inst.InstitutionalFlowsPuller.SOURCE_NAME, "13F-change-rows", s.CIK_ALPHA,
+                           filed.isoformat())
+
+    holder = pg_engine.connect()
+    held = holder.begin()
+    holder.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
+    try:
+        started = _time.monotonic()
+        waited = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
+        took = _time.monotonic() - started
+        assert [(r["status"], r.get("reason"), r["rows_inserted"]) for r in waited] == [
+            ("DEFERRED", "change_rows_held_by_another_writer", 0)]
+        assert 0.25 <= took < 10
+        assert _count(pg_engine, "13F:%") == 0 and _count(pg_engine, "13F-FILING:%") == 0
+
+        monkeypatch.setattr(inst, "_CHANGE_ROW_LOCK_BUDGET_S", 0.0)       # nothing left to wait with
+        started = _time.monotonic()
+        tried = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
+        assert tried[0]["status"] == "DEFERRED" and _time.monotonic() - started < 5
+    finally:
+        held.rollback()
+        holder.close()
+
+    monkeypatch.setattr(inst, "_CHANGE_ROW_LOCK_BUDGET_S", 20.0)
+    after = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()     # the lock is free again
+    assert after[0]["status"] == "SUCCESS" and after[0]["rows_inserted"] == _count(pg_engine, "13F:%") > 0
+    assert _count(pg_engine, "13F-FILING:%") == 1
+
+
+def test_overlapping_writers_with_different_payloads_store_both_in_commit_order(pg_engine, monkeypatch):
+    """What the lock does not claim. Each writer fetched its filing before the
+    lock; they hold different states of one holding. Both states are stored,
+    and the newest vintage is the one written last (the DB stamps the write),
+    whichever fetch was newer. Vintage order is write order, not fetch order."""
+    import threading
+
+    first_state = s.two_quarter_scenario()
+    second_state = s.two_quarter_scenario()
+    second_state.filings[s.CIK_ALPHA][1].holdings[s.ROOT_CUSIP] = ("ROOT HOLDINGS INC", 280_000, 2_000)
+
+    def get(url, headers=None, timeout=None):
+        edgar = second_state if threading.current_thread().name == "writer-two" else first_state
+        return edgar.get(url, headers, timeout)
+
+    inst = _patch_writer(monkeypatch, get)
+    first_inside = threading.Event()
+    arrivals: list[str] = []
+    gate = threading.Lock()
+    original_receipt = inst.InstitutionalFlowsPuller._insert_receipt
+
+    def second_is_waiting_on_the_lock() -> bool:
+        with pg_engine.connect() as probe:
+            return bool(probe.execute(text(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+                "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            )).scalar_one())
+
+    def held_receipt(self, conn, series_id, obs_date, payload, curr_snap):
+        with gate:
+            arrivals.append(threading.current_thread().name)
+            first = len(arrivals) == 1
+        if first:
+            first_inside.set()
+            deadline = datetime.now(timezone.utc) + timedelta(seconds=3)
+            while datetime.now(timezone.utc) < deadline and not second_is_waiting_on_the_lock():
+                threading.Event().wait(0.05)
+        return original_receipt(self, conn, series_id, obs_date, payload, curr_snap)
+
+    monkeypatch.setattr(inst.InstitutionalFlowsPuller, "_insert_receipt", held_receipt)
+    results: dict[str, list[dict]] = {}
+    errors: list[BaseException] = []
+
+    def write(name: str) -> None:
+        try:
+            results[name] = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
+        except BaseException as exc:  # noqa: BLE001 -- surfaced below
+            errors.append(exc)
+
+    one = threading.Thread(target=write, args=("one",), name="writer-one")
+    two = threading.Thread(target=write, args=("two",), name="writer-two")
+    one.start()
+    assert first_inside.wait(20)
+    two.start()
+    one.join(60)
+    two.join(60)
+    assert not errors and arrivals[0] == "writer-one", (errors, arrivals)
+    assert results["two"][0]["status"] == "SUCCESS" and results["two"][0]["rows_inserted"] == 1
+
+    with pg_engine.connect() as conn:
+        root = conn.execute(text(
+            "SELECT raw_payload->>'curr_value_usd' FROM raw_series WHERE series_id LIKE :p "
+            "ORDER BY pull_timestamp, id"), {"p": f"13F:{s.CIK_ALPHA}:{s.ROOT_CUSIP}:%"}).fetchall()
+        copies = conn.execute(text(
+            "SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM raw_series WHERE series_id LIKE '13F:%' "
+            "AND series_id NOT LIKE :root GROUP BY series_id, obs_date) per_key"),
+            {"root": f"13F:{s.CIK_ALPHA}:{s.ROOT_CUSIP}:%"}).scalar_one()
+    assert [float(v) for (v,) in root] == [260_000.0, 280_000.0]      # both kept; the later commit is newest
+    assert copies == 1                                                # every unchanged series once
+    assert _count(pg_engine, "13F-FILING:%") == 2

@@ -47,9 +47,10 @@ import requests
 from loguru import logger as log
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
 from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, _stable_lock_key, retry_on_failure
 
 # yfinance logs expected missing/delisted ticker misses at ERROR internally.
 # This module treats those as upstream data absence, not Hermes/app failures.
@@ -560,6 +561,27 @@ _REQUEST_TIMEOUT: int = 30
 # timestamp. The lookup and the inserts therefore run under one
 # transaction-scoped advisory lock per (source, manager, filing date); the
 # second writer waits, then looks up what the first committed.
+#
+# The wait is bounded. A timed-out run is not stopped: its thread goes on, and
+# Hermes' repair worker abandons a retry after PER_SOURCE_REPAIR_SECONDS (60 s)
+# and starts another, so several orphaned writers can overlap. A writer waits
+# at most _CHANGE_ROW_LOCK_WAIT_S for one manager's lock and at most
+# _CHANGE_ROW_LOCK_BUDGET_S in a whole run; after that it only tries the lock.
+# A manager whose lock is not obtained is DEFERRED for this run: nothing is
+# written for it (no change row, no receipt) and the next run takes it.
+#
+# What this does not claim. Each writer fetches its filings before it takes
+# the lock, and raw_series stamps the write time itself. When two overlapping
+# writers hold different payloads, both are stored and the one that commits
+# last is the newest vintage, whichever fetch was newer. The vintage order is
+# the order of writes, not of fetches.
+_CHANGE_ROW_LOCK_WAIT_S: float = 5.0
+_CHANGE_ROW_LOCK_BUDGET_S: float = 20.0
+_PG_LOCK_NOT_AVAILABLE = "55P03"
+
+
+class ChangeRowsBusy(RuntimeError):
+    """Another writer holds this manager's change rows for this filing date."""
 # (uq_raw_series_composite makes pull_timestamp unique per series, source and
 # obs_date, so "newest" needs no tie-break.)
 _CHANGE_ROW_LOOKUP_CHUNK: int = 500
@@ -1404,12 +1426,38 @@ class InstitutionalFlowsPuller(BasePuller):
 
         Must be the first statement of the transaction that looks the stored
         rows up and inserts (see the note above ``_LATEST_CHANGE_ROWS_SQL``).
-        PostgreSQL only; other dialects (the SQLite test engines) have one
-        writer and no advisory locks.
+        Waits at most ``_CHANGE_ROW_LOCK_WAIT_S``, and at most
+        ``_CHANGE_ROW_LOCK_BUDGET_S`` over the whole run; with the budget
+        spent it only tries the lock. PostgreSQL only; other dialects (the
+        SQLite test engines) have one writer and no advisory locks.
+
+        Raises:
+            ChangeRowsBusy: the lock was not obtained. The transaction must
+                be left without writing.
         """
         if conn.dialect.name != "postgresql":
             return
-        self._file_advisory_lock(conn, "13F-change-rows", cik, obs_date.isoformat())
+        key = _stable_lock_key(self.SOURCE_NAME, "13F-change-rows", cik, obs_date.isoformat())
+        spent = getattr(self, "_change_row_lock_wait_s", 0.0)
+        wait_s = min(_CHANGE_ROW_LOCK_WAIT_S, _CHANGE_ROW_LOCK_BUDGET_S - spent)
+        if wait_s <= 0:
+            if not conn.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": key}).scalar():
+                raise ChangeRowsBusy(f"13F change rows of {cik} for {obs_date} are held by another writer")
+            return
+        started = time.monotonic()
+        conn.execute(text("SELECT set_config('lock_timeout', :ms, true)"),
+                     {"ms": f"{max(1, int(wait_s * 1000))}ms"})
+        try:
+            conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
+        except DBAPIError as exc:
+            if getattr(exc.orig, "pgcode", None) == _PG_LOCK_NOT_AVAILABLE:
+                raise ChangeRowsBusy(
+                    f"13F change rows of {cik} for {obs_date} are held by another writer "
+                    f"(waited {wait_s:.1f} s)") from exc
+            raise
+        finally:
+            self._change_row_lock_wait_s = spent + (time.monotonic() - started)
+        conn.execute(text("SELECT set_config('lock_timeout', '0', true)"))
 
     def _latest_stored_change_rows(
         self, conn: Any, series_ids: list[str], obs_date: date,
@@ -1469,6 +1517,7 @@ class InstitutionalFlowsPuller(BasePuller):
             List of result dicts per manager.
         """
         results: list[dict[str, Any]] = []
+        self._change_row_lock_wait_s = 0.0      # lock-wait budget of this run
 
         for cik, manager_name in TOP_13F_FILERS.items():
             try:
@@ -1730,6 +1779,17 @@ class InstitutionalFlowsPuller(BasePuller):
                     u=rows_unchanged,
                 )
 
+            except ChangeRowsBusy as busy:
+                # Another writer is on this manager's filing date. Nothing was
+                # written by this run for it; the next run takes it.
+                log.warning("13F {m} (CIK={c}) deferred: {e}", m=manager_name, c=cik, e=str(busy))
+                results.append({
+                    "feature": f"13F:{cik}",
+                    "manager": manager_name,
+                    "status": "DEFERRED",
+                    "reason": "change_rows_held_by_another_writer",
+                    "rows_inserted": 0,
+                })
             except requests.HTTPError as http_exc:
                 # Permanent HTTP failures (404 / 403) — log once at WARNING,
                 # not ERROR.  Retries are already disabled at the fetcher.
