@@ -651,4 +651,13 @@ would read tagged rows as ordinary ones. Turn the switch on only in this order:
    `/api/v1/oracle/latest` do not return them while an admin token's do.
 
 Roll back: unset the variable and restart grid-hermes. Rows already tagged stay
-hidden from non-admin readers.
+hidden from non-admin readers. Once any tagged row exists, never roll a reader
+back to a release older than #1396 (and the model-state fix after it): the
+older readers would serve tagged rows as ordinary ones. Disabling the producer
+is not enough on its own.
+
+Model state counts too. `oracle_models` holds running counters, cumulative
+P&L, weights and timestamps that the scorer and weight evolution update from
+every scored row, private ones included. Only an admin request reads them
+(`/oracle/scorecard` admin branch, scoreboard weights); everyone else gets
+public-cohort counts (`tests/test_oracle_model_state_private.py`).
