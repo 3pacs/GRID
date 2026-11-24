@@ -49,8 +49,8 @@ def doc() -> str:
 def test_status_is_draft_and_authorises_nothing(lineage: dict, doc: str) -> None:
     assert lineage["status"] == "DRAFT_UNREVIEWED"
     assert lineage["authorises"] == []
-    assert lineage["revision"] == 6
-    assert "DRAFT v0, revision 6" in doc and "authorises nothing" in doc
+    assert lineage["revision"] == 7
+    assert "DRAFT v0, revision 7" in doc and "authorises nothing" in doc
     assert lineage["document"] == str(DOC_PATH.relative_to(ROOT))
 
 
@@ -126,7 +126,11 @@ def negative_read_proves_absence(read: dict, run: dict, read_at: datetime) -> bo
             or read.get("table") != "publication_review_runs"):
         return False
     if read.get("lookup") == "exact_identity":
-        return read.get("found") is False
+        qid, qsha = read.get("queried_run_id"), read.get("queried_review_sha256")
+        return (type(qid) is int and qid == run["run_id"]
+                and isinstance(qsha, str) and re.fullmatch(r"[0-9a-f]{64}", qsha) is not None
+                and qsha == run["review_sha256"]
+                and read.get("completed") is True and read.get("found") is False)
     if read.get("lookup") == "scoped_list":
         ids = read.get("returned_run_ids")
         return (read.get("complete") is True and isinstance(ids, list)
@@ -212,6 +216,11 @@ def test_fixtures_cover_every_verdict_and_the_reviewed_cases(lineage: dict, inge
                  "commit proof bound to another run", "commit proof from an untrusted source"):
         assert states[name] == "VISIBILITY_UNKNOWN", name
     assert states["neg: exact identity lookup found no row"] == "NOT_VISIBLE"
+    # Review 6034193990: the exact lookup must name this run and hash, typed, and be completed.
+    for name in ("exact lookup: wrong queried run id", "exact lookup: wrong queried hash",
+                 "exact lookup: query keys omitted", "exact lookup: run id typed as a string",
+                 "exact lookup: not completed"):
+        assert states[name] == "VISIBILITY_UNKNOWN", name
 
 
 def test_ingested_at_never_decides_visibility(lineage: dict) -> None:

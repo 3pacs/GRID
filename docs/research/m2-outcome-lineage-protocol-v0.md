@@ -4,9 +4,9 @@ Issue: [#960](https://github.com/3pacs/GRID/issues/960). Milestone: M2, "Evidenc
 Machine-readable companion: [`m2-outcome-lineage-v0.json`](m2-outcome-lineage-v0.json). The companion is held to
 the code by `tests/test_m2_outcome_lineage_map.py`.
 
-**Status: DRAFT v0, revision 6** (answers the reviewer's HOLDs 6033027329 on `393cde73`, 6033670709 on
-`4aa18aee`, 6033699395 on `bc0e85db`, 6033821128 on `3c0c79a9` and 6033941569 on `c7be57b6`; the change maps
-are §7–§11). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
+**Status: DRAFT v0, revision 7** (answers the reviewer's HOLDs 6033027329 on `393cde73`, 6033670709 on
+`4aa18aee`, 6033699395 on `bc0e85db`, 6033821128 on `3c0c79a9`, 6033941569 on `c7be57b6` and 6034193990 on
+`e017229b`; the change maps are §7–§12). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
 scoring or learning, evaluation run, DDL, historical rewrite, promotion or trading action. Only the research owner
 can adopt it, and only after the independent reviewer's pass (§6). Adoption is a separate commit that pins this
 file's hash. The D0 contract ([#1129](https://github.com/3pacs/GRID/issues/1129), draft PR #1142) is the first
@@ -81,8 +81,9 @@ and only then assigns a protocol state. Two clocks of the row's run decide wheth
     - **Trusted source:** the primary database, not a replica (replica lag can hide a committed run).
     - **Snapshot timing:** the read's snapshot was **acquired** at or after `R`. The response or completion time
       does not count, since a snapshot taken before `R` can finish after it.
-    - **Complete lookup:** either an exact-identity lookup of this `run_id` that completed without error and
-      returned no row; or a scoped list of `publication_review_runs` for the run's publication day, marked
+    - **Complete lookup:** either an exact-identity lookup whose receipt names the queried `run_id` and
+      `review_sha256` (both present, typed, and equal to the target's), is marked completed, and returned no row;
+      or a scoped list of `publication_review_runs` for the run's publication day, marked
       complete (no filter, limit or pagination), whose `returned_run_ids` is present and omits the `run_id`.
 
     A read before `R` that misses the run proves nothing about `R`.
@@ -312,4 +313,11 @@ days (rule 2.4.4). The pending, unavailable and unmeasurable counts are always s
 | A pre-`R` snapshot completing after `R`, replica lag, and a filtered, incomplete or missing list can falsely certify `NOT_VISIBLE` | §2.2: a negative witness needs a trusted primary source, a snapshot acquired at or after `R` (not the response time), and either a complete exact-identity lookup or a complete scoped list with `returned_run_ids` present. An error or a missing field reverts to `VISIBILITY_UNKNOWN`. |
 | Bind the authoritative commit proof to the exact run and hash, from a trusted source | §2.2: the commit time must come from a trusted database source and name the same `run_id` and `review_sha256`. |
 | Add stale-snapshot and partial or missing list cases | Fixtures: a stale snapshot (acquired before `R`, completed after); a replica read; a partial list; a missing list; an errored read; an exact-identity lookup with no row (`NOT_VISIBLE`); a commit proof bound to another run. |
+
+## 12. Revision 7 change map (answers HOLD 6034193990 on `e017229b`)
+
+| Reviewer point | Change |
+|---|---|
+| An exact-lookup receipt with `found=false` was accepted without matching its queried run ID and review hash to the target | §2.2: the receipt must carry `queried_run_id` (an integer) and `queried_review_sha256` (64 lowercase hex), both equal to the target's, and `completed: true`. Anything else reverts to `VISIBILITY_UNKNOWN`. |
+| Test a wrong ID or hash, omitted keys and incomplete reads | Fixtures: wrong run ID, wrong hash, omitted query keys, a string-typed run ID, and `completed: false`, all `VISIBILITY_UNKNOWN`; the matching completed lookup stays `NOT_VISIBLE`. |
 
