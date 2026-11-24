@@ -172,11 +172,20 @@ class NewsMomentumAnalyzer:
             )
 
         details["data_points"] = matrix.shape[0]
-        details["features_available"] = list(tone_ids.keys())
+        # The PIT pivot only has a column for a feature with at least one row
+        # in the window, so a registered actor can be missing altogether.
+        present = {name: fid for name, fid in tone_ids.items() if fid in matrix.columns}
+        details["features_available"] = list(present.keys())
+        if not present:
+            return self._unavailable_result(
+                as_of_date,
+                note="No GDELT actor-tone feature has data in the window",
+                warning="No GDELT actor-tone data in the window",
+            )
 
         # Composite tone: average across whichever actor-tone columns have
         # data on a given date (any one actor query can come back empty).
-        tone_series = matrix[list(tone_ids.values())].mean(axis=1, skipna=True).dropna()
+        tone_series = matrix[list(present.values())].mean(axis=1, skipna=True).dropna()
         if len(tone_series) < 5:
             return self._unavailable_result(
                 as_of_date,
@@ -240,16 +249,19 @@ class NewsMomentumAnalyzer:
             tension_matrix = self._load_matrix(
                 list(tension_ids.values()), start_date, as_of_date
             )
-            if not tension_matrix.empty:
+            tension_present = {
+                name: fid for name, fid in tension_ids.items() if fid in tension_matrix.columns
+            }
+            if not tension_matrix.empty and tension_present:
                 tension_series = (
-                    tension_matrix[list(tension_ids.values())]
+                    tension_matrix[list(tension_present.values())]
                     .mean(axis=1, skipna=True)
                     .dropna()
                 )
                 if len(tension_series) >= 5:
                     conflict_energy = self._compute_energy(tension_series)
                     details["conflict_energy"] = conflict_energy
-                    details["tension_features_available"] = list(tension_ids.keys())
+                    details["tension_features_available"] = list(tension_present.keys())
 
         summary = self._build_summary(
             sentiment_trend, momentum_direction, energy_state, conflict_energy,

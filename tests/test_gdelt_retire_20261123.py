@@ -103,6 +103,35 @@ def test_tone_that_ended_weeks_ago_is_unavailable_and_says_when() -> None:
     assert any("stale" in w for w in result.warnings)
 
 
+def test_a_registered_actor_with_no_column_in_the_pivot_does_not_break_the_read() -> None:
+    """The PIT pivot has no column for a feature with no row in the window.
+    One actor missing altogether must not raise before the staleness check
+    (Codex HOLD 6032263681)."""
+    for last_obs, available in ((AS_OF, True), (date(2026, 11, 6), False)):
+        analyzer = _analyzer(last_obs)
+        full = analyzer.pit_store.get_feature_matrix.side_effect
+        missing = 3                                         # this actor's feature id has no column
+
+        def without_one(feature_ids, _full=full, **kw):
+            return _full([f for f in feature_ids if f != missing], **kw)
+
+        analyzer.pit_store.get_feature_matrix.side_effect = without_one
+        result = analyzer.analyze(AS_OF, lookback_days=90)
+        assert result.available is available
+        if available:
+            assert len(result.details["features_available"]) == len(pm.GDELT_ACTOR_TONE_FEATURES) - 1
+        else:
+            assert result.details["tone_last_observed"] == "2026-11-06"
+
+
+def test_no_actor_column_at_all_is_unavailable() -> None:
+    analyzer = _analyzer(AS_OF)
+    analyzer.pit_store.get_feature_matrix.side_effect = lambda feature_ids, **_kw: pd.DataFrame(
+        {999: range(10)}, index=pd.Index([AS_OF - timedelta(days=k) for k in range(10)][::-1]))
+    result = analyzer.analyze(AS_OF, lookback_days=90)
+    assert result.available is False and "No GDELT actor-tone" in result.details["note"]
+
+
 @pytest.mark.parametrize(("age_days", "available"), [(0, True), (pm.TONE_STALE_AFTER_DAYS, True),
                                                       (pm.TONE_STALE_AFTER_DAYS + 1, False)])
 def test_the_staleness_edge(age_days: int, available: bool) -> None:
@@ -120,6 +149,8 @@ PRE_DEPRECATED_ROWS = {
     "gdelt_opec_tone": (False, PRE_DEPRECATED),             # theme, already deprecated
     "gdelt_actor_ueda_tone": (True, PRE_DEPRECATED),        # actor, already deprecated but still eligible
 }
+# After the migration: the earlier date is kept, and none is model-eligible.
+PRE_DEPRECATED_AFTER = {name: (False, PRE_DEPRECATED) for name in PRE_DEPRECATED_ROWS}
 OPTED_OUT_ROWS = {
     "gdelt_actor_yellen_tone": (False, None),               # actor, opted out of model use before
     "gdelt_tension_india_china": (False, None),             # tension, opted out before
@@ -167,19 +198,33 @@ def test_upgrade_retires_exactly_the_doc_features(monkeypatch: pytest.MonkeyPatc
 
     assert set(after) == set(before)
     for name in revision.DOC_FEATURES:
-        if name in PRE_DEPRECATED_ROWS:
-            continue
         assert after[name][0] is False and after[name][1] is not None, name
     for name, state in UNTOUCHED_ROWS.items():
         assert after[name] == state, name
 
 
-def test_a_row_deprecated_before_is_left_exactly_as_it_was(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Its earlier deprecation date stays, and so does its model_eligible flag:
-    the migration does not touch a row someone already retired."""
-    before, after = _upgraded(monkeypatch)
+def test_a_row_deprecated_before_keeps_its_date_and_loses_eligibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The earlier deprecation date is not overwritten. A row that was
+    deprecated but left model-eligible is retired from model use too."""
+    before, after = _upgraded(monkeypatch, times=2)
     for name, state in PRE_DEPRECATED_ROWS.items():
-        assert before[name] == state and after[name] == state, name
+        assert before[name] == state and after[name] == PRE_DEPRECATED_AFTER[name], name
+    assert before["gdelt_actor_ueda_tone"][0] is True and after["gdelt_actor_ueda_tone"][0] is False
+
+
+def test_no_doc_feature_is_selectable_by_the_model_eligible_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """oracle/engine.py selects features by family and ``model_eligible = TRUE``
+    and does not look at deprecated_at, so eligibility is what must be off."""
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        _registry(conn)
+        select = text("SELECT name FROM feature_registry WHERE model_eligible = TRUE AND name LIKE 'gdelt%' ORDER BY 1")
+        before = [n for (n,) in conn.execute(select)]
+        monkeypatch.setattr(revision, "op", Operations(MigrationContext.configure(conn)))
+        revision.upgrade()
+        after = [n for (n,) in conn.execute(select)]
+    assert "gdelt_actor_ueda_tone" in before and "gdelt_actor_powell_tone" in before
+    assert after == ["gdelt_actor_powell_tone_v2", "gdelt_avg_tone"]       # neither is a DOC feature
 
 
 def test_a_row_that_had_opted_out_stays_out_and_gains_the_deprecation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,7 +246,7 @@ def test_downgrade_is_refused_and_changes_nothing(monkeypatch: pytest.MonkeyPatc
         with pytest.raises(RuntimeError, match="refused"):
             revision.downgrade()
         assert _rows(conn) == upgraded
-    for name, state in PRE_DEPRECATED_ROWS.items():
+    for name, state in PRE_DEPRECATED_AFTER.items():
         assert upgraded[name] == state, name
 
 

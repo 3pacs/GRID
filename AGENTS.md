@@ -1051,8 +1051,12 @@ deleted: `ingestion/altdata/gdelt.py`, its tests and all stored rows stay.
   back to `_PRODUCING` in `tests/test_scheduler_daily_outcomes_20261117.py`, add
   a forward migration that names the features to re-enable, and re-pin SCHED.
 - **Codex HOLD 6031396980 (2026-11-24):** the migration's downgrade is refused.
-  The upgrade leaves a row that was already deprecated exactly as it was, and a
-  row that had opted out of model use only gains `deprecated_at`; no prior
-  value is recorded, so restoring defaults would erase and re-enable them.
+  No prior value is recorded, so restoring defaults would erase earlier
+  deprecations and re-enable opt-outs.
+- **Codex HOLD 6032263681 (2026-11-24):** eligibility is retired for every named
+  DOC feature, including one deprecated earlier but left model-eligible (the
+  oracle selects by `model_eligible` only); an earlier `deprecated_at` is kept
+  (COALESCE). `physics/momentum.py` no longer indexes a registered actor whose
+  column the PIT pivot omitted.
   This is not a complete removal of the DOC API: three other callers remain
   and the bulk-file loader stays.

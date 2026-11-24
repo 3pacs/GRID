@@ -12,18 +12,23 @@ have no writer any more: the actor tones and country tensions stopped on
 The 14 actor-tone and tension features were registered model_eligible with
 FORWARD_FILL (migrations/0062), so feature pipelines that select
 model_eligible features would keep forward-filling their last value. Mark all
-24 deprecated and not model-eligible. History stays in raw_series and
-resolved_series untouched; only the two registry flags change. Already
-deprecated rows are left as they are.
+24 not model-eligible, and deprecated. History stays in raw_series and
+resolved_series untouched; only the two registry flags change.
+
+Eligibility is retired for every named feature, including one that was
+deprecated earlier but left model-eligible: the oracle selects by family and
+model_eligible only (oracle/engine.py), so such a row would still be read. An
+earlier deprecation date is kept as it is (COALESCE), not overwritten.
 
 The 12 daily event features written from GDELT's bulk files
 (ingestion/altdata/gdelt_bulk.py: gdelt_avg_tone, gdelt_conflict_count, ...)
 are not touched: that loader still runs.
 
 Downgrade is refused. The upgrade does not record each row's prior flags: a
-row that was already deprecated is left alone, and a row that had opted out
-of model use (model_eligible FALSE) only gains deprecated_at. Restoring
-"defaults" would erase an earlier deprecation and re-enable those opt-outs.
+row that was already deprecated keeps its date but may lose model_eligible,
+and a row that had opted out of model use (model_eligible FALSE) only gains
+deprecated_at. Restoring "defaults" would erase an earlier deprecation and
+re-enable those opt-outs.
 To bring DOC features back, write a new forward migration that names the
 features to re-enable and the reason, after lifting the registry hold.
 """
@@ -68,8 +73,8 @@ DOC_FEATURES: tuple[str, ...] = THEME_FEATURES + ACTOR_AND_TENSION_FEATURES
 
 _RETIRE = text(
     "UPDATE feature_registry "
-    "SET model_eligible = FALSE, deprecated_at = CURRENT_TIMESTAMP "
-    "WHERE deprecated_at IS NULL AND name IN :names"
+    "SET model_eligible = FALSE, deprecated_at = COALESCE(deprecated_at, CURRENT_TIMESTAMP) "
+    "WHERE name IN :names"
 ).bindparams(bindparam("names", expanding=True))
 
 
