@@ -17,23 +17,24 @@ Modes (nothing is written to any database without ``--apply``)::
     # 2. the owner reviews receipt.json; 3. within 30 minutes, the same host applies exactly that receipt
     python scripts/apply_eligibility_change.py --apply --approved-receipt receipt.json --approved-receipt-sha256 <hex>
 
-    python scripts/apply_eligibility_change.py --rollback <uuid>       # dry run of rolling one set back
-    python scripts/apply_eligibility_change.py --rollback <uuid> --apply
+    # rolling one set back: a dry run prints a rollback receipt; within 30 minutes, apply exactly that receipt
+    python scripts/apply_eligibility_change.py --rollback <uuid> --receipt-out rollback.json
+    python scripts/apply_eligibility_change.py --rollback <uuid> --apply --approved-receipt rollback.json \
+        --approved-receipt-sha256 <hex>
 
 The database URL comes from the environment variable named by ``--db-url-env`` (default
 ``GRID_ELIGIBILITY_DB_URL``, which keeps it out of argv), else ``config.settings.DB_URL``. The script prints a
 JSON report and exits 0, 2 when it refused, or 1 on an error.
 
 **Prerequisite gate (apply only).** The plan changes what the Oracle and auto_regime act on, so ``--apply``
-refuses unless every deployed code tree declares both contract constants as module-level string literals with
-the exact values in ``PREREQUISITES``:
+refuses unless every deployed code tree carries both prerequisites:
 
-* ``oracle/engine.py``: ``SIGNAL_POLARITY_RULE = "oracle-signal-polarity-v1"``, added by the Oracle polarity
-  fix (branch ``claude/fp-oracle-polarity-20261122``);
-* ``scripts/auto_regime.py``: ``REGIME_HYSTERESIS_RULE = "auto-regime-own-bindings-hysteresis-v1"``, added by
-  auto_regime's own declared bindings plus hysteresis (#1307).
-
-The files are read with ``ast``; nothing is imported or executed.
+* the Oracle feature-polarity fix: #1350's merge commit ``9d777445`` must be in the tree's HEAD history
+  (``git merge-base --is-ancestor``, ``ANCESTOR_PREREQUISITES``). #1350 landed without a contract literal, and a
+  commit is stronger than one: a tree that predates it, or whose history is missing, refuses;
+* ``scripts/auto_regime.py``: ``REGIME_HYSTERESIS_RULE = "auto-regime-own-bindings-hysteresis-v1"`` as a
+  module-level string literal (``PREREQUISITES``), added by auto_regime's own declared bindings plus hysteresis
+  (#1307). The file is read with ``ast``; nothing is imported or executed.
 
 **Deployed-code evidence.** Configuration is not proof of what runs, so the gate collects positive evidence for
 every unit in ``SERVICE_UNITS``, the deployed service inventory (the scheduler and grid-realtime are pinned to
@@ -59,12 +60,27 @@ NeedDaemonReload. Then, read-only:
   HEAD, and a ``<live_path>.releases/<name>`` directory must be named for its HEAD. It must also carry both
   literals.
 
+* **code identity (#1383).** The cwd is not proof of the code, so the command line is bound too: the running
+  process's ``/proc/<pid>/cmdline`` and the unit's ExecStart must be equal, and each must name an entry file inside
+  its tree: ``python -m <module>`` (the module's file under the tree), ``python -m uvicorn <module>:app ...`` (the
+  app module's file) or ``python <script>`` (resolved against the tree). Only those shapes, the venv interpreter
+  and ``-u``/``-B`` are accepted; a wrapper (flock, bash), any other interpreter option, uvicorn's ``--app-dir`` or
+  ``--reload``, an absolute script outside the tree, or a module not in the tree refuses. From the process's
+  environment only ``PYTHONPATH`` and ``PYTHONSAFEPATH`` are kept (the rest may hold secrets): a ``PYTHONPATH``
+  entry outside the tree, or ``PYTHONSAFEPATH``, refuses. A stopped unit's environment is not read
+  (EnvironmentFile holds secrets);
+* **restart receipt.** A process imports at start, so for every running unit the receipt records when its
+  process started (``/proc/<pid>/stat`` with the boot time) and when its tree's code last changed on disk (the
+  newest mtime of its tracked files, or HEAD's last reflog entry). A process that started before its code last
+  changed (an in-place checkout or edit) refuses: restart it.
+
 Only the MainPID is checked, not the other processes in a unit's cgroup. They are forked from it, and a child
 that execs code from another tree is not covered.
 
 **The owner receipt.** A dry run of the plan prints a receipt: the evidence above for each unit and tree, every
-refusal, the rows the plan would change, the database target (password redacted), the host, its boot id and the
-time. It prints the receipt's sha256 over its canonical JSON, and ``--receipt-out FILE`` saves exactly those bytes
+refusal, the rows the plan would change, the database target (password redacted) and the identity of the backend
+it read them on, the change set the apply will record, the deploy locks it will hold, the host, its boot id and
+the time. It prints the receipt's sha256 over its canonical JSON, and ``--receipt-out FILE`` saves exactly those bytes
 to a new file. Making it writes to no database. ``--apply`` requires ``--approved-receipt FILE`` and
 ``--approved-receipt-sha256 HEX``. Before opening a connection it refuses if:
 
@@ -76,8 +92,23 @@ to a new file. Making it writes to no database. ``--apply`` requires ``--approve
   hash, cleanliness, release name and literals. A restart (new MainPID or start time) or a repin between dry run
   and apply refuses.
 
-Every divergence is named. In the write transaction the rows the plan would change must equal the receipt's
+Every divergence is named. In the write transaction the backend must be the receipt's, the receipt's change set
+must not be recorded yet (a receipt writes once), and the rows the plan would change must equal the receipt's
 planned rows, before and after the locked update, or nothing is written.
+
+**Write boundary (#1383).** ``main`` verifies the receipt before connecting, and the transaction can then wait on
+locks. So, inside the write transaction, the apply takes the deploy's own lock (``<live_path>.releases/.lock``,
+which ``scripts/deploy_release_swap.sh`` holds for its whole run) without waiting, changes the rows, collects the
+evidence again and compares it with the receipt, and only then commits; the lock is released after the commit. A
+deploy that holds the lock refuses the apply. A restart, repin or in-place change that lands after the first probe
+and before the re-check refuses, and nothing is written. What remains: a restart between the re-check and the
+commit (milliseconds), which runs the same tree unless a repin, and a repin needs the lock. A tree outside a
+``.releases`` directory has no deploy lock; the re-check covers it.
+
+**Database identity (#1383).** A redacted DSN names a target, not a backend. The dry run reads the backend's
+identity in its read-only transaction (``pg_control_system().system_identifier``, the checkpoint timeline, the
+database oid, the postmaster's start time, the server address and port, recovery state, version), and the write
+reads it again on its own connection: any difference, or a standby, refuses. No superuser is needed.
 
 **Migration authority (every write).** Checked in ``pg_catalog`` on the open connection, never taken from a
 flag. The connected role must own ``feature_eligibility_changes`` or be a member of its owner role, and must be
@@ -97,7 +128,16 @@ the feature id exists, its name is the recorded name, its flag equals X's record
 change set that is still in effect changed it. If any row diverges the whole rollback is refused and the
 divergent rows are reported; nothing is partly restored. A set can be rolled back once, a rollback set cannot
 itself be rolled back (apply again instead), and the rollback is recorded as its own change set
-(``action = 'rollback'``, ``rolls_back = X``). The prerequisite gate does not apply to a rollback.
+(``action = 'rollback'``, ``rolls_back = X``).
+
+**Rollback authorization (#1383).** A rollback is a write, so it needs an approved receipt as an apply does:
+``--rollback X`` (a dry run) prints a rollback receipt with the rows it would restore, the backend it read them on,
+the change set the rollback will record, the host, its boot id and the time; ``--rollback X --apply`` takes that
+file and its sha256. Before connecting it refuses a receipt for another set, another host, boot or database
+target, one older than 30 minutes or one that records a refusal; inside the write transaction the backend must
+be the receipt's, its change set unused, and the rows the rollback locks and restores exactly its rows. It never
+consults the deployed-code evidence or the prerequisite gate: an emergency rollback restores the flags that were
+in place before, whatever is deployed, so it works while the forward prerequisites fail.
 
 **Bounded waits and blockers.** Every run sets ``lock_timeout`` (``--lock-timeout``, default 5 s) and
 ``statement_timeout`` (``--statement-timeout``, default 60 s) for its transaction. Before a write takes any lock,
@@ -111,6 +151,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fcntl
 import hashlib
 import json
 import os
@@ -120,10 +161,11 @@ import socket
 import subprocess  # nosec B404 - fixed argv to systemctl and git, no shell
 import sys
 import uuid
-from dataclasses import dataclass, replace
+from contextlib import AbstractContextManager, ExitStack, contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Iterator, Optional, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
@@ -170,17 +212,32 @@ PLAN = Plan(
 
 @dataclass(frozen=True)
 class Prerequisite:
+    """A module-level string literal every deployed tree must declare."""
+
     path: str
     constant: str
     expected: str
     provided_by: str
 
 
+@dataclass(frozen=True)
+class AncestorPrerequisite:
+    """A merged change every deployed tree's HEAD must contain (``git merge-base --is-ancestor``)."""
+
+    name: str
+    commit: str
+    provided_by: str
+
+
 PREREQUISITES = (
-    Prerequisite("oracle/engine.py", "SIGNAL_POLARITY_RULE", "oracle-signal-polarity-v1",
-                 "the Oracle polarity fix (branch claude/fp-oracle-polarity-20261122)"),
     Prerequisite("scripts/auto_regime.py", "REGIME_HYSTERESIS_RULE", "auto-regime-own-bindings-hysteresis-v1",
                  "auto_regime's own declared bindings plus hysteresis (#1307)"),
+)
+# The Oracle polarity fix landed as #1350 without a contract literal, so it is bound to its merge commit: a tree
+# whose HEAD contains it carries the fix (stronger than a literal someone could add without the code).
+ANCESTOR_PREREQUISITES = (
+    AncestorPrerequisite("oracle_feature_polarity", "9d777445a23eb90b92b6cab812aece7b9bcf99c8",
+                         "the Oracle feature-polarity fix, #1350 (merge commit 9d777445, 2026-11-22)"),
 )
 
 # Units whose code reads model_eligible (directly or through the Oracle, inference, discovery or auto_regime).
@@ -238,14 +295,17 @@ def read_string_constant(path: Path, name: str) -> tuple[Optional[str], Optional
 UnitShow = Callable[[str], Optional[dict[str, str]]]
 
 # What systemctl is asked for each inventory unit.
-UNIT_PROPERTIES = ("LoadState", "ActiveState", "SubState", "MainPID", "WorkingDirectory", "NeedDaemonReload")
+UNIT_PROPERTIES = ("LoadState", "ActiveState", "SubState", "MainPID", "WorkingDirectory", "NeedDaemonReload",
+                   "ExecStart")
 # A unit in one of these states runs no process: its evidence is its configuration only (see the docstring).
 STOPPED_STATES = ("inactive", "failed")
 RELEASES_SUFFIX = ".releases"  # <live_path>.releases/<sha>/, scripts/deploy_release_swap.sh
 SHA_HEX = re.compile(r"[0-9a-f]{40}")
 
 RECEIPT_KIND = "grid-eligibility-apply-receipt"
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2               # 2 (#1383): backend identity, change set, entrypoints, restart receipts, locks
+ROLLBACK_RECEIPT_KIND = "grid-eligibility-rollback-receipt"
+ROLLBACK_RECEIPT_VERSION = 1
 RECEIPT_MAX_AGE_S = 1800          # an apply refuses a receipt older than 30 minutes
 RECEIPT_MAX_FUTURE_S = 60         # ... or one stamped more than a minute ahead of this host's clock
 RECEIPT_MAX_BYTES = 1 << 20
@@ -285,6 +345,42 @@ def boot_id() -> str:
         return fh.read().strip()
 
 
+def proc_cmdline(pid: int) -> list[str]:
+    """The argv a process was started with (``/proc/<pid>/cmdline``). Raises OSError."""
+    with open(f"/proc/{pid}/cmdline", "rb") as fh:
+        raw = fh.read()
+    parts = raw.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    return [part.decode("utf-8", "replace") for part in parts]
+
+
+# The only environment entries ever kept from a process: the rest of its environment may hold secrets.
+PYTHON_ENV_KEYS = ("PYTHONPATH", "PYTHONSAFEPATH")
+
+
+def proc_python_env(pid: int) -> dict[str, str]:
+    """``PYTHON_ENV_KEYS`` of a process's environment, and nothing else. Raises OSError."""
+    with open(f"/proc/{pid}/environ", "rb") as fh:
+        raw = fh.read()
+    found: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        key, sep, value = entry.partition(b"=")
+        name = key.decode("ascii", "replace")
+        if sep and name in PYTHON_ENV_KEYS:
+            found[name] = value.decode("utf-8", "replace")
+    return found
+
+
+def proc_clock(ticks: str) -> datetime:
+    """The wall-clock start of a process from its ``/proc/<pid>/stat`` start time (clock ticks since boot)."""
+    with open("/proc/stat", encoding="ascii") as fh:
+        btime = next((int(line.split()[1]) for line in fh if line.startswith("btime ")), None)
+    if btime is None:
+        raise OSError("/proc/stat has no btime line")
+    return datetime.fromtimestamp(btime + int(ticks) / os.sysconf("SC_CLK_TCK"), tz=timezone.utc)
+
+
 def git_identity(tree: Path) -> dict[str, Any]:
     """HEAD, its tree and whether tracked files match it, read without writing (no index refresh, no locks)."""
     exe = shutil.which("git")
@@ -305,13 +401,82 @@ def git_identity(tree: Path) -> dict[str, Any]:
     return {"toplevel": lines[0], "head": lines[1], "head_tree": lines[2], "clean": diff.returncode == 0}
 
 
+def _git_exe() -> str:
+    exe = shutil.which("git")
+    if exe is None:
+        raise RuntimeError("git is not installed on this host")
+    return exe
+
+
+def git_is_ancestor(tree: Path, commit: str) -> bool:
+    """Whether ``commit`` is in the history of ``tree``'s HEAD. RuntimeError when git cannot tell (an unknown
+    commit: the tree predates it, or its history is missing)."""
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+    proc = subprocess.run(  # nosec B603 - fixed argv, no shell
+        [_git_exe(), "-C", str(tree), "--no-optional-locks", "merge-base", "--is-ancestor", commit, "HEAD"],
+        capture_output=True, text=True, timeout=60, check=False, env=env)
+    if proc.returncode in (0, 1):
+        return proc.returncode == 0
+    raise RuntimeError(f"git merge-base --is-ancestor exited {proc.returncode}: {proc.stderr.strip()}")
+
+
+REFLOG_TIME = re.compile(r"HEAD@\{(\d+)\}")
+
+
+def git_code_changed_at(tree: Path) -> datetime:
+    """When the code in ``tree`` last changed on disk: the newest mtime of its tracked files, or the time of
+    HEAD's last reflog entry (a checkout or reset) when that is later. Read-only: no index refresh, no locks.
+
+    Directory mtimes are not used: Python creates ``__pycache__`` inside package directories at import time.
+    """
+    exe = _git_exe()
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+    listed = subprocess.run(  # nosec B603 - fixed argv, no shell
+        [exe, "-C", str(tree), "--no-optional-locks", "ls-files", "-z"],
+        capture_output=True, text=True, timeout=60, check=False, env=env)
+    if listed.returncode != 0:
+        raise RuntimeError(f"git ls-files in {tree} exited {listed.returncode}: {listed.stderr.strip()}")
+    newest = 0.0
+    for rel in listed.stdout.split("\0"):
+        if not rel:
+            continue
+        try:
+            newest = max(newest, os.lstat(tree / rel).st_mtime)
+        except FileNotFoundError:
+            continue  # a deleted tracked file makes the tree dirty, which is refused on its own
+    reflog = subprocess.run(  # nosec B603 - fixed argv, no shell
+        [exe, "-C", str(tree), "--no-optional-locks", "reflog", "-1", "--date=unix", "--format=%gd", "HEAD"],
+        capture_output=True, text=True, timeout=30, check=False, env=env)
+    moved = REFLOG_TIME.fullmatch(reflog.stdout.strip()) if reflog.returncode == 0 else None
+    if moved:
+        newest = max(newest, float(moved.group(1)))
+    if newest == 0.0:
+        raise RuntimeError(f"{tree} has no tracked file and no reflog to date its code")
+    return datetime.fromtimestamp(newest, tz=timezone.utc)
+
+
+@contextmanager
+def flock_deploy_lock(path: Path) -> Iterator[None]:
+    """Hold the deploy's own lock (``<live_path>.releases/.lock``, ``scripts/deploy_release_swap.sh``) exclusively,
+    without waiting: BlockingIOError while a deploy holds it. Opened read-only; nothing is written to the host."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
 class Probes:
-    """Every read of the host the evidence makes; tests replace them."""
+    """Every read of the host the evidence makes, and the deploy lock an apply holds; tests replace them."""
 
     show: UnitShow
     readlink: Callable[[int], str]
@@ -320,11 +485,19 @@ class Probes:
     host: Callable[[], str]
     boot_id: Callable[[], str]
     now: Callable[[], datetime]
+    cmdline: Callable[[int], list[str]]
+    python_env: Callable[[int], dict[str, str]]
+    clock: Callable[[str], datetime]
+    code_changed_at: Callable[[Path], datetime]
+    is_ancestor: Callable[[Path, str], bool]
+    deploy_lock: Callable[[Path], AbstractContextManager[Any]]
 
 
 def default_probes() -> Probes:
     return Probes(show=systemctl_show, readlink=proc_cwd, pid_start=proc_start, git=git_identity,
-                  host=socket.gethostname, boot_id=boot_id, now=_utc_now)
+                  host=socket.gethostname, boot_id=boot_id, now=_utc_now, cmdline=proc_cmdline,
+                  python_env=proc_python_env, clock=proc_clock, code_changed_at=git_code_changed_at,
+                  is_ancestor=git_is_ancestor, deploy_lock=flock_deploy_lock)
 
 
 def _resolved(path: str) -> Optional[str]:
@@ -334,11 +507,103 @@ def _resolved(path: str) -> Optional[str]:
         return None
 
 
+def _inside(path: str, tree: str) -> bool:
+    child, root = Path(path), Path(tree)
+    return child == root or root in child.parents
+
+
+# ── code identity: what a unit's process was started to run (#1383) ─────────────────────────────────────────
+# A process's cwd is not proof of its code: an absolute script path, a module found elsewhere on sys.path, or a
+# PYTHONPATH entry can load code from another tree. So the command line itself is bound. Only the launch shapes
+# grid-svr uses are modelled (2026-11-24: ``python -m <module>``, ``python -m uvicorn <module>:app ...`` and
+# ``python scripts/<file>.py ...``, venv interpreter, no PYTHONPATH); anything else refuses.
+INTERPRETER_NAME = re.compile(r"python(\d+(\.\d+)*)?")
+INTERPRETER_FLAGS = frozenset({"-u", "-B"})        # any other option can change what is imported, or is unknown
+APP_LAUNCHERS = frozenset({"uvicorn"})             # library launchers whose first argument names the GRID module
+LAUNCHER_REFUSED = frozenset({"--app-dir", "--reload", "--reload-dir"})
+MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+EXEC_ARGV = re.compile(r"argv\[\]=(.*?) ;")
+
+
+def parse_exec_start(raw: Optional[str]) -> tuple[Optional[list[str]], Optional[str]]:
+    """The argv of a unit's single ExecStart, from ``systemctl show``. (argv, problem)."""
+    found = EXEC_ARGV.findall(raw or "")
+    if len(found) != 1:
+        return None, f"has {len(found)} ExecStart command lines, not one, so its entrypoint cannot be bound"
+    return found[0].split(), None
+
+
+def entrypoint(argv: Optional[Sequence[str]], tree: Optional[str],
+               env: Optional[dict[str, str]] = None) -> tuple[dict[str, Any], list[str]]:
+    """What ``argv`` runs when started in ``tree``: (record, problems). ``env`` is the process's PYTHON_ENV_KEYS
+    (None for a configuration, whose environment is not read: EnvironmentFile holds secrets)."""
+    record: dict[str, Any] = {"argv": None if argv is None else list(argv), "interpreter": None, "kind": None,
+                              "entry": None, "entry_file": None, "python_env": None if env is None else dict(env)}
+    if argv is None or tree is None:
+        return record, []           # the missing command line or tree is reported on its own
+    if not argv:
+        return record, ["has an empty command line"]
+    if not INTERPRETER_NAME.fullmatch(Path(argv[0]).name):
+        return record, [f"is launched by {argv[0]}, not a python interpreter, so its entrypoint cannot be bound"]
+    record["interpreter"] = argv[0]
+    i = 1
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-m":
+        if argv[i] not in INTERPRETER_FLAGS:
+            return record, [f"runs python with {argv[i]}, which this check does not model (only "
+                            f"{', '.join(sorted(INTERPRETER_FLAGS))} are accepted)"]
+        i += 1
+    if i >= len(argv) or (argv[i] == "-m" and i + 1 >= len(argv)):
+        return record, ["names no script or module"]
+    root = Path(tree)
+    if argv[i] == "-m":
+        module, rest = argv[i + 1], list(argv[i + 2:])
+        if module in APP_LAUNCHERS:
+            if not rest or rest[0].startswith("-"):
+                return record, [f"runs {module} without its app as the first argument"]
+            refused = [a for a in rest if a.split("=", 1)[0] in LAUNCHER_REFUSED]
+            if refused:
+                return record, [f"runs {module} with {refused[0]}, which loads code from outside its working "
+                                "directory or reloads it"]
+            kind, entry = "app", rest[0].split(":", 1)[0]
+        else:
+            kind, entry = "module", module
+        if not MODULE_NAME.fullmatch(entry):
+            return record, [f"names {entry!r}, which is not a module name"]
+        base = root.joinpath(*entry.split("."))
+        candidates = (base.with_suffix(".py"), base / ("__main__.py" if kind == "module" else "__init__.py"))
+        found = next((c for c in candidates if c.is_file()), None)
+        record.update(kind=kind, entry=entry)
+        if found is None:
+            return record, [f"runs {kind} {entry}, which is not a file in {tree}, so python would import it "
+                            "from somewhere else on sys.path"]
+    else:
+        script = Path(argv[i])
+        found = script if script.is_absolute() else root / script
+        record.update(kind="script", entry=argv[i])
+        if not found.is_file():
+            return record, [f"runs {argv[i]}, which is not a file under {tree}"]
+    resolved = _resolved(str(found))
+    record["entry_file"] = resolved
+    if resolved is None or not _inside(resolved, tree):
+        return record, [f"runs {record['entry']}, which resolves to {resolved}, outside its tree {tree}"]
+    problems: list[str] = []
+    if env and env.get("PYTHONSAFEPATH"):
+        problems.append("sets PYTHONSAFEPATH, so its working directory is not on sys.path")
+    for entry_path in (env or {}).get("PYTHONPATH", "").split(os.pathsep):
+        if entry_path:
+            where = _resolved(entry_path if os.path.isabs(entry_path) else str(root / entry_path))
+            if where is None or not _inside(where, tree):
+                problems.append(f"has PYTHONPATH entry {entry_path} outside its tree {tree}, which can shadow "
+                                "its modules")
+    return record, problems
+
+
 def unit_evidence(unit: str, probes: Probes) -> tuple[Optional[dict[str, Any]], list[str]]:
     """What runs ``unit`` and from where. Returns (record, problems); a None record means no systemctl."""
     record: dict[str, Any] = dict.fromkeys(
         ("load_state", "active_state", "sub_state", "main_pid", "process_start", "need_daemon_reload",
-         "working_directory", "working_directory_resolved", "process_cwd", "evidence", "tree"))
+         "working_directory", "working_directory_resolved", "process_cwd", "evidence", "tree", "entrypoint",
+         "process_entrypoint", "process_started_at", "restart_receipt"))
     try:
         props = probes.show(unit)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -367,6 +632,11 @@ def unit_evidence(unit: str, probes: Probes) -> tuple[Optional[dict[str, Any]], 
     record["working_directory_resolved"] = _resolved(configured)
     if record["working_directory_resolved"] is None:
         problems.append(f"{unit}'s WorkingDirectory {configured} does not resolve to an existing directory")
+    configured_argv, argv_problem = parse_exec_start(props.get("ExecStart"))
+    if argv_problem:
+        problems.append(f"{unit} {argv_problem}")
+    record["entrypoint"], entry_problems = entrypoint(configured_argv, record["working_directory_resolved"])
+    problems += [f"{unit}'s ExecStart {p}" for p in entry_problems]
     if state in STOPPED_STATES:
         if main_pid != 0:
             problems.append(f"{unit} is {state} but systemd reports MainPID {main_pid}")
@@ -380,13 +650,17 @@ def unit_evidence(unit: str, probes: Probes) -> tuple[Optional[dict[str, Any]], 
     try:
         start = probes.pid_start(main_pid)
         link = probes.readlink(main_pid)
+        argv = probes.cmdline(main_pid)
+        env = probes.python_env(main_pid)
         start_after = probes.pid_start(main_pid)
-    except OSError as exc:
+        started_at = probes.clock(start)
+    except (OSError, ValueError) as exc:
         return record, problems + [f"cannot read {unit}'s running process (PID {main_pid}): "
-                                   f"{exc.strerror or exc}; run as the user the GRID units run as"]
+                                   f"{getattr(exc, 'strerror', None) or exc}; run as the user the GRID units run as"]
     record["process_start"] = start
     if start_after != start:
         return record, problems + [f"{unit}'s PID {main_pid} changed while it was read; re-run"]
+    record["process_started_at"] = started_at.astimezone(timezone.utc).isoformat()
     if link.endswith(" (deleted)"):
         record["process_cwd"] = link
         return record, problems + [f"{unit}'s running process (PID {main_pid}) runs from a deleted directory {link}"]
@@ -396,13 +670,18 @@ def unit_evidence(unit: str, probes: Probes) -> tuple[Optional[dict[str, Any]], 
         problems.append(f"{unit}'s running process (PID {main_pid}) runs from {record['process_cwd']}, but its "
                         f"WorkingDirectory {configured} resolves to {record['working_directory_resolved']}; the "
                         "configuration is not what runs (restart the unit, or revert the repin)")
+    record["process_entrypoint"], entry_problems = entrypoint(argv, record["process_cwd"], env)
+    problems += [f"{unit}'s running process (PID {main_pid}) {p}" for p in entry_problems]
+    if configured_argv is not None and list(argv) != configured_argv:
+        problems.append(f"{unit}'s running process (PID {main_pid}) was started as {' '.join(argv)!r}, not its "
+                        f"ExecStart {' '.join(configured_argv)!r}; restart the unit")
     return record, problems
 
 
 def tree_evidence(tree: str, probes: Probes) -> tuple[dict[str, Any], list[str]]:
     """Exact code identity of ``tree`` plus the prerequisite literals it carries."""
     record: dict[str, Any] = {"toplevel": None, "head": None, "head_tree": None, "clean": None,
-                              "release_label": None, "prerequisites": {}}
+                              "release_label": None, "prerequisites": {}, "contains": {}, "code_changed_at": None}
     problems: list[str] = []
     path = Path(tree)
     if path.parent.name.endswith(RELEASES_SUFFIX):
@@ -429,6 +708,22 @@ def tree_evidence(tree: str, probes: Probes) -> tuple[dict[str, Any], list[str]]
             problem = f"{req.constant} in {path / req.path} is {found!r}, not {req.expected!r}"
         if problem is not None:
             problems.append(f"{problem} (needs {req.provided_by})")
+    for anc in ANCESTOR_PREREQUISITES:
+        try:
+            contained: Optional[bool] = probes.is_ancestor(path, anc.commit)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            contained = None
+            problems.append(f"cannot show that {tree}'s HEAD contains {anc.commit} ({exc}); the tree predates it "
+                            f"or its history is missing (needs {anc.provided_by})")
+        else:
+            if not contained:
+                problems.append(f"{tree}'s HEAD {record['head']} does not contain {anc.commit} "
+                                f"(needs {anc.provided_by})")
+        record["contains"][anc.name] = {"commit": anc.commit, "ancestor": contained}
+    try:
+        record["code_changed_at"] = probes.code_changed_at(path).astimezone(timezone.utc).isoformat()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        problems.append(f"cannot date the code in {tree}: {exc}")
     return record, problems
 
 
@@ -467,13 +762,42 @@ def collect_evidence(extra: Sequence[Path] = (), units: Sequence[str] = SERVICE_
         record, tree_problems = tree_evidence(tree, probes)
         tree_records[tree] = {"used_by": sorted(used_by), **record}
         problems += tree_problems
+    for unit, record in unit_records.items():
+        problems += restart_receipt(unit, record, tree_records.get(record.get("tree") or ""))
     try:
         host_boot = probes.boot_id()
     except OSError as exc:
         host_boot = None
         problems.append(f"cannot read this host's boot id: {exc}")
     return {"host": probes.host(), "boot_id": host_boot, "units": unit_records, "trees": tree_records,
-            "refusals": problems}
+            "deploy_locks": deploy_locks(tree_records), "refusals": problems}
+
+
+def restart_receipt(unit: str, record: dict[str, Any], tree: Optional[dict[str, Any]]) -> list[str]:
+    """For a running unit, whether its process started after the code in its tree last changed (#1383).
+
+    A process imports at start, so an in-place checkout or edit after it started leaves it running code that its
+    tree no longer holds, while the tree's HEAD and cleanliness say otherwise. Sets ``restart_receipt``."""
+    if record.get("evidence") != "running_process" or not record.get("process_started_at"):
+        return []
+    changed = (tree or {}).get("code_changed_at")
+    if changed is None:
+        return []                   # the tree's own problem is reported
+    started = record["process_started_at"]
+    after = datetime.fromisoformat(started) >= datetime.fromisoformat(changed)
+    record["restart_receipt"] = {"process_started_at": started, "code_changed_at": changed,
+                                 "started_after_code": after}
+    if after:
+        return []
+    return [f"{unit}'s running process (PID {record['main_pid']}) started at {started}, before the code in "
+            f"{record['tree']} last changed ({changed}); it may still run code loaded before that change "
+            "(restart the unit)"]
+
+
+def deploy_locks(trees: dict[str, Any]) -> list[str]:
+    """The deploy locks covering the evidenced release trees: ``<live_path>.releases/.lock``, which
+    ``scripts/deploy_release_swap.sh`` holds for its whole run (so a repin cannot land while it is held)."""
+    return sorted({str(Path(t).parent / ".lock") for t in trees if Path(t).parent.name.endswith(RELEASES_SUFFIX)})
 
 
 def check_prerequisites(roots: Sequence[tuple[str, Path]], problems: Sequence[str] = (),
@@ -522,19 +846,31 @@ def canonical(document: Any) -> bytes:
 
 
 def build_receipt(gate: dict[str, Any], planned: Optional[list[dict[str, Any]]], database: str,
+                  backend: Optional[dict[str, Any]] = None, change_set: Optional[str] = None,
                   plan: Plan = PLAN) -> dict[str, Any]:
     evidence = gate["evidence"]
     return {"kind": RECEIPT_KIND, "version": RECEIPT_VERSION, "plan": plan.name, "created_at": gate["checked_at"],
-            "max_age_seconds": RECEIPT_MAX_AGE_S, "database": database, "host": evidence["host"],
-            "boot_id": evidence["boot_id"], "units": evidence["units"], "trees": evidence["trees"],
+            "max_age_seconds": RECEIPT_MAX_AGE_S, "database": database, "backend": backend,
+            "change_set": change_set, "host": evidence["host"], "boot_id": evidence["boot_id"],
+            "units": evidence["units"], "trees": evidence["trees"], "deploy_locks": evidence["deploy_locks"],
             "refusals": evidence["refusals"], "planned_changes": planned}
 
 
+# Compared inside the write transaction, not against the host evidence: the planned rows (against the rows the
+# apply actually locks), the backend identity (read on the write's own connection) and the change set it records.
+IN_TRANSACTION_FIELDS = ("planned_changes", "backend", "change_set")
+
+
 def _identity(receipt: dict[str, Any]) -> dict[str, Any]:
-    """Every field an apply must find unchanged: all of it but when it was made, its refusals (the live ones are
-    reported on their own) and the planned rows (compared in the write transaction, against the rows the apply
-    actually locks)."""
-    return {k: v for k, v in receipt.items() if k not in ("created_at", "refusals", "planned_changes")}
+    """Every field an apply must find unchanged on the host: all of it but when it was made, its refusals (the
+    live ones are reported on their own) and the fields compared inside the write transaction."""
+    return {k: v for k, v in receipt.items() if k not in ("created_at", "refusals", *IN_TRANSACTION_FIELDS)}
+
+
+def evidence_drift(receipt: dict[str, Any], live: dict[str, Any], database: str, plan: Plan = PLAN) -> list[str]:
+    """Every host-evidence field of ``live`` (a gate) that differs from the approved ``receipt``, named."""
+    expected = _identity(build_receipt(live, None, database, plan=plan))
+    return [f"live evidence differs from the approved receipt: {d}" for d in divergences(_identity(receipt), expected)]
 
 
 def divergences(approved: Any, live: Any, path: str = "receipt") -> list[str]:
@@ -556,12 +892,12 @@ def _by_feature(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {str(r["feature_id"]): {k: r[k] for k in ("name", "old_eligible", "new_eligible")} for r in rows}
 
 
-def verify_receipt(path: Optional[Path], sha256_hex: Optional[str], live: dict[str, Any], database: str,
-                   now: datetime, plan: Plan = PLAN) -> tuple[Optional[dict[str, Any]], list[str]]:
-    """Check an approved receipt against the live gate. Returns (receipt, refusals); every divergence is named."""
+def _load_receipt(path: Optional[Path], sha256_hex: Optional[str], kind: str, version: int,
+                  how: str) -> tuple[Optional[dict[str, Any]], list[str]]:
+    """Read an approved receipt and check its bytes: sha256, canonical JSON, kind and version."""
     if path is None or sha256_hex is None:
-        return None, ["--apply needs --approved-receipt and --approved-receipt-sha256: run a dry run on this host, "
-                      "have the owner review its receipt, then apply with that file and its sha256"]
+        return None, [f"{how} needs --approved-receipt and --approved-receipt-sha256: run its dry run on this host "
+                      "with --receipt-out, have the owner review the receipt, then apply that file and its sha256"]
     wanted = sha256_hex.strip().lower()
     if not SHA256_HEX.fullmatch(wanted):
         return None, [f"--approved-receipt-sha256 {sha256_hex!r} is not a sha256 hex digest"]
@@ -581,28 +917,81 @@ def verify_receipt(path: Optional[Path], sha256_hex: Optional[str], live: dict[s
         return None, [f"the approved receipt {path} is not JSON: {exc}"]
     if not isinstance(receipt, dict) or canonical(receipt) != raw:
         return None, [f"the approved receipt {path} is not a canonical receipt (write it with --receipt-out)"]
-    if receipt.get("kind") != RECEIPT_KIND or receipt.get("version") != RECEIPT_VERSION:
-        return None, [f"{path} is not a version {RECEIPT_VERSION} {RECEIPT_KIND}"]
-    refusals: list[str] = []
-    if receipt.get("refusals"):
-        refusals.append(f"the approved receipt records {len(receipt['refusals'])} refusal(s); it cannot approve an "
-                        "apply")
-    if receipt.get("planned_changes") is None:
-        refusals.append("the approved receipt has no planned changes (its dry run did not read the database)")
+    if receipt.get("kind") != kind or receipt.get("version") != version:
+        return None, [f"{path} is not a version {version} {kind}"]
+    return receipt, []
+
+
+def _age_refusals(receipt: dict[str, Any], now: datetime) -> list[str]:
     try:
         created = datetime.strptime(str(receipt.get("created_at")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
-        refusals.append(f"the approved receipt's created_at {receipt.get('created_at')!r} is not a UTC timestamp")
-    else:
-        age = (now - created).total_seconds()
-        if age > RECEIPT_MAX_AGE_S:
-            refusals.append(f"the approved receipt is {int(age)} s old; an apply takes one at most "
-                            f"{RECEIPT_MAX_AGE_S} s old (run a new dry run)")
-        elif age < -RECEIPT_MAX_FUTURE_S:
-            refusals.append(f"the approved receipt is stamped {int(-age)} s ahead of this host's clock")
-    expected = _identity(build_receipt(live, receipt.get("planned_changes"), database, plan))
-    refusals += [f"live evidence differs from the approved receipt: {d}"
-                 for d in divergences(_identity(receipt), expected)]
+        return [f"the approved receipt's created_at {receipt.get('created_at')!r} is not a UTC timestamp"]
+    age = (now - created).total_seconds()
+    if age > RECEIPT_MAX_AGE_S:
+        return [f"the approved receipt is {int(age)} s old; an apply takes one at most {RECEIPT_MAX_AGE_S} s old "
+                "(run a new dry run)"]
+    if age < -RECEIPT_MAX_FUTURE_S:
+        return [f"the approved receipt is stamped {int(-age)} s ahead of this host's clock"]
+    return []
+
+
+def _approvable(receipt: dict[str, Any], now: datetime) -> list[str]:
+    """What every approved receipt must hold to approve a write: no refusals, planned rows, the backend it was
+    made on and the change set the write will record, within its age."""
+    refusals: list[str] = []
+    if receipt.get("refusals"):
+        refusals.append(f"the approved receipt records {len(receipt['refusals'])} refusal(s); it cannot approve a "
+                        "write")
+    if not isinstance(receipt.get("planned_changes"), list):
+        refusals.append("the approved receipt has no planned changes (its dry run did not read the database)")
+    if not isinstance(receipt.get("backend"), dict):
+        refusals.append("the approved receipt has no database backend identity (its dry run did not read the "
+                        "database)")
+    try:
+        uuid.UUID(str(receipt.get("change_set")))
+    except ValueError:
+        refusals.append(f"the approved receipt's change_set {receipt.get('change_set')!r} is not a uuid")
+    return refusals + _age_refusals(receipt, now)
+
+
+def verify_receipt(path: Optional[Path], sha256_hex: Optional[str], live: dict[str, Any], database: str,
+                   now: datetime, plan: Plan = PLAN) -> tuple[Optional[dict[str, Any]], list[str]]:
+    """Check an approved apply receipt against the live gate. Returns (receipt, refusals); every divergence is
+    named."""
+    receipt, refusals = _load_receipt(path, sha256_hex, RECEIPT_KIND, RECEIPT_VERSION, "--apply")
+    if receipt is None:
+        return None, refusals
+    return receipt, _approvable(receipt, now) + evidence_drift(receipt, live, database, plan)
+
+
+def build_rollback_receipt(rollback_of: uuid.UUID, report: dict[str, Any], database: str, host: str,
+                           host_boot: Optional[str], created_at: datetime, change_set: str) -> dict[str, Any]:
+    """The receipt a rollback dry run prints (#1383): the rows it would restore, the backend it read them on, the
+    change set the rollback will record, this host and the time. No deployed-code evidence: an emergency rollback
+    must not depend on the forward prerequisites."""
+    planned = report.get("changes") if report.get("status") == "dry_run" else None
+    return {"kind": ROLLBACK_RECEIPT_KIND, "version": ROLLBACK_RECEIPT_VERSION, "rollback_of": str(rollback_of),
+            "created_at": _stamp(created_at), "max_age_seconds": RECEIPT_MAX_AGE_S, "database": database,
+            "backend": report.get("backend"), "change_set": change_set, "host": host, "boot_id": host_boot,
+            "refusals": list(report.get("refusals") or []), "planned_changes": planned}
+
+
+def verify_rollback_receipt(path: Optional[Path], sha256_hex: Optional[str], rollback_of: uuid.UUID, host: str,
+                            host_boot: Optional[str], database: str,
+                            now: datetime) -> tuple[Optional[dict[str, Any]], list[str]]:
+    """Check an approved rollback receipt before any connection: its bytes, age, set, host and database target."""
+    receipt, refusals = _load_receipt(path, sha256_hex, ROLLBACK_RECEIPT_KIND, ROLLBACK_RECEIPT_VERSION,
+                                      "--rollback with --apply")
+    if receipt is None:
+        return None, refusals
+    refusals = _approvable(receipt, now)
+    if receipt.get("rollback_of") != str(rollback_of):
+        refusals.append(f"the approved receipt rolls back {receipt.get('rollback_of')}, not {rollback_of}")
+    for key, live in (("host", host), ("boot_id", host_boot), ("database", database)):
+        if receipt.get(key) != live:
+            refusals.append(f"live evidence differs from the approved receipt: receipt[{key!r}]: approved "
+                            f"{receipt.get(key)!r}, now {live!r}")
     return receipt, refusals
 
 
@@ -707,6 +1096,71 @@ def check_authority(conn: Connection, app_role: Optional[str] = None) -> dict[st
 # ── apply ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 TIMEOUTS_SQL = text("SELECT set_config('lock_timeout', :lock, true), set_config('statement_timeout', :stmt, true)")
+
+# ── database backend identity (#1383) ───────────────────────────────────────────────────────────────────────
+# A redacted DSN names a target, not a backend: after a DNS change or a failover the same URL reaches another
+# server. So the write reads the identity of the backend it is actually connected to, on its own connection, and
+# it must equal what the approved dry run read. system_identifier names the cluster (a streaming standby shares
+# it), so the timeline, the postmaster's start time and the server address tell a promoted standby or a
+# restarted server apart. pg_control_system() and pg_control_checkpoint() need no superuser (PG 15).
+BACKEND_SQL = text("""
+SELECT (SELECT system_identifier FROM pg_control_system())::text AS system_identifier,
+       (SELECT timeline_id FROM pg_control_checkpoint())::bigint AS timeline_id,
+       current_database()::text AS database_name,
+       (SELECT oid FROM pg_database WHERE datname = current_database())::bigint AS database_oid,
+       to_char(pg_postmaster_start_time() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+           AS postmaster_started_at,
+       host(inet_server_addr()) AS server_addr,
+       inet_server_port() AS server_port,
+       pg_is_in_recovery() AS in_recovery,
+       current_setting('server_version_num') AS server_version_num
+""")
+CHANGE_SET_USED_SQL = text("SELECT 1 FROM feature_eligibility_changes WHERE change_set = CAST(:change_set AS uuid) "
+                           "LIMIT 1")
+
+
+def backend_identity(conn: Connection) -> dict[str, Any]:
+    return dict(conn.execute(BACKEND_SQL).mappings().one())
+
+
+@dataclass(frozen=True)
+class Approval:
+    """What the owner approved, checked inside the write transaction (#1383): the rows, the backend the dry run
+    read them on, and the change set the write records (so one receipt writes once)."""
+
+    changes: tuple[dict[str, Any], ...]
+    backend: dict[str, Any]
+    change_set: uuid.UUID
+
+    @classmethod
+    def from_receipt(cls, receipt: dict[str, Any]) -> Approval:
+        return cls(changes=tuple(receipt["planned_changes"]), backend=dict(receipt["backend"]),
+                   change_set=uuid.UUID(str(receipt["change_set"])))
+
+
+@dataclass(frozen=True)
+class WriteBoundary:
+    """What an apply holds and re-checks at its write (#1383). ``hold`` is entered before the flags change and
+    released only after the commit; ``recheck`` runs after the change and before the commit and returns refusals."""
+
+    hold: Callable[[], AbstractContextManager[Any]]
+    recheck: Callable[[], list[str]]
+    locks: tuple[str, ...] = field(default=())
+
+
+@contextmanager
+def hold_deploy_locks(paths: Sequence[str], lock: Callable[[Path], AbstractContextManager[Any]]) -> Iterator[None]:
+    """Hold every deploy lock in ``paths`` (sorted, never waiting). A busy or missing lock refuses."""
+    with ExitStack() as stack:
+        for path in sorted(paths):
+            try:
+                stack.enter_context(lock(Path(path)))
+            except BlockingIOError:
+                raise Refused([f"a deploy holds {path}; nothing was written; retry when it finishes"]) from None
+            except OSError as exc:
+                raise Refused([f"cannot take the deploy lock {path}: {exc.strerror or exc}; nothing was "
+                               "written"]) from None
+        yield
 
 # ── bounded waits and blockers ──────────────────────────────────────────────────────────────────────────────
 # Every run sets lock_timeout and statement_timeout for its own transaction (TIMEOUTS_SQL), so no wait is
@@ -884,8 +1338,13 @@ def plan_rollback(conn: Connection, target: uuid.UUID, *, lock: bool) -> list[di
              "new_eligible": r["old_eligible"]} for r in rows]
 
 
-def apply_rollback(conn: Connection, target: uuid.UUID, change_set: uuid.UUID) -> list[dict[str, Any]]:
+def apply_rollback(conn: Connection, target: uuid.UUID, change_set: uuid.UUID,
+                   approved: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     expected = plan_rollback(conn, target, lock=True)
+    drift = divergences(_by_feature(approved), _by_feature(expected), "planned_changes")
+    if drift:
+        raise Refused(["the rows the rollback would restore differ from the approved receipt's; nothing was "
+                       "written (run a new rollback dry run)", *drift])
     restored = _rows(conn.execute(ROLLBACK_SQL, {"target": str(target), "change_set": str(change_set)}))
     recorded = _rows(conn.execute(SET_ROWS_SQL, {"change_set": str(change_set)}))
     if not (restored == recorded == expected):
@@ -900,12 +1359,14 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
         prerequisites: Optional[dict[str, Any]] = None, app_role: Optional[str] = None, plan: Plan = PLAN,
         lock_timeout: str = f"{LOCK_TIMEOUT_DEFAULT_S}s",
         statement_timeout: str = f"{STATEMENT_TIMEOUT_DEFAULT_S}s",
-        approved_changes: Optional[Sequence[dict[str, Any]]] = None) -> dict[str, Any]:
+        approval: Optional[Approval] = None, boundary: Optional[WriteBoundary] = None) -> dict[str, Any]:
     """One dry run, apply or rollback in one transaction.
 
-    ``prerequisites`` is ``deployed_prerequisites()``. An apply also needs ``approved_changes``, the planned rows of
-    the receipt the owner approved (``main`` verifies the receipt first); it refuses, writing nothing, unless the
-    rows it locks and changes are exactly those.
+    ``prerequisites`` is ``deployed_prerequisites()``. Every write needs ``approval``, from the receipt the owner
+    approved (``main`` verifies it first): inside the write transaction the backend must be the one its dry run
+    read, its change set must be unused, and the rows the write locks and changes must be exactly its rows. An
+    apply also needs ``boundary``: the deploy locks it holds from before the change until after the commit, and
+    the evidence re-check it runs right before the commit.
     """
     mode = ("rollback" if rollback_of else "apply") + ("" if write else "_dry_run")
     report: dict[str, Any] = {"mode": mode, "plan": plan.name, "writes_to_database": False, "refusals": []}
@@ -916,16 +1377,21 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
         if write and not prerequisites["ok"]:
             report.update(status="refused", refusals=list(prerequisites["refusals"]))
             return report  # refused before any connection is opened
-        if write and approved_changes is None:
-            raise ValueError("an apply needs the approved receipt's planned changes")
+        if write and boundary is None:
+            raise ValueError("an apply needs its write boundary (deploy locks and the evidence re-check)")
     else:
         report["rollback_of"] = str(rollback_of)
+    if write and approval is None:
+        raise ValueError("a write needs the approved receipt's approval")
     would_refuse = [] if rollback_of is not None else list(prerequisites["refusals"])
     try:
-        with engine.connect() as conn, conn.begin():
+        # Exit order: the transaction commits, the connection closes, then the deploy locks are released.
+        with ExitStack() as held, engine.connect() as conn, conn.begin():
             if not write:
                 conn.execute(text("SET TRANSACTION READ ONLY"))
             conn.execute(TIMEOUTS_SQL, {"lock": lock_timeout, "stmt": statement_timeout})
+            backend = backend_identity(conn)
+            report["backend"] = backend
             blockers = find_blockers(conn)
             report["blockers"] = blockers
             if blockers:
@@ -943,35 +1409,54 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
             would_refuse += authority["refusals"]
             if not authority["change_log_exists"]:
                 raise Refused(authority["refusals"])
+            if write:
+                assert approval is not None  # nosec B101 - checked above
+                if backend.get("in_recovery"):
+                    raise Refused(["the database is in recovery (a standby); nothing was written"])
+                drift = divergences(approval.backend, backend, "backend")
+                if drift:
+                    raise Refused(["the database backend is not the one the approved receipt was made on; nothing "
+                                   "was written (run a new dry run)", *drift])
+                if conn.execute(CHANGE_SET_USED_SQL, {"change_set": str(approval.change_set)}).first():
+                    raise Refused([f"change set {approval.change_set} is already recorded: an approved receipt "
+                                   "writes once (run a new dry run)"])
+                report["change_set"] = str(approval.change_set)
             if rollback_of is None:
                 if not write:
                     report.update(status="dry_run", changes=planned_changes(conn, plan))
                 else:
-                    approved = _by_feature(approved_changes or [])
+                    assert approval is not None and boundary is not None  # nosec B101 - checked above
+                    approved = _by_feature(approval.changes)
                     drift = divergences(approved, _by_feature(planned_changes(conn, plan)), "planned_changes")
                     if drift:
                         raise Refused(["the rows the plan would change differ from the approved receipt's; "
                                        "nothing was written (run a new dry run)", *drift])
-                    change_set = uuid.uuid4()
-                    changes = apply_plan(conn, change_set, plan)
+                    held.enter_context(boundary.hold())
+                    changes = apply_plan(conn, approval.change_set, plan)
                     drift = divergences(approved, _by_feature(changes), "planned_changes")
                     if drift:  # a row changed between the check and the locked update: roll the whole set back
                         raise Refused(["the rows changed while the apply ran; nothing was written", *drift])
+                    late = boundary.recheck()
+                    if late:
+                        raise Refused(["the write-boundary re-check found the deployed code changed after the "
+                                       "receipt was verified; nothing was written", *late])
+                    report["write_boundary"] = {"deploy_locks_held": list(boundary.locks), "rechecked": True}
                     if changes:
-                        report.update(status="applied", change_set=str(change_set), changes=changes,
-                                      writes_to_database=True)
+                        report.update(status="applied", changes=changes, writes_to_database=True)
                     else:
                         report.update(status="nothing_to_change", changes=[])
             else:
                 if not write:
                     report.update(status="dry_run", changes=plan_rollback(conn, rollback_of, lock=False))
                 else:
-                    change_set = uuid.uuid4()
-                    report.update(status="rolled_back", change_set=str(change_set),
-                                  changes=apply_rollback(conn, rollback_of, change_set), writes_to_database=True)
+                    assert approval is not None  # nosec B101 - checked above
+                    report.update(status="rolled_back",
+                                  changes=apply_rollback(conn, rollback_of, approval.change_set, approval.changes),
+                                  writes_to_database=True)
     except Refused as refused:
         report.update(status="refused", refusals=refused.reasons, **refused.details)
         report["writes_to_database"] = False
+        report.pop("change_set", None)
         return report
     except DBAPIError as exc:
         which = LOCK_WAIT_SQLSTATES.get(getattr(getattr(exc, "orig", None), "pgcode", None))
@@ -983,6 +1468,7 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
         report.update(status="refused", writes_to_database=False, blockers=blockers,
                       refusals=[f"a lock wait exceeded {which} {limit}; the transaction was rolled back and "
                                 "nothing was written; retry when the blocking sessions finish"])
+        report.pop("change_set", None)
         return report
     if not write:
         report["would_refuse"] = would_refuse
@@ -1010,6 +1496,36 @@ def _write_receipt(path: Path, body: bytes) -> None:
         fh.write(body)
 
 
+def _boot_or_none(probes: Probes) -> Optional[str]:
+    try:
+        return probes.boot_id()
+    except OSError:
+        return None
+
+
+def _refused_before_connecting(mode: str, refusals: list[str], database: str, approved: Optional[Path],
+                               **extra: Any) -> int:
+    report = {"mode": mode, "plan": PLAN.name, "status": "refused", "refusals": refusals,
+              "writes_to_database": False, **extra,
+              "approved_receipt": None if approved is None else str(approved), "database": database}
+    print(json.dumps(report, indent=2, default=str))
+    return 2
+
+
+def write_boundary(receipt: dict[str, Any], code_roots: Sequence[Path], database: str,
+                   probes: Probes) -> WriteBoundary:
+    """The apply's write boundary for ``receipt``: hold its deploy locks, then collect the evidence again and
+    compare it with the receipt (and its age) right before the commit."""
+    locks = tuple(receipt.get("deploy_locks") or ())
+
+    def recheck() -> list[str]:
+        live = deployed_prerequisites(code_roots, probes=probes)
+        return list(live["refusals"]) + evidence_drift(receipt, live, database) + _age_refusals(receipt,
+                                                                                                probes.now())
+
+    return WriteBoundary(hold=lambda: hold_deploy_locks(locks, probes.deploy_lock), recheck=recheck, locks=locks)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="write (default: dry run); with --rollback, roll back")
@@ -1017,7 +1533,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--code-root", type=Path, action="append", default=[],
                     help="another deployed code tree the prerequisite gate must also find (repeatable)")
     ap.add_argument("--receipt-out", type=Path, metavar="FILE",
-                    help="dry run of the plan: also save the receipt's canonical bytes to this new file")
+                    help="dry run (of the plan or of --rollback): also save the receipt's canonical bytes to this "
+                         "new file")
     ap.add_argument("--approved-receipt", type=Path, metavar="FILE", help="--apply: the receipt the owner approved")
     ap.add_argument("--approved-receipt-sha256", metavar="HEX", help="--apply: the sha256 the owner approved")
     ap.add_argument("--lock-timeout", type=_bounded_seconds(1, 60), default=LOCK_TIMEOUT_DEFAULT_S,
@@ -1028,11 +1545,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help=f"environment variable holding the database URL (default {DB_URL_ENV}); "
                          "unset falls back to config.settings.DB_URL")
     args = ap.parse_args(argv)
-    applying_plan = args.apply and args.rollback is None
-    if args.receipt_out and (args.apply or args.rollback):
-        ap.error("--receipt-out belongs to a dry run of the plan")
-    if (args.approved_receipt or args.approved_receipt_sha256) and not applying_plan:
-        ap.error("--approved-receipt and --approved-receipt-sha256 belong to --apply of the plan")
+    if args.receipt_out and args.apply:
+        ap.error("--receipt-out belongs to a dry run")
+    if (args.approved_receipt or args.approved_receipt_sha256) and not args.apply:
+        ap.error("--approved-receipt and --approved-receipt-sha256 belong to --apply")
+    if args.rollback and args.code_root:
+        ap.error("--code-root belongs to the plan: a rollback does not check the deployed code")
 
     db_url = os.environ.get(args.db_url_env)
     if not db_url:
@@ -1044,37 +1562,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     database = _redacted(db_url)
     timeouts = {"lock_timeout": f"{args.lock_timeout}s", "statement_timeout": f"{args.statement_timeout}s"}
     probes = default_probes()
-    gate = None if args.rollback else deployed_prerequisites(args.code_root, probes=probes)
+    if args.rollback:
+        return _main_rollback(args, db_url, database, timeouts, probes, create_engine)
+
+    gate = deployed_prerequisites(args.code_root, probes=probes)
     receipt = None
-    if applying_plan:
+    if args.apply:
         receipt, receipt_refusals = verify_receipt(args.approved_receipt, args.approved_receipt_sha256, gate,
                                                    database, probes.now())
         refusals = list(gate["refusals"]) + receipt_refusals
         if refusals:  # refused before any connection is opened
-            report = {"mode": "apply", "plan": PLAN.name, "status": "refused", "refusals": refusals,
-                      "writes_to_database": False, "prerequisites": gate,
-                      "approved_receipt": None if args.approved_receipt is None else str(args.approved_receipt)}
-            report["database"] = database
-            print(json.dumps(report, indent=2, default=str))
-            return 2
+            return _refused_before_connecting("apply", refusals, database, args.approved_receipt, prerequisites=gate)
     engine = create_engine(db_url, pool_pre_ping=True)
     try:
-        report = run(engine, write=args.apply, rollback_of=args.rollback, prerequisites=gate,
-                     approved_changes=None if receipt is None else receipt["planned_changes"], **timeouts)
+        if receipt is not None:
+            report = run(engine, write=True, prerequisites=gate, approval=Approval.from_receipt(receipt),
+                         boundary=write_boundary(receipt, args.code_root, database, probes), **timeouts)
+        else:
+            report = run(engine, write=False, prerequisites=gate, **timeouts)
     finally:
         engine.dispose()
     report["database"] = database
     if receipt is not None:
         report.update(approved_receipt=str(args.approved_receipt),
                       approved_receipt_sha256=args.approved_receipt_sha256.strip().lower())
-    if gate is not None and not args.apply:
+    else:
         planned = report.get("changes") if report.get("status") == "dry_run" else None
-        new_receipt = build_receipt(gate, planned, database)
-        body = canonical(new_receipt)
-        report.update(receipt=new_receipt, receipt_sha256=hashlib.sha256(body).hexdigest())
-        if args.receipt_out:
-            _write_receipt(args.receipt_out, body)
-            report["receipt_file"] = str(args.receipt_out)
+        new_receipt = build_receipt(gate, planned, database, backend=report.get("backend"),
+                                    change_set=str(uuid.uuid4()))
+        _emit_receipt(report, new_receipt, args.receipt_out)
+    print(json.dumps(report, indent=2, default=str))
+    return 2 if report["status"] == "refused" else 0
+
+
+def _emit_receipt(report: dict[str, Any], receipt: dict[str, Any], out: Optional[Path]) -> None:
+    body = canonical(receipt)
+    report.update(receipt=receipt, receipt_sha256=hashlib.sha256(body).hexdigest())
+    if out:
+        _write_receipt(out, body)
+        report["receipt_file"] = str(out)
+
+
+def _main_rollback(args: argparse.Namespace, db_url: str, database: str, timeouts: dict[str, str], probes: Probes,
+                   create_engine: Callable[..., Engine]) -> int:
+    """``--rollback``: a dry run prints the rollback receipt; ``--apply`` writes exactly an approved one (#1383).
+
+    The deployed-code evidence and the prerequisite gate are never consulted: an emergency rollback restores the
+    flags that were in place before, whatever is deployed. What binds it is the owner's approval of the exact
+    rows, on the exact backend, under the change set the receipt names, within 30 minutes, on this host."""
+    host, host_boot = probes.host(), _boot_or_none(probes)
+    receipt = None
+    if args.apply:
+        receipt, refusals = verify_rollback_receipt(args.approved_receipt, args.approved_receipt_sha256,
+                                                    args.rollback, host, host_boot, database, probes.now())
+        if refusals:
+            return _refused_before_connecting("rollback", refusals, database, args.approved_receipt,
+                                              rollback_of=str(args.rollback))
+    engine = create_engine(db_url, pool_pre_ping=True)
+    try:
+        report = run(engine, write=args.apply, rollback_of=args.rollback,
+                     approval=None if receipt is None else Approval.from_receipt(receipt), **timeouts)
+    finally:
+        engine.dispose()
+    report["database"] = database
+    if receipt is not None:
+        report.update(approved_receipt=str(args.approved_receipt),
+                      approved_receipt_sha256=args.approved_receipt_sha256.strip().lower())
+    else:
+        _emit_receipt(report, build_rollback_receipt(args.rollback, report, database, host, host_boot, probes.now(),
+                                                     str(uuid.uuid4())), args.receipt_out)
     print(json.dumps(report, indent=2, default=str))
     return 2 if report["status"] == "refused" else 0
 

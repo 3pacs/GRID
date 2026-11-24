@@ -15,11 +15,17 @@ step that fails on any skip. It proves:
   is recorded, happens once, and is refused whole on any divergent row; the coordinator's case: rolling back a
   second set that left vix_spot alone leaves vix_spot enabled;
 * the log is append-only after a real apply, and downgrade refuses once an apply recorded a set;
-* blockers and bounded lock waits refuse before any write.
+* blockers and bounded lock waits refuse before any write;
+* the write boundary (#1383): an apply holds the deploy lock from before the change until after the commit and
+  re-checks the evidence right before the commit, so a repin or restart that lands after the first probe refuses
+  with nothing written; a busy deploy lock refuses; a different backend refuses; a receipt writes once;
+* rollback authorization (#1383): a rollback writes only an approved rollback receipt (its rows, its backend, its
+  change set), a changed backend or preview refuses, and it works while the forward prerequisites fail.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
 import json
@@ -173,15 +179,39 @@ def _planned(engine: Engine):
         return elig.planned_changes(conn)
 
 
-def _apply(engine: Engine, approved=None, **kw):
+# A write boundary with no deploy lock and nothing to re-check, for run() tests that are not about it.
+OPEN_BOUNDARY = elig.WriteBoundary(hold=contextlib.nullcontext, recheck=lambda: [])
+
+
+def _backend(engine: Engine) -> dict:
+    with engine.connect() as conn:
+        return elig.backend_identity(conn)
+
+
+def _approval(engine: Engine, changes, change_set: uuid.UUID | None = None) -> elig.Approval:
+    """What a dry run's receipt approves: these rows, on the backend the dry run read, under a new change set."""
+    return elig.Approval(changes=tuple(changes), backend=_backend(engine), change_set=change_set or uuid.uuid4())
+
+
+def _apply(engine: Engine, approved=None, boundary: elig.WriteBoundary = OPEN_BOUNDARY, **kw):
     """The owner's flow: the rows the plan would change are read first (what the dry run's receipt records), then
     the apply is given exactly those."""
-    return elig.run(engine, write=True, prerequisites=PASSING_GATE,
-                    approved_changes=_planned(engine) if approved is None else approved, **kw)
+    changes = _planned(engine) if approved is None else approved
+    return elig.run(engine, write=True, prerequisites=PASSING_GATE, approval=_approval(engine, changes),
+                    boundary=boundary, **kw)
 
 
 def _rollback(engine: Engine, change_set: str, *, write: bool = True):
-    return elig.run(engine, write=write, rollback_of=uuid.UUID(change_set))
+    """A rollback dry run's rows, then the write given exactly those (empty when the dry run refused)."""
+    target = uuid.UUID(change_set)
+    if not write:
+        return elig.run(engine, write=False, rollback_of=target)
+    with engine.connect() as conn:
+        try:
+            changes = elig.plan_rollback(conn, target, lock=False)
+        except elig.Refused:
+            changes = []
+    return elig.run(engine, write=True, rollback_of=target, approval=_approval(engine, changes))
 
 
 def _changes(report) -> list[tuple]:
@@ -244,7 +274,7 @@ def _no_systemd(tmp_path):
     return lambda: elig.Probes(**{**probes.__dict__, "show": lambda unit: None})
 
 
-def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkeypatch, capsys, tmp_path):
+def test_apply_refuses_today_because_1307_is_not_deployed(db, monkeypatch, capsys, tmp_path):
     _migrate(db.owner)
     before = _flags(db.admin)
     monkeypatch.setenv("ELIG_TEST_DB_URL", db.url(db.owner_role))
@@ -252,9 +282,8 @@ def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkey
     assert elig.main(["--apply", "--db-url-env", "ELIG_TEST_DB_URL"]) == 2
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "refused" and not report["writes_to_database"]
-    assert len(report["refusals"]) == 4         # no service inventory, neither constant, no approved receipt
+    assert len(report["refusals"]) == 3         # no service inventory, no #1307 constant, no approved receipt
     assert any("deployed service inventory cannot be checked" in r for r in report["refusals"])
-    assert any("SIGNAL_POLARITY_RULE" in r for r in report["refusals"])
     assert any("REGIME_HYSTERESIS_RULE" in r for r in report["refusals"])
     assert any("--apply needs --approved-receipt" in r for r in report["refusals"])
     assert "testpass" not in report["database"]
@@ -264,8 +293,8 @@ def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkey
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "dry_run" and report["authority"]["ok"]
     assert _changes(report) == FIRST_SET
-    assert len(report["would_refuse"]) == 3
-    assert len(report["receipt"]["refusals"]) == 3          # a receipt is printed for review, but cannot approve
+    assert len(report["would_refuse"]) == 2
+    assert len(report["receipt"]["refusals"]) == 2          # a receipt is printed for review, but cannot approve
     assert report["receipt_sha256"] == hashlib.sha256(elig.canonical(report["receipt"])).hexdigest()
     assert _flags(db.admin) == before and _log(db.admin) == []
 
@@ -290,6 +319,29 @@ def owner_flow(db, monkeypatch, capsys, tmp_path):
         return code, json.loads(capsys.readouterr().out)
 
     return fake, receipt_file, dry_run, apply
+
+
+@pytest.fixture()
+def rollback_flow(db, owner_flow, monkeypatch, capsys, tmp_path):
+    """--rollback as the owner runs it: a dry run saves a rollback receipt; --apply writes exactly that receipt."""
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    code, applied = apply(dry["receipt_sha256"])
+    assert code == 0 and applied["status"] == "applied"
+    counter = {"n": 0}
+
+    def rollback_dry_run(change_set: str):
+        counter["n"] += 1
+        out = tmp_path / f"rollback-{counter['n']}.json"
+        code = elig.main(["--rollback", change_set, "--receipt-out", str(out), "--db-url-env", "ELIG_TEST_DB_URL"])
+        return code, json.loads(capsys.readouterr().out), out
+
+    def rollback_apply(change_set: str, receipt_file, sha: str):
+        code = elig.main(["--rollback", change_set, "--apply", "--approved-receipt", str(receipt_file),
+                          "--approved-receipt-sha256", sha, "--db-url-env", "ELIG_TEST_DB_URL"])
+        return code, json.loads(capsys.readouterr().out)
+
+    return fake, applied["change_set"], rollback_dry_run, rollback_apply
 
 
 def test_the_owner_flow_dry_run_review_then_apply(db, owner_flow):
@@ -332,6 +384,196 @@ def test_the_0803z_repin_refuses_the_apply(db, owner_flow):
     assert any("runs from" in r and "the configuration is not what runs" in r for r in report["refusals"])
     assert any("['grid-scheduler.service']['working_directory']" in r for r in report["refusals"])
     assert _log(db.admin) == []
+
+
+def test_the_apply_holds_the_deploy_lock_from_before_the_change_until_after_the_commit(db, owner_flow):
+    from sqlalchemy import event
+
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    assert dry["receipt"]["deploy_locks"] == [fake.deploy_lock_path]
+    fake.lock_events.clear()
+    record = lambda conn: fake.lock_events.append(("commit", ""))   # noqa: E731
+    event.listen(Engine, "commit", record)
+    try:
+        code, report = apply(dry["receipt_sha256"])
+    finally:
+        event.remove(Engine, "commit", record)
+    assert code == 0 and report["status"] == "applied"
+    assert report["change_set"] == dry["receipt"]["change_set"]          # the receipt named the set it writes
+    assert report["write_boundary"] == {"deploy_locks_held": [fake.deploy_lock_path], "rechecked": True}
+    order = [kind for kind, _ in fake.lock_events]
+    assert order.index("lock") < order.index("commit") < order.index("unlock")
+
+
+@pytest.mark.parametrize("change, named", [
+    ("repin", "['grid-scheduler.service']['working_directory']"),
+    ("restart", "['grid-scheduler.service']['main_pid']"),
+    ("checkout", "['restart_receipt']['started_after_code']"),
+])
+def test_a_change_that_lands_after_the_first_probe_refuses_at_the_write_boundary(db, owner_flow, change, named):
+    """main() verified the receipt before connecting; this lands while the apply holds the deploy lock (a restart
+    or an in-place checkout needs no deploy), after the rows changed in the transaction and before the commit."""
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    before = _flags(db.admin)
+
+    def lands():
+        if change == "repin":
+            fake.units["grid-scheduler.service"]["WorkingDirectory"] = str(fake.current)
+        elif change == "restart":
+            fake.run("grid-scheduler.service", 7777, fake.pinned, fake.pinned)
+        else:
+            fake.code_at[str(fake.pinned)] = fake.now
+    fake.on_lock = lands
+    code, report = apply(dry["receipt_sha256"])
+    assert code == 2 and report["status"] == "refused" and not report["writes_to_database"]
+    assert report["refusals"][0] == ("the write-boundary re-check found the deployed code changed after the receipt "
+                                     "was verified; nothing was written")
+    assert any(named in r for r in report["refusals"][1:]), report["refusals"]
+    assert _flags(db.admin) == before and _log(db.admin) == []
+    assert [kind for kind, _ in fake.lock_events][-1] == "unlock"
+
+
+def test_a_deploy_holding_its_lock_refuses_the_apply(db, owner_flow):
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    fake.busy_locks.add(fake.deploy_lock_path)
+    before = _flags(db.admin)
+    code, report = apply(dry["receipt_sha256"])
+    assert code == 2 and report["refusals"] == [f"a deploy holds {fake.deploy_lock_path}; nothing was written; "
+                                                "retry when it finishes"]
+    assert _flags(db.admin) == before and _log(db.admin) == []
+
+
+def test_a_different_backend_behind_the_same_url_refuses_the_apply(db, owner_flow, monkeypatch):
+    """A failover or DNS change: the redacted DSN is the same, the backend the write is connected to is not."""
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    real = elig.backend_identity
+    monkeypatch.setattr(elig, "backend_identity", lambda conn: {**real(conn), "system_identifier": "1",
+                                                                "timeline_id": 2})
+    before = _flags(db.admin)
+    code, report = apply(dry["receipt_sha256"])
+    assert code == 2 and report["refusals"][0].startswith("the database backend is not the one the approved receipt")
+    assert any("backend['system_identifier']" in r for r in report["refusals"])
+    assert any("backend['timeline_id']: approved 1, now 2" in r for r in report["refusals"])
+    assert _flags(db.admin) == before and _log(db.admin) == []
+
+
+def test_a_receipt_writes_once(db, owner_flow):
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    assert apply(dry["receipt_sha256"])[0] == 0
+    after = _flags(db.admin)
+    code, report = apply(dry["receipt_sha256"])                # the same approved receipt, within its 30 minutes
+    assert code == 2 and report["refusals"] == [f"change set {dry['receipt']['change_set']} is already recorded: an "
+                                                "approved receipt writes once (run a new dry run)"]
+    assert _flags(db.admin) == after and len(_log(db.admin)) == 4
+
+
+def test_the_backend_identity_needs_no_superuser(db):
+    """pg_control_system() and pg_control_checkpoint() as the non-superuser migration authority."""
+    identity = _backend(db.owner)
+    assert identity["system_identifier"].isdigit() and identity["timeline_id"] >= 1
+    assert identity["database_oid"] > 0 and identity["in_recovery"] is False
+    assert identity["postmaster_started_at"].endswith("Z")
+    with db.owner.connect() as conn:
+        assert conn.execute(text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")).scalar_one() is False
+
+
+# ── rollback authorization (#1383) ──────────────────────────────────────────────────────────────────────────
+
+
+def test_a_rollback_writes_exactly_its_approved_receipt(db, rollback_flow):
+    fake, set_1, rollback_dry_run, rollback_apply = rollback_flow
+    applied = _flags(db.admin)
+    code, dry, receipt_file = rollback_dry_run(set_1)
+    assert code == 0 and dry["status"] == "dry_run"
+    receipt = dry["receipt"]
+    assert receipt["kind"] == elig.ROLLBACK_RECEIPT_KIND and receipt["rollback_of"] == set_1
+    assert receipt["refusals"] == [] and _changes({"changes": receipt["planned_changes"]}) == _swapped(FIRST_SET)
+    assert receipt["backend"] == _backend(db.owner) and "units" not in receipt and "trees" not in receipt
+    assert receipt_file.read_bytes() == elig.canonical(receipt) and _flags(db.admin) == applied
+
+    fake.now += timedelta(minutes=5)
+    code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
+    assert code == 0 and report["status"] == "rolled_back"
+    assert report["change_set"] == receipt["change_set"]
+    assert _set(db.admin, receipt["change_set"]) == _swapped(FIRST_SET)
+    assert _flags(db.admin) != applied and len(_log(db.admin)) == 8
+
+
+def test_a_rollback_without_an_approved_receipt_refuses_before_connecting(db, rollback_flow, capsys):
+    fake, set_1, rollback_dry_run, rollback_apply = rollback_flow
+    before = _flags(db.admin)
+    assert elig.main(["--rollback", set_1, "--apply", "--db-url-env", "ELIG_TEST_DB_URL"]) == 2
+    bare = json.loads(capsys.readouterr().out)
+    assert bare["mode"] == "rollback" and not bare["writes_to_database"]
+    assert bare["refusals"][0].startswith("--rollback with --apply needs --approved-receipt and "
+                                          "--approved-receipt-sha256")
+    code, dry, receipt_file = rollback_dry_run(set_1)
+    other = str(uuid.uuid4())
+    code, report = rollback_apply(other, receipt_file, dry["receipt_sha256"])   # a receipt for another set
+    assert code == 2 and f"the approved receipt rolls back {set_1}, not {other}" in report["refusals"]
+    fake.host = "laptop"
+    code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
+    assert code == 2 and any("receipt['host']: approved 'grid-svr', now 'laptop'" in r for r in report["refusals"])
+    fake.host, fake.now = "grid-svr", fake.now + timedelta(seconds=elig.RECEIPT_MAX_AGE_S + 1)
+    code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
+    assert code == 2 and "s old; an apply takes one at most" in report["refusals"][0]
+    assert _flags(db.admin) == before and len(_log(db.admin)) == 4
+
+
+def test_a_changed_backend_after_an_approved_rollback_plan_refuses(db, rollback_flow, monkeypatch):
+    fake, set_1, rollback_dry_run, rollback_apply = rollback_flow
+    code, dry, receipt_file = rollback_dry_run(set_1)
+    real = elig.backend_identity
+    monkeypatch.setattr(elig, "backend_identity", lambda conn: {**real(conn),
+                                                                "postmaster_started_at": "2099-01-01T00:00:00Z"})
+    before = _flags(db.admin)
+    code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
+    assert code == 2 and report["refusals"][0].startswith("the database backend is not the one the approved receipt")
+    assert _flags(db.admin) == before and len(_log(db.admin)) == 4
+
+
+def test_a_changed_preview_after_an_approved_rollback_plan_refuses(db, rollback_flow):
+    fake, set_1, rollback_dry_run, rollback_apply = rollback_flow
+    code, dry, receipt_file = rollback_dry_run(set_1)
+    _as_app(db, "UPDATE feature_registry SET model_eligible = FALSE WHERE name = 'vix_spot'")
+    before = _flags(db.admin)
+    code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
+    assert code == 2 and report["status"] == "refused" and [d["feature_id"] for d in report["divergent"]] == [11]
+    assert _flags(db.admin) == before and len(_log(db.admin)) == 4
+
+
+def test_a_rollback_whose_rows_differ_from_its_approval_refuses(db):
+    _migrate(db.owner)
+    set_1 = _apply(db.owner)["change_set"]
+    before = _flags(db.admin)
+    wrong = [{"feature_id": 11, "name": "vix_spot", "old_eligible": True, "new_eligible": False}]
+    report = elig.run(db.owner, write=True, rollback_of=uuid.UUID(set_1), approval=_approval(db.owner, wrong))
+    assert report["status"] == "refused"
+    assert report["refusals"][0] == ("the rows the rollback would restore differ from the approved receipt's; "
+                                     "nothing was written (run a new rollback dry run)")
+    assert _flags(db.admin) == before and len(_log(db.admin)) == 4
+
+
+def test_an_emergency_rollback_works_while_the_forward_prerequisites_fail(db, rollback_flow, capsys):
+    """The forward gate refuses on every count; the rollback consults none of it."""
+    fake, set_1, rollback_dry_run, rollback_apply = rollback_flow
+    for tree in (fake.current, fake.pinned):
+        (tree / elig.PREREQUISITES[0].path).write_text("import os\n")      # #1307's literal is gone
+        fake.ancestors[str(tree)] = False                                   # and #1350 is not deployed
+    fake.run("grid-scheduler.service", 7777, fake.current, fake.pinned)     # a unit runs another tree
+    assert elig.main(["--db-url-env", "ELIG_TEST_DB_URL"]) == 0
+    forward = json.loads(capsys.readouterr().out)
+    assert len(forward["would_refuse"]) >= 5
+    code, dry, receipt_file = rollback_dry_run(set_1)
+    assert code == 0 and dry["receipt"]["refusals"] == []
+    code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
+    assert code == 0 and report["status"] == "rolled_back"
+    assert _set(db.admin, report["change_set"]) == _swapped(FIRST_SET)
 
 
 def test_rows_that_changed_since_the_receipt_refuse_the_apply(db, owner_flow):
