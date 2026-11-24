@@ -341,7 +341,8 @@ export default function Dashboard({ onNavigate }) {
                 api.getStatus().catch(() => null),
                 api.getWatchlistPrices().catch(() => null),
             ]);
-            if (regime) setCurrentRegime(regime);
+            // api._fetch resolves failures to {error: true}; never store that as the regime.
+            if (regime && !regime.error) setCurrentRegime(regime);
             if (status) setSystemStatus(status);
             if (watchlistPriceResponse?.prices) setPulsePrices(watchlistPriceResponse.prices);
         } catch {
@@ -357,7 +358,8 @@ export default function Dashboard({ onNavigate }) {
                 api.getCurrent().catch(() => null),
                 api.getStatus().catch(() => null),
             ]);
-            if (regime) setCurrentRegime(regime);
+            // api._fetch resolves failures to {error: true}; never store that as the regime.
+            if (regime && !regime.error) setCurrentRegime(regime);
             if (status) setSystemStatus(status);
             setLoading('dashboard', false);
 
@@ -391,7 +393,8 @@ export default function Dashboard({ onNavigate }) {
     const dbOnline = systemStatus?.database?.connected;
     const allConnected = wsConnected && dbOnline;
     const regime = currentRegime;
-    const regimeState = regime?.state || 'NEUTRAL';
+    // No reading is not a NEUTRAL reading: say UNAVAILABLE, in the neutral colour.
+    const regimeState = (typeof regime?.state === 'string' && regime.state) || 'UNAVAILABLE';
     const regimeConf = regime?.confidence;
     const rc = REGIME_COLORS[regimeState.toUpperCase()] || REGIME_COLORS.NEUTRAL;
 

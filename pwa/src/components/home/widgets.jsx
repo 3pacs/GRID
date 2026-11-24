@@ -39,7 +39,14 @@ function ErrorState({ msg, onRetry }) {
     );
 }
 
-/** Data-fetching hook with a reload() for retry. */
+/**
+ * Data-fetching hook with a reload() for retry.
+ *
+ * api._fetch never rejects: a failed request resolves to {error: true, ...}.
+ * That object is truthy, so treating it as data made every card read a failure
+ * as an empty answer ("No stocks saved yet", "It's quiet", "Nothing notable
+ * moving"). A resolved error object is an error here, the same as a rejection.
+ */
 function useFetch(fn, deps) {
     const [state, setState] = useState({ loading: true, error: null, data: null });
     const [n, setN] = useState(0);
@@ -49,7 +56,14 @@ function useFetch(fn, deps) {
         setState({ loading: true, error: null, data: null });
         Promise.resolve()
             .then(fn)
-            .then((data) => { if (alive) setState({ loading: false, error: null, data }); })
+            .then((data) => {
+                if (!alive) return;
+                if (data && typeof data === 'object' && data.error === true) {
+                    setState({ loading: false, error: true, data: null });
+                } else {
+                    setState({ loading: false, error: null, data });
+                }
+            })
             .catch(() => { if (alive) setState({ loading: false, error: true, data: null }); });
         return () => { alive = false; };
         // eslint-disable-next-line react-hooks/exhaustive-deps
