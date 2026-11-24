@@ -951,6 +951,171 @@ class TestFrozenBookMissingOutcomes:
         assert m["n_days"] == 40
 
 
+class TestFrozenBookCostLedgerAndCoverageLabels:
+    """Codex HOLD 6031219554: a rebalance on an unscored day (a whole leg's
+    outcomes missing) must not vanish from the net series. Every formed book
+    pays its turnover on its own date in the cost ledger; an unscored date's
+    cost is carried into the next scored net return. Coverage is labelled
+    complete/partial per series, and a leg mean over observed members only is
+    labelled a conditional estimate."""
+
+    _COLS = ["A", "B", "C", "D", "E", "F"]
+    # top_n=2, cost_bps=10: a full one-leg swap costs (1 + 0) / 2 * 10 * 2 / 1e4.
+    _ONE_LEG_SWAP = 0.001
+    _ENTRY = 0.002  # first book: both legs enter from flat
+
+    def _frames(self, signal_rows, fwd_rows):
+        dates = pd.bdate_range("2024-04-01", periods=len(signal_rows))
+        signal = pd.DataFrame(signal_rows, index=dates, columns=self._COLS, dtype=float)
+        fwd = pd.DataFrame(fwd_rows, index=dates, columns=self._COLS, dtype=float)
+        return signal, fwd
+
+    def test_selected_name_change_on_missing_leg_day_is_charged_next_scored_day(self):
+        # Day 2 swaps the long leg {E, F} -> {C, D}, and both of C's and D's
+        # outcomes are missing, so the day is unscored. Day 3 holds {C, D}:
+        # its own turnover is zero, so the day-2 swap must be carried in.
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6], [1, 2, 5, 6, 3, 4], [1, 2, 5, 6, 3, 4]],
+            [[-0.01, -0.02, 0.0, 0.01, 0.03, 0.02],
+             [-0.01, -0.02, np.nan, np.nan, 0.03, 0.02],
+             [-0.01, -0.02, 0.01, 0.03, 0.0, 0.0]],
+        )
+        d1, d2, d3 = signal.index
+        ls = long_short_returns(signal, fwd, top_n=2, cost_bps=10.0)
+        assert list(ls.index) == [d1, d3]
+        assert ls.loc[d1] == pytest.approx(0.04 - self._ENTRY, abs=1e-12)
+        # Pre-fix: 0.035 (the swap's cost vanished from every later net return).
+        assert ls.loc[d3] == pytest.approx(0.035 - self._ONE_LEG_SWAP, abs=1e-12)
+
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        assert book.loc[d2, "cost"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        assert book.loc[d2, "cost_charged"] == 0.0
+        assert book.loc[d3, "cost_charged"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        # The ledger's total cost lands in the net series: none of it vanishes.
+        assert ls.sum() == pytest.approx(
+            book["gross"].dropna().sum() - book["cost"].sum(), abs=1e-12
+        )
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["turnover_cost_carried"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        assert cov["turnover_cost_uncharged"] == 0.0
+
+    def test_rebalance_on_market_wide_gap_day_is_a_book_date_not_skipped(self):
+        # Day 2 has no realized outcome at all (a data gap inside the window).
+        # The book still rotates long {E, F} -> {C, D} there and back on day 3:
+        # a round trip that costs two one-leg swaps. Pre-fix day 2 was skipped,
+        # day 3 compared against day 1, and the round trip cost nothing.
+        nan_row = [np.nan] * 6
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6], [1, 2, 5, 6, 3, 4], [1, 2, 3, 4, 5, 6]],
+            [[-0.01, -0.02, 0.0, 0.01, 0.03, 0.02],
+             nan_row,
+             [-0.01, -0.02, 0.0, 0.01, 0.03, 0.02]],
+        )
+        d1, d2, d3 = signal.index
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        assert list(book.index) == [d1, d2, d3]
+        assert book.loc[d2, "n_observed"] == 0
+        assert np.isnan(book.loc[d2, "return"])
+        ls = long_short_returns(signal, fwd, top_n=2, cost_bps=10.0)
+        assert ls.loc[d3] == pytest.approx(0.04 - 2 * self._ONE_LEG_SWAP, abs=1e-12)
+        assert metrics_mod.outcome_coverage(book)["n_unscored_days"] == 1
+
+    def test_cost_after_last_scored_day_is_reported_uncharged(self):
+        # Day 2 swaps the long leg into names with no outcome and is the last
+        # date with any realized outcome; day 3 has none (not yet scorable)
+        # and forms no book. The day-2 cost has no later scored date to land
+        # on: it is reported as uncharged and the net series is partial.
+        nan_row = [np.nan] * 6
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6], [1, 2, 5, 6, 3, 4], [1, 2, 3, 4, 5, 6]],
+            [[-0.01, -0.02, 0.0, 0.01, 0.03, 0.02],
+             [-0.01, -0.02, np.nan, np.nan, 0.03, 0.02],
+             nan_row],
+        )
+        book = metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        assert list(book.index) == list(signal.index[:2])
+        cov = metrics_mod.outcome_coverage(book)
+        assert cov["turnover_cost_uncharged"] == pytest.approx(self._ONE_LEG_SWAP, abs=1e-12)
+        assert cov["turnover_cost_total"] == pytest.approx(
+            self._ENTRY + self._ONE_LEG_SWAP, abs=1e-12
+        )
+        assert cov["net_coverage"] == "partial"
+
+    def test_coverage_labels_on_complete_book(self):
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6], [1, 2, 5, 6, 3, 4]],
+            [[-0.01, -0.02, 0.0, 0.01, 0.03, 0.02],
+             [-0.01, -0.02, 0.01, 0.03, 0.0, 0.0]],
+        )
+        cov = metrics_mod.outcome_coverage(
+            metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        )
+        assert cov["gross_coverage"] == "complete"
+        assert cov["net_coverage"] == "complete"
+        assert cov["estimate"] == "full_book"
+        assert cov["n_partial_days"] == 0
+        assert cov["n_unscored_days"] == 0
+        assert cov["turnover_cost_carried"] == 0.0
+        assert cov["turnover_cost_uncharged"] == 0.0
+
+        rng = np.random.default_rng(8)
+        dates = pd.bdate_range("2024-01-02", periods=40)
+        cols = [f"T{i:02d}" for i in range(12)]
+        sig = pd.DataFrame(rng.normal(size=(40, 12)), index=dates, columns=cols)
+        ret = pd.DataFrame(rng.normal(0, 0.01, size=(40, 12)), index=dates, columns=cols)
+        m = compute_signal_metrics(sig, ret, top_n=5, cost_bps=10.0)
+        assert (m["gross_coverage"], m["net_coverage"], m["estimate"]) == (
+            "complete", "complete", "full_book",
+        )
+
+    def test_coverage_labels_on_partial_book(self):
+        # Day 1: F (long) missing, leg mean over E alone -> a partial scored day.
+        # Day 2: the whole long leg missing -> unscored. Day 3: complete.
+        signal, fwd = self._frames(
+            [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]],
+            [[-0.01, -0.02, 0.0, 0.01, 0.03, np.nan],
+             [-0.01, -0.02, 0.0, 0.01, np.nan, np.nan],
+             [-0.01, -0.02, 0.0, 0.01, 0.03, 0.02]],
+        )
+        cov = metrics_mod.outcome_coverage(
+            metrics_mod.long_short_book(signal, fwd, top_n=2, cost_bps=10.0)
+        )
+        assert cov["n_partial_days"] == 1
+        assert cov["n_unscored_days"] == 1
+        assert cov["gross_coverage"] == "partial"
+        assert cov["net_coverage"] == "partial"
+        assert cov["estimate"] == "conditional_on_observed_outcomes"
+
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range("2024-01-02", periods=40)
+        cols = [f"T{i:02d}" for i in range(12)]
+        sig = pd.DataFrame(rng.normal(size=(40, 12)), index=dates, columns=cols)
+        ret = pd.DataFrame(rng.normal(0, 0.01, size=(40, 12)), index=dates, columns=cols)
+        ret.loc[dates[7], sig.iloc[7].idxmax()] = np.nan
+        m = compute_signal_metrics(sig, ret, top_n=5, cost_bps=10.0)
+        assert m["n_partial_days"] == 1
+        assert (m["gross_coverage"], m["net_coverage"], m["estimate"]) == (
+            "partial", "partial", "conditional_on_observed_outcomes",
+        )
+
+    def test_gauntlet_reports_coverage_labels_next_to_net_sharpe(self):
+        rng = np.random.default_rng(13)
+        n, k = 200, 8
+        dates = pd.bdate_range("2023-01-02", periods=n)
+        cols = [f"T{i:02d}" for i in range(k)]
+        sig = pd.DataFrame(rng.normal(size=(n, k)), index=dates, columns=cols)
+        ret = pd.DataFrame(rng.normal(0, 0.01, size=(n, k)), index=dates, columns=cols)
+        ret.loc[dates[50], sig.iloc[50].idxmax()] = np.nan
+        res = gauntlet.run_gauntlet(
+            sig, ret, n_models_tested=1, top_n=2, cost_bps=10.0,
+            n_permutations=19, n_subsample_splits=4, seed=1,
+        )
+        assert res.details["net_coverage"] == "partial"
+        assert res.details["gross_coverage"] == "partial"
+        assert res.details["estimate"] == "conditional_on_observed_outcomes"
+        assert res.details["n_partial_days"] == 1
+
+
 class TestEnsembleEmbargoAndEarlyStopping:
     def _mock_lgb(self, monkeypatch):
         recorded: dict = {"datasets": [], "train_calls": []}
@@ -1065,4 +1230,25 @@ class TestEnsembleEmbargoAndEarlyStopping:
             assert not pd.isna(ds.label).any()
         # Coverage is reported: 25 val dates x 10 book slots, one missing.
         assert res.val_outcome_coverage == pytest.approx(1 - 1 / 250)
+
+    def test_reports_coverage_labels_for_train_and_val_books(self, monkeypatch):
+        """Codex HOLD 6031219554: train and val Sharpe carry coverage labels."""
+        self._mock_lgb(monkeypatch)
+        dates, panels, fwd = self._synthetic_panels(n_dates=100, n_tickers=12)
+        val_day = dates[80]
+        panels["f1"].loc[val_day, "T00"] = 50.0
+        fwd = fwd.copy()
+        fwd.loc[val_day, "T00"] = np.nan
+
+        res = ensemble.train_ensemble(
+            panels, fwd, train_frac=0.7, label_horizon=5, embargo_days=5,
+            n_rounds=20, early_stopping=5,
+        )
+        val = res.book_coverage["val"]
+        assert val["net_coverage"] == "partial"
+        assert val["estimate"] == "conditional_on_observed_outcomes"
+        assert val["n_partial_days"] == 1
+        train = res.book_coverage["train"]
+        assert train["net_coverage"] == "complete"
+        assert train["estimate"] == "full_book"
 
