@@ -392,14 +392,26 @@ class TestPredictHorizonAware:
     ):
         predictor = self._build_predictor_with_stub_factory(mock_engine)
 
-        # Divergent buckets: model_a weighted toward 1d, model_b toward 30d.
+        # Divergent per-horizon hit rates + bucket weights: model_a leads at 1d,
+        # model_b leads at 30d. vote_weight uses hit_rate once (no triple count)
+        # while bucket_weight is preserved on vote metadata.
+        hit_rates_by_horizon = {
+            ("model_a", 1): 0.75,
+            ("model_a", 30): 0.45,
+            ("model_b", 1): 0.45,
+            ("model_b", 30): 0.75,
+        }
         weights_by_horizon = {
             ("model_a", 1): 3.0,
             ("model_a", 30): 0.2,
             ("model_b", 1): 0.2,
             ("model_b", 30): 3.0,
         }
-        predictor._get_hit_rate = lambda name, *, horizon=None: 0.7
+        predictor._get_hit_rate = (
+            lambda name, *, horizon=None: hit_rates_by_horizon.get(
+                (name, int(horizon)), 0.5
+            )
+        )
         predictor._get_bucket_weight = (
             lambda name, *, horizon=None: weights_by_horizon.get(
                 (name, int(horizon)), 1.0
@@ -411,13 +423,13 @@ class TestPredictHorizonAware:
 
         assert pred_1d.horizon == 1
         assert pred_30d.horizon == 30
-        # model_a dominates the 1d ensemble and model_b dominates 30d —
-        # so the top vote by weight must differ between calls.
         top_1d = pred_1d.model_votes[0]["model_name"]
         top_30d = pred_30d.model_votes[0]["model_name"]
         assert top_1d == "model_a"
         assert top_30d == "model_b"
         assert top_1d != top_30d
+        assert pred_1d.model_votes[0]["bucket_weight"] == pytest.approx(3.0)
+        assert pred_30d.model_votes[0]["bucket_weight"] == pytest.approx(3.0)
 
     def test_default_horizon_is_7(self, mock_engine):
         predictor = self._build_predictor_with_stub_factory(mock_engine)
