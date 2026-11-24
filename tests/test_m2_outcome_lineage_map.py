@@ -13,6 +13,7 @@ import importlib.util
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,8 @@ def doc() -> str:
 def test_status_is_draft_and_authorises_nothing(lineage: dict, doc: str) -> None:
     assert lineage["status"] == "DRAFT_UNREVIEWED"
     assert lineage["authorises"] == []
-    assert "DRAFT v0" in doc and "authorises nothing" in doc
+    assert lineage["revision"] == 2
+    assert "DRAFT v0, revision 2" in doc and "authorises nothing" in doc
     assert lineage["document"] == str(DOC_PATH.relative_to(ROOT))
 
 
@@ -88,15 +90,83 @@ def test_claim_types_match_ingest_and_grader(lineage: dict, ingest) -> None:
     assert set(re.findall(r'"([a-z_]+)"', match.group(1))) == set(lineage["claim_types"])
 
 
-def test_outcome_states_cover_every_verdict_and_only_verdicts(lineage: dict, ingest) -> None:
-    encodings = {s["verdict"] for s in lineage["outcome_states"]}
-    assert encodings == set(ingest.VERDICTS)
-    names = [s["state"] for s in lineage["outcome_states"]]
-    assert len(names) == len(set(names))
-    # A non-success state is never encoded as a resolved verdict.
-    for state in lineage["outcome_states"]:
-        if state["state"] in {"PENDING", "UNRESOLVABLE_BY_RULE", "UNAVAILABLE", "UNMEASURABLE"}:
-            assert state["verdict"] not in ingest.RESOLVED, state
+RESOLVED_STATE = {"confirmed": "CONFIRMED", "refuted": "REFUTED", "partially_confirmed": "PARTIAL"}
+UNAVAILABLE_DATA = {"MISSING_BASELINE", "MISSING_ENDPOINT", "UNUSABLE_ENDPOINT", "NO_SOURCE"}
+
+
+def derive(row: dict, rules: dict, read_at: datetime) -> dict:
+    """Doc section 2.2 as code: maturity, data and state for one verdict row at read instant R."""
+    horizon = row["horizon_end"]
+    if horizon is None:
+        maturity = "NO_HORIZON"
+    else:
+        maturity = "IMMATURE" if datetime.fromisoformat(horizon) > read_at else "MATURE"
+    verdict = row["verdict"]
+    if verdict in RESOLVED_STATE:
+        data = "PRESENT"
+    elif verdict == "unresolved":
+        if row["claim_type"] in {"event", "causal"} or maturity == "NO_HORIZON":
+            data = "NOT_GRADABLE"
+        else:
+            data = "MISSING_ENDPOINT" if maturity == "MATURE" else "AWAITING_ENDPOINT"
+    else:  # unscorable
+        cause = row.get("root_cause") or ""
+        data = next((r["data"] for r in rules["unscorable_root_cause_prefixes"] if cause.startswith(r["prefix"])),
+                    "UNKNOWN_CAUSE")
+    if data == "UNKNOWN_CAUSE":
+        state = "UNKNOWN"
+    elif maturity == "IMMATURE":
+        state = "PENDING"
+    elif maturity == "NO_HORIZON" or data == "NOT_GRADABLE":
+        state = "UNMEASURABLE"
+    elif data == "PRESENT":
+        state = RESOLVED_STATE[verdict]
+    elif data in UNAVAILABLE_DATA:
+        state = "UNAVAILABLE"
+    else:
+        raise AssertionError(f"no state for {maturity}/{data}")
+    return {"maturity": maturity, "data": data, "state": state}
+
+
+def test_derivation_fixtures(lineage: dict) -> None:
+    rules = lineage["derivation"]
+    read_at = datetime.fromisoformat(rules["read_at"])
+    for fixture in rules["fixtures"]:
+        assert derive(fixture, rules, read_at) == fixture["expect"], fixture["name"]
+
+
+def test_fixtures_cover_every_verdict_and_the_reviewed_cases(lineage: dict, ingest) -> None:
+    fixtures = lineage["derivation"]["fixtures"]
+    assert {f["verdict"] for f in fixtures} == set(ingest.VERDICTS)
+    expects = {(f["expect"]["maturity"], f["expect"]["data"]) for f in fixtures}
+    # Review 6033027329 (1): due-but-missing endpoint and pre-maturity missing baseline are distinct cases.
+    assert ("MATURE", "MISSING_ENDPOINT") in expects
+    assert ("IMMATURE", "AWAITING_ENDPOINT") in expects
+    assert ("IMMATURE", "MISSING_BASELINE") in expects
+
+
+def test_pending_and_unknown_never_enter_the_matured_denominator(lineage: dict) -> None:
+    rules = lineage["derivation"]
+    read_at = datetime.fromisoformat(rules["read_at"])
+    denominator = set(rules["matured_denominator"])
+    assert {"PENDING", "UNMEASURABLE", "UNKNOWN"}.isdisjoint(denominator)
+    for fixture in rules["fixtures"]:
+        got = derive(fixture, rules, read_at)
+        assert (got["state"] in denominator) == (got["maturity"] == "MATURE"
+                                                 and got["data"] not in {"NOT_GRADABLE", "UNKNOWN_CAUSE"}), fixture["name"]
+
+
+def test_root_cause_prefixes_are_the_graders_own(lineage: dict) -> None:
+    grader_src = (ROOT / "scripts" / "grade_publication_review.py").read_text(encoding="utf-8")
+    for rule in lineage["derivation"]["unscorable_root_cause_prefixes"]:
+        assert re.search(r'f?"' + re.escape(rule["prefix"]), grader_src), rule["prefix"]
+
+
+def test_every_stage_states_its_binding(lineage: dict, doc: str) -> None:
+    allowed = set(lineage["binding_values"])
+    for stage in lineage["stages"]:
+        assert stage["binding"] and set(stage["binding"]) <= allowed, stage["stage"]
+    assert "Binding today" in doc
 
 
 def test_publication_channels_match_ingest_id_pattern(lineage: dict, ingest) -> None:
@@ -117,7 +187,7 @@ def test_every_gap_is_named_in_the_doc_and_referenced(lineage: dict, doc: str) -
     assert ids == [f"L{i}" for i in range(1, len(ids) + 1)]
     for gap_id in ids:
         assert f"| {gap_id} |" in doc, gap_id
-    referenced = {g for item in lineage["chain"] + lineage["outcome_states"] for g in item.get("gaps", [])}
+    referenced = {g for item in lineage["chain"] for g in item.get("gaps", [])}
     assert referenced <= set(ids)
 
 

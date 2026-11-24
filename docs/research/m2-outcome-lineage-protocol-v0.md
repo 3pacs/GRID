@@ -4,7 +4,8 @@ Issue: [#960](https://github.com/3pacs/GRID/issues/960). Milestone: M2, "Evidenc
 Machine-readable companion: [`m2-outcome-lineage-v0.json`](m2-outcome-lineage-v0.json). The companion is held to
 the code by `tests/test_m2_outcome_lineage_map.py`.
 
-**Status: DRAFT v0.** It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
+**Status: DRAFT v0, revision 2** (answers the reviewer's HOLD 6033027329 on revision 1, `393cde73`; the change map
+is §7). It is unreviewed and unsigned, and it authorises nothing. It adds no research job, production
 scoring or learning, evaluation run, DDL, historical rewrite, promotion or trading action. Only the research owner
 can adopt it, and only after the independent reviewer's pass (§6). Adoption is a separate commit that pins this
 file's hash. The D0 contract ([#1129](https://github.com/3pacs/GRID/issues/1129), draft PR #1142) is the first
@@ -46,21 +47,56 @@ keeps a named non-success state (§2.2); it is never dropped and never filled in
 | C. Claim | (`publication_id`, `claim_sha256`); `claim_span` is a verbatim substring of the captured text; `claim_type` ∈ {direction, level, event, causal, data_quality} | `publication_claim_verdicts` | **EXISTS**, per extraction setup (L2) |
 | I. Inputs the publication used | raw row / vintage / pull timestamp of every input the generator read | not recorded. The packet sets `capture_receipt.missing_decision_vintages: true` | **MISSING** (L1) |
 | T. Target | instrument, session, horizon end, price basis | `instrument` and `horizon_end` are typed; the price basis appears only inside `evidence` | **PARTIAL** (L3) |
-| O. Matured outcome | `verdict` with evidence dated no later than `graded_at`; `horizon_end` must lie in (`stated_at`, `graded_at`] | `publication_claim_verdicts` + `publication_review_runs.id` | **EXISTS**; non-success states partial (L4) |
+| O. Matured outcome | `verdict` with evidence dated no later than `graded_at`; for a resolved verdict, `horizon_end` must lie in (`stated_at`, `graded_at`] | `publication_claim_verdicts` + `publication_review_runs.id` | **PARTIAL**. Maturity and missing data are not separate fields (§2.2, L4). The close evidence is dated by observation date: it does not show when the selected vintage became available (L7). |
 | R. Run identity | `publication_review_runs.review_sha256`, `supersedes_run_id`, grader version | `publication_review_runs` | **EXISTS**; learning must pin one run (rule 2.4.3) |
 
-### 2.2 Outcome states (every state is kept and counted)
+### 2.2 Outcome states: three derived axes, then one state
 
-| Protocol state | Current encoding | Meaning |
+The grader's `verdict` mixes three questions, so a study must not read it alone:
+
+- `unresolved` covers both a horizon still in the future and a horizon that has passed with no endpoint close.
+- A missing **baseline** close is graded `unscorable` straight away, before the horizon matures.
+- The grader's own `claims_graded` count is total minus `unscorable`. It includes immature rows, so it is **not** a
+  matured denominator.
+
+A study therefore derives three axes for each row, at a fixed read instant `R` (the study's own, recorded at S1),
+and only then assigns a protocol state.
+
+**Maturity**, from `horizon_end` and `R`:
+
+| Value | Rule |
+|---|---|
+| `NO_HORIZON` | `horizon_end` is null: event, causal and data_quality claims, and level claims without a horizon |
+| `IMMATURE` | `horizon_end` > `R` |
+| `MATURE` | `horizon_end` ≤ `R` |
+
+**Data**, from `verdict` and `root_cause`. v1 has no typed reason code (L4), so the derivation reads the grader's
+fixed `root_cause` prefixes, and anything it does not recognise is `UNKNOWN_CAUSE`:
+
+| Value | Rule |
+|---|---|
+| `PRESENT` | verdict is confirmed, refuted or partially_confirmed |
+| `MISSING_BASELINE` | unscorable, `root_cause` starts `no usable ` (grader: no usable close on the baseline session) |
+| `UNUSABLE_ENDPOINT` | unscorable, `root_cause` starts `unusable ` |
+| `NO_SOURCE` | unscorable, `root_cause` starts `no price series for instrument` |
+| `MISSING_ENDPOINT` | unresolved, `MATURE`, claim type direction or level |
+| `AWAITING_ENDPOINT` | unresolved, `IMMATURE` |
+| `NOT_GRADABLE` | unresolved for event / causal (v1 rule); any other unscorable with a recognised no-target cause (alias level, withheld narrative, no direction, no checkable claim) |
+| `UNKNOWN_CAUSE` | unscorable with an unrecognised `root_cause` |
+
+**State**:
+
+| Protocol state | Axes | Counted in the matured denominator? |
 |---|---|---|
-| `CONFIRMED` / `REFUTED` / `PARTIAL` | `confirmed` / `refuted` / `partially_confirmed` | matured, graded against dated evidence |
-| `PENDING` | `unresolved` with a future `horizon_end` | not matured yet. It is never read as a negative. |
-| `UNRESOLVABLE_BY_RULE` | `unresolved` for `event` / `causal` | v1 cannot grade the claim. A causal claim is never confirmed from co-movement. |
-| `UNAVAILABLE` | `unscorable`, distinguished by `root_cause` text only | a matured target whose price or evidence is missing |
-| `UNMEASURABLE` | `unscorable`, distinguished by `root_cause` text only | no gradable target, e.g. an alias level ("SPX above 6800") or a narrative that was withheld |
+| `CONFIRMED` / `REFUTED` / `PARTIAL` | `MATURE`, `PRESENT` | yes |
+| `PENDING` | `IMMATURE`, any data value, including `MISSING_BASELINE`, which is known before maturity | no. It is never read as a negative. |
+| `UNAVAILABLE` | `MATURE` with `MISSING_BASELINE`, `MISSING_ENDPOINT`, `UNUSABLE_ENDPOINT` or `NO_SOURCE` | yes, as a non-success. It is never dropped. |
+| `UNMEASURABLE` | `NO_HORIZON`, or `NOT_GRADABLE` | no; reported beside the result |
+| `UNKNOWN` | `UNKNOWN_CAUSE`, at any maturity (checked first) | no; reported beside the result, and a non-zero count is a grader-owner defect |
 
-Negatives (`REFUTED`) and non-success states are published with every result. A rate computed over graded claims
-must also report the pending, unavailable and unmeasurable counts beside it.
+A matured rate's denominator is every `MATURE` row (resolved plus `UNAVAILABLE`). The rate is reported with the
+`UNAVAILABLE`, `PENDING`, `UNMEASURABLE` and `UNKNOWN` counts next to it. The companion JSON carries one fixture
+per derivation rule; the test applies the rules to those fixtures, as the executable form of this table.
 
 ### 2.3 Lineage gaps (each blocks only what it names)
 
@@ -72,6 +108,7 @@ must also report the pending, unavailable and unmeasurable counts beside it.
 | L4 | `UNAVAILABLE` and `UNMEASURABLE` share `unscorable` | missingness accounting by cause | grader owner (typed reason code in the next schema version) |
 | L5 | M0 (#958) proved one designed refusal, not a reasoned use of an input | any accuracy claim that depends on lineage | research owner. A reasoned-use proof (e.g. the 2026-10-26 briefing 4756) needs the receipt-format decision noted on #958. |
 | L6 | Verdict rows are not E2 predictions. E2 needs a logged entry before the outcome and registration in `rules.json`. | scoring publications on the E2 scoreboard | owner decision. A publication stream would be a new E2 version, never an edit of `e2-v1`. |
+| L7 | Close evidence is dated by observation date (`obs_date`, session close). It records neither the selected vintage nor its availability time. | any claim that an outcome was knowable at the grading instant from first-release data; revision-sensitive outcomes | grader owner (record the vintage and pull timestamp of each close used) |
 
 ### 2.4 Lineage rules
 
@@ -94,40 +131,60 @@ must also report the pending, unavailable and unmeasurable counts beside it.
 Every empirical study goes through these stages in order, and each stage leaves a record. "Existing" names the code
 that enforces the stage. A study may reuse an application's frozen numbers (D0 §5–§6) but may not skip a stage.
 
-| Stage | Requirement | Existing |
-|---|---|---|
-| S0 Explore | Anything goes, labelled `EXPLORATORY`. It can propose a candidate but never supply evidence for one. The data it read is recorded as spent. | `analysis/research_findings.py` catalogue; D0 §4 spent periods |
-| S1 Register | One candidate record **before any data is read**: rule, variants, horizons, instruments, controls, outcome definition, thresholds and the fixed look. Abandonment counts as a failure. | `evals/e3` E3A ledger, S11 allocation (`record_hypothesis_batch`), edge-stream registration |
-| S2 Custody | A holdout or walk-forward split declared at S1, never chosen after a look. Holdout reads go through custody. | E3B `holdout.py` (fixture-only), factory pre-screen (one older-data look), D0 §5.2 / §8 |
-| S3 Leakage | Every input passes the six clocks of D0 §2.1. The study runs a look-ahead canary and a late/revised/missing/duplicate fixture. | `evals/e1`, `assert_no_lookahead()`, `read_window_known_at`, D0 §5.6 |
-| S4 Costs | Results are net of a cost model declared at S1. A gross-only result is labelled gross and cannot pass. | E2 cost model, edge-stream cost floor, D0 §6.3 |
-| S5 Uncertainty | Block-permutation or block-bootstrap intervals that respect the serial and cross-sectional dependence; BH-FDR across the declared family. Effect size ± interval comes first, then the verdict. | `offline_research_proof.py`, `hypothesis_trials.py`, E2 bootstrap |
-| S6 Regimes | Regime splits are declared at S1 from the market-state record as of each decision. Results are reported per regime. A regime is never picked after the look. | `intelligence/regime/market_state.py` |
-| S7 Fixed look | One look per registered cell. Interim reads are labelled interim and change nothing. Verdicts: PASS / FAIL / UNDERPOWERED / HOLD, all published. | S10 `research_forward_log.py`, edge-stream one look, E2 pre-registered looks |
-| S8 Promotion | Manual only. A PASS is a candidate report for the owner. Nothing changes a production score, weight, prompt or allocation automatically. | `governance/registry.py` lifecycle (CANDIDATE → SHADOW → STAGING → PRODUCTION); packet `promotion_allowed: false`; edge-stream PASS = candidate report |
+Binding, per stage, says what actually makes a study comply today:
+
+- `ENFORCED`: a production code path refuses the violation;
+- `CI_GATE`: a released suite or test fails CI on it;
+- `FIXTURE_ONLY`: the code exists and is tested on fixtures, with no production caller;
+- `POLICY`: a written rule that nothing refuses;
+- `MISSING`: nothing yet.
+
+| Stage | Requirement | Existing | Binding today |
+|---|---|---|---|
+| S0 Explore | Anything goes, labelled `EXPLORATORY`. It can propose a candidate but never supply evidence for one. The data it read is recorded as spent. | `analysis/research_findings.py` catalogue; D0 §4 spent periods | `POLICY`: the catalogue records spent looks, and nothing refuses re-reading them |
+| S1 Register | One candidate record **before any data is read**: rule, variants, horizons, instruments, controls, outcome definition, thresholds, the fixed look and the read instant `R`. Abandonment counts as a failure. | `evals/e3` E3A ledger, S11 allocation (`record_hypothesis_batch`), edge-stream registration | `ENFORCED` inside the edge stream and hypothesis scoring v2; E3A is a released library with no production caller verified here; elsewhere `POLICY` |
+| S2 Custody | A holdout or walk-forward split declared at S1, never chosen after a look. Holdout reads go through custody. | E3B `holdout.py` (`e3-v2`), factory pre-screen (one older-data look), D0 §5.2 / §8 | E3B `FIXTURE_ONLY`; the D0 admission verifier is inert (`VERIFIER_ACCEPTED = False`); elsewhere `POLICY` |
+| S3 Leakage | Every input passes the six clocks of D0 §2.1. The study runs a look-ahead canary and a late/revised/missing/duplicate fixture. | `evals/e1`, `assert_no_lookahead()`, `read_window_known_at`, D0 §5.6 | `CI_GATE` (E1) and `ENFORCED` on the inference paths that call `assert_no_lookahead()`; the per-study fixture is `POLICY` |
+| S4 Costs | Results are net of a cost model declared at S1. A gross-only result is labelled gross and cannot pass. | E2 cost model, edge-stream cost floor, D0 §6.3 | `ENFORCED` inside the edge stream; E2 applies its cost model whenever it scores; elsewhere `POLICY` |
+| S5 Uncertainty | Block-permutation or block-bootstrap intervals that respect the serial and cross-sectional dependence; BH-FDR across the declared family. Effect size ± interval comes first, then the verdict. | `offline_research_proof.py`, `hypothesis_trials.py`, E2 bootstrap | `ENFORCED` in hypothesis scoring v2 (BH per batch); E2 applies its bootstrap whenever it scores; library functions otherwise, so `POLICY` |
+| S6 Regimes | Regime splits are declared at S1 from the market-state record as of each decision. Results are reported per regime. A regime is never picked after the look. | `intelligence/regime/market_state.py` | `MISSING`: the record exists, but nothing binds a study's splits to its registration |
+| S7 Fixed look | One look per registered cell. Interim reads are labelled interim and change nothing. Verdicts: PASS / FAIL / UNDERPOWERED / HOLD, all published. | S10 `research_forward_log.py`, edge-stream one look, E2 pre-registered looks | `ENFORCED` in S10 and the edge stream; elsewhere `POLICY` |
+| S8 Promotion | Manual only. A PASS is a candidate report for the owner. Nothing changes a production score, weight, prompt or allocation automatically. | `governance/registry.py` lifecycle (CANDIDATE → SHADOW → STAGING → PRODUCTION); packet `promotion_allowed: false`; edge-stream PASS = candidate report | `POLICY` for promotion decisions; the packet flag is a constant, not a gate |
 
 ### 3.1 Co-firing signals count once
 
 1. Before S1 closes, the study builds the co-firing clusters of its candidate signals from **fire overlap only**
    (never from returns), using `factory_stats.cofiring` at a threshold declared in the registration.
 2. A cluster is **one trial** in the multiple-testing denominator and takes at most one forward slot.
-3. The cluster representative is fixed by the existing rule (the tested trial with the highest t, ties by ledger
-   order).
-4. Any other member earns credit only for **incremental evidence**: its effect on the sessions where the
+3. **The representative is chosen without outcomes.** The registration fixes an outcome-independent rule before any
+   outcome is read. Default: the member with the most fires in the discovery window, ties by ledger order (fires are
+   events, not returns).
+4. **The alternative is to account for the selection.** `factory_stats.cofiring` today picks the tested trial with
+   the highest t, which is selected by outcome. A study that keeps that rule must:
+   - compute its cluster-level null on the **maximum** statistic over every tested member, under the same
+     permutation or bootstrap;
+   - send the representative to a **separate frozen forward check** before any verdict is quoted.
+
+   Without both, its cluster verdict is exploratory (S0).
+5. Any other member earns credit only for **incremental evidence**: its effect on the sessions where the
    representative did not fire, or its effect after conditioning on the representative. That incremental test is
    itself declared at S1 and counted.
 
 ### 3.2 Second- and third-order chains
 
-A chain (A moves → B responds → C follows) is registered as its links, each with an observable, a clock and a
-declared lag window.
+A chain (A moves → B responds → C follows) is registered as its links. Each link has an observable, a clock, a
+declared lag window and the coverage it needs.
 
 1. A chain is `CONFIRMED` only when every intermediate link is observed, in order, inside its window.
-2. A link that fires without its successor is recorded as `BROKEN_LINK` at that link. It counts as a negative for the
-   chain and is never dropped.
-3. Counter-cases are counted and published: the terminal outcome occurring without the chain, and the chain
-   occurring without the terminal outcome.
-4. A terminal outcome alone never confirms a chain.
+2. A successor that is absent counts as `BROKEN_LINK`, a negative for the chain, **only when both hold**:
+   - its lag window has fully matured at `R`;
+   - the successor's observable has **verified coverage** over that whole window: the source was collecting, with
+     no gap, outage or missing session in the window, shown by a receipt.
+3. If the window has not matured, the link is `LINK_PENDING`. If coverage is unverified or has gaps, it is
+   `LINK_UNOBSERVABLE`. Both are kept and counted, and neither is a negative.
+4. Counter-cases are counted and published, under the same maturity and coverage rule: the terminal outcome
+   occurring without the chain, and the chain occurring without the terminal outcome.
+5. A terminal outcome alone never confirms a chain.
 
 ## 4. Budget
 
@@ -160,3 +217,13 @@ days (rule 2.4.4). The pending, unavailable and unmeasurable counts are always s
 3. After the reviewer's pass, the owner adopts v0 in its own commit, which pins this file's sha256 with a test. Any
    later edit is a new version, never a re-pin.
 4. No evaluation run under this protocol starts before adoption. D0 runs keep their own admission (D0 §8).
+
+## 7. Revision 2 change map (answers HOLD 6033027329 on `393cde73`)
+
+| Reviewer point | Change |
+|---|---|
+| (1) `unresolved` covers both a future and a due-but-missing endpoint; a missing baseline is `unscorable` before maturity; `claims_graded` is not a matured denominator | §2.2 rewritten as three derived axes (maturity, data, verdict) and one state, with the matured denominator defined. Fixtures for each rule are in the JSON (`derivation.fixtures`), applied by the test. |
+| (2) Dated close evidence is an observation date, not vintage availability; separate production enforcement, fixture-only checks, operator policy and missing bindings per stage | Link O is now `PARTIAL`, and new gap L7 covers outcome-vintage lineage. Each stage in §3 has a "Binding today" column (`ENFORCED` / `CI_GATE` / `FIXTURE_ONLY` / `POLICY` / `MISSING`). |
+| (3) Highest observed t is an outcome-selected representative | §3.1: an outcome-independent representative is chosen at S1, or the selection is accounted for with a max-statistic cluster null plus a separate frozen forward check; otherwise the result is exploratory. |
+| (4) An absent successor is a negative only on a mature window with verified coverage | §3.2: `BROKEN_LINK` requires a matured window and receipted coverage; otherwise the link is `LINK_PENDING` or `LINK_UNOBSERVABLE`. |
+
