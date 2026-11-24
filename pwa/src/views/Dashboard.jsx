@@ -340,24 +340,35 @@ export default function Dashboard({ onNavigate }) {
     const regimeRef = useRef(currentRegime);
     regimeRef.current = currentRegime;
     const [regimeReadFailure, setRegimeReadFailure] = useState(null);
-    const applyRegimeRead = useCallback((regime) => {
+    // Mount and reconnect can issue overlapping reads. Each read takes a
+    // generation and remembers the regime object on screen when it started.
+    // A result is applied only if it is still the newest read AND nothing newer
+    // (e.g. a websocket push) replaced the regime meanwhile. So an older success
+    // never overwrites or clears a newer failure, and an older failure never
+    // stale-marks newer data.
+    const regimeGenRef = useRef(0);
+    const startRegimeRead = useCallback(() => ({ gen: ++regimeGenRef.current, before: regimeRef.current }), []);
+    const applyRegimeRead = useCallback((token, regime) => {
+        if (token.gen !== regimeGenRef.current) return;
+        if (regimeRef.current !== token.before) return;
         // api._fetch resolves failures to {error: true}; never store that as the regime.
         if (regime && typeof regime === 'object' && !regime.error) {
             setCurrentRegime(regime);
             setRegimeReadFailure(null);
         } else {
-            setRegimeReadFailure({ regime: regimeRef.current, at: new Date() });
+            setRegimeReadFailure({ regime: token.before, at: new Date() });
         }
     }, []);
 
     const refreshLiveSnapshot = useCallback(async () => {
         try {
+            const regimeRead = startRegimeRead();
             const [regime, status, watchlistPriceResponse] = await Promise.all([
                 api.getCurrent({ force: true }).catch(() => null),
                 api.getStatus().catch(() => null),
                 api.getWatchlistPrices().catch(() => null),
             ]);
-            applyRegimeRead(regime);
+            applyRegimeRead(regimeRead, regime);
             if (status) setSystemStatus(status);
             if (watchlistPriceResponse?.prices) setPulsePrices(watchlistPriceResponse.prices);
         } catch {
@@ -369,11 +380,12 @@ export default function Dashboard({ onNavigate }) {
         setLoading('dashboard', true);
         try {
             // Fast: regime + status load first (small payloads)
+            const regimeRead = startRegimeRead();
             const [regime, status] = await Promise.all([
                 api.getCurrent({ force: true }).catch(() => null),
                 api.getStatus().catch(() => null),
             ]);
-            applyRegimeRead(regime);
+            applyRegimeRead(regimeRead, regime);
             if (status) setSystemStatus(status);
             setLoading('dashboard', false);
 
