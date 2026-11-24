@@ -3,7 +3,7 @@ import path from 'node:path';
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import IntelDashboard from '../views/IntelDashboard.jsx';
+import IntelDashboard, { describeBriefing } from '../views/IntelDashboard.jsx';
 import { api } from '../api.js';
 
 vi.mock('../api.js', () => ({
@@ -79,5 +79,40 @@ describe('IntelDashboard source', () => {
         );
         expect(src).not.toMatch(/Math\.random/i);
         expect(src).not.toMatch(/placeholder/i);
+    });
+});
+
+describe('IntelDashboard briefing tile never claims LIVE', () => {
+    beforeEach(() => {
+        for (const fn of Object.values(api)) fn.mockReset();
+        api.getTrustScores.mockResolvedValue(null);
+        api.getConvergenceAlerts.mockResolvedValue(null);
+        api.getCrossReference.mockResolvedValue(null);
+        api.getSpiderStats.mockResolvedValue(null);
+    });
+
+    // The three shapes /api/v1/ollama/briefing/latest and the api wrapper return.
+    // All are truthy objects; the old tile showed a green LIVE for each of them.
+    const cases = [
+        ['a failed request', { error: true, status: 500, message: 'boom' }, 'UNAVAILABLE'],
+        ['no saved briefing', { content: null, message: 'No hourly briefings found' }, 'NONE'],
+        ['a saved briefing', { content: 'Markets were mixed.', type: 'hourly' }, 'SAVED'],
+    ];
+
+    it.each(cases)('renders %s honestly', async (_name, payload, label) => {
+        api.getLatestBriefing.mockResolvedValue(payload);
+        render(<IntelDashboard onNavigate={vi.fn()} />);
+        await waitFor(() => {
+            expect(screen.getByTestId('briefing-state')).toHaveTextContent(label);
+        });
+        expect(screen.queryByText('LIVE')).not.toBeInTheDocument();
+    });
+
+    it('marks a saved briefing as age unknown, since the payload carries no generation time', () => {
+        const saved = describeBriefing({ content: 'x', type: 'hourly' });
+        expect(saved.saved).toBe(true);
+        expect(saved.title).toMatch(/age is unknown/);
+        expect(describeBriefing(null).label).toBe('UNAVAILABLE');
+        expect(describeBriefing({ content: '   ' }).label).toBe('NONE');
     });
 });
