@@ -15,6 +15,56 @@ if TYPE_CHECKING:
 
     from contracts.schemas import PostmortemCompleted, PredictionScored
 
+ORACLE_MODEL_PRODUCER_PREFIX = "oracle.model:"
+
+# Track event types for which the non-oracle skip INFO log has already been
+# emitted so high-volume options-trade batches log at INFO once per event type.
+_SKIP_DECAY_LOGGED_EVENT_TYPES: set[str] = set()
+
+
+def _extract_oracle_model_name(producer_module: str | None) -> str | None:
+    """Return the exact oracle model name if ``producer_module`` attributes an
+    outcome to an oracle prediction model (``oracle.model:<model_name>``).
+
+    Non-oracle producers (such as ``"trading.options_recommender"``), signal
+    families (``"vol"``, ``"sentiment"``, etc.), unmapped strings, and missing
+    model names return ``None`` so decay is skipped.
+    """
+    if not isinstance(producer_module, str):
+        return None
+    val = producer_module.strip()
+    if not val.startswith(ORACLE_MODEL_PRODUCER_PREFIX):
+        return None
+    model_name = val[len(ORACLE_MODEL_PRODUCER_PREFIX):].strip()
+    if not model_name or model_name.lower() == "unknown":
+        return None
+    if any(ch.isspace() for ch in model_name):
+        return None
+    return model_name
+
+
+def _log_skip_non_oracle_once(evt: object) -> None:
+    """Log non-oracle skip at INFO once per event type, DEBUG thereafter."""
+    event_type = type(evt).__name__
+    producer = getattr(evt, "producer_module", None)
+    if event_type not in _SKIP_DECAY_LOGGED_EVENT_TYPES:
+        _SKIP_DECAY_LOGGED_EVENT_TYPES.add(event_type)
+        log.info(
+            "oracle_weights.on_postmortem_completed: "
+            "skip decay: outcome not attributable to an oracle model "
+            "(event_type={et} producer={p})",
+            et=event_type,
+            p=producer,
+        )
+    else:
+        log.debug(
+            "oracle_weights.on_postmortem_completed: "
+            "skip decay: outcome not attributable to an oracle model "
+            "(event_type={et} producer={p})",
+            et=event_type,
+            p=producer,
+        )
+
 
 def on_prediction_scored(
     evt: "PredictionScored", *, engine: "Engine"
@@ -33,11 +83,14 @@ def on_prediction_scored(
 def on_postmortem_completed(
     evt: "PostmortemCompleted", *, engine: "Engine"
 ) -> None:
-    """Decay contagion model heads when a postmortem reports MISS.
+    """Decay a specific oracle model when a postmortem reports MISS.
 
-    The source is derived from the contract's ``producer_module`` field
-    (e.g. ``"postmortem.apply_contagion_feedback"``). Non-MISS verdicts are
-    a no-op so that HIT and PARTIAL postmortems don't punish the network.
+    Only outcomes attributable to a named oracle model
+    (``producer_module="oracle.model:<model_name>"``) may decay, and only
+    that exact model via ``ModelRegistry.decay_model_by_name`` — never by
+    signal-family substring. Options-trade outcomes
+    (``"trading.options_recommender"``) and unattributed/unmapped producers
+    are skipped cleanly.
     """
     if evt.verdict != "MISS":
         log.debug(
@@ -46,14 +99,19 @@ def on_postmortem_completed(
         )
         return
 
+    model_name = _extract_oracle_model_name(evt.producer_module)
+    if not model_name:
+        _log_skip_non_oracle_once(evt)
+        return
+
     from oracle.engine import ModelRegistry
 
     registry = ModelRegistry(engine)
-    decayed = registry.decay_model_by_source(
-        source=evt.producer_module,
+    decayed = registry.decay_model_by_name(
+        model_name=model_name,
         factor=0.9,
     )
     log.info(
-        "oracle_weights.on_postmortem_completed: source={s} decayed={n}",
-        s=evt.producer_module, n=decayed,
+        "oracle_weights.on_postmortem_completed: model={m} decayed={n}",
+        m=model_name, n=decayed,
     )

@@ -92,6 +92,14 @@ def pg():
             "obs_date DATE NOT NULL, release_date DATE, vintage_date DATE NOT NULL, "
             "value DOUBLE PRECISION, UNIQUE (feature_id, obs_date, vintage_date))"
         ))
+        # signal_executor._get_latest_prices also excludes retracted vintages
+        # (#1356); empty here, so it reads what the legacy statement read.
+        conn.execute(text(
+            "CREATE TABLE resolved_series_retractions (id BIGSERIAL PRIMARY KEY, "
+            "feature_id INTEGER NOT NULL, obs_date DATE NOT NULL, vintage_date DATE NOT NULL, "
+            "retracted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reason TEXT NOT NULL, "
+            "run_tag TEXT NOT NULL, UNIQUE (feature_id, obs_date, vintage_date))"
+        ))
         # griddb's read indexes, so the new statements plan the way they do there.
         conn.execute(text(
             "CREATE INDEX ON resolved_series (feature_id, obs_date DESC)"

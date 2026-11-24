@@ -50,6 +50,7 @@ class StrategyCircuitBreaker:
         self.engine = engine
         self.threshold = threshold or settings.CIRCUIT_BREAKER_THRESHOLD
         self.cooldown_hours = cooldown_hours or settings.CIRCUIT_BREAKER_COOLDOWN_HOURS
+        self.last_error: str | None = None
 
     def _ensure_table(self) -> None:
         """Create the breaker state table if it doesn't exist."""
@@ -94,41 +95,56 @@ class StrategyCircuitBreaker:
         }
 
     def should_execute(self, strategy_id: str) -> bool:
-        """Check if a strategy is allowed to execute.
+        """Check if a strategy is allowed to execute new entries.
 
         Handles auto-transition from OPEN → HALF_OPEN after cooldown.
+        Fails closed (returns ``False`` and logs an error) if the breaker state
+        table is missing or unreachable, rather than raising and blocking exits.
 
         Returns:
-            True if the strategy may execute, False if halted.
+            True if the strategy may execute entries, False if halted or unavailable.
         """
-        info = self.get_state(strategy_id)
-        state = info["state"]
+        self.last_error = None
+        try:
+            info = self.get_state(strategy_id)
+            state = info["state"]
 
-        if state == BreakerState.CLOSED:
-            return True
-
-        if state == BreakerState.HALF_OPEN:
-            # Allow one probe trade
-            return True
-
-        # OPEN — check if cooldown has elapsed
-        opened_at = info["opened_at"]
-        if opened_at is not None:
-            cooldown_end = opened_at + timedelta(hours=self.cooldown_hours)
-            now = datetime.now(timezone.utc)
-            if now >= cooldown_end:
-                log.info(
-                    "Circuit breaker cooldown elapsed for strategy {s} — transitioning to HALF_OPEN",
-                    s=strategy_id,
-                )
-                self._set_state(strategy_id, BreakerState.HALF_OPEN)
+            if state == BreakerState.CLOSED:
                 return True
 
-        log.debug(
-            "Circuit breaker OPEN for strategy {s} — skipping execution",
-            s=strategy_id,
-        )
-        return False
+            if state == BreakerState.HALF_OPEN:
+                # Allow one probe trade
+                return True
+
+            # OPEN — check if cooldown has elapsed
+            opened_at = info["opened_at"]
+            if opened_at is not None:
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+                cooldown_end = opened_at + timedelta(hours=self.cooldown_hours)
+                now = datetime.now(timezone.utc)
+                if now >= cooldown_end:
+                    log.info(
+                        "Circuit breaker cooldown elapsed for strategy {s} — transitioning to HALF_OPEN",
+                        s=strategy_id,
+                    )
+                    self._set_state(strategy_id, BreakerState.HALF_OPEN)
+                    return True
+
+            log.debug(
+                "Circuit breaker OPEN for strategy {s} — skipping execution",
+                s=strategy_id,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — fail closed on missing table / DB errors
+            self.last_error = str(exc)
+            log.error(
+                "Circuit breaker check failed for strategy {s} "
+                "(paper_strategy_breaker_state missing or DB error) — "
+                "halting entries: {e}",
+                s=strategy_id, e=str(exc),
+            )
+            return False
 
     def record_success(self, strategy_id: str) -> None:
         """Record a successful execution. Resets breaker to CLOSED."""
