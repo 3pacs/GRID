@@ -33,9 +33,10 @@ gives the age, unit, limit and basis. `stale` outranks both `ok` and `no_baselin
 
 Sessions are NYSE sessions after the observation, up to and including `as_of`. They are counted on the hash-pinned
 XNYS manifests in `docs/reference/calendar-manifests` (the prescreen parts, then `factory_session_calendar.PINS`:
-2018-04-02 to 2027-12-31), never on the approximate scheduler helpers in `ingestion/market_calendar.py`. Those
-helpers close Juneteenth in 2018–2021, before it existed, and keep 2018-12-05 and 2025-01-09 open, so they miscount
-ages in both directions. Each record names the calendar it used in `freshness_calendar`.
+2018-04-02 to 2027-12-31), never on the rule-based scheduler helpers in `ingestion/market_calendar.py`. Until
+2026-11-24 those helpers closed Juneteenth in 2018–2021, before it existed, and kept 2018-12-05 and 2025-01-09 open.
+They now agree with the manifests (`tests/test_market_calendar_history.py`), but the record still counts on the
+pinned files. Each record names the calendar it used in `freshness_calendar`.
 - A record for a day after 2027-12-31 is refused until the manifests are extended.
 - An observation from before 2018-04-02 gets a lower-bound age (`age_is_lower_bound`).
 - The 0-session limit is a same-date rule: dealer gamma is fresh only when its row's date is the record's own date.

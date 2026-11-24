@@ -344,18 +344,19 @@ def test_daily_age_counts_trading_sessions_not_calendar_days():
 
 
 def test_session_ages_use_the_pinned_calendar_not_the_scheduler_helpers():
-    """ingestion.market_calendar's helpers close Juneteenth before it existed and miss one-off closures; ages must
-    come from the pinned XNYS manifests (docs/reference/calendar-manifests)."""
+    """Ages come from the pinned XNYS manifests (docs/reference/calendar-manifests). ingestion.market_calendar's
+    helpers used to close Juneteenth before it existed and miss one-off closures; since 2026-11-24 they agree with
+    the manifests (tests/test_market_calendar_history.py), and these cases check both."""
     from ingestion.market_calendar import trading_days_between
 
     nxt = M.MAX_AGE["vix"]
     # Juneteenth became an NYSE holiday in 2022: Friday 2020-06-19 was a session, so Wed -> Mon is 3 sessions.
-    assert len(trading_days_between(date(2020, 6, 18), date(2020, 6, 22))) == 2          # the helper's wrong count
+    assert len(trading_days_between(date(2020, 6, 18), date(2020, 6, 22))) == 3          # was 2 before 2026-11-24
     assert M.freshness(date(2020, 6, 17), date(2020, 6, 22), nxt) | {"basis": ""} == {
         "status": "stale", "age": 3, "unit": "sessions", "limit": 2, "basis": ""}
     assert M.sessions_after(date(2021, 6, 17), date(2021, 6, 18)) == (1, False)          # 2021-06-18 traded
-    # 2025-01-09 (national day of mourning) and 2018-12-05 were one-off closures the helper treats as sessions.
-    assert len(trading_days_between(date(2025, 1, 8), date(2025, 1, 10))) == 3
+    # 2025-01-09 (national day of mourning) and 2018-12-05 were one-off closures (the helper counted them until 2026-11-24).
+    assert len(trading_days_between(date(2025, 1, 8), date(2025, 1, 10))) == 2
     assert M.freshness(date(2025, 1, 7), date(2025, 1, 10), nxt)["status"] == "fresh"   # 01-08, 01-10
     assert M.sessions_after(date(2018, 12, 4), date(2018, 12, 6)) == (1, False)
     start, end, days, version = M.xnys_sessions()

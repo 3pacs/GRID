@@ -80,8 +80,8 @@ Trading-day test (2026-11-10). "A raw close row exists" misfired as the test
 for a real trading day (nasdaq_full, russell2000_full, pypl_full, rxt_full
 were flagged on ordinary Mondays: their raw close rows were simply absent).
 ``after_first_on_trading_day`` now asks the market calendar
-(``is_trading_day``: ingestion/market_calendar.py plus its documented
-corrections). The newly-dark / phantom split used the same proxy and had the
+(``is_trading_day``: ingestion/market_calendar.py, which has carried the
+corrections this script used to patch in locally since 2026-11-24). The newly-dark / phantom split used the same proxy and had the
 mirror-image fault (a served cell on a real trading day with no raw close row
 was called phantom and hidden from the floor): a gone cell is now phantom
 only when the calendar says closed AND no raw close row exists, or when it is
@@ -130,7 +130,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
-from ingestion.market_calendar import is_market_open, is_weekend
+from ingestion.market_calendar import is_market_open
 from normalization.entity_map import RAW_CLOSE_FULL_FEATURES, static_feeds  # noqa: E402
 from price_close_contract import SPY_CLOSE_FEATURE  # noqa: E402
 
@@ -182,30 +182,16 @@ INCEPTION_DATES: dict[str, date] = {
     "XLC": date(2018, 6, 19),
 }
 
-#: Weekday closures ingestion/market_calendar.py does not list (it covers the
-#: standard holidays only): Hurricane Sandy, and the national days of mourning
-#: for G. H. W. Bush and J. Carter.
-_SPECIAL_CLOSURES = frozenset({date(2012, 10, 29), date(2012, 10, 30), date(2018, 12, 5), date(2025, 1, 9)})
-#: NYSE first closed for Juneteenth in 2022; market_calendar lists it for every year.
-_JUNETEENTH_FIRST_YEAR = 2022
-
-
-def _juneteenth_observed(year: int) -> date:
-    d = date(year, 6, 19)
-    if d.weekday() == 5:
-        return d - timedelta(days=1)
-    if d.weekday() == 6:
-        return d + timedelta(days=1)
-    return d
-
-
 def is_trading_day(d: date) -> bool:
-    """US equity market open on ``d``: ``is_market_open`` corrected for pre-2022 Juneteenth and one-off closures."""
-    if d in _SPECIAL_CLOSURES:
-        return False
-    if is_market_open(d):
-        return True
-    return d.year < _JUNETEENTH_FIRST_YEAR and not is_weekend(d) and d == _juneteenth_observed(d.year)
+    """US equity market open on ``d``.
+
+    Delegates to ``ingestion.market_calendar.is_market_open``, which now carries
+    the pre-2022 Juneteenth rule and the one-off closures this script used to
+    patch in locally (``SPECIAL_CLOSURES``). From 2010-01-01 (this script's
+    default ``--start``) the answer is unchanged; earlier dates now follow the
+    NYSE record (MLK Day only from 1998; 1985-2007 closures added).
+    """
+    return is_market_open(d)
 
 
 ON_BASIS = "ON_BASIS"

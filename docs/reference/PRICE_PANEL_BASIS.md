@@ -260,9 +260,13 @@ with a primary-source date.
 `after_first_on_trading_day` and the newly-dark / phantom split no longer use "a raw close row
 exists" as the test for a trading day (it flagged `nasdaq_full`, `russell2000_full`,
 `pypl_full`, `rxt_full` on ordinary Mondays, and hid a served trading-day cell with a missing
-raw row as phantom). They use `is_trading_day` (`ingestion/market_calendar.is_market_open`
-plus two corrections it lacks: Juneteenth is a market holiday only from 2022, and the one-off
-closures 2012-10-29/30, 2018-12-05, 2025-01-09). A closed-day cell whose only raw close print
+raw row as phantom). They use `is_trading_day`, which is `ingestion/market_calendar.is_market_open`.
+Since 2026-11-24 that calendar carries the NYSE record itself: MLK Day only from 1998,
+Juneteenth only from 2022, and the one-off closures of 1985-2025 (`SPECIAL_CLOSURES`: Gloria,
+Nixon, 2001-09-11..14, Reagan, Ford, Sandy, G. H. W. Bush, Carter). It matches the pinned
+exchange_calendars XNYS manifests on every weekday from 2007-11-01 to 2027-12-31
+(`tests/test_market_calendar_history.py`). From 2010-01-01, the repairs' default start, the
+script's answer is the same as before; only earlier dates changed. A closed-day cell whose only raw close print
 is itself a junk outlier (0.9-1.0 prints stamped on the 2018-12-05 and 2025-01-09 days of
 mourning) is phantom too.
 
