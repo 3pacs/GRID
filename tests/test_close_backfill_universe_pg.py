@@ -1,16 +1,17 @@
 """PostgreSQL contract for scripts/close_backfill_universe.py.
 
-The unit tests fake the engine; this runs the script's real SQL (the work
-queries, the observation reader and the upsert guard) on PostgreSQL.
+The unit tests script the raw rows; this runs the work queries, the real
+completed-close reader and the fill-only write on PostgreSQL.
 
 Runs against a fresh schema on ``GRID_TEST_DB_URL`` (local, disposable
-database only) and skips without it.
+database only). Skips without it unless ``REQUIRE_CLOSE_BACKFILL_PG=1``, which
+the dedicated CI step sets so the contract cannot pass by skipping.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -21,7 +22,9 @@ import scripts.close_backfill_universe as mod
 
 pytestmark = pytest.mark.xdist_group("postgres")
 
-TODAY = date(2026, 11, 23)
+_REQUIRE_ENV = "REQUIRE_CLOSE_BACKFILL_PG"
+EVALUATED_AT = datetime(2026, 11, 24, 1, 0, tzinfo=timezone.utc)      # Mon 20:00 New York
+WED, THU, FRI = date(2026, 11, 18), date(2026, 11, 19), date(2026, 11, 20)
 DDL = (
     "CREATE TABLE source_catalog (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
     "CREATE TABLE raw_series (id BIGSERIAL PRIMARY KEY, series_id TEXT NOT NULL, "
@@ -42,6 +45,8 @@ DDL = (
 def pg_engine():
     url = os.environ.get("GRID_TEST_DB_URL")
     if not url:
+        if os.environ.get(_REQUIRE_ENV) == "1":
+            pytest.fail(f"GRID_TEST_DB_URL is required for the close backfill PG contract ({_REQUIRE_ENV}=1)")
         pytest.skip("GRID_TEST_DB_URL is required for disposable PostgreSQL proof")
     parsed = make_url(url)
     if parsed.host not in {"localhost", "127.0.0.1"} or "test" not in (parsed.database or ""):
@@ -61,12 +66,13 @@ def pg_engine():
     admin.dispose()
 
 
-def _close(conn, ticker: str, source_id: int, days_ago: int, value: float, status: str = "SUCCESS") -> None:
+def _close(conn, ticker: str, source_id: int, day: date, value: float, *, pulled: datetime | None = None,
+           status: str = "SUCCESS") -> None:
+    pulled = pulled or datetime(day.year, day.month, day.day, 23, 30, tzinfo=timezone.utc)   # after 17:00 NY
     conn.execute(
-        text("INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
-             "VALUES (:sid, :src, :d, :v, :st)"),
-        {"sid": f"YF:{ticker}:close", "src": source_id, "d": TODAY - timedelta(days=days_ago), "v": value,
-         "st": status},
+        text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, pull_status) "
+             "VALUES (:sid, :src, :d, :ts, :v, :st)"),
+        {"sid": f"YF:{ticker}:close", "src": source_id, "d": day, "ts": pulled, "v": value, "st": status},
     )
 
 
@@ -82,35 +88,44 @@ def test_universe_run_on_postgres(pg_engine):
             "INSERT INTO data_freshness_audit (ticker, bucket, audited_at) VALUES "
             "('OLD', 'DEAD', now() - interval '2 days'), "          # an earlier audit: ignored
             "('AAA', 'DEAD', now()), ('BBB', 'STALE_7_30', now()), ('GLEN', 'STALE_30+', now()), "
-            "('FINE', 'FRESH', now())"))
-        _close(conn, "AAA", 1, 1, 11.0)
-        _close(conn, "AAA", 1, 2, 10.0)
-        _close(conn, "AAA", 1, 3, 0.0, status="FAILED")           # a failed pull is not an observation
-        _close(conn, "AAA", 2, 5, 9.0)                            # yfinance ends earlier: not used
-        _close(conn, "BBB", 2, 1, 5.5)
-        _close(conn, "BBB", 2, 90, 4.0)                           # outside the 60-day window
-        _close(conn, "FINE", 1, 1, 1.0)
-        # A row sec_xbrl_shares owns, and one this job may correct.
+            "('AMB', 'DEAD', now()), ('BTC-USD', 'DEAD', now()), ('FINE', 'FRESH', now())"))
+        _close(conn, "AAA", 1, WED, 9.0)
+        _close(conn, "AAA", 1, THU, 10.0)
+        _close(conn, "AAA", 1, FRI, 11.0)
+        _close(conn, "AAA", 1, FRI, 0.0, status="FAILED")           # a failed pull is not an observation
+        _close(conn, "BBB", 2, FRI, 5.5)
+        _close(conn, "BBB", 2, THU, 5.4, pulled=datetime(2026, 11, 19, 19, 0, tzinfo=timezone.utc))  # 14:00 NY
+        _close(conn, "AMB", 1, FRI, 100.0)
+        _close(conn, "AMB", 2, FRI, 50.0)                           # the sources disagree
+        _close(conn, "FINE", 1, FRI, 1.0)
         conn.execute(text(
             "INSERT INTO ticker_metrics_daily (ticker, obs_date, shares_outstanding, close_price, market_cap_usd, source) "
-            "VALUES ('AAA', :d1, 1000, 10.9, 10900, 'sec_xbrl + yfinance'), "
-            "('AAA', :d2, NULL, 9.7, NULL, 'twelvedata_universe_backfill')"),
-            {"d1": TODAY - timedelta(days=1), "d2": TODAY - timedelta(days=2)})
+            "VALUES ('AAA', :fri, 1000, 10.9, 10900, 'sec_xbrl + yfinance'), "     # sec_xbrl_shares owns it
+            "('AAA', :thu, NULL, 9.7, NULL, 'twelvedata_universe_backfill'), "        # an existing close
+            "('AAA', :wed, NULL, NULL, NULL, 'placeholder')"),                        # a row with no close
+            {"fri": FRI, "thu": THU, "wed": WED})
 
-    summary = mod.run(pg_engine, "universe", today=TODAY)
+    receipt = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT)
 
-    assert summary["tickers"] == 3 and summary["filled"] == 2
-    assert summary["no_stored_close"] == ["GLEN"] and summary["failed"] == []
-    assert summary["by_source"] == {"TIINGO": 1, "yfinance": 1}
+    assert receipt["tickers"] == 5
+    assert receipt["eligible_tickers"] == 2 and receipt["eligible_closes"] == 4
+    assert receipt["no_completed_close"] == ["AMB", "GLEN"] and receipt["unsupported"] == ["BTC-USD"]
+    assert receipt["ambiguous_days_withheld"] == 1 and receipt["failed"] == []
+    assert receipt["by_source"] == {"TIINGO": 1, "yfinance": 1}
     rows = _metrics(pg_engine)
-    assert rows[("AAA", TODAY - timedelta(days=1))] == (10.9, 1000, "sec_xbrl + yfinance")     # untouched
-    assert rows[("AAA", TODAY - timedelta(days=2))] == (10.0, None, "stored_close_backfill:TIINGO")
-    assert rows[("BBB", TODAY - timedelta(days=1))] == (5.5, None, "stored_close_backfill:yfinance")
-    assert not any(t in ("OLD", "FINE", "GLEN") for t, _d in rows)
-    assert (summary["written"], summary["left_as_is"]) == (2, 1)
+    assert rows[("AAA", FRI)] == (10.9, 1000, "sec_xbrl + yfinance")              # untouched
+    assert rows[("AAA", THU)] == (9.7, None, "twelvedata_universe_backfill")      # an existing close is kept
+    assert rows[("AAA", WED)] == (9.0, None, "stored_close_backfill:TIINGO")      # the missing close is filled
+    assert rows[("BBB", FRI)] == (5.5, None, "stored_close_backfill:yfinance")
+    assert ("BBB", THU) not in rows                                               # only a provisional price
+    assert not any(t in ("OLD", "FINE", "GLEN", "AMB", "BTC-USD") for t, _d in rows)
+    assert (receipt["written"], receipt["left_as_is"]) == (2, 2)
 
-    again = mod.run(pg_engine, "universe", today=TODAY)
-    assert again["written"] == 0 and again["left_as_is"] == 3 and _metrics(pg_engine) == rows
+    again = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT)
+    assert again["written"] == 0 and again["left_as_is"] == 4 and _metrics(pg_engine) == rows
+
+    dry = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT, dry_run=True)
+    assert dry["eligible_tickers"] == 2 and dry["written"] == 0 and _metrics(pg_engine) == rows
 
 
 def test_gem_run_on_postgres(pg_engine):
@@ -119,11 +134,11 @@ def test_gem_run_on_postgres(pg_engine):
             "INSERT INTO gem_alerts (backtest_ticker, subject_kind, subject_id) VALUES "
             "('FLUT', 'ticker', 'FLUT'), (NULL, 'ticker', 'HAVE'), ('MACRO', 'macro', 'x y'), (NULL, 'ticker', 'NONE')"))
         conn.execute(text("INSERT INTO ticker_metrics_daily (ticker, obs_date, close_price, source) "
-                          "VALUES ('HAVE', :d, 3.0, 'sec_xbrl + yfinance')"), {"d": TODAY - timedelta(days=2)})
-        _close(conn, "FLUT", 1, 1, 250.0)
-        _close(conn, "HAVE", 1, 1, 3.1)
+                          "VALUES ('HAVE', :d, 3.0, 'sec_xbrl + yfinance')"), {"d": FRI})
+        _close(conn, "FLUT", 1, FRI, 250.0)
+        _close(conn, "HAVE", 1, FRI, 3.1)
 
-    summary = mod.run(pg_engine, "gem", today=TODAY)
+    receipt = mod.run(pg_engine, "gem", evaluated_at=EVALUATED_AT)
 
-    assert summary["tickers"] == 1 and summary["filled"] == 1
-    assert _metrics(pg_engine)[("FLUT", TODAY - timedelta(days=1))] == (250.0, None, "stored_close_backfill:TIINGO")
+    assert receipt["tickers"] == 1 and receipt["eligible_tickers"] == 1
+    assert _metrics(pg_engine)[("FLUT", FRI)] == (250.0, None, "stored_close_backfill:TIINGO")

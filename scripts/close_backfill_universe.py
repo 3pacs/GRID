@@ -1,42 +1,56 @@
 #!/usr/bin/env python3
-"""Fill ticker_metrics_daily closes from GRID's own stored prices.
+"""Fill missing ticker_metrics_daily closes from GRID's own stored prices.
 
-Replaces the two Twelve Data backfills (owner decision, 2026-11-23: "drop the
-twelve stuff, get it from our other sources instead"):
+The replacement for the two Twelve Data backfills (owner, 2026-11-23: "drop
+the twelve stuff, get it from our other sources instead"). **Not wired to a
+unit yet**: ``scripts/td_backfill_universe.py`` and
+``scripts/td_backfill_gem_tickers.py`` keep running until this script's
+coverage of both cohorts has been measured on griddb (run it with
+``DRY_RUN=1`` and read the receipt line). Joining the Tiingo list is not
+coverage.
+
+Cohorts:
 
 * ``universe``: every ticker the daily freshness audit grades DEAD, STALE_30+
-  or STALE_7_30 (``data_freshness_audit``, built by
-  ``scripts/freshness_audit_universe.sql``). Window 365 / 180 / 60 days.
+  or STALE_7_30 (``data_freshness_audit``). Window 365 / 180 / 60 days.
 * ``gem``: every gem-alert ticker with no close in the last 7 days. Window 60
   days.
 
-For each ticker the closes come from ``raw_series`` (``YF:{TICKER}:close``),
-the same rows ``ingestion/altdata/sec_xbrl_shares.py`` prices market cap
-with, read through ``store.observations.read_window`` (accepted rows only,
-one per date, newest vintage). TIINGO and yfinance both write that series;
-one source is used per ticker: the one whose stored closes reach the latest
-date, TIINGO on a tie. No external request is made and no API key is read.
+Which closes count. Only a **completed** close of the ticker's own
+instrument, as ``store.observations.read_completed_closes`` defines it with
+the US-listed boundary of ``evaluation.prices``:
 
-A ticker with no stored close in its window is named and skipped. That is a
-coverage gap upstream (the routine Tiingo list takes the freshness universe
-from ``TiingoPuller.freshness_universe_tickers``), not a failure of this job.
+* the label is a NYSE session and the row was pulled at or after 17:00 New
+  York on that day, so a same-day provisional price never qualifies;
+* accepted rows only, from ``yfinance`` or ``TIINGO``; a TIINGO row after the
+  ticker's last session (another instrument's price) is dropped;
+* a payload that marks the row not policy-eligible, or on another price
+  basis, is dropped;
+* when the stored vintages of one day disagree by more than the reader's
+  tolerance (two sources, or a restated split basis) the day is
+  **ambiguous** and withheld, not resolved by recency.
 
-Source-precedence policy (task #171, unchanged): this writer is subordinate
-to ``sec_xbrl_shares``. It writes only ``close_price``, ``source`` and
-``as_of``, and never touches a row whose ``shares_outstanding`` is set.
+A ticker that is not a US-listed symbol (crypto pairs, foreign suffixes) is
+unsupported and withheld whole.
 
-Environment: ``DRY_RUN=1`` reads and reports but writes nothing;
-``ONLY_BUCKET=DEAD`` and ``LIMIT=20`` narrow the universe run.
+What is written. Only a missing close: a new ``(ticker, obs_date)`` row, or a
+row whose ``close_price`` is NULL and that ``sec_xbrl_shares`` does not own
+(``shares_outstanding`` NULL). An existing close is never replaced, whoever
+wrote it; correcting one needs its own reviewed change.
+
+Environment: ``DRY_RUN=1`` reads and reports but writes nothing (this is the
+coverage measurement); ``ONLY_BUCKET=DEAD`` and ``LIMIT=20`` narrow the
+universe run.
 
 Exit code: 1 when a ticker's write failed and no ticker was filled; otherwise
-0, including a run where nothing had a stored close.
+0, including a run where nothing had an eligible close.
 """
 from __future__ import annotations
 
-import math
+import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -46,10 +60,14 @@ if str(_ROOT) not in sys.path:
 
 from sqlalchemy import text  # noqa: E402
 
-from store.observations import read_window  # noqa: E402
+from evaluation.prices import (  # noqa: E402
+    _CRYPTO_TICKER_PATTERN,
+    _US_TICKER_PATTERN,
+    COMPLETED_CLOSE_SOURCES,
+    us_listed_close_boundary,
+)
+from store.observations import read_completed_closes  # noqa: E402
 
-# Order of preference when two sources reach the same latest date.
-PRICE_SOURCES: tuple[str, ...] = ("TIINGO", "yfinance")
 SOURCE_LABEL = "stored_close_backfill"
 
 STALE_BUCKETS: tuple[str, ...] = ("DEAD", "STALE_30+", "STALE_7_30")
@@ -75,35 +93,41 @@ _GEM_WORK_SQL = text(
     " WHERE m.ticker = g.t AND m.close_price IS NOT NULL AND m.obs_date >= :fresh_since"
     ") ORDER BY 1"
 )
-# Never a row sec_xbrl_shares owns (shares_outstanding set), and no rewrite of
-# a close that is already the stored one.
-_UPSERT_SQL = text(
+# Fill only: a new row, or a row with no close that sec_xbrl_shares does not
+# own. An existing close is never replaced.
+_FILL_SQL = text(
     "INSERT INTO ticker_metrics_daily (ticker, obs_date, close_price, source, as_of) "
     "VALUES (:ticker, :obs_date, :close, :source, now()) "
     "ON CONFLICT (ticker, obs_date) DO UPDATE "
     "SET close_price = EXCLUDED.close_price, source = EXCLUDED.source, as_of = now() "
-    "WHERE ticker_metrics_daily.shares_outstanding IS NULL "
-    "AND ticker_metrics_daily.close_price IS DISTINCT FROM EXCLUDED.close_price"
+    "WHERE ticker_metrics_daily.close_price IS NULL "
+    "AND ticker_metrics_daily.shares_outstanding IS NULL"
 )
 
 
-def stored_closes(conn: Any, ticker: str, start: date, end: date) -> tuple[str | None, list[tuple[date, float]]]:
-    """``(source, [(obs_date, close), ...])`` from one stored price source.
+def is_supported_instrument(ticker: str) -> bool:
+    """A US-listed symbol the completed-close boundary applies to."""
+    return bool(_US_TICKER_PATTERN.match(ticker)) and not _CRYPTO_TICKER_PATTERN.match(ticker)
 
-    The source whose closes reach the latest date wins; ``PRICE_SOURCES``
-    order breaks a tie. ``(None, [])`` when neither holds a positive, finite
-    close in ``[start, end]``.
+
+def eligible_closes(
+    conn: Any, ticker: str, start: date, end: date, evaluated_at: datetime,
+) -> tuple[list[tuple[date, float, str]], int]:
+    """``([(obs_date, close, sources), ...], ambiguous_days)`` for ``ticker``.
+
+    Completed closes only (see the module docstring); ambiguous days are
+    counted and withheld. Raises ``ValueError`` for an unsupported instrument.
     """
-    best: tuple[str | None, list[tuple[date, float]]] = (None, [])
-    for source in PRICE_SOURCES:
-        rows = [
-            (o.obs_date, float(o.value))
-            for o in read_window(conn, f"YF:{ticker}:close", source=source, start=start, as_of=end)
-            if o.value is not None and math.isfinite(float(o.value)) and float(o.value) > 0
-        ]
-        if rows and (not best[1] or rows[-1][0] > best[1][-1][0]):
-            best = (source, rows)
-    return best
+    if not is_supported_instrument(ticker):
+        raise ValueError(f"not a US-listed ticker: {ticker!r}")
+    closes = read_completed_closes(
+        conn, f"YF:{ticker}:close", start=start, end=end,
+        boundary=us_listed_close_boundary, source=COMPLETED_CLOSE_SOURCES,
+        as_of_ts=evaluated_at,
+    )
+    rows = [(d, float(c.latest.value), str(c.source or "unknown"))
+            for d, c in sorted(closes.items()) if not c.ambiguous]
+    return rows, sum(1 for c in closes.values() if c.ambiguous)
 
 
 def _universe_work(conn: Any, only_bucket: str | None, limit: int) -> list[tuple[str, int]]:
@@ -118,60 +142,71 @@ def _gem_work(conn: Any, today: date) -> list[tuple[str, int]]:
     return [(str(r[0]), GEM_WINDOW_DAYS) for r in rows]
 
 
-def run(engine: Any, mode: str, *, today: date | None = None, dry_run: bool = False,
+def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run: bool = False,
         only_bucket: str | None = None, limit: int = 0) -> dict[str, Any]:
-    """Fill closes for ``mode`` ("universe" or "gem"); returns the run's counts."""
+    """Fill closes for ``mode`` ("universe" or "gem"); returns the run's receipt."""
     if mode not in ("universe", "gem"):
         raise ValueError(f"unknown mode {mode!r}")
-    today = today or date.today()
+    evaluated_at = evaluated_at or datetime.now(timezone.utc)
+    if evaluated_at.tzinfo is None:
+        raise ValueError("evaluated_at must be timezone-aware")
+    today = evaluated_at.date()
     with engine.connect() as conn:
         work = _universe_work(conn, only_bucket, limit) if mode == "universe" else _gem_work(conn, today)
     print(f"close backfill ({mode}): {len(work)} tickers (dry_run={dry_run})")
 
-    summary: dict[str, Any] = {
-        "mode": mode, "tickers": len(work), "filled": 0, "written": 0, "left_as_is": 0,
-        "no_stored_close": [], "failed": [], "by_source": {},
+    receipt: dict[str, Any] = {
+        "mode": mode, "dry_run": dry_run, "evaluated_at": evaluated_at.isoformat(),
+        "tickers": len(work), "eligible_tickers": 0, "eligible_closes": 0,
+        "written": 0, "left_as_is": 0, "ambiguous_days_withheld": 0,
+        "no_completed_close": [], "unsupported": [], "failed": [], "by_source": {},
     }
     for i, (ticker, days) in enumerate(work, 1):
         start = today - timedelta(days=days)
+        if not is_supported_instrument(ticker):
+            receipt["unsupported"].append(ticker)
+            print(f"[{i}/{len(work)}] {ticker}: withheld, not a US-listed symbol")
+            continue
         try:
             with engine.connect() as conn:
-                source, closes = stored_closes(conn, ticker, start, today)
+                closes, ambiguous = eligible_closes(conn, ticker, start, today, evaluated_at)
+            receipt["ambiguous_days_withheld"] += ambiguous
             if not closes:
-                summary["no_stored_close"].append(ticker)
-                print(f"[{i}/{len(work)}] {ticker}: skipped, no stored close since {start} "
-                      f"({', '.join(PRICE_SOURCES)})")
+                receipt["no_completed_close"].append(ticker)
+                print(f"[{i}/{len(work)}] {ticker}: skipped, no completed close since {start}"
+                      + (f" ({ambiguous} ambiguous days withheld)" if ambiguous else ""))
                 continue
             written = 0
             if not dry_run:
                 with engine.begin() as conn:
-                    for obs_date, close in closes:
-                        result = conn.execute(_UPSERT_SQL, {
+                    for obs_date, close, sources in closes:
+                        result = conn.execute(_FILL_SQL, {
                             "ticker": ticker, "obs_date": obs_date, "close": close,
-                            "source": f"{SOURCE_LABEL}:{source}",
+                            "source": f"{SOURCE_LABEL}:{sources}",
                         })
                         written += 1 if (result.rowcount or 0) > 0 else 0
         except Exception as exc:  # noqa: BLE001 -- one ticker must not stop the rest
-            summary["failed"].append(ticker)
+            receipt["failed"].append(ticker)
             print(f"[{i}/{len(work)}] {ticker}: FAILED ({type(exc).__name__}: {exc})", file=sys.stderr)
             continue
-        summary["filled"] += 1
-        summary["written"] += written
-        summary["left_as_is"] += len(closes) - written
-        summary["by_source"][source] = summary["by_source"].get(source, 0) + 1
-        verb = "would write up to" if dry_run else "wrote"
-        count = len(closes) if dry_run else written
-        print(f"[{i}/{len(work)}] {ticker}: {len(closes)} stored closes from {source} "
-              f"({closes[0][0]}..{closes[-1][0]}), {verb} {count}")
+        receipt["eligible_tickers"] += 1
+        receipt["eligible_closes"] += len(closes)
+        receipt["written"] += written
+        receipt["left_as_is"] += 0 if dry_run else len(closes) - written
+        for sources in {s for _d, _c, s in closes}:
+            receipt["by_source"][sources] = receipt["by_source"].get(sources, 0) + 1
+        verb = "eligible" if dry_run else "filled"
+        print(f"[{i}/{len(work)}] {ticker}: {len(closes)} completed closes "
+              f"({closes[0][0]}..{closes[-1][0]}), {verb} {len(closes) if dry_run else written}"
+              + (f", {ambiguous} ambiguous days withheld" if ambiguous else ""))
 
-    print(f"\nDONE filled={summary['filled']}/{len(work)} written={summary['written']} "
-          f"left_as_is={summary['left_as_is']} no_stored_close={len(summary['no_stored_close'])} "
-          f"failed={len(summary['failed'])} by_source={summary['by_source']}")
-    if summary["no_stored_close"]:
-        print(f"no stored close: {summary['no_stored_close']}")
-    if summary["failed"]:
-        print(f"failed tickers: {summary['failed']}", file=sys.stderr)
-    return summary
+    print(f"\nDONE eligible_tickers={receipt['eligible_tickers']}/{len(work)} "
+          f"eligible_closes={receipt['eligible_closes']} written={receipt['written']} "
+          f"left_as_is={receipt['left_as_is']} ambiguous_days_withheld={receipt['ambiguous_days_withheld']} "
+          f"no_completed_close={len(receipt['no_completed_close'])} unsupported={len(receipt['unsupported'])} "
+          f"failed={len(receipt['failed'])}")
+    print("RECEIPT " + json.dumps(receipt, sort_keys=True))
+    return receipt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -182,14 +217,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     from db import get_engine
 
-    summary = run(
+    receipt = run(
         get_engine(), mode,
         dry_run=bool(os.environ.get("DRY_RUN")),
         only_bucket=os.environ.get("ONLY_BUCKET") or None,
         limit=int(os.environ.get("LIMIT", "0") or 0),
     )
-    if summary["failed"] and summary["filled"] == 0:
-        print(f"total failure: 0/{len(summary['failed'])} attempted tickers were filled", file=sys.stderr)
+    if receipt["failed"] and receipt["eligible_tickers"] == 0:
+        print(f"total failure: 0/{len(receipt['failed'])} attempted tickers were filled", file=sys.stderr)
         return 1
     return 0
 

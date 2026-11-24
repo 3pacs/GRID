@@ -1023,35 +1023,35 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
   merge. No PR merge, deployment, production access, historical repair, SSH,
   outside-worktree report or coordination write was performed in this run.
 
-## 2026-11-23 - Twelve Data dropped from the scheduled path (owner), draft only
+## 2026-11-23 - Twelve Data: replacement path built, cutover held (draft only; reworked 2026-11-24 after Codex HOLD 6031399890)
 
 Branch `claude/drop-twelvedata-20261123`. Anik: "drop the twelve stuff, get it
 from our other sources instead".
 
-- **What Twelve Data was doing:** two daily units filled
+- **What Twelve Data does:** two daily units fill
   `ticker_metrics_daily.close_price` for tickers `sec_xbrl_shares` does not
   cover: `grid-td-universe-backfill` (the freshness-audit universe) and
   `grid-td-backfill` (gem-alert tickers). grid-svr, 2026-11-23: 324,949 rows for
   1,323 tickers carry `twelvedata_universe_backfill`, 1,826 rows carry
-  `twelvedata_backfill`. It was also the third spot-price fallback.
-- **Now:** `scripts/close_backfill_universe.py` fills the same rows from the
-  stored `YF:{TICKER}:close` series (TIINGO or yfinance, one source per ticker,
-  read through `store.observations.read_window`). No external request, no key.
-  `scripts/td_backfill_universe.py` and `scripts/td_backfill_gem_tickers.py` are
-  kept as entry points because the units' ExecStart names them.
-- **Coverage first:** 209 of the 618 freshness-universe tickers had no stored
-  close of their own in 5 days; Twelve Data was their only writer. They join
-  the routine Tiingo list (`TiingoPuller.freshness_universe_tickers`). A ticker
-  Tiingo cannot serve (GLEN, US, WSE, RVI, ANT, AIOK, VFIAX on 11-23) stays
-  stale and is named by the backfill every day.
-- **Not touched:** existing `twelvedata_*` rows; `TWELVEDATA_API_KEY` in
-  `config.py`; the hand-run research scripts that can still call Twelve Data
-  (`analysis/price_admission_*`, `scripts/full_universe_pull.py`,
-  `scripts/backfill_smallcap_coverage.py`, the pre-registered panel code); the
-  policy comment in `ingestion/altdata/sec_xbrl_shares.py`.
-- **For the operator:** rename the two units and point their ExecStart at
-  `scripts/close_backfill_universe.py universe|gem`, then delete the two
-  entry-point files. `TWELVEDATA_API_KEY` can leave the units' environment.
-- **Overlap with #1407:** that PR edits the old Twelve Data fetch and adds
-  `tests/test_td_backfill_universe_skips.py`. Whichever merges second takes this
-  branch's `scripts/td_backfill_universe.py` and drops that test file.
+  `twelvedata_backfill`.
+- **In this PR:**
+  - `ingestion/price_fallback.py` no longer calls Twelve Data (accepted).
+  - The freshness universe joins the routine Tiingo list
+    (`TiingoPuller.freshness_universe_tickers`): 209 of its 618 tickers had no
+    stored close of their own in 5 days.
+  - New `scripts/close_backfill_universe.py` (`universe` / `gem`). It reads only
+    completed closes (`store.observations.read_completed_closes` with the
+    US-listed 17:00 New York boundary): no same-day provisional price, no
+    TIINGO row after a ticker's last session, no row its payload marks
+    otherwise, and a day whose stored vintages disagree is withheld as
+    ambiguous. It only fills a missing close; an existing close is never
+    replaced. It prints a `RECEIPT {json}` line.
+- **Not in this PR (held):** the cutover. `scripts/td_backfill_universe.py` and
+  `scripts/td_backfill_gem_tickers.py` are unchanged and the units keep calling
+  Twelve Data. Before they are retired: deploy this, let the Tiingo list catch
+  up, run the new script with `DRY_RUN=1` on griddb for both cohorts, and read
+  the receipts. Joining the Tiingo list is not coverage.
+- **Not touched:** existing `twelvedata_*` rows; `TWELVEDATA_API_KEY`; the
+  hand-run research scripts; the policy comment in `sec_xbrl_shares.py`; any
+  unit or env file.
+
