@@ -800,3 +800,19 @@ def test_sector_state_finds_an_old_row_behind_many_later_ones(tmp_path):
     sec = S.desk_sector_state(_sector_db(tmp_path, rows), "pre_open", SESSION, PREV, PRE, PREV)
     assert sec.status == "ok" and sec.facts["record_date"] == "2026-10-01"
     assert "Fed balance sheet: flat" in sec.lines and "VIX: middle third, none" in sec.lines
+
+
+def test_sector_state_vix_line_without_a_third(tmp_path):
+    import hashlib
+
+    rec = _sector_rec("2026-11-19")
+    rec["vix"] = {"spike_state": "spike day", "stale": False}
+    body = json.dumps(rec)
+    db = _sector_db(tmp_path, [])
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO desk_state VALUES (?,?,?,?,?,?)", ("2026-11-19", "live", "desk-sector-state/1", body,
+                                                                 hashlib.sha256(body.encode()).hexdigest(), "2026-11-20T06:45:08Z"))
+    con.commit()
+    con.close()
+    sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+    assert "VIX: spike day" in sec.lines and not any("None" in x for x in sec.lines)

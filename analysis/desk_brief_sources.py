@@ -755,8 +755,9 @@ def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day
     if fed.get("phase"):
         lines.append(f"Fed balance sheet: {fed['phase']}" + (f" (as of {fed['obs_date']})" if fed.get("obs_date") else ""))
     if vix.get("third") or vix.get("spike_state"):
-        lines.append(f"VIX: {vix.get('third')} third, {vix.get('spike_state')}"
-                     + (f" (close of {vix['obs_date']})" if vix.get("obs_date") else "") + (", stale" if vix.get("stale") else ""))
+        parts = ([f"{vix['third']} third"] if vix.get("third") else []) + ([str(vix["spike_state"])] if vix.get("spike_state") else [])
+        lines.append("VIX: " + ", ".join(parts) + (f" (close of {vix['obs_date']})" if vix.get("obs_date") else "")
+                     + (", stale" if vix.get("stale") else ""))
     if vix.get("stale"):
         problems.append(f"row for {day}: the VIX close in it is marked stale")
     if expected is not None and day < expected.isoformat():
