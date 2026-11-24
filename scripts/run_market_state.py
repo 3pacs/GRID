@@ -22,6 +22,14 @@ vintages (``--no-refresh`` is accepted and changes nothing; no flag turns a refr
 ``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is still the one
 this writer makes the next evening.
 
+Each decision record also carries a ``spells`` block (``intelligence/regime/spells.py``, #1309): every variable's
+current label spell and three named spells, derived from the stored labels of earlier sessions plus this record, and
+the transitions read at this session (``source: writer``). A provisional record has none. A dry run follows the
+same admission as the command without ``--dry-run``: it reads which targets already have rows and records, in
+``writer_provenance.dry_run_admission``, what the live run would do (``would_write``, ``would_replace``,
+``would_hold`` or ``existing_row_preserved``). Later targets' spells follow only the records the live run would
+store, so a dry run's spells blocks are the live run's.
+
 Before computing, a real run fetches the FRED vintages published since the last stored one for the news indexes
 (``ingestion/fred_vintages.py``; ``--no-refresh`` skips it). First time: ``python -m ingestion.fred_vintages backfill``.
 """
@@ -114,9 +122,25 @@ def readiness(record: dict, target: date) -> dict:
     }
 
 
+def dry_run_admission(*, existing: bool, replace: bool, hold: bool) -> str:
+    """What the same command without ``--dry-run`` would do with one target, in the live path's order (#1309).
+
+    The live run skips a target that already has a row (unless ``--replace``) before computing it, then holds one
+    whose dealer gate fails, then writes. Only ``would_write`` and ``would_replace`` advance later targets' spells.
+    """
+    if existing and not replace:
+        return "existing_row_preserved"
+    if hold:
+        return "would_hold"
+    return "would_replace" if replace else "would_write"
+
+
+ADVANCES_SPELLS = frozenset({"would_write", "would_replace"})
+
+
 def code_receipt() -> dict:
     names = ("scripts/run_market_state.py", "intelligence/regime/market_state.py",
-             "intelligence/regime/baseline.py", "intelligence/regime/state_vector.py",
+             "intelligence/regime/baseline.py", "intelligence/regime/spells.py", "intelligence/regime/state_vector.py",
              "physics/dealer_gex_daily.py", "ingestion/market_calendar.py",
              "store/observations.py", "store/fred_vintages.py", "analysis/factory_session_calendar.py",
              "config/econ_release_dates.json")
@@ -151,7 +175,8 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         print("market-state: refusing empty or nontrading target sessions", file=sys.stderr)
         return 2
 
-    from intelligence.regime.market_state import compute_market_state, load_calendar, store_market_state
+    from intelligence.regime.market_state import RECORD_RULE, compute_market_state, load_calendar, store_market_state
+    from intelligence.regime.spells import SpellRow, load_rows, record_spells, spells_unavailable
 
     if engine is None:
         from db import get_engine
@@ -159,11 +184,14 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         engine = get_engine()
     started = datetime.now(timezone.utc).isoformat()
     run_id = str(uuid.uuid4())
-    outcomes, pending = [], []
+    outcomes, pending, preserved = [], [], set()
     for t in targets:
-        old = None if a.dry_run or a.replace else existing_row(engine, t)
+        old = None if a.replace else existing_row(engine, t)   # a read; a dry run needs it to mirror admission
         if old is None:
             pending.append(t)
+        elif a.dry_run:          # still computed and printed, but the live run would leave the stored row
+            pending.append(t)
+            preserved.add(t)
         else:
             outcomes.append({"target_session": t.isoformat(), "outcome": "already_present",
                              "written_this_run": False, "forward_qualified": False,
@@ -177,10 +205,21 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         refresh = [refresh_vintages(engine, s) for s in SERIES]
     written = held = 0
     code = code_receipt()
+    # Spells (#1309) read the stored labels once, then follow the records this run stores (a dry run: would store),
+    # so a range sees its earlier targets and a dry run's blocks are the live run's. A failed read leaves every record
+    # without spells, never unwritten.
+    spell_rows: dict[date, SpellRow] | None = {}
+    spell_error = ""
+    if pending:
+        try:
+            spell_rows = {r.as_of: r for r in load_rows(engine, through=max(pending))}
+        except Exception as exc:  # spells never sink the record
+            spell_rows, spell_error = None, f"error reading stored labels: {type(exc).__name__}"
     for t in pending:
         state = compute_market_state(engine, t, calendar=calendar)
         rec = state.to_dict()
         ready = readiness(rec, t)
+        hold = a.require_target_dealer and not ready["dealer_target_ready"]
         state.writer_provenance = {
             "run_id": run_id, "started_at": started, "target_session": t.isoformat(),
             "cutoff_exclusive": (t + timedelta(days=1)).isoformat() + "T00:00:00+00:00",
@@ -189,26 +228,43 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             "dry_run": a.dry_run, "target_dealer_required": a.require_target_dealer,
             "execution_origin": "unverified", "code_sha256": code, "readiness": ready,
         }
-        outcome = {**ready, "written_this_run": False}
+        admission = dry_run_admission(existing=t in preserved, replace=a.replace, hold=hold) if a.dry_run else None
+        if admission is not None:
+            state.writer_provenance["dry_run_admission"] = admission
+        state.spells = (record_spells(spell_rows.values(), t, RECORD_RULE, state.to_dict())
+                        if spell_rows is not None else spells_unavailable(t, spell_error))
+        outcome = {**ready, "written_this_run": False, "spells_status": state.spells.get("status")}
         if a.dry_run:
             outcome["outcome"] = "dry_run"
-            outcome["would_hold"] = a.require_target_dealer and not ready["dealer_target_ready"]
+            outcome["dry_run_admission"] = admission
+            if spell_rows is not None and admission in ADVANCES_SPELLS:
+                spell_rows[t] = SpellRow.from_record(t, RECORD_RULE, state.to_dict())
+            outcome["would_hold"] = hold
             if a.json:
                 print(json.dumps(state.to_dict(), sort_keys=True, default=str))
             else:
-                print(f"market-state {t}: {rec['coverage']['ok']}/{rec['coverage']['total']} variables ok (dry run)")
-        elif a.require_target_dealer and not ready["dealer_target_ready"]:
+                print(f"market-state {t}: {rec['coverage']['ok']}/{rec['coverage']['total']} variables ok "
+                      f"(dry run: {admission})")
+        elif hold:
             outcome["outcome"] = "held_missing_target_dealer"
             held += 1
         elif store_market_state(engine, state, replace=a.replace):
             written += 1
             outcome["outcome"] = "replaced" if a.replace else "written"
             outcome["written_this_run"] = True
+            if spell_rows is not None:
+                spell_rows[t] = SpellRow.from_record(t, RECORD_RULE, state.to_dict())
         else:
             # A competing insert can win after our preflight. Never report our computed
             # metadata as the winner's stored provenance or overwrite that record.
             outcome = {"target_session": t.isoformat(), "outcome": "already_present_race",
                        "written_this_run": False, "forward_qualified": False}
+            if spell_rows is not None:  # later targets follow the winner's stored labels, not ours
+                spell_rows.pop(t, None)
+                try:
+                    spell_rows.update({r.as_of: r for r in load_rows(engine, through=t) if r.as_of == t})
+                except Exception as exc:  # spells never sink the record
+                    spell_rows, spell_error = None, f"error reading stored labels: {type(exc).__name__}"
         outcomes.append(outcome)
     if not a.dry_run:
         summary = {"job": "run_market_state", "run_id": run_id, "sessions": len(targets),

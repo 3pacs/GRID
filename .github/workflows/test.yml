@@ -150,6 +150,19 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_13f_holdings_graph_pg.py -q -rA
 
+      # Stored-close backfill (scripts/close_backfill_universe.py): the work
+      # queries, the completed-close reader and the fill-only write on
+      # PostgreSQL. The test fails instead of skipping when
+      # REQUIRE_CLOSE_BACKFILL_PG=1.
+      - name: Stored-close backfill PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_CLOSE_BACKFILL_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_close_backfill_universe_pg.py -q -rA
+
       - name: Pipeline health PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test

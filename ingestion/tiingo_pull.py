@@ -72,6 +72,7 @@ _REQUEST_TIMEOUT = 30
 ROUTINE_OVERLAP_DAYS = 10          # re-check this many days behind the latest stored session
 LAPSED_WINDOW_DAYS = 10            # a close this recent before the expected session = the ticker was live
 MAX_NAMED_TICKERS = 50             # tickers named per bucket in the pull summary and log
+MAX_COVERAGE_CHECKS = 25           # lapsed tickers whose Tiingo listing is read per run (evidence only)
 NEW_TICKER_START = "2020-01-01"    # routine first pull for a ticker with no TIINGO rows (pull_ticker's default)
 EOD_READY_ET = dtime(18, 0)        # a session's EOD bar is treated as published from 18:00 America/New_York
 DEFAULT_MAX_WORKERS = 3            # concurrent HTTP fetches
@@ -97,6 +98,27 @@ SUPPLY_CHAIN_NODE_IDS_SQL = (
     "SELECT upstream_id FROM supply_chain_edges UNION SELECT downstream_id FROM supply_chain_edges"
 )
 INSIDER_MAX_TICKERS = 1000
+# The freshness-audit universe: tickers of the signal_registry modules whose
+# ticker_metrics_daily closes the daily audit grades (the same rule as
+# scripts/freshness_audit_universe.sql). Twelve Data was the only writer
+# keeping those closes current (2026-11-23: 209 of the 618 had no stored close
+# of their own in the last 5 days). Twelve Data is dropped (owner, 2026-11-23),
+# so they get a routine Tiingo close and scripts/close_backfill_universe.py
+# copies it across.
+FRESHNESS_UNIVERSE_MODULES: tuple[str, ...] = (
+    "lever_pullers", "alpha_research:vol_price_divergence", "news_intel",
+    "sector_network", "earnings_intel",
+)
+FRESHNESS_UNIVERSE_MAX_TICKERS = 2000
+FRESHNESS_UNIVERSE_TICKERS_SQL = """
+    SELECT DISTINCT ticker
+    FROM signal_registry
+    WHERE ticker IS NOT NULL
+      AND ticker ~ '^[A-Z]{1,6}$'
+      AND source_module = ANY(:modules)
+    ORDER BY ticker
+    LIMIT :cap
+"""
 INSIDER_BUYER_TICKERS_SQL = """
     SELECT t FROM (
         SELECT upper(trim(ticker)) AS t, source_type,
@@ -187,7 +209,8 @@ def still_behind(results: list[dict[str, Any]], expected: date) -> list[tuple[st
     still has no close for ``expected``: no data, a failed fetch, or data
     that stops earlier. A ticker last seen inside ``LAPSED_WINDOW_DAYS`` was
     trading, so missing it now is a failure, not a delisting; the pull
-    reports PARTIAL and names it. Long-dead and never-served symbols (renamed
+    reports PARTIAL and names it, with what Tiingo's own listing says about it
+    (:func:`listing_state`). Long-dead and never-served symbols (renamed
     companies, FX, crypto) are counted but do not fail the run.
     """
     out: list[tuple[str, date | None]] = []
@@ -199,6 +222,34 @@ def still_behind(results: list[dict[str, Any]], expected: date) -> list[tuple[st
         if latest is None or latest < expected:
             out.append((r["ticker"], before))
     return out
+
+
+LISTING_NOT_READ = "listing not read"
+LISTING_NOT_FOUND = "not found in Tiingo's listing"
+LISTING_NO_DATES = "no dates in Tiingo's listing"
+
+
+def listing_state(found: bool | None, coverage_end: date | None) -> str:
+    """What Tiingo's own listing says about a lapsed ticker, as evidence only.
+
+    2026-11-10..23: every routine price run was PARTIAL for a few tickers
+    Tiingo itself had stopped serving (KPTI ``endDate`` 2026-11-10, ROKU
+    2026-11-06, BKH no dates, GWHT not found). The run now reads the listing
+    of each lapsed ticker and reports it next to the name, so whoever marks
+    the ticker in analysis/sector_map_ticker_status.yaml has the evidence.
+
+    It never changes the run's status. A listing without dates can be an
+    incomplete record of a live ticker, and an old ``endDate`` can be a late
+    vendor: neither establishes a delisting. A lapsed ticker stays lapsed, and
+    the run stays PARTIAL, until the ticker is marked in the sidecar.
+    """
+    if found is None:
+        return LISTING_NOT_READ
+    if not found:
+        return LISTING_NOT_FOUND
+    if coverage_end is None:
+        return LISTING_NO_DATES
+    return f"listing ends {coverage_end.isoformat()}"
 
 
 def _tiingo_headers() -> dict[str, str]:
@@ -396,6 +447,40 @@ class TiingoPuller(BasePuller):
             result["errors"].append(err_str)
 
         return result
+
+    def _listing(
+        self, ticker: str, limiter: _RateLimiter | None = None,
+    ) -> tuple[bool | None, date | None]:
+        """Tiingo's own listing for ``ticker``: ``(found, endDate)``.
+
+        ``(False, None)``: HTTP 404. ``(True, None)``: listed without a usable
+        ``endDate``. ``(None, None)``: no usable answer (rate limit, server
+        error, network, odd body). Evidence for :func:`listing_state` only.
+        """
+        if limiter is not None:
+            limiter.wait()
+        try:
+            resp = requests.get(
+                f"{_BASE_URL}/tiingo/daily/{ticker}",
+                headers=_tiingo_headers(), timeout=_REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 404:
+                return False, None
+            if resp.status_code != 200:
+                return None, None
+            meta = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Tiingo {t}: listing lookup failed ({e})", t=ticker, e=type(exc).__name__)
+            return None, None
+        if not isinstance(meta, dict):
+            return None, None
+        raw_end = meta.get("endDate")
+        if raw_end is None:
+            return True, None
+        try:
+            return True, date.fromisoformat(str(raw_end)[:10])
+        except ValueError:
+            return None, None
 
     def _split_rows(self, ticker: str, df: pd.DataFrame) -> list[dict[str, Any]]:
         """``YF:{ticker}:split_factor`` rows for the non-unit ``splitFactor`` days in ``df``.
@@ -665,6 +750,27 @@ class TiingoPuller(BasePuller):
                 if t and not is_placeholder_ticker(t) and is_testable_ticker(t) and is_tiingo_equity(t)]
 
     @staticmethod
+    def freshness_universe_tickers(db_engine: Engine) -> list[str]:
+        """Listed equities in the freshness-audit universe (see FRESHNESS_UNIVERSE_TICKERS_SQL).
+
+        Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.actor_identity import is_placeholder_ticker
+            from intelligence.sleuth_intersections import is_testable_ticker
+
+            with db_engine.connect() as conn:
+                rows = conn.execute(text(FRESHNESS_UNIVERSE_TICKERS_SQL), {
+                    "modules": list(FRESHNESS_UNIVERSE_MODULES),
+                    "cap": FRESHNESS_UNIVERSE_MAX_TICKERS,
+                }).fetchall()
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: freshness universe unavailable: {e}", e=str(exc))
+            return []
+        return [t for (t,) in rows
+                if t and not is_placeholder_ticker(t) and is_testable_ticker(t) and is_tiingo_equity(t)]
+
+    @staticmethod
     def default_tickers(db_engine: Engine | None = None) -> list[str]:
         """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle,
         active-hypothesis and insider-buyer universes.
@@ -679,7 +785,9 @@ class TiingoPuller(BasePuller):
         insider buyers (:meth:`insider_buyer_tickers`; 2026-11-08: 287 of 332
         had no routine close), and so is every listed supply-chain graph node
         (:meth:`supply_chain_tickers`; 2026-11-16: 29 of 203 had no close since
-        April).
+        April), and so is the freshness-audit universe
+        (:meth:`freshness_universe_tickers`; 2026-11-23: 209 of 618 had no
+        stored close in 5 days and were kept current only by Twelve Data).
 
         Sector-map tickers go through ``analysis.sector_map.price_tickers``:
         renamed symbols are swapped for their successor and acquired,
@@ -695,6 +803,7 @@ class TiingoPuller(BasePuller):
             all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
             all_tickers.update(TiingoPuller.insider_buyer_tickers(db_engine))
             all_tickers.update(TiingoPuller.supply_chain_tickers(db_engine))
+            all_tickers.update(TiingoPuller.freshness_universe_tickers(db_engine))
         try:
             from analysis.sector_map import price_ticker, price_tickers
             all_tickers.update(price_tickers())
@@ -722,7 +831,8 @@ class TiingoPuller(BasePuller):
         dict whose ``status`` is SUCCESS, PARTIAL (stopped by
         ``should_continue`` or the index-corruption breaker, or a ticker that
         was trading inside ``LAPSED_WINDOW_DAYS`` got no close for the expected
-        session: see :func:`still_behind`), FAILED (most
+        session: see :func:`still_behind`; ``lapsed_listing`` carries what
+        Tiingo's listing says about each, as evidence only), FAILED (most
         fetches failed) or SKIPPED (another run holds the lock -- callers
         must not treat that as a completed pull).
         """
@@ -793,6 +903,14 @@ class TiingoPuller(BasePuller):
             lapsed = [t for t, before in behind
                       if before is not None
                       and before >= expected - timedelta(days=LAPSED_WINDOW_DAYS)]
+            # Read Tiingo's listing for each lapsed ticker and report it next
+            # to the name. Evidence only: the status is not changed by it
+            # (see listing_state).
+            lapsed_listing: dict[str, str] = {}
+            for ticker in lapsed[:MAX_COVERAGE_CHECKS]:
+                if should_continue is not None and not should_continue():
+                    break
+                lapsed_listing[ticker] = listing_state(*self._listing(ticker, limiter))
             if fetched >= 10 and failed * 2 > fetched:
                 status = "FAILED"
             elif unattempted or _INDEX_CORRUPTED_BREAKER or lapsed:
@@ -815,6 +933,7 @@ class TiingoPuller(BasePuller):
                                     if r["status"] == "PARTIAL"][:MAX_NAMED_TICKERS],
                 "behind": len(behind),
                 "lapsed_tickers": lapsed[:MAX_NAMED_TICKERS],
+                "lapsed_listing": lapsed_listing,
             }
             if status == "FAILED":
                 summary["error"] = f"{failed}/{fetched} Tiingo fetches failed"
@@ -822,7 +941,9 @@ class TiingoPuller(BasePuller):
                 summary["error"] = (
                     f"{len(lapsed)} ticker(s) with a close in the {LAPSED_WINDOW_DAYS} days "
                     f"before {expected.isoformat()} got none for it: "
-                    + ", ".join(lapsed[:MAX_NAMED_TICKERS]))
+                    + ", ".join(
+                        f"{t} ({lapsed_listing[t]})" if t in lapsed_listing else t
+                        for t in lapsed[:MAX_NAMED_TICKERS]))
             log.info(
                 "Tiingo incremental pull {s}: {c} current, {f} fetched, {ok} ok, "
                 "{nd} no data, {fl} failed, {u} unattempted, {r} rows",

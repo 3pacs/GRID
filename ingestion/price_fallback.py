@@ -2,9 +2,10 @@
 Backup price data puller — runs when yfinance is unreliable.
 
 Uses free-tier APIs as fallback sources:
-1. Alpha Vantage (ALPHAVANTAGE_API_KEY env var, free: 25 req/day)
-2. Twelve Data (TWELVEDATA_API_KEY env var, free: 800 req/day)
-3. Stooq.com (no API key needed, CSV download)
+1. Stooq.com (no API key needed, CSV download)
+2. Alpha Vantage (ALPHAVANTAGE_API_KEY env var, free: 25 req/day)
+
+Twelve Data was the third source until 2026-11-23 (owner: dropped).
 
 Falls through sources in priority order until one succeeds.
 
@@ -41,7 +42,6 @@ class PriceFallbackPuller:
     def __init__(self, db_engine: Any = None) -> None:
         self.engine = db_engine
         self.av_key = os.getenv("ALPHAVANTAGE_API_KEY", "")
-        self.td_key = os.getenv("TWELVEDATA_API_KEY", "")
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "GRID/4.0"})
 
@@ -51,7 +51,7 @@ class PriceFallbackPuller:
         Returns dict with keys: ticker, price, date, source
         or None if all sources fail.
         """
-        for source_fn in [self._stooq, self._alpha_vantage, self._twelve_data]:
+        for source_fn in [self._stooq, self._alpha_vantage]:
             try:
                 result = source_fn(ticker)
                 if result and result.get("price"):
@@ -120,24 +120,6 @@ class PriceFallbackPuller:
             "price": float(price),
             "date": quote.get("07. latest trading day", date.today().isoformat()),
             "source": "alpha_vantage",
-        }
-
-    def _twelve_data(self, ticker: str) -> dict | None:
-        """Twelve Data — free tier, 800 requests/day."""
-        if not self.td_key:
-            return None
-        url = f"https://api.twelvedata.com/price?symbol={ticker}&apikey={self.td_key}"
-        resp = self._session.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        price = data.get("price")
-        if not price:
-            return None
-        return {
-            "ticker": ticker,
-            "price": float(price),
-            "date": date.today().isoformat(),
-            "source": "twelve_data",
         }
 
     def save_to_db(self, results: list[dict]) -> int:
