@@ -566,7 +566,7 @@ class TestPredictRegimeRouting:
             "model_b": pytest.approx(0.3),
         }
 
-    def test_different_regimes_yield_different_vote_weights(self, mock_engine):
+    def test_different_regimes_yield_different_regime_router_weights(self, mock_engine):
         predictor = _build_predictor_with_stub_factory(mock_engine)
 
         def _weights_for(name, regime):
@@ -596,12 +596,19 @@ class TestPredictRegimeRouting:
             ):
                 pred_exp = predictor.predict("AAPL")
 
-        top_crisis = pred_crisis.model_votes[0]["model_name"]
-        top_exp = pred_exp.model_votes[0]["model_name"]
-        # model_a dominates in CRISIS, model_b in EXPANSION
-        assert top_crisis == "model_a"
-        assert top_exp == "model_b"
-        assert top_crisis != top_exp
+        # Regime router weights are exposed on the prediction and per-vote
+        # metadata, while vote_weight stays anchored to hit_rate alone (no
+        # triple-counting of oracle_models hit history).
+        assert pred_crisis.regime_router_weights == {
+            "model_a": pytest.approx(2.5),
+            "model_b": pytest.approx(0.2),
+        }
+        assert pred_exp.regime_router_weights == {
+            "model_a": pytest.approx(0.2),
+            "model_b": pytest.approx(2.5),
+        }
+        for v in pred_crisis.model_votes + pred_exp.model_votes:
+            assert v["vote_weight"] == pytest.approx(0.6)
 
     def test_prediction_regime_and_liquidity_state_agree(self, mock_engine):
         """ALPHA-5 dampener and ALPHA-13 router must read the SAME regime

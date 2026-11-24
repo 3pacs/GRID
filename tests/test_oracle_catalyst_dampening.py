@@ -1,9 +1,11 @@
 """ALPHA-4 follow-up — confidence dampening from catalyst_aggregator into oracle.predict.
 
 Locks the behavior: when an imminent high-impact catalyst is in the
-prediction's horizon window, the EnsemblePrediction.confidence is dampened
-by up to 50% AND the catalyst_proximity / catalyst_type fields are stamped
-on the returned object. Direction + strength are untouched.
+prediction's horizon window, the edge of EnsemblePrediction.confidence over
+0.5 is dampened by up to 50% AND the catalyst_proximity / catalyst_type
+fields are stamped on the returned object. Direction + strength are
+untouched, and the damped confidence never crosses 0.5 (Codex HOLD
+6011902881: 0.8 x 0.5 used to give 0.4, a bullish call below a coin flip).
 """
 from __future__ import annotations
 
@@ -136,9 +138,9 @@ class TestPredictCatalystDampening:
             result = p.predict("SPY", as_of=datetime(2026, 4, 29, tzinfo=timezone.utc))
         assert result.catalyst_proximity == 1.0
         assert result.catalyst_type == "fomc"
-        # 1.0 proximity → multiply confidence by (1 - 0.5*1.0) = 0.5
-        # baseline 0.8 → dampened 0.4
-        assert abs(result.confidence - 0.4) < 0.01
+        # 1.0 proximity → multiply the edge over 0.5 by (1 - 0.5*1.0) = 0.5
+        # baseline 0.8 → dampened 0.5 + 0.3 * 0.5 = 0.65
+        assert abs(result.confidence - 0.65) < 0.01
 
     def test_partial_proximity_partial_dampening(self):
         p = _stub_predictor()
@@ -147,9 +149,9 @@ class TestPredictCatalystDampening:
                                "nearest": object(), "days_to_event": 5,
                                "window_density": 1}
             result = p.predict("AAPL", as_of=datetime(2026, 5, 1, tzinfo=timezone.utc))
-        # 0.4 proximity → factor (1 - 0.5*0.4) = 0.8
-        # baseline 0.8 → dampened 0.64
-        assert abs(result.confidence - 0.64) < 0.01
+        # 0.4 proximity → edge factor (1 - 0.5*0.4) = 0.8
+        # baseline 0.8 → dampened 0.5 + 0.3 * 0.8 = 0.74
+        assert abs(result.confidence - 0.74) < 0.01
         assert result.catalyst_type == "earnings"
 
     def test_direction_and_strength_unchanged_by_dampening(self):
