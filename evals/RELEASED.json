@@ -210,7 +210,7 @@
       "path": "evals/e1",
       "manifest_sha256": "d71584c83d6d77d8fad4269d4681d0a44332a716db7043a66dd5ce206e981a91",
       "released_in": "GRID #1372 (draft; merge pending)",
-      "approved_by": "TBD: owner merge decision (3pacs)",
+      "approved_by": "Anik (owner) signed off 2026-11-23: E1 v1.4, E1-V7c closed by the bridge stamping fix; historical backdated TwelveData rows left for separate remediation",
       "note": "E1 v1.4: E1-V7c closed. scripts/backfill_resolved_series_from_ticker_metrics.sql stamps release_date = vintage_date = the ticker_metrics_daily fetch day (UTC, never before obs_date), so its strict xfail XPASSed and is removed. Rows written before the fix are not rewritten (count: scripts/count_release_before_vintage.py)."
     }
   ]
