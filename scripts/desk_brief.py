@@ -60,6 +60,7 @@ def collect(kind: str, session: B.SessionTimes, prev_day: date, as_of: datetime,
     ms = S.market_state(engine, kind, session, as_of, expected) if engine is not None else B.Section(
         "market_state", "Market state", "unknown", "griddb market_state_daily", problems=("no database configured",))
     sections.append(ms)
+    sections.append(S.desk_sector_state(cfg.get("desk_state_db"), kind, session, prev_day, as_of, prev_day))
     sections.append(S.calendar(session, as_of, market_events=(ms.facts or {}).get("events")))
     if kind == "post_close":
         sections.append(S.paper_record(cfg.get("paper_record"), kind, as_of))

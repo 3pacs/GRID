@@ -1,0 +1,265 @@
+"""The scheduled GDELT DOC puller is retired: held, not deleted, and no reader
+presents its last values as current.
+
+2026-11-23 on grid-svr: ``smart:gdelt`` had no SUCCESS since 11-04 (25 runs
+ended in HTTP 429), and ``api.gdeltproject.org:443`` refused TCP connections
+from three hosts at 22:30Z. The actor-tone and tension features stopped on
+11-03/06, yet ``/physics/news-momentum`` still answered ``available: true``
+from a 90-day window, and 14 of the features were model-eligible with
+forward fill.
+"""
+
+from __future__ import annotations
+
+import importlib
+from datetime import date, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import numpy as np
+import pandas as pd
+import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import create_engine, text
+
+import ingestion.smart_scheduler as ss
+from ingestion.altdata import gdelt
+from physics import momentum as pm
+
+ROOT = Path(__file__).resolve().parents[1]
+revision = importlib.import_module("migrations.versions.gdelt_doc_retire_20261123")
+AS_OF = date(2026, 11, 23)
+
+
+# ── scheduling ──────────────────────────────────────────────────────────────
+
+def test_registry_entry_is_held_with_the_measured_reason_and_kept() -> None:
+    (entry,) = [p for p in ss.PULLER_REGISTRY if p["name"] == "gdelt"]
+    reason = entry["hold_reason"]
+    assert reason.startswith("Retired 2026-11-23 (owner)")
+    assert "429" in reason and "refused TCP" in reason
+    assert ss.hold_reason_for("gdelt") == reason
+    # Not deleted: the entry still names the module and class that exist.
+    assert entry["mod"] == "ingestion.altdata.gdelt" and entry["cls"] == "GDELTPuller"
+    assert callable(getattr(gdelt.GDELTPuller, entry["method"]))
+
+
+def test_grid_scheduler_follows_the_same_hold() -> None:
+    source = (ROOT / "ingestion" / "scheduler.py").read_text(encoding="utf-8")
+    gate = source.index('hold_reason_for("gdelt")')
+    build = source.index('pullers.append(("GDELT", GDELTPuller(db_engine)')
+    assert gate < build
+    assert source.count("GDELTPuller(db_engine)") == 1     # no ungated second path
+    block = source[gate:build]
+    assert "if _gdelt_hold:" in block and "else:" in block
+
+
+def test_hermes_repair_treats_gdelt_as_retired_under_every_log_name() -> None:
+    from scripts import hermes_fixers as hf
+
+    held = hf._held_source_names()
+    for alias in ("gdelt", "GDELT", "smart:gdelt"):
+        assert hf._normalize_source_key(alias) in held, alias
+    # No retry route either: the repair map only names runnable writers.
+    assert "GDELT" not in hf._CATALOG_TO_REGISTRY
+
+
+def test_bulk_file_loader_is_not_held() -> None:
+    assert not any(p.get("hold_reason") for p in ss.PULLER_REGISTRY if "gdelt_bulk" in p["name"])
+    from ingestion.altdata import gdelt_bulk
+    assert callable(gdelt_bulk.run_daily)
+
+
+# ── reader: news momentum ───────────────────────────────────────────────────
+
+def _analyzer(last_obs: date, n: int = 40) -> pm.NewsMomentumAnalyzer:
+    ids = {name: i + 1 for i, name in enumerate(pm.GDELT_ACTOR_TONE_FEATURES)}
+    days = [last_obs - timedelta(days=k) for k in range(n)][::-1]
+    rng = np.random.default_rng(7)
+    matrix = pd.DataFrame(
+        rng.normal(-1.0, 0.5, size=(n, len(ids))), index=pd.Index(days, name="obs_date"),
+        columns=list(ids.values()),
+    )
+    pit = MagicMock()
+    pit.get_feature_matrix.side_effect = lambda feature_ids, **_kw: (
+        matrix[feature_ids] if set(feature_ids) <= set(matrix.columns) else pd.DataFrame()
+    )
+    analyzer = pm.NewsMomentumAnalyzer(MagicMock(), pit)
+    analyzer._resolve_feature_ids = lambda names: ids if names == pm.GDELT_ACTOR_TONE_FEATURES else {}
+    return analyzer
+
+
+def test_tone_that_ended_weeks_ago_is_unavailable_and_says_when() -> None:
+    result = _analyzer(date(2026, 11, 6)).analyze(AS_OF, lookback_days=90)
+
+    assert result.available is False
+    assert result.sentiment_trend == result.direction == result.energy_state == "unavailable"
+    assert "2026-11-06" in result.details["note"]
+    assert result.details["tone_last_observed"] == "2026-11-06"
+    assert result.details["tone_age_days"] == 17
+    assert result.details["stale_after_days"] == pm.TONE_STALE_AFTER_DAYS
+    assert "trend" not in result.details and "energy" not in result.details
+    assert any("stale" in w for w in result.warnings)
+
+
+def test_a_registered_actor_with_no_column_in_the_pivot_does_not_break_the_read() -> None:
+    """The PIT pivot has no column for a feature with no row in the window.
+    One actor missing altogether must not raise before the staleness check
+    (Codex HOLD 6032263681)."""
+    for last_obs, available in ((AS_OF, True), (date(2026, 11, 6), False)):
+        analyzer = _analyzer(last_obs)
+        full = analyzer.pit_store.get_feature_matrix.side_effect
+        missing = 3                                         # this actor's feature id has no column
+
+        def without_one(feature_ids, _full=full, **kw):
+            return _full([f for f in feature_ids if f != missing], **kw)
+
+        analyzer.pit_store.get_feature_matrix.side_effect = without_one
+        result = analyzer.analyze(AS_OF, lookback_days=90)
+        assert result.available is available
+        if available:
+            assert len(result.details["features_available"]) == len(pm.GDELT_ACTOR_TONE_FEATURES) - 1
+        else:
+            assert result.details["tone_last_observed"] == "2026-11-06"
+
+
+def test_no_actor_column_at_all_is_unavailable() -> None:
+    analyzer = _analyzer(AS_OF)
+    analyzer.pit_store.get_feature_matrix.side_effect = lambda feature_ids, **_kw: pd.DataFrame(
+        {999: range(10)}, index=pd.Index([AS_OF - timedelta(days=k) for k in range(10)][::-1]))
+    result = analyzer.analyze(AS_OF, lookback_days=90)
+    assert result.available is False and "No GDELT actor-tone" in result.details["note"]
+
+
+@pytest.mark.parametrize(("age_days", "available"), [(0, True), (pm.TONE_STALE_AFTER_DAYS, True),
+                                                      (pm.TONE_STALE_AFTER_DAYS + 1, False)])
+def test_the_staleness_edge(age_days: int, available: bool) -> None:
+    result = _analyzer(AS_OF - timedelta(days=age_days)).analyze(AS_OF, lookback_days=90)
+
+    assert result.available is available
+    assert result.details["tone_last_observed"] == (AS_OF - timedelta(days=age_days)).isoformat()
+
+
+# ── registry migration ──────────────────────────────────────────────────────
+
+PRE_DEPRECATED = "2026-01-01 00:00:00"
+# Rows whose state before the migration must be provable afterwards.
+PRE_DEPRECATED_ROWS = {
+    "gdelt_opec_tone": (False, PRE_DEPRECATED),             # theme, already deprecated
+    "gdelt_actor_ueda_tone": (True, PRE_DEPRECATED),        # actor, already deprecated but still eligible
+}
+# After the migration: the earlier date is kept, and none is model-eligible.
+PRE_DEPRECATED_AFTER = {name: (False, PRE_DEPRECATED) for name in PRE_DEPRECATED_ROWS}
+OPTED_OUT_ROWS = {
+    "gdelt_actor_yellen_tone": (False, None),               # actor, opted out of model use before
+    "gdelt_tension_india_china": (False, None),             # tension, opted out before
+}
+UNTOUCHED_ROWS = {
+    "gdelt_avg_tone": (True, None),                         # bulk-file features
+    "gdelt_conflict_count": (False, None),
+    "gdelt_actor_powell_tone_v2": (True, None),             # not in the list
+    "sp500_full": (True, None),
+}
+
+
+def _registry(conn) -> dict[str, tuple[bool, object]]:
+    conn.exec_driver_sql(
+        "CREATE TABLE feature_registry (name TEXT UNIQUE, model_eligible BOOLEAN, deprecated_at TIMESTAMP)"
+    )
+    rows: dict[str, tuple[bool, object]] = {n: (True, None) for n in revision.ACTOR_AND_TENSION_FEATURES}
+    rows.update({n: (False, None) for n in revision.THEME_FEATURES})
+    rows.update(PRE_DEPRECATED_ROWS)
+    rows.update(OPTED_OUT_ROWS)
+    rows.update(UNTOUCHED_ROWS)
+    for name, (eligible, deprecated) in rows.items():
+        conn.execute(text("INSERT INTO feature_registry VALUES (:n, :e, :d)"),
+                     {"n": name, "e": eligible, "d": deprecated})
+    return rows
+
+
+def _rows(conn) -> dict[str, tuple[bool, object]]:
+    return {n: (bool(e), d) for n, e, d in
+            conn.exec_driver_sql("SELECT name, model_eligible, deprecated_at FROM feature_registry")}
+
+
+def _upgraded(monkeypatch: pytest.MonkeyPatch, times: int = 1):
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        before = _registry(conn)
+        monkeypatch.setattr(revision, "op", Operations(MigrationContext.configure(conn)))
+        for _ in range(times):
+            revision.upgrade()
+        return before, _rows(conn)
+
+
+def test_upgrade_retires_exactly_the_doc_features(monkeypatch: pytest.MonkeyPatch) -> None:
+    before, after = _upgraded(monkeypatch, times=2)      # idempotent
+
+    assert set(after) == set(before)
+    for name in revision.DOC_FEATURES:
+        assert after[name][0] is False and after[name][1] is not None, name
+    for name, state in UNTOUCHED_ROWS.items():
+        assert after[name] == state, name
+
+
+def test_a_row_deprecated_before_keeps_its_date_and_loses_eligibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The earlier deprecation date is not overwritten. A row that was
+    deprecated but left model-eligible is retired from model use too."""
+    before, after = _upgraded(monkeypatch, times=2)
+    for name, state in PRE_DEPRECATED_ROWS.items():
+        assert before[name] == state and after[name] == PRE_DEPRECATED_AFTER[name], name
+    assert before["gdelt_actor_ueda_tone"][0] is True and after["gdelt_actor_ueda_tone"][0] is False
+
+
+def test_no_doc_feature_is_selectable_by_the_model_eligible_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """oracle/engine.py selects features by family and ``model_eligible = TRUE``
+    and does not look at deprecated_at, so eligibility is what must be off."""
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        _registry(conn)
+        select = text("SELECT name FROM feature_registry WHERE model_eligible = TRUE AND name LIKE 'gdelt%' ORDER BY 1")
+        before = [n for (n,) in conn.execute(select)]
+        monkeypatch.setattr(revision, "op", Operations(MigrationContext.configure(conn)))
+        revision.upgrade()
+        after = [n for (n,) in conn.execute(select)]
+    assert "gdelt_actor_ueda_tone" in before and "gdelt_actor_powell_tone" in before
+    assert after == ["gdelt_actor_powell_tone_v2", "gdelt_avg_tone"]       # neither is a DOC feature
+
+
+def test_a_row_that_had_opted_out_stays_out_and_gains_the_deprecation(monkeypatch: pytest.MonkeyPatch) -> None:
+    before, after = _upgraded(monkeypatch)
+    for name in OPTED_OUT_ROWS:
+        assert before[name] == (False, None)
+        assert after[name][0] is False and after[name][1] is not None, name
+
+
+def test_downgrade_is_refused_and_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restoring defaults would erase the earlier deprecations and re-enable
+    the opt-outs above (Codex HOLD 6031396980), so there is no downgrade."""
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        _registry(conn)
+        monkeypatch.setattr(revision, "op", Operations(MigrationContext.configure(conn)))
+        revision.upgrade()
+        upgraded = _rows(conn)
+        with pytest.raises(RuntimeError, match="refused"):
+            revision.downgrade()
+        assert _rows(conn) == upgraded
+    for name, state in PRE_DEPRECATED_AFTER.items():
+        assert upgraded[name] == state, name
+
+
+def test_the_retired_list_is_the_doc_pullers_own_feature_set() -> None:
+    written = ({q["feature"] for q in gdelt.GDELT_QUERIES}
+               | {a["feature"] for a in gdelt.GDELT_ACTOR_QUERIES}
+               | {t["feature"] for t in gdelt.GDELT_TENSION_PAIRS})
+    assert set(revision.DOC_FEATURES) == written
+    assert set(revision.ACTOR_AND_TENSION_FEATURES) == (
+        set(pm.GDELT_ACTOR_TONE_FEATURES) | set(pm.GDELT_TENSION_FEATURES))
+    assert len(revision.DOC_FEATURES) == 24
+
+
+def test_chains_after_the_current_head() -> None:
+    assert revision.down_revision == "cboe_equity_pcr_20261123"
+    assert len(revision.revision) <= 32

@@ -84,10 +84,10 @@ class WalkForwardBacktest:
             vintage_policy: PIT vintage policy ('FIRST_RELEASE' or 'LATEST_AS_OF').
             cost_bps: Transaction cost assumption in basis points.
             predict_fn: Callable that takes a feature DataFrame and returns
-                        predictions. If None, uses a simple baseline. Used
-                        directly, unchanged, when ``fit_fn`` is not given --
-                        this is the original stateless-predictor path and
-                        existing callers keep working exactly as before.
+                        predictions. Required when ``fit_fn`` is not provided
+                        (raises ``ValueError`` if both ``predict_fn`` and
+                        ``fit_fn`` are ``None``). Used directly when ``fit_fn``
+                        is not given.
             target_feature_id: Which of ``feature_ids`` is the
                 target/underlying return series to trade and score against.
                 ``None`` keeps the old implicit "lowest feature id" default
@@ -112,6 +112,11 @@ class WalkForwardBacktest:
             dict: Comprehensive validation results suitable for storing in
                   validation_results table.
         """
+        if fit_fn is None and predict_fn is None:
+            raise ValueError(
+                "predict_fn (or fit_fn) is required for walk-forward validation"
+            )
+
         log.info(
             "Running walk-forward validation — hypothesis={h}, {sd} to {ed}, "
             "{n} splits, vintage={v}",
@@ -255,15 +260,17 @@ class WalkForwardBacktest:
             # out-of-sample returns rather than re-fitting or re-running a
             # single predictor across the whole start..end span (there is
             # no such single predictor in this path -- that is the point).
+            eval_index: pd.Index | None = None
             if era_returns_for_aggregate:
                 combined_returns = pd.concat(era_returns_for_aggregate).sort_index()
                 full_metrics = self._summarize_returns(combined_returns)
+                eval_index = combined_returns.index
             else:
                 full_metrics = {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "n_days": 0}
 
-            # Baseline is just "what would buy-and-hold have done over the
-            # whole window" -- it has no predictor and nothing to leak, so
-            # it is unaffected by the train/test split.
+            # Baseline is "what would buy-and-hold have done over the exact
+            # same scored dates as the strategy" -- no predictor and nothing
+            # to leak, aligned to the strategy's active return rows.
             baseline_matrix = self._fetch_pit_correct_matrix(
                 feature_ids=feature_ids,
                 start_date=start_date,
@@ -271,7 +278,9 @@ class WalkForwardBacktest:
                 vintage_policy=vintage_policy,
             )
             baseline_matrix = baseline_matrix.ffill().dropna()
-            baseline = self._compute_baseline_metrics(baseline_matrix, target_feature_id)
+            baseline = self._compute_baseline_metrics(
+                baseline_matrix, target_feature_id, eval_index=eval_index
+            )
         else:
             # Compute full-period metrics (same per-day PIT fetch as each era).
             full_matrix = self._fetch_pit_correct_matrix(
@@ -281,12 +290,16 @@ class WalkForwardBacktest:
                 vintage_policy=vintage_policy,
             )
             full_matrix = full_matrix.ffill().dropna()
-            full_metrics = self._compute_era_metrics(
+            full_metrics, full_adjusted = self._compute_era_metrics_with_returns(
                 full_matrix, predict_fn, cost_bps, target_feature_id
             )
 
-            # Baseline comparison (buy-and-hold equivalent)
-            baseline = self._compute_baseline_metrics(full_matrix, target_feature_id)
+            # Baseline comparison (buy-and-hold over the exact same active dates)
+            baseline = self._compute_baseline_metrics(
+                full_matrix,
+                target_feature_id,
+                eval_index=full_adjusted.index if full_adjusted is not None else None,
+            )
 
         # Simplicity comparison
         simplicity = self._compute_simplicity_comparison(
@@ -426,6 +439,9 @@ class WalkForwardBacktest:
             returns, rather than re-running a single predictor across era
             boundaries.
         """
+        if predict_fn is None:
+            raise ValueError("predict_fn is required and cannot be None")
+
         if matrix.empty:
             return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "n_days": 0}, None
 
@@ -482,13 +498,9 @@ class WalkForwardBacktest:
                 "n_total": n_total,
             }, None
 
-        # Predictions actually drive the result now. A missing/None
-        # prediction for a row is treated as "no position" (0), not as a
-        # wrong call and not dropped from the denominator.
-        if predict_fn is not None:
-            raw_signal = pd.Series(predict_fn(features), index=matrix.index)
-        else:
-            raw_signal = pd.Series(1.0, index=matrix.index)
+        # Predictions drive the strategy position. predict_fn is required
+        # (validated above).
+        raw_signal = pd.Series(predict_fn(features), index=matrix.index)
 
         # Same-bar lookahead guard: a signal computed from row t's own
         # features (which includes t's own already-realized return) has
@@ -498,13 +510,36 @@ class WalkForwardBacktest:
         # the return that already happened getting to t.
         lagged_signal = raw_signal.shift(1).reindex(valid_returns.index)
         n_warmup = int(lagged_signal.isna().sum())
-        signal = lagged_signal.astype(float).fillna(0.0)
 
-        strategy_returns = signal * valid_returns
+        # Trim leading warmup rows before the first defined lagged signal
+        # rather than zero-padding them: padding leading NaNs to 0.0 while
+        # the baseline earns returns on those rows creates spurious outperformance
+        # whenever the skipped opening move is negative. Interior NaNs after
+        # warmup remain explicit flat (0.0) abstentions.
+        first_valid = lagged_signal.first_valid_index()
+        if first_valid is None:
+            return {
+                "return": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "n_days": 0,
+                "n_missing": n_missing,
+                "n_warmup": n_warmup,
+                "n_total": n_total,
+            }, None
 
-        # Apply cost adjustment
-        cost_adjustment = cost_bps / 10000.0
-        adjusted_returns = strategy_returns - cost_adjustment / 252  # Daily cost
+        active_returns = valid_returns.loc[first_valid:]
+        signal = lagged_signal.loc[first_valid:].astype(float).fillna(0.0)
+
+        strategy_returns = signal * active_returns
+
+        # Turnover-based transaction cost: cost_bps / 1e4 * |Δposition| per
+        # period (initial entry from flat 0.0 pays |signal[0]|; holding pays 0;
+        # flat rows pay 0; reversing +1 -> -1 pays 2x cost_bps / 1e4).
+        prev_position = signal.shift(1, fill_value=0.0)
+        turnover = (signal - prev_position).abs()
+        cost = (cost_bps / 1e4) * turnover
+        adjusted_returns = strategy_returns - cost
 
         metrics = self._summarize_returns(adjusted_returns)
         metrics["n_missing"] = n_missing
@@ -548,6 +583,7 @@ class WalkForwardBacktest:
         self,
         matrix: pd.DataFrame,
         target_feature_id: int | None = None,
+        eval_index: pd.Index | None = None,
     ) -> dict[str, Any]:
         """Compute baseline (buy-and-hold) metrics.
 
@@ -556,6 +592,9 @@ class WalkForwardBacktest:
             target_feature_id: Same meaning as in ``_compute_era_metrics``.
                 The baseline has no ``predict_fn`` to hide the target from,
                 so this only picks which column to buy-and-hold.
+            eval_index: Optional date index of the strategy's active scored
+                return rows so baseline and strategy start and end on the
+                exact same rows.
 
         Returns:
             dict: Baseline performance metrics.
@@ -584,6 +623,8 @@ class WalkForwardBacktest:
             )
 
         returns = matrix[target_col].pct_change(fill_method=None).dropna()
+        if eval_index is not None:
+            returns = returns.reindex(eval_index).dropna()
         if returns.empty:
             return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
 

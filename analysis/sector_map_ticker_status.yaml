@@ -37,7 +37,7 @@ TICKER_STATUS:
   BKH:
     status: renamed
     successor: HZN
-    note: 'Black Hills and NorthWestern Energy merged to form Bright Horizon Energy (WOWT, 2026-11-16). The issuer''s exchange note (ir.blackhillscorp.com/exchange-shares) and OCC information memo 60193, named in Codex review 6031566036, answered this session with HTTP 403 and were not read. Tiingo lists HZN as Bright Horizon Energy Corp (NYSE) with history from 1984-09-07; that vendor history is not verified point-in-time continuity. Tiingo''s BKH listing has no start or end date (read 2026-11-23), so no last_session is given and no venue date is inferred. Last BKH close GRID stored from Tiingo is 2026-11-13'
+    note: 'Black Hills and NorthWestern Energy merged to form Bright Horizon Energy (WOWT, 2026-11-16). The issuer''s exchange note (ir.blackhillscorp.com/exchange-shares) answered this session with HTTP 403 and was not read; Codex review 6032263432 names the Black Hills issuer release and NorthWestern''s Form 8-K as corroboration of the BKH/HZN exchange, also not read here. Tiingo lists HZN as Bright Horizon Energy Corp (NYSE) with history from 1984-09-07; that vendor history is not verified point-in-time continuity. Tiingo''s BKH listing has no start or end date (read 2026-11-23), so no last_session is given and no venue date is inferred. Last BKH close GRID stored from Tiingo is 2026-11-13'
   EQR:
     status: renamed
     successor: VMRK

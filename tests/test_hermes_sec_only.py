@@ -718,6 +718,20 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # comments of smart_money / social_sentiment plus the 4-line comment
         # above social_ticker_series. No SEC, FINRA or dispatch code changes.
         # Needs reviewer acceptance like the prior pins.
+        # SCHED re-pinned 08c0356f -> 44a4eadc (2026-11-23,
+        # claude/gdelt-retire-20261123): the only scheduler edit is
+        # PULLER_REGISTRY data -- a hold_reason on the gdelt entry (owner
+        # retirement) with a 5-line comment above it. No SEC, FINRA or
+        # dispatch code changes. PR #1407 re-pins the same base for its
+        # quiverquant timeout_s edit; whichever merges second re-pins on the
+        # merged tail. Needs reviewer acceptance like the prior pins.
+        # SCHED re-pinned 44a4eadc -> da7202ec (2026-11-24,
+        # claude/puller-triage-20261123-a5d8fb, on main 6def2bcc with the
+        # GDELT hold above already merged): the only further scheduler edit is
+        # PULLER_REGISTRY data -- quiverquant timeout_s 120 -> 240 (runs take
+        # 84-124 s) with a trailing comment. etf_flows stays at 120. No SEC,
+        # FINRA or dispatch code changes. Needs reviewer acceptance like the
+        # prior pins.
         # OPER re-pinned 7a85e9a0 -> 754dfee2 (2026-11-22,
         # claude/hermes-weekly-due-20261122): the Sunday weekly block leaves
         # run_intelligence_tasks for its own step (_run_weekly_intel_step,
@@ -732,7 +746,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','da7202ecac77ff70a548ad2b9cc8bbf05137ccdea00b2870778f24fb90557a72')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

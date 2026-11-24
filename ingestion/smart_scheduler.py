@@ -1334,6 +1334,12 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
         # 60 s timeout cut runs short. pull_recent stops at deadline_at.
         "freq_h": 1,
         "timeout_s": 360,
+        # Not scheduled, not deleted: the module, its tests and the stored
+        # history stay. To bring it back, remove this hold (grid-scheduler
+        # follows it through hold_reason_for) and add a forward migration that
+        # re-enables the features wanted (gdelt_doc_retire_20261123 cannot be
+        # downgraded).
+        "hold_reason": "Retired 2026-11-23 (owner): no SUCCESS since 2026-11-04; the GDELT DOC API answered 429 on most runs since October and refused TCP connections from grid-svr, precision5520 and i7gen10 at 22:30Z on 2026-11-23. The daily GDELT event features come from the bulk files (gdelt_bulk), which still answer",
         "kwargs": {
             "days_back": 1,
             "max_theme_queries": 4,
@@ -1407,7 +1413,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env",
      "hold_reason": "Retired 2026-11-08 (owner): the Tiingo plan covers only the DOW 30 (89 of 138 tickers refused); market cap and shares come from sec_xbrl_shares (ticker_metrics_daily) for the full universe"},
-    {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
+    {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 240, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},  # 10 endpoints take 84-124 s; 120 s failed 5 of 13 runs (2026-11-19..23) that then finished and stored their rows
 
     # ── Crypto (DexScreener) ──
     # PumpFun is deliberately not registered (E1-V3): the entry named a
