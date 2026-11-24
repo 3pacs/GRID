@@ -189,12 +189,15 @@ _RETIRED = {
     "JQuants": "JQuantsPuller",                      # not in registry: removed
     "Telegram_Solana_Scanner": "TelegramScanner",    # no users configured
     "Discord_Solana_Scanner": "DiscordScanner",      # no users configured
+    # Registry hold from 2026-11-23 (owner): the DOC API refuses grid-svr. It
+    # was in _PRODUCING until then (5-10 rows a week through the 429s).
+    "GDELT": "GDELTPuller",
 }
 
 # Each wrote raw_series rows in the 30 days to 2026-11-17 (pull_log), or is
 # fed by another runner (CBOE_Indices); none of them may be dropped.
 _PRODUCING = [
-    "ECB_SDW", "BCB_BR", "MAS_SG", "AKShare", "OppInsights", "GDELT", "WorldNews",
+    "ECB_SDW", "BCB_BR", "MAS_SG", "AKShare", "OppInsights", "WorldNews",
     "OFR", "EDINET", "alphavantage_news_sentiment", "NYFed", "Congress_Trading",
     "Congress_Legislation", "SEC_Insider", "Unusual_Whales", "Smart_Money",
     "Fed_Liquidity", "SEC_XBRL_Financials", "ETF_Flows", "News_Scraper_RSS",
@@ -231,6 +234,14 @@ def test_retired_pullers_are_not_registered_or_constructed(monkeypatch):
     for name, cls in _RETIRED.items():
         assert name not in names, name
         assert cls not in constructed, cls
+
+
+def test_lifting_the_gdelt_hold_registers_it_again(monkeypatch):
+    _lift_holds(monkeypatch, "gdelt")
+    entries, constructed = _daily(monkeypatch)
+    (entry,) = [e for e in entries if e[0] == "GDELT"]
+    assert entry[2] == "pull_recent" and entry[3] == {"days_back": 2}
+    assert "GDELTPuller" in constructed
 
 
 def test_new_holds_are_dated_registry_holds():

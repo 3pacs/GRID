@@ -32,6 +32,8 @@ Data stored:
 
 from __future__ import annotations
 
+import json
+
 import logging
 import math
 import time
@@ -43,10 +45,12 @@ from typing import Any
 import pandas as pd
 import requests
 from loguru import logger as log
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
 from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, _stable_lock_key, retry_on_failure
 
 # yfinance logs expected missing/delisted ticker misses at ERROR internally.
 # This module treats those as upstream data absence, not Hermes/app failures.
@@ -534,6 +538,96 @@ def _aggregate_holdings_by_cusip(
 
 # Request timeout
 _REQUEST_TIMEOUT: int = 30
+
+# ── Re-runs write nothing new ────────────────────────────────────────────
+# The change rows used BasePuller._row_exists, whose window is one hour: every
+# run more than an hour after the last appended every row again (grid-svr
+# 2026-11-23: 167,475 rows for 41,762 distinct (series_id, obs_date), from five
+# runs in a day). A change row is now skipped only when the newest stored
+# vintage of its (series_id, obs_date) is the same observation: the same
+# filing pair (filing_accession, prev_filing_accession) and identical content.
+# Anything else is a new vintage and is stored, so point-in-time readers keep
+# every state GRID ever held: an amendment or a different prior filing, a
+# corrected value, a parser change, a failed earlier row.
+#
+# QUARANTINED rows are left out before the ranking: a quarantined row is never
+# the stored state. So an older identical SUCCESS under a newer QUARANTINED
+# copy still counts as stored (nothing is written), and a row whose every
+# stored copy is quarantined is written again.
+#
+# Two writers for the same manager and filing date (a timed-out run's orphaned
+# thread and the repair worker's retry, 2026-11-23) could both look up before
+# either committed and both insert: raw_series' uniqueness includes the write
+# timestamp. The lookup and the inserts therefore run under one
+# transaction-scoped advisory lock per (source, manager, filing date); the
+# second writer waits, then looks up what the first committed.
+#
+# The wait is bounded. A timed-out run is not stopped: its thread goes on, and
+# Hermes' repair worker abandons a retry after PER_SOURCE_REPAIR_SECONDS (60 s)
+# and starts another, so several orphaned writers can overlap. A writer waits
+# at most _CHANGE_ROW_LOCK_WAIT_S for one manager's lock and at most
+# _CHANGE_ROW_LOCK_BUDGET_S in a whole run; after that it only tries the lock.
+# A manager whose lock is not obtained is DEFERRED for this run: nothing is
+# written for it (no change row, no receipt) and the next run takes it.
+#
+# What this does not claim. Each writer fetches its filings before it takes
+# the lock, and raw_series stamps the write time itself. When two overlapping
+# writers hold different payloads, both are stored and the one that commits
+# last is the newest vintage, whichever fetch was newer. The vintage order is
+# the order of writes, not of fetches.
+_CHANGE_ROW_LOCK_WAIT_S: float = 5.0
+_CHANGE_ROW_LOCK_BUDGET_S: float = 20.0
+_PG_LOCK_NOT_AVAILABLE = "55P03"
+
+
+class ChangeRowsBusy(RuntimeError):
+    """Another writer holds this manager's change rows for this filing date."""
+# (uq_raw_series_composite makes pull_timestamp unique per series, source and
+# obs_date, so "newest" needs no tie-break.)
+_CHANGE_ROW_LOOKUP_CHUNK: int = 500
+_LATEST_CHANGE_ROWS_SQL = text(
+    "SELECT series_id, pull_status, value, raw_payload FROM ("
+    " SELECT series_id, pull_status, value, raw_payload,"
+    " ROW_NUMBER() OVER ("
+    "  PARTITION BY series_id ORDER BY pull_timestamp DESC"
+    " ) AS newest_rank"
+    " FROM raw_series"
+    " WHERE source_id = :src AND obs_date = :od AND series_id IN :sids"
+    " AND pull_status != 'QUARANTINED'"
+    ") newest_stored WHERE newest_rank = 1"
+).bindparams(bindparam("sids", expanding=True))
+_FILING_IDENTITY_KEYS: tuple[str, ...] = ("filing_accession", "prev_filing_accession")
+
+
+def _is_stored_observation(stored: tuple[Any, Any, Any] | None, value: float, payload: dict[str, Any]) -> bool:
+    """True when ``stored`` (status, value, raw_payload of the newest stored
+    vintage) is this same observation, so writing it again would add nothing.
+
+    Fails open: anything unreadable or different means "not stored", and the
+    caller writes a new vintage (the behaviour before this check existed).
+    """
+    if stored is None:
+        return False
+    status, stored_value, stored_payload = stored
+    if status != "SUCCESS" or stored_value is None:
+        return False
+    if isinstance(stored_payload, (str, bytes)):
+        try:
+            stored_payload = json.loads(stored_payload)
+        except ValueError:
+            return False
+    if not isinstance(stored_payload, dict):
+        return False
+    for key in _FILING_IDENTITY_KEYS:
+        if not payload.get(key) or stored_payload.get(key) != payload.get(key):
+            return False
+    try:
+        same_value = float(stored_value) == float(value)
+        # Compare what the store holds: the payload after its JSON round trip.
+        same_content = stored_payload == json.loads(json.dumps(payload))
+    except (TypeError, ValueError):
+        return False
+    return same_value and same_content
 
 # In-memory cache of CIKs that have permanently 404'd this process so we
 # stop hammering EDGAR (and stop spamming errors.jsonl) for filers whose
@@ -1327,6 +1421,60 @@ class InstitutionalFlowsPuller(BasePuller):
             evidence["failure"] = kind
             return FilingSnapshot(accession=accession, status=f"fetch_failed:{kind}", evidence=evidence)
 
+    def _lock_change_rows(self, conn: Any, cik: str, obs_date: date) -> None:
+        """Serialize writers of one manager's change rows for one filing date.
+
+        Must be the first statement of the transaction that looks the stored
+        rows up and inserts (see the note above ``_LATEST_CHANGE_ROWS_SQL``).
+        Waits at most ``_CHANGE_ROW_LOCK_WAIT_S``, and at most
+        ``_CHANGE_ROW_LOCK_BUDGET_S`` over the whole run; with the budget
+        spent it only tries the lock. PostgreSQL only; other dialects (the
+        SQLite test engines) have one writer and no advisory locks.
+
+        Raises:
+            ChangeRowsBusy: the lock was not obtained. The transaction must
+                be left without writing.
+        """
+        if conn.dialect.name != "postgresql":
+            return
+        key = _stable_lock_key(self.SOURCE_NAME, "13F-change-rows", cik, obs_date.isoformat())
+        spent = getattr(self, "_change_row_lock_wait_s", 0.0)
+        wait_s = min(_CHANGE_ROW_LOCK_WAIT_S, _CHANGE_ROW_LOCK_BUDGET_S - spent)
+        if wait_s <= 0:
+            if not conn.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": key}).scalar():
+                raise ChangeRowsBusy(f"13F change rows of {cik} for {obs_date} are held by another writer")
+            return
+        started = time.monotonic()
+        conn.execute(text("SELECT set_config('lock_timeout', :ms, true)"),
+                     {"ms": f"{max(1, int(wait_s * 1000))}ms"})
+        try:
+            conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
+        except DBAPIError as exc:
+            if getattr(exc.orig, "pgcode", None) == _PG_LOCK_NOT_AVAILABLE:
+                raise ChangeRowsBusy(
+                    f"13F change rows of {cik} for {obs_date} are held by another writer "
+                    f"(waited {wait_s:.1f} s)") from exc
+            raise
+        finally:
+            self._change_row_lock_wait_s = spent + (time.monotonic() - started)
+        conn.execute(text("SELECT set_config('lock_timeout', '0', true)"))
+
+    def _latest_stored_change_rows(
+        self, conn: Any, series_ids: list[str], obs_date: date,
+    ) -> dict[str, tuple[Any, Any, Any]]:
+        """Newest non-quarantined vintage per series for ``obs_date``:
+        ``{series_id: (pull_status, value, raw_payload)}``. Quarantined rows
+        are excluded before the ranking, not after it."""
+        latest: dict[str, tuple[Any, Any, Any]] = {}
+        for start in range(0, len(series_ids), _CHANGE_ROW_LOOKUP_CHUNK):
+            chunk = series_ids[start:start + _CHANGE_ROW_LOOKUP_CHUNK]
+            for sid, status, value, payload in conn.execute(
+                _LATEST_CHANGE_ROWS_SQL,
+                {"src": self.source_id, "od": obs_date, "sids": chunk},
+            ):
+                latest[str(sid)] = (status, value, payload)
+        return latest
+
     def _insert_receipt(
         self,
         conn: Any,
@@ -1369,6 +1517,7 @@ class InstitutionalFlowsPuller(BasePuller):
             List of result dicts per manager.
         """
         results: list[dict[str, Any]] = []
+        self._change_row_lock_wait_s = 0.0      # lock-wait budget of this run
 
         for cik, manager_name in TOP_13F_FILERS.items():
             try:
@@ -1524,14 +1673,62 @@ class InstitutionalFlowsPuller(BasePuller):
 
                 # Store changes
                 rows_inserted = 0
+                rows_unchanged = 0
                 with self.engine.begin() as conn:
+                    self._lock_change_rows(conn, cik, obs_date)
+                    stored_rows = self._latest_stored_change_rows(
+                        conn,
+                        [f"13F:{cik}:{chg['cusip']}:{chg['action']}" for chg in changes],
+                        obs_date,
+                    )
                     for chg in changes:
                         series_id = (
                             f"13F:{cik}:{chg['cusip']}:{chg['action']}"
                         )
                         value = float(chg.get("value_usd", 0))
+                        payload = {
+                            "manager_cik": cik,
+                            "manager_name": manager_name,
+                            "cusip": chg["cusip"],
+                            "issuer_name": chg.get("name", ""),
+                            "action": chg["action"],
+                            "estimated_flow_usd": chg.get("estimated_flow_usd"),
+                            "holdings_value_delta_usd": chg.get("holdings_value_delta_usd"),
+                            "curr_value_usd": chg.get("curr_value_usd"),
+                            "prev_value_usd": chg.get("prev_value_usd"),
+                            "pct_change": chg.get("pct_change"),
+                            "share_pct_change": chg.get("share_pct_change"),
+                            "shares": chg.get("shares"),
+                            "curr_shares": chg.get("curr_shares"),
+                            "prev_shares": chg.get("prev_shares"),
+                            "delta_shares": chg.get("delta_shares"),
+                            "valuation_price_usd": chg.get("valuation_price_usd"),
+                            "valuation_price_basis": chg.get("valuation_price_basis"),
+                            "flow_estimation_method": chg.get("flow_estimation_method"),
+                            "value_units": chg.get("value_units", "usd"),
+                            "value_multiplier": curr_mult,
+                            "prev_value_multiplier": prev_mult,
+                            "share_type": chg.get("share_type", "SH"),
+                            "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
+                            "unqualified_reason": chg.get("unqualified_reason"),
+                            "observation_kind": chg.get("observation_kind"),
+                            "measure": chg.get("measure"),
+                            "filing_accession": curr_acc,
+                            "prev_filing_accession": prev_acc,
+                            "filing_date": obs_date.isoformat(),
+                            "prev_filing_date": _parse_13f_date(prev_date_str).isoformat() if _parse_13f_date(prev_date_str) else None,
+                            "report_date": curr_report_date,
+                            "prev_report_date": prev_report_date,
+                            "form_type": curr_form,
+                            "is_amendment": curr_is_amendment,
+                            "replaces_accession": replaces_acc,
+                        }
 
-                        if self._row_exists(series_id, obs_date, conn):
+                        # A re-run that read the same filing pair and found
+                        # the same thing writes nothing (see the note above
+                        # _LATEST_CHANGE_ROWS_SQL).
+                        if _is_stored_observation(stored_rows.get(series_id), value, payload):
+                            rows_unchanged += 1
                             continue
 
                         self._insert_raw(
@@ -1539,43 +1736,7 @@ class InstitutionalFlowsPuller(BasePuller):
                             series_id=series_id,
                             obs_date=obs_date,
                             value=value,
-                            raw_payload={
-                                "manager_cik": cik,
-                                "manager_name": manager_name,
-                                "cusip": chg["cusip"],
-                                "issuer_name": chg.get("name", ""),
-                                "action": chg["action"],
-                                "estimated_flow_usd": chg.get("estimated_flow_usd"),
-                                "holdings_value_delta_usd": chg.get("holdings_value_delta_usd"),
-                                "curr_value_usd": chg.get("curr_value_usd"),
-                                "prev_value_usd": chg.get("prev_value_usd"),
-                                "pct_change": chg.get("pct_change"),
-                                "share_pct_change": chg.get("share_pct_change"),
-                                "shares": chg.get("shares"),
-                                "curr_shares": chg.get("curr_shares"),
-                                "prev_shares": chg.get("prev_shares"),
-                                "delta_shares": chg.get("delta_shares"),
-                                "valuation_price_usd": chg.get("valuation_price_usd"),
-                                "valuation_price_basis": chg.get("valuation_price_basis"),
-                                "flow_estimation_method": chg.get("flow_estimation_method"),
-                                "value_units": chg.get("value_units", "usd"),
-                                "value_multiplier": curr_mult,
-                                "prev_value_multiplier": prev_mult,
-                                "share_type": chg.get("share_type", "SH"),
-                                "qualified_for_directional_flow": chg.get("qualified_for_directional_flow", True),
-                                "unqualified_reason": chg.get("unqualified_reason"),
-                                "observation_kind": chg.get("observation_kind"),
-                                "measure": chg.get("measure"),
-                                "filing_accession": curr_acc,
-                                "prev_filing_accession": prev_acc,
-                                "filing_date": obs_date.isoformat(),
-                                "prev_filing_date": _parse_13f_date(prev_date_str).isoformat() if _parse_13f_date(prev_date_str) else None,
-                                "report_date": curr_report_date,
-                                "prev_report_date": prev_report_date,
-                                "form_type": curr_form,
-                                "is_amendment": curr_is_amendment,
-                                "replaces_accession": replaces_acc,
-                            },
+                            raw_payload=payload,
                         )
                         rows_inserted += 1
 
@@ -1605,17 +1766,30 @@ class InstitutionalFlowsPuller(BasePuller):
                     "status": "SUCCESS",
                     "changes_detected": len(changes),
                     "rows_inserted": rows_inserted,
+                    "rows_unchanged": rows_unchanged,
                     "receipts_inserted": receipts_inserted,
                     "quarantined": quarantined_total,
                 })
 
                 log.info(
-                    "13F {m}: {n} changes detected, {r} rows inserted",
+                    "13F {m}: {n} changes detected, {r} rows inserted, {u} already stored",
                     m=manager_name,
                     n=len(changes),
                     r=rows_inserted,
+                    u=rows_unchanged,
                 )
 
+            except ChangeRowsBusy as busy:
+                # Another writer is on this manager's filing date. Nothing was
+                # written by this run for it; the next run takes it.
+                log.warning("13F {m} (CIK={c}) deferred: {e}", m=manager_name, c=cik, e=str(busy))
+                results.append({
+                    "feature": f"13F:{cik}",
+                    "manager": manager_name,
+                    "status": "DEFERRED",
+                    "reason": "change_rows_held_by_another_writer",
+                    "rows_inserted": 0,
+                })
             except requests.HTTPError as http_exc:
                 # Permanent HTTP failures (404 / 403) — log once at WARNING,
                 # not ERROR.  Retries are already disabled at the fetcher.
