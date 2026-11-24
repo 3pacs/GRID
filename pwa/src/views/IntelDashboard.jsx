@@ -14,6 +14,26 @@ const hoverBrighten = {
     onMouseLeave: (e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.transform = 'translateY(0)'; },
 };
 
+/**
+ * State of the latest saved briefing, from what /api/v1/ollama/briefing/latest
+ * actually returns: `{content, type}`, `{content: null, message}` when none is
+ * saved, or the api wrapper's `{error: true, ...}` on a failed request. Every one
+ * of those is a truthy object, so presence alone proves nothing. The payload has
+ * no generation time, so a saved briefing is never called live or fresh.
+ */
+export function describeBriefing(brief) {
+    if (!brief || brief.error) {
+        return { label: 'UNAVAILABLE', saved: false, title: 'Briefing request failed or returned nothing' };
+    }
+    if (typeof brief.content !== 'string' || brief.content.trim() === '') {
+        return { label: 'NONE', saved: false, title: brief.message || 'No saved briefing' };
+    }
+    return {
+        label: 'SAVED', saved: true,
+        title: 'Latest saved briefing. The endpoint returns no generation time, so its age is unknown.',
+    };
+}
+
 export default function IntelDashboard({ onNavigate }) {
     const [trustSources, setTrustSources] = useState(null);
     const [convergence, setConvergence] = useState(null);
@@ -46,6 +66,8 @@ export default function IntelDashboard({ onNavigate }) {
     }, []);
 
     useEffect(() => { loadData(); }, [loadData]);
+
+    const briefingState = describeBriefing(briefing);
 
     // Derived counts
     const redFlagCount = crossRef?.redFlags?.length || 0;
@@ -170,14 +192,18 @@ export default function IntelDashboard({ onNavigate }) {
                     }}
                     {...hoverBrighten}
                 >
-                    <div style={{
-                        fontSize: '28px', fontWeight: 800, fontFamily: MONO,
-                        color: briefing ? colors.green : colors.textMuted,
-                    }}>{briefing ? 'LIVE' : '--'}</div>
+                    <div
+                        data-testid="briefing-state"
+                        title={briefingState.title}
+                        style={{
+                            fontSize: '28px', fontWeight: 800, fontFamily: MONO,
+                            color: briefingState.saved ? colors.text : colors.textMuted,
+                        }}
+                    >{briefingState.label}</div>
                     <div style={{
                         fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
                         color: colors.textMuted, fontFamily: MONO, marginTop: '4px',
-                    }}>AI BRIEFING</div>
+                    }}>AI BRIEFING{briefingState.saved ? ' · AGE UNKNOWN' : ''}</div>
                 </div>
 
                 {/* Spider Network */}

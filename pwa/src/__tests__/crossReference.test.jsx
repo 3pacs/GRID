@@ -119,7 +119,10 @@ describe('CrossReference view async data', () => {
             expect(screen.queryByTestId('loading-skeleton')).not.toBeInTheDocument();
         });
 
-        expect(screen.getByText('LIVE')).toBeInTheDocument();
+        // Computed comparisons are labelled DERIVED; nothing here proves a real-time feed.
+        expect(screen.getByText('DERIVED')).toBeInTheDocument();
+        expect(screen.queryByText('LIVE')).not.toBeInTheDocument();
+        expect(screen.getByText('Generation time unknown')).toBeInTheDocument();
         expect(screen.getByText('Divergence Matrix')).toBeInTheDocument();
 
         fireEvent.click(screen.getByText('Checks (1)'));

@@ -1192,17 +1192,22 @@ export default function CrossReference({ onNavigate }) {
                             background: data.totalChecks > 0 ? colors.greenBg : colors.yellowBg,
                             color: data.totalChecks > 0 ? colors.green : colors.yellow,
                         }}>
-                            {data.totalChecks > 0 ? 'LIVE' : 'NO DATA'}
+                            {/* Checks are computed comparisons, not a real-time feed. */}
+                            {data.totalChecks > 0 ? 'DERIVED' : 'NO DATA'}
                         </span>
                     )}
                 </div>
                 <div style={s.subtitle}>
                     Government statistics vs. physical reality — {CATEGORIES.length} domains × {REGIONS.length} regions
-                    {data?.generatedAt && (
+                    {data?.generatedAt ? (
                         <span style={{ marginLeft: '12px', color: colors.textDim }}>
                             Updated {new Date(data.generatedAt).toLocaleString()}
                         </span>
-                    )}
+                    ) : data?.totalChecks > 0 ? (
+                        <span style={{ marginLeft: '12px', color: colors.textDim }}>
+                            Generation time unknown
+                        </span>
+                    ) : null}
                 </div>
             </div>
 

@@ -86,6 +86,16 @@ describe('Dashboard watchlist loading', () => {
         api.generateFlowBriefing.mockReset();
     });
 
+    it('never stores a failed regime read and never calls a missing reading NEUTRAL (#959)', async () => {
+        api.getCurrent.mockResolvedValue({ error: true, status: 503, message: 'down' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        await waitFor(() => expect(api.getCurrent).toHaveBeenCalled());
+        expect(storeState.setCurrentRegime).not.toHaveBeenCalled();
+        expect(screen.getByText('UNAVAILABLE')).toBeInTheDocument();
+        expect(screen.queryByText('NEUTRAL')).not.toBeInTheDocument();
+    });
+
     it('uses cached watchlist prices on mount and avoids the refresh endpoint', async () => {
         render(<Dashboard onNavigate={vi.fn()} />);
 
