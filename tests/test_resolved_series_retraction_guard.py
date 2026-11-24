@@ -81,7 +81,7 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "api/routers/dad.py": 3,
     "api/routers/flows.py": 6,
     "api/routers/forecasts.py": 3,
-    "api/routers/intelligence_risk.py": 14,
+    "api/routers/intelligence_risk.py": 2,
     "api/routers/price_alerts.py": 1,
     "api/routers/regime.py": 4,
     "api/routers/signals.py": 3,
@@ -131,7 +131,7 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "orchestration/llm_task_workers.py": 5,
     "physics/verify.py": 4,
     "store/astrogrid.py": 5,
-    "trading/options_recommender.py": 2,
+    "trading/options_recommender.py": 1,
     "trading/signal_executor.py": 2,
 }
 

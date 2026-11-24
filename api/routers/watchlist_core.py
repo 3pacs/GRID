@@ -7,6 +7,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth, viewer_is_admin
+from store.feature_ids import feature_ids
 from store.options_provenance import LATEST_DAILY_SIGNALS, visible_sql
 from api.dependencies import get_db_engine
 from api.schemas.watchlist import WatchlistItemCreate
@@ -173,6 +174,14 @@ def get_portfolio(
     unless a custom weight column is set. Computes allocation by sector and
     asset type, risk metrics (concentration, beta, diversification), and
     options P&L from the recommendation tracker.
+
+    This view's weights are an illustration, not holdings. The risk map's
+    concentration block (``intelligence_risk``, ``weight_basis:
+    "explicit_watchlist_weight"``) differs on purpose. It scores only the
+    names with ``weight > 0``, and it is unavailable when none are set. So
+    its top-N and sector shares will not match this view's
+    ``concentration_top3`` or ``allocation`` unless every name is weighted.
+    Both views read sectors from ``watchlist_helpers.watchlist_sectors``.
     """
 
     # ── Load watchlist with weights ──────────────────────────────
@@ -233,30 +242,8 @@ def get_portfolio(
         if cached_prices:
             _wh._price_cache.set("prices", cached_prices)
 
-    # ── Sector map ───────────────────────────────────────────────
-    sector_ctx: dict[str, str] = {}
-    try:
-        from analysis.sector_map import SECTOR_MAP
-        for sector_name, sector in SECTOR_MAP.items():
-            for sub_name, sub in sector.get("subsectors", {}).items():
-                for actor in sub.get("actors", []):
-                    tk = actor.get("ticker")
-                    if tk and tk in tickers:
-                        sector_ctx[tk] = sector_name
-    except Exception as exc:
-        log.debug("Watchlist: sector map context failed: {e}", e=str(exc))
-
-    # Default sector guesses by asset_type
-    for it in items:
-        if it["ticker"] not in sector_ctx:
-            if it["asset_type"] == "crypto":
-                sector_ctx[it["ticker"]] = "Crypto"
-            elif it["asset_type"] == "etf":
-                sector_ctx[it["ticker"]] = "ETF"
-            elif it["asset_type"] == "commodity":
-                sector_ctx[it["ticker"]] = "Commodities"
-            else:
-                sector_ctx[it["ticker"]] = "Other"
+    # ── Sector map (shared with the risk map's concentration block) ──
+    sector_ctx = _wh.watchlist_sectors([(it["ticker"], it["asset_type"]) for it in items])
 
     # ── Build positions list ─────────────────────────────────────
     ESTIMATED_PORTFOLIO = 125_000  # estimated portfolio value
@@ -428,15 +415,26 @@ def list_watchlist_enriched(
 
                 feature_names = _resolve_feature_names(tk)
 
-                # Try resolved_series first
+                # Try resolved_series first. The candidates' ids are bound and
+                # each one's newest row is read through LATERAL
+                # (store.feature_ids): matched through a feature_registry name
+                # join, every vintage was read and sorted per ticker (spy_full:
+                # 176-182 ms on griddb, 2026-11-23; 0.7 ms bound).
+                # Same-date ties: the newest vintage, then the first candidate
+                # listed (store.feature_ids).
                 price_row = None
-                if feature_names:
+                fids = feature_ids(conn, feature_names) if feature_names else []
+                if fids:
                     price_row = conn.execute(text(
-                        "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                        "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                        "WHERE fr.name = ANY(:names) "
-                        "ORDER BY rs.obs_date DESC LIMIT 1"
-                    ), {"names": feature_names}).fetchone()
+                        "SELECT x.value, x.obs_date "
+                        "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
+                        "CROSS JOIN LATERAL ("
+                        "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                        "  WHERE rs.feature_id = f.id "
+                        "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                        ") x "
+                        "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
+                    ), {"fids": fids}).fetchone()
 
                 db_stale = (
                     price_row is None
@@ -446,12 +444,16 @@ def list_watchlist_enriched(
                 if not db_stale and price_row:
                     latest = float(price_row[0])
                     prev_row = conn.execute(text(
-                        "SELECT rs.value FROM resolved_series rs "
-                        "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                        "WHERE fr.name = ANY(:names) "
-                        "AND rs.obs_date <= :d30 "
-                        "ORDER BY rs.obs_date DESC LIMIT 1"
-                    ), {"names": feature_names,
+                        "SELECT x.value "
+                        "FROM unnest(CAST(:fids AS integer[])) WITH ORDINALITY AS f(id, ord) "
+                        "CROSS JOIN LATERAL ("
+                        "  SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                        "  WHERE rs.feature_id = f.id "
+                        "  AND rs.obs_date <= :d30 "
+                        "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                        ") x "
+                        "ORDER BY x.obs_date DESC, f.ord LIMIT 1"
+                    ), {"fids": fids,
                         "d30": today - timedelta(days=30)}).fetchone()
 
                     pct_1m = None
