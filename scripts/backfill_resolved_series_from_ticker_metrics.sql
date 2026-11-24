@@ -25,6 +25,20 @@
 --     -f scripts/backfill_resolved_series_from_ticker_metrics.sql
 --
 -- Idempotent: ON CONFLICT DO NOTHING. Re-run daily.
+--
+-- Point-in-time stamps (E1-V7c, fixed 2026-11-21)
+-- ------------------------------------------------
+-- A bridged row becomes knowable when GRID fetched it into
+-- ticker_metrics_daily (`tmd.as_of`, set by every writer of that table),
+-- not on its observation day. Both `release_date` and `vintage_date` are
+-- that fetch day (UTC, the day convention of store/pit.py), never earlier
+-- than `obs_date`; a row with no `as_of` is stamped with the day this script
+-- runs, the first day GRID can show it held the value. Until 2026-11-21
+-- this script wrote `release_date = obs_date`: those rows claim release up
+-- to ~60 days before GRID held them. store/pit.py and the direct readers
+-- fence `vintage_date <= as_of` as well, so they no longer leak; existing
+-- rows are not rewritten here (counts:
+-- scripts/count_release_before_vintage.py, read-only).
 
 SET statement_timeout = 300000;
 
@@ -46,8 +60,8 @@ INSERT INTO resolved_series
 SELECT
   fr.id AS feature_id,
   tmd.obs_date,
-  tmd.obs_date AS release_date,
-  COALESCE(tmd.as_of::date, tmd.obs_date) AS vintage_date,
+  held.held_on AS release_date,
+  held.held_on AS vintage_date,
   tmd.close_price::double precision AS value,
   (SELECT id FROM source_catalog WHERE name = 'TWELVEDATA') AS source_priority_used,
   false AS conflict_flag,
@@ -55,6 +69,12 @@ SELECT
 FROM ticker_metrics_daily tmd
 JOIN feature_registry fr
   ON fr.name = lower(tmd.ticker) || '_full'
+CROSS JOIN LATERAL (
+  SELECT GREATEST(
+           tmd.obs_date,
+           COALESCE((tmd.as_of AT TIME ZONE 'UTC')::date, (now() AT TIME ZONE 'UTC')::date)
+         ) AS held_on
+) held
 LEFT JOIN LATERAL (
   SELECT max(obs_date) AS max_obs FROM resolved_series WHERE feature_id = fr.id
 ) rs ON true

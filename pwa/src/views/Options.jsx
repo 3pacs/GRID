@@ -309,20 +309,36 @@ const persistedSanityLayers = [
     ['HISTORICAL_ANALOG', 'Historical analog'],
 ];
 
+// A shadow check (``"shadow": true`` in sanity_status, CROSS_ASSET since #1400)
+// is recorded but never gates a recommendation: it is drawn as a hollow,
+// neutral dot whatever its verdict, so a shadow FAIL is not read as a failed gate.
+const SHADOW_DOT = '#7A8A9A';
+
 function SanityDots({ checks }) {
     // The persisted producer stores a keyed sanity_status object; live cards
     // may still supply the legacy positional sanity_checks array.
     const layers = Array.isArray(checks)
-        ? sanityLayerNames.map((name, i) => ({ name, status: checks[i]?.status || checks[i] }))
-        : persistedSanityLayers.map(([key, name]) => ({ name, status: checks?.[key]?.status }));
+        ? sanityLayerNames.map((name, i) => ({ name, status: checks[i]?.status || checks[i], shadow: false }))
+        : persistedSanityLayers.map(([key, name]) => ({
+            name, status: checks?.[key]?.status, shadow: checks?.[key]?.shadow === true,
+        }));
     return (
         <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }} title="Sanity checks">
-            {layers.map(({ name, status }) => {
+            {layers.map(({ name, status, shadow }) => {
+                const label = `${name}: ${status || 'N/A'}`;
+                if (shadow) {
+                    return (
+                        <div key={name} data-shadow="true" title={`${label} (shadow, recorded, not a gate)`} style={{
+                            width: '8px', height: '8px', borderRadius: '50%', boxSizing: 'border-box',
+                            background: 'transparent', border: `1px dashed ${SHADOW_DOT}`, flexShrink: 0,
+                        }} />
+                    );
+                }
                 const bg = status === 'PASS' ? colors.green
                     : status === 'FAIL' ? colors.red
                     : '#3A4A5A';
                 return (
-                    <div key={name} title={`${name}: ${status || 'N/A'}`} style={{
+                    <div key={name} title={label} style={{
                         width: '8px', height: '8px', borderRadius: '50%',
                         background: bg, flexShrink: 0,
                     }} />

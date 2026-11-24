@@ -131,7 +131,7 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "orchestration/llm_task_workers.py": 5,
     "physics/verify.py": 4,
     "store/astrogrid.py": 5,
-    "trading/options_recommender.py": 2,
+    "trading/options_recommender.py": 1,
     "trading/signal_executor.py": 2,
 }
 
