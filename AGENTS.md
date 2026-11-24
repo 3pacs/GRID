@@ -1031,7 +1031,7 @@ Only `analysis/sector_map_ticker_status.yaml` and tests change.
 
 | Symbol | Mark | Fetched after this | End date from Tiingo's listing (read 2026-11-23) | Source for the event |
 |---|---|---|---|---|
-| BKH | renamed -> HZN | HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07. The issuer's exchange note and OCC memo 60193 answered HTTP 403 and were not read |
+| BKH | renamed -> HZN | HZN | none: the BKH listing has no dates | WOWT 2026-11-16 (merger forming Bright Horizon Energy); Tiingo lists HZN with history from 1984-09-07. The issuer's exchange note answered HTTP 403 and was not read (OCC memo 60193, cited here at first, is Karyopharm's: corrected 2026-11-24) |
 | GWHT | delisted | nothing | none: GWHT is not found | ESS Tech Form 8-K, Item 1.03, 2026-11-13 (Chapter 7 petition) |
 | KPTI | delisted | nothing | 2026-11-10 | Karyopharm Form 8-K, Item 3.01, event date 2026-11-04 (Nasdaq suspension from 11-11, OTC as KPTIQ) |
 | ROKU | acquired by Fox | nothing | 2026-11-06 | Roku Form 8-K, 2026-11-06 (merger closed; Nasdaq halt before the 11-09 open) |

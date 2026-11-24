@@ -81,6 +81,14 @@ def test_every_note_says_where_its_facts_come_from(ticker):
         ticker == "BKH" and "WOWT" in note and "HTTP 403" in note)
 
 
+def test_the_bkh_note_does_not_cite_another_issuers_occ_memo():
+    """OCC information memo 60193 is about Karyopharm, not Black Hills (Codex
+    review 6032263432)."""
+    note = sm.TICKER_STATUS["BKH"]["note"]
+    assert "60193" not in note and "OCC" not in note
+    assert "HTTP 403" in note and "not read" in note
+
+
 def test_no_note_rests_on_an_ai_written_summary_page():
     for ticker in ("BKH", "GWH", "GWHT", "KPTI", "ROKU"):
         note = sm.TICKER_STATUS[ticker]["note"]
