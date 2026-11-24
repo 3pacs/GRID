@@ -10,6 +10,8 @@ Key finding from QuantaAlpha v2:
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -25,8 +27,16 @@ def rank_ic(
 
     RankIC = Spearman correlation between signal ranks and forward returns
     across all tickers, computed per date.
+
+    Contract: ``forward_returns`` must already be aligned to the decision row
+    (i.e. ``forward_returns.loc[t]`` is the forward return realized after the
+    signal at date ``t`` is known, such as ``prices.pct_change(h).shift(-h)``).
+    At default ``horizon=1`` no extra shift is applied; ``horizon > 1`` shifts
+    by ``-(horizon - 1)`` to measure decay at further lead steps.
     """
-    fwd = forward_returns.shift(-horizon)
+    if int(horizon) != horizon or horizon < 1:
+        raise ValueError("horizon must be a positive integer")
+    fwd = forward_returns if horizon == 1 else forward_returns.shift(-(horizon - 1))
 
     common_dates = signal.index.intersection(fwd.dropna(how="all").index)
     ics = []
@@ -56,6 +66,287 @@ def rank_icir(ic_series: pd.Series) -> float:
     return float(ic_series.mean() / ic_series.std())
 
 
+COVERAGE_COMPLETE = "complete"
+COVERAGE_PARTIAL = "partial"
+COVERAGE_NONE = "none"
+ESTIMATE_FULL_BOOK = "full_book"
+ESTIMATE_CONDITIONAL = "conditional_on_observed_outcomes"
+# The net series is a cost-ledger accounting, not daily executable P&L: an
+# unscored date books no P&L and its turnover cost lands on the next scored
+# date (see long_short_book).
+NET_BASIS_CARRIED_COST = "carried_cost_accounting"
+# Where the eligibility window's sessions come from. Only an explicit session
+# calendar, independent of labels, can show a due outcome row that is absent
+# from forward_returns; the label index (forward_returns.index) cannot.
+CALENDAR_EXPLICIT = "explicit_calendar"
+CALENDAR_LABEL_INDEX = "label_index"
+
+
+def as_session_calendar(calendar: Any, like: pd.Index) -> pd.Index:
+    """``calendar`` as a sorted, unique index of ``like``'s kind (dates for a DatetimeIndex)."""
+    cal = pd.DatetimeIndex(calendar) if isinstance(like, pd.DatetimeIndex) else pd.Index(calendar)
+    return cal.unique().sort_values()
+
+
+def mature_through(calendar: pd.Index, outcome_horizon: int = 0, as_of: Any = None) -> Any:
+    """Last decision date whose forward outcome is due by ``as_of``, or ``None``.
+
+    Read from a session calendar (an explicit one, or the label index
+    ``forward_returns.index``: see :func:`long_short_book`), never from
+    outcome values. A decision row is mature once
+    ``outcome_horizon`` further calendar rows have elapsed by ``as_of``
+    (default: the calendar's last row). ``outcome_horizon=0`` takes every
+    calendar row up to ``as_of`` as mature: the caller declares the panel
+    holds mature rows only. A horizon cannot be dated past the calendar's
+    last row, so ``as_of`` after it raises when ``outcome_horizon > 0``.
+    """
+    if int(outcome_horizon) != outcome_horizon or outcome_horizon < 0:
+        raise ValueError("outcome_horizon must be a non-negative integer")
+    cal = calendar.unique().sort_values()
+    if as_of is not None:
+        if isinstance(cal, pd.DatetimeIndex):
+            as_of = pd.Timestamp(as_of)
+        if outcome_horizon and len(cal) and as_of > cal[-1]:
+            raise ValueError(
+                "as_of is after the outcome calendar's last row: the calendar "
+                "cannot date an outcome horizon past its end"
+            )
+        cal = cal[cal <= as_of]
+    n_mature = len(cal) - int(outcome_horizon)
+    return cal[n_mature - 1] if n_mature > 0 else None
+
+
+def eligible_panels(
+    signal: pd.DataFrame, forward_returns: pd.DataFrame, through: Any
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The signal and outcome rows dated on or before ``through`` (none if ``None``)."""
+    if through is None:
+        return signal.iloc[:0], forward_returns.iloc[:0]
+    return (
+        signal.loc[signal.index <= through],
+        forward_returns.loc[forward_returns.index <= through],
+    )
+
+
+def long_short_book(
+    signal: pd.DataFrame,
+    forward_returns: pd.DataFrame,
+    top_n: int = 5,
+    cost_bps: float = 10.0,
+    *,
+    outcome_horizon: int = 0,
+    as_of: Any = None,
+    calendar: Any = None,
+) -> pd.DataFrame:
+    """Per decision date: the frozen long-short book, its cost ledger, net return and coverage.
+
+    The book (top ``top_n`` long, bottom ``top_n`` short) is picked from
+    ``signal.loc[t]`` alone, the universe known at the decision, before any
+    forward return is read. A book member whose outcome goes missing
+    (delisted, halted, data gap) stays in the book and is never replaced by
+    the next-ranked name: its outcome is counted as missing, not imputed.
+    Each leg returns the equal-weight mean over its members with an observed
+    outcome (a conditional estimate when some are missing, see
+    :func:`outcome_coverage`); a leg with none leaves the date unscored
+    (``gross`` and ``return`` NaN). ``coverage`` is observed book slots /
+    book slots and ``missing`` names the members without one.
+
+    Cost ledger: every formed book pays its round-trip turnover cost against
+    the previous formed book on its own date (``cost``), scored or not, so
+    the previous membership never advances without its rebalance being
+    charged. Rule for an unscored date: its cost is carried, never dropped.
+    It is netted from the next scored date's return, so ``cost_charged`` is
+    that date's own cost plus every cost carried since the last scored date
+    (0.0 on an unscored date) and ``return = gross - cost_charged``. A cost
+    after the last scored date has no net return to land on; it stays
+    pending and :func:`outcome_coverage` reports it as
+    ``turnover_cost_uncharged`` with ``net_coverage`` partial.
+
+    Eligibility window: chronological and declared, never read from which
+    outcomes are observed. The decision dates are the signal dates on or
+    before :func:`mature_through` of the outcome calendar, ``outcome_horizon``
+    and ``as_of``. Each one forms a book and pays its cost, scored or not: a
+    date with no observed outcome at all (first, interior or last) is
+    unscored, never dropped. Only the later signal dates (an immature tail,
+    or after ``as_of``) form no book and none of their outcomes is read;
+    ``book.attrs`` records ``outcome_horizon``, ``mature_through`` and
+    ``n_immature_excluded``. With the default ``outcome_horizon=0`` an
+    undeclared immature tail counts as missing outcomes (partial coverage):
+    a panel built as ``shift(-h)`` declares ``outcome_horizon=h``.
+
+    Calendar: ``calendar`` is the complete session calendar, independent of
+    labels (``calendar_basis`` ``"explicit_calendar"``). Maturity counts its
+    sessions, so a due outcome row ABSENT from ``forward_returns`` is a
+    missing outcome, exactly as a NaN row is; a decision date that is not one
+    of its sessions is refused. Without it the window is dated from the
+    outcome rows present (``"label_index"``): an absent due row shortens the
+    window instead of counting as missing, so :func:`outcome_coverage` never
+    labels the book full-book and always sets ``net_pass_blocked_reason``.
+
+    The net ``return`` is carried-cost accounting
+    (:data:`NET_BASIS_CARRIED_COST`), not daily executable P&L.
+
+    Contract: ``forward_returns`` must already be aligned to the decision row
+    (i.e. ``forward_returns.loc[t]`` is the forward return realized after the
+    signal at date ``t`` is known, such as ``prices.pct_change(h).shift(-h)``).
+    This function does NOT shift ``forward_returns``.
+    """
+    if calendar is None:
+        basis, cal = CALENDAR_LABEL_INDEX, forward_returns.index
+    else:
+        basis, cal = CALENDAR_EXPLICIT, as_session_calendar(calendar, signal.index)
+    through = mature_through(cal, outcome_horizon, as_of)
+    if through is None:
+        eligible = np.zeros(len(signal.index), dtype=bool)
+    else:
+        eligible = np.asarray(signal.index <= through, dtype=bool)
+    dates = signal.index[eligible]
+    off_calendar = dates.difference(cal) if basis == CALENDAR_EXPLICIT else dates[:0]
+    if len(off_calendar):
+        raise ValueError(
+            f"{len(off_calendar)} decision dates are not sessions of the explicit "
+            f"calendar (first {off_calendar[0]}): the calendar is not complete"
+        )
+    fwd = forward_returns.reindex(index=dates)
+
+    rows = []
+    prev_longs: set = set()
+    prev_shorts: set = set()
+    pending_cost = 0.0  # ledger cost of unscored dates not yet netted from a return
+
+    for dt in dates:
+        sig_row = signal.loc[dt].dropna()
+        if len(sig_row) < 2 * top_n:
+            continue
+
+        ranked = sig_row.sort_values()
+        shorts = list(ranked.index[:top_n])
+        longs = list(ranked.index[-top_n:])
+
+        # Cost ledger: this rebalance's turnover, charged on its own date.
+        long_turnover = len(set(longs) - prev_longs) / max(top_n, 1)
+        short_turnover = len(set(shorts) - prev_shorts) / max(top_n, 1)
+        avg_turnover = (long_turnover + short_turnover) / 2
+        cost = avg_turnover * cost_bps * 2 / 10_000  # round-trip
+
+        out_row = fwd.loc[dt]  # outcomes are read only for the frozen book
+        long_out, short_out = out_row.reindex(longs), out_row.reindex(shorts)
+
+        gross_ret = net_ret = float("nan")
+        charged = 0.0
+        if long_out.notna().any() and short_out.notna().any():
+            gross_ret = float(long_out.mean() - short_out.mean())  # mean skips missing
+            charged = cost + pending_cost
+            pending_cost = 0.0
+            net_ret = gross_ret - charged
+        else:
+            pending_cost += cost
+
+        n_observed = int(long_out.notna().sum() + short_out.notna().sum())
+        missing = tuple(n for n, v in [*long_out.items(), *short_out.items()] if pd.isna(v))
+        rows.append((
+            dt, net_ret, gross_ret, cost, charged,
+            2 * top_n, n_observed, n_observed / (2 * top_n), missing,
+        ))
+
+        prev_longs = set(longs)
+        prev_shorts = set(shorts)
+
+    cols = [
+        "date", "return", "gross", "cost", "cost_charged",
+        "n_book", "n_observed", "coverage", "missing",
+    ]
+    book = pd.DataFrame(rows, columns=cols).set_index("date")
+    book.attrs.update(
+        outcome_horizon=int(outcome_horizon),
+        mature_through=through,
+        n_immature_excluded=int((~eligible).sum()),
+        calendar_basis=basis,
+    )
+    return book
+
+
+def outcome_coverage(book: pd.DataFrame) -> dict[str, float | int | str | None]:
+    """Coverage, labels and cost-ledger totals of a :func:`long_short_book`.
+
+    ``gross_coverage`` is ``"complete"`` when every book slot on every date
+    has an observed outcome, ``"partial"`` otherwise and ``"none"`` when no
+    book was formed. ``net_coverage`` is the same, and also ``"partial"``
+    while any ledger cost is uncharged. ``estimate`` is ``"full_book"`` only
+    for a complete book on an explicit calendar; otherwise
+    ``"conditional_on_observed_outcomes"``: leg means are renormalized over the observed members (``n_partial_days``
+    scored dates) and unscored dates are absent, so the performance is
+    conditional on the outcomes that were observed. ``turnover_cost_total``
+    is the ledger sum, ``turnover_cost_carried`` the unscored-date costs
+    netted from a later scored return and ``turnover_cost_uncharged`` the
+    unscored-date costs after the last scored date.
+
+    ``net_basis`` is ``"carried_cost_accounting"``: a net Sharpe on this
+    series is not daily executable P&L. ``net_pass_blocked_reason`` is
+    ``None`` only for a full-book net series (``calendar_basis``
+    ``"explicit_calendar"``, ``net_coverage`` complete, no uncharged cost);
+    otherwise it says why no ROBUST verdict or net-threshold pass may rest on
+    it. ``calendar_basis``, ``outcome_horizon``, ``mature_through`` and
+    ``n_immature_excluded`` label the eligibility window (the immature tail
+    left out by declaration).
+    """
+    n_slots = int(book["n_book"].sum())
+    n_observed = int(book["n_observed"].sum())
+    scored = book["return"].notna().to_numpy()
+    full = (book["n_observed"] == book["n_book"]).to_numpy()
+    unscored_cost = np.where(scored, 0.0, book["cost"].to_numpy(dtype=float))
+    scored_pos = np.flatnonzero(scored)
+    after_last = np.arange(len(book)) > (scored_pos[-1] if len(scored_pos) else -1)
+    uncharged = float(unscored_cost[after_last].sum())
+
+    if n_slots == 0:
+        gross_label = COVERAGE_NONE
+    elif n_observed == n_slots:
+        gross_label = COVERAGE_COMPLETE
+    else:
+        gross_label = COVERAGE_PARTIAL
+    net_label = COVERAGE_PARTIAL if uncharged > 0.0 else gross_label
+    basis = book.attrs.get("calendar_basis", CALENDAR_LABEL_INDEX)
+    explicit = basis == CALENDAR_EXPLICIT
+    full_book = gross_label == COVERAGE_COMPLETE and explicit
+    estimate = ESTIMATE_FULL_BOOK if full_book else ESTIMATE_CONDITIONAL
+    n_unscored = int((~scored).sum())
+    n_partial = int((scored & ~full).sum())
+    reasons = []
+    if net_label != COVERAGE_COMPLETE or uncharged > 0.0:
+        reasons.append(
+            f"net coverage {net_label} ({n_unscored} unscored and {n_partial} partial "
+            f"book dates, turnover cost uncharged {uncharged:.6g}): the net Sharpe "
+            f"is {estimate}, not a full-book net figure"
+        )
+    if not explicit:
+        reasons.append(
+            f"calendar_basis {basis}: the window is dated from the outcome rows "
+            "present, so an absent due row is not counted missing; pass an explicit "
+            "session calendar"
+        )
+    blocked = "; ".join(reasons) or None
+    through = book.attrs.get("mature_through")
+    return {
+        "outcome_coverage": n_observed / n_slots if n_slots else 0.0,
+        "n_missing_outcomes": n_slots - n_observed,
+        "n_unscored_days": n_unscored,
+        "n_partial_days": n_partial,
+        "gross_coverage": gross_label,
+        "net_coverage": net_label,
+        "estimate": estimate,
+        "net_basis": NET_BASIS_CARRIED_COST,
+        "net_pass_blocked_reason": blocked,
+        "calendar_basis": basis,
+        "turnover_cost_total": float(book["cost"].to_numpy(dtype=float).sum()),
+        "turnover_cost_carried": float(unscored_cost[~after_last].sum()),
+        "turnover_cost_uncharged": uncharged,
+        "outcome_horizon": book.attrs.get("outcome_horizon"),
+        "mature_through": None if through is None else str(through),
+        "n_immature_excluded": int(book.attrs.get("n_immature_excluded", 0)),
+    }
+
+
 def long_short_returns(
     signal: pd.DataFrame,
     forward_returns: pd.DataFrame,
@@ -67,46 +358,15 @@ def long_short_returns(
 
     Top N tickers by signal → long. Bottom N → short.
     Average long return minus average short return, net of costs.
+    The book is frozen at the decision and a missing outcome is never
+    reselected (rule and alignment contract: :func:`long_short_book`);
+    unscored dates are dropped and their turnover cost is netted from the
+    next scored return (carried-cost accounting, not daily executable P&L).
+    Eligibility window: :func:`long_short_book` with its default
+    ``outcome_horizon=0``. Coverage labels: :func:`outcome_coverage`.
     """
-    fwd = forward_returns.shift(-1)
-    common_dates = signal.index.intersection(fwd.dropna(how="all").index)
-
-    ls_returns = []
-    prev_longs = set()
-    prev_shorts = set()
-
-    for dt in common_dates:
-        sig_row = signal.loc[dt].dropna()
-        ret_row = fwd.loc[dt].dropna()
-        common = sig_row.index.intersection(ret_row.index)
-
-        if len(common) < 2 * top_n:
-            continue
-
-        ranked = sig_row[common].sort_values()
-        shorts = set(ranked.index[:top_n])
-        longs = set(ranked.index[-top_n:])
-
-        long_ret = ret_row[list(longs)].mean()
-        short_ret = ret_row[list(shorts)].mean()
-        gross_ret = long_ret - short_ret
-
-        # Transaction costs: turnover-based
-        long_turnover = len(longs - prev_longs) / max(top_n, 1)
-        short_turnover = len(shorts - prev_shorts) / max(top_n, 1)
-        avg_turnover = (long_turnover + short_turnover) / 2
-        cost = avg_turnover * cost_bps * 2 / 10_000  # round-trip
-
-        net_ret = gross_ret - cost
-        ls_returns.append({"date": dt, "return": net_ret})
-
-        prev_longs = longs
-        prev_shorts = shorts
-
-    if not ls_returns:
-        return pd.Series(dtype=float, name="ls_return")
-
-    return pd.DataFrame(ls_returns).set_index("date")["return"]
+    ls = long_short_book(signal, forward_returns, top_n, cost_bps)["return"].dropna()
+    return ls.astype(float) if len(ls) else pd.Series(dtype=float, name="ls_return")
 
 
 def sharpe_ratio(returns: pd.Series, annualize: int = 252) -> float:
@@ -174,22 +434,44 @@ def compute_signal_metrics(
     forward_returns: pd.DataFrame,
     top_n: int = 5,
     cost_bps: float = 10.0,
+    *,
+    outcome_horizon: int = 0,
+    as_of: Any = None,
+    calendar: Any = None,
 ) -> dict:
-    """Compute full metrics suite for a signal."""
+    """Compute full metrics suite for a signal.
+
+    Gross and net figures come from one frozen book over the eligibility
+    window (``outcome_horizon``, ``as_of``, ``calendar``: :func:`long_short_book`) and
+    carry its coverage labels (see :func:`outcome_coverage`); rank IC and
+    turnover read only the eligible dates. ``sharpe_net`` is carried-cost
+    accounting (``net_basis``), not daily executable P&L. ``passes_threshold``
+    needs a full-book net series on an explicit calendar: a partial,
+    uncharged or label-index book never passes, and
+    ``net_pass_blocked_reason`` says why.
+    """
+    book = long_short_book(
+        signal, forward_returns, top_n, cost_bps,
+        outcome_horizon=outcome_horizon, as_of=as_of, calendar=calendar,
+    )
+    signal, forward_returns = eligible_panels(
+        signal, forward_returns, book.attrs["mature_through"]
+    )
     ic = rank_ic(signal, forward_returns)
-    ls_ret = long_short_returns(signal, forward_returns, top_n, cost_bps)
+    ls_ret = book["return"].dropna().astype(float)
+    coverage = outcome_coverage(book)
+    sharpe_net = sharpe_ratio(ls_ret)
 
     return {
         "mean_rank_ic": float(ic.mean()) if len(ic) > 0 else 0.0,
         "rank_icir": rank_icir(ic),
-        "sharpe_gross": sharpe_ratio(
-            long_short_returns(signal, forward_returns, top_n, 0.0)
-        ),
-        "sharpe_net": sharpe_ratio(ls_ret),
+        "sharpe_gross": sharpe_ratio(book["gross"].dropna().astype(float)),
+        "sharpe_net": sharpe_net,
         "annualized_return": annualized_return(ls_ret),
         "max_drawdown": max_drawdown(ls_ret),
         "calmar": calmar_ratio(ls_ret),
         "turnover": turnover(signal, top_n),
         "n_days": len(ls_ret),
-        "passes_threshold": sharpe_ratio(ls_ret) > 1.4,
+        "passes_threshold": sharpe_net > 1.4 and coverage["net_pass_blocked_reason"] is None,
+        **coverage,
     }
