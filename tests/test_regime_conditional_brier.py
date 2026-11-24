@@ -738,6 +738,10 @@ class TestRegimeSourceAPI:
                 signal_contributions={"flow_momentum": 1.0},
                 regime="EXPANSION",
             )
+        # The seeded row must exist at the requested count. Otherwise a
+        # "thin row" test passes on a missing row and tests nothing.
+        row = engine.store.get(("flow_momentum", 7, "EXPANSION"))
+        assert row is not None and row["scored_count"] == count
 
     def test_warm_regime_row_reports_regime(self):
         from features.regime_conditional_brier import (
