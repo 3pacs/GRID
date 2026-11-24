@@ -705,7 +705,53 @@ def _pick_sector_row(rows, as_of: datetime, problems: list[str]):
         except ValueError:
             problems.append(f"row for {day}: body is not JSON; not used")
             continue
+        bad = _sector_body_problem(rec, str(day), row_kind)
+        if bad:
+            problems.append(f"row for {day}: {bad}; not used")
+            continue
         return str(day), row_kind, rec, computed
+    return None
+
+
+_NUM = (int, float)
+_OPT_DICTS = ("market", "fed_balance_sheet", "vix", "events", "overnight_rule")
+
+
+def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
+    """Why a hash-valid body cannot be shown, or None. The body must be an object whose own schema, kind and
+    data_through are the row's columns, with ``sectors`` a dict of dicts and every other part of the shape it
+    is read with (absent parts are allowed; a part of the wrong type is not)."""
+    if not isinstance(rec, dict):
+        return f"body is a JSON {type(rec).__name__}, not an object"
+    for field, want in (("schema", SECTOR_SCHEMA), ("kind", row_kind), ("data_through", day)):
+        if rec.get(field) != want:
+            return f"body's {field} {rec.get(field)!r} is not the row's {want!r}"
+    sectors = rec.get("sectors")
+    if not isinstance(sectors, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in sectors.items()):
+        return "sectors is not an object of objects"
+    for name, sc in sectors.items():
+        for f in ("trend_pct", "relative_trend_pct"):
+            if sc.get(f) is not None and (isinstance(sc[f], bool) or not isinstance(sc[f], _NUM)):
+                return f"sector {name!r}: {f} is not a number"
+        for f in ("group", "phase"):
+            if sc.get(f) is not None and not isinstance(sc[f], str):
+                return f"sector {name!r}: {f} is not text"
+        if sc.get("leading") is not None and not isinstance(sc["leading"], bool):
+            return f"sector {name!r}: leading is not true or false"
+    for f in _OPT_DICTS:
+        if rec.get(f) is not None and not isinstance(rec[f], dict):
+            return f"{f} is not an object"
+    for f in ("leaders", "laggards"):
+        if rec.get(f) is not None and not (isinstance(rec[f], list) and all(isinstance(x, str) for x in rec[f])):
+            return f"{f} is not a list of names"
+    if rec.get("read") is not None and not isinstance(rec["read"], str):
+        return "read is not text"
+    ahead = (rec.get("events") or {}).get("within_7_days")
+    if ahead is not None and not (isinstance(ahead, list) and all(isinstance(e, dict) for e in ahead)):
+        return "events.within_7_days is not a list of objects"
+    sin = (rec.get("overnight_rule") or {}).get("sectors_in")
+    if sin is not None and not (isinstance(sin, list) and all(isinstance(x, str) for x in sin)):
+        return "overnight_rule.sectors_in is not a list of names"
     return None
 
 
@@ -716,7 +762,10 @@ def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day
     The newest row for a session up to the previous one (pre-open) or the session itself (post-close) whose
     ``computed_at`` is at or before the brief's clock. ``computed_at`` must carry its offset; a naive one is not
     used. A row whose stored hash does not match its body, or whose schema is another, is not used either.
-    ``expected``: the newest session the writer normally has by the brief's clock; an older row is a data problem."""
+    ``expected``: the newest session the writer normally has by the brief's clock; an older row is a data problem.
+
+    ``computed_at`` is the writer's own clock at insert. It is not inside the hashed body, so it is the writer's word,
+    not proof of when the row became visible; the table's insert-only triggers stop a later rewrite, nothing more."""
     title, key = "Sectors (desk-sector-state/1)", "desk_sector_state"
     src = f"{db} desk_state" if db else "desk-state state.db"
     if not db:
@@ -734,6 +783,14 @@ def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day
         return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
     if chosen is None:
         return Section(key, title, "empty", src, problems=("no row computed before the brief's clock",) + tuple(problems))
+    try:
+        return _sector_section(key, title, src, chosen, expected, problems)
+    except Exception as exc:  # noqa: BLE001 - no row shape may abort the brief
+        return Section(key, title, "unknown", src,
+                       problems=(f"row for {chosen[0]} could not be read into lines ({type(exc).__name__})",) + tuple(problems))
+
+
+def _sector_section(key: str, title: str, src: str, chosen: tuple, expected: date | None, problems: list[str]) -> Section:
     day, row_kind, rec, computed = chosen
     lines = [f"row for session {day} ({row_kind}), computed {iso(computed)}"]
     if rec.get("read"):
@@ -745,7 +802,8 @@ def desk_sector_state(db: str | None, kind: str, session: SessionTimes, prev_day
                      f"against the market {_pct(sc.get('relative_trend_pct'))}" + (", leading" if sc.get("leading") else ""))
     rule = rec.get("overnight_rule") or {}
     if rule:
-        lines.append("overnight rule's gate: market " + ("open" if rule.get("market_gate") else "closed")
+        gate = {True: "open", False: "closed"}.get(rule.get("market_gate")) if isinstance(rule.get("market_gate"), bool) else "not stated"
+        lines.append("overnight rule's gate: market " + gate
                      + "; sectors let through: " + (", ".join(rule.get("sectors_in") or []) or "none"))
     ev = rec.get("events") or {}
     ahead = [f"{e.get('event')} {e.get('date')}" for e in ev.get("within_7_days") or []]

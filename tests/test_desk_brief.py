@@ -816,3 +816,76 @@ def test_sector_state_vix_line_without_a_third(tmp_path):
     con.close()
     sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
     assert "VIX: spike day" in sec.lines and not any("None" in x for x in sec.lines)
+
+
+def _put_body(db: str, day: str, body_obj, kind: str = "live", computed: str = "2026-11-20T06:45:08Z") -> None:
+    import hashlib
+
+    body = json.dumps(body_obj)
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO desk_state VALUES (?,?,?,?,?,?)", (day, kind, "desk-sector-state/1", body,
+                                                                 hashlib.sha256(body.encode()).hexdigest(), computed))
+    con.commit()
+    con.close()
+
+
+def _malformed(day: str):
+    good = _sector_rec(day)
+    yield "a JSON list", [], "is a JSON list, not an object"
+    yield "a JSON number", 3, "is a JSON int, not an object"
+    yield "body schema", dict(good, schema="desk-sector-state/2"), "body's schema"
+    yield "body kind", dict(good, kind="backfill"), "body's kind"
+    yield "body date", dict(good, data_through="2026-11-18"), "body's data_through"
+    yield "sectors list", dict(good, sectors=[]), "sectors is not an object of objects"
+    yield "sector not object", dict(good, sectors={"Energy": 4.0}), "sectors is not an object of objects"
+    yield "trend text", dict(good, sectors={"Energy": dict(good["sectors"]["Energy"], trend_pct="4")}), "trend_pct is not a number"
+    yield "leading text", dict(good, sectors={"Energy": dict(good["sectors"]["Energy"], leading="yes")}), "leading is not true or false"
+    yield "vix list", dict(good, vix=[]), "vix is not an object"
+    yield "leaders text", dict(good, leaders="Energy"), "leaders is not a list of names"
+    yield "events list of text", dict(good, events={"within_7_days": ["GDP"]}), "within_7_days is not a list of objects"
+    yield "sectors_in text", dict(good, overnight_rule={"market_gate": True, "sectors_in": "Energy"}), "sectors_in is not a list"
+
+
+def test_sector_state_malformed_newer_row_falls_back_to_the_valid_one(tmp_path):
+    for i, (label, body, reason) in enumerate(_malformed("2026-11-19")):
+        d = tmp_path / str(i)
+        d.mkdir()
+        db = _sector_db(d, [("2026-11-18", "2026-11-19T06:45:08Z")])
+        _put_body(db, "2026-11-19", body)
+        sec = B.clocked(S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV), PRE)
+        assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-18", label
+        assert any(p.startswith("row for 2026-11-19:") and reason in p and p.endswith("not used") for p in sec.problems), (label, sec.problems)
+        alone = tmp_path / f"alone{i}"
+        alone.mkdir()
+        db2 = _sector_db(alone, [])
+        _put_body(db2, "2026-11-19", body)
+        only = S.desk_sector_state(db2, "pre_open", SESSION, PREV, PRE, PREV)
+        assert only.status == "empty" and any(reason in p for p in only.problems), label
+
+
+def test_sector_state_gate_unstated_is_not_closed(tmp_path):
+    for i, gate in enumerate((None, "yes", 1)):
+        d = tmp_path / str(i)
+        d.mkdir()
+        db = _sector_db(d, [])
+        rule = {"sectors_in": ["Energy"]} if gate is None else {"market_gate": gate, "sectors_in": ["Energy"]}
+        _put_body(db, "2026-11-19", dict(_sector_rec("2026-11-19"), overnight_rule=rule))
+        sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+        assert "overnight rule's gate: market not stated; sectors let through: Energy" in sec.lines, gate
+    d = tmp_path / "closed"
+    d.mkdir()
+    db = _sector_db(d, [])
+    _put_body(db, "2026-11-19", dict(_sector_rec("2026-11-19"), overnight_rule={"market_gate": False, "sectors_in": []}))
+    assert "overnight rule's gate: market closed; sectors let through: none" in \
+        S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV).lines
+
+
+def test_sector_state_line_building_failure_is_unknown_not_an_abort(tmp_path, monkeypatch):
+    db = _sector_db(tmp_path, [("2026-11-19", "2026-11-20T06:45:08Z")])
+
+    def boom(*a, **k):
+        raise TypeError("shape")
+
+    monkeypatch.setattr(S, "_sector_section", boom)
+    sec = S.desk_sector_state(db, "pre_open", SESSION, PREV, PRE, PREV)
+    assert sec.status == "unknown" and sec.problems[0] == "row for 2026-11-19 could not be read into lines (TypeError)"
