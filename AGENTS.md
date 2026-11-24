@@ -1082,11 +1082,14 @@ What merged:
   amount is outside the rule. etf_flows is still 120 s.
 - **#1408 `6def2bcc`.** GDELT DOC retired: `hold_reason` on the registry entry,
   the same gate in `ingestion/scheduler.py`, no Hermes retries, and migration
-  `gdelt_doc_retire_20261123` marks the 17 DOC features not eligible.
+  `gdelt_doc_retire_20261123`, which names 24 DOC features and sets each one
+  that exists to not eligible and deprecated.
   `physics/momentum.py` treats tone older than 5 days as missing.
-- **#1409 `22f45030`.** A 13F re-run writes nothing new: change rows are
-  compared with the latest stored row, and an advisory lock keeps two writers
-  apart (`ChangeRowsBusy` -> the manager is `DEFERRED`).
+- **#1409 `22f45030`.** 13F dedup: a change row is written only when it
+  differs from the latest stored row, and an advisory lock keeps two writers
+  apart (`ChangeRowsBusy` -> the manager is `DEFERRED`). This is what the code
+  and its tests do; it is not a guarantee for every retry in production (see
+  the one run read below).
 - **#1410 `07eeea27`.** `ingestion/price_fallback.py` no longer uses Twelve
   Data. `scripts/close_backfill_universe.py` exists and is **not wired to any
   unit**; the two `td_backfill_*` scripts and their units are unchanged.
@@ -1102,11 +1105,20 @@ Production, 2026-11-24:
   `/home/grid/repair-records/20261124-13f-surplus-quarantine/` on grid-svr.
 - The first 13F run on #1409 wrote 0 change rows. One clean run, not proof: no
   deferral-and-retry and no second run has been read.
-- Drewry: `container_index` 2026-11-19 = 4176 stored at 03:44:44Z by the first
-  pull on #1407.
-- grid-scheduler activated on `e73a6f7f` at 03:47:55Z (deploy run 45321682892,
-  scheduler inputs only). No scheduled job on it had been read when this was
-  written.
+- GDELT, data state only: of the 24 names in the migration, 17 have a
+  `feature_registry` row on grid-svr, and all 17 read as not eligible and
+  deprecated (operator's read-only query, 04:07Z). The other 7 have no row.
+  Runtime is not observed: no scheduled or Hermes run has been read being
+  refused by the hold.
+- Drewry: one row, `container_index` 2026-11-19 = 4176, stored at 03:44:44Z.
+  It was written by a Hermes repair retry on the #1407 release and read by the
+  operator in a read-only session. It is not proof that the scheduler's own
+  pull works.
+- grid-scheduler restarted onto `e73a6f7f` at 03:47:55Z by deploy run
+  45321682892. The scheduler was the only optional activation in that run
+  (intelligence and realtime were not activated); grid-api and grid-hermes
+  restarted as on any deploy. No scheduled job on the new release had been
+  read when this was written.
 
 Open:
 
