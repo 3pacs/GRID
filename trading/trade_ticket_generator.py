@@ -425,8 +425,10 @@ def generate_ticket(
       - ``current_price`` ≤ 0 (no anchor for stops/targets)
       - direction is neither bullish nor bearish
       - a research report, a decision clock that is not an explicit,
-        timezone-aware instant at or before now, or no eligible directional
-        evidence (``signal_provenance.actionable_refusal_reason``, logged)
+        timezone-aware instant at or before now, a decision older than
+        ``ISSUANCE_MAX_AGE``, or no eligible directional evidence, which
+        needs a signed per-family receipt that nothing builds yet
+        (``signal_provenance.actionable_refusal_reason``, logged)
       - account_size_usd < 0
 
     Otherwise, returns a ``TradeTicket`` with every SOP field populated.

@@ -12,6 +12,7 @@ from features.per_signal_brier import (
 )
 from intelligence import signal_provenance as sp_module
 from intelligence.signal_convergence_scanner import ConvergenceReport
+from tests.test_provenance_stack_defects import _every_family_receipted
 from intelligence.signal_provenance import (
     CausationChain,
     SignalEvidence,
@@ -305,11 +306,12 @@ class TestBuildReport:
         def fake_get(eng, source, h, regime=None, aliases=()):
             return family_cards.get(source), "regime"
 
+        # Contract (round 7): receipts on every row, so the floor passes.
         with patch.object(
             # HIGH needs layer coverage; these layers are advisory in
             # production (CLOCK_FENCED_LAYERS), so fence them all here.
             sp_module, "CLOCK_FENCED_LAYERS", frozenset(sp_module.CONVICTION_LAYERS),
-        ), patch(
+        ), _every_family_receipted(), patch(
             "intelligence.signal_provenance.get_scorecard_with_regime_source",
             side_effect=fake_get,
         ), patch(
@@ -401,9 +403,10 @@ class TestBuildReport:
         engine = MagicMock()
         strong_card = _card("equity", 7, 50, 0.06, 1.5)
 
+        # Contract (round 7): receipts on every row, so the floor passes.
         with patch.object(
             sp_module, "CLOCK_FENCED_LAYERS", frozenset(sp_module.CONVICTION_LAYERS),
-        ), patch(
+        ), _every_family_receipted(), patch(
             "intelligence.signal_provenance.get_scorecard_with_regime_source",
             return_value=(strong_card, "regime"),
         ), patch(

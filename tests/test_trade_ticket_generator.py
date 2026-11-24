@@ -12,17 +12,20 @@ Validates:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from features.per_signal_brier import SignalScorecard
+from intelligence import signal_provenance as sp
 from intelligence.signal_provenance import (
     REPORT_BASIS_LIVE,
     CausationChain,
     SignalEvidence,
-    SignedInput,
+    SignedFamilyReceipt,
     TradeProvenanceReport,
+    actionable_refusal_reason,
 )
 from trading.trade_ticket_generator import (
     DEFAULT_VOL_30D,
@@ -61,17 +64,28 @@ def _fenced_card(source: str, weight: float) -> SignalScorecard:
 _DECISION_CLOCK = datetime(2026, 4, 13, tzinfo=timezone.utc)
 
 
-def _signed(source: str, direction: str, ticker: str) -> SignedInput:
-    """A signed input from the report's own decision, in ``direction``
-    (Codex HOLD 6032982233: eligible evidence needs one)."""
-    return SignedInput(
+# Issuance happens one minute after the decision, inside
+# ``sp.ISSUANCE_MAX_AGE`` (Codex HOLD 6033471347).
+_ISSUED_AT = _DECISION_CLOCK + timedelta(minutes=1)
+
+
+@pytest.fixture(autouse=True)
+def _issue_just_after_the_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sp, "_utc_now", lambda: _ISSUED_AT)
+
+
+def _signed(source: str, direction: str, ticker: str) -> SignedFamilyReceipt:
+    """CONTRACT FIXTURE: a complete signed per-family receipt from the
+    report's own decision, in ``direction``. Eligible evidence needs one
+    (Codex HOLD 6033471347); nothing in production builds it yet."""
+    return SignedFamilyReceipt(
         signal_source=source,
         direction=direction,
         ticker=ticker,
         decision_clock=_DECISION_CLOCK,
-        bullish_weight=1.0 if direction == "bullish" else 0.0,
-        bearish_weight=1.0 if direction == "bearish" else 0.0,
-        models=("head",),
+        consumed_signals=(f"{source}:obs-1",),
+        head_directions=(("head", direction),),
+        complete_contributing_set=True,
     )
 
 
@@ -102,7 +116,7 @@ def _make_report(
                 shapley_weight=round(0.4 / max(1, i + 1), 4),
                 scorecard=_fenced_card(f"signal_{i}", 1.3 if i == 0 else 1.0),
                 classification="strong" if i == 0 else "neutral",
-            signed_input=_signed(f"signal_{i}", direction, ticker),
+                receipt=_signed(f"signal_{i}", direction, ticker),
             )
         )
     return TradeProvenanceReport(
@@ -517,3 +531,26 @@ def test_invalidation_text_references_top_contributor_from_report():
     # And confidence_lower must appear, proving the price floor is
     # derived from the report and not hardcoded.
     assert f"{report.confidence_lower:.3f}" in ticket.invalidation
+
+
+# ── The fixture clears the evidence floor and the issuance bound ─────────
+
+
+@pytest.mark.parametrize("direction", ["bullish", "bearish"])
+def test_fixture_report_clears_the_floor_so_refusals_here_are_the_generators(
+    direction: str,
+) -> None:
+    # Round 7 (Codex HOLD 6033471347): each row's contract receipt makes it
+    # eligible and the report issues inside ISSUANCE_MAX_AGE, so a refusal
+    # in this file comes from the gate it tests, not from the floor.
+    report = _make_report(direction=direction)
+    assert actionable_refusal_reason(report) is None
+    expired = _ISSUED_AT + sp.ISSUANCE_MAX_AGE
+    assert actionable_refusal_reason(report, now=expired).startswith(sp.DECISION_EXPIRED)
+    no_receipts = [
+        SignalEvidence(ev.signal_source, ev.shapley_weight, ev.scorecard, ev.classification)
+        for ev in report.signal_evidence
+    ]
+    assert actionable_refusal_reason(replace(report, signal_evidence=no_receipts)).startswith(
+        sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+    )

@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from features.per_signal_brier import SignalScorecard
+from intelligence import signal_provenance as sp
 from intelligence.liquidity_regime import STATE_CRISIS, LiquidityRegimeResult
 from intelligence.market_implied_prob import (
     MarketImpliedProb,
@@ -37,8 +38,9 @@ from intelligence.signal_provenance import (
     REPORT_BASIS_LIVE,
     CausationChain,
     SignalEvidence,
-    SignedInput,
+    SignedFamilyReceipt,
     TradeProvenanceReport,
+    actionable_refusal_reason,
 )
 from oracle.risk import (
     CircuitBreaker,
@@ -62,6 +64,9 @@ def _admit_models_and_reset_breaker(monkeypatch):
         "oracle.contrast_distillation.compute_divergence",
         lambda rollouts: 0.0,
     )
+    # Tickets issue one minute after the fixture report's decision, inside
+    # sp.ISSUANCE_MAX_AGE (Codex HOLD 6033471347).
+    monkeypatch.setattr(sp, "_utc_now", lambda: _REPORT_CLOCK + timedelta(minutes=1))
     reset_global_circuit_breaker()
     yield
     reset_global_circuit_breaker()
@@ -188,16 +193,17 @@ def _make_report(
                     conviction_weight=1.3,
                 ),
                 classification="strong",
-                # A signed input from the report's own decision, in the
-                # call's direction (Codex HOLD 6032982233).
-                signed_input=SignedInput(
+                # Contract: a complete signed per-family receipt from the
+                # report's own decision, in the call's direction (Codex HOLD
+                # 6033471347; nothing in production builds one yet).
+                receipt=SignedFamilyReceipt(
                     signal_source="sig_0",
                     direction=direction,
                     ticker="AAPL",
                     decision_clock=_REPORT_CLOCK,
-                    bullish_weight=1.0 if direction == "bullish" else 0.0,
-                    bearish_weight=1.0 if direction == "bearish" else 0.0,
-                    models=("head",),
+                    consumed_signals=("sig_0:obs-1",),
+                    head_directions=(("head", direction),),
+                    complete_contributing_set=True,
                 ),
             )
         ],
@@ -543,6 +549,13 @@ class TestDefect6RiskGatePriceAndFailClosed:
         )
         assert res.passed is False
         assert "exposure" in res.reason.lower()
+
+    def test_fixture_report_clears_the_floor_so_refusals_here_are_the_gates(self):
+        # Round 7: the fixture's contract receipt and its issuance inside
+        # ISSUANCE_MAX_AGE pass the floor, so the refusals below are the
+        # risk gate's own.
+        for direction in ("bullish", "bearish"):
+            assert actionable_refusal_reason(_make_report(direction=direction)) is None
 
     def test_generate_ticket_blocks_when_notional_exceeds_exposure_limit(self):
         # Default max_total_exposure = $50,000. 5% of $1.2M = $60,000 > $50,000.

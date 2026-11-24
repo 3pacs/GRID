@@ -404,9 +404,9 @@ def _swap_signal_evidence(
     scorecard conviction_weight overridden to ``new_weight``.
 
     We rebuild the SignalEvidence (and its inner SignalScorecard) since
-    both are frozen dataclasses, keeping every other field, the signed input
-    included: stress perturbs the card's skill, not what the signal said at
-    the decision. Pure — never mutates the input.
+    both are frozen dataclasses, keeping every other field, the receipt and
+    head vote included: stress perturbs the card's skill, not what the
+    signal said at the decision. Pure — never mutates the input.
     """
     new_list: list[SignalEvidence] = []
     for i, ev in enumerate(evidence_list):

@@ -34,6 +34,7 @@ from intelligence.signal_provenance import (
     compute_aggregate_conviction,
     compute_evidence_coverage,
 )
+from tests.test_provenance_stack_defects import _every_family_receipted
 
 
 def _card(source: str, weight: float, calibrated: bool = True) -> SignalScorecard:
@@ -159,8 +160,8 @@ class TestBuildProvenanceReportCoverage:
             horizon=7,
             regime="NEUTRAL",
             fci_regime="EASY",
-            # A signed head vote, so the evidence floor passes and these tests
-            # reach the coverage gate.
+            # A signed head vote. Since Codex HOLD 6033471347 it never counts:
+            # _patch_all_layers adds contract receipts so the floor passes.
             model_votes=[{"model_name": "flow_momentum", "weight": 1.0, "direction": "bullish"}],
             shapley_top_contributor="flow_momentum",
             shapley_top_share=1.0,
@@ -180,6 +181,9 @@ class TestBuildProvenanceReportCoverage:
         stack.enter_context(
             patch.object(sp, "CLOCK_FENCED_LAYERS", frozenset(CONVICTION_LAYERS))
         )
+        # Contract (round 7): a complete receipt on every row, so the evidence
+        # floor passes and these tests reach the coverage gate.
+        stack.enter_context(_every_family_receipted())
         def _fail(*_a, **_k):
             raise RuntimeError("layer unavailable")
 

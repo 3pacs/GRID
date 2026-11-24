@@ -104,21 +104,24 @@ def _classify_evidence(scorecard: SignalScorecard | None) -> str:
 
 # Signed-input direction when the head votes that weight a family disagree.
 SIGNED_INPUT_MIXED: str = "mixed"
+# What a ``SignedInput`` is: the head-vote aggregate, never evidence.
+AGGREGATE_HEAD_VOTE_BASIS: str = "aggregate_head_vote_not_a_receipt"
 
 
 @dataclass(frozen=True)
 class SignedInput:
-    """A signal family's signed observation at one decision (Codex HOLD
-    6032982233).
+    """The aggregate head vote on a signal family: descriptive context only.
 
-    Its only source is the live prediction's oracle head votes
-    (``EnsemblePrediction.model_votes``): ``predict(ticker, as_of)`` computes
-    each head's ``direction`` from that head's signals valid at ``as_of`` for
-    ``ticker``. A family is signed by the votes that weight it, decomposed
-    as for the evidence weights: ``bullish`` or ``bearish`` when every
-    directional vote on it agrees, ``mixed`` when they disagree, ``neutral``
-    when none is directional. ``ticker`` and ``decision_clock`` bind it to
-    that prediction.
+    Built from the prediction's oracle head votes (``model_votes``): each
+    head's one ``direction``, spread over the head's configured families as
+    for the evidence weights, ``bullish`` or ``bearish`` when every
+    directional vote on the family agrees, ``mixed`` when they disagree,
+    ``neutral`` when none is directional; bound to the ticker and clock.
+    Codex HOLD 6033471347: a head's direction is the aggregate of all it
+    consumed, so this can mark bullish a family the head never read, or
+    read as bearish; and ``model_votes`` holds the top ten heads only. It
+    never counts toward eligibility (``SignedFamilyReceipt`` does) and is
+    serialized with ``basis=AGGREGATE_HEAD_VOTE_BASIS``.
     """
 
     signal_source: str
@@ -131,6 +134,7 @@ class SignedInput:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "basis": AGGREGATE_HEAD_VOTE_BASIS,
             "signal_source": self.signal_source,
             "direction": self.direction,
             "ticker": self.ticker,
@@ -138,6 +142,51 @@ class SignedInput:
             "bullish_weight": round(self.bullish_weight, 4),
             "bearish_weight": round(self.bearish_weight, 4),
             "models": list(self.models),
+        }
+
+
+@dataclass(frozen=True)
+class SignedFamilyReceipt:
+    """What one signal family said at one decision, as the heads consumed it
+    (Codex HOLD 6033471347). The only signed input that counts.
+
+    Contract, every field checked (``_receipt_supports``):
+    - ``signal_source``: the family, the evidence row's own;
+    - ``direction``: the family's sign at the decision, bullish or bearish;
+    - ``ticker`` and ``decision_clock`` (timezone-aware): the report's;
+    - ``consumed_signals``: the IDs or names of this family's signals the
+      heads consumed, at least one;
+    - ``head_directions``: ``(head, sign)`` for each head that consumed
+      this family, the sign of that head's input from this family alone;
+    - ``complete_contributing_set``: True only when ``head_directions``
+      covers every contributing head, not just the ten in ``model_votes``.
+    A row is eligible only with a complete receipt whose every head signs
+    the call's way: one dissenting or neutral head refuses it.
+
+    Nothing in production builds one. ``oracle/engine.py`` exports each
+    head's aggregate direction and weight, not the family, sign or IDs of
+    what it consumed; Anik chose to abstain until it does ("Abstain now
+    (B)", 2026-11-24), so every live row's receipt is None and no live
+    report can ticket. Building receipts is a separate, reviewed change.
+    """
+
+    signal_source: str
+    direction: str
+    ticker: str
+    decision_clock: datetime
+    consumed_signals: tuple[str, ...]
+    head_directions: tuple[tuple[str, str], ...]
+    complete_contributing_set: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "signal_source": self.signal_source,
+            "direction": self.direction,
+            "ticker": self.ticker,
+            "decision_clock": self.decision_clock.isoformat(),
+            "consumed_signals": list(self.consumed_signals),
+            "head_directions": [list(pair) for pair in self.head_directions],
+            "complete_contributing_set": self.complete_contributing_set,
         }
 
 
@@ -157,9 +206,12 @@ class SignalEvidence:
     # clock. Reported only: the row is then classified "advisory", its
     # ``scorecard`` is None, and it weighs as no history.
     advisory_scorecard: SignalScorecard | None = None
-    # This family's signed input at the decision, or None when no signed
-    # vote weights it. Eligible evidence needs one that agrees with the call.
+    # The aggregate head vote on this family, or None when no signed vote
+    # weights it. Descriptive context only: it never makes a row eligible.
     signed_input: SignedInput | None = None
+    # This family's signed receipt at the decision. Eligible evidence needs
+    # one meeting the contract; the live builder sets none (abstain).
+    receipt: SignedFamilyReceipt | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,6 +230,7 @@ class SignalEvidence:
             "signed_input": (
                 self.signed_input.to_dict() if self.signed_input is not None else None
             ),
+            "receipt": self.receipt.to_dict() if self.receipt is not None else None,
         }
 
 
@@ -739,8 +792,8 @@ def _verdict_reason(
         return (
             f"{NO_ELIGIBLE_DIRECTIONAL_EVIDENCE}: {eligible_directional_evidence} eligible "
             "rows (calibrated strong/neutral scorecards fenced to the decision "
-            "clock, each with a signed input from the same decision that agrees "
-            f"with the call; floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE})"
+            "clock, each with a complete signed per-family receipt from the same "
+            f"decision that agrees with the call; floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE})"
         )
     if conviction < 0.7:
         return f"aggregate conviction {conviction:.2f} < 0.70"
@@ -776,11 +829,16 @@ def _verdict_reason(
 #   blank, date-only, naive or unparseable clock admits nothing;
 # - that card, classified from its own conviction weight, is strong or
 #   neutral (a weak or anti-predictive card says not to trust the signal);
-# - and (Codex HOLD 6032982233) the row carries a signed input for the same
-#   family, bound to the report's ticker and decision clock, whose sign is
-#   the call's. A card is historical skill, the same behind a bullish and a
-#   bearish call; the signed input is what the signal said at the decision.
-#   An opposite, mixed, neutral or absent input is not eligible.
+# - and the row carries a ``SignedFamilyReceipt`` meeting its contract: for
+#   the same family, bound to the report's ticker and decision clock,
+#   complete over the contributing heads, and signed the call's way by every
+#   head. A card is historical skill, the same behind a bullish and a
+#   bearish call; the receipt is what the family said at the decision.
+#   Round 6 (Codex HOLD 6032982233) took that sign from the head votes;
+#   Codex HOLD 6033471347 showed a head's vote is its aggregate, not its
+#   family's, so the head vote (``signed_input``) never counts. Nothing in
+#   production builds receipts, so no live row is eligible (Anik, "Abstain
+#   now (B)", 2026-11-24).
 # Fudge alerts only dampen conviction and are not directional evidence.
 MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE: int = 1
 NO_ELIGIBLE_DIRECTIONAL_EVIDENCE: str = "no_eligible_directional_evidence"
@@ -797,6 +855,9 @@ DECISION_CLOCK_DATE_ONLY: str = "decision_clock_date_only"
 DECISION_CLOCK_NOT_AWARE: str = "decision_clock_not_timezone_aware"
 DECISION_CLOCK_UNPARSEABLE: str = "decision_clock_unparseable"
 DECISION_CLOCK_IN_FUTURE: str = "decision_clock_in_future"
+DECISION_EXPIRED: str = "decision_expired"
+# Recorded with the floor's reason when rows carry no signed receipt.
+NO_SIGNED_FAMILY_RECEIPT: str = "no_signed_family_receipt"
 
 
 def parse_decision_instant(raw: Any) -> tuple[datetime | None, str | None]:
@@ -832,21 +893,49 @@ def parse_decision_instant(raw: Any) -> tuple[datetime | None, str | None]:
     return parsed.astimezone(timezone.utc), None
 
 
-def _signed_input_supports(
+def _named(value: Any) -> bool:
+    """True iff ``value`` is a non-blank string."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _receipt_supports(
     ev: SignalEvidence, *, call: str, clock: datetime, ticker: str
 ) -> bool:
-    """True iff ``ev``'s signed input is this family's, from this ticker and
-    decision clock, and signed in the call's direction."""
-    si = getattr(ev, "signed_input", None)
-    if not isinstance(si, SignedInput) or si.signal_source != ev.signal_source:
+    """True iff ``ev``'s receipt meets the ``SignedFamilyReceipt`` contract
+    for this family, ticker and decision clock, complete and signed the
+    call's way by every contributing head."""
+    rc = getattr(ev, "receipt", None)
+    if not isinstance(rc, SignedFamilyReceipt) or rc.signal_source != ev.signal_source:
+        return False
+    if rc.complete_contributing_set is not True or rc.direction != call:
         return False
     want = str(ticker or "").strip().upper()
-    if not want or str(si.ticker or "").strip().upper() != want:
+    if not want or str(rc.ticker or "").strip().upper() != want:
         return False
-    stamp = si.decision_clock
+    stamp = rc.decision_clock
     if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
         return False
-    return stamp.astimezone(timezone.utc) == clock and si.direction == call
+    if stamp.astimezone(timezone.utc) != clock:
+        return False
+    consumed, heads = rc.consumed_signals, rc.head_directions
+    if not isinstance(consumed, tuple) or not consumed or not all(map(_named, consumed)):
+        return False
+    if not isinstance(heads, tuple) or not heads:
+        return False
+    return all(
+        isinstance(pair, tuple) and len(pair) == 2 and _named(pair[0]) and pair[1] == call
+        for pair in heads
+    )
+
+
+def _receipt_note(rows: Iterable[SignalEvidence]) -> str:
+    """``"; no_signed_family_receipt: k of n rows"`` when k rows carry no
+    receipt, else ``""``."""
+    rows = list(rows)
+    missing = sum(
+        1 for ev in rows if not isinstance(getattr(ev, "receipt", None), SignedFamilyReceipt)
+    )
+    return f"; {NO_SIGNED_FAMILY_RECEIPT}: {missing} of {len(rows)} rows" if missing else ""
 
 
 def is_eligible_directional_evidence(
@@ -875,7 +964,7 @@ def is_eligible_directional_evidence(
         return False
     if _classify_evidence(card) not in DIRECTION_SUPPORTING_CLASSIFICATIONS:
         return False
-    return _signed_input_supports(ev, call=call, clock=clock, ticker=ticker)
+    return _receipt_supports(ev, call=call, clock=clock, ticker=ticker)
 
 
 def count_eligible_directional_evidence(
@@ -912,7 +1001,8 @@ def actionable_refusal_reason(report: Any, *, now: datetime | None = None) -> st
 
     Refused: a research report (``actionable`` is not True, e.g.
     ``basis="research_no_clock"``); a decision clock that is not an explicit,
-    timezone-aware instant, or is after ``now``; and fewer than
+    timezone-aware instant, or is after ``now``; a decision older than
+    ``ISSUANCE_MAX_AGE`` at ``now`` (``decision_expired``); and fewer than
     ``MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE`` eligible rows on that clock.
     """
     if getattr(report, "actionable", False) is not True:
@@ -927,8 +1017,14 @@ def actionable_refusal_reason(report: Any, *, now: datetime | None = None) -> st
             f"{DECISION_CLOCK_IN_FUTURE}: {clock.isoformat()} is after now "
             f"({current.isoformat()})"
         )
+    if current - clock > ISSUANCE_MAX_AGE:
+        return (
+            f"{DECISION_EXPIRED}: decision {clock.isoformat()} is more than "
+            f"{ISSUANCE_MAX_AGE} before now ({current.isoformat()})"
+        )
+    rows = list(getattr(report, "signal_evidence", None) or [])
     eligible = count_eligible_directional_evidence(
-        getattr(report, "signal_evidence", None) or [],
+        rows,
         direction=getattr(report, "direction", ""),
         decision_clock=clock,
         ticker=getattr(report, "ticker", ""),
@@ -936,7 +1032,7 @@ def actionable_refusal_reason(report: Any, *, now: datetime | None = None) -> st
     if eligible < MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE:
         return (
             f"{NO_ELIGIBLE_DIRECTIONAL_EVIDENCE}: {eligible} eligible rows "
-            f"(floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE})"
+            f"(floor {MIN_ELIGIBLE_DIRECTIONAL_EVIDENCE}){_receipt_note(rows)}"
         )
     return None
 
@@ -984,6 +1080,8 @@ def decide_verdict(
         layers_advisory=layers_advisory,
         eligible_directional_evidence=eligible,
     )
+    if reason.startswith(NO_ELIGIBLE_DIRECTIONAL_EVIDENCE):
+        reason += _receipt_note(rows)
     return verdict, reason
 
 
@@ -1163,9 +1261,10 @@ def _extract_signed_inputs(
     ticker: str,
     clock: datetime,
 ) -> dict[str, SignedInput]:
-    """Each family's ``SignedInput`` from the prediction's head votes, split
-    over families as ``_extract_signal_contributions`` splits their weight.
-    A vote without a bullish/bearish/neutral ``direction`` signs nothing."""
+    """Each family's ``SignedInput`` (the aggregate head vote, context only)
+    from the prediction's head votes, split over families as
+    ``_extract_signal_contributions`` splits their weight. A vote without a
+    bullish/bearish/neutral ``direction`` signs nothing."""
     bullish: dict[str, float] = {}
     bearish: dict[str, float] = {}
     models: dict[str, list[str]] = {}
@@ -1201,6 +1300,20 @@ def _extract_signed_inputs(
             models=tuple(models[family]),
         )
     return signed
+
+
+def _family_receipts(
+    prediction: Any, *, ticker: str, clock: datetime
+) -> dict[str, SignedFamilyReceipt]:
+    """Each family's ``SignedFamilyReceipt`` at this decision: none.
+
+    Abstain (Codex HOLD 6033471347; Anik, "Abstain now (B)", 2026-11-24):
+    the engine exports no per-family receipts, so nothing is built and
+    nothing on the prediction is read; every live row's ``receipt`` is
+    None. Wiring real receipts here is a separate, reviewed change.
+    """
+    del prediction, ticker, clock
+    return {}
 
 
 def _extract_signal_contributions(
@@ -1564,6 +1677,12 @@ def _lookup_convergence(
 #   decision needs an explicit, timezone-aware instant.
 LIVE_CLOCK_MAX_AGE: timedelta = timedelta(hours=1)
 LIVE_CLOCK_MAX_FUTURE_SKEW: timedelta = timedelta(seconds=60)
+# Issuance freshness (Codex HOLD 6033471347): an actionable entry point
+# refuses a ticket once now - decision instant exceeds ISSUANCE_MAX_AGE
+# (``decision_expired``). It is the builder's live window, measured from the
+# decision and not from the build, so a report built 59 minutes after its
+# decision has one minute left to issue; after that, predict again.
+ISSUANCE_MAX_AGE: timedelta = LIVE_CLOCK_MAX_AGE
 
 
 def _utc_now() -> datetime:
@@ -1646,10 +1765,11 @@ def build_provenance_report(
     ``_decision_clock`` (missing, date-only, naive, future or stale clocks
     raise ``ValueError`` before any layer is read). The report is labelled
     ``actionable=True``, ``basis="live_decision_clock"``. Each evidence row
-    carries its family's signed input from the prediction's head votes,
-    bound to the ticker and clock. Only evidence stamped at or
-    before that clock moves a decision-bearing number: scorecards whose
-    ``last_updated`` is at or before it, and the layers in
+    carries its family's aggregate head vote (``signed_input``, context
+    only) and its signed receipt (``_family_receipts``: none in production,
+    so no row is eligible and no live report tickets). Only evidence
+    stamped at or before that clock moves a decision-bearing number:
+    scorecards whose ``last_updated`` is at or before it, and the layers in
     ``CLOCK_FENCED_LAYERS``. Every other layer is still computed and
     reported in ``advisory_layers``, but its report field stays at the
     neutral 1.0, it multiplies nothing into ``aggregate_conviction``, and it
@@ -1671,6 +1791,7 @@ def build_provenance_report(
     signed_inputs = _extract_signed_inputs(
         prediction, model_signal_map=model_signal_map, ticker=ticker, clock=clock
     )
+    receipts = _family_receipts(prediction, ticker=ticker, clock=clock)
 
     signal_evidence: list[SignalEvidence] = []
     regime_calibrated_count = 0
@@ -1698,6 +1819,7 @@ def build_provenance_report(
                     calibration_source=calibration_source,
                     advisory_scorecard=scorecard,
                     signed_input=signed_inputs.get(source),
+                    receipt=receipts.get(source),
                 )
             )
             continue
@@ -1709,6 +1831,7 @@ def build_provenance_report(
                 classification=_classify_evidence(scorecard),
                 calibration_source=calibration_source,
                 signed_input=signed_inputs.get(source),
+                receipt=receipts.get(source),
             )
         )
 

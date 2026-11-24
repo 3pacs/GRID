@@ -6,10 +6,11 @@ no LLM, no DB.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from features.per_signal_brier import SignalScorecard
 from intelligence.decision_gateway import (
@@ -18,7 +19,13 @@ from intelligence.decision_gateway import (
     combine_verdict,
     should_i_trade,
 )
-from intelligence.signal_provenance import REPORT_BASIS_LIVE, SignalEvidence, SignedInput
+from intelligence import signal_provenance as sp
+from intelligence.signal_provenance import (
+    REPORT_BASIS_LIVE,
+    SignalEvidence,
+    SignedFamilyReceipt,
+    SignedInput,
+)
 
 
 # ── combine_verdict (pure function) ──────────────────────────────────────
@@ -142,6 +149,13 @@ def _mock_prediction() -> SimpleNamespace:
 _PROVENANCE_CLOCK = datetime(2026, 11, 21, 15, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _issue_just_after_the_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The ticket stage refuses a decision older than sp.ISSUANCE_MAX_AGE
+    # (Codex HOLD 6033471347); these tests issue one minute after it.
+    monkeypatch.setattr(sp, "_utc_now", lambda: _PROVENANCE_CLOCK + timedelta(minutes=1))
+
+
 def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
     obj = SimpleNamespace(
         ticker="NVDA",
@@ -162,9 +176,11 @@ def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
         market_implied_prob=0.78,
         red_team_epistemic_risk=0.0,
         shipping_fudge_alerts=[],
-        # A live report with one calibrated, stamped card and a signed input
-        # in the call's direction from the same decision: the evidence floor
-        # passes, so these tests exercise the stages after it.
+        # A live report with one calibrated, stamped card and (contract) a
+        # complete signed per-family receipt in the call's direction from
+        # the same decision: the evidence floor passes, so these tests
+        # exercise the stages after it. The head vote alone would not count
+        # (Codex HOLD 6033471347).
         actionable=True,
         basis=REPORT_BASIS_LIVE,
         decision_clock=_PROVENANCE_CLOCK.isoformat(),
@@ -192,6 +208,15 @@ def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
                     bullish_weight=1.0,
                     bearish_weight=0.0,
                     models=("regime_contrarian",),
+                ),
+                receipt=SignedFamilyReceipt(
+                    signal_source="regime_contrarian",
+                    direction="bullish",
+                    ticker="NVDA",
+                    decision_clock=_PROVENANCE_CLOCK,
+                    consumed_signals=("regime_contrarian:obs-1",),
+                    head_directions=(("regime_contrarian", "bullish"),),
+                    complete_contributing_set=True,
                 ),
             )
         ],
@@ -528,3 +553,24 @@ class TestShouldITrade:
                 account_size_usd=100000,
             )
         assert response.ticker == "NVDA"
+
+
+class TestMockProvenanceClearsTheFloor:
+    def test_mock_report_clears_the_floor_so_refusals_here_are_the_stages(self) -> None:
+        # Round 7 (Codex HOLD 6033471347): the mocked report's contract
+        # receipt makes its row eligible and it issues inside
+        # ISSUANCE_MAX_AGE; without the receipt, or later, it is refused.
+        report = _mock_provenance()
+        assert sp.actionable_refusal_reason(report) is None
+        (row,) = report.signal_evidence
+        report.signal_evidence = [
+            SignalEvidence(row.signal_source, row.shapley_weight, row.scorecard,
+                           row.classification, signed_input=row.signed_input)
+        ]
+        assert sp.actionable_refusal_reason(report).startswith(
+            sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+        )
+        late = _PROVENANCE_CLOCK + sp.ISSUANCE_MAX_AGE + timedelta(seconds=1)
+        assert sp.actionable_refusal_reason(_mock_provenance(), now=late).startswith(
+            sp.DECISION_EXPIRED
+        )

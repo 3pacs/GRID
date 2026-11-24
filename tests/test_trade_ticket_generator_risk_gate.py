@@ -20,18 +20,20 @@ tests/test_oracle_risk.py at the breaker level.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
 
 from features.per_signal_brier import SignalScorecard
+from intelligence import signal_provenance as sp
 from intelligence.signal_provenance import (
     REPORT_BASIS_LIVE,
     CausationChain,
     SignalEvidence,
-    SignedInput,
+    SignedFamilyReceipt,
     TradeProvenanceReport,
+    actionable_refusal_reason,
 )
 from oracle.risk import (
     CircuitBreaker,
@@ -76,17 +78,28 @@ def _fenced_card(source: str, weight: float) -> SignalScorecard:
 _DECISION_CLOCK = datetime(2026, 4, 13, tzinfo=timezone.utc)
 
 
-def _signed(source: str, direction: str, ticker: str) -> SignedInput:
-    """A signed input from the report's own decision, in ``direction``
-    (Codex HOLD 6032982233: eligible evidence needs one)."""
-    return SignedInput(
+# Issuance happens one minute after the decision, inside
+# ``sp.ISSUANCE_MAX_AGE`` (Codex HOLD 6033471347).
+_ISSUED_AT = _DECISION_CLOCK + timedelta(minutes=1)
+
+
+@pytest.fixture(autouse=True)
+def _issue_just_after_the_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sp, "_utc_now", lambda: _ISSUED_AT)
+
+
+def _signed(source: str, direction: str, ticker: str) -> SignedFamilyReceipt:
+    """CONTRACT FIXTURE: a complete signed per-family receipt from the
+    report's own decision, in ``direction``. Eligible evidence needs one
+    (Codex HOLD 6033471347); nothing in production builds it yet."""
+    return SignedFamilyReceipt(
         signal_source=source,
         direction=direction,
         ticker=ticker,
         decision_clock=_DECISION_CLOCK,
-        bullish_weight=1.0 if direction == "bullish" else 0.0,
-        bearish_weight=1.0 if direction == "bearish" else 0.0,
-        models=("head",),
+        consumed_signals=(f"{source}:obs-1",),
+        head_directions=(("head", direction),),
+        complete_contributing_set=True,
     )
 
 
@@ -115,7 +128,7 @@ def _make_report(
             shapley_weight=round(0.4 / max(1, i + 1), 4),
             scorecard=_fenced_card(f"signal_{i}", 1.3 if i == 0 else 1.0),
             classification="strong" if i == 0 else "neutral",
-            signed_input=_signed(f"signal_{i}", direction, ticker),
+            receipt=_signed(f"signal_{i}", direction, ticker),
         )
         for i in range(n_evidence)
     ]
@@ -361,3 +374,11 @@ def test_reset_between_calls_clears_halt():
         vol_30d=0.30,
     )
     assert isinstance(ticket, TradeTicket)
+
+
+def test_fixture_report_clears_the_floor_so_refusals_here_are_the_gates() -> None:
+    # Round 7 (Codex HOLD 6033471347): each row's contract receipt makes it
+    # eligible and the report issues inside ISSUANCE_MAX_AGE, so a refusal
+    # in this file comes from the circuit breaker, not from the floor.
+    for direction in ("bullish", "bearish"):
+        assert actionable_refusal_reason(_make_report(direction=direction)) is None

@@ -345,10 +345,11 @@ def _run_trade_ticket(
     if current_price is None or current_price <= 0:
         return None, "current_price missing or non-positive"
     try:
-        # The evidence floor (Codex review 6032024752; Anik, 2026-11-24) and
-        # the mandatory decision instant (Codex HOLD 6032982233): no ticket
-        # from a research report, a bad or future clock, or without eligible
-        # directional evidence, in any band.
+        # The evidence floor (Codex review 6032024752; Anik, 2026-11-24), the
+        # mandatory decision instant (Codex HOLD 6032982233) and issuance
+        # freshness (Codex HOLD 6033471347): no ticket from a research
+        # report, a bad, future or expired clock, or without eligible
+        # directional evidence (a signed per-family receipt), in any band.
         from intelligence.signal_provenance import actionable_refusal_reason
         refusal = actionable_refusal_reason(provenance_report)
         if refusal is not None:

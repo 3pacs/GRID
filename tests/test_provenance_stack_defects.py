@@ -361,11 +361,12 @@ class TestDefect1HonestCoverage:
         engine = _failing_engine()
         pred = _prediction(ticker="XOM", confidence=0.72)
 
+        # Contract (round 7): receipts on every row, so the coverage gate decides.
         with patch.object(
             sp,
             "get_scorecard_with_regime_source",
             lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.3), "regime"),
-        ):
+        ), _every_family_receipted():
             report = sp.build_provenance_report(engine, prediction=pred)
 
         assert report.layers_present == 0
@@ -572,6 +573,8 @@ class TestDefect3ShippingFudgeAlertsSectorScoped:
                     lambda _eng, src, _h, _reg=None, **_k: (_card(src, 1.3), "regime"),
                 )
             )
+            # Contract (round 7): receipts, so the coverage denominator decides.
+            stack.enter_context(_every_family_receipted())
             report = sp.build_provenance_report(MagicMock(), prediction=pred)
 
         assert report.layers_total == 11
@@ -679,8 +682,8 @@ class TestDefect4RedTeamAdvisoryOnly:
             verdict="high",
             aggregate_conviction=1.3,
             red_team_epistemic_risk=0.95,
-            # A live report with one fenced card and a signed input in the
-            # call's direction from the same decision: the floor passes.
+            # A live report with one fenced card and (contract, round 7) a
+            # complete receipt in the call's direction: the floor passes.
             actionable=True,
             basis=sp.REPORT_BASIS_LIVE,
             direction="bullish",
@@ -694,6 +697,7 @@ class TestDefect4RedTeamAdvisoryOnly:
                     signed_input=sp.SignedInput(
                         "flow_momentum", "bullish", "NVDA", clock, 1.0, 0.0, ("flow_momentum",)
                     ),
+                    receipt=_receipt("flow_momentum", clock=clock),
                 )
             ],
         )
@@ -823,6 +827,8 @@ class TestDefect5ScorecardKeyMapping:
                     lambda _eng, src, _h, _reg=None, **_k: (family_cards.get(src), "regime"),
                 )
             )
+            # Contract (round 7): receipts, so the key mapping decides.
+            stack.enter_context(_every_family_receipted())
             report = sp.build_provenance_report(_OracleModelsEngine(), prediction=pred)
 
         sources = {ev.signal_source: ev for ev in report.signal_evidence}
@@ -1363,10 +1369,13 @@ class TestCodexHold6030789643EvidenceFence:
         clock: datetime,
         ticker: str = "NVDA",
         engine: Any = None,
+        receipted: bool = False,
     ) -> Any:
         pred = _prediction(ticker=ticker, confidence=0.72, signal_contributions=contributions)
         pred.as_of = clock
         with ExitStack() as stack:
+            if receipted:
+                stack.enter_context(_every_family_receipted())
             _patch_all_non_fudge_adapters(stack, value=layer_value)
             stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW, create=True))
             _patch_calibration_tables(stack, regime_cards=cards, flat_cards={})
@@ -1381,8 +1390,13 @@ class TestCodexHold6030789643EvidenceFence:
     def test_unfenced_layers_are_advisory_and_do_not_move_numbers(self) -> None:
         clock = _LIVE_NOW - timedelta(minutes=2)
         cards = {"jodi_oil": _card_at("jodi_oil", 1.3, _LIVE_NOW - timedelta(days=1))}
-        quiet = self._build(layer_value=1.0, cards=cards, contributions={"jodi_oil": 1.0}, clock=clock)
-        loud = self._build(layer_value=0.9, cards=cards, contributions={"jodi_oil": 1.0}, clock=clock)
+        # Contract (round 7): a receipt on the row, so the fence decides.
+        quiet = self._build(
+            layer_value=1.0, cards=cards, contributions={"jodi_oil": 1.0}, clock=clock, receipted=True
+        )
+        loud = self._build(
+            layer_value=0.9, cards=cards, contributions={"jodi_oil": 1.0}, clock=clock, receipted=True
+        )
 
         # Every number directional use reads is the same whether the
         # unfenced layers say 1.0 or 0.9.
@@ -1588,6 +1602,32 @@ def _inject_receipts(stack: ExitStack, receipts: dict[str, Any] | None) -> None:
         stack.enter_context(
             patch.object(sp, "_family_receipts", lambda *_a, **_k: dict(receipts))
         )
+
+
+class _ReceiptForEveryFamily(dict):
+    """CONTRACT FIXTURE: answers the builder's ``receipts.get(family)`` with
+    a complete receipt signed ``call`` at the builder's ticker and clock."""
+
+    def __init__(self, call: str, ticker: str, clock: datetime) -> None:
+        super().__init__()
+        self._signed = (call, ticker, clock)
+
+    def get(self, family: Any, default: Any = None) -> Any:
+        call, ticker, clock = self._signed
+        return _receipt(str(family), call, ticker=ticker, clock=clock)
+
+
+def _every_family_receipted() -> Any:
+    """CONTRACT FIXTURE (round 7): every row gets a complete receipt signed
+    the call's way, so the evidence floor passes and the mechanics a test
+    pins (coverage, fences, key mapping) decide the verdict."""
+    return patch.object(
+        sp,
+        "_family_receipts",
+        lambda prediction, *, ticker, clock: _ReceiptForEveryFamily(
+            str(getattr(prediction, "direction", "")), ticker, clock
+        ),
+    )
 
 
 def _late_or_unstamped_fudge_engine() -> MagicMock:
@@ -3149,7 +3189,7 @@ class TestCodexHold6033471347SignedFamilyReceipts:
         # Contract, not live: once an engine change exports receipts, a
         # complete, agreeing receipt behind a fenced strong card at
         # confidence above 0.85 tickets; an incomplete one does not.
-        pred, family, _ = _exact_case("aggregate-head-vote-alone")
+        pred, _, family = _exact_case("aggregate-head-vote-alone")
         receipt = _receipt(
             family,
             clock=_SIGNED_CLOCK,
