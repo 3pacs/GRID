@@ -28,6 +28,12 @@ and mocks (no database, no network):
      without eligible directional evidence, one verdict policy shared by
      provenance and the counterfactual stress test, and positive-control and
      exact-threshold tests (``TestEvidenceFloor``).
+ 10. Codex HOLD 6032982233: eligible evidence needs a signed input from the
+     same decision (``TestCodexHold6032982233SignedInput``); actionable
+     entry points need an explicit, timezone-aware decision instant
+     (``TestCodexHold6032982233DecisionInstant``); clockless research
+     reports are labelled and never ticket
+     (``TestCodexHold6032982233ResearchReports``).
 """
 from __future__ import annotations
 
@@ -1549,6 +1555,17 @@ def _gateway_decision(
         signal_contributions=dict(contributions or _ZERO_EVIDENCE_CONTRIBUTIONS),
     )
     pred.as_of = _ZERO_EVIDENCE_CLOCK
+    return _run_gateway(pred, cards=cards)
+
+
+def _run_gateway(
+    pred: SimpleNamespace,
+    *,
+    cards: dict[str, SignalScorecard] | None = None,
+) -> dg.DecisionResponse:
+    """``_gateway_decision``'s body for a caller-built live prediction."""
+    ticker = pred.ticker
+    confidence = pred.confidence
     red_team = llm_red_team.RedTeamReport(
         ticker=ticker,
         prediction_score=confidence,
@@ -1781,6 +1798,13 @@ def _live_report(
         signal_contributions=dict(contributions or _ZERO_EVIDENCE_CONTRIBUTIONS),
     )
     pred.as_of = _ZERO_EVIDENCE_CLOCK
+    return _build_live(pred, cards=cards)
+
+
+def _build_live(
+    pred: SimpleNamespace, *, cards: dict[str, SignalScorecard]
+) -> sp.TradeProvenanceReport:
+    """``build_provenance_report`` on a caller-built live prediction."""
     with ExitStack() as stack:
         _patch_all_non_fudge_adapters(stack, value=_UNFENCED_LAYER_VALUE)
         stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW))
@@ -2039,3 +2063,510 @@ class TestEvidenceFloor:
             )
         assert ticket is None
         assert err is not None and err.startswith(sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE)
+
+
+# ── Codex HOLD 6032982233: a signed input from the decision, and its instant ─
+#
+# Codex review 6032982233 (at dba5ef01) held the adopted floor on two
+# points. (1) A scorecard is historical skill, not an observation made at
+# the decision: the same positive-weight calibrated card passed unchanged
+# behind a bullish and a bearish call. Eligible evidence now also needs a
+# signed input for the same signal family, bound to the report's ticker and
+# decision clock, whose sign agrees with the call. The live prediction
+# carries one: each oracle head vote in ``model_votes`` has the direction
+# ``predict(ticker, as_of)`` computed from that head's signals at the clock,
+# and a family's signed input is the direction of the votes that weight it.
+# (2) A missing, blank or date-only clock skipped the time fence, so a
+# constructed MEDIUM report with a card stamped after the decision could
+# reach a ticket. Actionable entry points now need an explicit,
+# timezone-aware decision instant; clockless research reports are labelled
+# non-actionable and never ticket, and their stress test is not live parity.
+
+_SIGNED_CLOCK = _ZERO_EVIDENCE_CLOCK
+
+
+def _vote(
+    model: str,
+    direction: str | None,
+    families: list[str],
+    weight: float = 1.0,
+) -> dict[str, Any]:
+    """One oracle head vote; ``direction=None`` is an unsigned vote."""
+    vote: dict[str, Any] = {
+        "model_name": model,
+        "vote_weight": weight,
+        "signal_sources": list(families),
+    }
+    if direction is not None:
+        vote["direction"] = direction
+    return vote
+
+
+def _signed_prediction(
+    *,
+    call: str,
+    votes: list[dict[str, Any]],
+    confidence: float = 0.92,
+    ticker: str = "NVDA",
+) -> SimpleNamespace:
+    """A live prediction whose rows and signs both come from ``votes``."""
+    pred = _prediction(ticker=ticker, direction=call, confidence=confidence, model_votes=votes)
+    pred.as_of = _SIGNED_CLOCK
+    return pred
+
+
+def _strong_jodi() -> dict[str, SignalScorecard]:
+    return {"jodi_oil": _fenced_card("jodi_oil", 1.3)}
+
+
+def _restamp(report: sp.TradeProvenanceReport, stamp: datetime) -> list[sp.SignalEvidence]:
+    return [
+        replace(ev, scorecard=replace(ev.scorecard, last_updated=stamp))
+        if ev.scorecard is not None
+        else ev
+        for ev in report.signal_evidence
+    ]
+
+
+def _gateway_ticket_stage(report: Any) -> tuple[Any, str | None]:
+    with patch("oracle.risk.get_global_circuit_breaker", lambda: CircuitBreaker()):
+        return dg._run_trade_ticket(
+            report,
+            account_size_usd=100_000,
+            current_price=120.0,
+            vol_30d=0.35,
+            instrument="equity",
+            unified_verdict=report.verdict,
+        )
+
+
+class TestCodexHold6032982233SignedInput:
+    """Point (1): eligible evidence is a signed input bound to the decision."""
+
+    @pytest.mark.parametrize("sign", ["bullish", "bearish"])
+    def test_paired_same_card_and_input_only_the_matching_call_tickets(self, sign: str) -> None:
+        votes = [_vote("head_a", sign, ["jodi_oil"])]
+        other = "bearish" if sign == "bullish" else "bullish"
+        match = _run_gateway(_signed_prediction(call=sign, votes=votes), cards=_strong_jodi())
+        against = _run_gateway(_signed_prediction(call=other, votes=votes), cards=_strong_jodi())
+
+        # Only the call the input agrees with qualifies...
+        assert _outcome(match) == ("medium", "medium", True)
+        assert match.trade_ticket.direction == sign
+        assert _outcome(against) == ("low", "low", False)
+        assert against.provenance_report.verdict_reason.startswith(
+            sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+        )
+        # ...from the same card, the same row weight and the same signed input.
+        m_row = _evidence_rows(match.provenance_report)["jodi_oil"]
+        a_row = _evidence_rows(against.provenance_report)["jodi_oil"]
+        assert m_row["scorecard"] == a_row["scorecard"]
+        assert m_row["classification"] == a_row["classification"] == "strong"
+        assert m_row["shapley_weight"] == a_row["shapley_weight"] == pytest.approx(1.0)
+        assert m_row["signed_input"] == a_row["signed_input"]
+        assert m_row["signed_input"]["direction"] == sign
+        assert _eligible_count(match.provenance_report) == 1
+        assert _eligible_count(against.provenance_report) == 0
+
+    def test_the_signed_input_is_the_head_vote_bound_to_ticker_and_clock(self) -> None:
+        report = _build_live(
+            _signed_prediction(
+                call="bullish",
+                votes=[_vote("head_a", "bullish", ["jodi_oil"], weight=2.0)],
+            ),
+            cards=_strong_jodi(),
+        )
+        si = report.signal_evidence[0].signed_input
+        assert si == sp.SignedInput(
+            signal_source="jodi_oil",
+            direction="bullish",
+            ticker="NVDA",
+            decision_clock=_SIGNED_CLOCK,
+            bullish_weight=2.0,
+            bearish_weight=0.0,
+            models=("head_a",),
+        )
+        assert _evidence_rows(report)["jodi_oil"]["signed_input"] == {
+            "signal_source": "jodi_oil",
+            "direction": "bullish",
+            "ticker": "NVDA",
+            "decision_clock": _SIGNED_CLOCK.isoformat(),
+            "bullish_weight": 2.0,
+            "bearish_weight": 0.0,
+            "models": ["head_a"],
+        }
+
+    @pytest.mark.parametrize(
+        ("votes", "signed_direction"),
+        [
+            pytest.param([_vote("head_a", "bearish", ["jodi_oil"])], "bearish", id="opposite"),
+            pytest.param(
+                [
+                    _vote("head_a", "bullish", ["jodi_oil"]),
+                    _vote("head_b", "bearish", ["jodi_oil"], weight=0.5),
+                ],
+                "mixed",
+                id="heads-disagree",
+            ),
+            pytest.param([_vote("head_a", "neutral", ["jodi_oil"])], "neutral", id="neutral"),
+            pytest.param([_vote("head_a", None, ["jodi_oil"])], None, id="unsigned-vote"),
+        ],
+    )
+    def test_an_opposite_mixed_neutral_or_absent_input_is_refused(
+        self, votes: list[dict[str, Any]], signed_direction: str | None
+    ) -> None:
+        resp = _run_gateway(_signed_prediction(call="bullish", votes=votes), cards=_strong_jodi())
+        prov = resp.provenance_report
+        assert _outcome(resp) == ("low", "low", False)
+        assert prov.verdict_reason.startswith(sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE)
+        row = _evidence_rows(prov)["jodi_oil"]
+        # The card alone would qualify (it is the positive control's card).
+        assert row["classification"] == "strong"
+        if signed_direction is None:
+            assert row["signed_input"] is None
+        else:
+            assert row["signed_input"]["direction"] == signed_direction
+        assert _eligible_count(prov) == 0
+        # The ticket backstop refuses the same report forced to MEDIUM.
+        forced = replace(prov, verdict="medium")
+        assert _ticket(forced) is None
+        assert sp.actionable_refusal_reason(forced).startswith(
+            sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+        )
+
+    def test_positive_control_matching_sign_gives_a_robust_ticket(self) -> None:
+        resp = _run_gateway(
+            _signed_prediction(
+                call="bullish",
+                votes=[
+                    _vote("head_a", "bullish", ["jodi_oil"]),
+                    _vote("head_b", "neutral", ["jodi_oil"], weight=0.5),
+                ],
+            ),
+            cards=_strong_jodi(),
+        )
+        assert _outcome(resp) == ("medium", "medium", True)
+        assert resp.stage_errors == {}
+        assert sp.actionable_refusal_reason(resp.provenance_report) is None
+        # Stress perturbs the card, not the signed input, so the strong card
+        # still qualifies at every sigma: the call holds.
+        assert resp.stress_report.robustness_label == "robust"
+        assert resp.stress_report.live_parity is True
+        assert _eligible_count(resp.provenance_report) == 1
+
+    def test_an_input_from_another_ticker_or_decision_is_refused(self) -> None:
+        nvda = _build_live(
+            _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]),
+            cards=_strong_jodi(),
+        )
+        amd = _build_live(
+            _signed_prediction(
+                call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])], ticker="AMD"
+            ),
+            cards=_strong_jodi(),
+        )
+        assert nvda.verdict == amd.verdict == "medium"
+        assert _ticket(nvda) is not None
+
+        cases = {
+            # AMD's rows, signed for AMD, moved into the NVDA report.
+            "rows-from-another-ticker": replace(nvda, signal_evidence=amd.signal_evidence),
+            # The NVDA report relabelled as another ticker.
+            "report-for-another-ticker": replace(nvda, ticker="AMD"),
+            # The same rows under an earlier decision clock: the card is
+            # still fenced, but the input was signed at the later decision.
+            "another-decision": replace(
+                nvda, decision_clock=(_SIGNED_CLOCK - timedelta(minutes=1)).isoformat()
+            ),
+        }
+        for name, forged in cases.items():
+            assert _ticket(forged) is None, name
+            assert sp.actionable_refusal_reason(forged).startswith(
+                sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+            ), name
+
+    def test_eligibility_reads_the_sign_ticker_and_clock(self) -> None:
+        report = _build_live(
+            _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]),
+            cards=_strong_jodi(),
+        )
+        (ev,) = report.signal_evidence
+
+        def eligible(**kw: Any) -> bool:
+            args: dict[str, Any] = {
+                "direction": "bullish",
+                "decision_clock": _SIGNED_CLOCK,
+                "ticker": "NVDA",
+            }
+            args.update(kw)
+            return sp.is_eligible_directional_evidence(ev, **args)
+
+        assert eligible()
+        assert eligible(ticker="nvda")
+        assert not eligible(direction="bearish")
+        assert not eligible(ticker="AMD")
+        assert not eligible(ticker="")
+        assert not eligible(decision_clock=_SIGNED_CLOCK + timedelta(seconds=1))
+        assert not eligible(decision_clock=None)
+        assert not sp.is_eligible_directional_evidence(
+            replace(ev, signed_input=None),
+            direction="bullish",
+            decision_clock=_SIGNED_CLOCK,
+            ticker="NVDA",
+        )
+        assert not sp.is_eligible_directional_evidence(
+            replace(ev, signed_input=replace(ev.signed_input, signal_source="pcr")),
+            direction="bullish",
+            decision_clock=_SIGNED_CLOCK,
+            ticker="NVDA",
+        )
+
+
+def _ticketable_report() -> sp.TradeProvenanceReport:
+    report = _build_live(
+        _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])]),
+        cards=_strong_jodi(),
+    )
+    assert report.verdict == "medium"
+    assert _ticket(report) is not None
+    return report
+
+
+class TestCodexHold6032982233DecisionInstant:
+    """Point (2): actionable entry points need an explicit, aware instant."""
+
+    def test_refusal_codes_are_stable(self) -> None:
+        assert (
+            sp.DECISION_CLOCK_MISSING,
+            sp.DECISION_CLOCK_BLANK,
+            sp.DECISION_CLOCK_DATE_ONLY,
+            sp.DECISION_CLOCK_NOT_AWARE,
+            sp.DECISION_CLOCK_UNPARSEABLE,
+            sp.DECISION_CLOCK_IN_FUTURE,
+            sp.NOT_ACTIONABLE,
+            sp.SIGNED_INPUT_MIXED,
+        ) == (
+            "decision_clock_missing",
+            "decision_clock_blank",
+            "decision_clock_date_only",
+            "decision_clock_not_timezone_aware",
+            "decision_clock_unparseable",
+            "decision_clock_in_future",
+            "not_actionable",
+            "mixed",
+        )
+
+    @pytest.mark.parametrize(
+        ("clock", "card_stamp", "code"),
+        [
+            # Before the fix, no clock skipped the card fence, so a card
+            # stamped a day after the decision qualified.
+            pytest.param(
+                None, _SIGNED_CLOCK + timedelta(days=1), "decision_clock_missing", id="none"
+            ),
+            pytest.param(
+                "", _SIGNED_CLOCK + timedelta(days=1), "decision_clock_blank", id="blank"
+            ),
+            pytest.param(
+                "   ", _SIGNED_CLOCK + timedelta(days=1), "decision_clock_blank", id="whitespace"
+            ),
+            # Before the fix a bare date read as midnight.
+            pytest.param(
+                _SIGNED_CLOCK.date().isoformat(),
+                _SIGNED_CLOCK - timedelta(days=1),
+                "decision_clock_date_only",
+                id="date-only",
+            ),
+            pytest.param(
+                _SIGNED_CLOCK.replace(tzinfo=None).isoformat(),
+                _SIGNED_CLOCK - timedelta(days=1),
+                "decision_clock_not_timezone_aware",
+                id="naive",
+            ),
+            pytest.param(
+                "not-a-clock",
+                _SIGNED_CLOCK - timedelta(days=1),
+                "decision_clock_unparseable",
+                id="unparseable",
+            ),
+        ],
+    )
+    def test_a_constructed_medium_report_without_a_valid_instant_gets_no_ticket(
+        self, clock: Any, card_stamp: datetime, code: str
+    ) -> None:
+        report = _ticketable_report()
+        forged = replace(
+            report, decision_clock=clock, signal_evidence=_restamp(report, card_stamp)
+        )
+        assert forged.verdict == "medium"
+        assert _ticket(forged) is None
+        reason = sp.actionable_refusal_reason(forged)
+        assert reason is not None and reason.startswith(code)
+        ticket, err = _gateway_ticket_stage(forged)
+        assert ticket is None
+        assert err is not None and err.startswith(code)
+
+    def test_a_decision_instant_after_now_is_refused(self) -> None:
+        report = _ticketable_report()
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        forged = replace(report, decision_clock=future.isoformat())
+        assert _ticket(forged) is None
+        assert sp.actionable_refusal_reason(forged).startswith(sp.DECISION_CLOCK_IN_FUTURE)
+        ticket, err = _gateway_ticket_stage(forged)
+        assert ticket is None and err.startswith(sp.DECISION_CLOCK_IN_FUTURE)
+
+    @pytest.mark.parametrize(
+        "late",
+        [timedelta(microseconds=1), timedelta(minutes=5), timedelta(days=1)],
+        ids=["1us", "5min", "1d"],
+    )
+    def test_a_card_stamped_after_the_decision_is_ineligible_in_the_backstop(
+        self, late: timedelta
+    ) -> None:
+        report = _ticketable_report()
+        forged = replace(report, signal_evidence=_restamp(report, _SIGNED_CLOCK + late))
+        assert _ticket(forged) is None
+        assert sp.actionable_refusal_reason(forged).startswith(
+            sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+        )
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param(None, id="none"),
+            pytest.param("", id="blank"),
+            pytest.param("   ", id="whitespace"),
+            pytest.param(_SIGNED_CLOCK.date().isoformat(), id="date-only-string"),
+            pytest.param(_SIGNED_CLOCK.date(), id="date"),
+            pytest.param(_SIGNED_CLOCK.replace(tzinfo=None), id="naive-datetime"),
+            pytest.param(_SIGNED_CLOCK.replace(tzinfo=None).isoformat(), id="naive-string"),
+            pytest.param("not-a-clock", id="unparseable"),
+            pytest.param(1764000000, id="number"),
+        ],
+    )
+    def test_parse_refuses_anything_but_an_aware_instant(self, raw: Any) -> None:
+        clock, reason = sp.parse_decision_instant(raw)
+        assert clock is None
+        assert reason is not None
+        # Nothing counts as eligible on such a clock.
+        report = _ticketable_report()
+        assert sp.count_eligible_directional_evidence(
+            report.signal_evidence, direction="bullish", decision_clock=raw, ticker="NVDA"
+        ) == 0
+
+    def test_parse_accepts_an_aware_instant_and_its_iso_string(self) -> None:
+        for raw in (_SIGNED_CLOCK, _SIGNED_CLOCK.isoformat()):
+            assert sp.parse_decision_instant(raw) == (_SIGNED_CLOCK, None)
+        offset = _SIGNED_CLOCK.astimezone(timezone(timedelta(hours=-5)))
+        assert sp.parse_decision_instant(offset.isoformat()) == (_SIGNED_CLOCK, None)
+
+    @pytest.mark.parametrize(
+        "as_of",
+        [
+            pytest.param(None, id="none"),
+            pytest.param("", id="blank"),
+            pytest.param(_LIVE_NOW.replace(tzinfo=None) - timedelta(minutes=2), id="naive"),
+            pytest.param(_LIVE_NOW.date(), id="date-only"),
+            pytest.param(_LIVE_NOW + timedelta(minutes=5), id="future"),
+        ],
+    )
+    def test_the_builder_refuses_a_clock_that_is_not_an_aware_instant(self, as_of: Any) -> None:
+        pred = _signed_prediction(call="bullish", votes=[_vote("head_a", "bullish", ["jodi_oil"])])
+        pred.as_of = as_of
+        with ExitStack() as stack:
+            reads = _spy_every_layer(stack)
+            stack.enter_context(patch.object(sp, "_utc_now", lambda: _LIVE_NOW))
+            with pytest.raises(ValueError, match="live-only"):
+                sp.build_provenance_report(MagicMock(), prediction=pred)
+        assert reads == []
+
+
+def _walk_forward_report() -> sp.TradeProvenanceReport:
+    from scripts import walk_forward_validate as wfv
+
+    created = _SIGNED_CLOCK - timedelta(days=30)
+    row = {
+        "id": "p1",
+        "ticker": "NVDA",
+        "created_at": created,
+        "expiry": created + timedelta(days=7),
+        "confidence": 0.92,
+        "verdict": "hit",
+        "model_name": None,
+        "signals": {"direction": "bullish", "regime": "EXPANSION", "fci_regime": "EASY"},
+        "signal_contributions": {"jodi_oil": 1.0},
+        "model_weights": None,
+    }
+    return wfv.build_time_frozen_provenance(
+        row, {"jodi_oil": _card_at("jodi_oil", 1.3, created - timedelta(days=1))}
+    )
+
+
+class TestCodexHold6032982233ResearchReports:
+    """Clockless research reports are labelled and never ticket."""
+
+    def test_live_report_is_labelled_actionable(self) -> None:
+        report = _ticketable_report()
+        assert report.actionable is True
+        assert report.basis == sp.REPORT_BASIS_LIVE == "live_decision_clock"
+        out = report.to_dict()
+        assert out["actionable"] is True
+        assert out["basis"] == "live_decision_clock"
+
+    def test_walk_forward_report_is_research_and_never_tickets(self) -> None:
+        report = _walk_forward_report()
+        assert report.actionable is False
+        assert report.basis == sp.REPORT_BASIS_RESEARCH == "research_no_clock"
+        assert report.decision_clock == ""
+        out = report.to_dict()
+        assert (out["actionable"], out["basis"]) == (False, "research_no_clock")
+        # Forced to a strong MEDIUM call, and even given a valid clock, it is
+        # refused: research reports are not actionable.
+        forced = replace(report, verdict="medium", aggregate_conviction=1.3)
+        with_clock = replace(forced, decision_clock=_SIGNED_CLOCK.isoformat())
+        for forged in (forced, with_clock):
+            assert _ticket(forged) is None
+            assert sp.actionable_refusal_reason(forged).startswith(sp.NOT_ACTIONABLE)
+            ticket, err = _gateway_ticket_stage(forged)
+            assert ticket is None and err.startswith(sp.NOT_ACTIONABLE)
+
+    def test_a_hand_built_report_defaults_to_research(self) -> None:
+        live = _ticketable_report()
+        fields = {
+            name: getattr(live, name)
+            for name in sp.TradeProvenanceReport.__dataclass_fields__
+            if name not in ("actionable", "basis")
+        }
+        bare = sp.TradeProvenanceReport(**fields)
+        assert (bare.actionable, bare.basis) == (False, sp.REPORT_BASIS_RESEARCH)
+        assert _ticket(bare) is None
+
+    def test_research_stress_is_labelled_and_is_not_live_parity(self) -> None:
+        research = cs.run_stress_test(_walk_forward_report())
+        assert research.basis == sp.REPORT_BASIS_RESEARCH
+        assert research.live_parity is False
+        assert research.to_dict()["live_parity"] is False
+        assert research.to_dict()["basis"] == "research_no_clock"
+
+        live = cs.run_stress_test(_ticketable_report())
+        assert live.basis == sp.REPORT_BASIS_LIVE
+        assert live.live_parity is True
+
+        # A research report given a clock string is still not re-decided
+        # with the live policy.
+        clocked = cs.run_stress_test(
+            replace(_walk_forward_report(), decision_clock=_SIGNED_CLOCK.isoformat())
+        )
+        assert clocked.live_parity is False
+
+    def test_call_a_trade_is_research_and_prints_no_ticket(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from scripts import call_a_trade
+
+        rc = call_a_trade.main()
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "research_no_clock" in out
+        assert "not actionable" in out
+        assert "TRADE TICKET" not in out
