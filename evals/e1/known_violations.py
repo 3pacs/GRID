@@ -18,7 +18,11 @@ stored rows) and E1-V6 (coingecko writing resolved_series directly) -- suite
 ``e1-v1.2``.
 
 Open: E1-V7a..o (suite ``e1-v1.3``), direct resolved_series writers that
-backdate or rewrite vintages (evals/e1/vintage_scan.py, DATA-FIX DFa).
+backdate or rewrite vintages (evals/e1/vintage_scan.py, DATA-FIX DFa), except
+E1-V7c: closed 2026-11-21, the TwelveData bridge
+(scripts/backfill_resolved_series_from_ticker_metrics.sql) now stamps release
+and vintage with the ticker_metrics_daily fetch day. Rows it wrote before
+then are counted by scripts/count_release_before_vintage.py (read-only).
 """
 
 from __future__ import annotations
@@ -58,10 +62,6 @@ _V7: dict[str, tuple[str, str, str]] = {
                "ephemeris backfill stamps each day's resolved row with that day as release and vintage",
                _V7_BACKDATE + " Ephemeris values are computable in advance, so the honest fix may be an explicit, "
                "reviewed same-value exemption rather than a code change; until then it is tracked."),
-    "E1-V7c": ("scripts/backfill_resolved_series_from_ticker_metrics.sql (tmd.obs_date AS release_date)",
-               "TwelveData ticker_metrics_daily bridge sets release_date from obs_date",
-               "release_date = obs_date (vintage_date = as_of, or obs_date when as_of is NULL): rows bridged from "
-               "ticker_metrics_daily claim release on their observation day, bypassing raw_series and the resolver."),
     "E1-V7d": ("scripts/bridge_crucix.py::ins", "Crucix bridge writes backdated resolved rows", _V7_BACKDATE),
     "E1-V7e": ("scripts/load_alt_data.py::insert_obs", "alt-data loader writes backdated resolved rows",
                _V7_BACKDATE),
