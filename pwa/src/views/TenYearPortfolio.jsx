@@ -52,7 +52,7 @@ const DEFAULT_API_SETUP = {
 const INITIAL_CHAT_MESSAGES = [
     {
         role: 'assistant',
-        text: 'Oracle heartbeat is live. The $1M 10-year prompt, Monte Carlo ranges, workbook intake, exports, and API checklist are staged on this page.',
+        text: 'The $1M 10-year prompt, Monte Carlo ranges, workbook intake, exports, and API checklist are staged on this page.',
     },
 ];
 const DEFAULT_PLAN_STEPS = [
@@ -79,11 +79,6 @@ function money(value) {
 function number(value, digits = 1) {
     if (value == null || Number.isNaN(Number(value))) return '—';
     return Number(value).toFixed(digits);
-}
-
-function formatTime(date) {
-    if (!date) return 'waiting';
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 function triggerDownload({ blob, filename }) {
@@ -302,7 +297,6 @@ export default function TenYearPortfolio() {
     const [workbookBusy, setWorkbookBusy] = useState(false);
     const [apiSetup, setApiSetup] = useState(DEFAULT_API_SETUP);
     const [apiSaved, setApiSaved] = useState(false);
-    const [heartbeatAt, setHeartbeatAt] = useState(() => new Date());
     const [chatInput, setChatInput] = useState('');
     const [chatMessages, setChatMessages] = useState(INITIAL_CHAT_MESSAGES);
 
@@ -343,11 +337,6 @@ export default function TenYearPortfolio() {
         } catch (_) {
             setApiSetup(DEFAULT_API_SETUP);
         }
-    }, []);
-
-    useEffect(() => {
-        const timer = window.setInterval(() => setHeartbeatAt(new Date()), 10000);
-        return () => window.clearInterval(timer);
     }, []);
 
     const activeProfile = useMemo(() => (
@@ -424,7 +413,6 @@ export default function TenYearPortfolio() {
             { role: 'assistant', text: reply },
         ]);
         setChatInput('');
-        setHeartbeatAt(new Date());
     };
 
     if (simple) {
@@ -599,7 +587,8 @@ export default function TenYearPortfolio() {
                     </div>
                     <div className="ty-heartbeat">
                         <HeartPulse size={15} />
-                        <span>Heartbeat {formatTime(heartbeatAt)}</span>
+                        {/* Was "Heartbeat <browser clock>": a 10 s page timer, not a backend signal. */}
+                        <span>Data as of {loading ? 'loading' : (data?.as_of || 'unknown')}</span>
                     </div>
                 </div>
 

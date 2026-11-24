@@ -349,10 +349,23 @@ function SanityDots({ checks }) {
 }
 
 function ConfidenceCircle({ value }) {
-    const pct = Math.round((value || 0) * 100);
+    // A saved recommendation may carry no confidence (options.py returns None).
+    // That is "not stated", never a red 0. A real 0 still renders 0.
+    if (value == null || !Number.isFinite(Number(value))) {
+        return (
+            <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }} aria-label="confidence not stated">
+                <circle cx="20" cy="20" r={16} fill="none" stroke={colors.border} strokeWidth="3" strokeDasharray="3 3" />
+                <text x="20" y="21" textAnchor="middle" dominantBaseline="middle"
+                    fontSize="10" fontWeight="700" fill={colors.textMuted}
+                    fontFamily="'JetBrains Mono', monospace"
+                >—</text>
+            </svg>
+        );
+    }
+    const pct = Math.round(value * 100);
     const r = 16;
     const circ = 2 * Math.PI * r;
-    const offset = circ - (circ * (value || 0));
+    const offset = circ - (circ * value);
     const col = pct >= 70 ? colors.green : pct >= 40 ? colors.yellow : colors.red;
     return (
         <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }}>

@@ -293,11 +293,23 @@ export default function MobileDashboard({ subTab, onNavigate }) {
             return t > latest ? t : latest;
         }, 0)
         : 0;
-    const healthySources = pipeline.healthy ?? 0;
-    const totalSources = pipeline.total_sources ?? 0;
-    const brokenSources = pipeline.broken ?? 0;
-    const staleSources = pipeline.stale ?? 0;
-    const pipelineHealthPct = totalSources > 0 ? healthySources / totalSources : null;
+    // Counts the route did not send are unknown, never 0.
+    const countOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+    const healthySources = countOrNull(pipeline.healthy);
+    const totalSources = countOrNull(pipeline.total_sources) ?? 0;
+    const brokenSources = countOrNull(pipeline.broken);
+    const staleSources = countOrNull(pipeline.stale);
+    const countText = (v) => (v == null ? '?' : String(v));
+    const pipelineUnavailable = pipelineHealth?.availability === 'unavailable';
+    const pipelineHealthPct = !pipelineUnavailable && totalSources > 0 && healthySources != null
+        ? healthySources / totalSources : null;
+    // Green only for a pipeline that is actually healthy: at least 90 % of
+    // sources healthy and a known zero broken. Under 50 % is red; anything
+    // else, including unknown broken counts, is amber. No percentage: muted.
+    const pipelineTone = pipelineHealthPct == null ? colors.textMuted
+        : pipelineHealthPct < 0.5 ? colors.red
+            : (pipelineHealthPct >= 0.9 && brokenSources === 0) ? colors.green
+                : colors.yellow;
     const pipelineLastRun = pipelineHealth?.resolver_status?.last_run || null;
     const pendingOutcomes = Math.max(
         (grid.journal_entries_total ?? 0) - (grid.journal_entries_with_outcomes ?? 0),
@@ -446,15 +458,19 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                         <div style={s.metricCard}>
                             <div style={s.metricTop}>
                                 <span style={s.metricValue}>
+                                    {/* The DB being up says nothing about the pipeline. With no
+                                        sources (or availability 'unavailable') there is no health %. */}
                                     {pipelineHealthPct != null
                                         ? `${(pipelineHealthPct * 100).toFixed(0)}%`
-                                        : (db.connected ? 'OK' : '--')}
+                                        : (pipelineUnavailable ? 'N/A' : '--')}
                                 </span>
-                                <span style={s.dot(db.connected ? colors.green : colors.red)} />
+                                <span data-testid="pipeline-dot" data-tone={pipelineTone} style={s.dot(pipelineTone)} />
                             </div>
                             <div style={s.metricLabel}>Pipeline</div>
                             <div style={s.metricSub}>
-                                {pipelineLastRun ? timeAgo(pipelineLastRun) : `${brokenSources} broken / ${staleSources} stale`}
+                                {pipelineUnavailable
+                                    ? (pipelineHealth?.stale_reason || 'pipeline health unavailable')
+                                    : (pipelineLastRun ? timeAgo(pipelineLastRun) : `${countText(brokenSources)} broken / ${countText(staleSources)} stale`)}
                             </div>
                         </div>
 
@@ -539,7 +555,7 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                             </div>
                             <div style={s.metricLabel}>Options</div>
                             <div style={s.metricSub}>
-                                {healthySources}/{totalSources || '--'} healthy
+                                {countText(healthySources)}/{totalSources || '--'} healthy
                             </div>
                         </div>
                     </div>
