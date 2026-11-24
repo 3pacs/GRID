@@ -1736,7 +1736,9 @@ _CATALOG_TO_REGISTRY: dict[str, str] = {
     "POLYMARKET": "polymarket",
     "FOIA_CABLES": "foia_cables",
     "CFTC_COT": "cftc_cot",
-    "GDELT": "gdelt",
+    # "GDELT": "gdelt" removed 2026-11-23: the registry entry is held
+    # (retired by the owner; the DOC API refuses grid-svr), so there is no
+    # writer to retry. Put the line back when the hold is lifted.
     "AAII_Sentiment": "aaii_sentiment",
     # 2026-11-04: was "fred" -- the FRED writer cannot represent USDA_NASS
     # (the catalog identity check refused it every time). USDA_NASS now
