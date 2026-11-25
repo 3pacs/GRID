@@ -28,7 +28,7 @@ The goal is to observe the real path once for one new Item 2.02 filing, without 
    - Write the bytes to a scratch archive with `ingest_document`, then read them back.
    - Emit a receipt labelled `rehearsal`, never eligible for production.
    - Run #1424's `diagnose_sec_exhibit_evidence` with a recording consumer.
-3. **Output:** the receipt, the document and claim hashes and the consumer's input, published to the vault. No
+3. **Output:** the receipt, the document and claim hashes, the clocks and the status, published to the vault (not the consumer's full input; see section 3). No
    database write, no change to the earnings-release hold, no ranking, and no price or outcome read.
 4. **Code:** Codex's Dell delta (sha256 `e284bd17…70550528`, verified; base #1424 `6e7e010d`) is the
    candidate. It adds a default-off `EarningsEventsPuller.rehearse_sec_exhibit_handoff` that `pull()` never calls.
