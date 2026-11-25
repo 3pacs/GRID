@@ -88,6 +88,11 @@ class GRIDApi {
         this._wsGeneration = 0;
         this._wsShouldReconnect = false;
         this._cache = new Map();
+        // A GET may only write the cache if no clear happened since it started and
+        // no later-started GET already wrote the key: a slow older response must
+        // never overwrite or outlive newer data.
+        this._cacheGen = 0;
+        this._fetchSeq = 0;
         this._inflight = new Map();
     }
 
@@ -141,6 +146,7 @@ class GRIDApi {
     }
 
     clearCache({ prefix = null } = {}) {
+        this._cacheGen = (this._cacheGen || 0) + 1;
         if (!prefix) {
             this._cache?.clear();
             this._inflight?.clear();
@@ -199,6 +205,8 @@ class GRIDApi {
         const cacheable = method === 'GET' && this._isCacheableGet(path);
         const cacheKey = this._cacheKey(path);
         const now = Date.now();
+        const startGen = this._cacheGen;
+        const startSeq = ++this._fetchSeq;
 
         if (cacheable && !gridForce) {
             const cached = this._cache.get(cacheKey);
@@ -275,10 +283,16 @@ class GRIDApi {
                 if (gammaState && callerAborted()) return cancelled();
                 if (method !== 'GET') {
                     this.clearCache();
-                } else if (cacheable && !timedOut && !data?.error) {
+                } else if (cacheable && !timedOut && !data?.error
+                    // A 200 that says the source is unavailable is an answer for now,
+                    // not something to serve from cache for the TTL after it recovers.
+                    && data?.status !== 'unavailable' && data?.availability !== 'unavailable'
+                    && startGen === this._cacheGen
+                    && startSeq > (this._cache.get(cacheKey)?.seq ?? 0)) {
                     this._cache.set(cacheKey, {
                         value: data,
                         expiresAt: Date.now() + gridTtlMs,
+                        seq: startSeq,
                     });
                 }
                 return data;

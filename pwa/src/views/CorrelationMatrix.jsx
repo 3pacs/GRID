@@ -365,7 +365,7 @@ export default function CorrelationMatrix() {
         const cells = [];
         for (let i = 0; i < n; i++) {
             for (let j = 0; j < n; j++) {
-                cells.push({ i, j, v: matrix[i]?.[j] ?? 0 });
+                cells.push({ i, j, v: matrix[i]?.[j] ?? null });
             }
         }
 
@@ -380,7 +380,7 @@ export default function CorrelationMatrix() {
             .attr('width', size - 2)
             .attr('height', size - 2)
             .attr('rx', 3)
-            .attr('fill', d => corrColor(d.v))
+            .attr('fill', d => (d.v == null ? colors.bg : corrColor(d.v)))
             .attr('stroke', colors.bg)
             .attr('stroke-width', 1)
             .style('cursor', 'pointer')
@@ -394,8 +394,8 @@ export default function CorrelationMatrix() {
                         <div style="font-weight:700;color:${colors.text};margin-bottom:4px">
                             ${escapeHtml(features[d.i])} x ${escapeHtml(features[d.j])}
                         </div>
-                        <div style="font-size:15px;font-weight:700;color:${d.v > 0 ? '#3B82F6' : d.v < -0.15 ? colors.red : colors.textDim}">
-                            ${d.v.toFixed(3)}
+                        <div style="font-size:15px;font-weight:700;color:${d.v == null ? colors.textMuted : d.v > 0 ? '#3B82F6' : d.v < -0.15 ? colors.red : colors.textDim}">
+                            ${d.v == null ? 'not computed' : d.v.toFixed(3)}
                         </div>
                         <div style="font-size:10px;color:${colors.textMuted};margin-top:2px">
                             ${corrLabel(d.v)} -- ${corrExplain(d.v)}
@@ -414,7 +414,7 @@ export default function CorrelationMatrix() {
             })
             .merge(rects)
             .transition().duration(TRANSITION_MS).ease(d3.easeCubicInOut)
-            .attr('fill', d => corrColor(d.v));
+            .attr('fill', d => (d.v == null ? colors.bg : corrColor(d.v)));
 
         // Cell value text
         const texts = g.selectAll('.corr-text').data(cells, d => `${d.i}-${d.j}`);
@@ -429,12 +429,16 @@ export default function CorrelationMatrix() {
             .attr('font-family', MONO)
             .attr('fill', d => Math.abs(d.v) > 0.5 ? '#fff' : colors.textDim)
             .attr('pointer-events', 'none')
-            .text(d => d.i === d.j ? '' : d.v.toFixed(2))
+            .text(d => (d.i === d.j ? '' : d.v == null ? 'n/a' : d.v.toFixed(2)))
             .merge(texts)
             .transition().duration(TRANSITION_MS)
             .attr('fill', d => Math.abs(d.v) > 0.5 ? '#fff' : colors.textDim)
             .tween('text', function (d) {
                 const node = this;
+                if (d.v == null) {
+                    if (d.i !== d.j) node.textContent = 'n/a';
+                    return () => {};
+                }
                 const prev = parseFloat(node.textContent) || 0;
                 const interp = d3.interpolateNumber(prev, d.v);
                 return t => {

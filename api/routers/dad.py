@@ -1551,7 +1551,7 @@ def _load_workbook_context(
         {
             "source_type": row[0],
             "evidence_text": _shorten(row[1]),
-            "context_score": float(row[2] or 0),
+            "context_score": float(row[2]) if row[2] is not None else None,
             "file": row[3],
             "sheet": row[4],
             "cell": row[5],
@@ -2436,7 +2436,7 @@ def _get_dad_ticker_gold_legacy(
         {
             "source_type": row[0],
             "evidence_text": _shorten(row[1]),
-            "context_score": float(row[2] or 0),
+            "context_score": float(row[2]) if row[2] is not None else None,
             "file": row[3],
             "sheet": row[4],
             "cell": row[5],

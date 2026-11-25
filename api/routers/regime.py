@@ -297,8 +297,8 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
         for row in rows:
             entry = {
                 "state": row[0],
-                "confidence": float(row[1]) if row[1] else 0.0,
-                "transition_probability": float(row[2]) if row[2] else 0.0,
+                "confidence": float(row[1]) if row[1] is not None else None,
+                "transition_probability": float(row[2]) if row[2] is not None else None,
                 "contradiction_flags": strip_binding_flags(row[3]) if isinstance(row[3], dict) else {},
                 "recommendation": row[4] or "",
                 "as_of": row[5].isoformat() if row[5] else "",
@@ -309,8 +309,12 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
                 strategy.append(entry)
 
         # Sort by confidence descending
-        macro.sort(key=lambda x: x["confidence"], reverse=True)
-        strategy.sort(key=lambda x: x["confidence"], reverse=True)
+        # A state with no reported confidence sorts last; it is not 0.0.
+        def _conf_key(x: dict[str, Any]) -> tuple[bool, float]:
+            return (x["confidence"] is not None, x["confidence"] or 0.0)
+
+        macro.sort(key=_conf_key, reverse=True)
+        strategy.sort(key=_conf_key, reverse=True)
 
         # No source for per-feature regime contributions. This used to call
         # ClusterDiscovery(engine).identify_transition_leaders() with none of

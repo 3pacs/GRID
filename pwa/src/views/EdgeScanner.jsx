@@ -1306,11 +1306,11 @@ export default function EdgeScanner({ onNavigate }) {
                     gridTemplateColumns: `repeat(auto-fit, minmax(${isMobile ? 130 : 150}px, 1fr))`,
                     gap: '8px',
                 }}>
-                    <StatCard label="Active" value={summary.active_count ?? 0} tone={colors.green} />
-                    <StatCard label="Arming" value={summary.arming_count ?? 0} tone={colors.yellow} />
-                    <StatCard label="Live" value={summary.live_count ?? 0} tone={colors.accent} />
+                    <StatCard label="Active" value={summary.active_count ?? '-'} tone={colors.green} />
+                    <StatCard label="Arming" value={summary.arming_count ?? '-'} tone={colors.yellow} />
+                    <StatCard label="Live" value={summary.live_count ?? '-'} tone={colors.accent} />
                     <StatCard label="Gaps" value={summary.coverage_gap_count ?? coverageGaps.length} tone={colors.red} />
-                    <StatCard label="Avg Edge" value={`${Math.round(summary.avg_expected_edge_pct || 0)}%`} tone={'#E8F0F8'} />
+                    <StatCard label="Avg Edge" value={summary.avg_expected_edge_pct != null ? `${Math.round(summary.avg_expected_edge_pct)}%` : '-'} tone={'#E8F0F8'} />
                 </div>
 
                 {!loading && priorityRailItems.length ? (

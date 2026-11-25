@@ -148,7 +148,7 @@ function DecisionStack({ decision }) {
                 {(decision.cards || []).map(card => (
                     <div key={card.source} className={`tl-decision-card ${stateClass(card.state)}`}>
                         <strong>{card.source}</strong>
-                        <em>{Number(card.points || 0).toFixed(1)} pts</em>
+                        <em>{card.state === 'missing' || card.points == null ? 'no data' : `${Number(card.points || 0).toFixed(1)} pts`}</em>
                         <span>{card.detail}</span>
                     </div>
                 ))}
@@ -190,7 +190,7 @@ function FinvizPanel({ finviz, onRefresh, refreshing }) {
                 </button>
             </div>
             <div className="tl-finviz-meta">
-                <span>{finviz?.field_count || 0} fields</span>
+                <span>{finviz?.field_count != null ? `${finviz.field_count} fields` : 'fields not reported'}</span>
                 <span>{finviz?.freshness?.label || 'missing'}</span>
                 <span>Fiscal period end: {finviz?.latest_obs_date || 'unavailable'}</span>
             </div>
@@ -264,7 +264,7 @@ function EvidenceTable({ rows }) {
                                 <div className="tl-evidence-text">{row.evidence_text || row.row_context || '-'}</div>
                                 {row.column_header ? <div className="tl-subtle">Column: {row.column_header}</div> : null}
                             </td>
-                            <td>{Number(row.context_score || 0).toFixed(1)}</td>
+                            <td>{row.context_score != null ? Number(row.context_score).toFixed(1) : '-'}</td>
                         </tr>
                     ))}
                 </tbody>
@@ -589,7 +589,7 @@ export default function TickerLookup() {
                 </div>
                 <div className="tl-chart-topline">
                     <div>
-                        <strong>{latestPrice != null ? `$${Number(latestPrice).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : 'Price loading'}</strong>
+                        <strong>{latestPrice != null ? `$${Number(latestPrice).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : (sectionStatus.chart === 'loading' ? 'Price loading' : 'Price not reported')}</strong>
                         <span>{periodReturn != null ? `${periodReturn >= 0 ? '+' : ''}${periodReturn.toFixed(1)}% over ${period}` : 'Needs market history'}</span>
                     </div>
                     <TradingViewActions tv={data?.tradingview} ticker={activeTicker} signals={tvSignals} />
