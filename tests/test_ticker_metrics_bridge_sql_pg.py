@@ -7,10 +7,16 @@ row up to ~60 days before GRID held it. These tests run the real file against
 a scratch schema (session time zone deliberately not UTC) and check the
 stamps and what ``store.pit.PITStore`` then serves. Skips without PostgreSQL
 (``GRID_TEST_DB_URL``).
+
+The bridge reads only TwelveData rows (``ticker_metrics_daily.source`` exactly
+``twelvedata_backfill`` or ``twelvedata_universe_backfill``) and stamps each with
+the TWELVEDATA ``source_catalog`` id; the mixed-source tests check that the
+yfinance copy, NULL and every other label never land (Codex hold on #1372).
 """
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -19,6 +25,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from normalization.entity_map import RAW_CLOSE_FULL_FEATURES
+from price_close_contract import SPY_CLOSE_FEATURE
 from store.pit import PITStore
 
 SQL_FILE = Path(__file__).resolve().parent.parent / "scripts" / "backfill_resolved_series_from_ticker_metrics.sql"
@@ -153,3 +161,120 @@ def test_rerun_is_idempotent(bridged):
     first = _stamps(engine, fid)
     _run_file(engine)
     assert _stamps(engine, fid) == first
+
+
+# ── Source filter + provenance (Codex hold on #1372 head 7cadfd78) ──────────
+
+MIXED_FEATURES = ("aapl_full", "msft_full", "nvda_full", "xyz_full", "wxy_full", "spy_full", "gold_full")
+MIXED = (
+    # (ticker, obs_date, close, source) -- all fetched 2026-05-17 14:00 UTC
+    ("AAPL", date(2026, 4, 1), 101.0, "twelvedata_backfill"),
+    ("AAPL", date(2026, 4, 2), 202.0, "sec_xbrl + yfinance"),           # newer-source gap day
+    ("AAPL", date(2026, 4, 3), 303.0, None),                            # no source recorded
+    ("AAPL", date(2026, 4, 6), 106.0, "twelvedata_universe_backfill"),  # lands past the gap
+    ("MSFT", date(2026, 4, 1), 401.0, "twelvedata_universe_backfill"),
+    ("NVDA", date(2026, 4, 1), 18.0, "sec_xbrl + yfinance"),            # unadjusted YF close
+    ("XYZ", date(2026, 4, 1), 5.0, None),
+    ("WXY", date(2026, 4, 1), 7.0, "TwelveData"),                       # not the stored label
+    ("WXY", date(2026, 4, 2), 7.5, "stored_close_backfill:yfinance"),
+    # Fresh TwelveData rows that would pass the source filter but join a
+    # pinned raw-close panel by ticker name (Codex hold on #1459).
+    ("SPY", date(2026, 4, 1), 560.0, "twelvedata_universe_backfill"),   # spy_full: receipted raw close only
+    ("SPY", date(2026, 4, 6), 565.0, "twelvedata_backfill"),
+    ("GOLD", date(2026, 4, 1), 21.0, "twelvedata_universe_backfill"),   # Barrick's stock, not the gold future
+)
+MIXED_AS_OF = datetime(2026, 5, 17, 14, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture()
+def mixed(pg_engine: Engine):
+    schema = f"tmd_bridge_mix_{uuid4().hex[:12]}"
+    with pg_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_engine(pg_engine.url, connect_args={"options": f"-csearch_path={schema}"})
+    try:
+        with engine.begin() as conn:
+            for ddl in _DDL:
+                conn.execute(text(ddl))
+            # Other catalog rows first, so a wrong id cannot pass by being 1.
+            for name in ("yfinance", "TWELVEDATA_STATS"):
+                conn.execute(text("INSERT INTO source_catalog (name) VALUES (:n)"), {"n": name})
+            fids = {}
+            for name in MIXED_FEATURES:
+                fids[name] = conn.execute(
+                    text("INSERT INTO feature_registry (name) VALUES (:n) RETURNING id"), {"n": name}).scalar_one()
+                conn.execute(
+                    text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
+                         "source_priority_used) VALUES (:f, :d, :d, :d, 1.0, 1)"),
+                    {"f": fids[name], "d": EXISTING},
+                )
+            for ticker, od, close, source in MIXED:
+                conn.execute(
+                    text("INSERT INTO ticker_metrics_daily (ticker, obs_date, close_price, source, as_of) "
+                         "VALUES (:t, :od, :c, :s, :a)"),
+                    {"t": ticker, "od": od, "c": close, "s": source, "a": MIXED_AS_OF},
+                )
+        _run_file(engine)
+        yield engine, fids
+    finally:
+        engine.dispose()
+        with pg_engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+def _bridged_rows(engine: Engine) -> set[tuple[str, date, float, str]]:
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT fr.name, rs.obs_date, rs.value, sc.name FROM resolved_series rs "
+                 "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                 "LEFT JOIN source_catalog sc ON sc.id = rs.source_priority_used "
+                 "WHERE rs.obs_date > :e"),
+            {"e": EXISTING},
+        ).fetchall()
+    return {(r[0], r[1], r[2], r[3]) for r in rows}
+
+
+def test_only_twelvedata_rows_land_with_the_twelvedata_source_id(mixed):
+    engine, _fids = mixed
+    assert _bridged_rows(engine) == {
+        ("aapl_full", date(2026, 4, 1), 101.0, "TWELVEDATA"),
+        ("aapl_full", date(2026, 4, 6), 106.0, "TWELVEDATA"),
+        ("msft_full", date(2026, 4, 1), 401.0, "TWELVEDATA"),
+    }
+
+
+def test_excluded_sources_leave_their_features_untouched(mixed):
+    engine, fids = mixed
+    with engine.connect() as conn:
+        for name in ("nvda_full", "xyz_full", "wxy_full"):
+            n = conn.execute(text("SELECT count(*) FROM resolved_series WHERE feature_id = :f AND obs_date > :e"),
+                             {"f": fids[name], "e": EXISTING}).scalar_one()
+            assert n == 0, name
+
+
+def test_mixed_source_rerun_is_idempotent(mixed):
+    engine, _fids = mixed
+    first = _bridged_rows(engine)
+    _run_file(engine)
+    assert _bridged_rows(engine) == first
+
+
+def test_pinned_raw_close_panels_are_never_bridged(mixed):
+    """A fresh TwelveData SPY (or GOLD) close passes the source filter but must not land."""
+    engine, fids = mixed
+    with engine.connect() as conn:
+        for name in (SPY_CLOSE_FEATURE, "gold_full"):
+            n = conn.execute(text("SELECT count(*) FROM resolved_series WHERE feature_id = :f AND obs_date > :e"),
+                             {"f": fids[name], "e": EXISTING}).scalar_one()
+            assert n == 0, name
+    # Same-day TwelveData rows for an ordinary equity still land.
+    assert ("aapl_full", date(2026, 4, 1), 101.0, "TWELVEDATA") in _bridged_rows(engine)
+
+
+def test_sql_skips_exactly_the_raw_close_feature_set():
+    """The literal NOT IN list in the SQL matches normalization.entity_map.RAW_CLOSE_FULL_FEATURES."""
+    sql = SQL_FILE.read_text(encoding="utf-8")
+    clauses = re.findall(r"fr\.name NOT IN \(([^)]*)\)", sql)
+    assert len(clauses) == 1, clauses
+    assert set(re.findall(r"'([^']+)'", clauses[0])) == set(RAW_CLOSE_FULL_FEATURES)
+    assert SPY_CLOSE_FEATURE in RAW_CLOSE_FULL_FEATURES
