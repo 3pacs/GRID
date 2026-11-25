@@ -348,6 +348,46 @@ slot uses its call-time window, with no guarantee beyond the bounded lookback.
 
 `ingestion/flow_materializer.py::sync_all` (insider_trades, congressional_trades, dark_pool_weekly, etf_flows, junction_point_readings, which the flows API reads) has other callers in source: grid-hermes's daily-intel `flow_materialize` task (held, and not running while grid-hermes is off) and a host systemd unit, `grid-flow-materializer.timer` (every 30 min, oneshot from the old checkout `/home/grid/grid_v4/grid_repo` at `5facbdf0`; documented in `docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md`, not tracked under `server_setup/`). Historical operator receipt **2026-10-19T06:53Z** reported it **LIVE** (enabled and active, last run 06:30:56Z SUCCESS). That is a dated observation, not a current-state verification; if still enabled, it keeps writing old-code, old-semantics rows every 30 minutes. `grid-scheduler` now also registers `run_flow_materialize_daily` weekdays at 23:15 UTC (after the 22:00Z domestic slot, outside the 03:30-10:30Z backup window). It has the same lateness guard as `run_daily_pulls`, a 60 s wait budget (the Hermes SQL-task budget) on a worker thread; timeout records FAILED and lets the scheduler loop continue, but does not cancel the worker or its writes. The worker retains its advisory lock until it finishes. Timeout and worker-exception receipts record unknown (`NULL`) rows because earlier per-table transactions may already have committed and a timed-out worker can keep writing. Deployed `pull_log.rows_inserted` nullability remains a schema verification gate. Uncertain advisory-lock acquisition or failed release invalidates the backend before closing its SQLAlchemy wrapper; if invalidation fails, cleanup attempts pool detachment and logs any unconfirmed discard. Normal pool return alone does not release a session advisory lock. The job also has a session-level Postgres advisory lock (`FLOW_MATERIALIZE_ADVISORY_LOCK_KEY`) held for the whole run (another holder means a "SKIPPED" receipt), and a `pull_log` receipt (`puller_name = 'FlowMaterialize_Daily'`; status, total rows, per-table counts and per-table errors in `error_message`). The lock only coordinates callers that take the same key; the old-checkout timer takes none, so **activation precondition: disable `grid-flow-materializer.timer` (`sudo systemctl disable --now grid-flow-materializer.timer`) in the same change window as the scheduler release**, (an operator step, not part of the scheduler release itself) or the two code versions will keep writing the same tables. Activation needs a grid-scheduler release/restart.
 
+## SEC earnings collector and E2 scoreboard (host timers)
+
+Owner: the Claude D-track session, named by Anik on 2026-11-25. The owner answers for the facts below.
+Any change to a unit, timer, wrapper, env file or scorer version is a proposal to Anik, reviewed by Codex.
+Facts verified read-only on 2026-11-25 around 03:10Z. Each is a dated observation, not a guarantee.
+
+### `grid-earnings-events` (SEC filings + earnings transcripts)
+
+- **Schedule:** `grid-earnings-events.timer`, `OnCalendar=*-*-* 06:00:00 UTC`, `Persistent=true`. The `.service` is a
+  `User=grid` oneshot; it shows "disabled" because only the timer is enabled. A run takes about 5-10 minutes.
+- **What runs:** host script `/usr/local/bin/grid-earnings-events.sh` (not tracked in this repo). It runs from
+  `/data/grid_v4/grid_release` on `grid_venv-314`, loads `.env` from the old `grid_repo` checkout (#1242), and
+  calls `python -m ingestion.earnings_events_puller --days-back 14 --av-max-calls 25`. Log:
+  `/var/log/grid-earnings-events.log`, one `START` / `END rc=N` line pair per run.
+- **Writes:** the `earnings_events` table on griddb only: 10-K / 10-Q / 8-K(/A) / 20-F / 40-F rows with SEC `items`,
+  plus AlphaVantage transcripts. It does **not** write the company-documents archive (`ingestion/company_documents.py`).
+  That archive has one writer, `scripts/ingest_company_document.py --archive`, which is run by hand. No
+  primary post-commit readback receipt is produced anywhere, which is the input #1424's diagnostic expects.
+- **Loaded code:** release tree at `b2629045` (equal to `origin/main` at the check). The `ingestion/earnings_events_puller.py`
+  blob is `3ac71a55`, the same as main.
+- **Last success:** the last 7 runs (2026-11-18 .. 2026-11-24) all ended `rc=0`. The latest was 2026-11-24T06:05:10Z (52 new filings).
+- **Availability clock:** GRID ingest time, not SEC acceptance. An 8-K accepted after the close (about 21:05Z) reaches
+  GRID about 9 h later, before the next open. One accepted before the open reaches GRID only after that session.
+
+### `grid-e2-scoreboard` (E2 forward scoreboard, `evals/e2`)
+
+- **Schedule:** `grid-e2-scoreboard.timer`, 15:00 and 23:15 UTC. Installed from
+  `deploy/systemd/grid-e2-scoreboard.{service,timer}.template` on 2026-10-02 (timer file date). Drop-in `py314.conf`.
+- **What runs:** `User=grid`, `WorkingDirectory=/data/grid_v4/grid_release`,
+  `python -m evals.e2 run --board-dir /data/grid/evals/e2_scoreboard ...`. It reads the S10 forward log and the
+  GEX-levels v1 paper log read-only and opens no database connection. `ExecStopPost` runs `scripts/e2_witness_sync.sh`,
+  which commits the new anchor lines from a dedicated vault clone that only this job writes
+  (`05-GRID/Paper-Log/e2/e2_scoreboard_e2-v1.anchors.jsonl`).
+- **Writes:** `e2_scoreboard_e2-v1.jsonl` (append-only, hash-chained), its anchors, and the views `SCOREBOARD.md` /
+  `latest_snapshot.json` in the board dir.
+- **Version:** `e2-v1`, cost model `e2-costs-v1`. The E2 code last changed at `d00a24ab` (2026-10-01).
+- **Last success:** 2026-11-24 23:15Z (`Result=success`). Vault witness commits land twice daily.
+- **Known gap:** `e2-costs-v1` has no options class, which D0 §6.3 requires before D3 scoring of D2-H1. See
+  `docs/research/e2-options-cost-class-proposal-v0.md` (a proposal only; no version bump).
+
 ## Cron Jobs
 
 Installed via `bash scripts/setup_cron.sh`:
