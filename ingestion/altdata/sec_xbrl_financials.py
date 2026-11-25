@@ -1112,6 +1112,7 @@ class SECXBRLFinancialsPuller:
         results: list[dict[str, Any]] = []
         processed = 0
         rows_this_run = 0
+        tolerated_total = 0
         completed_list: list[str] = sorted(already_done)
         attempted_list: list[str] = sorted(already_attempted)
 
@@ -1177,18 +1178,21 @@ class SECXBRLFinancialsPuller:
                 "ticker": ticker, "cik": cik_padded, "status": "SUCCESS", "rows": written,
                 "candidates": len(snapshot.rows), "snapshot_id": snapshot.snapshot_id,
                 "snapshot_status": outcome["status"], "rows_removed": outcome.get("rows_removed", 0),
+                "tolerated_legacy_entries": snapshot.tolerated_legacy_entries,
             })
+            tolerated_total += snapshot.tolerated_legacy_entries
             record_attempt(ticker, success=True)
 
         elapsed = time.monotonic() - start_ts
         log.info(
-            "SEC_XBRL complete — {p} tickers, {r} rows, {e:.1f}s",
-            p=processed, r=rows_this_run, e=elapsed,
+            "SEC_XBRL complete — {p} tickers, {r} rows, {t} unusable legacy entries tolerated, {e:.1f}s",
+            p=processed, r=rows_this_run, t=tolerated_total, e=elapsed,
         )
         results.append({
             "status": "SUMMARY",
             "tickers_processed": processed,
             "rows_written": rows_this_run,
+            "tolerated_legacy_entries": tolerated_total,
             "elapsed_seconds": round(elapsed, 1),
         })
         return results

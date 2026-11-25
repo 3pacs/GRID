@@ -287,15 +287,36 @@ def test_a_current_period_entry_without_start_stays_fatal_even_beside_legacy_one
         prepared(data)
 
 
-@pytest.mark.parametrize('days_before_newest, refused', [(0, True), (730, True), (731, False), (4000, False)])
-def test_legacy_horizon_boundary(days_before_newest, refused):
-    from datetime import date
-    newest = date(2026, 8, 26)                                       # the payload's newest filing
+@pytest.mark.parametrize('days_before_capture, refused', [(-30, True), (0, True), (730, True), (731, False), (4000, False)])
+def test_legacy_horizon_is_measured_from_the_capture_date(days_before_capture, refused):
     data = payload()
     data['facts']['us-gaap']['PaymentsOfDividends'] = _legacy(
-        end=(newest - timedelta(days=days_before_newest)).isoformat(), filed='2026-08-26')
+        end=(AT.date() - timedelta(days=days_before_capture)).isoformat(), filed='2026-08-26')
     if refused:
         with pytest.raises(ValueError, match='duration'):
             prepared(data)
     else:
         assert prepared(data).rows
+
+
+def test_an_unrelated_future_filed_fact_does_not_widen_the_horizon():
+    """Codex 6061699121: an Assets fact filed 2035-01-01 moved the old anchor past the
+    capture and admitted a current-period dividend without a start."""
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _legacy(
+        end='2026-07-26', filed='2026-08-26', accn='0001045810-26-000075', form='10-Q', fp='Q2')
+    data['facts']['us-gaap']['Assets'] = {'units': {'USD': [dict(
+        end='2035-01-01', val=5, accn='0001045810-35-000001', filed='2035-01-01', form='10-K')]}}
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+
+
+def test_tolerated_legacy_entries_are_counted_but_not_part_of_the_identity():
+    clean = prepared()
+    data = payload()
+    data['facts']['us-gaap']['PaymentsToAcquireBusinessesNetOfCashAcquired'] = _legacy()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _legacy(
+        end='2014-02-23', filed='2014-02-11', start='2013-11-24')
+    s = prepared(data)
+    assert s.tolerated_legacy_entries == 2 and clean.tolerated_legacy_entries == 0
+    validate_snapshot(s)                                    # replay at the write boundary still matches
