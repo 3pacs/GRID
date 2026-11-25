@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Dashboard from '../views/Dashboard.jsx';
 import { api } from '../api.js';
@@ -153,6 +153,28 @@ describe('Dashboard watchlist loading', () => {
         render(<Dashboard onNavigate={vi.fn()} />);
         await screen.findByText(/Change feed unavailable/);
         expect(screen.queryByText(/No significant changes/)).not.toBeInTheDocument();
+    });
+
+    it('keeps pending, available-empty and failed change-feed states apart (#959, Codex hold at 0cd00fc2)', async () => {
+        let release;
+        api.getIntelDashboard.mockReturnValue(new Promise((res) => { release = res; }));
+        render(<Dashboard onNavigate={vi.fn()} />);
+        // First request still in flight: neither "no changes" nor "unavailable".
+        await screen.findByText('Loading change feed...');
+        expect(screen.queryByText(/No significant changes/)).not.toBeInTheDocument();
+        expect(screen.queryByText(/Change feed unavailable/)).not.toBeInTheDocument();
+        // It succeeds with nothing to show: now, and only now, the feed is empty.
+        await act(async () => { release({ generated_at: '2026-11-24T12:00:00Z' }); });
+        await screen.findByText(/No significant changes/);
+        expect(screen.queryByText('Loading change feed...')).not.toBeInTheDocument();
+    });
+
+    it('a rejected first intel request reads unavailable, not empty (#959)', async () => {
+        api.getIntelDashboard.mockRejectedValue(new Error('network'));
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await screen.findByText(/Change feed unavailable/);
+        expect(screen.queryByText(/No significant changes/)).not.toBeInTheDocument();
+        expect(screen.queryByText('Loading change feed...')).not.toBeInTheDocument();
     });
 
     it('renders a text-only on-demand briefing when no audio was made (paid TTS disabled)', async () => {

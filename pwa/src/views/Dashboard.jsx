@@ -332,7 +332,8 @@ export default function Dashboard({ onNavigate }) {
     const [thesisLoading, setThesisLoading] = useState(false);
     const [changeFeed, setChangeFeed] = useState([]);
     // api._fetch resolves a failure to {error: true}; that is not an empty feed.
-    const [changeFeedFailed, setChangeFeedFailed] = useState(false);
+    // 'pending' (first read in flight), 'ok' (a read succeeded; empty means empty), 'failed'.
+    const [changeFeedState, setChangeFeedState] = useState('pending');
     const [pulsePrices, setPulsePrices] = useState({});
     const [watchlistItems, setWatchlistItems] = useState([]);
     const [intelData, setIntelData] = useState(null);
@@ -396,11 +397,11 @@ export default function Dashboard({ onNavigate }) {
             // Background: thesis + intel + cached watchlist state (heavier, don't block UI)
             api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
             api.getIntelDashboard().then(d => {
-                if (!d || d.error) { setChangeFeedFailed(true); return; }
-                setChangeFeedFailed(false);
+                if (!d || d.error) { setChangeFeedState('failed'); return; }
+                setChangeFeedState('ok');
                 setChangeFeed(buildChangeFeed(d));
                 setIntelData(d);
-            }).catch(() => { setChangeFeedFailed(true); });
+            }).catch(() => { setChangeFeedState('failed'); });
             api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
             api.getWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
@@ -690,11 +691,18 @@ export default function Dashboard({ onNavigate }) {
             <div style={{ ...card, padding: isMobile ? '14px' : '18px' }}>
                 <div style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 700,
                     letterSpacing: '1.5px', color: colors.textMuted, marginBottom: '12px' }}>WHAT CHANGED</div>
+                {changeFeedState === 'failed' && changeFeed.length > 0 && (
+                    <div data-testid="change-feed-last-known" style={{ fontFamily: SANS, fontSize: '12px', color: colors.yellow, padding: '0 0 8px' }}>
+                        Change feed unavailable: the latest request failed. Showing the last successful read.
+                    </div>
+                )}
                 {changeFeed.length === 0
                     ? <div style={{ fontFamily: SANS, fontSize: '13px', color: colors.textDim, padding: '12px 0' }}>
-                        {changeFeedFailed
+                        {changeFeedState === 'failed'
                             ? 'Change feed unavailable: the request failed, so this is not an empty feed.'
-                            : 'No significant changes in the last 6 hours.'}</div>
+                            : changeFeedState === 'pending'
+                                ? 'Loading change feed...'
+                                : 'No significant changes in the last 6 hours.'}</div>
                     : <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
                         {changeFeed.map((item, i) => (
                             <div key={i} onClick={() => item.nav && onNavigate(item.nav)}
