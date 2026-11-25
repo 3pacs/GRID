@@ -112,6 +112,43 @@ only where the chain stood.
   from before the factory and `present` when all of `FACTORY_TABLES` are there. Any other
   layout, the looks table alone included, is `unknown` (an incomplete generation). A look
   must belong to a registered `panel-factory` slot.
+- **A passed slot's retirement checks are read too** (#1163). gex-signals re-checks a
+  passed slot at registered checkpoints and a check below the registered floor lapses it
+  for good (`factory_retirement_checks`, panel-factory/2). The verdict export carries no
+  lapse, so the receipt is where GRID learns of one. The payload holds each check's slot,
+  checkpoint, time, last day, lapse flag, exact stored text and that text's sha256.
+  `factory_retirement_checks_table` is `absent` on a generation without the table, which
+  is not "none lapsed". Checks are append-only and are held to that against the last
+  receipt that read them; a check for a slot with no stored look is `unknown`.
+- **How a lapse reaches the factory ledger.** The nightly `verdicts-witness` command also
+  calls `ledger_steered_exploration.read_factory_retirement` on the same verified receipt.
+  It appends one `factory_retirement_reading` covering every passed verdict whose
+  registration and look the receipt retains, lapsed or not, or it appends nothing and says
+  why. `summarize()["live"]["lapsed"]` is the last reading's count, as of that session. It
+  is `null` while any passed verdict is covered by no reading, and `0` when no verdict has
+  passed. A reading takes nothing back: every check it names stays that check.
+- **What a reading can and cannot say.** It is an observation at the time the receipt's
+  source read finished, and every check in it must be dated no later than that time (the
+  session is named separately and is not the test). Each check is named in the record
+  (checkpoint, time, last day, lapse flag, text digest), sits at a checkpoint the slot's own
+  registration gives, and was made on the registered floor, level and window, read from the
+  registration's parameter text in the receipt. The first receipt that reads the checks is a
+  `baseline` (`factory_retirement_checks_continuity`): its checks were first seen then, and
+  no earlier receipt attests they were only added to. A count is an observation from a
+  slot's first reading on, not an earlier zero. The check's numbers are the producer's (a
+  lapse's bound is marked `producer_reported`: it is not recomputed here); the rule they are
+  judged on is the registration's. Each check also carries the terms version it was made
+  under and the digest of the fires it counted.
+- **A registration that cannot be read is unknown, never "no rule".** Parameter text that
+  is not JSON, is not an object, or names slot terms this ledger does not know is refused and
+  writes no reading. The one absence that is known is a registration under
+  `panel-factory/1`, which has no retirement rule; the record names those terms.
+- **The producer's rows are pinned on both sides.** `tests/fixtures/factory_retirement_producer_rows.json`
+  is a byte-for-byte copy of what gex-signals' `tests/factory_retirement_rows.py` prints
+  (a slot registered, looked at and checked twice by the real slot code, in its test
+  environment). The same sha256 is pinned in both repositories, and
+  `tests/test_factory_live_verdicts.py` reads those rows through the real receipt source,
+  a verified receipt, the reading and a reload.
 - It is a nightly reading: a change made and undone between two closes is not seen.
 
 ## Rules
