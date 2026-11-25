@@ -148,7 +148,7 @@ function DecisionStack({ decision }) {
                 {(decision.cards || []).map(card => (
                     <div key={card.source} className={`tl-decision-card ${stateClass(card.state)}`}>
                         <strong>{card.source}</strong>
-                        <em>{card.state === 'missing' ? 'no data' : `${Number(card.points || 0).toFixed(1)} pts`}</em>
+                        <em>{card.state === 'missing' || card.points == null ? 'no data' : `${Number(card.points || 0).toFixed(1)} pts`}</em>
                         <span>{card.detail}</span>
                     </div>
                 ))}

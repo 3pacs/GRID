@@ -146,10 +146,13 @@ export default function Regime() {
             setCurrentRegime(current);
             // Fetch the strategy for the current regime
             const strat = await api.getStrategyForRegime(current.state).catch(() => null);
+            const stratOk = strat && !strat.error ? strat : null;
             // A newer read may have started while the strategy was loading; its
             // panels win, so this older read applies nothing further.
             if (token.gen !== regimeGenRef.current) return { current, all, hist, trans, superseded: true };
-            if (strat) setActiveStrategy(strat);
+            // The strategy belongs to this read's regime. When it could not be
+            // loaded, show none rather than the previous regime's strategy.
+            setActiveStrategy(stratOk);
         }
         if (all && !all.error) setAllRegimes(all);
         setHistory(hist.history || []);

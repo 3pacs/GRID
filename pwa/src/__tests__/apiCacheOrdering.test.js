@@ -59,4 +59,23 @@ describe('api GET cache ordering', () => {
         expect(await api._fetch('/api/v1/example')).toEqual({ v: 'new' });
         expect(global.fetch).toHaveBeenCalledTimes(2);
     });
+
+    it('an unavailable answer is not cached, so a recovered source shows at once', async () => {
+        global.fetch
+            .mockReturnValueOnce(ok({ status: 'unavailable', total_actors: 0 }))
+            .mockReturnValueOnce(ok({ status: 'ok', total_actors: 7 }));
+        expect((await api._fetch('/api/v1/example')).status).toBe('unavailable');
+        expect(await api._fetch('/api/v1/example')).toEqual({ status: 'ok', total_actors: 7 });
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('an availability:unavailable answer is not cached either, but a good one still is', async () => {
+        global.fetch
+            .mockReturnValueOnce(ok({ availability: 'unavailable' }))
+            .mockReturnValueOnce(ok({ availability: 'available', v: 1 }));
+        await api._fetch('/api/v1/example');
+        await api._fetch('/api/v1/example');
+        await api._fetch('/api/v1/example');
+        expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
 });

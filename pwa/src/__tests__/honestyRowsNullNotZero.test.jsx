@@ -68,6 +68,21 @@ describe('TickerLookup', () => {
         const cell = screen.getByText('AAA', { selector: '.tl-evidence-text' }).closest('tr').querySelectorAll('td');
         expect(cell[cell.length - 1].textContent).toBe('-');
     });
+
+    it('a card with no points is no data, not 0.0 pts, whatever its state', async () => {
+        window.location.hash = '#/ticker-lookup?ticker=AAA';
+        api.getDadTickerGold.mockResolvedValue({
+            ticker: 'AAA', grid_data: {}, signals: {},
+            decision_stack: {
+                stance: 'Needs more evidence', score: 12, method: 'stack',
+                cards: [{ source: 'Chart', state: 'watch', detail: 'no points field' }],
+                reasons: [], blockers: [],
+            },
+        });
+        render(<TickerLookup />);
+        await waitFor(() => expect(screen.getByText('no data')).toBeTruthy());
+        expect(screen.queryByText('0.0 pts')).toBeNull();
+    });
 });
 
 describe('Regime', () => {
@@ -87,6 +102,24 @@ describe('Regime', () => {
         await waitFor(() => expect(screen.getByText('MACRO REGIME READINGS')).toBeTruthy());
         expect(screen.queryByText('0%')).toBeNull();
         expect(screen.getAllByText('--').length).toBeGreaterThan(0);
+    });
+
+    it.each([
+        ['is null', null],
+        ['is an error object', { error: true, status: 503 }],
+    ])('does not keep the earlier regime strategy when the new strategy %s', async (_name, second) => {
+        api.getCurrent.mockResolvedValue(GROWTH);
+        api.getAllActiveRegimes.mockResolvedValue(null);
+        api.getHistory.mockResolvedValue({ history: [] });
+        api.getTransitions.mockResolvedValue({ transitions: [] });
+        api.getStrategyForRegime
+            .mockResolvedValueOnce({ name: 'Trend Rider', action: 'Add', allocation: '60%', risk_level: 'med' })
+            .mockResolvedValueOnce(second);
+        render(<Regime />);
+        await screen.findByText('Trend Rider');
+        fireEvent.click(screen.getByText('REFRESH'));
+        await waitFor(() => expect(api.getStrategyForRegime).toHaveBeenCalledTimes(2));
+        await waitFor(() => expect(screen.queryByText('Trend Rider')).toBeNull());
     });
 
     it('an older read finishing its strategy load after a newer read applies none of its panels', async () => {

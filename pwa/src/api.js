@@ -284,6 +284,9 @@ class GRIDApi {
                 if (method !== 'GET') {
                     this.clearCache();
                 } else if (cacheable && !timedOut && !data?.error
+                    // A 200 that says the source is unavailable is an answer for now,
+                    // not something to serve from cache for the TTL after it recovers.
+                    && data?.status !== 'unavailable' && data?.availability !== 'unavailable'
                     && startGen === this._cacheGen
                     && startSeq > (this._cache.get(cacheKey)?.seq ?? 0)) {
                     this._cache.set(cacheKey, {
