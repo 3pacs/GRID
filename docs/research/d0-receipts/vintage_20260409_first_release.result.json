@@ -1,0 +1,13 @@
+{
+ "measured_at": "2026-11-13T06:02:15+00:00",
+ "query_sha256": "761eee8c07958890cca189b68e11d2952c7c8c9ec73d7afa317bb5b7744a8c8f",
+ "rows": [
+  {
+   "first_release": "1",
+   "first_release_rows": "2026-04-09=21.45",
+   "off_vs_prior_vintage": "1639",
+   "total": "9134"
+  }
+ ],
+ "transaction": "READ ONLY"
+}

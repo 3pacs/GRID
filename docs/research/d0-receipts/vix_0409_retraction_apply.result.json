@@ -1,0 +1,27 @@
+{
+ "after": {
+  "already_retracted": 9134,
+  "candidates": 9134,
+  "other_source_rows": 0
+ },
+ "apply": true,
+ "before": {
+  "already_retracted": 0,
+  "candidates": 9134,
+  "other_source_rows": 0
+ },
+ "expect_rows": 9134,
+ "feature": "vix_spot",
+ "feature_id": 11,
+ "finished_at": "2026-11-13T10:31:37+00:00",
+ "inserted": 9134,
+ "result": "APPLIED",
+ "run_tag": "vix-spot-yf-20260409",
+ "served_from_vintage_after": 0,
+ "served_from_vintage_before": 0,
+ "source": "yfinance",
+ "source_id": 2,
+ "started_at": "2026-11-13T10:31:32+00:00",
+ "tagged": 9134,
+ "vintage": "2026-04-09"
+}

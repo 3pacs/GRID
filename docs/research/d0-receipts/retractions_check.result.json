@@ -1,0 +1,31 @@
+{
+ "measured_at": "2026-11-13T05:15:59+00:00",
+ "query_sha256": "cf8d560fe58fdeb590de28aec694de20e42f8d3958128775fc273aa69f8425b8",
+ "rows": [
+  {
+   "a": "skew_index",
+   "b": "0",
+   "c": null,
+   "part": "retractions"
+  },
+  {
+   "a": "spy_full",
+   "b": "26811",
+   "c": "dfa-spy-full-backdated-20261002,full-basis-20261109,reresolve_20260927",
+   "part": "retractions"
+  },
+  {
+   "a": "vix_spot",
+   "b": "0",
+   "c": null,
+   "part": "retractions"
+  },
+  {
+   "a": "next vintage after 2026-04-09",
+   "b": "2026-04-10",
+   "c": "2026-04-10",
+   "part": "vix_bad_0409_window"
+  }
+ ],
+ "transaction": "READ ONLY"
+}

@@ -1,0 +1,4 @@
+# D0 admission signers (analysis/d0_admission.py, contract §9 G14).
+# Format (ssh-keygen ALLOWED SIGNERS): <principal> namespaces="grid-d0-admission" <key-type> <public-key> [comment]
+# Required principals: reviewer, operator. Each adds their OWN public key, in a reviewed commit.
+# This file intentionally lists no keys, so no hypothesis can be admitted yet.
