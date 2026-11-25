@@ -55,8 +55,8 @@ writer-conflicting lock on it before it stamps the epoch and holds it until the 
 can be written after the epoch without the trigger's clock. Existing rows are not touched.
 
 ``schema.sql`` declares the same objects (the migration replay applies schema.sql first, so every statement is
-idempotent). Downgrade refuses while any revision exists: dropping the table would destroy the only copy of what
-market_state_daily used to say.
+idempotent). Downgrade takes the same writer-conflicting lock first, then refuses while any revision exists:
+dropping the table would destroy the only copy of what market_state_daily used to say.
 """
 
 from typing import Sequence, Union
@@ -297,6 +297,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Block every market_state_daily writer before the archive is checked, and keep blocking them until the
+    # trigger and the archive are gone (Codex 6055357248): otherwise a replacement committed between the check and
+    # DROP TRIGGER would be archived, then dropped with the table. Only the trigger writes revisions, and the
+    # trigger fires only for a write to market_state_daily, so no revision can appear while the lock is held.
+    op.execute("SET LOCAL lock_timeout = '10s'")
+    op.execute("SET LOCAL statement_timeout = '60s'")
+    op.execute(WRITE_LOCK)
     op.execute(
         """
         DO $$

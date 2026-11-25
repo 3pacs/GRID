@@ -18,7 +18,8 @@ this file in its own step that fails on any skip. Against a real database they p
   delete commits); a clock not later than the session's history is refused, not bumped; the upgrade refuses a row
   already stamped at or after its epoch; and only the trigger writes revisions;
 * a replay shows what had been written by its clock, a live read what had committed (a delayed commit);
-* downgrade refuses while revisions exist.
+* downgrade refuses while revisions exist, and takes the writer lock before it checks (Codex 6055357248): a
+  replacement still open when the downgrade starts makes it wait, then refuse, and its history stays.
 """
 
 from __future__ import annotations
@@ -606,6 +607,73 @@ def test_an_unreadable_archive_falls_back_to_the_current_table_in_a_fresh_read_o
     sec = S.market_state(scratch, "post_close", MON, _db_utc_now(scratch).replace(tzinfo=UTC))
     assert sec.status == "ok" and sec.facts["record_date"] == DAY.isoformat()
     assert any(p.startswith("superseded versions read failed (ProgrammingError)") for p in sec.problems)
+
+
+def test_the_downgrade_takes_the_write_lock_before_it_checks_the_archive():
+    """Codex 6055357248: checking first would let a replacement archive a version between the check and
+    DROP TRIGGER, and the downgrade would then drop it. The lock lasts to the end of the transaction."""
+    m = importlib.import_module(_MIGRATION)
+    calls: list[str] = []
+
+    class _Op:
+        def execute(self, statement):
+            calls.append(str(statement).strip())
+
+    real_op = m.op
+    m.op = _Op()
+    try:
+        m.downgrade()
+    finally:
+        m.op = real_op
+    lock = calls.index(m.WRITE_LOCK)
+    check = next(i for i, c in enumerate(calls) if "downgrade refused" in c)
+    first_drop = next(i for i, c in enumerate(calls) if c.startswith("DROP "))
+    assert calls[:lock] == ["SET LOCAL lock_timeout = '10s'", "SET LOCAL statement_timeout = '60s'"]
+    assert lock < check < first_drop
+
+
+def test_a_replacement_open_when_the_downgrade_starts_keeps_its_history(scratch):
+    """Two connections. A's replacement has archived the original and is not committed when the downgrade starts.
+    The downgrade waits on A's lock, then sees A's revision and refuses; the archive and its trigger stay."""
+    _run(scratch, "upgrade")
+    MS.store_market_state(scratch, _state("low"))
+    done, errors = threading.Event(), []
+
+    def _downgrade():
+        try:
+            _run(scratch, "downgrade")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            done.set()
+
+    def _waiting() -> int:
+        with scratch.connect() as conn:
+            return conn.execute(text("SELECT count(*) FROM pg_locks WHERE locktype = 'relation' "
+                                     "AND relation = 'market_state_daily'::regclass AND NOT granted")).scalar_one()
+
+    conn_a = scratch.connect()
+    trans_a = conn_a.begin()
+    worker = threading.Thread(target=_downgrade)
+    try:
+        conn_a.execute(text("SELECT set_config('grid.market_state_reason', 'A', true), "
+                            "set_config('grid.market_state_run', 'run-A', true)"))
+        conn_a.execute(text("UPDATE market_state_daily SET record = CAST(:r AS JSONB) WHERE as_of_date = :d"),
+                       {"r": json.dumps(_state("high").to_dict()), "d": DAY})
+        worker.start()
+        deadline = time.monotonic() + 10
+        while _waiting() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _waiting() == 1 and not done.is_set()          # the downgrade waits on A
+        trans_a.commit()
+    finally:
+        conn_a.close()
+        worker.join(timeout=30)
+    assert done.is_set() and len(errors) == 1 and "downgrade refused" in str(errors[0])
+    (rev,) = _revisions(scratch)
+    assert rev.record["variables"]["vix"]["label"] == "low" and rev.reason == "A"
+    assert MS.store_market_state(scratch, _state("normal"), replace=REPLACE) is True   # the trigger is still there
+    assert len(_revisions(scratch)) == 2
 
 
 def test_downgrade_refuses_while_revisions_exist(scratch):
