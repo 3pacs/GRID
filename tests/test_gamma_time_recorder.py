@@ -342,6 +342,7 @@ def test_cycle_changes_dispatch_only_during_pinned_opening_minute(monkeypatch):
     monkeypatch.setattr(
         rec, "_retry_opening", lambda results, minute: retry.append(minute)
     )
+    monkeypatch.setattr(rec, "sleep", lambda seconds: None)  # the 2 s slots (2026-11-25)
     monkeypatch.setattr(rec, "_utc", lambda: OPEN)
     assert rec.cycle() == "SPX=recorded, AAPL=recorded"
     assert (
@@ -407,3 +408,111 @@ def test_opening_retry_returns_at_cutoff_while_slow_read_cannot_write_next_minut
         release.set()
     assert done.wait(1)
     assert outcomes == ["opening_window_elapsed"] and writes == []
+
+
+# --- 2026-11-25: one /chains start every 2 s, at :30 (the 09:30 opening keeps :00.15) ---
+
+
+def _slot_waits(monkeypatch, rec, start, symbols):
+    """Run cycle() at a fixed clock; return {symbol: seconds it waited for its slot} and the capture arguments."""
+    import threading
+
+    monkeypatch.setattr(rec.settings, "SCHWAB_PRIVATE_GEX_BOARD_ENABLED", True)
+    monkeypatch.setattr(rec, "tracked_symbols", lambda: symbols)
+    monkeypatch.setattr(rec, "_retry_opening", lambda results, minute: None)
+    monkeypatch.setattr(rec, "_utc", lambda: start)
+    pending, waited, args = {}, {}, {}
+
+    def pause(seconds):
+        pending[threading.get_ident()] = seconds
+
+    def record(*a):
+        waited[a[0]] = pending.pop(threading.get_ident(), 0)
+        args[a[0]] = a
+        return "recorded"
+
+    monkeypatch.setattr(rec, "sleep", pause)
+    monkeypatch.setattr(rec, "_safe_capture", record)
+    status = rec.cycle()
+    return status, waited, args
+
+
+def test_cycle_starts_one_read_every_two_seconds(monkeypatch):
+    """Until 11-25 the three pins read together (max_workers=3) and finished within 0.12 s of each other; every
+    other client's 429 on 11-23 and 11-24 came 0-12.6 s after that burst."""
+    from datetime import timedelta
+    from scripts import record_gamma_time as rec
+
+    start = OPEN + timedelta(minutes=5, seconds=30)
+    status, waited, args = _slot_waits(monkeypatch, rec, start, ("SPX", "SPY", "QQQ", "AAPL"))
+    assert status == "SPX=recorded, SPY=recorded, QQQ=recorded, AAPL=recorded"
+    assert waited == {"SPX": 0, "SPY": 2.0, "QQQ": 4.0, "AAPL": 6.0}
+    assert all(a == (s,) for s, a in args.items()), "outside the opening: no window"
+
+
+def test_opening_minute_staggers_the_pins_first(monkeypatch):
+    from datetime import timedelta
+    from scripts import record_gamma_time as rec
+
+    status, waited, args = _slot_waits(monkeypatch, rec, OPEN + timedelta(seconds=0.15), PINNED + ("AAPL",))
+    assert waited == {"SPX": 0, "SPY": 2.0, "QQQ": 4.0, "AAPL": 6.0}
+    assert {s: a[1:] for s, a in args.items()} == {
+        **{s: (OPEN, OPEN + timedelta(minutes=1)) for s in PINNED},
+        "AAPL": (),
+    }
+
+
+def test_opening_retry_staggers_pending_pins_inside_the_cutoff():
+    import threading
+    from datetime import timedelta
+    from scripts.record_gamma_time import _retry_opening
+
+    clock = [OPEN + timedelta(seconds=5)]
+    main_pauses, slot_waits, calls = [], {}, []
+
+    def pause(seconds):
+        if threading.current_thread() is threading.main_thread():
+            main_pauses.append(seconds)
+            clock[0] += timedelta(seconds=seconds)
+        else:
+            slot_waits[threading.get_ident()] = seconds
+
+    def run(symbol, minute, cutoff):
+        calls.append((symbol, slot_waits.pop(threading.get_ident(), 0), minute, cutoff))
+        return "recorded"
+
+    results = {s: "opening_data_pending" for s in PINNED}
+    _retry_opening(results, OPEN, clock=lambda: clock[0], pause=pause, run=run)
+    assert main_pauses == [7]   # to :12, as before
+    assert sorted(calls) == sorted(
+        (s, w, OPEN, OPEN + timedelta(seconds=55)) for s, w in (("SPX", 0), ("SPY", 2.0), ("QQQ", 4.0))
+    )
+    assert all(r.startswith("recorded (opening retry") for r in results.values())
+
+
+@pytest.mark.parametrize(
+    "now,after,wait",
+    [
+        # Nov: New York is UTC-5. 09:29:30 ET, the minute just read was 09:29: the opening at 09:30:00.15.
+        (datetime(2026, 11, 10, 14, 29, 30, 500000, tzinfo=timezone.utc), "14:29", 29.65),
+        # The opening read ended at 09:30:20: next at 09:31:30, never 09:30:30.
+        (datetime(2026, 11, 10, 14, 30, 20, tzinfo=timezone.utc), "14:30", 70.0),
+        (datetime(2026, 11, 10, 17, 30, 40, tzinfo=timezone.utc), "17:30", 50.0),
+        # A wake a moment early (read made at :29.9995) never reads the same minute twice.
+        (datetime(2026, 11, 10, 17, 30, 29, 999500, tzinfo=timezone.utc), "17:30", 60.0005),
+        # Startup mid-minute (no read made yet): this minute's :30.
+        (datetime(2026, 11, 10, 17, 30, 10, tzinfo=timezone.utc), None, 20.0),
+        (datetime(2026, 11, 10, 14, 30, 0, 50000, tzinfo=timezone.utc), None, 0.10),
+        # July: New York is UTC-4, so the opening is 13:30Z.
+        (datetime(2026, 7, 1, 13, 29, 31, tzinfo=timezone.utc), "13:29", 29.15),
+        (datetime(2026, 7, 1, 14, 29, 31, tzinfo=timezone.utc), "14:29", 59.0),
+    ],
+)
+def test_next_read_is_the_half_minute_and_the_opening_at_00_15(now, after, wait):
+    from scripts.record_gamma_time import next_read
+
+    if after is not None:
+        h, m = map(int, after.split(":"))
+        after = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    assert next_read(now, after=after) == pytest.approx(wait, abs=1e-6)
+
