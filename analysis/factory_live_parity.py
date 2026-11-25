@@ -52,7 +52,9 @@ clock and the fields used). A (session, decision, feature) row counts only if:
   a binding stamped at another time than its value is not that value's;
 * the recorded eligibility and value equal what these terms give on the
   recorded bars. A stored value that the bars do not produce is a failure
-  (``recorded_value_differs_from_bars``), whatever the bars would have given.
+  (``recorded_value_differs_from_bars``), whatever the bars would have given;
+* an eligible value was stamped inside the recorder's decision window
+  (version 5, below).
 
 Anything else is ``live_rule_not_recorded`` for that row: the comparison is
 still shown, and it is not a match. A session that changed generation part-way
@@ -114,6 +116,36 @@ three numbers are fixed here, not arguments. They are sizes chosen for a
 diagnostic, after looking at those eight sessions; they are not to be tuned on
 later reports, and they bound nothing about how many decisions change.
 
+A recorded value counts only if the recorder wrote it as a decision input
+(version 5). The recorder writes an eligible value only on a pass inside its
+decision window: at or after the decision time and less than
+``DECISION_WINDOW_S`` seconds after it (gex-signals ``factory_slots.py``,
+``DECISION_WINDOW_S``; after the window it records ``missed_decision_window``
+and no value). Through version 4 this module did not read the stamp against the
+decision time, so an eligible row written hours later, with a binding of the
+same stamp and a value the bars give, counted as a match. A value delivered
+after the decision is not the input the decision had, however equal it is. Now
+an eligible recorded row whose own stamp is outside that window on the row's
+New York day is ``value_recorded_outside_the_decision_window`` and is never a
+match. The window is not part of the recorder's pinned terms text
+(``LIVE_RULE_TERMS``): the recorder does not write it beside a value. It is
+frozen here, with the rest of this rule, in ``RECEIPT_RULE_TERMS``, whose text
+and sha256 are pinned in the tests and printed in the report. This module judges
+stamps by its own frozen window whatever a later recorder generation allows, so
+a recorder with a wider window fails here; it is not believed.
+
+The same rule holds for the history a candidate's trigger is taken on. The
+recorder's z at a verdict session is computed on its ``RETURN_SPREAD_HISTORY``
+earlier values, most of them outside the verdict sessions. A value recorded
+outside the decision window among them would feed the state the verdict
+sessions certify, so a history that holds one certifies no trigger: that
+session is ``recorder_history_not_admitted`` and the candidate is not ready
+until the value has left the history. The z is still shown.
+
+A stamp says when the recorder wrote the value row. It does not say which
+vintage of each bar the recorder read. A bar corrected later is caught only
+where the recorded value no longer equals what the bars give.
+
 **What this report is, and is not.** A feature's ``live_ready`` says the
 recording's values agree with research on the verdict sessions. It is a
 diagnostic about the source. It is not the gate for a slot. A slot is one
@@ -148,7 +180,7 @@ import sqlite3
 import statistics
 import sys
 from collections import Counter, deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from analysis.module_factory import (
@@ -165,7 +197,7 @@ from analysis.module_factory import (
 )
 from ingestion.market_calendar import is_market_open, market_close_time
 
-SCHEMA = "factory-live-parity-v4"
+SCHEMA = "factory-live-parity-v5"
 MIN_SESSIONS = 5                  # the verdict: each of the most recent MIN_SESSIONS expected closed exchange sessions matched
 OPEN_MIN = 9 * 60 + 30
 FULL_SESSION_MIN = 390
@@ -216,6 +248,26 @@ LIVE_RULE_TERMS_SHA256 = hashlib.sha256(LIVE_RULE_TERMS_JSON.encode()).hexdigest
 RULE_NOT_RECORDED = "live_rule_not_recorded"
 SESSION_MISSING = "session_missing"       # an expected recent session is absent from research, from live, or from both
 RECORDED_DIFFERS = "recorded_value_differs_from_bars"
+# The recorder writes an eligible value only on a pass this soon after the decision time (gex-signals
+# factory_slots.DECISION_WINDOW_S). Not in the pinned terms text: this is a copy, and the report names it.
+DECISION_WINDOW_S = 120
+RECORDED_LATE = "value_recorded_outside_the_decision_window"
+HISTORY_NOT_ADMITTED = "recorder_history_not_admitted"   # a candidate's z history holds a value recorded outside the window
+# This report's own rule for a recorded value and for the history behind a trigger, frozen: text and sha256 are pinned
+# in the tests. The recorder's terms (LIVE_RULE_TERMS) do not carry the window, so it is frozen here.
+RECEIPT_RULE_TERMS = {
+    "terms": "factory-live-parity-receipt/1",
+    "live_rule_terms_sha256": LIVE_RULE_TERMS_SHA256,
+    "decision_window_s": DECISION_WINDOW_S,
+    "decision_window": ("an eligible value counts only if decision time <= recorded_at < decision time + "
+                        "decision_window_s, by whole seconds, on the row's New York day"),
+    "history_admission": ("a candidate's trigger is taken on the recorder's own history (eligible, a number, bound to "
+                          "the live rule terms with the value's stamp); a history holding a value recorded outside the "
+                          "decision window certifies no trigger"),
+    "stamp_limit": "a stamp is when the value row was written; it does not show which vintage of a bar was read",
+}
+RECEIPT_RULE_TERMS_JSON = json.dumps(RECEIPT_RULE_TERMS, sort_keys=True, separators=(",", ":"))
+RECEIPT_RULE_TERMS_SHA256 = hashlib.sha256(RECEIPT_RULE_TERMS_JSON.encode()).hexdigest()
 SPREAD_UNAVAILABLE = "research_spread_unavailable"   # a return value with no research spread to judge it on
 VALUE_BIASED = "value_biased"                         # at some decision time the mean signed difference is not near zero
 # A named candidate's own gate (slot_gate).
@@ -368,6 +420,30 @@ def binding_problem(row: dict | None) -> str | None:
         return "value_bound_to_other_terms"
     if row["terms_recorded_at"] != row["recorded_at"]:
         return "binding_not_written_with_the_value"   # stamped at another time than the value it claims
+    return None
+
+
+def stamp_problem(row: dict | None, day: str, decision: str) -> str | None:
+    """Why an eligible recorded value was not the input its decision had; None when it was, or when none is claimed.
+
+    The recorder writes an eligible value only on a pass at or after the decision time and less than
+    ``DECISION_WINDOW_S`` seconds after it, by the clock's whole seconds. A row that is not eligible claims no
+    value, so its stamp is not judged here: it can never be a match.
+    """
+    if row is None or not row["eligible"]:
+        return None
+    try:
+        at = datetime.fromisoformat(row["recorded_at"])
+    except (TypeError, ValueError):
+        return "value_stamp_unreadable"
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)          # the recorder reads a stamp without a zone as UTC
+    due = datetime.fromisoformat(f"{day}T{decision}").replace(tzinfo=NY)
+    after = (at.replace(microsecond=0) - due).total_seconds()
+    if after < 0:
+        return "value_stamped_before_the_decision_time"
+    if after >= DECISION_WINDOW_S:
+        return "value_stamped_after_the_decision_window"
     return None
 
 
@@ -672,10 +748,23 @@ def recorder_history(recorded: dict | None, feature: str, decision: str, before_
     values of (feature, decision) that are eligible, hold a number and are bound to these terms, oldest first.
 
     This is gex-signals ``factory_slots.history()``. A value an earlier generation recorded is in no history."""
-    rows = sorted((day, row["raw"]) for (day, t, f), row in (recorded or {}).items()
-                  if f == feature and t == decision and day < before_day and row["eligible"] and row["raw"] is not None
-                  and binding_problem(row) is None)
-    return tuple(raw for _day, raw in rows[-RETURN_SPREAD_HISTORY:])
+    return tuple(row["raw"] for _day, row in _recorder_history_rows(recorded, feature, decision, before_day))
+
+
+def _recorder_history_rows(recorded: dict | None, feature: str, decision: str, before_day: str) -> list[tuple]:
+    rows = sorted(((day, row) for (day, t, f), row in (recorded or {}).items()
+                   if f == feature and t == decision and day < before_day and row["eligible"] and row["raw"] is not None
+                   and binding_problem(row) is None), key=lambda item: item[0])
+    return rows[-RETURN_SPREAD_HISTORY:]
+
+
+def recorder_history_not_admitted(recorded: dict | None, feature: str, decision: str, before_day: str) -> list[str]:
+    """The days in that history whose value was recorded outside the decision window, oldest first.
+
+    The recorder does not leave such a value out of its own z, so neither does ``recorder_history``. A history that
+    holds one is the recorder's real state, and it is not one a verdict may rest on."""
+    return [day for day, row in _recorder_history_rows(recorded, feature, decision, before_day)
+            if stamp_problem(row, day, decision) is not None]
 
 
 def parse_candidate(feature: str, decision: str, op: str, k: str | float, decisions: list[str]) -> dict:
@@ -711,7 +800,7 @@ def slot_gate(candidate: dict, compared: dict, histories: dict, recorded_history
     """
     f, t, op, k = candidate["feature"], candidate["decision"], candidate["op"], candidate["k"]
     rows = {r["day"]: r for r in compared["value_rows"] if r["feature"] == f and r["decision"] == t}
-    sessions, unmatched, unavailable, disagree = [], [], [], []
+    sessions, unmatched, unavailable, disagree, not_admitted = [], [], [], [], []
     have = []
     for day in verdict_sessions:
         row = rows.get(day)
@@ -721,6 +810,9 @@ def slot_gate(candidate: dict, compared: dict, histories: dict, recorded_history
         research_history = histories.get((f, t, day))
         live_history = recorder_history(recorded_history, f, t, day)
         have.append(len(live_history))
+        late_in_history = recorder_history_not_admitted(recorded_history, f, t, day)
+        if late_in_history:
+            not_admitted.append(day)
         recorded = (recorded_history or {}).get((day, t, f))
         live_value = recorded["raw"] if recorded and recorded["eligible"] and binding_problem(recorded) is None else None
         research_z = (robust_z(row["research"], deque(research_history, maxlen=RETURN_SPREAD_HISTORY))
@@ -728,7 +820,8 @@ def slot_gate(candidate: dict, compared: dict, histories: dict, recorded_history
         live_z = (robust_z(live_value, deque(live_history, maxlen=RETURN_SPREAD_HISTORY))
                   if live_value is not None and len(live_history) == RETURN_SPREAD_HISTORY else None)
         entry = {"day": day, "value_matched": matched, "research_z": research_z, "live_z": live_z,
-                 "recorder_history_have": len(live_history), "research_fires": None, "live_fires": None, "agree": None}
+                 "recorder_history_have": len(live_history), "research_fires": None, "live_fires": None, "agree": None,
+                 "recorder_history_recorded_outside_the_decision_window": late_in_history}
         if research_z is None or live_z is None:
             unavailable.append(day)
         else:
@@ -752,10 +845,13 @@ def slot_gate(candidate: dict, compared: dict, histories: dict, recorded_history
         reasons.append(TRIGGER_UNAVAILABLE)
     if disagree:
         reasons.append(TRIGGER_DISAGREES)
+    if not_admitted:
+        reasons.append(HISTORY_NOT_ADMITTED)
     return {**candidate, "status": "not_ready" if reasons else "ready", "reasons": reasons,
             "sessions": sessions, "value_not_matched": unmatched,
             "mean_signed_diff_in_spreads": bias, "bias_limit_in_spreads": RETURN_BIAS_SPREADS if FEATURE_TYPE[f] == "return" else None,
             "trigger_unavailable": unavailable, "trigger_disagrees": disagree,
+            "recorder_history_not_admitted": not_admitted,
             "recorder_history": {"needed": RETURN_SPREAD_HISTORY, "have_min": min(have) if have else 0,
                                  "have_max": max(have) if have else 0},
             "note": ("ready is evidence about the recording at this decision time; the recorded sessions, the "
@@ -788,7 +884,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
     rows = []
     per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0, "matched_values": 0,
                        "applicable": Counter(), "matched": Counter(), "no_value": 0, "no_value_by_day": Counter(),
-                       "unbound": Counter(), "differs": Counter(), "bound_values": 0,
+                       "unbound": Counter(), "differs": Counter(), "bound_values": 0, "late": Counter(),
                        "out_of_tolerance": 0, "out_of_tolerance_by_day": Counter(), "max_abs_diff": None,
                        "no_spread": Counter(), "scaled": {}, "max_abs_diff_in_spreads": None}
                    for f in FEATURES}
@@ -831,6 +927,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                     within = diff is not None and diff <= TOLERANCE["range"]
                 row = (recorded or {}).get((day, decision, f))
                 unbound = binding_problem(row)
+                stamped = stamp_problem(row, day, decision)   # an eligible value written outside the decision window
                 agrees = row is not None and row["eligible"] == (not l_why[f]) and _same_value(row["raw"], rule_val[f])
                 if diff is not None:
                     stat["compared"] += 1
@@ -849,7 +946,8 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                     stat["unbound"][day] += unbound is not None
                     stat["differs"][day] += unbound is None and not agrees
                     stat["bound_values"] += unbound is None
-                    matched = bool(both_eligible and within and unbound is None and agrees)
+                    stat["late"][day] += stamped is not None
+                    matched = bool(both_eligible and within and unbound is None and stamped is None and agrees)
                     if matched:
                         stat["matched"][day] += 1
                         stat["matched_values"] += 1
@@ -862,6 +960,9 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                              "applicable": applicable, "matched": matched,
                              "recorded_value": None if row is None else row["raw"],
                              "binding": unbound or "bound_to_these_terms",
+                             "recorded_at": None if row is None else row["recorded_at"],
+                             "decision_stamp": stamped or (None if row is None or not row["eligible"]
+                                                           else "inside_the_decision_window"),
                              "recorded_agrees_with_bars": None if row is None else agrees,
                              "backstop_minutes": [list(u) for u in l_used[f]]})
             for horizon in horizons:
@@ -893,6 +994,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
         recent_disagreed = sorted({m["day"] for m in availability_mismatch if f in m["features"] and m["day"] in recent})
         recent_not_recorded = [d for d in recent if stat["unbound"][d]]      # a required value without its own binding
         recent_differs = [d for d in recent if stat["differs"][d]]            # a bound value the bars do not give
+        recent_late = [d for d in recent if stat["late"][d]]                  # an eligible value stamped outside the decision window
         recent_no_spread = [d for d in recent if stat["no_spread"][d]]        # a return value with no spread to judge it on
         # The bias of a return feature, at each decision time on its own: the mean signed difference over the verdict
         # sessions at that time. Never averaged over decision times: opposite errors at two times would cancel.
@@ -913,6 +1015,8 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             reasons.append(RULE_NOT_RECORDED)
         if recent_differs:
             reasons.append(RECORDED_DIFFERS)
+        if recent_late:
+            reasons.append(RECORDED_LATE)
         if len(recent_matched) < MIN_SESSIONS:
             reasons.append("insufficient_matched_sessions")
         if recent_out:
@@ -933,6 +1037,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             "verdict_on": {"sessions": recent, "matched": len(recent_matched), "required": MIN_SESSIONS,
                            "missing": missing, "not_recorded_under_the_rule": recent_not_recorded,
                            "recorded_values_differ_from_the_bars": recent_differs,
+                           "recorded_outside_the_decision_window": recent_late,
                            "values_out_of_tolerance": recent_out, "eligible_rows_with_no_value": recent_no_value,
                            "sessions_with_an_availability_disagreement": recent_disagreed,
                            "sessions_with_no_research_spread": recent_no_spread,
@@ -949,6 +1054,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             "eligible_rows_with_no_value": stat["no_value"], "applicable_decision_times": applicable_times,
             "values_bound_to_the_terms": stat["bound_values"], "values_not_bound": sum(stat["unbound"].values()),
             "recorded_values_that_differ_from_the_bars": sum(stat["differs"].values()),
+            "values_recorded_outside_the_decision_window": sum(stat["late"].values()),
             "max_abs_diff": stat["max_abs_diff"],
             "max_abs_diff_in_spreads": stat["max_abs_diff_in_spreads"],
             "values_with_no_research_spread": sum(stat["no_spread"].values()),
@@ -1016,6 +1122,8 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
                       "recorded_values": len(recorded or {}),
                       "recorded_values_bound_to_these_terms": sum(binding_problem(r) is None for r in (recorded or {}).values()),
                       "gap_max": GAP_MAX, "backstop_source": BACKSTOP_SOURCE,
+                      "decision_window_s": DECISION_WINDOW_S,
+                      "receipt_rule": {"terms": RECEIPT_RULE_TERMS, "terms_sha256": RECEIPT_RULE_TERMS_SHA256},
                       "backstop_table": backstop is not None,
                       "backstop_bars": sum(len(v) for v in (backstop or {}).values()),
                       "note": ("live features are judged by the live recorder's lost-minute rule, research by the "
