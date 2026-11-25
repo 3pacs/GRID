@@ -145,8 +145,19 @@ def test_guard_catches_the_original_bug_shape():
 
 # ── Event-loop lag watchdog ─────────────────────────────────────────────────
 
-def _blocking_coroutine_for_test(seconds: float) -> None:
-    time.sleep(seconds)  # deliberately blocks the loop
+def _block_the_loop_until(observed, what: str, limit: float = 30.0) -> None:
+    """Hold the event-loop thread, as a blocking call does, until ``observed()``.
+
+    The watchdog is a separate thread, so how long it takes to notice a stall
+    depends on when the OS schedules it. A fixed hold (``time.sleep(0.3)``
+    against a 0.1 s threshold) is a race against that: when the thread was late
+    the first stall went unseen and "one stack log per cooldown window" failed
+    on a loaded CI runner (GRID#1439). So hold until the watchdog has reported
+    the stall; ``limit`` only bounds a watchdog that never does."""
+    deadline = time.monotonic() + limit
+    while not observed():
+        assert time.monotonic() < deadline, f"the watchdog never reported {what}"
+        time.sleep(0.005)  # deliberately blocks the loop
 
 
 def test_watchdog_names_the_blocking_function():
@@ -158,37 +169,46 @@ def test_watchdog_names_the_blocking_function():
             threshold=0.2, interval=0.05, cooldown=60.0,
         )
         wd.start()
-        await asyncio.sleep(0.15)  # healthy loop: no stall
-        assert wd.stalls_detected == 0
-        _blocking_coroutine_for_test(0.8)
-        await asyncio.sleep(0.3)
-        wd.stop()
+        try:
+            await asyncio.sleep(0.15)  # healthy loop: no stall
+            assert wd.stalls_detected == 0
+            _block_the_loop_until(lambda: wd.last_stack is not None, "the stall")
+            await asyncio.sleep(0)  # let the loop answer the heartbeat
+        finally:
+            wd.stop()
         return wd
 
     wd = asyncio.run(main())
     assert wd.stalls_detected >= 1
-    assert wd.last_stack and "_blocking_coroutine_for_test" in wd.last_stack
+    assert wd.last_stack and "_block_the_loop_until" in wd.last_stack
 
 
 def test_watchdog_rate_limits_stack_logs():
     from api.loop_watchdog import EventLoopWatchdog
 
-    async def main() -> tuple[int, str | None]:
+    async def main() -> tuple[int, list[str | None]]:
         wd = EventLoopWatchdog(
             asyncio.get_running_loop(), threading.get_ident(),
             threshold=0.1, interval=0.02, cooldown=60.0,
         )
         wd.start()
-        stacks = []
-        for _ in range(3):
-            _blocking_coroutine_for_test(0.3)
-            await asyncio.sleep(0.15)
-            stacks.append(wd.last_stack)
-        wd.stop()
+        stacks: list[str | None] = []
+        try:
+            for stall in (1, 2, 3):
+                # last_stack is published just after the counter moves, so wait
+                # for both; the stack is None until the first stall is logged.
+                _block_the_loop_until(
+                    lambda: wd.stalls_detected >= stall and wd.last_stack is not None,
+                    f"stall {stall}",
+                )
+                stacks.append(wd.last_stack)
+                await asyncio.sleep(0)  # let the loop answer, so the next stall is a new one
+        finally:
+            wd.stop()
         return wd.stalls_detected, stacks
 
     stalls, stacks = asyncio.run(main())
-    assert stalls >= 2
+    assert stalls >= 3
     assert stacks[0] is not None and stacks[0] is stacks[-1], "one stack log per cooldown window"
 
 

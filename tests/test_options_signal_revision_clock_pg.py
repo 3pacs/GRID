@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -137,6 +138,28 @@ def _prior_weekday(day: date) -> date:
     return prior
 
 
+def _mentions(text: str, value: str) -> bool:
+    """True when ``value`` appears in ``text`` as a number of its own.
+
+    A bare ``value in text`` also matches inside a longer number, and the
+    verdict text carries ISO timestamps: a decision clock of ``...:50.458010``
+    contains ``0.45``, so the test failed on about one run in a few hundred
+    (GRID#1440) although the 0.45 PCR was not leaked."""
+    return re.search(rf"(?<![\d.]){re.escape(value)}(?!\d)", text) is not None
+
+
+def test_mentions_matches_a_value_but_not_a_slice_of_a_timestamp():
+    assert _mentions("PCR 0.45 as of the clock", "0.45")
+    assert _mentions("value=0.45, next", "0.45")
+    assert _mentions("0.45", "0.45")
+    # the failing text from CI: seconds ending in 0, fraction starting 45
+    stamp = "decision clock 2026-11-25T03:12:50.458010+00:00"
+    assert not _mentions(stamp, "0.45")
+    assert not _mentions("2026-11-25T06:25:41.250000+00:00", "1.25")
+    assert not _mentions("2026-11-25T06:25:40.400000+00:00", "0.40")
+    assert not _mentions("a 10.45 reading and 0.451", "0.45")
+
+
 def _freeze_scorer_clock(monkeypatch, ts, decision: datetime) -> None:
     class _FakeDatetime(datetime):
         @classmethod
@@ -181,8 +204,11 @@ def test_a_value_revised_after_the_clock_is_unavailable_not_replaced(engine, mon
     # substitute for it. The score is unavailable, and says why.
     assert verdict["status"] == "no_data", verdict
     assert verdict["evidence_availability"] == ts.OPTIONS_WRITTEN_AFTER_CLOCK
+    # The text states the clock's timestamps, so match each PCR as a whole
+    # number: a timestamp such as 03:12:50.458010 contains "0.45" (see _mentions).
     for value in ("1.25", "0.40", "0.45"):
-        assert value not in verdict["data_point"] and value not in verdict["reasoning"]
+        assert not _mentions(verdict["data_point"], value), (value, verdict["data_point"])
+        assert not _mentions(verdict["reasoning"], value), (value, verdict["reasoning"])
 
 
 def test_a_writer_transaction_straddling_a_live_read_is_invisible_until_commit(engine, monkeypatch):
