@@ -124,7 +124,9 @@ export default function Regime() {
     const [history, setHistory] = useState([]);
     const [transitions, setTransitions] = useState([]);
     const [activeTab, setActiveTab] = useState('action');
-    const [activeStrategy, setActiveStrategy] = useState(null);
+    // The strategy is stored with the regime it was loaded for, and shown only
+    // while that is still the regime on screen.
+    const [strategyFor, setStrategyFor] = useState(null);
 
     const { data, loading, error, refetch: loadData } = useAsyncData(async () => {
         const token = { gen: ++regimeGenRef.current, before: regimeRef.current };
@@ -144,19 +146,23 @@ export default function Regime() {
         if (current && !current.error) {
             setRegimeReadFailure(null);
             setCurrentRegime(current);
+        }
+        // Apply this read's other panels together with the banner, before the
+        // strategy request, so none of them shows the previous read under the
+        // new regime while that request is in flight.
+        if (all && !all.error) setAllRegimes(all);
+        setHistory(hist.history || []);
+        setTransitions(trans.transitions || []);
+        if (current && !current.error) {
             // Fetch the strategy for the current regime
             const strat = await api.getStrategyForRegime(current.state).catch(() => null);
             const stratOk = strat && !strat.error ? strat : null;
             // A newer read may have started while the strategy was loading; its
             // panels win, so this older read applies nothing further.
             if (token.gen !== regimeGenRef.current) return { current, all, hist, trans, superseded: true };
-            // The strategy belongs to this read's regime. When it could not be
-            // loaded, show none rather than the previous regime's strategy.
-            setActiveStrategy(stratOk);
+            // Bound to this read's regime; when it could not be loaded, none.
+            setStrategyFor(stratOk ? { state: current.state, strategy: stratOk } : null);
         }
-        if (all && !all.error) setAllRegimes(all);
-        setHistory(hist.history || []);
-        setTransitions(trans.transitions || []);
         return { current, all, hist, trans };
     }, { fallback: null });
 
@@ -170,6 +176,7 @@ export default function Regime() {
     // No verified read is not the backend's UNCALIBRATED reply: that one is a real
     // answer ("no regime row yet"); a cold 503/null is no answer at all.
     const regime = currentRegime || { state: 'UNAVAILABLE' };
+    const activeStrategy = strategyFor && strategyFor.state === regime.state ? strategyFor.strategy : null;
     const regimeLastKnown = currentRegime != null && regimeReadFailure != null
         && regimeReadFailure.regime === currentRegime;
     const primaryColor = stateColors[regime.state] || '#5A7080';

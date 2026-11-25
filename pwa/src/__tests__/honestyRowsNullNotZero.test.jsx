@@ -122,6 +122,33 @@ describe('Regime', () => {
         await waitFor(() => expect(screen.queryByText('Trend Rider')).toBeNull());
     });
 
+    it('never shows the previous regime\'s strategy under a newly read regime while its own loads', async () => {
+        const CONTRACTION = { state: 'CONTRACTION', confidence: 0.6, transition_probability: 0.3 };
+        let release;
+        const slow = new Promise((res) => { release = res; });
+        api.getCurrent.mockResolvedValueOnce(GROWTH).mockResolvedValueOnce(CONTRACTION);
+        api.getAllActiveRegimes.mockResolvedValue(null);
+        api.getHistory.mockResolvedValue({ history: [] });
+        api.getTransitions.mockResolvedValue({ transitions: [] });
+        api.getStrategyForRegime
+            .mockResolvedValueOnce({ name: 'Trend Rider', action: 'Add', allocation: '60%', risk_level: 'med' })
+            .mockReturnValueOnce(slow);
+        const view = render(<Regime />);
+        await waitFor(() => expect(api.getStrategyForRegime).toHaveBeenCalledTimes(1));
+        view.rerender(<Regime />);
+        await screen.findByText('Trend Rider');
+        fireEvent.click(screen.getByText('REFRESH'));
+        await waitFor(() => expect(api.getStrategyForRegime).toHaveBeenCalledTimes(2));
+        view.rerender(<Regime />);
+        // New regime on screen, its strategy still loading: the old one must be gone.
+        await waitFor(() => expect(screen.getAllByText(/CONTRACTION/).length).toBeGreaterThan(0));
+        expect(screen.queryByText('Trend Rider')).toBeNull();
+        await act(async () => { release({ name: 'Defensive Posture', action: 'Trim', allocation: '30%', risk_level: 'low' }); });
+        view.rerender(<Regime />);
+        await screen.findByText('Defensive Posture');
+        expect(screen.queryByText('Trend Rider')).toBeNull();
+    });
+
     it('an older read finishing its strategy load after a newer read applies none of its panels', async () => {
         let release;
         const slowStrategy = new Promise((res) => { release = res; });
