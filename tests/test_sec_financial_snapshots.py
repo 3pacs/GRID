@@ -247,3 +247,55 @@ def test_current_view_migration_covers_every_normalizer_flow():
     migration = (Path(__file__).resolve().parents[1] / 'migrations/versions/sec_financial_current_20261108.py').read_text(encoding='utf-8')
     for flow in {item['flow_type'] for item in _FLOW_MAPPINGS} | {'debt_issuance'}:
         assert migration.count("'" + flow + "'") == 2, flow
+
+
+# ── legacy unusable entries do not refuse the whole issuer (2026-11-25) ───────
+# 2026-11-23/24: 47 to 60 of each 200-issuer batch were refused "Invalid mapped
+# financial-flow duration" because of 2014-2023 mapped-flow entries with no start
+# (YUM: a 2020 acquisition payment; SIRI: 2016 dividends). The normalizer drops
+# such entries anyway, so the issuer's valid periods must be admitted unchanged.
+
+def _legacy(end='2020-03-18', filed='2021-02-22', **extra):
+    fact = dict(end=end, val=1_000, accn='0001041061-21-000012', filed=filed, form='10-K', fp='FY')
+    fact.update(extra)                               # no 'start': a point-in-time amount tagged as a flow
+    return {'units': {'USD': [fact]}}
+
+
+def test_legacy_mapped_entry_without_start_does_not_refuse_the_issuer():
+    clean = prepared()
+    data = payload()
+    data['facts']['us-gaap']['PaymentsToAcquireBusinessesNetOfCashAcquired'] = _legacy()
+    s = prepared(data)
+    assert s.rows == clean.rows and s.rows[0]['amount_usd'] == 96_221_000_000
+    assert s.normalized_sha256 == clean.normalized_sha256          # the entry changes nothing the normalizer emits
+    assert s.source_sha256 != clean.source_sha256                  # the capture still holds the exact source bytes
+
+
+def test_legacy_entry_filed_before_its_end_does_not_refuse_the_issuer():
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _legacy(
+        end='2014-02-23', filed='2014-02-11', start='2013-11-24')
+    assert prepared(data).rows[0]['amount_usd'] == 96_221_000_000
+
+
+def test_a_current_period_entry_without_start_stays_fatal_even_beside_legacy_ones():
+    data = payload()
+    data['facts']['us-gaap']['PaymentsToAcquireBusinessesNetOfCashAcquired'] = _legacy()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _legacy(
+        end='2026-07-26', filed='2026-08-26', accn='0001045810-26-000075', form='10-Q', fp='Q2')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+
+
+@pytest.mark.parametrize('days_before_newest, refused', [(0, True), (730, True), (731, False), (4000, False)])
+def test_legacy_horizon_boundary(days_before_newest, refused):
+    from datetime import date
+    newest = date(2026, 8, 26)                                       # the payload's newest filing
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _legacy(
+        end=(newest - timedelta(days=days_before_newest)).isoformat(), filed='2026-08-26')
+    if refused:
+        with pytest.raises(ValueError, match='duration'):
+            prepared(data)
+    else:
+        assert prepared(data).rows

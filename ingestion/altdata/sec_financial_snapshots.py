@@ -16,6 +16,14 @@ from typing import Any
 
 NORMALIZER_VERSION = "sec-financial-periods-v2"
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
+# A mapped flow entry with no start, or filed before its end, is unusable. The
+# normalizer drops it either way (``_normalize_entry``), so refusing the whole
+# issuer for one that ended long before the newest filing in the response only
+# discards the issuer (2026-11-23/24: 47 to 60 of each 200-issuer batch, from
+# 2014-2023 entries such as a 2020 acquisition payment without a start date). An
+# unusable entry that ended within this many days of the newest filing is a
+# current period that would be silently dropped, and stays fatal.
+LEGACY_ENTRY_HORIZON_DAYS = 730
 
 
 def _json(value: Any) -> str:
@@ -131,6 +139,8 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
         'ifrs-full': {tag for tags in _IFRS_TAG_MAP.values() for tag in tags}
                      | {_IFRS_DEBT_PROCEEDS_TAG, _IFRS_DEBT_REPAY_TAG},
     }
+    unusable_ends: list[date] = []
+    newest_filed: date | None = None
     for taxonomy in ('us-gaap', 'ifrs-full'):
         namespace = facts.get(taxonomy, {})
         if not isinstance(namespace, dict):
@@ -161,8 +171,13 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                     # Whole-company responses also contain forward-looking and
                     # instant non-flow concepts. Only our mapped duration flows
                     # require a start and a reporting end not after filing.
+                    if newest_filed is None or filed > newest_filed:
+                        newest_filed = filed
                     if tag_name in mapped_tags[taxonomy] and (start is None or filed < end):
-                        raise ValueError("Invalid mapped financial-flow duration")
+                        unusable_ends.append(end)
+    if newest_filed is not None and any(
+            (newest_filed - end).days <= LEGACY_ENTRY_HORIZON_DAYS for end in unusable_ends):
+        raise ValueError("Invalid mapped financial-flow duration")
     rates = _AppliedFxRates(json.loads(_json(fx_rates)))
     rows = _collect_all_flows(payload, rates)
     fx_json = _json(rates.applied)
