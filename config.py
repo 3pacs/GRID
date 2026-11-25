@@ -163,6 +163,11 @@ class Settings(BaseSettings):
 
     # Polygon.io (stocks, options with Greeks, crypto, forex)
     POLYGON_API_KEY: str = ""            # Free: 5 req/min, Paid: unlimited
+    # Off by default: while False, PolygonPuller.pull() returns SKIPPED before
+    # any request or write, so Hermes's stale-source repair (key "polygon")
+    # cannot write source 722. Unset reads as False. Turning it on is a
+    # separate rollout decision (GRID#1401).
+    POLYGON_OPTIONS_PULL_ENABLED: bool = False
 
     # NASA Earthdata (FIRMS fire data, VIIRS, satellite imagery)
     NASA_EARTHDATA_TOKEN: str = ""       # JWT token from earthdata.nasa.gov
