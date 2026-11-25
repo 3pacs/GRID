@@ -218,20 +218,37 @@ def used_price_dates(event: SelectedEvent, calendar: Calendar | None = None) -> 
     return [*_sessions_ending(event.p_prev_date, VOL_CLOSES, calendar or RegularCalendar()), event.day0]
 
 
+def _t(x: Any) -> str:
+    return x.isoformat() if isinstance(x, datetime) else repr(x)
+
+
+def _obs_key(f: Filing) -> tuple:
+    """A total order on observations, so no choice below depends on the order they were handed in."""
+    return (not _aware(f.visible_at), _t(f.visible_at) if not _aware(f.visible_at) else "",
+            f.visible_at.astimezone(ET).isoformat() if _aware(f.visible_at) else "",
+            _t(f.acceptance), _t(f.retrieved_at), repr(f.items), f.content_sha256)
+
+
+def _meta(f: Filing) -> tuple:
+    return (_t(f.acceptance), _t(f.retrieved_at), repr(tuple(f.items) if isinstance(f.items, (list, tuple)) else f.items))
+
+
 def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal: Calendar, period: str,
          breakpoints: R.Breakpoints | None) -> tuple[Decision, SelectedEvent | None]:
-    dropped = 0
-    unique: dict[str, Filing] = {}
+    groups: dict[str, list[Filing]] = {}
     for v in versions:
-        have = unique.get(v.content_sha256)
-        if have is None:
-            unique[v.content_sha256] = v
-        else:
-            dropped += 1
-            if _aware(v.visible_at) and (not _aware(have.visible_at) or v.visible_at < have.visible_at):
-                unique[v.content_sha256] = v  # the earliest observation of the same content is its first availability
-    ordered = sorted(unique.values(), key=lambda f: (not _aware(f.visible_at), f.visible_at if _aware(f.visible_at)
-                                                     else datetime.max.replace(tzinfo=ET)))
+        groups.setdefault(v.content_sha256, []).append(v)
+    dropped = sum(len(g) - 1 for g in groups.values())
+    unique: dict[str, Filing] = {}
+    conflicts: set[str] = set()  # same content, tied earliest visible clock, disagreeing metadata
+    for sha, g in groups.items():
+        g = sorted(g, key=_obs_key)
+        unique[sha] = g[0]  # the earliest observation of the content is its first availability
+        if _aware(g[0].visible_at):
+            tied = [x for x in g if _aware(x.visible_at) and x.visible_at == g[0].visible_at]
+            if len({_meta(x) for x in tied}) > 1:
+                conflicts.add(sha)
+    ordered = sorted(unique.values(), key=_obs_key)
     orig, others = ordered[0], ordered[1:]
     base = dict(acceptance=orig.acceptance, retrieved_at=orig.retrieved_at, visible_at=orig.visible_at,
                 duplicates_dropped=dropped)
@@ -265,6 +282,9 @@ def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal
             return _decision(accession, EXCLUDED_LATE_INPUT, f"visible_at {orig.visible_at.isoformat()} is after the "
                              f"deadline {d.isoformat()}" + (f" (its record is also inconsistent: {why})" if why else ""),
                              period, **base), None
+        if orig.content_sha256 in conflicts:
+            return _decision(accession, EXCLUDED_MALFORMED, "observations of the same content tied at the earliest "
+                             "visible clock disagree on their other clocks or items", period, **base), None
         bad = _chronology_problem(orig)
         if bad:
             return _decision(accession, EXCLUDED_MALFORMED, f"impossible chronology: {bad}", period, **base), None
@@ -275,9 +295,12 @@ def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal
                                  **base), None
             if other.visible_at > d:  # first known after the decision: not part of what D could see
                 ignored.append(other.content_sha256)
-                if _chronology_problem(other):
+                if _chronology_problem(other) or other.content_sha256 in conflicts:
                     invalid_after.append(other.content_sha256)
                 continue
+            if other.content_sha256 in conflicts:
+                return _decision(accession, EXCLUDED_MALFORMED, "a second version claimed to be visible by the "
+                                 "deadline has tied observations that disagree", period, **base), None
             bad = _chronology_problem(other)
             if bad:
                 return _decision(accession, EXCLUDED_MALFORMED, f"a second version claimed to be visible by the "
@@ -337,6 +360,7 @@ def select_events(filings: Iterable[Filing], tape: Mapping[date, Price], *, peri
                                        "not a Filing with a string accession", period))
             continue
         groups.setdefault(f.accession, []).append(f)
+    decisions.sort(key=lambda x: (repr(x.accession), x.reason))  # the non-Filing members, in a fixed order
     selected: list[SelectedEvent] = []
     diagnostic: list[SelectedEvent] = []
     for acc in sorted(groups):

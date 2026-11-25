@@ -643,3 +643,140 @@ def test_the_as_of_decision_is_the_same_whenever_it_is_replayed():
     adds = [_later(at(D17, 22, 0), at(D17, 21, 0))]
     a, b = run([ORIGINAL, *adds]), run([ORIGINAL, *adds, *adds])
     assert a.selected == b.selected == BASE.selected
+
+
+# ---- order independence: the second order-dependence found (Codex 6056389309) ----
+
+import itertools  # noqa: E402
+import random  # noqa: E402
+
+VIS = at(D17, 11, 32)  # the original's visible clock (acceptance 11:30, retrieved 11:31)
+
+
+def _tied(ret_a, ret_b, vis=VIS):
+    a = S.Filing("TIE", ("2.02",), ON_TIME, ret_a, vis, "same")
+    b = S.Filing("TIE", ("2.02",), ON_TIME, ret_b, vis, "same")
+    return a, b
+
+
+def test_two_observations_of_one_content_tied_on_visibility_but_conflicting_on_retrieval_fail_closed_in_both_orders():
+    """Codex's control: same content hash, exactly the same visible clock, different retrieval clocks."""
+    a, b = _tied(at(D17, 11, 31), at(D17, 11, 20))   # b was "retrieved" before the 11:30 acceptance: inconsistent
+    one, two = run([a, b]), run([b, a])
+    assert one == two
+    d = only(one)
+    assert d.status == S.EXCLUDED_MALFORMED and "tied" in d.reason and one.selected == ()
+
+
+def test_the_tied_conflict_fails_closed_even_when_both_records_are_individually_consistent():
+    a, b = _tied(at(D17, 11, 31), at(D17, 11, 32))   # both consistent; they still disagree on retrieval
+    assert run([a, b]) == run([b, a]) and only(run([a, b])).status == S.EXCLUDED_MALFORMED
+
+
+def test_a_tied_conflict_on_the_acceptance_or_the_items_fails_closed_in_both_orders():
+    a = S.Filing("TIE", ("2.02",), ON_TIME, at(D17, 11, 31), VIS, "same")
+    for b in (dataclasses.replace(a, acceptance=at(D17, 11, 29)), dataclasses.replace(a, items=("2.02", "9.01"))):
+        assert run([a, b]) == run([b, a])
+        assert only(run([a, b])).status == S.EXCLUDED_MALFORMED
+
+
+def test_truly_identical_observations_are_still_one_event_in_both_orders():
+    a = S.Filing("TIE", ("2.02",), ON_TIME, at(D17, 11, 31), VIS, "same")
+    res = run([a, dataclasses.replace(a)])
+    assert only(res).status == S.SELECTED and only(res).duplicates_dropped == 1
+    assert res == run([dataclasses.replace(a), a])
+
+
+def test_a_later_tied_conflict_does_not_rewrite_a_frozen_decision_and_is_logged():
+    orig = filing("TIE", ON_TIME, sha="orig")
+    base = run([orig])
+    x, y = (S.Filing("TIE", ("2.02",), ON_TIME, r, at(D17, 21, 0), "late") for r in (at(D17, 21, 5), at(D17, 21, 1)))
+    for order in ([orig, x, y], [y, x, orig], [x, orig, y]):
+        res = run(order)
+        d = only(res)
+        assert d.status == S.SELECTED and res.selected == base.selected
+        assert d.ignored_revisions == ("late",) and d.invalid_after_deadline == ("late",)
+
+
+def test_a_tied_conflict_in_a_revision_claimed_visible_by_d_refuses_in_both_orders():
+    orig = filing("TIE", ON_TIME, sha="orig")
+    x, y = (S.Filing("TIE", ("2.02",), ON_TIME, r, at(D17, 18, 0), "rev") for r in (at(D17, 17, 59), at(D17, 17, 58)))
+    assert run([orig, x, y]) == run([y, x, orig])
+    assert only(run([orig, x, y])).status == S.EXCLUDED_MALFORMED
+
+
+def test_two_different_contents_tied_at_the_earliest_visible_clock_decide_the_same_in_both_orders():
+    a = S.Filing("TIE", ("2.02",), ON_TIME, at(D17, 11, 31), VIS, "one")
+    b = S.Filing("TIE", ("2.02",), at(D17, 11, 29), at(D17, 11, 31), VIS, "two")
+    assert run([a, b]) == run([b, a])
+    assert only(run([a, b])).status == S.EXCLUDED_REVISED_INPUT
+
+
+def test_the_non_filing_members_come_back_in_a_fixed_order():
+    assert run([None, "x", 3]) == run([3, None, "x"]) == run(["x", 3, None])
+
+
+# A generator of messy inputs: ties, inconsistent clocks, revisions, duplicates, junk, several accessions.
+_TIMES = [None, at(D17, 10, 0), at(D17, 11, 0), at(D17, 11, 31), at(D17, 11, 32), at(D17, 19, 59), at(D17, 20, 0),
+          at(D17, 20, 1), at(D17, 21, 0), at(D17, 22, 0), datetime(2026, 11, 17, 11, 32)]
+_ACCEPT = [None, at(D17, 11, 30), at(D17, 11, 29), at(D17, 16, 30), datetime(2026, 11, 17, 11, 30)]
+
+
+def _messy(rng: random.Random) -> list:
+    out = []
+    for acc in rng.sample(["Q1", "Q2", "Q3"], rng.randint(1, 3)):
+        for _ in range(rng.randint(1, 4)):
+            out.append(S.Filing(acc, rng.choice([("2.02",), ("1.01",), ("7.01",), ("2.02", "9.01")]),
+                                rng.choice(_ACCEPT), rng.choice(_TIMES), rng.choice(_TIMES), rng.choice("abc")))
+    if rng.random() < 0.4:  # a consistent original and a consistent second version, both visible by D
+        for sha in rng.sample("abc", 2):
+            out.append(S.Filing("Q9", ("2.02",), at(D17, 11, 30), at(D17, 11, 31), at(D17, 11, 32), sha))
+    if rng.random() < 0.3:
+        out += [None, "junk"]
+    return out
+
+
+def test_selection_is_invariant_under_any_ordering_of_a_messy_input():
+    """Property test: 400 seeded messy inputs, each replayed under every permutation (up to 5 records) or 24
+    shuffles. The whole result (selected, diagnostic and every decision, in order) must be identical."""
+    rng = random.Random(20261125)
+    checked = 0
+    for _ in range(400):
+        items = _messy(rng)
+        base = run(items)
+        perms = (itertools.permutations(items) if len(items) <= 5
+                 else (rng.sample(items, len(items)) for _ in range(24)))
+        for perm in perms:
+            assert run(list(perm)) == base, (items, list(perm))
+            checked += 1
+    assert checked > 3000
+
+
+def test_the_property_test_actually_reaches_every_outcome():
+    """The generator is only useful if it exercises the refusals; pin that it does."""
+    rng = random.Random(20261125)
+    seen = set()
+    for _ in range(400):
+        for d in run(_messy(rng)).decisions:
+            seen.add(d.status)
+    assert {S.SELECTED, S.EXCLUDED_MALFORMED, S.EXCLUDED_LATE_INPUT, S.EXCLUDED_REVISED_INPUT,
+            S.EXCLUDED_UNKNOWN_AVAILABILITY, S.EXCLUDED_NO_FAMILY} <= seen
+    reasons = {d.reason for _ in range(1) for d in run(_messy(random.Random(1))).decisions}
+    assert reasons
+
+
+def test_a_consistent_later_tied_conflict_is_still_logged_as_invalid_and_never_rewrites_the_decision():
+    orig = filing("TIE", ON_TIME, sha="orig")
+    x, y = (S.Filing("TIE", ("2.02",), ON_TIME, r, at(D17, 21, 30), "late") for r in (at(D17, 21, 0), at(D17, 21, 10)))
+    res = run([x, orig, y])
+    d = only(res)
+    assert d.status == S.SELECTED and res.selected == run([orig]).selected
+    assert d.ignored_revisions == ("late",) and d.invalid_after_deadline == ("late",)
+
+
+def test_non_filing_members_with_different_accessions_come_back_in_a_fixed_order_in_every_permutation():
+    import types
+    junk = [types.SimpleNamespace(accession="J2"), types.SimpleNamespace(accession="J1"), None, 3]
+    base = run(junk)
+    assert all(run(list(p)) == base for p in itertools.permutations(junk))
+    assert [d.accession for d in base.decisions] == sorted([d.accession for d in base.decisions], key=repr)
