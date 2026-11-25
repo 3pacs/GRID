@@ -13,6 +13,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -642,7 +643,14 @@ def test_the_commands_import_once_witness_once_and_report_a_refusal(tmp_path, ca
 # --- retirement: a passed slot that later lapses (3pacs/GRID#1163) ------------------------------
 
 RETIREMENT_RULE = {"every_fires": 25, "window_fires": 100, "level": 0.95, "floor_usd": 0.04}   # as a slot registers it
-SLOT_PARAMS = json.dumps({"feature": "F1", "min_n": 100, "retirement": RETIREMENT_RULE}, sort_keys=True)
+SLOT_PARAMS = json.dumps({"feature": "F1", "version": "panel-factory/2", "retirement": RETIREMENT_RULE}, sort_keys=True)
+LEGACY_PARAMS = json.dumps({"feature": "F1", "version": "panel-factory/1"}, sort_keys=True)   # the earlier terms: no retirement rule
+
+
+def params_with(**change):
+    """A panel-factory/2 registration's parameter text with some of it changed (None removes a key)."""
+    params = {**json.loads(SLOT_PARAMS), **change}
+    return json.dumps({k: v for k, v in params.items() if v is not None}, sort_keys=True)
 
 
 def check_text(trial, at_fires=125, lower=0.051, floor=0.04, level=0.95, n=100,
@@ -718,8 +726,10 @@ def one_pass(tmp_path, lp=None, ap=None):
 S1, S2, S3, S4, S5 = "2027-03-01", "2027-04-12", "2027-05-10", "2027-05-11", "2027-05-12"
 PASSING, LAPSING = check_text(T1), check_text(T1, **LAPSE)
 BOTH = [(T1, PASSING), (T1, LAPSING)]
-ID_150 = {"at_fires": 150, "checked_at": LAPSE["checked_at"], "through_day": LAPSE["through"],
+AT_150 = {"at_fires": 150, "checked_at": LAPSE["checked_at"], "through_day": LAPSE["through"],
           "result_sha256": hashlib.sha256(LAPSING.encode()).hexdigest()}
+ID_150 = {**AT_150, "lapsed": True, "version": "panel-factory/2", "cohort_sha256": "5" * 64}     # how a reading names the check
+LAPSED_150 = {**AT_150, "n": 100, "lower_bound": 0.02, "floor_usd": 0.04, "bound_basis": "producer_reported"}
 
 
 def test_readings_follow_a_passed_slot_until_it_lapses_and_summarize_counts_it(tmp_path):
@@ -751,11 +761,11 @@ def test_readings_follow_a_passed_slot_until_it_lapses_and_summarize_counts_it(t
     assert live["lapsed"] == 1 and live["passed"] == 1      # passed is passed; lapsed says what became of it
     assert (live["retirement"]["as_of_session"], live["retirement"]["baseline_session"], live["retirement"]["readings"]) == (S3, S1, 3)
     assert live["verdicts"][0]["retirement"] == {
-        "status": "lapsed", **ID_150, "n": 100, "lower_bound": 0.02, "floor_usd": 0.04,
-        "checks": 2, "rule_basis": "registration", "first_read_session": S1}
+        "status": "lapsed", **LAPSED_150, "checks": 2, "rule_basis": "registration", "first_read_session": S1}
     kept = reloaded.of_kind(lse.FACTORY_RETIREMENT_READING)[-1]["slots"][0]     # every check is named, not only counted
-    assert [c["at_fires"] for c in kept["checks"]] == [125, 150] and kept["checks"][1] == {**ID_150, "lapsed": True}
-    assert kept["rule"] == {"basis": "registration", **RETIREMENT_RULE,
+    assert [c["at_fires"] for c in kept["checks"]] == [125, 150] and kept["checks"][1] == ID_150
+    assert kept["lapse"]["bound_basis"] == "producer_reported"                  # the bound is gex-signals' own number
+    assert kept["rule"] == {"basis": "registration", **RETIREMENT_RULE, "registration_version": "panel-factory/2",
                             "registration_content_sha256": hashlib.sha256(f"registration of {SLOT[T1]}".encode()).hexdigest()}
 
     again = reading(reloaded, tmp_path, retirement_body(T1, checks=BOTH), S4)
@@ -851,7 +861,7 @@ def test_a_second_passed_slot_is_read_beside_the_first(tmp_path):
     ([(T1, check_text(T1, mean_net=0.072)), (T1, LAPSING)], SLOT_PARAMS, "takes nothing back"),             # an earlier check's text changed
     ([(T1, LAPSING)], SLOT_PARAMS, "the registered checkpoints"),                                           # the first check is gone
     ([(T1, check_text(T1, level=0.9)), (T1, check_text(T1, level=0.9, **LAPSE))],
-     json.dumps({"retirement": {**RETIREMENT_RULE, "level": 0.9}}), "takes nothing back"),                  # another rule than the one recorded
+     params_with(retirement={**RETIREMENT_RULE, "level": 0.9}), "takes nothing back"),                      # another rule than the one recorded
 ])
 def test_a_later_receipt_cannot_take_a_check_or_a_lapse_back(tmp_path, checks, params, message):
     ledger, _ = three_verdicts(tmp_path)
@@ -880,10 +890,26 @@ def _swap(body, **change):
     (lambda: retirement_body(T1, checks=[(T1, check_text(T1, lower=0.02, floor=0.0))]), "not made on the registered rule"),   # "did not lapse" on a lower floor
     (lambda: retirement_body(T1, checks=[(T1, check_text(T1, level=0.9))]), "not made on the registered rule"),
     (lambda: retirement_body(T1, checks=[(T1, check_text(T1, n=50))]), "not made on the registered rule"),
-    (lambda: retirement_body(T1, checks=[(T1, PASSING)], params="{}"), "registration names no retirement rule"),
-    (lambda: retirement_body(T1, checks=[(T1, PASSING)], params="not json"), "registration names no retirement rule"),
-    (lambda: retirement_body(T1, params=json.dumps({"retirement": {**RETIREMENT_RULE, "every_fires": 0}})), "is not a rule"),
-    (lambda: retirement_body(T1, params=json.dumps({"retirement": {"floor_usd": 0.04}})), "is not a rule"),
+    # Codex on 75ce888b: a registration that cannot be read is unknown, never "no rule". With or without checks.
+    (lambda: retirement_body(T1, params="not json"), "are not JSON: its retirement rule is unknown, not absent"),
+    (lambda: retirement_body(T1, checks=[(T1, PASSING)], params="not json"), "are not JSON"),
+    (lambda: retirement_body(T1, params=None), "are not JSON"),
+    (lambda: retirement_body(T1, params="[1, 2]"), "are not a JSON object: its retirement rule is unknown, not absent"),
+    (lambda: retirement_body(T1, params="null"), "are not a JSON object"),
+    (lambda: retirement_body(T1, params='"panel-factory/1"'), "are not a JSON object"),
+    (lambda: retirement_body(T1, params="{}"), "registered under terms None is not one whose retirement this ledger can read"),
+    (lambda: retirement_body(T1, params=params_with(version="panel-factory/3")), "terms 'panel-factory/3' is not one whose retirement"),
+    (lambda: retirement_body(T1, params=params_with(version=None)), "terms None is not one whose retirement"),
+    (lambda: retirement_body(T1, params=params_with(retirement=None)), "is not a rule"),             # /2 terms require the rule
+    (lambda: retirement_body(T1, params=params_with(retirement="yes")), "is not a rule"),
+    (lambda: retirement_body(T1, params=params_with(retirement={**RETIREMENT_RULE, "every_fires": 0})), "is not a rule"),
+    (lambda: retirement_body(T1, params=params_with(retirement={"floor_usd": 0.04})), "is not a rule"),
+    (lambda: retirement_body(T1, params=params_with(version="panel-factory/1")), "carries no retirement rule, and this registration has one"),
+    (lambda: retirement_body(T1, checks=[(T1, PASSING)], params=LEGACY_PARAMS), "registered under panel-factory/1, which has no retirement rule"),
+    # the check's own terms and the fires it counted
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, version="panel-factory/1"))]), "not made under the slot's registered terms"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, cohort=None))]), "does not name the fires it counted"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, cohort={"sha256": "short"}))]), "does not name the fires it counted"),
     # the registered checkpoints, in order, none skipped
     (lambda: retirement_body(T1, checks=[(T1, check_text(T1, at_fires=150))]), "the registered checkpoints"),
     (lambda: retirement_body(T1, checks=[(T1, check_text(T1, at_fires=100))]), "the registered checkpoints"),
@@ -912,13 +938,16 @@ def test_a_receipt_that_contradicts_the_registration_the_clock_or_itself_is_refu
     assert ledger.of_kind(lse.FACTORY_RETIREMENT_READING) == [] and lse.summarize(ledger)["live"]["lapsed"] is None
 
 
-def test_a_slot_registered_without_a_retirement_rule_is_read_as_having_none(tmp_path):
+def test_a_slot_registered_under_the_known_earlier_terms_is_read_as_having_no_rule(tmp_path):
+    """The one absence that is known: panel-factory/1 terms, named in the registration, have no retirement rule."""
     ledger, _ = three_verdicts(tmp_path)
 
-    out = reading(ledger, tmp_path, retirement_body(T1, params="{}", checks_continuity="baseline"), S1)
+    out = reading(ledger, tmp_path, retirement_body(T1, params=LEGACY_PARAMS, checks_continuity="baseline"), S1)
 
     slot = ledger.of_kind(lse.FACTORY_RETIREMENT_READING)[0]["slots"][0]
-    assert out["appended"] and slot["rule"]["basis"] == "none_registered" and slot["checks"] == [] and slot["lapsed"] is False
+    assert out["appended"] and slot["checks"] == [] and slot["lapsed"] is False
+    assert slot["rule"] == {"basis": "none_registered", "registration_version": "panel-factory/1",
+                            "registration_content_sha256": slot["rule"]["registration_content_sha256"]}
     assert lse.summarize(ledger)["live"]["verdicts"][0]["retirement"]["rule_basis"] == "none_registered"
 
 
@@ -949,9 +978,16 @@ def test_what_a_reading_must_be(tmp_path):
     refused("carries the retirement rule of its registration", **with_slot(rule={**slot["rule"], "basis": "the check says so"}))
     refused("carries the retirement rule of its registration", **with_slot(rule={**slot["rule"], "registration_content_sha256": "x"}))
     refused("a registered retirement rule is", **with_slot(rule={**slot["rule"], "extra": 1}))
+    refused("a registered retirement rule is", **with_slot(rule={**slot["rule"], "registration_version": "panel-factory/1"}))
+    refused("a registered retirement rule is", **with_slot(rule={k: v for k, v in slot["rule"].items() if k != "registration_version"}))
     refused("is not a rule", **with_slot(rule={**slot["rule"], "every_fires": 0}))
-    refused("has no retirement checks", **with_slot(rule={"basis": "none_registered",
-                                                           "registration_content_sha256": slot["rule"]["registration_content_sha256"]}))
+    legacy = {"basis": "none_registered", "registration_content_sha256": slot["rule"]["registration_content_sha256"]}
+    refused("has no retirement checks", **with_slot(rule={**legacy, "registration_version": "panel-factory/1"}))
+    refused("only under the known earlier slot terms", **with_slot(rule={**legacy, "registration_version": "panel-factory/2"}, checks=[], lapsed=False, lapse=None))
+    refused("only under the known earlier slot terms", **with_slot(rule=legacy, checks=[], lapsed=False, lapse=None))   # no terms named: unknown
+    refused("was made under 'panel-factory/1'", **with_slot(checks=[{**first, "version": "panel-factory/1"}, last]))
+    refused("is named by", **with_slot(checks=[{**first, "cohort_sha256": "short"}, last]))
+    refused("carries its lapsing check", **with_slot(lapse={**slot["lapse"], "bound_basis": "verified"}))   # the bound is not recomputed here
     refused("names its checks", **with_slot(checks=2))
     refused("names its checks", **with_slot(lapsed=1))
     refused("names its checks", **with_slot(first_read=None))
@@ -1086,8 +1122,8 @@ def test_end_to_end_from_the_signals_database_to_a_reloaded_ledger(tmp_path):
     reloaded = lse.Ledger(lp, anchor=ap)
     live = lse.summarize(reloaded)["live"]
     assert (live["passed"], live["lapsed"]) == (1, 1) and live["retirement"]["readings"] == 3
-    assert live["verdicts"][0]["retirement"] == {"status": "lapsed", **ID_150, "n": 100, "lower_bound": 0.02, "floor_usd": 0.04,
-                                                 "checks": 2, "rule_basis": "registration", "first_read_session": S1}
+    assert live["verdicts"][0]["retirement"] == {"status": "lapsed", **LAPSED_150, "checks": 2, "rule_basis": "registration",
+                                                 "first_read_session": S1}
     slot = reloaded.of_kind(lse.FACTORY_RETIREMENT_READING)[-1]["slots"][0]
     assert slot["rule"]["basis"] == "registration" and {k: slot["rule"][k] for k in RETIREMENT_RULE} == RETIREMENT_RULE
     assert [c["result_sha256"] for c in slot["checks"]] == [hashlib.sha256(t.encode()).hexdigest() for t in (PASSING, LAPSING)]
@@ -1114,3 +1150,129 @@ def test_end_to_end_a_future_dated_row_and_a_database_without_the_table_write_no
     out = desk_y.night(ledger_y, S1)[1]()
     assert out["appended"] is False and "unknown, not no" in out["reason"]
     assert lse.summarize(ledger_y)["live"]["lapsed"] is None
+
+
+# --- end to end on the producer's own rows ----------------------------------------------------------
+# tests/fixtures/factory_retirement_producer_rows.json is a byte-for-byte copy of what gex-signals'
+# tests/factory_retirement_rows.py prints: one slot registered, looked at (PASS) and checked twice by the real
+# factory_slots code, the second check lapsing it. The same sha256 is pinned in gex (test_factory_retirement_rows.py),
+# so a change to what the producer writes fails there and here. Synthetic: made in the producer's test environment.
+
+PRODUCER_ROWS = Path(__file__).parent / "fixtures" / "factory_retirement_producer_rows.json"
+PRODUCER_ROWS_SHA256 = "544364fc2224d4fd92e7abf8d13fff1143d3017b65ca6548ddbff7070eb1b1e6"
+N1, N2, N3 = "2027-04-14", "2027-05-10", "2027-06-03"     # the nights after the look, the first check and the lapse
+
+
+def producer_rows():
+    raw = PRODUCER_ROWS.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == PRODUCER_ROWS_SHA256, "the fixture is not the producer's pinned output"
+    return json.loads(raw)
+
+
+def producer_db(path, rows, checks=0):
+    """The producer's registration and look in a signals database, with its first ``checks`` retirement checks."""
+    reg, look = rows["registration"], rows["look"]
+    conn = sqlite3.connect(path)
+    conn.execute(TRIALS_DDL)
+    conn.execute("INSERT INTO panel_trials (trial_id, family, registered_at, min_n, params, prev_hash, row_hash) VALUES (?,?,?,?,?,?,?)",
+                 (reg["trial_id"], reg["family"], reg["registered_at"], reg["min_n"], reg["params"], None, reg["row_hash"]))
+    for name in dsr.FACTORY_TABLES:
+        if name != "factory_looks":
+            conn.execute(f"CREATE TABLE {name} (trial_id TEXT, day TEXT)")
+    conn.execute("CREATE TABLE factory_looks (trial_id TEXT PRIMARY KEY, looked_at TEXT NOT NULL, through_day TEXT, result TEXT NOT NULL)")
+    conn.execute("INSERT INTO factory_looks VALUES (?,?,?,?)", (reg["trial_id"], look["looked_at"], look["through_day"], look["result"]))
+    conn.execute(CHECKS_DDL)
+    conn.commit()
+    conn.close()
+    for check in rows["checks"][:checks]:
+        producer_check(path, rows, check)
+    return path
+
+
+def producer_check(db, rows, check):
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO factory_retirement_checks VALUES (?,?,?,?,?,?)", (
+        rows["registration"]["trial_id"], check["at_fires"], check["checked_at"], check["through_day"], check["lapsed"], check["result"]))
+    conn.commit()
+    conn.close()
+
+
+def producer_ledger(tmp_path, rows):
+    """A factory ledger with one trial that is the producer's rule, and the producer's look imported as its verdict."""
+    lp, ap = paths(tmp_path)
+    ledger = lse.Ledger.create_factory(lp, ledger_id="factory-test", anchor=ap)
+    reg, look = rows["registration"], json.loads(rows["look"]["result"])
+    params = json.loads(reg["params"])
+    rule = {k: params[k] for k in ("feature", "op", "k", "side", "decision", "horizon")}
+    family, feature = lse.factory_rule_names(rule)
+    lse.record_factory_declared(ledger, run_id="r1", run_file={"run_id": "r1"}, data_manifest_sha256="0" * 64, trial_count=1,
+                                recorded_at="2026-11-20T01:00:00+00:00")
+    result = lse.record_factory_result(
+        ledger, trials=[{"trial_id": T1, "status": "tested", "selected": True, "family": family, "feature": feature, "class": "price"}],
+        max_t={"critical_t": 3.1}, report_sha256="1" * 64, frozen_sha256="2" * 64, recorded_at=RECORDED)["sha256"]
+    verdict = line(result, T1, look["verdict"], n=look["n"], lower=look["lower_bound"], mean=look["mean_net"],
+                   slot_trial_id=reg["trial_id"], row_hash=reg["row_hash"], registered_at=reg["registered_at"], rule=rule,
+                   resolved_fires=look["resolved_fires"], alpha_per_test=look["alpha_per_test"],
+                   looked_at=look["looked_at"], through_day=look["through_day"],
+                   look_sha256=hashlib.sha256(rows["look"]["result"].encode()).hexdigest())
+    assert lse.ingest_factory_verdicts(ledger, export(tmp_path, verdict, name="producer.jsonl")) == 1
+    return ledger, lp, ap
+
+
+def test_the_fixture_is_the_producers_pinned_output_and_what_this_reader_expects():
+    rows = producer_rows()
+    assert rows["schema"] == "factory-retirement-producer-rows/1" and rows["producer"]["state"] == "lapsed"
+    assert rows["producer"]["version"] in lse.SLOT_TERMS_WITH_RETIREMENT
+    assert lse._registered_retirement(rows["registration"]["params"]) == (rows["producer"]["version"], rows["producer"]["retirement"])
+    assert tuple(sorted(rows["producer"]["retirement"])) == tuple(sorted(lse.RETIREMENT_RULE_FIELDS))
+    assert [c["lapsed"] for c in rows["checks"]] == [0, 1]
+
+
+def test_end_to_end_on_rows_made_by_the_producer(tmp_path):
+    rows = producer_rows()
+    ledger, lp, ap = producer_ledger(tmp_path, rows)
+    db = producer_db(tmp_path / "signals.db", rows)
+    desk = Desk(tmp_path, db)
+    first_check, lapsing = rows["checks"]
+    rule = rows["producer"]["retirement"]
+
+    entry, read = desk.night(ledger, N1)                 # the night after the look: the table is there, no check yet
+    assert entry["status"] == "read"
+    anchors = desk.vault / dsr.WITNESS_DIR / dsr.ANCHOR_NAME
+    assert witness_from(ledger, desk.log.root, anchors, N1, at=(read_clock(N1) + timedelta(minutes=30)).isoformat()) == 1   # the look itself is witnessed
+    baseline = read()
+    assert (baseline["appended"], baseline["lapsed"], baseline["checks_continuity"]) == (True, 0, "baseline")
+
+    producer_check(db, rows, first_check)
+    assert desk.night(ledger, N2)[1]()["lapsed"] == 0
+    producer_check(db, rows, lapsing)
+    assert desk.night(ledger, N3)[1]()["lapsed"] == 1
+
+    reloaded = lse.Ledger(lp, anchor=ap)                 # every record re-verified by its rules from the file
+    live = lse.summarize(reloaded)["live"]
+    assert (live["passed"], live["lapsed"], live["witnessed"]) == (1, 1, 1)
+    assert (live["retirement"]["baseline_session"], live["retirement"]["as_of_session"]) == (N1, N3)
+    stored = json.loads(lapsing["result"])
+    assert live["verdicts"][0]["retirement"] == {
+        "status": "lapsed", "at_fires": lapsing["at_fires"], "checked_at": lapsing["checked_at"], "through_day": lapsing["through_day"],
+        "result_sha256": hashlib.sha256(lapsing["result"].encode()).hexdigest(), "n": rule["window_fires"],
+        "lower_bound": stored["lower_bound"], "floor_usd": rule["floor_usd"], "bound_basis": "producer_reported",
+        "checks": 2, "rule_basis": "registration", "first_read_session": N1}
+    slot = reloaded.of_kind(lse.FACTORY_RETIREMENT_READING)[-1]["slots"][0]
+    assert slot["rule"] == {"basis": "registration", **rule, "registration_version": rows["producer"]["version"],
+                            "registration_content_sha256": slot["rule"]["registration_content_sha256"]}
+    assert [(c["at_fires"], c["version"], c["cohort_sha256"]) for c in slot["checks"]] == [
+        (c["at_fires"], rows["producer"]["version"], json.loads(c["result"])["cohort"]["sha256"]) for c in rows["checks"]]
+
+
+def test_the_producers_own_rows_read_too_early_write_no_reading(tmp_path):
+    rows = producer_rows()
+    ledger, lp, ap = producer_ledger(tmp_path, rows)
+    desk = Desk(tmp_path, producer_db(tmp_path / "signals.db", rows, checks=2))    # both checks, on the night after the look
+
+    with pytest.raises(ValueError, match="after the receipt's source read finished"):
+        desk.night(ledger, N1)[1]()
+
+    assert lse.Ledger(lp, anchor=ap).of_kind(lse.FACTORY_RETIREMENT_READING) == []
+    assert lse.summarize(ledger)["live"]["lapsed"] is None
+    assert desk.night(ledger, N3)[1]()["lapsed"] == 1    # read once both checks could have been made: accepted

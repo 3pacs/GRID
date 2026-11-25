@@ -2555,8 +2555,12 @@ def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anch
     return len(pending)
 
 
-LAPSE_FIELDS = ("at_fires", "checked_at", "through_day", "result_sha256", "n", "lower_bound", "floor_usd")
-CHECK_ID_FIELDS = ("at_fires", "checked_at", "through_day", "lapsed", "result_sha256")
+LAPSE_FIELDS = ("at_fires", "checked_at", "through_day", "result_sha256", "n", "lower_bound", "floor_usd", "bound_basis")
+CHECK_ID_FIELDS = ("at_fires", "checked_at", "through_day", "lapsed", "result_sha256", "version", "cohort_sha256")
+BOUND_PRODUCER_REPORTED = "producer_reported"   # the bound is gex-signals' own number: read from its text, not recomputed here
+# The slot terms a registration can be under. One that is neither is unknown: never read as "no rule".
+SLOT_TERMS_WITHOUT_RETIREMENT = ("panel-factory/1",)   # the known earlier terms: no retirement rule, so no checks
+SLOT_TERMS_WITH_RETIREMENT = ("panel-factory/2",)
 RETIREMENT_RULE_FIELDS = ("every_fires", "window_fires", "level", "floor_usd")
 RULE_FROM_REGISTRATION = "registration"   # the rule in the slot's own registration text, as the receipt retains it
 RULE_NONE_REGISTERED = "none_registered"  # the registration names no retirement rule: such a slot has no checks
@@ -2572,23 +2576,40 @@ def _whole(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
 
 
-def _registered_retirement(params_text) -> dict | None:
-    """The retirement rule in a slot's registration, read from its exact parameter text; None when it names none.
-
-    The receipt binds that text to the registration row by a content digest and refuses a row whose contents later
-    change, so this is the rule the slot was registered with, not one a check reports about itself."""
-    try:
-        params = json.loads(params_text)
-    except (TypeError, ValueError):
-        return None
-    rule = params.get("retirement") if isinstance(params, dict) else None
-    if rule is None:
-        return None
+def _retirement_rule_problem(rule) -> str | None:
     if not isinstance(rule, dict) or not _whole(rule.get("every_fires")) or rule["every_fires"] < 1 \
             or not _whole(rule.get("window_fires")) or rule["window_fires"] < 1 \
             or not _number(rule.get("level")) or not _number(rule.get("floor_usd")):
-        raise ValueError("a slot's registered retirement rule is not a rule: " + ", ".join(RETIREMENT_RULE_FIELDS))
-    return {k: rule[k] for k in RETIREMENT_RULE_FIELDS}
+        return "a slot's registered retirement rule is not a rule: " + ", ".join(RETIREMENT_RULE_FIELDS)
+    return None
+
+
+def _registered_retirement(params_text) -> tuple[str, dict | None]:
+    """(the terms version, the retirement rule) of a slot's registration, read from its exact parameter text.
+
+    The receipt binds that text to the registration row by a content digest and refuses a row whose contents later
+    change, so this is the rule the slot was registered with, not one a check reports about itself. The rule is
+    None only for the known earlier terms, which have none. Anything that cannot be read as one or the other is
+    refused: text that is not JSON, JSON that is not an object, terms this ledger does not know, a rule under terms
+    that have none, or no rule under terms that require one. Unknown is never "no rule"."""
+    try:
+        params = json.loads(params_text)
+    except (TypeError, ValueError):
+        raise ValueError("a slot's registration parameters are not JSON: its retirement rule is unknown, not absent") from None
+    if not isinstance(params, dict):
+        raise ValueError("a slot's registration parameters are not a JSON object: its retirement rule is unknown, not absent")  # noqa: TRY004
+    version, rule = params.get("version"), params.get("retirement")
+    if version in SLOT_TERMS_WITHOUT_RETIREMENT:
+        if rule is not None:
+            raise ValueError(f"a slot registered under {version} carries no retirement rule, and this registration has one")
+        return version, None
+    if version not in SLOT_TERMS_WITH_RETIREMENT:
+        raise ValueError(f"a slot registered under terms {version!r} is not one whose retirement this ledger can read: "
+                         "unknown, not absent")
+    problem = _retirement_rule_problem(rule)
+    if problem:
+        raise ValueError(problem)
+    return version, {k: rule[k] for k in RETIREMENT_RULE_FIELDS}
 
 
 def _check_sequence(checks: list, rule: dict, verdict: dict, read_finished_at: str) -> None:
@@ -2606,8 +2627,12 @@ def _check_sequence(checks: list, rule: dict, verdict: dict, read_finished_at: s
     for i, check in enumerate(checks):
         if not isinstance(check, dict) or tuple(sorted(check)) != tuple(sorted(CHECK_ID_FIELDS)) or not _whole(check["at_fires"]) \
                 or not isinstance(check["lapsed"], bool) or not _hex64(check["result_sha256"]) \
-                or not isinstance(check["checked_at"], str) or not isinstance(check["through_day"], str):
+                or not isinstance(check["checked_at"], str) or not isinstance(check["through_day"], str) \
+                or not _hex64(check["cohort_sha256"]):
             raise ValueError(f"a retirement check is named by: {', '.join(CHECK_ID_FIELDS)}")
+        if check["version"] != rule["registration_version"]:
+            raise ValueError(f"the check at {check['at_fires']} fires was made under {check['version']!r}, and the slot is "
+                             f"registered under {rule['registration_version']!r}")
         expected = verdict["n"] + (i + 1) * rule["every_fires"]
         if check["at_fires"] != expected:
             raise ValueError(f"check {i + 1} is at {check['at_fires']} fires; the registered checkpoints after a look at "
@@ -2648,7 +2673,8 @@ def validate_factory_retirement_reading(record: dict, forward: dict[str, dict], 
     * every check is named (checkpoint, time, last day, lapse flag, digest of its stored text), sits at a registered
       checkpoint in order, and is dated no later than the receipt's source read finished (``_check_sequence``);
     * a lapsed slot's last check is the lapse, and its numbers are carried: a bound below the registered floor, on
-      the registered window. A slot that has not lapsed carries none;
+      the registered window. The bound is the producer's own number and is marked so (``bound_basis``); the floor
+      it is judged on is the registration's. A slot that has not lapsed carries none;
     * nothing is taken back: a slot an earlier reading covered is covered, with the same rule, and the checks that
       reading named are still the first checks named here, each unchanged.
     """
@@ -2681,10 +2707,17 @@ def validate_factory_retirement_reading(record: dict, forward: dict[str, dict], 
         if not isinstance(rule, dict) or rule.get("basis") not in (RULE_FROM_REGISTRATION, RULE_NONE_REGISTERED) \
                 or not _hex64(rule.get("registration_content_sha256")):
             raise ValueError("a reading's slot carries the retirement rule of its registration, or says it names none")
-        if rule["basis"] == RULE_FROM_REGISTRATION and (
-                tuple(sorted(rule)) != tuple(sorted((*RETIREMENT_RULE_FIELDS, "basis", "registration_content_sha256")))
-                or _registered_retirement(json.dumps({"retirement": {k: rule[k] for k in RETIREMENT_RULE_FIELDS}})) is None):
-            raise ValueError("a registered retirement rule is: " + ", ".join(RETIREMENT_RULE_FIELDS))
+        named = ("basis", "registration_content_sha256", "registration_version")
+        if rule["basis"] == RULE_FROM_REGISTRATION:
+            if tuple(sorted(rule)) != tuple(sorted((*RETIREMENT_RULE_FIELDS, *named))) \
+                    or rule["registration_version"] not in SLOT_TERMS_WITH_RETIREMENT:
+                raise ValueError("a registered retirement rule is: " + ", ".join(RETIREMENT_RULE_FIELDS)
+                                 + ", under slot terms that have one")
+            problem = _retirement_rule_problem(rule)
+            if problem:
+                raise ValueError(problem)
+        elif tuple(sorted(rule)) != tuple(sorted(named)) or rule["registration_version"] not in SLOT_TERMS_WITHOUT_RETIREMENT:
+            raise ValueError("a slot has no registered retirement rule only under the known earlier slot terms, which the record names")
         if not isinstance(checks, list) or not isinstance(lapsed, bool) or not isinstance(slot.get("first_read"), bool):
             raise ValueError("a reading's slot names its checks, says whether one lapsed it, and whether this is its first reading")  # noqa: TRY004
         _check_sequence(checks, rule, verdict, receipt["read_finished_at"])
@@ -2693,6 +2726,7 @@ def validate_factory_retirement_reading(record: dict, forward: dict[str, dict], 
         if lapsed:
             if not isinstance(lapse, dict) or tuple(sorted(lapse)) != tuple(sorted(LAPSE_FIELDS)) or not _whole(lapse["n"]) \
                     or not _number(lapse["lower_bound"]) or not _number(lapse["floor_usd"]) \
+                    or lapse["bound_basis"] != BOUND_PRODUCER_REPORTED \
                     or any(lapse[k] != checks[-1][k] for k in ("at_fires", "checked_at", "through_day", "result_sha256")):
                 raise ValueError(f"a lapsed slot carries its lapsing check, the last one it names: {', '.join(LAPSE_FIELDS)}")
             if not lapse["lower_bound"] < lapse["floor_usd"]:
@@ -2728,7 +2762,9 @@ def read_factory_retirement(ledger: Ledger, receipts: str | Path, external_ancho
     from its exact stored text, whose digest is recomputed. The text must be that slot's check at that checkpoint;
     the row's time and last day must be the text's own; its level, floor and window must be the ones in the slot's
     registration (read from the registration's own parameter text in the receipt); its lapse flag must be the one
-    its bound and that floor give; and its time must not be after the receipt's source read finished.
+    its bound and that floor give; it must be made under the registration's own terms version and name the fires it
+    counted; and its time must not be after the receipt's source read finished. A registration whose parameters
+    cannot be read, or whose terms this ledger does not know, is refused: unknown is never "no rule".
 
     Returns ``{"appended": bool, "reason": str | None, ...}``. Nothing is appended, and the reason says why, when:
     no verdict on the ledger passed; the receipt's session is not after the last reading's; the receipt did not
@@ -2776,14 +2812,15 @@ def read_factory_retirement(ledger: Ledger, receipts: str | Path, external_ancho
         if held is None or held.get("row_hash") != slot["row_hash"] or held.get("registered_at") != slot["registered_at"] \
                 or not _hex64(held.get("content_sha256")) or look is None or look.get("result_sha256") != v["look_sha256"]:
             continue   # the receipt does not retain this registration and this look: not covered, so unknown
-        registered = _registered_retirement(held.get("params"))
+        terms, registered = _registered_retirement(held.get("params"))   # refuses what it cannot read: unknown is not "no rule"
         rule = ({"basis": RULE_NONE_REGISTERED} if registered is None else {"basis": RULE_FROM_REGISTRATION, **registered})
-        rule["registration_content_sha256"] = held["content_sha256"]
+        rule.update(registration_content_sha256=held["content_sha256"], registration_version=terms)
         ids, lapse = [], None
         for check in sorted(by_slot.get(slot["trial_id"], []), key=lambda c: c.get("at_fires") if _whole(c.get("at_fires")) else 0):
             text, where = check.get("result"), f"slot {slot['trial_id']} at {check.get('at_fires')} fires"
             if registered is None:
-                raise ValueError(f"the receipt holds a retirement check for {where}, and that slot's registration names no retirement rule")
+                raise ValueError(f"the receipt holds a retirement check for {where}, and that slot is registered under "
+                                 f"{terms}, which has no retirement rule")
             if not isinstance(text, str) or sha256_bytes(text.encode("utf-8")) != check.get("result_sha256"):
                 raise ValueError(f"the receipt's retirement check for {where} is not the text its digest names")
             try:
@@ -2802,11 +2839,17 @@ def read_factory_retirement(ledger: Ledger, receipts: str | Path, external_ancho
             if stored.get("lapsed") is not (stored["lower_bound"] < registered["floor_usd"]) or check.get("lapsed") is not stored["lapsed"]:
                 raise ValueError(f"the receipt's retirement check for {where} has a lapse flag that is not what its own "
                                  "bound and the registered floor give")
+            cohort = stored.get("cohort")
+            if stored.get("version") != terms or not isinstance(cohort, dict) or not _hex64(cohort.get("sha256")):
+                raise ValueError(f"the receipt's retirement check for {where} was not made under the slot's registered terms "
+                                 f"({terms}), or does not name the fires it counted")
             ids.append({"at_fires": check["at_fires"], "checked_at": check["checked_at"], "through_day": check["through_day"],
-                        "lapsed": stored["lapsed"], "result_sha256": check["result_sha256"]})
+                        "lapsed": stored["lapsed"], "result_sha256": check["result_sha256"],
+                        "version": stored["version"], "cohort_sha256": cohort["sha256"]})
             if stored["lapsed"]:
                 lapse = {**{k: ids[-1][k] for k in ("at_fires", "checked_at", "through_day", "result_sha256")},
-                         "n": stored["n"], "lower_bound": stored["lower_bound"], "floor_usd": registered["floor_usd"]}
+                         "n": stored["n"], "lower_bound": stored["lower_bound"], "floor_usd": registered["floor_usd"],
+                         "bound_basis": BOUND_PRODUCER_REPORTED}
         _check_sequence(ids, rule, v, receipt["read_finished_at"])   # the checkpoints, the order and every clock against the read
         read.append({"forward_sha256": sha, "run_id": v["run_id"], "trial_id": v["trial_id"], "look_sha256": v["look_sha256"],
                      "slot_trial_id": slot["trial_id"], "rule": rule, "checks": ids,

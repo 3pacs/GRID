@@ -135,8 +135,20 @@ only where the chain stood.
   registration's parameter text in the receipt. The first receipt that reads the checks is a
   `baseline` (`factory_retirement_checks_continuity`): its checks were first seen then, and
   no earlier receipt attests they were only added to. A count is an observation from a
-  slot's first reading on, not an earlier zero. The check's numbers are the producer's; the
-  rule they are judged on is the registration's.
+  slot's first reading on, not an earlier zero. The check's numbers are the producer's (a
+  lapse's bound is marked `producer_reported`: it is not recomputed here); the rule they are
+  judged on is the registration's. Each check also carries the terms version it was made
+  under and the digest of the fires it counted.
+- **A registration that cannot be read is unknown, never "no rule".** Parameter text that
+  is not JSON, is not an object, or names slot terms this ledger does not know is refused and
+  writes no reading. The one absence that is known is a registration under
+  `panel-factory/1`, which has no retirement rule; the record names those terms.
+- **The producer's rows are pinned on both sides.** `tests/fixtures/factory_retirement_producer_rows.json`
+  is a byte-for-byte copy of what gex-signals' `tests/factory_retirement_rows.py` prints
+  (a slot registered, looked at and checked twice by the real slot code, in its test
+  environment). The same sha256 is pinned in both repositories, and
+  `tests/test_factory_live_verdicts.py` reads those rows through the real receipt source,
+  a verified receipt, the reading and a reload.
 - It is a nightly reading: a change made and undone between two closes is not seen.
 
 ## Rules
