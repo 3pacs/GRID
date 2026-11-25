@@ -45,7 +45,10 @@ eligible stored closes on the same days. When any pair differs by more than
 1% and more than 0.01 (a split-adjusted close next to a raw one, for example),
 the ticker is **withheld whole** and listed under ``basis_conflict`` in the
 receipt, so a series never gets two price bases side by side. Two-decimal
-rounding of a sub-dollar price is under that bar and does not count.
+rounding of a sub-dollar price is under that bar and does not count. A ticker
+that has stored closes but no day in common with the eligible ones cannot be
+compared: it is still filled and is listed under ``basis_unverified`` (unknown,
+not verified same-basis).
 
 Environment: ``DRY_RUN=1`` reads and reports but writes nothing (this is the
 coverage measurement); ``ONLY_BUCKET=DEAD`` and ``LIMIT=20`` narrow the
@@ -160,6 +163,12 @@ def basis_conflicts(existing: list[tuple[date, Any]], closes: list[tuple[date, f
     return out
 
 
+def basis_overlap(existing: list[tuple[date, Any]], closes: list[tuple[date, float, str]]) -> int:
+    """Days on which a stored close and an eligible stored close can be compared."""
+    ours = {d for d, _c, _s in closes}
+    return sum(1 for d, stored in existing if d in ours and stored is not None and float(stored) != 0)
+
+
 def _universe_work(conn: Any, only_bucket: str | None, limit: int) -> list[tuple[str, int]]:
     buckets = [only_bucket] if only_bucket else list(STALE_BUCKETS)
     rows = conn.execute(_UNIVERSE_WORK_SQL, {"buckets": buckets}).fetchall()
@@ -189,7 +198,7 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
         "mode": mode, "dry_run": dry_run, "evaluated_at": evaluated_at.isoformat(),
         "tickers": len(work), "eligible_tickers": 0, "eligible_closes": 0,
         "written": 0, "left_as_is": 0, "ambiguous_days_withheld": 0,
-        "no_completed_close": [], "unsupported": [], "basis_conflict": [], "failed": [], "by_source": {},
+        "no_completed_close": [], "unsupported": [], "basis_conflict": [], "basis_unverified": [], "failed": [], "by_source": {},
     }
     for i, (ticker, days) in enumerate(work, 1):
         start = today - timedelta(days=days)
@@ -215,6 +224,10 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
                 print(f"[{i}/{len(work)}] {ticker}: withheld, {len(clashes)} stored closes on another price basis "
                       f"({clashes[0]}..{clashes[-1]})")
                 continue
+            if existing and basis_overlap(existing, closes) == 0:
+                # Stored closes exist but none shares a day with an eligible
+                # one: the basis could not be compared. Filled, and named.
+                receipt["basis_unverified"].append(ticker)
             written = 0
             if not dry_run:
                 with engine.begin() as conn:
@@ -243,7 +256,7 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
           f"eligible_closes={receipt['eligible_closes']} written={receipt['written']} "
           f"left_as_is={receipt['left_as_is']} ambiguous_days_withheld={receipt['ambiguous_days_withheld']} "
           f"no_completed_close={len(receipt['no_completed_close'])} unsupported={len(receipt['unsupported'])} "
-          f"basis_conflict={len(receipt['basis_conflict'])} "
+          f"basis_conflict={len(receipt['basis_conflict'])} basis_unverified={len(receipt['basis_unverified'])} "
           f"failed={len(receipt['failed'])}")
     print("RECEIPT " + json.dumps(receipt, sort_keys=True))
     return receipt

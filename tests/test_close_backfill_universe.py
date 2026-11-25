@@ -361,3 +361,17 @@ def test_basis_conflicts_helper_ignores_days_without_a_pair_and_zero_prices():
     assert mod.basis_conflicts([(FRI, 99.0), (THU, 0)], closes) == []
     assert mod.basis_conflicts([(THU, 10.05)], closes) == []            # 0.5% apart: rounding
     assert mod.basis_conflicts([(THU, 20.0)], closes) == [THU]
+
+
+def test_stored_closes_with_no_common_day_are_filled_and_named_unverified():
+    engine = _Engine([("NOV", "DEAD")], [raw("NOV", FRI, 7.0)], existing=[("NOV", THU, 7.1)])
+    receipt = _run(engine)
+    assert receipt["basis_unverified"] == ["NOV"] and receipt["basis_conflict"] == []
+    assert [f["ticker"] for f in engine.fills] == ["NOV"]
+    assert mod.basis_overlap([(THU, 7.1)], [(FRI, 7.0, "yfinance")]) == 0
+    assert mod.basis_overlap([(FRI, 7.1)], [(FRI, 7.0, "yfinance")]) == 1
+
+
+def test_a_ticker_with_no_stored_closes_is_not_called_unverified():
+    receipt = _run(_Engine([("NEW", "DEAD")], [raw("NEW", FRI, 7.0)]))
+    assert receipt["basis_unverified"] == []
