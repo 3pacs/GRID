@@ -462,41 +462,41 @@ export default function PipelineHealth() {
             ) : (
                 <div style={s.summaryBar}>
                     <div style={s.summaryTile(colors.text)}>
-                        <div style={s.summaryNum}>{summary.total_sources || 0}</div>
+                        <div style={s.summaryNum}>{summary.total_sources ?? '-'}</div>
                         <div style={s.summaryLabel}>Total Sources</div>
                     </div>
                     <div style={s.summaryTile(colors.green)}>
-                        <div style={{ ...s.summaryNum, color: colors.green }}>{summary.healthy || 0}</div>
+                        <div style={{ ...s.summaryNum, color: colors.green }}>{summary.healthy ?? '-'}</div>
                         <div style={s.summaryLabel}>Healthy</div>
                     </div>
                     {detailed && (
                         <div style={s.summaryTile(colors.green)}>
-                            <div style={{ ...s.summaryNum, color: colors.green }}>{summary.quiet || 0}</div>
+                            <div style={{ ...s.summaryNum, color: colors.green }}>{summary.quiet ?? '-'}</div>
                             <div style={s.summaryLabel}>Quiet</div>
                         </div>
                     )}
                     <div style={s.summaryTile(colors.yellow)}>
-                        <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.stale || 0}</div>
+                        <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.stale ?? '-'}</div>
                         <div style={s.summaryLabel}>Stale</div>
                     </div>
                     {detailed && (
                         <div style={s.summaryTile(colors.yellow)}>
-                            <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.skipped_config || 0}</div>
+                            <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.skipped_config ?? '-'}</div>
                             <div style={s.summaryLabel}>Skipped (config)</div>
                         </div>
                     )}
                     <div style={s.summaryTile(colors.red)}>
-                        <div style={{ ...s.summaryNum, color: colors.red }}>{summary.broken || 0}</div>
+                        <div style={{ ...s.summaryNum, color: colors.red }}>{summary.broken ?? '-'}</div>
                         <div style={s.summaryLabel}>Broken</div>
                         {detailed && (
                             <div style={{ ...s.summaryLabel, textTransform: 'none' }}>
-                                {summary.failing || 0} failing · {summary.stopped || 0} stopped
+                                {summary.failing ?? '-'} failing · {summary.stopped ?? '-'} stopped
                             </div>
                         )}
                     </div>
                     {detailed && (
                         <div style={s.summaryTile(colors.textMuted)}>
-                            <div style={{ ...s.summaryNum, color: colors.textMuted }}>{summary.inactive || 0}</div>
+                            <div style={{ ...s.summaryNum, color: colors.textMuted }}>{summary.inactive ?? '-'}</div>
                             <div style={s.summaryLabel}>Inactive</div>
                         </div>
                     )}
@@ -555,7 +555,7 @@ export default function PipelineHealth() {
                             onClick={() => setStatusFilter(f)}
                         >
                             {f === 'all'
-                                ? `All (${summary.total_sources || 0})`
+                                ? `All (${summary.total_sources ?? '-'})`
                                 : `${capitalize(statusLabel(f))} (${filterCount(f)})`}
                         </button>
                     ))}

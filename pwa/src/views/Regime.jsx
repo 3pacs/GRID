@@ -41,6 +41,8 @@ const s = {
 function RegimeBar({ state, confidence, recommendation, isCurrent }) {
     const sc = stateColors[state] || '#5A7080';
     const meta = regimeMeta[state];
+    // null means the backend reported no confidence; that is not 0%.
+    const confidenceKnown = typeof confidence === 'number' && Number.isFinite(confidence);
     return (
         <div style={{
             ...shared.card, borderColor: isCurrent ? `${sc}88` : '#1A2840',
@@ -59,12 +61,12 @@ function RegimeBar({ state, confidence, recommendation, isCurrent }) {
                 </div>
                 <span style={{ fontSize: '18px', fontWeight: 700, color: sc,
                     fontFamily: "'JetBrains Mono', monospace" }}>
-                    {Math.round(confidence * 100)}%
+                    {confidenceKnown ? `${Math.round(confidence * 100)}%` : '--'}
                 </span>
             </div>
             <div style={{ marginTop: '6px', height: '4px', borderRadius: '2px',
                 background: '#1A2840', overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${confidence * 100}%`,
+                <div style={{ height: '100%', width: confidenceKnown ? `${confidence * 100}%` : '0%',
                     background: sc, borderRadius: '2px', transition: 'width 0.6s ease' }} />
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '6px' }}>
@@ -144,9 +146,12 @@ export default function Regime() {
             setCurrentRegime(current);
             // Fetch the strategy for the current regime
             const strat = await api.getStrategyForRegime(current.state).catch(() => null);
+            // A newer read may have started while the strategy was loading; its
+            // panels win, so this older read applies nothing further.
+            if (token.gen !== regimeGenRef.current) return { current, all, hist, trans, superseded: true };
             if (strat) setActiveStrategy(strat);
         }
-        if (all) setAllRegimes(all);
+        if (all && !all.error) setAllRegimes(all);
         setHistory(hist.history || []);
         setTransitions(trans.transitions || []);
         return { current, all, hist, trans };
@@ -382,7 +387,7 @@ export default function Regime() {
                             <RegimeBar
                                 key={state}
                                 state={state}
-                                confidence={active?.confidence || 0}
+                                confidence={active?.confidence ?? null}
                                 recommendation={active?.recommendation}
                                 isCurrent={regime.state === state}
                             />

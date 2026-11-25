@@ -880,15 +880,15 @@ function OperatorBrief({ brief, loading, onSelectCandidate }) {
                 <div className="surfacer-brief-metrics" style={styles.briefMetricGrid}>
                     <div className="surfacer-brief-metric" style={styles.briefMetric}>
                         <div style={styles.kpiLabel}>Ready</div>
-                        <div className="surfacer-brief-metric-value" style={styles.briefMetricValue}>{counts.play || 0}</div>
+                        <div className="surfacer-brief-metric-value" style={styles.briefMetricValue}>{counts.play ?? '-'}</div>
                     </div>
                     <div className="surfacer-brief-metric" style={styles.briefMetric}>
                         <div style={styles.kpiLabel}>Wait</div>
-                        <div className="surfacer-brief-metric-value" style={styles.briefMetricValue}>{counts.watch || 0}</div>
+                        <div className="surfacer-brief-metric-value" style={styles.briefMetricValue}>{counts.watch ?? '-'}</div>
                     </div>
                     <div className="surfacer-brief-metric" style={styles.briefMetric}>
                         <div style={styles.kpiLabel}>Research</div>
-                        <div className="surfacer-brief-metric-value" style={styles.briefMetricValue}>{counts.research || 0}</div>
+                        <div className="surfacer-brief-metric-value" style={styles.briefMetricValue}>{counts.research ?? '-'}</div>
                     </div>
                     <div className="surfacer-brief-metric" style={styles.briefMetric}>
                         <div style={styles.kpiLabel}>Score</div>
@@ -1085,8 +1085,8 @@ export default function Surfacer() {
 
             <div className="surfacer-kpis" style={styles.kpis}>
                 <Kpi label="Setups" value={meta.count ?? candidates.length} />
-                <Kpi label="Ready" value={meta.actionable_count ?? 0} />
-                <Kpi label="Avg Score" value={meta.average_conviction ?? 0} />
+                <Kpi label="Ready" value={meta.actionable_count ?? '-'} />
+                <Kpi label="Avg Score" value={meta.average_conviction ?? '-'} />
                 <Kpi label="Main Source" value={formatSource(topSource)} />
             </div>
 

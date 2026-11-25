@@ -119,6 +119,14 @@ export default function SpiderStats() {
     const fetchStats = async () => {
         try {
             const d = await api.getSpiderStats();
+            // api._fetch resolves failures to {error: true}, and the route answers
+            // status 'unavailable' with zeroed counts: neither is a stats read, so
+            // neither shows zeros or restarts the age clock.
+            if (!d || d.error || d.status === 'unavailable') {
+                setError((d && d.message) || 'Spider stats unavailable');
+                setLoading(false);
+                return;
+            }
             setStats(d);
             setLastUpdate(Date.now());
             setSecondsAgo(0);
