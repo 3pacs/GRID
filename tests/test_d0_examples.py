@@ -12,7 +12,7 @@ import pytest
 
 from analysis import d0_examples as X
 from analysis import d1_selection as S
-from tests.test_d1_selection_fixture import D17, ON_TIME, TAPE, filing, run
+from tests.test_d1_selection_fixture import BP, D17, ON_TIME, TAPE, at, filing, run
 
 # ---- synthetic records ------------------------------------------------------------------------
 
@@ -52,9 +52,8 @@ def reseal(rec):
 def d1_receipt(**kw):
     f = filing("0000000000-26-000001", ON_TIME, items=("2.02", "9.01"))
     res = run([f])
-    kw = kw or {"materialization": {"table": "event_materialization", "row_id": 17,
-                                    "row_sha256": "ab" * 32}}
-    return f, res, X.d1_traceable_receipt(f, res, TAPE, **kw)
+    kw = kw or {"materialization": {"table": "event_materialization", "row_id": 17, "row_sha256": "ab" * 32}}
+    return f, res, X.d1_traceable_receipt(f, TAPE, breakpoints=BP, **kw)
 
 
 # ---- D1 refusal (§5.6) ------------------------------------------------------------------------
@@ -93,50 +92,103 @@ def test_the_traceable_item_2_02_card_has_every_outcome_pending_and_verifies():
                              "entry_day": "2026-11-18"}
     card = rec["card"]
     assert card["already_moved"] == TAPE[D17].close / TAPE[date(2026, 11, 16)].close - 1.0 and card["claimed"] is False
+    assert (card["direction"], card["strength"], card["quintile"]) == (ev.direction, ev.strength, ev.quintile)
     assert set(card["outcome"].values()) == {"PENDING"} and card["entry_open"]["status"] == "PENDING"
     assert rec["note"] == "M0 does not prove accuracy" and rec["family"] == "D1-F1"
+    assert rec["not_verified"] == ["materialization_row", "unavailable_reason"]  # the narrowing is stated
+    assert sorted(rec["evidence"]["prices"]) == sorted(d.isoformat() for d in S.used_price_dates(ev))
+    assert len(rec["evidence"]["prices"]) == 62
 
 
 def test_the_traceable_receipt_binds_the_chain_shape_with_a_row_or_a_reason():
     _, _, with_reason = d1_receipt(unavailable_reason="no reasoning output yet (M0)")
     assert with_reason["chain"]["materialization_row"] is None and X.verify_receipt(with_reason) == []
     f = filing("0000000000-26-000002", ON_TIME)
-    res = run([f])
     for kw in ({}, {"materialization": {"a": 1}, "unavailable_reason": "x"}):
         with pytest.raises(X.ReceiptError):
-            X.d1_traceable_receipt(f, res, TAPE, **kw)
+            X.d1_traceable_receipt(f, TAPE, breakpoints=BP, **kw)
 
 
 def test_only_a_selected_item_2_02_filing_has_a_traceable_card():
     late = filing("L", ON_TIME, ret=ON_TIME.replace(hour=21), vis=ON_TIME.replace(hour=21))
     with pytest.raises(X.ReceiptError):
-        X.d1_traceable_receipt(late, run([late]), TAPE, unavailable_reason="x")
+        X.d1_traceable_receipt(late, TAPE, breakpoints=BP, unavailable_reason="x")
+    impossible = filing("L2", at(D17, 11, 0), ret=at(D17, 10, 0), vis=at(D17, 9, 0))  # Codex's chronology control
+    with pytest.raises(X.ReceiptError):
+        X.d1_traceable_receipt(impossible, TAPE, breakpoints=BP, unavailable_reason="x")
     f2 = filing("F2", ON_TIME, items=("1.01",))
     with pytest.raises(X.ReceiptError):
-        X.d1_traceable_receipt(f2, run([f2]), TAPE, unavailable_reason="x")
+        X.d1_traceable_receipt(f2, TAPE, breakpoints=BP, unavailable_reason="x")
 
 
-def test_a_traceable_receipt_fails_if_an_outcome_is_filled_a_clock_is_moved_or_a_move_is_claimed():
+def _edit(rec, *path, value):
+    m = copy.deepcopy(rec)
+    t = m
+    for k in path[:-1]:
+        t = t[k]
+    t[path[-1]] = value
+    return reseal(m)
+
+
+def test_every_derived_card_and_clock_field_is_rebound_to_the_evidence():
     _, _, rec = d1_receipt()
-    filled = copy.deepcopy(rec)
-    filled["card"]["outcome"]["h5"] = 0.031
-    assert any("PENDING" in e for e in X.verify_receipt(reseal(filled)))
-    opened = copy.deepcopy(rec)
-    opened["card"]["entry_open"]["status"] = "FILLED"
-    assert any("PENDING" in e for e in X.verify_receipt(reseal(opened)))
-    for key in ("day0", "p_prev_date", "entry_day", "deadline_d"):
-        moved = copy.deepcopy(rec)
-        moved["clocks"][key] = "2026-11-19" if key != "deadline_d" else "2026-11-17T21:00:00-05:00"
-        assert any(f"clocks.{key}" in e for e in X.verify_receipt(reseal(moved))), key
-    claimed = copy.deepcopy(rec)
-    claimed["card"]["claimed"] = True
-    assert any("never claimed" in e for e in X.verify_receipt(reseal(claimed)))
-    moved_a = copy.deepcopy(rec)
-    moved_a["chain"]["input"]["acceptance"] = ON_TIME.replace(hour=17).isoformat()  # after the close: day 0 moves
-    assert any("clocks.day0" in e for e in X.verify_receipt(reseal(moved_a)))
-    naive = copy.deepcopy(rec)
-    naive["chain"]["input"]["acceptance"] = "2026-11-17T11:30:00"
-    assert any("time zone" in e for e in X.verify_receipt(reseal(naive)))
+    for path, value in [(("card", "outcome", "h5"), 0.031), (("card", "entry_open", "status"), "FILLED"),
+                        (("card", "claimed"), True), (("card", "strength"), 9.9), (("card", "quintile"), 5),
+                        (("card", "direction"), -1), (("card", "already_moved"), 0.5),
+                        (("clocks", "day0"), "2026-11-19"), (("clocks", "p_prev_date"), "2026-11-13"),
+                        (("clocks", "entry_day"), "2026-11-20"), (("clocks", "cutoff_o"), "2026-11-17T10:00:00-05:00"),
+                        (("clocks", "deadline_d"), "2026-11-17T21:00:00-05:00"), (("family",), "D1-F2"),
+                        (("chain", "input", "filing_date"), "2026-11-18"), (("chain", "input", "accession"), "other"),
+                        (("chain", "retained_bytes_sha256"), "0" * 64)]:
+        assert X.verify_receipt(_edit(rec, *path, value=value)), path
+    assert X.verify_receipt({**rec, "unexpected": 1})
+
+
+def test_the_cutoff_o_is_the_actual_close_of_day_zero_including_an_early_close():
+    f = filing("0000000000-26-000003", at(date(2026, 11, 27), 9, 30))  # a 13:00 early-close session
+    rec = X.d1_traceable_receipt(f, TAPE, breakpoints=BP, unavailable_reason="x")
+    assert rec["clocks"]["cutoff_o"] == at(date(2026, 11, 27), 13, 0).isoformat() and X.verify_receipt(rec) == []
+    assert X.verify_receipt(_edit(rec, "clocks", "cutoff_o", value=at(date(2026, 11, 27), 16, 0).isoformat()))
+
+
+def test_the_receipt_inherits_the_chronology_rules_of_the_selection_it_embeds():
+    _, _, rec = d1_receipt()
+    prices = rec["evidence"]["prices"]
+    c0 = "2026-11-17"
+    for retrieved, visible in [("2026-11-17T10:00:00-05:00", "2026-11-17T11:00:00-05:00"),   # before the close
+                               ("2026-11-17T17:00:00-05:00", "2026-11-17T16:30:00-05:00"),   # visible before retrieved
+                               ("2026-11-17T20:00:01-05:00", "2026-11-17T20:00:01-05:00")]:  # after the deadline
+        bad = _edit(rec, "evidence", "prices", c0, value=[prices[c0][0], retrieved, visible])
+        errs = X.verify_receipt(bad)
+        assert errs and any("EXCLUDED_" in e for e in errs), (retrieved, visible, errs)
+    f = copy.deepcopy(rec["evidence"]["filing"])
+    f["retrieved_at"], f["visible_at"] = "2026-11-17T10:00:00-05:00", "2026-11-17T09:00:00-05:00"
+    assert any("EXCLUDED_MALFORMED" in e for e in X.verify_receipt(_edit(rec, "evidence", "filing", value=f)))
+
+
+def test_the_embedded_evidence_cannot_be_altered_without_failing_verification():
+    _, _, rec = d1_receipt()
+    ev = rec["evidence"]
+    for path, value in [(("filing", "acceptance"), at(D17, 17, 0).isoformat()), (("filing", "items"), ["7.01"]),
+                        (("filing", "items"), ["1.01"]), (("filing", "accession"), "other"),
+                        (("filing", "content_sha256"), "zz"), (("breakpoints",), [1, 2, 3, 4]), (("breakpoints",), None),
+                        (("prices", "2026-11-17", 0), TAPE[D17].close * 1.5),
+                        (("prices", "2026-11-16", 0), TAPE[date(2026, 11, 16)].close * 1.1)]:
+        assert X.verify_receipt(_edit(rec, "evidence", *path, value=value)), path
+    extra = copy.deepcopy(ev)
+    extra["prices"]["2026-11-18"] = [100.0, None, None]  # a close after day 0: not what the event used
+    assert any("exactly the closes" in e for e in X.verify_receipt(_edit(rec, "evidence", value=extra)))
+    short = copy.deepcopy(ev)
+    del short["prices"]["2026-09-01"]
+    assert X.verify_receipt(_edit(rec, "evidence", value=short))
+    naive = copy.deepcopy(ev)
+    naive["filing"]["acceptance"] = "2026-11-17T11:30:00"
+    assert X.verify_receipt(_edit(rec, "evidence", value=naive))
+
+
+def test_the_carried_not_verified_fields_are_named_and_cannot_be_dropped():
+    _, _, rec = d1_receipt()
+    assert X.verify_receipt(_edit(rec, "not_verified", value=[]))
 
 
 # ---- D2 traceable (§6.7) ----------------------------------------------------------------------
@@ -161,14 +213,74 @@ def test_a_missing_capture_file_says_not_stored_and_does_not_invent_an_id():
 
 
 def test_a_pre_registration_session_is_labelled_outside_the_judged_sample():
-    rec = X.fly_traceable_receipt(fly_row(day="2026-11-09"))
+    rec = X.fly_traceable_receipt(fly_row(day="2026-11-09", entry_t="2026-11-09T15:00:00-05:00",
+                                          detail=json.dumps(DETAIL).replace("2026-11-17", "2026-11-09")))
     assert rec["regime"].startswith("PRE_REGISTRATION") and X.verify_receipt(rec) == []
 
 
-def test_the_line_offset_is_the_seconds_between_the_target_and_the_minute_line():
-    late_detail = dict(DETAIL, x2_t="2026-11-17T15:57:00-05:00")
-    rec = X.fly_traceable_receipt(fly_row(entry_t="2026-11-17T14:59:00-05:00", detail=json.dumps(late_detail)))
-    assert rec["quotes"]["entry"]["line_offset_seconds"] == -60 and rec["quotes"]["exit"]["line_offset_seconds"] == 120
+def test_the_line_offset_is_the_seconds_between_the_target_and_the_minute_line_at_the_window_edges():
+    edge = dict(DETAIL, x2_t="2026-11-17T15:52:00-05:00")
+    rec = X.fly_traceable_receipt(fly_row(entry_t="2026-11-17T15:02:00-05:00", detail=json.dumps(edge)))
+    assert rec["quotes"]["entry"]["line_offset_seconds"] == 120 and rec["quotes"]["exit"]["line_offset_seconds"] == -180
+    assert X.verify_receipt(rec) == []
+
+
+@pytest.mark.parametrize("entry_t, x2_t", [("2026-11-17T14:59:00-05:00", "15:55"),    # entry before the target
+                                           ("2026-11-17T15:03:00-05:00", "15:55"),    # entry more than 2 minutes after
+                                           ("2026-11-17T15:00:00-05:00", "15:57"),    # exit after the target
+                                           ("2026-11-17T15:00:00-05:00", "15:51"),    # exit more than 3 minutes before
+                                           ("2026-11-17T15:00:00-05:00", "10:00"),    # Codex's control: exit at 10:00 ET
+                                           ("2026-11-17T15:00:00", "15:55"),          # no time zone
+                                           ("2026-11-18T15:00:00-05:00", "15:55")])   # another day
+def test_a_line_outside_its_permitted_target_window_or_day_makes_no_receipt(entry_t, x2_t):
+    x2 = x2_t if len(x2_t) > 5 else f"2026-11-17T{x2_t}:00-05:00"
+    with pytest.raises(X.ReceiptError):
+        X.fly_traceable_receipt(fly_row(entry_t=entry_t, detail=json.dumps(dict(DETAIL, x2_t=x2))))
+
+
+def test_the_exit_line_time_cannot_be_moved_and_resealed_codexs_control():
+    rec = X.fly_traceable_receipt(fly_row())
+    moved = _edit(rec, "quotes", "exit", "line_time", value="2026-11-17T10:00:00-05:00")
+    assert X.verify_receipt(moved)
+    both = copy.deepcopy(rec)
+    both["quotes"]["exit"]["line_time"] = "2026-11-17T10:00:00-05:00"
+    both["quotes"]["exit"]["line_offset_seconds"] = -20100
+    assert X.verify_receipt(reseal(both))
+    # moving it in the ledger row too, so the receipt agrees with its row, is refused by the window itself
+    row = copy.deepcopy(rec["ledger_row"])
+    row["detail"] = json.dumps(dict(DETAIL, x2_t="2026-11-17T10:00:00-05:00"))
+    forged = copy.deepcopy(rec)
+    forged["ledger_row"] = row
+    forged["quotes"]["exit"]["line_time"] = "2026-11-17T10:00:00-05:00"
+    assert any("allowed" in e for e in X.verify_receipt(reseal(forged)))
+
+
+def test_leg_identity_session_and_strike_are_bound_to_the_ledger_row():
+    with pytest.raises(X.ReceiptError):
+        X.fly_traceable_receipt(fly_row(k=6005.0))                       # legs say 6000, the row says 6005
+    d = copy.deepcopy(DETAIL)
+    d["legs"]["lc"] = "C6010"
+    with pytest.raises(X.ReceiptError):
+        X.fly_traceable_receipt(fly_row(detail=json.dumps(d)))
+    with pytest.raises(X.ReceiptError):
+        X.fly_traceable_receipt(fly_row(day="2026-11-16"))              # the lines are on 11-17
+    rec = X.fly_traceable_receipt(fly_row())
+    for path, value in [(("quotes", "entry", "leg_ids", "sc"), "C6005"), (("quotes", "exit", "leg_ids"), {}),
+                        (("session",), "2026-11-16"), (("quotes", "entry", "legs", "sp"), [1.1, 1.2]),
+                        (("quotes", "exit", "legs", "lc"), [0.0, 0.0]), (("quotes", "entry", "line_time"),
+                                                                       "2026-11-17T15:01:00-05:00"),
+                        (("quotes", "entry", "line_offset_seconds"), 0 + 60), (("credit",), 2.0), (("net",), 2.0),
+                        (("fills", "leg_sides"), 4), (("fills", "fee_per_leg_side"), 0.0),
+                        (("quotes", "leg_quote_time"), "15:00:00")]:
+        assert X.verify_receipt(_edit(rec, *path, value=value)), path
+    assert X.verify_receipt({**rec, "unexpected": 1})
+
+
+def test_the_capture_id_is_a_sha256_or_not_stored_and_nothing_else():
+    rec = X.fly_traceable_receipt(fly_row(), capture_bytes=b"x")
+    assert X.verify_receipt(_edit(rec, "capture", "id", value="not a hash"))
+    assert X.verify_receipt(_edit(rec, "capture", "id", value="A" * 64))
+    assert X.verify_receipt(_edit(rec, "capture", value={"id": "NOT_STORED"}))
 
 
 @pytest.mark.parametrize("over", [{"x2": NET + 0.01}, {"credit": CREDIT + 0.01}, {"status": "ungraded"},
@@ -191,16 +303,16 @@ def test_a_fly_receipt_fails_if_the_net_the_label_or_the_row_is_altered():
     rec = X.fly_traceable_receipt(fly_row())
     net = copy.deepcopy(rec)
     net["net"] = 2.0
-    assert any("do not follow from the quotes" in e for e in X.verify_receipt(reseal(net)))
+    assert any("net" in e for e in X.verify_receipt(reseal(net)))
     quote = copy.deepcopy(rec)
     quote["quotes"]["exit"]["legs"]["sc"] = [0.2, 0.9]
-    assert any("do not follow from the quotes" in e for e in X.verify_receipt(reseal(quote)))
+    assert any("quotes" in e for e in X.verify_receipt(reseal(quote)))
     label = copy.deepcopy(rec)
     label["fills"]["label"] = "FILLED"
-    assert any("MODELED_BBO" in e for e in X.verify_receipt(reseal(label)))
+    assert any("fills" in e for e in X.verify_receipt(reseal(label)))
     row = copy.deepcopy(rec)
     row["ledger_row"]["spot_in"] = 1.0
-    assert any("ledger_row_sha256" in e for e in X.verify_receipt(reseal(row)))
+    assert any("ledger_row_sha256" in e or "ledger_row" in e for e in X.verify_receipt(reseal(row)))
     regime = copy.deepcopy(rec)
     regime["regime"] = "PRE_REGISTRATION (outside the judged sample)"
     assert any("regime" in e for e in X.verify_receipt(reseal(regime)))
@@ -225,8 +337,9 @@ def test_only_a_skipped_or_ungraded_session_with_a_reason_makes_a_refusal_receip
 
 def test_a_fly_refusal_cannot_be_rewritten_into_a_grade_or_a_new_reason():
     rec = X.fly_refusal_receipt(skipped())
-    assert any("verbatim" in e for e in X.verify_receipt(reseal({**rec, "reason_as_stored": "stale_spot_clock"})))
-    assert any("graded value" in e for e in X.verify_receipt(reseal({**rec, "graded_value": 1.2})))
+    assert any("reason_as_stored" in e for e in X.verify_receipt(reseal({**rec, "reason_as_stored": "stale_spot_clock"})))
+    assert any("graded_value" in e for e in X.verify_receipt(reseal({**rec, "graded_value": 1.2})))
+    assert X.verify_receipt(reseal({**rec, "session": "2026-11-16"})) and X.verify_receipt(reseal({**rec, "extra": 1}))
     forged = copy.deepcopy(rec)
     forged["ledger_row"]["status"] = "traded"
     assert X.verify_receipt(reseal(forged))
@@ -299,7 +412,12 @@ def test_an_unsealed_edit_of_any_field_is_caught_by_the_hash():
 
 # ---- reproducible and offline -----------------------------------------------------------------
 
-GOLDEN = ["51ea9baacc917930432660c1ff7c2e8fdbb475065e5639dc6da0a58c3f27d822", "6d7c8c6f28fe2ac3cb96ad93edb528a7139986b0603eed87f7b52a6bab248441", "bc3b626a1b9546a8e02f07dc3cce9e7732f1c127a5bae1e8233fdbb1aa93cb54", "1880df35f3fcddd85c9eddfd43ba41e4c7f8794f757bd0a775b45ad171fa09a6"]
+GOLDEN = [
+    "51ea9baacc917930432660c1ff7c2e8fdbb475065e5639dc6da0a58c3f27d822",
+    "326bc7edc856dab9b4db21a0e31b05c77d106625f4abf15705ba1f9a937393a6",
+    "56b0e8fa211473c27d43cb9bef14c819f94467e1c6a9804a07f8c91ee098ca0f",
+    "1880df35f3fcddd85c9eddfd43ba41e4c7f8794f757bd0a775b45ad171fa09a6",
+]
 
 
 def test_receipts_are_deterministic_and_pinned():
