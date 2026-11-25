@@ -22,6 +22,20 @@ from ingestion import sec_velocity
 TODAY = date.today()
 
 
+@pytest.fixture(autouse=True)
+def _frozen_today(monkeypatch):
+    """The puller reads ``date.today()`` when a test runs; ``TODAY`` is read when
+    the file is collected. Across 00:00 (a run that starts before midnight and
+    finishes after it) the two named different days and the as_of assertions
+    failed (GRID main 0236ae93, PR 3f51e76a). Freeze the puller on TODAY."""
+    class _Date(date):
+        @classmethod
+        def today(cls):
+            return TODAY
+
+    monkeypatch.setattr(sec_velocity, "date", _Date)
+
+
 class FakeEngine:
     """Counts every execute on connect() (SIC read) and begin() (writes)."""
 

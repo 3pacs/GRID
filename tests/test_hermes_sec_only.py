@@ -4,7 +4,7 @@ Historical53 artifact-layout methods remain exact in offline provenance; this
 file needs only the declared product paths in a normal repository tree.
 """
 from pathlib import Path
-import ast,builtins,contextlib,copy,hashlib,io,json,runpy,sys,tokenize,types,unittest
+import ast,builtins,contextlib,copy,hashlib,io,json,os,runpy,sys,threading,tokenize,types,unittest
 from datetime import date,datetime,timezone
 from decimal import Decimal
 from unittest.mock import patch
@@ -254,13 +254,25 @@ class FinraEntryTests(unittest.TestCase):
         self.assertEqual(r['code'],'UNKNOWN_FAILURE');self.assertNotIn('SECRET',json.dumps(r))
 
     def test_operator_finra_early_dispatch_blocks_broad_startup(self):
-        original=builtins.__import__;effects=[]
+        # os.getenv, os.chdir and __import__ are patched for the whole process, but
+        # only the operator's own thread is under test. config.py starts a git-sink
+        # Timer in every test process whose _git() reads two env vars per call, so
+        # counting other threads' calls failed this test with ['getenv','getenv']
+        # at random (GRID#1399). Other threads get the real function.
+        original=builtins.__import__;real_getenv=os.getenv;real_chdir=os.chdir
+        effects=[];owner=threading.get_ident()
         def imp(name,*a,**k):
-            if name.split('.')[0] in ('loguru','sqlalchemy','config','ingestion','orchestration'):
+            if threading.get_ident()==owner and name.split('.')[0] in ('loguru','sqlalchemy','config','ingestion','orchestration'):
                 effects.append(name);raise RuntimeError('forbidden broad import')
             return original(name,*a,**k)
+        def getenv(*a,**k):
+            if threading.get_ident()!=owner:return real_getenv(*a,**k)
+            effects.append('getenv')
+        def chdir(*a,**k):
+            if threading.get_ident()!=owner:return real_chdir(*a,**k)
+            effects.append('chdir')
         for flags in (['--finra-unknown'],['--finra-only','--sec-only']):
-            with patch.object(sys,'argv',[str(OPER),*flags]),patch('os.chdir',side_effect=lambda *a:effects.append('chdir')),patch('os.getenv',side_effect=lambda *a:effects.append('getenv')),patch.object(builtins,'__import__',imp),contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(sys,'argv',[str(OPER),*flags]),patch('os.chdir',side_effect=chdir),patch('os.getenv',side_effect=getenv),patch.object(builtins,'__import__',imp),contextlib.redirect_stdout(io.StringIO()):
                 try:runpy.run_path(str(OPER),run_name='__main__')
                 except BaseException as exc:code=exc.code if type(exc) is SystemExit else None
                 else:code=None
