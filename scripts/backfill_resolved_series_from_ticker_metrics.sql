@@ -66,6 +66,19 @@
 -- scripts/close_backfill_universe.py (no rows on griddb yet). Those are
 -- copies of closes that other sources already store, so they map to no
 -- single source_catalog id. Add a label here only with its own catalog id.
+--
+-- Pinned raw-close panels are never bridged (Codex hold on #1459, 2026-11-25)
+-- ---------------------------------------------------------------------------
+-- normalization/entity_map.py RAW_CLOSE_FULL_FEATURES lists the `_full`
+-- panels that are not equity adjusted closes: `spy_full` is the receipted
+-- unadjusted SPY close that only Resolver._resolve_spy_close_receipt writes
+-- (price_close_contract.SPY_CLOSE_FEATURE); `sp500_full`, `gold_full` and the
+-- crypto panels are index, futures and coin closes. A TwelveData equity close
+-- joins them by ticker name alone (SPY -> spy_full; GOLD, Barrick's stock,
+-- -> gold_full, the gold future), so the bridge skips every one of them.
+-- tests/test_ticker_metrics_bridge_sql_pg.py pins this list to the frozenset.
+-- Rows already written there are not touched by this script (read-only
+-- counts 2026-11-25: spy_full 54, gold_full 67 TWELVEDATA rows).
 
 SET statement_timeout = 300000;
 
@@ -117,6 +130,9 @@ LEFT JOIN LATERAL (
 ) rs ON true
 WHERE tmd.close_price IS NOT NULL
   AND tmd.obs_date > COALESCE(rs.max_obs, '1900-01-01'::date)
+  -- RAW_CLOSE_FULL_FEATURES (see "Pinned raw-close panels" above)
+  AND fr.name NOT IN ('spy_full', 'sp500_full', 'gold_full',
+                      'btc_usd_full', 'eth_usd_full', 'sol_usd_full')
 ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING;
 
 -- 3) Report what landed.
