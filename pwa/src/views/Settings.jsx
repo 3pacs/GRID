@@ -548,12 +548,13 @@ export default function Settings({ onLogout, onShowTour }) {
         const snapshots = hermesStatus?.snapshots || [];
 
         const scheduleRows = [
-            { label: 'Health cycle', value: sched.cycle_interval || '5 min' },
-            { label: 'Full pipeline', value: sched.pipeline_interval || '6 hours' },
-            { label: 'Autoresearch', value: sched.autoresearch || 'weekdays 2 AM' },
-            { label: 'Daily briefing', value: sched.daily_briefing || 'weekdays 6 AM' },
-            { label: 'Weekly briefing', value: sched.weekly_briefing || 'Monday 7 AM' },
-            { label: 'Freshness threshold', value: sched.data_freshness_threshold || '26 hours' },
+            // A value the server did not send is "not reported", never a made-up default.
+            { label: 'Health cycle', value: sched.cycle_interval || 'not reported' },
+            { label: 'Full pipeline', value: sched.pipeline_interval || 'not reported' },
+            { label: 'Autoresearch', value: sched.autoresearch || 'not reported' },
+            { label: 'Daily briefing', value: sched.daily_briefing || 'not reported' },
+            { label: 'Weekly briefing', value: sched.weekly_briefing || 'not reported' },
+            { label: 'Freshness threshold', value: sched.data_freshness_threshold || 'not reported' },
         ];
 
         return (

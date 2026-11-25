@@ -426,7 +426,11 @@ export default function Briefings() {
         setAsking(false);
     };
 
-    const available = ollamaStatus?.available;
+    // Only an explicit `available: false` means down. A failed status call
+    // resolves to {error: true}, and before the reply the status is null: both unknown.
+    const available = ollamaStatus?.available === true;
+    const ollamaState = ollamaStatus?.available === true ? 'ONLINE'
+        : ollamaStatus?.available === false ? 'OFFLINE' : 'UNKNOWN';
     const ts = formatTimestamp(briefing?.timestamp);
     const isLong = typeof briefing?.content === 'string' && briefing.content.length > BRIEFING_PAGE_CHARS;
     const sections = useMemo(
@@ -448,8 +452,10 @@ export default function Briefings() {
                         <span style={shared.label}>Ollama</span>
                         <span style={shared.value}>{ollamaStatus?.model || 'unknown'}</span>
                     </div>
-                    <span style={shared.badge(available ? '#1A7A4A' : '#8B1F1F')}>
-                        {available ? 'ONLINE' : 'OFFLINE'}
+                    <span data-testid="ollama-state"
+                        title={ollamaState === 'UNKNOWN' ? 'Status not reported: the status check has not answered or failed.' : undefined}
+                        style={shared.badge(ollamaState === 'ONLINE' ? '#1A7A4A' : ollamaState === 'OFFLINE' ? '#8B1F1F' : '#5A7080')}>
+                        {ollamaState}
                     </span>
                 </div>
             </div>

@@ -1551,7 +1551,8 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 actor: t.name || t.insider || 'Insider',
                 action: `${t.type || 'trade'}${t.value != null ? ' ' + fmtUSD(t.value) : ''}`,
                 date: t.date || t.filing_date || t.transaction_date,
-                confidence: t.confidence || 'confirmed',
+                // A row that states no tier is unknown, not the top tier.
+                confidence: t.confidence || 'unknown',
             });
         }
         for (const t of congress || []) {
@@ -1561,7 +1562,7 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 actor: t.representative || t.name || 'Member',
                 action: `${t.type || ''} ${t.amount || ''}`.trim(),
                 date: t.date || t.transaction_date || t.disclosure_date,
-                confidence: t.confidence || 'confirmed',
+                confidence: t.confidence || 'unknown',
             });
         }
         for (const c of convergence || []) {

@@ -87,14 +87,16 @@ function buildChangeFeed(intel) {
     }
     for (const f of (intel?.cross_ref?.red_flags || [])) {
         items.push({
-            type: 'red_flag', timestamp: f.checked_at || f.timestamp || intel.generated_at,
+            // No time on the event is "time not reported": the brief's generated_at is when the
+            // report was built, not when the event happened.
+            type: 'red_flag', timestamp: f.checked_at || f.timestamp || null,
             text: `${f.category || 'Unknown'}: ${f.description || f.indicator || 'divergence detected'}`,
             nav: 'cross-reference',
         });
     }
     for (const c of (intel?.trust?.convergence_events || [])) {
         items.push({
-            type: 'convergence', timestamp: c.detected_at || c.timestamp || intel.generated_at,
+            type: 'convergence', timestamp: c.detected_at || c.timestamp || null,
             text: `Convergence: ${c.description || c.feature || 'multiple sources agree'}`,
             nav: null,
         });
@@ -329,6 +331,8 @@ export default function Dashboard({ onNavigate }) {
     const [thesis, setThesis] = useState(null);
     const [thesisLoading, setThesisLoading] = useState(false);
     const [changeFeed, setChangeFeed] = useState([]);
+    // api._fetch resolves a failure to {error: true}; that is not an empty feed.
+    const [changeFeedFailed, setChangeFeedFailed] = useState(false);
     const [pulsePrices, setPulsePrices] = useState({});
     const [watchlistItems, setWatchlistItems] = useState([]);
     const [intelData, setIntelData] = useState(null);
@@ -391,7 +395,12 @@ export default function Dashboard({ onNavigate }) {
 
             // Background: thesis + intel + cached watchlist state (heavier, don't block UI)
             api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
-            api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); setIntelData(d); }).catch(() => {});
+            api.getIntelDashboard().then(d => {
+                if (!d || d.error) { setChangeFeedFailed(true); return; }
+                setChangeFeedFailed(false);
+                setChangeFeed(buildChangeFeed(d));
+                setIntelData(d);
+            }).catch(() => { setChangeFeedFailed(true); });
             api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
             api.getWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
@@ -683,7 +692,9 @@ export default function Dashboard({ onNavigate }) {
                     letterSpacing: '1.5px', color: colors.textMuted, marginBottom: '12px' }}>WHAT CHANGED</div>
                 {changeFeed.length === 0
                     ? <div style={{ fontFamily: SANS, fontSize: '13px', color: colors.textDim, padding: '12px 0' }}>
-                        No significant changes in the last 6 hours.</div>
+                        {changeFeedFailed
+                            ? 'Change feed unavailable: the request failed, so this is not an empty feed.'
+                            : 'No significant changes in the last 6 hours.'}</div>
                     : <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
                         {changeFeed.map((item, i) => (
                             <div key={i} onClick={() => item.nav && onNavigate(item.nav)}
@@ -698,7 +709,7 @@ export default function Dashboard({ onNavigate }) {
                                     flex: 1, overflow: 'hidden', textOverflow: 'ellipsis',
                                     display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{item.text}</span>
                                 <span style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim,
-                                    flexShrink: 0, whiteSpace: 'nowrap' }}>{timeAgo(item.timestamp)}</span>
+                                    flexShrink: 0, whiteSpace: 'nowrap' }}>{item.timestamp ? timeAgo(item.timestamp) : 'time not reported'}</span>
                             </div>
                         ))}
                     </div>
@@ -715,13 +726,13 @@ export default function Dashboard({ onNavigate }) {
                 <span style={{ fontFamily: MONO, fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
                     color: colors.textDim, marginRight: isMobile ? 0 : '12px',
                     width: isMobile ? '100%' : 'auto', marginBottom: isMobile ? '4px' : 0 }}
-                    title="Live quotes via yfinance, 5-minute cache, refreshed on request">PULSE</span>
+                    title="Watchlist quotes with a 5-minute cache, refreshed on request. Each quote's own source and age are on hover; not a live feed.">PULSE</span>
                 {pulse.map((p, i) => (
                     <React.Fragment key={p.key}>
                         <span onClick={() => onNavigate('watchlist-analysis', p.key)}
                             title={p.updatedAt
-                                ? `${p.source || 'yfinance'} · ${formatRelative(new Date(p.updatedAt))}`
-                                : (p.source || 'yfinance')}
+                                ? `${p.source || 'source not reported'} · ${formatRelative(new Date(p.updatedAt))}`
+                                : `${p.source || 'source not reported'} · time not reported`}
                             style={{ display: 'inline-flex', alignItems: 'baseline', gap: '5px',
                                 cursor: 'pointer', padding: '2px 6px', borderRadius: '3px', transition: 'background 0.15s' }}
                             onMouseEnter={e => { e.currentTarget.style.background = `${colors.accent}10`; }}
