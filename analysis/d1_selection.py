@@ -26,8 +26,9 @@ excluded; whether it should be is a contract decision, not made here.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Mapping, Protocol
 from zoneinfo import ZoneInfo
 
@@ -35,7 +36,9 @@ from analysis import d1_ranking as R
 from ingestion import market_calendar as MC
 
 SELECTION_VERSION = "d1-selection-v1"
-ET = ZoneInfo("America/New_York")
+ET = ZoneInfo("America/New_York")  # the display zone for sessions, cutoffs and deadlines; never used to order or compare
+UTC = timezone.utc
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 ACCEPTANCE_MARGIN = timedelta(minutes=5)
 DEADLINE_ET = time(20, 0)
 VOL_CLOSES = R.VOL_RETURNS + 1
@@ -137,12 +140,27 @@ def _aware(x: Any) -> bool:
     return isinstance(x, datetime) and x.tzinfo is not None and x.utcoffset() is not None
 
 
+def _utc(x: Any) -> Any:
+    """An aware time as a UTC instant; anything else unchanged. Every ordering, equality and subtraction below is
+    done on UTC instants: two datetimes that share one ZoneInfo are compared by wall clock, which is wrong across the
+    repeated hour at the end of daylight saving time (05:50Z is 01:50 EDT, 06:10Z is 01:10 EST)."""
+    return x.astimezone(UTC) if _aware(x) else x
+
+
+def _norm_filing(f: Any) -> Any:
+    if not isinstance(f, Filing):
+        return f
+    return dataclasses.replace(f, acceptance=_utc(f.acceptance), retrieved_at=_utc(f.retrieved_at),
+                               visible_at=_utc(f.visible_at))
+
+
 def _close_dt(cal: Calendar, day: date) -> datetime:
     return datetime.combine(day, cal.close_time(day), tzinfo=ET)
 
 
 def day0_for(acceptance: datetime, cal: Calendar) -> date:
     """First regular session whose actual close is strictly after A + 5 minutes."""
+    acceptance = _utc(acceptance)
     horizon = acceptance + ACCEPTANCE_MARGIN
     day = acceptance.astimezone(ET).date()
     for _ in range(15):  # a longer closure would be a calendar defect, not a market
@@ -154,6 +172,7 @@ def day0_for(acceptance: datetime, cal: Calendar) -> date:
 
 def prev_close_date(acceptance: datetime, cal: Calendar) -> date:
     """The session of the last regular close strictly before A."""
+    acceptance = _utc(acceptance)
     day = acceptance.astimezone(ET).date()
     for _ in range(15):
         if cal.is_open(day) and _close_dt(cal, day) < acceptance:
@@ -193,6 +212,8 @@ def _price_clock_problem(p: Price, close_at: datetime, deadline: datetime) -> tu
     for name, t in (("retrieved_at", p.retrieved_at), ("visible_at", p.visible_at)):
         if not _aware(t):
             return EXCLUDED_UNKNOWN_AVAILABILITY, f"a price's {name} is unknown or has no time zone"
+    p = Price(p.close, _utc(p.retrieved_at), _utc(p.visible_at))
+    close_at, deadline = _utc(close_at), _utc(deadline)
     if p.visible_at > deadline:
         return EXCLUDED_LATE_INPUT, (f"a price's visible_at {p.visible_at.isoformat()} is after the deadline "
                                      f"{deadline.isoformat()}")
@@ -219,14 +240,15 @@ def used_price_dates(event: SelectedEvent, calendar: Calendar | None = None) -> 
 
 
 def _t(x: Any) -> str:
-    return x.isoformat() if isinstance(x, datetime) else repr(x)
+    """A stable text for a time: aware times are UTC instants, so equal instants give equal text."""
+    return _utc(x).isoformat() if isinstance(x, datetime) else repr(x)
 
 
 def _obs_key(f: Filing) -> tuple:
-    """A total order on observations, so no choice below depends on the order they were handed in."""
-    return (not _aware(f.visible_at), _t(f.visible_at) if not _aware(f.visible_at) else "",
-            f.visible_at.astimezone(ET).isoformat() if _aware(f.visible_at) else "",
-            _t(f.acceptance), _t(f.retrieved_at), repr(f.items), f.content_sha256)
+    """A total order on observations (all aware times already UTC instants), so no choice below depends on the
+    order they were handed in."""
+    vis = (0, f.visible_at - EPOCH, "") if _aware(f.visible_at) else (1, timedelta(0), _t(f.visible_at))
+    return (*vis, _t(f.acceptance), _t(f.retrieved_at), repr(f.items), f.content_sha256)
 
 
 def _meta(f: Filing) -> tuple:
@@ -235,6 +257,7 @@ def _meta(f: Filing) -> tuple:
 
 def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal: Calendar, period: str,
          breakpoints: R.Breakpoints | None) -> tuple[Decision, SelectedEvent | None]:
+    versions = [_norm_filing(v) for v in versions]
     groups: dict[str, list[Filing]] = {}
     for v in versions:
         groups.setdefault(v.content_sha256, []).append(v)

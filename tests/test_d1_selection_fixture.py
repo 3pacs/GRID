@@ -649,6 +649,8 @@ def test_the_as_of_decision_is_the_same_whenever_it_is_replayed():
 
 import itertools  # noqa: E402
 import random  # noqa: E402
+from datetime import timezone  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
 
 VIS = at(D17, 11, 32)  # the original's visible clock (acceptance 11:30, retrieved 11:31)
 
@@ -718,8 +720,11 @@ def test_the_non_filing_members_come_back_in_a_fixed_order():
 
 # A generator of messy inputs: ties, inconsistent clocks, revisions, duplicates, junk, several accessions.
 _TIMES = [None, at(D17, 10, 0), at(D17, 11, 0), at(D17, 11, 31), at(D17, 11, 32), at(D17, 19, 59), at(D17, 20, 0),
-          at(D17, 20, 1), at(D17, 21, 0), at(D17, 22, 0), datetime(2026, 11, 17, 11, 32)]
-_ACCEPT = [None, at(D17, 11, 30), at(D17, 11, 29), at(D17, 16, 30), datetime(2026, 11, 17, 11, 30)]
+          at(D17, 20, 1), at(D17, 21, 0), at(D17, 22, 0), datetime(2026, 11, 17, 11, 32),
+          datetime(2026, 11, 1, 1, 50, tzinfo=ET), datetime(2026, 11, 1, 1, 10, tzinfo=ET, fold=1),
+          at(D17, 11, 32).astimezone(timezone(timedelta(hours=9)))]
+_ACCEPT = [None, at(D17, 11, 30), at(D17, 11, 29), at(D17, 16, 30), datetime(2026, 11, 17, 11, 30),
+           datetime(2026, 11, 1, 0, 30, tzinfo=ET), datetime(2026, 11, 1, 1, 50, tzinfo=ET)]
 
 
 def _messy(rng: random.Random) -> list:
@@ -780,3 +785,121 @@ def test_non_filing_members_with_different_accessions_come_back_in_a_fixed_order
     base = run(junk)
     assert all(run(list(p)) == base for p in itertools.permutations(junk))
     assert [d.accession for d in base.decisions] == sorted([d.accession for d in base.decisions], key=repr)
+
+
+# ---- clocks are UTC instants: the repeated hour of the autumn clock change (Codex 6061842262) ----
+
+from datetime import timezone  # noqa: E402
+
+UTC = timezone.utc
+SUN = date(2026, 11, 1)  # US daylight saving time ends 02:00 EDT -> 01:00 EST; 01:00-02:00 ET happens twice
+EDT_0150 = datetime(2026, 11, 1, 1, 50, tzinfo=ET)            # fold=0: 05:50Z
+EST_0110 = datetime(2026, 11, 1, 1, 10, tzinfo=ET, fold=1)    # fold=1: 06:10Z, twenty minutes later
+ACC_SUN = datetime(2026, 11, 1, 0, 30, tzinfo=ET)             # 04:30Z, before the repeated hour
+
+
+def test_the_control_clocks_are_what_the_review_says():
+    assert EDT_0150.astimezone(UTC) == datetime(2026, 11, 1, 5, 50, tzinfo=UTC)
+    assert EST_0110.astimezone(UTC) == datetime(2026, 11, 1, 6, 10, tzinfo=UTC)
+    assert EST_0110 < EDT_0150  # Python's own comparison of two datetimes sharing one ZoneInfo: by wall clock, wrong
+
+
+def _obs(ret, vis, sha="fold", acc=ACC_SUN):
+    return S.Filing("FOLD", ("2.02",), acc, ret, vis, sha)
+
+
+def test_the_earlier_utc_instant_is_the_first_observation_across_the_fold_in_both_orders():
+    first = _obs(EDT_0150, EDT_0150)     # 05:50Z
+    later = _obs(EST_0110, EST_0110)     # 06:10Z, but its wall clock reads earlier
+    one, two = run([first, later]), run([later, first])
+    assert one == two
+    d = only(one)
+    # compared as UTC instants: a fold-ambiguous wall time never compares equal across different zone objects (PEP 495)
+    assert d.status == S.SELECTED and d.retrieved_at.astimezone(UTC) == datetime(2026, 11, 1, 5, 50, tzinfo=UTC)
+    assert d.visible_at.astimezone(UTC) == datetime(2026, 11, 1, 5, 50, tzinfo=UTC)
+    assert d.duplicates_dropped == 1
+
+
+def test_a_retrieval_twenty_minutes_after_the_acceptance_across_the_fold_is_chronological():
+    """Accepted 01:50 EDT (05:50Z), retrieved 01:10 EST (06:10Z): later, though the wall clock reads earlier."""
+    res = run([_obs(EST_0110, EST_0110, acc=EDT_0150)])
+    assert only(res).status == S.SELECTED
+
+
+def test_a_visibility_twenty_minutes_after_retrieval_across_the_fold_is_chronological():
+    res = run([_obs(EDT_0150, EST_0110)])
+    assert only(res).status == S.SELECTED
+    bad = run([_obs(EST_0110, EDT_0150)])  # visible 20 minutes BEFORE it was retrieved
+    assert only(bad).status == S.EXCLUDED_MALFORMED
+
+
+def test_a_close_retrieved_across_the_fold_is_ordered_by_instant():
+    tape = dict(TAPE)
+    day0 = date(2026, 11, 2)  # the Monday after: day 0 of a Sunday-morning filing
+    assert S.day0_for(ACC_SUN, CAL) == day0
+    tape[day0] = S.Price(TAPE[D17].close, at(day0, 16, 1), at(day0, 16, 1))
+    assert only(run([_obs(EDT_0150, EDT_0150)], tape)).status in (S.SELECTED, S.EXCLUDED_INPUT)
+
+
+def test_offset_equivalent_copies_are_truly_identical_not_a_conflict():
+    a = _obs(EDT_0150, EDT_0150)
+    zones = [UTC, ZoneInfo("America/New_York"), ZoneInfo("Asia/Tokyo"), timezone(timedelta(hours=-5))]
+    copies = [S.Filing("FOLD", ("2.02",), x.acceptance.astimezone(z), x.retrieved_at.astimezone(z),
+                       x.visible_at.astimezone(z), "fold") for x, z in zip([a] * 4, zones)]
+    res = run(copies)
+    d = only(res)
+    assert d.status == S.SELECTED and d.duplicates_dropped == 3
+    for perm in itertools.permutations(copies):
+        assert run(list(perm)) == res
+
+
+def test_a_real_disagreement_between_offset_equivalent_looking_copies_is_still_a_conflict():
+    a = _obs(EDT_0150, EDT_0150)
+    b = _obs(EDT_0150 + timedelta(minutes=1), EDT_0150)  # same visible instant, retrieval one minute apart
+    b = dataclasses.replace(b, retrieved_at=(EDT_0150 - timedelta(minutes=1)).astimezone(UTC))
+    assert run([a, b]) == run([b, a])
+    assert only(run([a, b])).status == S.EXCLUDED_MALFORMED
+
+
+def test_decisions_and_events_are_the_same_whatever_zone_the_clocks_are_written_in():
+    """Re-express every clock of a messy input in another zone: the result is equal (instants, not wall clocks)."""
+    rng = random.Random(20261201)
+    zones = [UTC, ZoneInfo("America/New_York"), ZoneInfo("Asia/Tokyo"), timezone(timedelta(hours=5, minutes=30))]
+
+    def rezone(f, z):
+        if not isinstance(f, S.Filing):
+            return f
+        t = lambda x: x.astimezone(z) if isinstance(x, datetime) and x.tzinfo is not None else x  # noqa: E731
+        return dataclasses.replace(f, acceptance=t(f.acceptance), retrieved_at=t(f.retrieved_at), visible_at=t(f.visible_at))
+
+    for _ in range(150):
+        items = _messy(rng)
+        base = run(items)
+        for z in zones:
+            assert run([rezone(f, z) for f in items]) == base, (z, items)
+
+
+def test_the_property_generator_now_includes_fold_and_offset_variants():
+    assert EDT_0150 in _TIMES and EST_0110 in _TIMES
+    assert any(t is not None and t.tzinfo is not None and t.utcoffset() != ET.utcoffset(t.replace(tzinfo=None))
+               for t in _TIMES[1:] if isinstance(t, datetime))
+
+
+def test_a_price_seen_across_the_fold_is_ordered_by_instant():
+    """P-1 is Friday's close, first seen on the Sunday of the clock change: retrieved 01:50 EDT, visible 01:10 EST."""
+    p_prev = S.prev_close_date(ACC_SUN, CAL)
+    assert p_prev == date(2026, 10, 30)
+    tape = dict(TAPE)
+    tape[p_prev] = S.Price(TAPE[p_prev].close, EDT_0150, EST_0110)          # visible twenty minutes after retrieval
+    assert only(run([_obs(EDT_0150, EDT_0150)], tape)).status == S.SELECTED
+    tape[p_prev] = S.Price(TAPE[p_prev].close, EST_0110, EDT_0150)          # visible twenty minutes before retrieval
+    d = only(run([_obs(EDT_0150, EDT_0150)], tape))
+    assert d.status == S.EXCLUDED_MALFORMED and "before it was retrieved" in d.reason
+
+
+def test_the_ordering_key_and_the_text_form_work_on_raw_instants_not_wall_clocks():
+    first, later = _obs(EDT_0150, EDT_0150), _obs(EST_0110, EST_0110)
+    assert sorted([later, first], key=S._obs_key) == [first, later]
+    assert sorted([first, later], key=S._obs_key) == [first, later]
+    assert S._t(EDT_0150) == S._t(EDT_0150.astimezone(UTC)) == S._t(EDT_0150.astimezone(ZoneInfo("Asia/Tokyo")))
+    assert S._t(EDT_0150) != S._t(EST_0110)
