@@ -186,18 +186,45 @@ def _decision(accession: Any, status: str, reason: str, period: str, **kw: Any) 
     return Decision(accession, status, reason, period, **kw)
 
 
-def _price_clock_problem(p: Price, deadline: datetime) -> tuple[str, str] | None:
+def _price_clock_problem(p: Price, close_at: datetime, deadline: datetime) -> tuple[str, str] | None:
+    """Unknown, then impossible, then late. A close cannot be retrieved before it printed, nor visible before it
+    was retrieved: that is a malformed observation, not a late one."""
     for name, t in (("retrieved_at", p.retrieved_at), ("visible_at", p.visible_at)):
         if not _aware(t):
             return EXCLUDED_UNKNOWN_AVAILABILITY, f"a price's {name} is unknown or has no time zone"
+    if p.retrieved_at < close_at:
+        return EXCLUDED_MALFORMED, (f"a price was retrieved at {p.retrieved_at.isoformat()}, before its session "
+                                    f"closed at {close_at.isoformat()}")
+    if p.visible_at < p.retrieved_at:
+        return EXCLUDED_MALFORMED, "a price was visible before it was retrieved"
+    for name, t in (("retrieved_at", p.retrieved_at), ("visible_at", p.visible_at)):
         if t > deadline:
             return EXCLUDED_LATE_INPUT, f"a price's {name} {t.isoformat()} is after the deadline {deadline.isoformat()}"
     return None
 
 
+def _chronology_problem(v: Filing) -> str | None:
+    """Acceptance <= retrieved <= visible, wherever the times are known."""
+    if _aware(v.acceptance) and _aware(v.retrieved_at) and v.retrieved_at < v.acceptance:
+        return f"retrieved_at {v.retrieved_at.isoformat()} is before the acceptance {v.acceptance.isoformat()}"
+    if _aware(v.retrieved_at) and _aware(v.visible_at) and v.visible_at < v.retrieved_at:
+        return f"visible_at {v.visible_at.isoformat()} is before retrieved_at {v.retrieved_at.isoformat()}"
+    return None
+
+
+def used_price_dates(event: SelectedEvent, calendar: Calendar | None = None) -> list[date]:
+    """Every session whose close an event used: the 61-close window ending at P-1, then day 0."""
+    return [*_sessions_ending(event.p_prev_date, VOL_CLOSES, calendar or RegularCalendar()), event.day0]
+
+
 def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal: Calendar, period: str,
          breakpoints: R.Breakpoints | None) -> tuple[Decision, SelectedEvent | None]:
     dropped = 0
+    for v in versions:
+        bad = _chronology_problem(v)
+        if bad:
+            return _decision(accession, EXCLUDED_MALFORMED, f"impossible chronology: {bad}", period,
+                             acceptance=v.acceptance, retrieved_at=v.retrieved_at, visible_at=v.visible_at), None
     unique: dict[str, Filing] = {}
     for v in versions:
         have = unique.get(v.content_sha256)
@@ -262,7 +289,7 @@ def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal
             entry_ = tape.get(day)
             if entry_ is None:
                 continue  # an absent close is caught below as a missing input, not as a clock
-            problem = _price_clock_problem(entry_, d)
+            problem = _price_clock_problem(entry_, _close_dt(cal, day), d)
             if problem:
                 return _decision(accession, problem[0], problem[1], period, ignored_revisions=tuple(ignored),
                                  **base), None

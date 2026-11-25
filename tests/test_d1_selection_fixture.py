@@ -149,12 +149,12 @@ def test_c0_visible_a_minute_after_the_deadline_is_late_and_not_deferred():
     assert "after the deadline" in d.reason
 
 
-@pytest.mark.parametrize("which", ["retrieved_at", "visible_at"])
-def test_c0_needs_both_clocks_at_or_before_the_deadline(which):
+@pytest.mark.parametrize("retrieved, visible", [(at(D17, 20, 0), at(D17, 20, 0, 1)),     # visible after D only
+                                                 (at(D17, 20, 0, 1), at(D17, 20, 0, 1)),   # both after D
+                                                 (at(D17, 20, 0, 1), at(D17, 21, 0))])
+def test_c0_needs_both_clocks_at_or_before_the_deadline(retrieved, visible):
     tape = dict(TAPE)
-    late = at(D17, 20, 0, 1)
-    ok = at(D17, 20, 0)
-    tape[D17] = S.Price(TAPE[D17].close, late if which == "retrieved_at" else ok, late if which == "visible_at" else ok)
+    tape[D17] = S.Price(TAPE[D17].close, retrieved, visible)
     refused(run([filing("L5", ON_TIME)], tape), S.EXCLUDED_LATE_INPUT)
 
 
@@ -473,3 +473,92 @@ def test_the_tape_is_read_only_through_day0():
         spy = Spy(tape)
         run([f], spy)
         assert spy.read and max(spy.read) <= S.day0_for(f.acceptance, CAL), name
+
+
+# ---- chronology: acceptance <= retrieved <= visible <= D, and close <= retrieved <= visible <= D (Codex 6054842777) ----
+
+def test_a_filing_visible_before_it_was_retrieved_and_retrieved_before_it_was_accepted_is_malformed():
+    a = at(D17, 11, 0)
+    d = refused(run([filing("C1", a, ret=at(D17, 10, 0), vis=at(D17, 9, 0))]), S.EXCLUDED_MALFORMED)
+    assert "impossible chronology" in d.reason and d.status != S.EXCLUDED_LATE_INPUT
+
+
+@pytest.mark.parametrize("ret, vis, needle", [(at(D17, 10, 59, 59), at(D17, 11, 30), "before the acceptance"),
+                                              (at(D17, 11, 5), at(D17, 11, 4), "visible_at"),
+                                              (at(D17, 10, 0), at(D17, 12, 0), "before the acceptance")])
+def test_each_filing_chronology_violation_is_malformed_not_unknown_or_late(ret, vis, needle):
+    d = refused(run([filing("C2", at(D17, 11, 0), ret=ret, vis=vis)]), S.EXCLUDED_MALFORMED)
+    assert needle in d.reason
+
+
+def test_equal_filing_clocks_are_chronological():
+    a = at(D17, 11, 0)
+    assert only(run([filing("C3", a, ret=a, vis=a)])).status == S.SELECTED
+
+
+def test_an_impossible_chronology_beats_a_late_one():
+    d = refused(run([filing("C4", at(D17, 11, 0), ret=at(D17, 21, 0), vis=at(D17, 20, 30))]), S.EXCLUDED_MALFORMED)
+    assert d.status != S.EXCLUDED_LATE_INPUT
+
+
+def test_a_duplicate_or_revision_with_an_impossible_chronology_refuses_the_accession():
+    good = filing("C5", ON_TIME, sha="s")
+    bogus_dup = dataclasses.replace(good, retrieved_at=at(D17, 12, 0), visible_at=at(D17, 8, 0))
+    refused(run([good, bogus_dup]), S.EXCLUDED_MALFORMED)
+    rev = dataclasses.replace(good, content_sha256="t", retrieved_at=at(D17, 21, 0), visible_at=at(D17, 20, 30))
+    refused(run([good, rev]), S.EXCLUDED_MALFORMED)
+
+
+def test_c0_retrieved_before_its_session_closed_is_malformed():
+    tape = dict(TAPE)
+    tape[D17] = S.Price(TAPE[D17].close, at(D17, 10, 0), at(D17, 11, 0))  # a 16:00 close "seen" at 10:00 / 11:00
+    d = refused(run([filing("C6", ON_TIME)], tape), S.EXCLUDED_MALFORMED)
+    assert "before its session closed" in d.reason
+
+
+@pytest.mark.parametrize("ret, vis", [(at(D17, 15, 59, 59), at(D17, 17, 0)), (at(D17, 10, 0), at(D17, 15, 0))])
+def test_c0_retrieved_before_the_close_is_malformed_whatever_its_visibility(ret, vis):
+    tape = dict(TAPE)
+    tape[D17] = S.Price(TAPE[D17].close, ret, vis)
+    refused(run([filing("C7", ON_TIME)], tape), S.EXCLUDED_MALFORMED)
+
+
+def test_c0_visible_before_it_was_retrieved_is_malformed():
+    tape = dict(TAPE)
+    tape[D17] = S.Price(TAPE[D17].close, at(D17, 17, 0), at(D17, 16, 30))
+    d = refused(run([filing("C8", ON_TIME)], tape), S.EXCLUDED_MALFORMED)
+    assert "before it was retrieved" in d.reason
+
+
+def test_c0_retrieved_exactly_at_the_close_is_chronological():
+    tape = dict(TAPE)
+    tape[D17] = S.Price(TAPE[D17].close, at(D17, 16, 0), at(D17, 16, 0))
+    assert only(run([filing("C9", ON_TIME)], tape)).status == S.SELECTED
+
+
+def test_every_close_used_must_be_chronological_not_only_c0():
+    early = date(2026, 11, 16)
+    tape = dict(TAPE)
+    tape[early] = S.Price(TAPE[early].close, at(early, 9, 0), at(early, 9, 1))  # P-1 "seen" before it printed
+    refused(run([filing("C10", ON_TIME)], tape), S.EXCLUDED_MALFORMED)
+    old = S._sessions_ending(early, 61, CAL)[3]  # a vol-window close deep in the history
+    tape2 = dict(TAPE)
+    tape2[old] = S.Price(TAPE[old].close, at(old, 8, 0), at(old, 8, 1))
+    refused(run([filing("C11", ON_TIME)], tape2), S.EXCLUDED_MALFORMED)
+
+
+def test_malformed_unknown_and_late_are_three_different_refusals():
+    tape_late = dict(TAPE)
+    tape_late[D17] = S.Price(TAPE[D17].close, at(D17, 20, 0, 1), at(D17, 20, 0, 1))
+    tape_unknown = dict(TAPE)
+    tape_unknown[D17] = S.Price(TAPE[D17].close, None, None)
+    tape_bad = dict(TAPE)
+    tape_bad[D17] = S.Price(TAPE[D17].close, at(D17, 10, 0), at(D17, 11, 0))
+    got = {only(run([filing(f"T{i}", ON_TIME)], t)).status for i, t in enumerate((tape_late, tape_unknown, tape_bad))}
+    assert got == {S.EXCLUDED_LATE_INPUT, S.EXCLUDED_UNKNOWN_AVAILABILITY, S.EXCLUDED_MALFORMED}
+
+
+def test_the_historical_proxy_stays_separate_from_the_forward_chronology_checks():
+    tape = make_tape(date(2023, 6, 1), date(2024, 6, 1), clocks=False)
+    res = run([filing("HC", at(date(2024, 3, 12), 11, 30))], tape, period=S.HISTORICAL)
+    assert only(res).status == S.DIAGNOSTIC_ONLY and res.selected == ()
