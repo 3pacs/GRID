@@ -120,6 +120,28 @@ display only (owner's decision, bring-up plan rev 100).
   - The decision writer still refuses today and targets the prior session.
   - `tests/test_market_state_provisional_cutoff.py` holds the delayed-input test.
 
+## As-of join and #1191's timing clause
+
+- **Join rule.** A consumer uses a row only once it was written. It joins on `computed_at` at or before the decision
+  time, never on the session the row describes. The desk brief's reader (`analysis/desk_brief_sources.market_state`)
+  is the only reader of `market_state_daily` outside the writer and the spells fold, and it joins this way.
+  `tests/test_market_state_asof_join.py` holds #1191's 2026-11-16 acceptance tests:
+  - a same-day decision before the close refuses that session's later row;
+  - the next session's decision accepts a row written between the close and its open;
+  - a late row stays unusable until it is written, and the brief names the missing record;
+  - a revised row is never shown before its revision.
+- **Granularity.** Both records are daily. A decision during a session sees no row for that session, and this table
+  gives it no intraday context.
+- **Timing clause (owner's ruling, 2026-11-24).** #1191 asks for each session's record to be written after that
+  session's close and before the next open. The provisional record meets that clause: the timer writes it at
+  21:15Z, with every read cut at the close. The decision record keeps its next-evening schedule (23:15Z on D+1) and
+  is not judged against the clause. The ruling changes what counts as evidence, not what decides. The provisional
+  record stays display only, and every other part of #1191's done-when still applies to it.
+- **Open: revisions.** A `--replace` overwrites the row and its `computed_at` in place. A decision replayed between
+  the original write and the revision therefore sees neither version of that row. Keeping the original version
+  ("late/revised rows retaining original vintage") needs a revisions archive like `regime_history_revisions`
+  (#1302).
+
 ## Spells and transitions (market-state-spells/1, #1309)
 
 Each label says how far a variable is from its normal today; a spell says how long it has been there, and a transition
