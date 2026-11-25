@@ -496,17 +496,23 @@ def test_equal_filing_clocks_are_chronological():
     assert only(run([filing("C3", a, ret=a, vis=a)])).status == S.SELECTED
 
 
-def test_an_impossible_chronology_beats_a_late_one():
-    d = refused(run([filing("C4", at(D17, 11, 0), ret=at(D17, 21, 0), vis=at(D17, 20, 30))]), S.EXCLUDED_MALFORMED)
-    assert d.status != S.EXCLUDED_LATE_INPUT
+def test_a_filing_first_visible_after_the_deadline_is_late_even_if_its_record_is_inconsistent():
+    """Read as of D, the filing was not yet visible: late. The inconsistency is logged in the reason, not promoted."""
+    d = refused(run([filing("C4", at(D17, 11, 0), ret=at(D17, 21, 0), vis=at(D17, 20, 30))]), S.EXCLUDED_LATE_INPUT)
+    assert "also inconsistent" in d.reason
 
 
-def test_a_duplicate_or_revision_with_an_impossible_chronology_refuses_the_accession():
+def test_an_impossible_duplicate_that_claims_to_be_visible_first_refuses_the_accession():
     good = filing("C5", ON_TIME, sha="s")
-    bogus_dup = dataclasses.replace(good, retrieved_at=at(D17, 12, 0), visible_at=at(D17, 8, 0))
+    bogus_dup = dataclasses.replace(good, retrieved_at=at(D17, 12, 0), visible_at=at(D17, 8, 0))  # claims 08:00
     refused(run([good, bogus_dup]), S.EXCLUDED_MALFORMED)
-    rev = dataclasses.replace(good, content_sha256="t", retrieved_at=at(D17, 21, 0), visible_at=at(D17, 20, 30))
-    refused(run([good, rev]), S.EXCLUDED_MALFORMED)
+
+
+def test_an_inconsistent_revision_claimed_visible_by_the_deadline_refuses_the_accession():
+    good = filing("C5b", ON_TIME, sha="s")
+    rev = dataclasses.replace(good, content_sha256="t", retrieved_at=at(D17, 19, 0), visible_at=at(D17, 18, 0))
+    d = refused(run([good, rev]), S.EXCLUDED_MALFORMED)
+    assert "claimed to be visible by the deadline" in d.reason
 
 
 def test_c0_retrieved_before_its_session_closed_is_malformed():
@@ -562,3 +568,78 @@ def test_the_historical_proxy_stays_separate_from_the_forward_chronology_checks(
     tape = make_tape(date(2023, 6, 1), date(2024, 6, 1), clocks=False)
     res = run([filing("HC", at(date(2024, 3, 12), 11, 30))], tape, period=S.HISTORICAL)
     assert only(res).status == S.DIAGNOSTIC_ONLY and res.selected == ()
+
+
+# ---- forward point-in-time stability: later records cannot rewrite a decision made at D (Codex 6055145346) ----
+
+ORIGINAL = filing("PIT", ON_TIME, sha="orig")
+BASE = run([ORIGINAL])
+D_END = at(D17, 20, 0)
+AFTER = [at(D17, 20, 0, 1), at(D17, 21, 0), at(D17, 22, 0), at(date(2026, 11, 18), 9, 0), at(date(2026, 12, 1), 12, 0)]
+BEFORE_ACCEPTANCE = [at(D17, 8, 0), at(D17, 10, 59)]
+
+
+def _later(retrieved, visible, sha="late", acceptance=ON_TIME):
+    return S.Filing("PIT", ("2.02",), acceptance, retrieved, visible, sha)
+
+
+def test_the_decision_at_d_is_the_same_with_any_record_first_visible_after_d_whatever_its_other_clocks():
+    """Replay the same as-of with every combination of later additions: retrieved before or after visible,
+    before the acceptance, the original's own content or a different one. The decision at D never moves."""
+    assert only(BASE).status == S.SELECTED
+    n = 0
+    for vis in AFTER:
+        for ret in [*BEFORE_ACCEPTANCE, at(D17, 19, 0), D_END, *AFTER]:  # includes ret < acceptance and ret > vis
+            for sha in ("late", "orig"):
+                res = run([ORIGINAL, _later(ret, vis, sha)])
+                d = only(res)
+                assert d.status == S.SELECTED, (ret, vis, sha, d)
+                assert res.selected == BASE.selected, (ret, vis, sha)
+                assert (d.acceptance, d.retrieved_at, d.visible_at, d.deadline_d) == (
+                    only(BASE).acceptance, only(BASE).retrieved_at, only(BASE).visible_at, only(BASE).deadline_d)
+                n += 1
+    assert n == len(AFTER) * 9 * 2
+
+
+def test_codexs_exact_control_a_revision_retrieved_22_00_and_visible_21_00_does_not_rewrite_the_original():
+    res = run([ORIGINAL, _later(at(D17, 22, 0), at(D17, 21, 0))])
+    d = only(res)
+    assert d.status == S.SELECTED and res.selected == BASE.selected
+    assert d.ignored_revisions == ("late",) and d.invalid_after_deadline == ("late",)  # logged separately
+
+
+def test_a_later_record_with_a_placed_visibility_after_d_is_ignored_even_if_its_retrieval_is_unknown():
+    d = only(run([ORIGINAL, _later(None, at(D17, 21, 0))]))
+    assert d.status == S.SELECTED and d.ignored_revisions == ("late",)
+
+
+def test_a_valid_later_revision_is_ignored_and_not_marked_invalid():
+    d = only(run([ORIGINAL, _later(at(D17, 21, 0), at(D17, 21, 30))]))
+    assert d.status == S.SELECTED and d.ignored_revisions == ("late",) and d.invalid_after_deadline == ()
+
+
+def test_the_order_later_records_arrive_in_cannot_change_the_decision():
+    adds = [_later(at(D17, 22, 0), at(D17, 21, 0), "x"), _later(at(D17, 21, 0), at(D17, 21, 30), "y")]
+    for perm in ([ORIGINAL, *adds], [adds[0], ORIGINAL, adds[1]], [*adds, ORIGINAL]):
+        res = run(perm)
+        assert only(res).status == S.SELECTED and res.selected == BASE.selected
+
+
+@pytest.mark.parametrize("late", [_later(None, None), _later(at(D17, 21, 0), None),
+                                  _later(datetime(2026, 11, 17, 21, 0), datetime(2026, 11, 17, 21, 30))])
+def test_a_later_record_whose_visibility_cannot_be_placed_stays_refused(late):
+    """Unresolved records that could affect the by-D set are refused, not ignored: it might have been visible by D."""
+    refused(run([ORIGINAL, late]), S.EXCLUDED_UNKNOWN_AVAILABILITY)
+
+
+@pytest.mark.parametrize("ret, vis", [(at(D17, 19, 0), at(D17, 18, 0)),       # visible before retrieved, both by D
+                                      (at(D17, 10, 0), at(D17, 12, 0)),        # retrieved before its own acceptance
+                                      (at(D17, 20, 30), at(D17, 19, 59))])     # retrieved after D yet visible by D
+def test_an_inconsistent_record_that_claims_visibility_by_d_stays_refused(ret, vis):
+    refused(run([ORIGINAL, _later(ret, vis)]), S.EXCLUDED_MALFORMED)
+
+
+def test_the_as_of_decision_is_the_same_whenever_it_is_replayed():
+    adds = [_later(at(D17, 22, 0), at(D17, 21, 0))]
+    a, b = run([ORIGINAL, *adds]), run([ORIGINAL, *adds, *adds])
+    assert a.selected == b.selected == BASE.selected

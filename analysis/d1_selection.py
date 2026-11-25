@@ -120,6 +120,7 @@ class Decision:
     deadline_d: datetime | None = None
     duplicates_dropped: int = 0
     ignored_revisions: tuple[str, ...] = ()
+    invalid_after_deadline: tuple[str, ...] = ()
     label: str | None = None
 
 
@@ -187,19 +188,19 @@ def _decision(accession: Any, status: str, reason: str, period: str, **kw: Any) 
 
 
 def _price_clock_problem(p: Price, close_at: datetime, deadline: datetime) -> tuple[str, str] | None:
-    """Unknown, then impossible, then late. A close cannot be retrieved before it printed, nor visible before it
-    was retrieved: that is a malformed observation, not a late one."""
+    """Read as of D: a close first visible after D is late, whatever else is wrong with its record. A close that
+    claims to be visible by D must be consistent: not retrieved before it printed, not visible before retrieved."""
     for name, t in (("retrieved_at", p.retrieved_at), ("visible_at", p.visible_at)):
         if not _aware(t):
             return EXCLUDED_UNKNOWN_AVAILABILITY, f"a price's {name} is unknown or has no time zone"
+    if p.visible_at > deadline:
+        return EXCLUDED_LATE_INPUT, (f"a price's visible_at {p.visible_at.isoformat()} is after the deadline "
+                                     f"{deadline.isoformat()}")
     if p.retrieved_at < close_at:
         return EXCLUDED_MALFORMED, (f"a price was retrieved at {p.retrieved_at.isoformat()}, before its session "
                                     f"closed at {close_at.isoformat()}")
     if p.visible_at < p.retrieved_at:
         return EXCLUDED_MALFORMED, "a price was visible before it was retrieved"
-    for name, t in (("retrieved_at", p.retrieved_at), ("visible_at", p.visible_at)):
-        if t > deadline:
-            return EXCLUDED_LATE_INPUT, f"a price's {name} {t.isoformat()} is after the deadline {deadline.isoformat()}"
     return None
 
 
@@ -220,11 +221,6 @@ def used_price_dates(event: SelectedEvent, calendar: Calendar | None = None) -> 
 def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal: Calendar, period: str,
          breakpoints: R.Breakpoints | None) -> tuple[Decision, SelectedEvent | None]:
     dropped = 0
-    for v in versions:
-        bad = _chronology_problem(v)
-        if bad:
-            return _decision(accession, EXCLUDED_MALFORMED, f"impossible chronology: {bad}", period,
-                             acceptance=v.acceptance, retrieved_at=v.retrieved_at, visible_at=v.visible_at), None
     unique: dict[str, Filing] = {}
     for v in versions:
         have = unique.get(v.content_sha256)
@@ -256,23 +252,38 @@ def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal
     base["deadline_d"] = d
     ignored: list[str] = []
     label = None
+    invalid_after: list[str] = []
     if period == FORWARD:
+        # The decision is read as of D: only records visible by D can change it. A record first visible after D is
+        # logged and ignored, however malformed; a record that claims to be visible by D must be consistent.
         for name, t in (("retrieved_at", orig.retrieved_at), ("visible_at", orig.visible_at)):
             if not _aware(t):
                 return _decision(accession, EXCLUDED_UNKNOWN_AVAILABILITY, f"{name} is unknown or has no time zone "
                                  "(clocks 3 and 4)", period, **base), None
-            if t > d:
-                return _decision(accession, EXCLUDED_LATE_INPUT, f"{name} {t.isoformat()} is after the deadline "
-                                 f"{d.isoformat()}", period, **base), None
+        if orig.visible_at > d:
+            why = _chronology_problem(orig)
+            return _decision(accession, EXCLUDED_LATE_INPUT, f"visible_at {orig.visible_at.isoformat()} is after the "
+                             f"deadline {d.isoformat()}" + (f" (its record is also inconsistent: {why})" if why else ""),
+                             period, **base), None
+        bad = _chronology_problem(orig)
+        if bad:
+            return _decision(accession, EXCLUDED_MALFORMED, f"impossible chronology: {bad}", period, **base), None
         for other in others:
             if not _aware(other.visible_at):
                 return _decision(accession, EXCLUDED_UNKNOWN_AVAILABILITY, "a second version of the filing has no "
                                  "visibility time, so it cannot be placed before or after the deadline", period,
                                  **base), None
-            if other.visible_at <= d:
-                return _decision(accession, EXCLUDED_REVISED_INPUT, "two different versions of the filing were "
-                                 "visible by the deadline; first availability is ambiguous", period, **base), None
-            ignored.append(other.content_sha256)
+            if other.visible_at > d:  # first known after the decision: not part of what D could see
+                ignored.append(other.content_sha256)
+                if _chronology_problem(other):
+                    invalid_after.append(other.content_sha256)
+                continue
+            bad = _chronology_problem(other)
+            if bad:
+                return _decision(accession, EXCLUDED_MALFORMED, f"a second version claimed to be visible by the "
+                                 f"deadline has an impossible chronology: {bad}", period, **base), None
+            return _decision(accession, EXCLUDED_REVISED_INPUT, "two different versions of the filing were "
+                             "visible by the deadline; first availability is ambiguous", period, **base), None
     else:
         label = PROXY_EOD_BY_DEADLINE
     # prices: only sessions up to day 0 are ever read
@@ -284,20 +295,20 @@ def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal
     if period == FORWARD:
         if c0_entry is None:
             return _decision(accession, EXCLUDED_LATE_INPUT, "C0 is not on the tape by the deadline (missing is "
-                             "counted, never deferred)", period, ignored_revisions=tuple(ignored), **base), None
+                             "counted, never deferred)", period, ignored_revisions=tuple(ignored), invalid_after_deadline=tuple(invalid_after), **base), None
         for day in [*window, day0]:
             entry_ = tape.get(day)
             if entry_ is None:
                 continue  # an absent close is caught below as a missing input, not as a clock
             problem = _price_clock_problem(entry_, _close_dt(cal, day), d)
             if problem:
-                return _decision(accession, problem[0], problem[1], period, ignored_revisions=tuple(ignored),
+                return _decision(accession, problem[0], problem[1], period, ignored_revisions=tuple(ignored), invalid_after_deadline=tuple(invalid_after),
                                  **base), None
     closes = [tape[x].close if x in tape else None for x in window]
     c0 = c0_entry.close if c0_entry is not None else None
     s = R.event_strength(closes, c0)
     if s.value is None:
-        return _decision(accession, EXCLUDED_INPUT, s.detail or "input", period, ignored_revisions=tuple(ignored),
+        return _decision(accession, EXCLUDED_INPUT, s.detail or "input", period, ignored_revisions=tuple(ignored), invalid_after_deadline=tuple(invalid_after),
                          label=label, **base), None
     ratio = c0 / closes[-1] - 1.0
     direction = (ratio > 0) - (ratio < 0)
@@ -307,7 +318,7 @@ def _one(accession: Any, versions: list[Filing], tape: Mapping[date, Price], cal
     ev = SelectedEvent(str(accession), fam, tuple(orig.items), day0, p_date, o, d, entry, direction, s.value, q)
     if period == FORWARD:
         return _decision(accession, SELECTED, "all clocks known and at or before the deadline", period,
-                         ignored_revisions=tuple(ignored), **base), ev
+                         ignored_revisions=tuple(ignored), invalid_after_deadline=tuple(invalid_after), **base), ev
     return _decision(accession, DIAGNOSTIC_ONLY, "historical closes are a proxy; availability by D is unknown", period,
                      label=label, **base), ev
 
