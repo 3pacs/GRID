@@ -110,6 +110,13 @@ identity in its read-only transaction (``pg_control_system().system_identifier``
 database oid, the postmaster's start time, the server address and port, recovery state, version), and the write
 reads it again on its own connection: any difference, or a standby, refuses. No superuser is needed.
 
+**Write target (Codex 6047746132).** A server and database are still not the rows a write changes: the script
+names ``feature_registry`` and ``feature_eligibility_changes`` unqualified, so the session's search_path picks
+the schema, and two schemas of one database can hold the same rows. So the identity also records the search_path
+and, for each relation, the schema and oid it resolves to, and the write must find them as its dry run did. The
+write then pins its own transaction's search_path to exactly the approved schemas, so a relation created later
+earlier on the path cannot be resolved in its place, and reads both relations again right before the commit.
+
 **Migration authority (every write).** Checked in ``pg_catalog`` on the open connection, never taken from a
 flag. The connected role must own ``feature_eligibility_changes`` or be a member of its owner role, and must be
 able to UPDATE ``feature_registry``. The application role ``grid`` must exist and must not be able to write a
@@ -134,8 +141,10 @@ itself be rolled back (apply again instead), and the rollback is recorded as its
 ``--rollback X`` (a dry run) prints a rollback receipt with the rows it would restore, the backend it read them on,
 the change set the rollback will record, the host, its boot id and the time; ``--rollback X --apply`` takes that
 file and its sha256. Before connecting it refuses a receipt for another set, another host, boot or database
-target, one older than 30 minutes or one that records a refusal; inside the write transaction the backend must
-be the receipt's, its change set unused, and the rows the rollback locks and restores exactly its rows. It never
+target, one older than 30 minutes or one that records a refusal; inside the write transaction the backend and its
+relations must be the receipt's, its change set unused, and the rows the rollback locks and restores exactly its
+rows. After the rollback holds its row locks, and right before the commit, it checks the receipt's age again: a
+receipt that expired while the connection or a lock was waited for writes nothing. It never
 consults the deployed-code evidence or the prerequisite gate: an emergency rollback restores the flags that were
 in place before, whatever is deployed, so it works while the forward prerequisites fail.
 
@@ -161,7 +170,7 @@ import socket
 import subprocess  # nosec B404 - fixed argv to systemctl and git, no shell
 import sys
 import uuid
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -303,9 +312,10 @@ RELEASES_SUFFIX = ".releases"  # <live_path>.releases/<sha>/, scripts/deploy_rel
 SHA_HEX = re.compile(r"[0-9a-f]{40}")
 
 RECEIPT_KIND = "grid-eligibility-apply-receipt"
-RECEIPT_VERSION = 2               # 2 (#1383): backend identity, change set, entrypoints, restart receipts, locks
+RECEIPT_VERSION = 3               # 2 (#1383): backend identity, change set, entrypoints, restart receipts, locks;
+                                  # 3 (Codex 6047746132): the backend names its search_path and both relations
 ROLLBACK_RECEIPT_KIND = "grid-eligibility-rollback-receipt"
-ROLLBACK_RECEIPT_VERSION = 1
+ROLLBACK_RECEIPT_VERSION = 2      # 2: as RECEIPT_VERSION 3
 RECEIPT_MAX_AGE_S = 1800          # an apply refuses a receipt older than 30 minutes
 RECEIPT_MAX_FUTURE_S = 60         # ... or one stamped more than a minute ahead of this host's clock
 RECEIPT_MAX_BYTES = 1 << 20
@@ -1103,6 +1113,13 @@ TIMEOUTS_SQL = text("SELECT set_config('lock_timeout', :lock, true), set_config(
 # it must equal what the approved dry run read. system_identifier names the cluster (a streaming standby shares
 # it), so the timeline, the postmaster's start time and the server address tell a promoted standby or a
 # restarted server apart. pg_control_system() and pg_control_checkpoint() need no superuser (PG 15).
+#
+# A server and database are not a target either (Codex 6047746132): the script names feature_registry and
+# feature_eligibility_changes unqualified, so the session's search_path picks the schema, and two schemas of one
+# database can hold the same rows. So the identity also names the search_path and, for each of the two relations,
+# the schema and oid it resolves to (RELATIONS_SQL). A write must find all of it as its dry run did; it then pins
+# its own transaction's search_path to exactly the approved schemas (PIN_SEARCH_PATH_SQL), so a relation created
+# later in another schema cannot be resolved instead, and it reads the relations again right before the commit.
 BACKEND_SQL = text("""
 SELECT (SELECT system_identifier FROM pg_control_system())::text AS system_identifier,
        (SELECT timeline_id FROM pg_control_checkpoint())::bigint AS timeline_id,
@@ -1113,20 +1130,59 @@ SELECT (SELECT system_identifier FROM pg_control_system())::text AS system_ident
        host(inet_server_addr()) AS server_addr,
        inet_server_port() AS server_port,
        pg_is_in_recovery() AS in_recovery,
-       current_setting('server_version_num') AS server_version_num
+       current_setting('server_version_num') AS server_version_num,
+       current_setting('search_path') AS search_path
+""")
+RELATIONS_SQL = text("""
+SELECT v.relation, n.nspname::text AS schema_name, c.oid::bigint AS relation_oid
+FROM (VALUES ('feature_eligibility_changes'), ('feature_registry')) AS v(relation)
+LEFT JOIN pg_class c ON c.oid = to_regclass(v.relation)
+LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+ORDER BY v.relation
+""")
+# Transaction-local; PostgreSQL quotes each schema name (quote_ident), so a name is never SQL.
+PIN_SEARCH_PATH_SQL = text("""
+SELECT set_config('search_path',
+                  (SELECT string_agg(quote_ident(s), ', ' ORDER BY s) FROM unnest(CAST(:schemas AS text[])) AS s),
+                  true)
 """)
 CHANGE_SET_USED_SQL = text("SELECT 1 FROM feature_eligibility_changes WHERE change_set = CAST(:change_set AS uuid) "
                            "LIMIT 1")
 
 
+def relation_identity(conn: Connection) -> dict[str, Any]:
+    """The schema and oid each relation the script names resolves to now (None for both when it does not)."""
+    return {r["relation"]: {"schema": r["schema_name"], "oid": r["relation_oid"]}
+            for r in conn.execute(RELATIONS_SQL).mappings()}
+
+
 def backend_identity(conn: Connection) -> dict[str, Any]:
-    return dict(conn.execute(BACKEND_SQL).mappings().one())
+    return {**dict(conn.execute(BACKEND_SQL).mappings().one()), "relations": relation_identity(conn)}
+
+
+def pin_relations(conn: Connection, approved: dict[str, Any]) -> list[str]:
+    """Pin this transaction's search_path to the approved relations' schemas, then check that both relations
+    resolve to the approved oids. Returns refusals."""
+    relations = approved.get("relations")
+    if not isinstance(relations, dict) or not relations or any(
+            not isinstance(r, dict) or r.get("schema") is None or r.get("oid") is None for r in relations.values()):
+        return [f"the approved receipt names no schema and oid for every relation ({relations!r}); nothing was written"]
+    conn.execute(PIN_SEARCH_PATH_SQL, {"schemas": sorted({r["schema"] for r in relations.values()})})
+    return relations_drift(conn, relations, "after pinning the search_path")
+
+
+def relations_drift(conn: Connection, approved: dict[str, Any], when: str) -> list[str]:
+    drift = divergences(approved, relation_identity(conn), "relations")
+    if not drift:
+        return []
+    return [f"{when}, the relations this write would change are not the approved ones; nothing was written", *drift]
 
 
 @dataclass(frozen=True)
 class Approval:
     """What the owner approved, checked inside the write transaction (#1383): the rows, the backend the dry run
-    read them on, and the change set the write records (so one receipt writes once)."""
+    read them on (with its search_path and the schema and oid of both relations), and the change set the write
+    records (so one receipt writes once)."""
 
     changes: tuple[dict[str, Any], ...]
     backend: dict[str, Any]
@@ -1140,8 +1196,10 @@ class Approval:
 
 @dataclass(frozen=True)
 class WriteBoundary:
-    """What an apply holds and re-checks at its write (#1383). ``hold`` is entered before the flags change and
-    released only after the commit; ``recheck`` runs after the change and before the commit and returns refusals."""
+    """What a write holds and re-checks at its write (#1383). ``hold`` is entered before the flags change and
+    released only after the commit; ``recheck`` runs after the change and before the commit and returns refusals.
+    An apply's boundary holds its deploy locks and re-checks the deployed code and the receipt's age (``write_boundary``);
+    a rollback's holds nothing and re-checks only its receipt's age (``rollback_boundary``)."""
 
     hold: Callable[[], AbstractContextManager[Any]]
     recheck: Callable[[], list[str]]
@@ -1364,9 +1422,11 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
 
     ``prerequisites`` is ``deployed_prerequisites()``. Every write needs ``approval``, from the receipt the owner
     approved (``main`` verifies it first): inside the write transaction the backend must be the one its dry run
-    read, its change set must be unused, and the rows the write locks and changes must be exactly its rows. An
-    apply also needs ``boundary``: the deploy locks it holds from before the change until after the commit, and
-    the evidence re-check it runs right before the commit.
+    read (its search_path and both relations included), the transaction's search_path is then pinned to the
+    approved schemas, its change set must be unused, and the rows the write locks and changes must be exactly its
+    rows. Every write also needs ``boundary``, re-checked right before the commit with the relations: for an apply,
+    the deploy locks it holds from before the change until after the commit and the evidence and age re-check; for
+    a rollback, the age re-check alone.
     """
     mode = ("rollback" if rollback_of else "apply") + ("" if write else "_dry_run")
     report: dict[str, Any] = {"mode": mode, "plan": plan.name, "writes_to_database": False, "refusals": []}
@@ -1381,6 +1441,8 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
             raise ValueError("an apply needs its write boundary (deploy locks and the evidence re-check)")
     else:
         report["rollback_of"] = str(rollback_of)
+        if write and boundary is None:
+            raise ValueError("a rollback needs its write boundary (the receipt's age re-check)")
     if write and approval is None:
         raise ValueError("a write needs the approved receipt's approval")
     would_refuse = [] if rollback_of is not None else list(prerequisites["refusals"])
@@ -1417,6 +1479,9 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
                 if drift:
                     raise Refused(["the database backend is not the one the approved receipt was made on; nothing "
                                    "was written (run a new dry run)", *drift])
+                pinned = pin_relations(conn, approval.backend)
+                if pinned:
+                    raise Refused(pinned)
                 if conn.execute(CHANGE_SET_USED_SQL, {"change_set": str(approval.change_set)}).first():
                     raise Refused([f"change set {approval.change_set} is already recorded: an approved receipt "
                                    "writes once (run a new dry run)"])
@@ -1440,6 +1505,9 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
                     if late:
                         raise Refused(["the write-boundary re-check found the deployed code changed after the "
                                        "receipt was verified; nothing was written", *late])
+                    moved = relations_drift(conn, approval.backend["relations"], "right before the commit")
+                    if moved:
+                        raise Refused(moved)
                     report["write_boundary"] = {"deploy_locks_held": list(boundary.locks), "rechecked": True}
                     if changes:
                         report.update(status="applied", changes=changes, writes_to_database=True)
@@ -1449,10 +1517,18 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
                 if not write:
                     report.update(status="dry_run", changes=plan_rollback(conn, rollback_of, lock=False))
                 else:
-                    assert approval is not None  # nosec B101 - checked above
-                    report.update(status="rolled_back",
-                                  changes=apply_rollback(conn, rollback_of, approval.change_set, approval.changes),
-                                  writes_to_database=True)
+                    assert approval is not None and boundary is not None  # nosec B101 - checked above
+                    held.enter_context(boundary.hold())
+                    restored = apply_rollback(conn, rollback_of, approval.change_set, approval.changes)
+                    late = boundary.recheck()
+                    if late:
+                        raise Refused(["the rollback's re-check right before the commit refused it; nothing was "
+                                       "written (run a new rollback dry run)", *late])
+                    moved = relations_drift(conn, approval.backend["relations"], "right before the commit")
+                    if moved:
+                        raise Refused(moved)
+                    report.update(status="rolled_back", changes=restored, writes_to_database=True,
+                                  write_boundary={"deploy_locks_held": list(boundary.locks), "rechecked": True})
     except Refused as refused:
         report.update(status="refused", refusals=refused.reasons, **refused.details)
         report["writes_to_database"] = False
@@ -1524,6 +1600,13 @@ def write_boundary(receipt: dict[str, Any], code_roots: Sequence[Path], database
                                                                                                 probes.now())
 
     return WriteBoundary(hold=lambda: hold_deploy_locks(locks, probes.deploy_lock), recheck=recheck, locks=locks)
+
+
+def rollback_boundary(receipt: dict[str, Any], probes: Probes) -> WriteBoundary:
+    """A rollback's write boundary (Codex 6047746132): no deploy lock and no forward prerequisite, only the
+    receipt's age, read again after the rollback holds its row locks and right before the commit. A receipt that
+    expired while the connection or a lock was waited for writes nothing."""
+    return WriteBoundary(hold=nullcontext, recheck=lambda: _age_refusals(receipt, probes.now()))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1609,7 +1692,8 @@ def _main_rollback(args: argparse.Namespace, db_url: str, database: str, timeout
 
     The deployed-code evidence and the prerequisite gate are never consulted: an emergency rollback restores the
     flags that were in place before, whatever is deployed. What binds it is the owner's approval of the exact
-    rows, on the exact backend, under the change set the receipt names, within 30 minutes, on this host."""
+    rows, on the exact backend and relations, under the change set the receipt names, within 30 minutes (checked
+    before connecting and again right before the commit), on this host."""
     host, host_boot = probes.host(), _boot_or_none(probes)
     receipt = None
     if args.apply:
@@ -1621,7 +1705,8 @@ def _main_rollback(args: argparse.Namespace, db_url: str, database: str, timeout
     engine = create_engine(db_url, pool_pre_ping=True)
     try:
         report = run(engine, write=args.apply, rollback_of=args.rollback,
-                     approval=None if receipt is None else Approval.from_receipt(receipt), **timeouts)
+                     approval=None if receipt is None else Approval.from_receipt(receipt),
+                     boundary=None if receipt is None else rollback_boundary(receipt, probes), **timeouts)
     finally:
         engine.dispose()
     report["database"] = database

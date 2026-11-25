@@ -20,7 +20,11 @@ step that fails on any skip. It proves:
   re-checks the evidence right before the commit, so a repin or restart that lands after the first probe refuses
   with nothing written; a busy deploy lock refuses; a different backend refuses; a receipt writes once;
 * rollback authorization (#1383): a rollback writes only an approved rollback receipt (its rows, its backend, its
-  change set), a changed backend or preview refuses, and it works while the forward prerequisites fail.
+  change set), a changed backend or preview refuses, and it works while the forward prerequisites fail;
+* the write's target (Codex 6047746132): the same rows in another schema of the same database refuse the write, a
+  relation created after the dry run earlier on the search_path refuses it, and one created during the write cannot
+  take the approved relation's place (the search_path is pinned); a rollback receipt that expires while the
+  rollback holds its locks writes nothing, and one still inside its 30 minutes at that point writes.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -211,7 +215,8 @@ def _rollback(engine: Engine, change_set: str, *, write: bool = True):
             changes = elig.plan_rollback(conn, target, lock=False)
         except elig.Refused:
             changes = []
-    return elig.run(engine, write=True, rollback_of=target, approval=_approval(engine, changes))
+    return elig.run(engine, write=True, rollback_of=target, approval=_approval(engine, changes),
+                    boundary=OPEN_BOUNDARY)
 
 
 def _changes(report) -> list[tuple]:
@@ -552,7 +557,8 @@ def test_a_rollback_whose_rows_differ_from_its_approval_refuses(db):
     set_1 = _apply(db.owner)["change_set"]
     before = _flags(db.admin)
     wrong = [{"feature_id": 11, "name": "vix_spot", "old_eligible": True, "new_eligible": False}]
-    report = elig.run(db.owner, write=True, rollback_of=uuid.UUID(set_1), approval=_approval(db.owner, wrong))
+    report = elig.run(db.owner, write=True, rollback_of=uuid.UUID(set_1), approval=_approval(db.owner, wrong),
+                      boundary=OPEN_BOUNDARY)
     assert report["status"] == "refused"
     assert report["refusals"][0] == ("the rows the rollback would restore differ from the approved receipt's; "
                                      "nothing was written (run a new rollback dry run)")
@@ -574,6 +580,141 @@ def test_an_emergency_rollback_works_while_the_forward_prerequisites_fail(db, ro
     code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
     assert code == 0 and report["status"] == "rolled_back"
     assert _set(db.admin, report["change_set"]) == _swapped(FIRST_SET)
+
+
+# ── the write's target: schema and relations (Codex 6047746132) ─────────────────────────────────────────────
+
+
+@dataclass
+class Schemas:
+    db: Db
+    made: list[str]
+    engines: list[Engine]
+
+    def make(self, suffix: str) -> str:
+        name = f"{self.db.schema}_{suffix}"
+        with self.db.admin.begin() as conn:
+            _ddl(conn, "CREATE SCHEMA %I", name)
+            _ddl(conn, "GRANT USAGE, CREATE ON SCHEMA %I TO %I, %I", name, self.db.owner_role, self.db.app_role)
+        self.made.append(name)
+        return name
+
+    def engine(self, role: str, path: str) -> Engine:
+        engine = create_engine(self.db.admin.url.update_query_dict({"options": f"-csearch_path={path} -crole={role}"}))
+        self.engines.append(engine)
+        return engine
+
+    def registry(self, schema: str) -> None:
+        """feature_registry in ``schema`` with the same rows, owned by the app role as on griddb."""
+        with self.engine(self.db.app_role, schema).begin() as conn:
+            conn.exec_driver_sql(_REGISTRY)
+            _ddl(conn, "GRANT SELECT, UPDATE ON feature_registry TO %I", self.db.owner_role)
+
+
+@pytest.fixture()
+def schemas(db):
+    handle = Schemas(db, [], [])
+    try:
+        yield handle
+    finally:
+        for engine in handle.engines:
+            engine.dispose()
+        with db.admin.begin() as conn:
+            for name in handle.made:
+                _ddl(conn, "DROP SCHEMA IF EXISTS %I CASCADE", name)
+
+
+def _write(engine: Engine, approval: elig.Approval, boundary: elig.WriteBoundary = OPEN_BOUNDARY):
+    return elig.run(engine, write=True, prerequisites=PASSING_GATE, approval=approval, boundary=boundary)
+
+
+def test_the_same_rows_in_another_schema_of_the_same_database_refuse_the_write(db, schemas):
+    """Same server, same database, same intended rows: only the schema differs, and the receipt names it."""
+    _migrate(db.owner)
+    twin = schemas.make("twin")
+    schemas.registry(twin)
+    owner_twin = schemas.engine(db.owner_role, twin)
+    _migrate(owner_twin)
+    approval = _approval(db.owner, _planned(db.owner))
+    assert approval.backend["relations"]["feature_registry"]["schema"] == db.schema
+    assert _planned(owner_twin) == list(approval.changes)
+    before, before_twin = _flags(db.admin), _flags(owner_twin)
+    report = _write(owner_twin, approval)
+    assert report["status"] == "refused" and not report["writes_to_database"]
+    assert report["refusals"][0].startswith("the database backend is not the one the approved receipt was made on")
+    assert any("backend['search_path']" in r for r in report["refusals"])
+    assert any(f"backend['relations']['feature_registry']['schema']: approved '{db.schema}', now '{twin}'" in r
+               for r in report["refusals"])
+    assert _flags(db.admin) == before and _flags(owner_twin) == before_twin
+    assert _log(db.admin) == [] and _log(owner_twin) == []
+
+
+def test_a_relation_created_after_the_dry_run_earlier_on_the_search_path_refuses_the_write(db, schemas):
+    _migrate(db.owner)
+    shadow = schemas.make("shadow")
+    owner_path = schemas.engine(db.owner_role, f"{shadow},{db.schema}")
+    approval = _approval(owner_path, _planned(owner_path))           # the dry run resolves both to db.schema
+    relations = approval.backend["relations"]
+    assert {r["schema"] for r in relations.values()} == {db.schema} and approval.backend["search_path"]
+    schemas.registry(shadow)                                          # now first on the same search_path
+    before, before_shadow = _flags(db.admin), _flags(schemas.engine(db.app_role, shadow))
+    report = _write(owner_path, approval)
+    assert report["status"] == "refused"
+    assert any("backend['relations']['feature_registry']" in r for r in report["refusals"])
+    assert _flags(db.admin) == before and _flags(schemas.engine(db.app_role, shadow)) == before_shadow
+    assert _log(db.admin) == []
+
+
+def test_a_relation_created_during_the_write_cannot_take_its_place(db, schemas):
+    """Another session commits feature_registry earlier on the search_path after the write pinned it, before the
+    flags change: the write still changes the approved relation and only it."""
+    _migrate(db.owner)
+    shadow = schemas.make("shadow")
+    owner_path = schemas.engine(db.owner_role, f"{shadow},{db.schema}")
+    approval = _approval(owner_path, _planned(owner_path))
+
+    @contextlib.contextmanager
+    def appears():
+        schemas.registry(shadow)
+        yield
+
+    report = _write(owner_path, approval, elig.WriteBoundary(hold=appears, recheck=lambda: []))
+    assert report["status"] == "applied", report["refusals"]
+    assert _set(db.admin, report["change_set"]) == FIRST_SET
+    with schemas.engine(db.app_role, shadow).connect() as conn:
+        untouched = dict(conn.execute(text("SELECT name, model_eligible FROM feature_registry")).all())
+    assert untouched["vix_spot"] is False and untouched["lunar_phase"] is True     # as _REGISTRY made them
+
+
+@pytest.mark.parametrize("waited, written", [(1, True), (2, False)])
+def test_a_rollback_receipt_that_expires_while_the_rollback_holds_its_locks_writes_nothing(
+        db, rollback_flow, monkeypatch, waited, written):
+    """Verified 1 s inside its 30 minutes before connecting; the locked rollback then takes ``waited`` seconds.
+    At exactly 30 minutes the receipt still approves; one second later the commit is refused."""
+    fake, set_1, rollback_dry_run, rollback_apply = rollback_flow
+    code, dry, receipt_file = rollback_dry_run(set_1)
+    created = datetime.strptime(dry["receipt"]["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    fake.now = created + timedelta(seconds=elig.RECEIPT_MAX_AGE_S - 1)
+    real = elig.apply_rollback
+
+    def slow(conn, *args, **kwargs):
+        restored = real(conn, *args, **kwargs)        # the rows are locked and changed, not yet committed
+        fake.now += timedelta(seconds=waited)
+        return restored
+
+    monkeypatch.setattr(elig, "apply_rollback", slow)
+    before = _flags(db.admin)
+    code, report = rollback_apply(set_1, receipt_file, dry["receipt_sha256"])
+    if written:
+        assert code == 0 and report["status"] == "rolled_back"
+        assert report["write_boundary"] == {"deploy_locks_held": [], "rechecked": True}
+        assert len(_log(db.admin)) == 8
+    else:
+        assert code == 2 and report["status"] == "refused" and not report["writes_to_database"]
+        assert report["refusals"][0] == ("the rollback's re-check right before the commit refused it; nothing was "
+                                         "written (run a new rollback dry run)")
+        assert report["refusals"][1].startswith(f"the approved receipt is {elig.RECEIPT_MAX_AGE_S + 1} s old")
+        assert _flags(db.admin) == before and len(_log(db.admin)) == 4
 
 
 def test_rows_that_changed_since_the_receipt_refuse_the_apply(db, owner_flow):

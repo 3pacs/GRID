@@ -722,8 +722,10 @@ def test_a_write_without_its_approval_or_boundary_is_a_programming_error():
         elig.run(MagicMock(), write=True, prerequisites=gate)
     with pytest.raises(ValueError, match="approved receipt's approval"):
         elig.run(MagicMock(), write=True, prerequisites=gate, boundary=boundary)
-    with pytest.raises(ValueError, match="approved receipt's approval"):
+    with pytest.raises(ValueError, match="a rollback needs its write boundary"):
         elig.run(MagicMock(), write=True, rollback_of=uuid.uuid4())
+    with pytest.raises(ValueError, match="approved receipt's approval"):
+        elig.run(MagicMock(), write=True, rollback_of=uuid.uuid4(), boundary=boundary)
 
 
 @pytest.mark.parametrize("argv", [
