@@ -500,6 +500,10 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
     database whose generation has no such table, which is not "no slot has
     lapsed". Checks are append-only and held to that against the last receipt
     that read them; a check for a slot with no stored look is unknown.
+    ``factory_retirement_checks_continuity`` says which: ``baseline`` on the
+    first receipt that read the table (its checks were first seen then; no
+    earlier receipt attests they were only added to), ``extends_last_receipt``
+    after that, ``not_checked`` when no earlier payload was supplied.
     """
 
     def read(_cutoff: datetime) -> SourceRead:
@@ -598,6 +602,11 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
             raise SourceUnavailable(broken)
         payload["continuity"] = ("not_checked" if previous is None else
                                  "first_read" if earlier is None else "extends_last_receipt")
+        # The retirement checks have their own continuity. The first receipt that reads the table is a baseline: the
+        # checks in it were first seen now, and no earlier receipt attests that they were only ever added to.
+        payload["factory_retirement_checks_continuity"] = (
+            None if not has_checks else "not_checked" if previous is None else
+            "extends_last_receipt" if (earlier or {}).get("factory_retirement_checks_table") == "present" else "baseline")
         return SourceRead(payload=payload, rows=len(rows),
                           scope={"database": Path(db).name, "snapshot": "one read-only transaction",
                                  "state": "as read; not limited to the session close",

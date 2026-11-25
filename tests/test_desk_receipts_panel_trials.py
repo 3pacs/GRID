@@ -467,6 +467,23 @@ def test_an_added_check_extends_the_last_receipt_and_a_lapse_is_carried(tmp_path
     payload = json.loads(log.payload(second["payload_sha256"]))
     assert payload["continuity"] == "extends_last_receipt"
     assert [(c["at_fires"], c["lapsed"]) for c in payload["factory_retirement_checks"]] == [(125, False), (150, True)]
+    assert payload["factory_retirement_checks_continuity"] == "baseline"       # first seen now: no earlier receipt read them
+
+
+def test_the_first_receipt_that_reads_the_checks_is_a_baseline_and_the_next_extends_it(tmp_path):
+    db = _run(_db(tmp_path / "signals.db"), CHECKS_DDL, INSERT_125)
+    log = dsr.ReceiptLog(tmp_path / "log")
+    source = dsr.panel_trials_source(db, lambda: log.last_payload("panel_trials"))
+
+    def continuity(at):
+        entry = log.record({"panel_trials": source}, now=lambda: at)["record"]["sources"]["panel_trials"]
+        return json.loads(log.payload(entry["payload_sha256"]))["factory_retirement_checks_continuity"]
+
+    assert continuity(WED_CLOSE + timedelta(minutes=30)) == "baseline"            # the first receipt of all
+    _run(db, INSERT_150)
+    assert continuity(THU_CLOSE + timedelta(minutes=30)) == "extends_last_receipt"
+    assert _read(db).payload["factory_retirement_checks_continuity"] == "not_checked"   # asked directly, nothing to compare with
+    assert _read(_db(tmp_path / "y.db")).payload["factory_retirement_checks_continuity"] is None   # no such table
 
 
 def test_history_is_append_only_for_retirement_checks():

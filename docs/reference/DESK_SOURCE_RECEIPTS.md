@@ -126,7 +126,17 @@ only where the chain stood.
   registration and look the receipt retains, lapsed or not, or it appends nothing and says
   why. `summarize()["live"]["lapsed"]` is the last reading's count, as of that session. It
   is `null` while any passed verdict is covered by no reading, and `0` when no verdict has
-  passed. A reading takes nothing back: a recorded lapse stays that lapse.
+  passed. A reading takes nothing back: every check it names stays that check.
+- **What a reading can and cannot say.** It is an observation at the time the receipt's
+  source read finished, and every check in it must be dated no later than that time (the
+  session is named separately and is not the test). Each check is named in the record
+  (checkpoint, time, last day, lapse flag, text digest), sits at a checkpoint the slot's own
+  registration gives, and was made on the registered floor, level and window, read from the
+  registration's parameter text in the receipt. The first receipt that reads the checks is a
+  `baseline` (`factory_retirement_checks_continuity`): its checks were first seen then, and
+  no earlier receipt attests they were only added to. A count is an observation from a
+  slot's first reading on, not an earlier zero. The check's numbers are the producer's; the
+  rule they are judged on is the registration's.
 - It is a nightly reading: a change made and undone between two closes is not seen.
 
 ## Rules

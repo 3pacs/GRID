@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from datetime import date, timedelta
 
 import pytest
@@ -640,10 +641,14 @@ def test_the_commands_import_once_witness_once_and_report_a_refusal(tmp_path, ca
 
 # --- retirement: a passed slot that later lapses (3pacs/GRID#1163) ------------------------------
 
+RETIREMENT_RULE = {"every_fires": 25, "window_fires": 100, "level": 0.95, "floor_usd": 0.04}   # as a slot registers it
+SLOT_PARAMS = json.dumps({"feature": "F1", "min_n": 100, "retirement": RETIREMENT_RULE}, sort_keys=True)
 
-def check_text(trial, at_fires=125, lower=0.011, floor=0.0, checked_at="2027-04-09T21:10:00+00:00", through="2027-04-09", **over):
+
+def check_text(trial, at_fires=125, lower=0.051, floor=0.04, level=0.95, n=100,
+               checked_at="2027-04-09T21:10:00+00:00", through="2027-04-09", **over):
     """One retirement check exactly as gex-signals stores it (factory_slots.retire: sorted-key JSON)."""
-    res = {"at_fires": at_fires, "n": 100, "mean_net": 0.031, "lower_bound": lower, "level": 0.9, "floor_usd": floor,
+    res = {"at_fires": at_fires, "n": n, "mean_net": 0.071, "lower_bound": lower, "level": level, "floor_usd": floor,
            "lapsed": lower < floor, "b": 10000, "seed": 20261119, "trial_id": SLOT[trial], "version": "panel-factory/2",
            "checked_at": checked_at, "through_day": through,
            "cohort": {"first_day": "2026-12-02", "last_day": through, "days": [], "sha256": "5" * 64}}
@@ -651,13 +656,17 @@ def check_text(trial, at_fires=125, lower=0.011, floor=0.0, checked_at="2027-04-
     return json.dumps(res, sort_keys=True)
 
 
-LAPSE = {"at_fires": 150, "lower": -0.02, "checked_at": "2027-05-07T21:10:00+00:00", "through": "2027-05-07"}
+LAPSE = {"at_fires": 150, "lower": 0.02, "checked_at": "2027-05-07T21:10:00+00:00", "through": "2027-05-07"}
 
 
-def retirement_body(*trials, checks=(), **change):
-    """A nightly receipt's panel_trials payload that also read the retirement checks: ``checks`` is (trial, text) pairs."""
+def retirement_body(*trials, checks=(), checks_continuity="extends_last_receipt", params=SLOT_PARAMS, **change):
+    """A nightly receipt's panel_trials payload that also read the retirement checks: ``checks`` is (trial, text) pairs.
+    Each slot's registration carries ``params``, the text its retirement rule is read from."""
     body = receipt_body(*trials, **change)
+    for slot in body["factory_slots"]:
+        slot["params"] = params
     body["factory_retirement_checks_table"] = "present"
+    body["factory_retirement_checks_continuity"] = checks_continuity
     body["factory_retirement_checks"] = []
     for trial, text in checks:
         stored = json.loads(text)
@@ -668,15 +677,24 @@ def retirement_body(*trials, checks=(), **change):
     return body
 
 
-def reading(ledger, tmp_path, body, session, name=None):
-    """Build that session's receipt log and read it for the passed slots' retirement checks, an hour after the read."""
-    root, anchors, _log = receipts(tmp_path, body, session, name or f"desk-{session}")
-    at = (dsr.session_cutoff(date.fromisoformat(session)) + timedelta(hours=1)).isoformat()
+def read_clock(session):
+    """When that session's receipt finished reading its sources: twenty minutes after the session's cutoff."""
+    return dsr.session_cutoff(date.fromisoformat(session)) + timedelta(minutes=20)
+
+
+def read_at(ledger, root, anchors, session):
+    at = (read_clock(session) + timedelta(minutes=40)).isoformat()
     clock, lse.now_iso = lse.now_iso, lambda: at
     try:
         return lse.read_factory_retirement(ledger, root, anchors, session)
     finally:
         lse.now_iso = clock
+
+
+def reading(ledger, tmp_path, body, session, name=None):
+    """Build that session's receipt log and read it for the passed slots' retirement checks, an hour after its cutoff."""
+    root, anchors, _log = receipts(tmp_path, body, session, name or f"desk-{session}")
+    return read_at(ledger, root, anchors, session)
 
 
 def three_verdicts(tmp_path, lp=None, ap=None):
@@ -687,16 +705,21 @@ def three_verdicts(tmp_path, lp=None, ap=None):
     return ledger, sha
 
 
-def one_pass(tmp_path):
+def one_pass(tmp_path, lp=None, ap=None):
     """A ledger whose only verdict so far is slot 1's pass; slot 2 has not been looked at yet."""
-    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    ledger = lse.Ledger.create_factory(lp, ledger_id="factory-test", anchor=ap)
     sha = run(ledger)
     assert lse.ingest_factory_verdicts(ledger, export(tmp_path, line(sha, T1, "PASS"), name="one.jsonl")) == 1
     return ledger, sha
 
 
-S1, S2, S3, S4 = "2027-03-01", "2027-04-12", "2027-05-10", "2027-05-11"
+# The look is on 2027-03-01. The check at 125 fires is made on 04-09 and the lapsing one at 150 on 05-07, so a
+# receipt can hold the first from S2 on and the second from S3 on, and never earlier.
+S1, S2, S3, S4, S5 = "2027-03-01", "2027-04-12", "2027-05-10", "2027-05-11", "2027-05-12"
 PASSING, LAPSING = check_text(T1), check_text(T1, **LAPSE)
+BOTH = [(T1, PASSING), (T1, LAPSING)]
+ID_150 = {"at_fires": 150, "checked_at": LAPSE["checked_at"], "through_day": LAPSE["through"],
+          "result_sha256": hashlib.sha256(LAPSING.encode()).hexdigest()}
 
 
 def test_readings_follow_a_passed_slot_until_it_lapses_and_summarize_counts_it(tmp_path):
@@ -705,33 +728,64 @@ def test_readings_follow_a_passed_slot_until_it_lapses_and_summarize_counts_it(t
     before = lse.summarize(ledger)["live"]
     assert before["lapsed"] is None and before["retirement"]["passed_not_read"] == 1 and before["retirement"]["readings"] == 0
 
-    first = reading(ledger, tmp_path, retirement_body(T1, T2, T3), S1)
-    assert (first["appended"], first["covered"], first["lapsed"]) == (True, 1, 0)   # only the passed slot is read
+    first = reading(ledger, tmp_path, retirement_body(T1, T2, T3, checks_continuity="baseline"), S1)
+    assert (first["appended"], first["covered"], first["lapsed"], first["first_read"]) == (True, 1, 0, 1)   # only the passed slot
     live = lse.summarize(ledger)["live"]
     assert live["lapsed"] == 0 and live["passed"] == 1      # a count now: the one passed slot was read, and had not lapsed
-    assert live["retirement"] == {**live["retirement"], "as_of_session": S1, "passed_read": 1, "passed_not_read": 0, "readings": 1}
+    assert live["retirement"] == {**live["retirement"], "as_of_session": S1, "as_of_read": read_clock(S1).isoformat(),
+                                  "baseline_session": S1, "checks_continuity": "baseline",
+                                  "passed_read": 1, "passed_not_read": 0, "readings": 1}
+    assert "baseline" in live["retirement"]["note"] and "not an earlier zero" in live["retirement"]["note"]
     by_trial = {v["trial_id"]: v["retirement"] for v in live["verdicts"]}
-    assert by_trial[T1] == {"status": "not_lapsed_at_last_reading", "checks": 0}
+    assert by_trial[T1] == {"status": "not_lapsed_at_last_reading", "checks": 0, "rule_basis": "registration", "first_read_session": S1}
     assert by_trial[T2] is None and by_trial[T3] is None    # a slot that did not pass has nothing to retire
 
-    assert reading(ledger, tmp_path, retirement_body(T1, checks=[(T1, PASSING)]), S2)["lapsed"] == 0
-    assert lse.summarize(ledger)["live"]["verdicts"][0]["retirement"] == {"status": "not_lapsed_at_last_reading", "checks": 1}
+    second = reading(ledger, tmp_path, retirement_body(T1, checks=[(T1, PASSING)]), S2)
+    assert (second["lapsed"], second["first_read"], second["checks_continuity"]) == (0, 0, "extends_last_receipt")
+    assert lse.summarize(ledger)["live"]["verdicts"][0]["retirement"]["checks"] == 1
 
-    third = reading(ledger, tmp_path, retirement_body(T1, checks=[(T1, PASSING), (T1, LAPSING)]), S3)
+    third = reading(ledger, tmp_path, retirement_body(T1, checks=BOTH), S3)
     assert (third["appended"], third["lapsed"]) == (True, 1)
     reloaded = lse.Ledger(lp, anchor=ap)                    # every reading re-verifies by its rules from the file
     live = lse.summarize(reloaded)["live"]
     assert live["lapsed"] == 1 and live["passed"] == 1      # passed is passed; lapsed says what became of it
-    assert live["retirement"]["as_of_session"] == S3 and live["retirement"]["readings"] == 3
+    assert (live["retirement"]["as_of_session"], live["retirement"]["baseline_session"], live["retirement"]["readings"]) == (S3, S1, 3)
     assert live["verdicts"][0]["retirement"] == {
-        "status": "lapsed", "at_fires": 150, "checked_at": LAPSE["checked_at"], "through_day": LAPSE["through"],
-        "result_sha256": hashlib.sha256(LAPSING.encode()).hexdigest(), "n": 100, "lower_bound": -0.02, "floor_usd": 0.0}
+        "status": "lapsed", **ID_150, "n": 100, "lower_bound": 0.02, "floor_usd": 0.04,
+        "checks": 2, "rule_basis": "registration", "first_read_session": S1}
+    kept = reloaded.of_kind(lse.FACTORY_RETIREMENT_READING)[-1]["slots"][0]     # every check is named, not only counted
+    assert [c["at_fires"] for c in kept["checks"]] == [125, 150] and kept["checks"][1] == {**ID_150, "lapsed": True}
+    assert kept["rule"] == {"basis": "registration", **RETIREMENT_RULE,
+                            "registration_content_sha256": hashlib.sha256(f"registration of {SLOT[T1]}".encode()).hexdigest()}
 
-    again = reading(reloaded, tmp_path, retirement_body(T1, checks=[(T1, PASSING), (T1, LAPSING)]), S4)
+    again = reading(reloaded, tmp_path, retirement_body(T1, checks=BOTH), S4)
     assert again["appended"] is False and "already recorded as lapsed" in again["reason"]
-    stale = reading(reloaded, tmp_path, retirement_body(T1, checks=[(T1, PASSING), (T1, LAPSING)]), S2, name="desk-again")
+    stale = reading(reloaded, tmp_path, retirement_body(T1, checks=BOTH), S2, name="desk-again")
     assert stale["appended"] is False and "this session or a later one" in stale["reason"]
     assert len(reloaded.of_kind(lse.FACTORY_RETIREMENT_READING)) == 3
+
+
+@pytest.mark.parametrize("session, checks, why", [
+    # Codex on 6b6fa0b3: an April 9 lapse inside a March 1 receipt, at a valid checkpoint after the look.
+    (S1, [(T1, check_text(T1, lower=0.02))], "the check at 125 fires is dated 2027-04-09"),
+    (S1, [(T1, PASSING)], "the check at 125 fires is dated 2027-04-09"),                   # a check that did not lapse, too
+    (S2, BOTH, "the check at 150 fires is dated 2027-05-07"),                              # the second of two
+    # The session's own day is not the test: this check is dated that day, after the source read had finished.
+    (S2, [(T1, check_text(T1, checked_at="2027-04-12T23:30:00+00:00", through="2027-04-12"))], "the check at 125 fires is dated 2027-04-12T23:30"),
+])
+def test_a_check_dated_after_the_receipts_read_finished_is_refused_and_nothing_is_written(tmp_path, session, checks, why):
+    lp, ap = paths(tmp_path)
+    ledger, _ = three_verdicts(tmp_path, lp, ap)
+
+    with pytest.raises(ValueError, match="after the receipt's source read finished") as refused:
+        reading(ledger, tmp_path, retirement_body(T1, checks=checks, checks_continuity="baseline"), session)
+
+    assert why in str(refused.value) and read_clock(session).isoformat() in str(refused.value)
+    assert ledger.of_kind(lse.FACTORY_RETIREMENT_READING) == [] and lse.summarize(ledger)["live"]["lapsed"] is None
+    assert lse.Ledger(lp, anchor=ap).of_kind(lse.FACTORY_RETIREMENT_READING) == []
+    on_time = retirement_body(T1, checks=[(T1, check_text(T1, checked_at=read_clock(S2).isoformat(), through="2027-04-12"))],
+                              checks_continuity="baseline")
+    assert reading(ledger, tmp_path, on_time, S2, name="on-time")["appended"] is True     # at the read clock itself: in the read
 
 
 def test_unknown_is_not_zero(tmp_path):
@@ -747,8 +801,11 @@ def test_unknown_is_not_zero(tmp_path):
     assert reading(ledger, tmp_path, another_look, S3)["appended"] is False  # the same slot, another stored look
     assert lse.summarize(ledger)["live"]["lapsed"] is None
 
-    assert reading(ledger, tmp_path, retirement_body(T1), S4)["appended"] is True
-    assert lse.summarize(ledger)["live"]["lapsed"] == 0
+    # The first reading comes two months after the look. It is a baseline: 0 from here on, not 0 since the look.
+    assert reading(ledger, tmp_path, retirement_body(T1, checks=[(T1, PASSING)], checks_continuity="baseline"), S4)["appended"] is True
+    live = lse.summarize(ledger)["live"]
+    assert live["lapsed"] == 0 and live["retirement"]["baseline_session"] == S4
+    assert live["verdicts"][0]["retirement"]["first_read_session"] == S4
     # A second slot passes later. No reading covers it yet, so the count is unknown again, not still 0.
     t2 = hashlib.sha256(look_text(T2).encode()).hexdigest()
     lse.ingest_factory_verdicts(ledger, export(tmp_path, line(sha, T2, "PASS", look_sha256=t2), name="later.jsonl"))
@@ -770,34 +827,38 @@ def test_with_no_passed_verdict_nothing_can_lapse(tmp_path):
 
 def test_a_second_passed_slot_is_read_beside_the_first(tmp_path):
     ledger, sha = one_pass(tmp_path)
-    assert reading(ledger, tmp_path, retirement_body(T1, T2, checks=[(T1, PASSING), (T1, LAPSING)]), S1)["lapsed"] == 1
+    assert reading(ledger, tmp_path, retirement_body(T1, T2, checks=BOTH, checks_continuity="baseline"), S3)["lapsed"] == 1
     t2_text = {**LOOK_TEXT, T2: look_text(T2)}
     lse.ingest_factory_verdicts(ledger, export(tmp_path, line(sha, T2, "PASS", look_sha256=hashlib.sha256(t2_text[T2].encode()).hexdigest()),
                                                name="t2.jsonl"))
-    both = retirement_body(T1, T2, texts=t2_text, checks=[(T1, PASSING), (T1, LAPSING), (T2, check_text(T2))])
+    both = retirement_body(T1, T2, texts=t2_text, checks=[*BOTH, (T2, check_text(T2))])
 
-    out = reading(ledger, tmp_path, both, S2)
+    out = reading(ledger, tmp_path, both, S4)
 
-    assert (out["appended"], out["covered"], out["lapsed"]) == (True, 2, 1)   # T1's lapse is carried, T2 is read
+    assert (out["appended"], out["covered"], out["lapsed"], out["first_read"]) == (True, 2, 1, 1)   # T1's lapse is carried, T2 is new
     live = lse.summarize(ledger)["live"]
     assert (live["passed"], live["lapsed"]) == (2, 1)
+    assert [v["retirement"]["first_read_session"] for v in live["verdicts"]] == [S3, S4]
     # A later receipt that no longer retains the first slot would take it back: refused, nothing appended.
     with pytest.raises(ValueError, match="a slot the last reading covered is missing"):
-        reading(ledger, tmp_path, retirement_body(T2, texts=t2_text, checks=[(T2, check_text(T2))]), S3)
+        reading(ledger, tmp_path, retirement_body(T2, texts=t2_text, checks=[(T2, check_text(T2))]), S5)
     assert len(ledger.of_kind(lse.FACTORY_RETIREMENT_READING)) == 2
 
 
-@pytest.mark.parametrize("checks, message", [
-    ([(T1, PASSING)], "takes nothing back"),                                                   # the lapse is gone
-    ([(T1, PASSING), (T1, check_text(T1, **{**LAPSE, "lower": -0.03}))], "takes nothing back"),   # another lapse than the one recorded
-    ([(T1, LAPSING)], "takes nothing back"),                                                   # fewer checks than were read
+@pytest.mark.parametrize("checks, params, message", [
+    ([(T1, PASSING)], SLOT_PARAMS, "takes nothing back"),                                                   # the lapse is gone
+    ([(T1, PASSING), (T1, check_text(T1, **{**LAPSE, "lower": 0.01}))], SLOT_PARAMS, "takes nothing back"),  # another lapse than the one recorded
+    ([(T1, check_text(T1, mean_net=0.072)), (T1, LAPSING)], SLOT_PARAMS, "takes nothing back"),             # an earlier check's text changed
+    ([(T1, LAPSING)], SLOT_PARAMS, "the registered checkpoints"),                                           # the first check is gone
+    ([(T1, check_text(T1, level=0.9)), (T1, check_text(T1, level=0.9, **LAPSE))],
+     json.dumps({"retirement": {**RETIREMENT_RULE, "level": 0.9}}), "takes nothing back"),                  # another rule than the one recorded
 ])
-def test_a_later_receipt_cannot_take_a_lapse_back(tmp_path, checks, message):
+def test_a_later_receipt_cannot_take_a_check_or_a_lapse_back(tmp_path, checks, params, message):
     ledger, _ = three_verdicts(tmp_path)
-    assert reading(ledger, tmp_path, retirement_body(T1, checks=[(T1, PASSING), (T1, LAPSING)]), S1)["lapsed"] == 1
+    assert reading(ledger, tmp_path, retirement_body(T1, checks=BOTH, checks_continuity="baseline"), S3)["lapsed"] == 1
     with pytest.raises(ValueError, match=message):
-        reading(ledger, tmp_path, retirement_body(T1, T2, checks=checks), S2)
-    assert lse.summarize(ledger)["live"]["lapsed"] == 1
+        reading(ledger, tmp_path, retirement_body(T1, T2, checks=checks, params=params), S4)
+    assert lse.summarize(ledger)["live"]["lapsed"] == 1 and len(ledger.of_kind(lse.FACTORY_RETIREMENT_READING)) == 1
 
 
 def _swap(body, **change):
@@ -806,72 +867,143 @@ def _swap(body, **change):
 
 
 @pytest.mark.parametrize("body, message", [
-    (lambda: _swap(retirement_body(T1, checks=[(T1, PASSING)]), result=PASSING.replace("0.011", "0.012")), "not the text its digest names"),
-    (lambda: _swap(retirement_body(T1, checks=[(T1, PASSING)]), lapsed=True), "lapse flag is not what its own bound and floor give"),
-    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, lapsed=True))]), "lapse flag is not what its own bound and floor give"),
+    (lambda: _swap(retirement_body(T1, checks=[(T1, PASSING)]), result=PASSING.replace("0.051", "0.052")), "not the text its digest names"),
+    (lambda: _swap(retirement_body(T1, checks=[(T1, PASSING)]), lapsed=True), "lapse flag that is not what"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, lapsed=True))]), "lapse flag that is not what"),
     (lambda: retirement_body(T1, checks=[(T1, check_text(T2))]), "is not that slot's check"),
     (lambda: _swap(retirement_body(T1, checks=[(T1, PASSING)]), at_fires=126), "is not that slot's check"),
-    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, lower=-0.02)), (T1, check_text(T1, at_fires=150))]), "a check after the one that lapsed it"),
-    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, at_fires=100, lower=-0.02))]), "comes after the look"),
-    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, lower=-0.02, checked_at="2027-02-01T21:10:00+00:00"))]), "comes after the look"),
+    # the row's own clocks are the text's, exactly
+    (lambda: _swap(retirement_body(T1, checks=[(T1, PASSING)]), checked_at="2027-04-09T21:11:00+00:00"), "row time or last day that is not its text's"),
+    (lambda: _swap(retirement_body(T1, checks=[(T1, PASSING)]), through_day="2027-04-08"), "row time or last day that is not its text's"),
+    # the rule is the registration's, not what the check says of itself
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, floor=0.0))]), "not made on the registered rule"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, lower=0.02, floor=0.0))]), "not made on the registered rule"),   # "did not lapse" on a lower floor
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, level=0.9))]), "not made on the registered rule"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, n=50))]), "not made on the registered rule"),
+    (lambda: retirement_body(T1, checks=[(T1, PASSING)], params="{}"), "registration names no retirement rule"),
+    (lambda: retirement_body(T1, checks=[(T1, PASSING)], params="not json"), "registration names no retirement rule"),
+    (lambda: retirement_body(T1, params=json.dumps({"retirement": {**RETIREMENT_RULE, "every_fires": 0}})), "is not a rule"),
+    (lambda: retirement_body(T1, params=json.dumps({"retirement": {"floor_usd": 0.04}})), "is not a rule"),
+    # the registered checkpoints, in order, none skipped
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, at_fires=150))]), "the registered checkpoints"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, at_fires=100))]), "the registered checkpoints"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, at_fires=130))]), "the registered checkpoints"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, lower=0.02)), (T1, check_text(T1, at_fires=150))]), "only a slot's last check"),
+    # clocks
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, checked_at="2027-02-01T21:10:00+00:00", through="2027-02-01"))]), "comes after the look"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, **{**LAPSE, "at_fires": 125}))]), None),          # a lapse at the first checkpoint: allowed
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, checked_at=LAPSE["checked_at"], through=LAPSE["through"])),
+                                         (T1, check_text(T1, at_fires=150))]), "no earlier than the check before it"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, through="2027-04-10"))]), "last day is not after the day it was made"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, through="2027-02-26"))]), "last day is not after the day it was made"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, through="April 9"))]), "its last day an ISO date"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, through="2027-4-9"))]), "ISO date"),
+    (lambda: retirement_body(T1, checks=[(T1, check_text(T1, checked_at="soon"))]), "an ISO time with a zone"),
     (lambda: retirement_body(T1, continuity="not_checked"), "not read against the receipt log's own history"),
+    (lambda: retirement_body(T1, checks_continuity="not_checked"), "retirement checks were not read against the receipt log's own history"),
 ])
-def test_a_receipt_that_contradicts_itself_or_the_look_is_refused(tmp_path, body, message):
+def test_a_receipt_that_contradicts_the_registration_the_clock_or_itself_is_refused(tmp_path, body, message):
     ledger, _ = three_verdicts(tmp_path)
+    if message is None:
+        assert reading(ledger, tmp_path, body(), S3)["lapsed"] == 1
+        return
     with pytest.raises(ValueError, match=message):
-        reading(ledger, tmp_path, body(), S1)
+        reading(ledger, tmp_path, body(), S3)
     assert ledger.of_kind(lse.FACTORY_RETIREMENT_READING) == [] and lse.summarize(ledger)["live"]["lapsed"] is None
+
+
+def test_a_slot_registered_without_a_retirement_rule_is_read_as_having_none(tmp_path):
+    ledger, _ = three_verdicts(tmp_path)
+
+    out = reading(ledger, tmp_path, retirement_body(T1, params="{}", checks_continuity="baseline"), S1)
+
+    slot = ledger.of_kind(lse.FACTORY_RETIREMENT_READING)[0]["slots"][0]
+    assert out["appended"] and slot["rule"]["basis"] == "none_registered" and slot["checks"] == [] and slot["lapsed"] is False
+    assert lse.summarize(ledger)["live"]["verdicts"][0]["retirement"]["rule_basis"] == "none_registered"
 
 
 def test_what_a_reading_must_be(tmp_path):
     ledger, _ = three_verdicts(tmp_path)
-    reading(ledger, tmp_path, retirement_body(T1, checks=[(T1, PASSING), (T1, LAPSING)]), S1)
+    reading(ledger, tmp_path, retirement_body(T1, checks=BOTH, checks_continuity="baseline"), S3)
     good = ledger.of_kind(lse.FACTORY_RETIREMENT_READING)[0]
     forward = lse.factory_forward_index(ledger)
     failed = next(sha for sha, v in forward.items() if v["verdict"] == "fail")
     slot = good["slots"][0]
+    first, last = slot["checks"]
 
     def refused(message, earlier=(), **change):
         with pytest.raises(ValueError, match=message):
             lse.validate_factory_retirement_reading({**good, **change}, forward, list(earlier))
 
+    def with_slot(**change):
+        return {"slots": [{**slot, **change}]}
+
     lse.validate_factory_retirement_reading(good, forward, [])
     refused("names at least one passed slot", slots=[])
-    refused("must name a passed live verdict", slots=[{**slot, "forward_sha256": failed}])
-    refused("must name a passed live verdict", slots=[{**slot, "forward_sha256": "0" * 64}])
+    refused("must name a passed live verdict", **with_slot(forward_sha256=failed))
+    refused("must name a passed live verdict", **with_slot(forward_sha256="0" * 64))
     refused("names each slot once", slots=[slot, slot])
-    refused("another verdict, another stored look or another slot", slots=[{**slot, "look_sha256": "0" * 64}])
-    refused("another verdict, another stored look or another slot", slots=[{**slot, "slot_trial_id": "T-PF-09"}])
-    refused("how many checks", slots=[{**slot, "lapsed": 1}])
-    refused("carries its lapsing check", slots=[{**slot, "lapse": None}])
-    refused("carries its lapsing check", slots=[{**slot, "lapse": {**slot["lapse"], "extra": 1}}])
-    refused("below the registered floor", slots=[{**slot, "lapse": {**slot["lapse"], "lower_bound": 0.0}}])
-    refused("comes after the look", slots=[{**slot, "lapse": {**slot["lapse"], "at_fires": 100}}])
-    refused("carries no lapsing check", slots=[{**slot, "lapsed": False}])
+    refused("another verdict, another stored look or another slot", **with_slot(look_sha256="0" * 64))
+    refused("another verdict, another stored look or another slot", **with_slot(slot_trial_id="T-PF-09"))
+    refused("carries the retirement rule of its registration", **with_slot(rule=None))
+    refused("carries the retirement rule of its registration", **with_slot(rule={**slot["rule"], "basis": "the check says so"}))
+    refused("carries the retirement rule of its registration", **with_slot(rule={**slot["rule"], "registration_content_sha256": "x"}))
+    refused("a registered retirement rule is", **with_slot(rule={**slot["rule"], "extra": 1}))
+    refused("is not a rule", **with_slot(rule={**slot["rule"], "every_fires": 0}))
+    refused("has no retirement checks", **with_slot(rule={"basis": "none_registered",
+                                                           "registration_content_sha256": slot["rule"]["registration_content_sha256"]}))
+    refused("names its checks", **with_slot(checks=2))
+    refused("names its checks", **with_slot(lapsed=1))
+    refused("names its checks", **with_slot(first_read=None))
+    refused("is named by", **with_slot(checks=[{**first, "extra": 1}, last]))
+    refused("is named by", **with_slot(checks=[{**first, "result_sha256": "short"}, last]))
+    refused("the registered checkpoints", **with_slot(checks=[last]))                       # a checkpoint skipped
+    refused("the registered checkpoints", **with_slot(checks=[{**first, "at_fires": 126}, last]))
+    refused("only a slot's last check", **with_slot(checks=[{**first, "lapsed": True}, last]))
+    refused("comes after the look", **with_slot(checks=[{**first, "checked_at": "2027-02-01T21:10:00+00:00", "through_day": "2027-02-01"}, last]))
+    refused("no earlier than the check before it", **with_slot(checks=[{**first, "checked_at": "2027-05-08T21:10:00+00:00"}, last]))
+    refused("last day is not after the day it was made", **with_slot(checks=[{**first, "through_day": "2027-04-10"}, last]))
+    refused("ISO", **with_slot(checks=[{**first, "through_day": "April 9"}, last]))
+    refused("lapsed exactly when its last check lapsed it", **with_slot(lapsed=False, lapse=None))
+    refused("lapsed exactly when its last check lapsed it", **with_slot(checks=[first], lapsed=True))
+    refused("carries its lapsing check", **with_slot(lapse=None))
+    refused("carries its lapsing check", **with_slot(lapse={**slot["lapse"], "extra": 1}))
+    refused("carries its lapsing check", **with_slot(lapse={**slot["lapse"], "at_fires": 125}))             # not the last check named
+    refused("carries its lapsing check", **with_slot(lapse={**slot["lapse"], "result_sha256": "9" * 64}))
+    refused("below the registered floor", **with_slot(lapse={**slot["lapse"], "lower_bound": 0.04}))
+    refused("registered floor, on the registered window", **with_slot(lapse={**slot["lapse"], "floor_usd": 0.05}))
+    refused("registered floor, on the registered window", **with_slot(lapse={**slot["lapse"], "n": 50}))
+    refused("carries no lapsing check", **with_slot(checks=[first], lapsed=False))
+    refused("first_read marks a slot no earlier reading covered", **with_slot(first_read=False))
+    refused("first to read the checks", checks_continuity="not_checked")
+    refused("first to read the checks", checks_continuity=None)
     refused("cannot arrive before its receipt was read", read_at="2027-03-01T00:00:00+00:00")
     refused("a witness names its receipt", receipt={**good["receipt"], "head_sha256": "short"})
     refused("for a session after the last reading's", earlier=[good])
+    # Codex's case at the record itself: the same checks under a receipt whose source read finished before them.
+    early = {**good["receipt"], "session": S1, "read_finished_at": read_clock(S1).isoformat()}
+    refused("after the receipt's source read finished", receipt=early)
+    refused("after the receipt's source read finished", receipt={**early, "read_finished_at": "2027-05-07T21:09:59+00:00"})
+    lse.validate_factory_retirement_reading({**good, "receipt": {**early, "read_finished_at": LAPSE["checked_at"]}}, forward, [])
     assert lse.FACTORY_RETIREMENT_READING in lse.FACTORY_KINDS
 
 
 def test_a_reading_written_past_the_rules_is_caught_on_reload(tmp_path, monkeypatch):
     lp, ap = paths(tmp_path)
     ledger, _ = three_verdicts(tmp_path, lp, ap)
-    with monkeypatch.context() as patch:             # a writer that skipped the rules: the chain and anchor are valid
+    reading(ledger, tmp_path, retirement_body(T1, checks=BOTH, checks_continuity="baseline"), S3)
+    good = ledger.of_kind(lse.FACTORY_RETIREMENT_READING)[0]
+    mine = ("kind", "slots", "receipt", "checked", "checks_recomputed", "checks_continuity", "read_at", "recorded_at")
+    # The next session's reading, with a receipt whose source read finished before the lapsing check was made.
+    forged = {**{k: good[k] for k in mine}, "slots": [{**good["slots"][0], "first_read": False}],
+              "receipt": {**good["receipt"], "session": S4, "read_finished_at": "2027-05-01T21:20:00+00:00"},
+              "read_at": "2027-05-12T00:00:00+00:00", "recorded_at": "2027-05-12T00:00:00+00:00"}
+    with pytest.raises(ValueError, match="after the receipt's source read finished"):
+        ledger._append(dict(forged))                     # the rules refuse it on append
+    with monkeypatch.context() as patch:                 # a writer that skipped the rules: the chain and anchor are valid
         patch.setattr(lse, "validate_factory_retirement_reading", lambda *a, **k: None)
-        text = check_text(T1, at_fires=150, lower=0.02, lapsed=True)     # "lapsed" with a bound above the floor
-        body = retirement_body(T1, checks=[(T1, text)])
-        record = {"kind": lse.FACTORY_RETIREMENT_READING, "read_at": "2027-03-02T00:20:05+00:00", "recorded_at": "2027-03-02T00:20:05+00:00",
-                  "checks_recomputed": True, "checked": {"by_code": ["x"], "by_a_person": "that the anchor copy is the vault's own file"},
-                  "receipt": {"session": S1, "head_sha256": "1" * 64, "payload_sha256": "2" * 64, "log_records": 2,
-                              "read_finished_at": "2027-03-01T21:20:00+00:00", "external_anchor": {"sha256": "3" * 64, "witnessed_records": 2}},
-                  "slots": [{"forward_sha256": next(iter(lse.factory_forward_index(ledger))), "run_id": "r1", "trial_id": T1,
-                             "look_sha256": LOOK[T1], "slot_trial_id": SLOT[T1], "checks": 1, "lapsed": True,
-                             "lapse": {"at_fires": 150, "checked_at": "2027-04-09T21:10:00+00:00", "through_day": "2027-04-09",
-                                       "result_sha256": body["factory_retirement_checks"][0]["result_sha256"], "n": 100,
-                                       "lower_bound": 0.02, "floor_usd": 0.0}}]}
-        ledger._append(record)
-    with pytest.raises(ValueError, match="below the registered floor"):
+        ledger._append(dict(forged))
+    with pytest.raises(ValueError, match="after the receipt's source read finished"):
         lse.Ledger(lp, anchor=ap)
 
 
@@ -879,3 +1011,106 @@ def test_only_a_factory_ledger_takes_retirement_readings(tmp_path):
     s11 = lse.Ledger.create(None, catalog=lse.synthetic_catalog(), ledger_id="s11-test")
     with pytest.raises(ValueError, match="belong on a factory ledger"):
         lse.read_factory_retirement(s11, tmp_path / "log", tmp_path / "anchors.jsonl", S1)
+
+
+# --- end to end: a signals database as gex-signals makes it -> the real receipt source -> a verified receipt ->
+#     the reading -> a reload. No payload is handed in: every one is read from the database by the receipt source.
+
+TRIALS_DDL = ("CREATE TABLE panel_trials (seq INTEGER PRIMARY KEY AUTOINCREMENT, trial_id TEXT, kind TEXT, name TEXT, "
+              "registered_at TEXT, hypothesis TEXT, metric TEXT, horizon_min INTEGER, min_n INTEGER, alpha REAL, family TEXT, "
+              "family_k INTEGER, in_sample_sessions TEXT, params TEXT, prev_hash TEXT, row_hash TEXT NOT NULL)")
+CHECKS_DDL = ("CREATE TABLE factory_retirement_checks (trial_id TEXT NOT NULL, at_fires INTEGER NOT NULL, checked_at TEXT NOT NULL, "
+              "through_day TEXT NOT NULL, lapsed INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY (trial_id, at_fires))")
+
+
+def signals_db(path, retirement_table=True):
+    """Slot 1 registered with its retirement rule and looked at on 2027-03-01, as generation Z leaves the database."""
+    conn = sqlite3.connect(path)
+    conn.execute(TRIALS_DDL)
+    conn.execute("INSERT INTO panel_trials (trial_id, family, registered_at, min_n, params, prev_hash, row_hash) VALUES (?,?,?,?,?,?,?)",
+                 (SLOT[T1], "panel-factory", "2026-12-01T22:00:00+00:00", 100, SLOT_PARAMS, None, ROW[T1]))
+    for name in dsr.FACTORY_TABLES:
+        if name != "factory_looks":
+            conn.execute(f"CREATE TABLE {name} (trial_id TEXT, day TEXT)")
+    conn.execute("CREATE TABLE factory_looks (trial_id TEXT PRIMARY KEY, looked_at TEXT NOT NULL, through_day TEXT, result TEXT NOT NULL)")
+    conn.execute("INSERT INTO factory_looks VALUES (?,?,?,?)", (SLOT[T1], LOOKED, "2027-03-01", LOOK_TEXT[T1]))
+    if retirement_table:
+        conn.execute(CHECKS_DDL)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def store_check(db, text):
+    """Insert one check the way factory_slots.retire does: the row's columns are the text's own values."""
+    res = json.loads(text)
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO factory_retirement_checks VALUES (?,?,?,?,?,?)",
+                 (res["trial_id"], res["at_fires"], res["checked_at"], res["through_day"], int(res["lapsed"]), text))
+    conn.commit()
+    conn.close()
+
+
+class Desk:
+    """One receipt log reading one signals database night after night, with its anchor copy exported to a vault."""
+
+    def __init__(self, tmp_path, db):
+        self.log = dsr.ReceiptLog(tmp_path / "desk" / "log")
+        self.vault = tmp_path / "desk" / "vault"
+        self.source = dsr.panel_trials_source(db, lambda: self.log.last_payload("panel_trials"))
+
+    def night(self, ledger, session):
+        entry = self.log.record({"panel_trials": self.source}, now=lambda: read_clock(session))["record"]["sources"]["panel_trials"]
+        self.log.export_anchors(self.vault)
+        return entry, lambda: read_at(ledger, self.log.root, self.vault / dsr.WITNESS_DIR / dsr.ANCHOR_NAME, session)
+
+
+def test_end_to_end_from_the_signals_database_to_a_reloaded_ledger(tmp_path):
+    lp, ap = paths(tmp_path)
+    ledger, _ = one_pass(tmp_path, lp, ap)
+    db = signals_db(tmp_path / "signals.db")
+    desk = Desk(tmp_path, db)
+
+    entry, read = desk.night(ledger, S1)                 # the first receipt of all: the table is there and empty
+    assert entry["status"] == "read"
+    first = read()
+    assert (first["appended"], first["lapsed"], first["first_read"], first["checks_continuity"]) == (True, 0, 1, "baseline")
+
+    store_check(db, PASSING)
+    assert desk.night(ledger, S2)[1]() == {**first, "session": S2, "first_read": 0, "checks_continuity": "extends_last_receipt",
+                                           "sha256": ledger.line_sha(ledger.records[-1]["seq"])}
+    store_check(db, LAPSING)
+    third = desk.night(ledger, S3)[1]()
+    assert (third["appended"], third["lapsed"]) == (True, 1)
+
+    reloaded = lse.Ledger(lp, anchor=ap)
+    live = lse.summarize(reloaded)["live"]
+    assert (live["passed"], live["lapsed"]) == (1, 1) and live["retirement"]["readings"] == 3
+    assert live["verdicts"][0]["retirement"] == {"status": "lapsed", **ID_150, "n": 100, "lower_bound": 0.02, "floor_usd": 0.04,
+                                                 "checks": 2, "rule_basis": "registration", "first_read_session": S1}
+    slot = reloaded.of_kind(lse.FACTORY_RETIREMENT_READING)[-1]["slots"][0]
+    assert slot["rule"]["basis"] == "registration" and {k: slot["rule"][k] for k in RETIREMENT_RULE} == RETIREMENT_RULE
+    assert [c["result_sha256"] for c in slot["checks"]] == [hashlib.sha256(t.encode()).hexdigest() for t in (PASSING, LAPSING)]
+
+
+def test_end_to_end_a_future_dated_row_and_a_database_without_the_table_write_no_reading(tmp_path):
+    lp, ap = paths(tmp_path)
+    ledger, _ = one_pass(tmp_path, lp, ap)
+    db = signals_db(tmp_path / "signals.db")
+    store_check(db, check_text(T1, lower=0.02))          # a lapse dated 2027-04-09, in the database on 2027-03-01
+    desk = Desk(tmp_path, db)
+
+    entry, read = desk.night(ledger, S1)
+    assert entry["status"] == "read"                     # the source reads what is there; it judges no clock
+    with pytest.raises(ValueError, match="after the receipt's source read finished"):
+        read()
+    assert lse.Ledger(lp, anchor=ap).of_kind(lse.FACTORY_RETIREMENT_READING) == []
+    assert lse.summarize(ledger)["live"]["lapsed"] is None
+
+    other = tmp_path / "y"
+    other.mkdir()
+    ledger_y, _ = one_pass(other)
+    desk_y = Desk(other, signals_db(other / "signals.db", retirement_table=False))    # panel-factory/1: no retirement table
+    out = desk_y.night(ledger_y, S1)[1]()
+    assert out["appended"] is False and "unknown, not no" in out["reason"]
+    assert lse.summarize(ledger_y)["live"]["lapsed"] is None
