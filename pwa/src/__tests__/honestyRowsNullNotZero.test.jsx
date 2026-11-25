@@ -149,6 +149,37 @@ describe('Regime', () => {
         expect(screen.queryByText('Trend Rider')).toBeNull();
     });
 
+    it('a refresh whose side requests fail clears those panels and says so, never keeping the previous read', async () => {
+        const FAILED = { error: true, status: 503 };
+        api.getCurrent.mockResolvedValue(GROWTH);
+        api.getAllActiveRegimes
+            .mockResolvedValueOnce({ macro: [{ state: 'GROWTH', confidence: 0.7, recommendation: 'HOLD' }], strategy: [{ state: 'MOMENTUM', confidence: 0.4, recommendation: 'ADD' }] })
+            .mockResolvedValueOnce(FAILED);
+        api.getHistory
+            .mockResolvedValueOnce({ history: [{ date: '2026-01-01', state: 'GROWTH', confidence: 0.5 }] })
+            .mockResolvedValueOnce(FAILED);
+        api.getTransitions
+            .mockResolvedValueOnce({ transitions: [{ date: '2026-01-02', from_state: 'GROWTH', to_state: 'FRAGILE', confidence: 0.5 }] })
+            .mockResolvedValueOnce(FAILED);
+        api.getStrategyForRegime.mockResolvedValue(null);
+        const view = render(<Regime />);
+        fireEvent.click(await screen.findByText(/^macro$/i));
+        // 70% is on the banner (current read) and on the GROWTH bar (all-regimes read).
+        await waitFor(() => expect(screen.getAllByText('70%').length).toBe(2));
+        fireEvent.click(screen.getByText('REFRESH'));
+        await screen.findByTestId('regime-readings-unavailable');
+        expect(screen.getAllByText('70%').length).toBe(1);
+        fireEvent.click(screen.getByText(/^subtypes$/i));
+        expect(screen.queryByText('MOMENTUM')).toBeNull();
+        expect(screen.getByText(/Regime subtypes unavailable/)).toBeTruthy();
+        fireEvent.click(screen.getByText(/^history$/i));
+        expect(screen.getByTestId('regime-history-unavailable')).toBeTruthy();
+        expect(view.container.querySelector('[title^="2026-01-01"]')).toBeNull();
+        expect(screen.getByText(/Transitions unavailable/)).toBeTruthy();
+        expect(screen.queryByText('No transitions detected yet')).toBeNull();
+        expect(screen.queryByText('FRAGILE')).toBeNull();
+    });
+
     it('an older read finishing its strategy load after a newer read applies none of its panels', async () => {
         let release;
         const slowStrategy = new Promise((res) => { release = res; });

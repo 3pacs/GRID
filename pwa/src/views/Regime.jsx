@@ -123,6 +123,9 @@ export default function Regime() {
     const [synthLoading, setSynthLoading] = useState(false);
     const [history, setHistory] = useState([]);
     const [transitions, setTransitions] = useState([]);
+    // Which of this read's side requests failed. A failed one clears its panel
+    // (never leaves the previous read under the new banner) and says so.
+    const [panelDown, setPanelDown] = useState({ all: false, history: false, transitions: false });
     const [activeTab, setActiveTab] = useState('action');
     // The strategy is stored with the regime it was loaded for, and shown only
     // while that is still the regime on screen.
@@ -150,9 +153,13 @@ export default function Regime() {
         // Apply this read's other panels together with the banner, before the
         // strategy request, so none of them shows the previous read under the
         // new regime while that request is in flight.
-        if (all && !all.error) setAllRegimes(all);
-        setHistory(hist.history || []);
-        setTransitions(trans.transitions || []);
+        const allOk = !!all && !all.error;
+        const histOk = !!hist && !hist.error;
+        const transOk = !!trans && !trans.error;
+        setAllRegimes(allOk ? all : null);
+        setHistory(histOk ? (hist.history || []) : []);
+        setTransitions(transOk ? (trans.transitions || []) : []);
+        setPanelDown({ all: !allOk, history: !histOk, transitions: !transOk });
         if (current && !current.error) {
             // Fetch the strategy for the current regime
             const strat = await api.getStrategyForRegime(current.state).catch(() => null);
@@ -391,6 +398,11 @@ export default function Regime() {
                         How the economy is positioned across 4 macro states. Multiple can fire simultaneously
                         — contradictions reveal regime transitions in progress.
                     </div>
+                    {panelDown.all && (
+                        <div data-testid="regime-readings-unavailable" style={{ color: colors.yellow, fontSize: '12px', marginBottom: '10px' }}>
+                            Regime readings unavailable: the request failed.
+                        </div>
+                    )}
                     {macroStates.map(state => {
                         const active = allRegimes?.macro?.find(r => r.state === state);
                         return (
@@ -465,7 +477,7 @@ export default function Regime() {
                         ))
                     ) : (
                         <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '20px' }}>
-                            No regime subtypes detected yet
+                            {panelDown.all ? 'Regime subtypes unavailable: the request failed.' : 'No regime subtypes detected yet'}
                         </div>
                     )}
                 </div>
@@ -548,7 +560,7 @@ export default function Regime() {
                         </div>
                     ) : (
                         <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '20px' }}>
-                            No significant movers detected
+                            {panelDown.all ? 'Movers unavailable: the request failed.' : 'No significant movers detected'}
                         </div>
                     )}
 
@@ -590,6 +602,11 @@ export default function Regime() {
             {/* ═══ HISTORY TAB ═══ */}
             {activeTab === 'history' && (
                 <div>
+                    {panelDown.history && (
+                        <div data-testid="regime-history-unavailable" style={{ color: colors.yellow, fontSize: '12px', marginBottom: '10px' }}>
+                            History unavailable: the request failed.
+                        </div>
+                    )}
                     {history.length > 0 && (
                         <>
                             <div style={shared.sectionTitle}>90-DAY TIMELINE</div>
@@ -613,7 +630,7 @@ export default function Regime() {
                         </>
                     )}
 
-                    <div style={shared.sectionTitle}>TRANSITIONS ({transitions.length})</div>
+                    <div style={shared.sectionTitle}>TRANSITIONS ({panelDown.transitions ? '-' : transitions.length})</div>
                     {transitions.length > 0 ? (
                         transitions.slice(-15).reverse().map((t, i) => (
                             <div key={i} style={{
@@ -642,7 +659,7 @@ export default function Regime() {
                         ))
                     ) : (
                         <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '20px' }}>
-                            No transitions detected yet
+                            {panelDown.transitions ? 'Transitions unavailable: the request failed.' : 'No transitions detected yet'}
                         </div>
                     )}
                 </div>
