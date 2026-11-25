@@ -101,7 +101,7 @@ def test_universe_run_on_postgres(pg_engine):
         conn.execute(text(
             "INSERT INTO ticker_metrics_daily (ticker, obs_date, shares_outstanding, close_price, market_cap_usd, source) "
             "VALUES ('AAA', :fri, 1000, 10.9, 10900, 'sec_xbrl + yfinance'), "     # sec_xbrl_shares owns it
-            "('AAA', :thu, NULL, 9.7, NULL, 'twelvedata_universe_backfill'), "        # an existing close
+            "('AAA', :thu, NULL, 9.99, NULL, 'twelvedata_universe_backfill'), "        # an existing close
             "('AAA', :wed, NULL, NULL, NULL, 'placeholder')"),                        # a row with no close
             {"fri": FRI, "thu": THU, "wed": WED})
 
@@ -114,7 +114,7 @@ def test_universe_run_on_postgres(pg_engine):
     assert receipt["by_source"] == {"TIINGO": 1, "yfinance": 1}
     rows = _metrics(pg_engine)
     assert rows[("AAA", FRI)] == (10.9, 1000, "sec_xbrl + yfinance")              # untouched
-    assert rows[("AAA", THU)] == (9.7, None, "twelvedata_universe_backfill")      # an existing close is kept
+    assert rows[("AAA", THU)] == (9.99, None, "twelvedata_universe_backfill")      # an existing close is kept
     assert rows[("AAA", WED)] == (9.0, None, "stored_close_backfill:TIINGO")      # the missing close is filled
     assert rows[("BBB", FRI)] == (5.5, None, "stored_close_backfill:yfinance")
     assert ("BBB", THU) not in rows                                               # only a provisional price
@@ -126,6 +126,28 @@ def test_universe_run_on_postgres(pg_engine):
 
     dry = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT, dry_run=True)
     assert dry["eligible_tickers"] == 2 and dry["written"] == 0 and _metrics(pg_engine) == rows
+
+
+def test_basis_conflict_and_unverified_on_postgres(pg_engine):
+    """A ticker whose stored closes sit on another basis is withheld whole; one
+    with stored closes but no common day is filled and named as unverified."""
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO data_freshness_audit (ticker, bucket, audited_at) VALUES "
+            "('SPL', 'DEAD', now()), ('NOV', 'DEAD', now())"))
+        _close(conn, "SPL", 1, THU, 0.30)
+        _close(conn, "SPL", 1, FRI, 0.31)
+        _close(conn, "NOV", 1, FRI, 7.0)
+        conn.execute(text(
+            "INSERT INTO ticker_metrics_daily (ticker, obs_date, close_price, source) VALUES "
+            "('SPL', :thu, 6.08, 'twelvedata_universe_backfill'), "      # split-adjusted next to a raw close
+            "('NOV', :wed, 7.1, 'twelvedata_universe_backfill')"),       # no day in common
+            {"thu": THU, "wed": WED})
+    receipt = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT)
+    assert receipt["basis_conflict"] == ["SPL"] and receipt["basis_unverified"] == ["NOV"]
+    rows = _metrics(pg_engine)
+    assert rows[("SPL", THU)][0] == 6.08 and ("SPL", FRI) not in rows       # withheld whole, nothing written
+    assert rows[("NOV", FRI)] == (7.0, None, "stored_close_backfill:TIINGO")
 
 
 def test_gem_run_on_postgres(pg_engine):

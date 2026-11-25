@@ -2,12 +2,14 @@
 """Fill missing ticker_metrics_daily closes from GRID's own stored prices.
 
 The replacement for the two Twelve Data backfills (owner, 2026-11-23: "drop
-the twelve stuff, get it from our other sources instead"). **Not wired to a
-unit yet**: ``scripts/td_backfill_universe.py`` and
-``scripts/td_backfill_gem_tickers.py`` keep running until this script's
-coverage of both cohorts has been measured on griddb (run it with
-``DRY_RUN=1`` and read the receipt line). Joining the Tiingo list is not
-coverage.
+the twelve stuff, get it from our other sources instead"). **Wired for the
+universe cohort only**: ``scripts/td_backfill_universe.py``, the entry point of
+``grid-td-universe-backfill.service``, delegates here (``universe`` mode).
+``scripts/td_backfill_gem_tickers.py`` keeps running Twelve Data until the gem
+cohort's coverage is good enough (the gem tickers that are not on the Tiingo
+list have no stored close to fill from). ``DRY_RUN=1`` reads and reports and
+writes nothing; read its receipt line to measure coverage. Joining the Tiingo
+list is not coverage.
 
 Cohorts:
 
@@ -37,6 +39,16 @@ What is written. Only a missing close: a new ``(ticker, obs_date)`` row, or a
 row whose ``close_price`` is NULL and that ``sec_xbrl_shares`` does not own
 (``shares_outstanding`` NULL). An existing close is never replaced, whoever
 wrote it; correcting one needs its own reviewed change.
+
+Basis guard. Closes already stored for the ticker are compared with the
+eligible stored closes on the same days. When any pair differs by more than
+1% and more than 0.01 (a split-adjusted close next to a raw one, for example),
+the ticker is **withheld whole** and listed under ``basis_conflict`` in the
+receipt, so a series never gets two price bases side by side. Two-decimal
+rounding of a sub-dollar price is under that bar and does not count. A ticker
+that has stored closes but no day in common with the eligible ones cannot be
+compared: it is still filled and is listed under ``basis_unverified`` (unknown,
+not verified same-basis).
 
 Environment: ``DRY_RUN=1`` reads and reports but writes nothing (this is the
 coverage measurement); ``ONLY_BUCKET=DEAD`` and ``LIMIT=20`` narrow the
@@ -93,6 +105,12 @@ _GEM_WORK_SQL = text(
     " WHERE m.ticker = g.t AND m.close_price IS NOT NULL AND m.obs_date >= :fresh_since"
     ") ORDER BY 1"
 )
+_EXISTING_CLOSES_SQL = text(
+    "SELECT obs_date, close_price FROM ticker_metrics_daily "
+    "WHERE ticker = :ticker AND obs_date >= :start AND close_price IS NOT NULL"
+)
+BASIS_REL_TOLERANCE = 0.01
+BASIS_ABS_TOLERANCE = 0.01
 # Fill only: a new row, or a row with no close that sec_xbrl_shares does not
 # own. An existing close is never replaced.
 _FILL_SQL = text(
@@ -130,6 +148,27 @@ def eligible_closes(
     return rows, sum(1 for c in closes.values() if c.ambiguous)
 
 
+def basis_conflicts(existing: list[tuple[date, Any]], closes: list[tuple[date, float, str]]) -> list[date]:
+    """Days where a stored close and the eligible stored close disagree beyond
+    rounding: more than ``BASIS_REL_TOLERANCE`` and more than ``BASIS_ABS_TOLERANCE``."""
+    ours = {d: c for d, c, _s in closes}
+    out = []
+    for d, stored in existing:
+        mine = ours.get(d)
+        if mine is None or stored is None or float(stored) == 0:
+            continue
+        diff = abs(float(stored) - mine)
+        if diff > BASIS_ABS_TOLERANCE and diff / abs(float(stored)) > BASIS_REL_TOLERANCE:
+            out.append(d)
+    return out
+
+
+def basis_overlap(existing: list[tuple[date, Any]], closes: list[tuple[date, float, str]]) -> int:
+    """Days on which a stored close and an eligible stored close can be compared."""
+    ours = {d for d, _c, _s in closes}
+    return sum(1 for d, stored in existing if d in ours and stored is not None and float(stored) != 0)
+
+
 def _universe_work(conn: Any, only_bucket: str | None, limit: int) -> list[tuple[str, int]]:
     buckets = [only_bucket] if only_bucket else list(STALE_BUCKETS)
     rows = conn.execute(_UNIVERSE_WORK_SQL, {"buckets": buckets}).fetchall()
@@ -159,7 +198,7 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
         "mode": mode, "dry_run": dry_run, "evaluated_at": evaluated_at.isoformat(),
         "tickers": len(work), "eligible_tickers": 0, "eligible_closes": 0,
         "written": 0, "left_as_is": 0, "ambiguous_days_withheld": 0,
-        "no_completed_close": [], "unsupported": [], "failed": [], "by_source": {},
+        "no_completed_close": [], "unsupported": [], "basis_conflict": [], "basis_unverified": [], "failed": [], "by_source": {},
     }
     for i, (ticker, days) in enumerate(work, 1):
         start = today - timedelta(days=days)
@@ -176,6 +215,19 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
                 print(f"[{i}/{len(work)}] {ticker}: skipped, no completed close since {start}"
                       + (f" ({ambiguous} ambiguous days withheld)" if ambiguous else ""))
                 continue
+            with engine.connect() as conn:
+                existing = [(r[0], r[1]) for r in conn.execute(
+                    _EXISTING_CLOSES_SQL, {"ticker": ticker, "start": start}).fetchall()]
+            clashes = basis_conflicts(existing, closes)
+            if clashes:
+                receipt["basis_conflict"].append(ticker)
+                print(f"[{i}/{len(work)}] {ticker}: withheld, {len(clashes)} stored closes on another price basis "
+                      f"({clashes[0]}..{clashes[-1]})")
+                continue
+            if existing and basis_overlap(existing, closes) == 0:
+                # Stored closes exist but none shares a day with an eligible
+                # one: the basis could not be compared. Filled, and named.
+                receipt["basis_unverified"].append(ticker)
             written = 0
             if not dry_run:
                 with engine.begin() as conn:
@@ -204,6 +256,7 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
           f"eligible_closes={receipt['eligible_closes']} written={receipt['written']} "
           f"left_as_is={receipt['left_as_is']} ambiguous_days_withheld={receipt['ambiguous_days_withheld']} "
           f"no_completed_close={len(receipt['no_completed_close'])} unsupported={len(receipt['unsupported'])} "
+          f"basis_conflict={len(receipt['basis_conflict'])} basis_unverified={len(receipt['basis_unverified'])} "
           f"failed={len(receipt['failed'])}")
     print("RECEIPT " + json.dumps(receipt, sort_keys=True))
     return receipt
