@@ -34,9 +34,24 @@ The goal is to observe the real path once for one new Item 2.02 filing, without 
    candidate. It adds a default-off `EarningsEventsPuller.rehearse_sec_exhibit_handoff` that `pull()` never calls.
    It needs an independent reviewer other than the owner.
 
-## 3. Decisions for Anik
+## 3. Tightened conditions (added after review 6051360420)
 
-- Approve or decline step 2: one SEC fetch of one filing, from a dev checkout, with no service change.
+Seeing a filing in the 06:00Z run does not guarantee a timely, usable pre-open claim. Before any fetch:
+
+1. **Freeze first.** Write down the one eligible accession, the scope (primary document plus EX-99.1), the cutoff
+   and a maximum request budget (a fixed count of SEC requests) before fetching anything.
+2. **Real clocks.** Record the actual retrieval time and the scratch readback time, not the 06:00Z run time.
+3. **Two checks, both documented.** (a) The Dell delta's recording consumer runs only inside an isolated fixture
+   injection. (b) The delta's exported `offline_rehearsal_only` receipt must be refused by the unchanged
+   production diagnostic in #1424. The export is never relabelled as `primary_post_commit_readback`.
+4. **Publish little.** Only the necessary hashes, clocks and status go to the vault, not the recording
+   consumer's full input.
+
+## 4. Decisions for Anik
+
+- Approve or decline step 2, now under the conditions in section 3: one SEC fetch of one pre-frozen filing,
+  from a dev checkout, with no service change. Review 6051360420 holds running it until section 3 is in the
+  one-shot's own written plan.
 - Name the independent reviewer for the Dell delta. The owner cannot review their own change. This session
   reviewed #1424 at `6e7e010d` before it was named owner; Anik may want that review re-done by Codex or another
   reviewer.

@@ -73,10 +73,30 @@ Metric for this class, as a new `net_cash_per_share` metric (`METRIC_KIND` sum) 
 - **No activation.** Shipping v2 code does not change the running timer. Pointing the job at v2, or running v2
   next to v1, is a separate owner step with its own approval, and only when D3 needs it.
 
+## Isolation requirements (added after review 6051360420)
+
+Writing a separate ledger does not isolate v1. The running timer imports `evals.e2` from the shared release tree
+(`WorkingDirectory=/data/grid_v4/grid_release`), so merging or deploying v2 code there would change what the v1
+job runs. Before any v2 code is staged:
+
+1. **Pin the engine.** v1 keeps running a pinned copy of its exact frozen files (`MANIFEST.sha256` e2-v1) or
+   v2 ships as a separate module path (for example `evals/e2_v2/`) so the release tree's `evals.e2` bytes do
+   not change. A test compares the shipped v1 files to the released manifest.
+2. **Pin the destinations.** v2 gets its own board dir, its own witness file
+   (`e2_scoreboard_e2-v2.anchors.jsonl`) and its own views. It may never write v1's `latest_snapshot.json`,
+   `SCOREBOARD.md` or anchors. A test asserts the path sets are disjoint.
+3. **Parity fixtures only.** Compare v1's metrics with synthetic fixtures of the retained record shape. No
+   protected stream or live ledger is read.
+4. **Float order.** Per-row parity pins edge6's exact float expression order and `round(…, 4)`. Codex's
+   unrounded Decimal preview is an accounting reference, not the parity oracle.
+
 ## Open before a version PR
 
-1. Codex's prototype (implementation sha256 `de646281…6e4ff8`, 12 synthetic tests) is not reachable from
-   the vault or this repo. Retain it at a pinned vault path so the v2 code can be checked against it for parity.
+1. Codex's prototype is now retained at vault commit `13e59cdd` (`h1-cost-preview-20261125.patch`). The
+   implementation sha256 `de646281…6e4ff8` was verified by this owner. It is an unrounded Decimal
+   accounting preview, not an E2 scorer. The parity oracle is edge6 (above).
 2. Whether D2-H2 (fly-shadow/1, registered fe8318a with its own fees) ever goes through E2. This proposal
    leaves H2 and H3 untouched, as D0 and Codex both require.
-3. Anik's approval of the version bump, and Codex as the independent reviewer of the exact v2 head.
+3. Anik's approval of the version bump, and Codex as the independent reviewer of the exact v2 head. Review
+   6051360420 holds running this proposal as written until the isolation requirements above are in the
+   version PR.
