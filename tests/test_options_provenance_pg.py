@@ -173,7 +173,7 @@ def test_admin_statement_is_the_plain_table() -> None:
     assert op.visible_sql_text(sql, True) == "SELECT spot_price FROM options_daily_signals ods WHERE ticker = :t"
 
 
-def test_latest_gex_falls_back_to_the_latest_non_schwab_day(pg, monkeypatch) -> None:
+def test_latest_gex_selects_public_batch_on_mixed_day_and_skips_schwab_only_day(pg, monkeypatch) -> None:
     from physics import dealer_gamma
     from physics.dealer_gamma import DealerGammaEngine
 
@@ -187,12 +187,34 @@ def test_latest_gex_falls_back_to_the_latest_non_schwab_day(pg, monkeypatch) -> 
 
     monkeypatch.setattr(DealerGammaEngine, "_get_spot_receipt", receipt)
 
+    # On MON (mixed Cboe + Schwab), admin sees the latest Schwab batch, while
+    # public readers select and load the verified same-day Cboe batch (never Schwab).
     admin = DealerGammaEngine(pg, include_schwab=True).compute_latest_completed_gex_profile("SPY")
     public = DealerGammaEngine(pg).compute_latest_completed_gex_profile("SPY")
 
     assert not admin.get("error"), admin
     assert (admin["chain_snap_date"], admin["chain_batch_id"]) == (MON.isoformat(), BATCH_MON_SCHWAB)
-    # Not the same-day Cboe batch: its day is hidden, so its chain would not load.
     assert not public.get("error"), public
-    assert (public["chain_snap_date"], public["chain_batch_id"]) == (FRI.isoformat(), BATCH_FRI)
+    assert (public["chain_snap_date"], public["chain_batch_id"]) == (MON.isoformat(), BATCH_MON_CBOE)
     assert public["gex_aggregate"] is not None
+
+    # Explicit replay of the Schwab batch still fails closed for public readers.
+    denied = DealerGammaEngine(pg).compute_gex_profile("SPY", MON, capture_batch_id=BATCH_MON_SCHWAB, cutoff=CUTOFF)
+    assert denied.get("error")
+
+    # On a Schwab-only day (TUE), public readers skip TUE and fall back to MON's Cboe batch.
+    tue = date(2026, 11, 24)
+    batch_tue_schwab = "44444444-4444-4444-8444-444444444444"
+    tue_cutoff = datetime(2026, 11, 25, 2, 0, tzinfo=UTC)
+    monkeypatch.setattr(dealer_gamma, "_utc_now", lambda: tue_cutoff)
+    with pg.begin() as conn:
+        _batch(conn, batch_tue_schwab, "SPY", tue, 1, "schwab")
+    try:
+        admin_tue = DealerGammaEngine(pg, include_schwab=True).compute_latest_completed_gex_profile("SPY")
+        public_tue = DealerGammaEngine(pg).compute_latest_completed_gex_profile("SPY")
+        assert (admin_tue["chain_snap_date"], admin_tue["chain_batch_id"]) == (tue.isoformat(), batch_tue_schwab)
+        assert (public_tue["chain_snap_date"], public_tue["chain_batch_id"]) == (MON.isoformat(), BATCH_MON_CBOE)
+    finally:
+        with pg.begin() as conn:
+            conn.execute(text("DELETE FROM options_snapshots_all WHERE capture_batch_id = :b"), {"b": batch_tue_schwab})
+            conn.execute(text("DELETE FROM options_capture_batches WHERE capture_batch_id = :b"), {"b": batch_tue_schwab})

@@ -161,15 +161,32 @@ VISIBLE_SNAPSHOTS_ALL = (
     + _no_schwab_batch("schwab_v", "snap_date") + ")"
 )
 
+#: ``options_snapshots_all`` filtered per batch: rows whose own registered
+#: ``capture_batch_id`` is non-Schwab (``NOT _SCHWAB_BATCH``). Unbatched rows
+#: (``capture_batch_id IS NULL``) and rows whose batch is missing or Schwab fail
+#: closed. Used by batch-addressed readers (``physics/dealer_gamma.py``
+#: registered-batch replay, ``paper_log/gex_batch_replay.py``) so a public
+#: Yahoo/Cboe capture (e.g. ``grid-options-puller`` GEM Yahoo SPY) stays
+#: readable on a day that also has a Schwab capture.
+VISIBLE_BATCH_SNAPSHOTS = (
+    "(SELECT schwab_v.* FROM options_snapshots_all schwab_v"
+    " WHERE schwab_v.capture_batch_id IS NOT NULL"
+    " AND EXISTS (SELECT 1 FROM options_capture_batches schwab_pb"
+    " WHERE schwab_pb.capture_batch_id = schwab_v.capture_batch_id"
+    " AND schwab_pb.ticker = schwab_v.ticker"
+    " AND schwab_pb.snap_date = schwab_v.snap_date"
+    " AND NOT " + _SCHWAB_BATCH + "))"
+)
+
 #: ``options_capture_batches`` without Schwab (or unknown-after-cutoff) batches.
-#: Batch-level: a listing still shows a same-day Cboe batch.
+#: Batch-level: a listing (and batch-addressed replay) still sees a same-day
+#: non-Schwab Cboe/Yahoo batch.
 VISIBLE_CAPTURE_BATCHES = (
     "(SELECT schwab_pb.* FROM options_capture_batches schwab_pb WHERE NOT " + _SCHWAB_BATCH + ")"
 )
 
-#: ``options_capture_batches`` on days with no Schwab batch for the ticker: the
-#: day-level rule of the contracts, for a reader that picks a batch and then
-#: loads its chain (``physics/dealer_gamma.py``), so the two always agree.
+#: ``options_capture_batches`` on days with no Schwab batch for the ticker
+#: (day-level rule, paired with ``VISIBLE_SNAPSHOTS`` / ``VISIBLE_SNAPSHOTS_ALL``).
 VISIBLE_CAPTURE_BATCH_DAYS = (
     "(SELECT schwab_b.* FROM options_capture_batches schwab_b WHERE "
     + _no_schwab_batch("schwab_b", "snap_date") + ")"
@@ -249,6 +266,7 @@ _ADMIN_FORM: dict[str, str] = {
     LATEST_SIGNAL_EACH_TICKER: "options_daily_signals",
     VISIBLE_DAILY_SIGNALS: "options_daily_signals",
     VISIBLE_SNAPSHOTS_ALL: "options_snapshots_all",
+    VISIBLE_BATCH_SNAPSHOTS: "options_snapshots_all",
     VISIBLE_SNAPSHOTS: "options_snapshots",
     VISIBLE_CAPTURE_BATCH_DAYS: "options_capture_batches",
     VISIBLE_CAPTURE_BATCHES: "options_capture_batches",
