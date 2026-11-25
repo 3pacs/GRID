@@ -7,7 +7,9 @@ table outside the writer and its own spells fold. Rows are written with the prod
 
 Session times come from the pinned XNYS calendar: 2026-11-18, -19 and -20 and 2026-11-23 open at 14:30Z and
 close at 21:00Z. The writer stores a session's decision record the next weekday evening (about 23:15Z), so the
-timely row in these tests is a hypothetical one written between a close and the next open.
+timely row in these tests is a hypothetical one written between a close and the next open. The record that meets
+#1191's timing clause in production is the provisional one (owner's ruling, 2026-11-24), and it is display only:
+no deciding reader reads ``market_state_provisional``.
 """
 
 from __future__ import annotations
