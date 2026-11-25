@@ -759,11 +759,40 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
     return errs
 
 
+def identity_errors(manifest: dict[str, Any]) -> list[str]:
+    """Refuse ambiguous identity in the manifest, whether or not anything is admitted.
+
+    The verifier looks inputs, gaps and hypotheses up by id. With two entries under one id, one
+    is shadowed (a dict keeps the last, ``next`` keeps the first), so a bad entry could sit
+    unchecked beside a good one, or the statement that is signed could come from another entry
+    than the one that is verified. Duplicate ids are refused for all three lists.
+
+    A hypothesis ``status`` that reads as ADMITTED after case and whitespace folding but is not
+    exactly ``ADMITTED`` is refused too: the verifier only judges the exact label, so a near
+    spelling would otherwise pass as an unverified admission claim.
+    """
+    errs: list[str] = []
+    for key, label in (("inputs", "input"), ("gaps", "gap"), ("hypotheses", "hypothesis")):
+        seen: set[Any] = set()
+        for entry in manifest.get(key) or []:
+            eid = entry.get("id") if isinstance(entry, dict) else None
+            if not isinstance(eid, str) or not eid:
+                errs.append(f"{label} entry without a string id")
+            elif eid in seen:
+                errs.append(f"{label} id {eid!r} appears more than once")
+            seen.add(eid)
+    for h in manifest.get("hypotheses") or []:
+        status = h.get("status") if isinstance(h, dict) else None
+        if isinstance(status, str) and status != "ADMITTED" and status.strip().upper() == "ADMITTED":
+            errs.append(f"{h.get('id')}: status {status!r} is not exactly 'ADMITTED' (near spellings are refused)")
+    return errs
+
+
 def admission_errors(manifest: dict[str, Any], repo_root: Path = M.REPO, today: date | None = None,
                      accepted: bool | None = None) -> list[str]:
     """Why any ADMITTED label in the manifest is not authenticated (empty = none, or all verified)."""
     accepted = VERIFIER_ACCEPTED if accepted is None else accepted
-    errs: list[str] = []
+    errs: list[str] = identity_errors(manifest)
     hyps = [h for h in manifest.get("hypotheses") or [] if h.get("status") == "ADMITTED"]
     covered: set[str] = set()
     for h in hyps:

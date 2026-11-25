@@ -735,3 +735,43 @@ def test_statement_binds_every_signing_date(world):
     assert body["owner_signed_at"] == world["m"]["signed_at"]
     assert body["reviewer_signed_at"] == world["m"]["reviewer"]["signed_at"]
     assert body["admission_signed_at"] == _hyp(world["m"], HYP)["admission"]["signed_at"]
+
+
+# ---- identity: duplicate ids and near-spelled ADMITTED (adversarial review of 2ef0dbbf, 2026-11-25) ----
+
+def test_duplicate_input_id_is_refused(world):
+    m = copy.deepcopy(world["m"])
+    good = next(i for i in m["inputs"] if i["id"] == INP)
+    bad = copy.deepcopy(good)
+    bad["missingness"] = "not measured"
+    m["inputs"] = [bad] + m["inputs"]  # the later, good entry used to shadow the bad one
+    _refused(world, _resign(world, m), f"input id {INP!r} appears more than once", base=[])
+
+
+def test_duplicate_gap_id_is_refused(d1world):
+    m = copy.deepcopy(d1world["m"])
+    g = next(g for g in m["gaps"] if g["id"] == "G15")
+    bad = copy.deepcopy(g)
+    bad["closure"] = {"status": "open"}
+    m["gaps"] = [bad] + m["gaps"]
+    _refused(d1world, _resign(d1world, m), "gap id 'G15' appears more than once", base=[])
+
+
+def test_duplicate_hypothesis_id_is_refused(world):
+    m = copy.deepcopy(world["m"])
+    twin = copy.deepcopy(next(h for h in m["hypotheses"] if h["id"] == HYP))
+    twin["status"] = "CANDIDATE_UNREVIEWED"
+    m["hypotheses"] = [twin] + m["hypotheses"]  # the signed statement used to be built from the twin
+    _refused(world, _resign(world, m), f"hypothesis id {HYP!r} appears more than once", base=[])
+
+
+@pytest.mark.parametrize("label", ["admitted", "Admitted", "ADMITTED ", " ADMITTED"])
+def test_near_spelled_admitted_status_is_refused(label):
+    m = json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
+    next(h for h in m["hypotheses"] if h["id"] == HYP)["status"] = label
+    ok, errs = _has(A.admission_errors(m, today=TODAY), "is not exactly 'ADMITTED'")
+    assert ok, errs
+
+
+def test_committed_manifest_has_unique_ids():
+    assert A.identity_errors(json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))) == []
