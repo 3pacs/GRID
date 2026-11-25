@@ -46,6 +46,26 @@ describe('Briefings view', () => {
         api.listBriefings.mockResolvedValue({ briefings: [] });
     });
 
+    it('says UNKNOWN, not OFFLINE, when the Ollama status call failed (#959)', async () => {
+        api.getOllamaStatus.mockResolvedValue({ error: true, status: 503, message: 'down' });
+        api.getLatestBriefing.mockResolvedValue({ content: 'x', type: 'hourly', timestamp: '2026-11-06T00:00:00Z' });
+        render(<Briefings />);
+        const badge = await screen.findByTestId('ollama-state');
+        expect(badge.textContent).toBe('UNKNOWN');
+        expect(screen.queryByText('OFFLINE')).not.toBeInTheDocument();
+    });
+
+    it('says OFFLINE only when the status says available:false, ONLINE only for true (#959)', async () => {
+        api.getLatestBriefing.mockResolvedValue({ content: 'x', type: 'hourly', timestamp: '2026-11-06T00:00:00Z' });
+        api.getOllamaStatus.mockResolvedValue({ available: false, model: 'qwen' });
+        const { unmount } = render(<Briefings />);
+        await vi.waitFor(() => expect(screen.getByTestId('ollama-state').textContent).toBe('OFFLINE'));
+        unmount();
+        api.getOllamaStatus.mockResolvedValue({ available: true, model: 'qwen' });
+        render(<Briefings />);
+        await vi.waitFor(() => expect(screen.getByTestId('ollama-state').textContent).toBe('ONLINE'));
+    });
+
     it('pages a ~500k-character briefing instead of rendering it all', async () => {
         api.getLatestBriefing.mockResolvedValue({ content: huge, type: 'hourly', timestamp: '2026-11-06T00:00:00Z' });
         const { container } = render(<Briefings />);

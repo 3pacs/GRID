@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Dashboard from '../views/Dashboard.jsx';
 import { api } from '../api.js';
@@ -118,7 +118,63 @@ describe('Dashboard watchlist loading', () => {
             expect(screen.getByText('PULSE')).toBeInTheDocument();
         });
         const pulseLabel = screen.getByText('PULSE');
-        expect(pulseLabel.title).toMatch(/yfinance/i);
+        // The strip is not a live feed and names no source of its own: each quote carries its own.
+        expect(pulseLabel.title).not.toMatch(/\blive quotes\b/i);
+        expect(pulseLabel.title).toMatch(/not a live feed/i);
+        expect(screen.getByTitle(/^yfinance · /)).toBeInTheDocument();
+    });
+
+    it('does not attribute a quote with no source to yfinance (#959)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({
+            prices: { SPY: { price: 500, pct_1d: 0.01 } }, fresh: true, cached: true,
+        });
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(screen.getAllByTitle('source not reported · time not reported').length).toBeGreaterThan(0));
+        expect(screen.queryByTitle(/yfinance/i)).not.toBeInTheDocument();
+    });
+
+    it('shows "time not reported" for a change-feed event with no time, never the brief time (#959)', async () => {
+        const generated = new Date(Date.now() - 5 * 60000).toISOString();
+        api.getIntelDashboard.mockResolvedValue({
+            generated_at: generated,
+            cross_ref: { red_flags: [{ category: 'Macro', description: 'divergence X' }] },
+            trust: { convergence_events: [{ description: 'sources agree Y', detected_at: '2020-01-01T00:00:00Z' }] },
+        });
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await screen.findByText(/divergence X/);
+        expect(screen.getByText('time not reported')).toBeInTheDocument();
+        expect(screen.queryByText('5m ago')).not.toBeInTheDocument();
+        // an event that carries its own time still shows it
+        expect(screen.getByText(/\dd ago/)).toBeInTheDocument();
+    });
+
+    it('does not read a failed intel request as "no changes" (#959)', async () => {
+        api.getIntelDashboard.mockResolvedValue({ error: true, status: 503, message: 'down' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await screen.findByText(/Change feed unavailable/);
+        expect(screen.queryByText(/No significant changes/)).not.toBeInTheDocument();
+    });
+
+    it('keeps pending, available-empty and failed change-feed states apart (#959, Codex hold at 0cd00fc2)', async () => {
+        let release;
+        api.getIntelDashboard.mockReturnValue(new Promise((res) => { release = res; }));
+        render(<Dashboard onNavigate={vi.fn()} />);
+        // First request still in flight: neither "no changes" nor "unavailable".
+        await screen.findByText('Loading change feed...');
+        expect(screen.queryByText(/No significant changes/)).not.toBeInTheDocument();
+        expect(screen.queryByText(/Change feed unavailable/)).not.toBeInTheDocument();
+        // It succeeds with nothing to show: now, and only now, the feed is empty.
+        await act(async () => { release({ generated_at: '2026-11-24T12:00:00Z' }); });
+        await screen.findByText(/No significant changes/);
+        expect(screen.queryByText('Loading change feed...')).not.toBeInTheDocument();
+    });
+
+    it('a rejected first intel request reads unavailable, not empty (#959)', async () => {
+        api.getIntelDashboard.mockRejectedValue(new Error('network'));
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await screen.findByText(/Change feed unavailable/);
+        expect(screen.queryByText(/No significant changes/)).not.toBeInTheDocument();
+        expect(screen.queryByText('Loading change feed...')).not.toBeInTheDocument();
     });
 
     it('renders a text-only on-demand briefing when no audio was made (paid TTS disabled)', async () => {
