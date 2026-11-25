@@ -2157,3 +2157,125 @@ CREATE TABLE IF NOT EXISTS market_state_provisional (
     computed_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     provisional  BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional)
 );
+
+-- ---------------------------------------------------------------------------
+-- market_state_daily keeps every version it replaces (#1191, migrations/versions/market_state_revs_20261125.py).
+-- ensure_table (intelligence/regime/market_state.py) used to be the table's only definition. The trigger owns
+-- every version clock (clock_timestamp() AT TIME ZONE 'UTC' under the row lock, strictly increasing; computed_at
+-- stays naive UTC): a change that alters rule or record copies the old version into market_state_daily_revisions,
+-- and writers cannot set computed_at. Clocks are mutation times, not commit visibility (superseded_by_xid records
+-- the transaction). Writers name a reason and run (set_config 'grid.market_state_reason' /
+-- 'grid.market_state_run', transaction-local); a change without them is archived as unattributed.
+-- computed_at_by_trigger says whether a version's clock is the trigger's (written after
+-- market_state_daily_revision_epoch) or the old writer's. as_of_date changes and TRUNCATE are refused.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_state_daily (
+    as_of_date   DATE PRIMARY KEY,
+    rule         TEXT NOT NULL,
+    record       JSONB NOT NULL,
+    computed_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS market_state_daily_revision_epoch (
+    singleton       BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revisions_from  TIMESTAMP NOT NULL
+);
+
+INSERT INTO market_state_daily_revision_epoch (revisions_from)
+SELECT clock_timestamp() AT TIME ZONE 'UTC'
+WHERE NOT EXISTS (SELECT 1 FROM market_state_daily_revision_epoch);
+
+CREATE TABLE IF NOT EXISTS market_state_daily_revisions (
+    id                      BIGSERIAL PRIMARY KEY,
+    as_of_date              DATE NOT NULL,
+    rule                    TEXT NOT NULL,
+    record                  JSONB NOT NULL,
+    computed_at             TIMESTAMP NOT NULL,
+    computed_at_by_trigger  BOOLEAN NOT NULL,
+    superseded_at           TIMESTAMP NOT NULL,
+    superseded_by_xid       TEXT NOT NULL,
+    operation               TEXT NOT NULL CHECK (operation IN ('UPDATE', 'DELETE')),
+    reason                  TEXT NOT NULL CHECK (btrim(reason) <> ''),
+    run_tag                 TEXT NOT NULL CHECK (btrim(run_tag) <> ''),
+    attributed              BOOLEAN NOT NULL,
+    CHECK (superseded_at > computed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_state_daily_revisions_as_of
+    ON market_state_daily_revisions (as_of_date, superseded_at);
+
+CREATE OR REPLACE FUNCTION market_state_daily_keep_revisions()
+RETURNS TRIGGER AS $$
+DECLARE
+    why TEXT := nullif(btrim(coalesce(current_setting('grid.market_state_reason', true), '')), '');
+    run TEXT := nullif(btrim(coalesce(current_setting('grid.market_state_run', true), '')), '');
+    app TEXT := nullif(btrim(coalesce(current_setting('application_name', true), '')), '');
+    clock TIMESTAMP := clock_timestamp() AT TIME ZONE 'UTC';
+    epoch TIMESTAMP;
+BEGIN
+    IF TG_OP = 'TRUNCATE' THEN
+        RAISE EXCEPTION 'market_state_daily keeps every version: TRUNCATE refused';
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        NEW.computed_at := clock;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.as_of_date IS DISTINCT FROM OLD.as_of_date THEN
+        RAISE EXCEPTION 'market_state_daily: as_of_date % cannot change', OLD.as_of_date;
+    END IF;
+    IF TG_OP = 'UPDATE' AND (NEW.rule, NEW.record) IS NOT DISTINCT FROM (OLD.rule, OLD.record) THEN
+        NEW.computed_at := OLD.computed_at;
+        RETURN NEW;
+    END IF;
+    IF clock <= OLD.computed_at THEN
+        clock := OLD.computed_at + interval '1 microsecond';
+    END IF;
+    SELECT revisions_from INTO epoch FROM market_state_daily_revision_epoch;
+    INSERT INTO market_state_daily_revisions
+        (as_of_date, rule, record, computed_at, computed_at_by_trigger, superseded_at, superseded_by_xid,
+         operation, reason, run_tag, attributed)
+    VALUES
+        (OLD.as_of_date, OLD.rule, OLD.record, OLD.computed_at, epoch IS NOT NULL AND OLD.computed_at >= epoch,
+         clock, pg_current_xact_id()::text,
+         TG_OP, coalesce(why, 'unattributed: the writer named no grid.market_state_reason'),
+         coalesce(run, 'unattributed: application_name ' || coalesce(app, '(none)')),
+         why IS NOT NULL AND run IS NOT NULL);
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    NEW.computed_at := clock;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION market_state_daily_revisions_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only: % refused', TG_TABLE_NAME, TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS market_state_daily_keep_revisions ON market_state_daily;
+CREATE TRIGGER market_state_daily_keep_revisions
+    BEFORE INSERT OR UPDATE OR DELETE ON market_state_daily
+    FOR EACH ROW EXECUTE FUNCTION market_state_daily_keep_revisions();
+DROP TRIGGER IF EXISTS market_state_daily_no_truncate ON market_state_daily;
+CREATE TRIGGER market_state_daily_no_truncate
+    BEFORE TRUNCATE ON market_state_daily
+    FOR EACH STATEMENT EXECUTE FUNCTION market_state_daily_keep_revisions();
+DROP TRIGGER IF EXISTS market_state_daily_revisions_no_mutation ON market_state_daily_revisions;
+CREATE TRIGGER market_state_daily_revisions_no_mutation
+    BEFORE UPDATE OR DELETE ON market_state_daily_revisions
+    FOR EACH ROW EXECUTE FUNCTION market_state_daily_revisions_append_only();
+DROP TRIGGER IF EXISTS market_state_daily_revisions_no_truncate ON market_state_daily_revisions;
+CREATE TRIGGER market_state_daily_revisions_no_truncate
+    BEFORE TRUNCATE ON market_state_daily_revisions
+    FOR EACH STATEMENT EXECUTE FUNCTION market_state_daily_revisions_append_only();
+DROP TRIGGER IF EXISTS market_state_daily_revision_epoch_no_mutation ON market_state_daily_revision_epoch;
+CREATE TRIGGER market_state_daily_revision_epoch_no_mutation
+    BEFORE UPDATE OR DELETE ON market_state_daily_revision_epoch
+    FOR EACH ROW EXECUTE FUNCTION market_state_daily_revisions_append_only();
+DROP TRIGGER IF EXISTS market_state_daily_revision_epoch_no_truncate ON market_state_daily_revision_epoch;
+CREATE TRIGGER market_state_daily_revision_epoch_no_truncate
+    BEFORE TRUNCATE ON market_state_daily_revision_epoch
+    FOR EACH STATEMENT EXECUTE FUNCTION market_state_daily_revisions_append_only();

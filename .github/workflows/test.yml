@@ -310,6 +310,28 @@ jobs:
             exit 1
           fi
 
+      # market_state_daily keeps every version (#1191, market_state_revs_20261125):
+      # proves on real PostgreSQL that the trigger owns computed_at (UTC), a
+      # default write leaves an existing row unchanged, a replacement keeps the
+      # superseded version with its reason and run (an unattributed hand edit is
+      # archived as such), a replacement without the trigger refuses, TRUNCATE
+      # and as_of_date changes are refused, revisions are append-only, the desk
+      # brief replayed before a revision shows the original, and downgrade
+      # refuses while revisions exist. A skip must fail.
+      - name: market_state_daily revisions PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_market_state_revisions.py -q -rA | tee /tmp/grid-market-state-revisions-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-market-state-revisions-pg.txt; then
+            echo "::error::market_state_daily revisions PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # model_eligible dry-run audit (#1301): the health half reads
       # resolved_series point-in-time (obs/release/vintage <= as_of,
       # retractions by the end of as_of removed before the latest-vintage

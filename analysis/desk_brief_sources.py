@@ -4,7 +4,9 @@ Every adapter reads a record another job already keeps and copies what it says, 
 
 * ``market_state``: the latest ``market_state_daily`` row (#1191; its own ``rule``, market-state/1 or /2) for an earlier
   session, computed before the brief's clock. Read-only transaction, parameterized SQL. ``computed_at`` is a naive TIMESTAMP written
-  with CURRENT_TIMESTAMP; it is read as UTC only when the session's TimeZone is UTC, otherwise the section is unknown.
+  with CURRENT_TIMESTAMP (since market_state_revs_20261125, by the table's trigger, in UTC); it is read as UTC only when
+  the session's TimeZone is UTC, otherwise the section is unknown. A row replaced after the brief's clock is shown as
+  it stood then, from ``market_state_daily_revisions``: a replay never sees a revision early, nor loses the original.
   Post-close only, and only while the session's own decision record is not there yet: the provisional record computed
   at that session's close (#1312), display only. Every line it adds starts with ``PROVISIONAL (display only)`` and its
   facts sit under their own ``provisional`` key; nothing that decides reads it.
@@ -44,7 +46,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import inspect, text
+from sqlalchemy import DateTime, bindparam, inspect, text
 from sqlalchemy.engine import Engine
 
 from analysis.desk_brief import Section, SessionTimes, Trial, iso, parse_clock
@@ -98,6 +100,11 @@ def previous_session(day: date, *, calendar=None) -> date:
 
 _MS_SQL = text("SELECT as_of_date, computed_at, rule, record FROM market_state_daily "
                "WHERE as_of_date <= :d ORDER BY as_of_date DESC LIMIT 10")
+# The newest superseded version (#1191) that stood at the brief's clock: written at or before it, superseded after
+# it. :t is the clock as naive UTC, like every stored clock in these tables.
+_MS_REV_SQL = text("SELECT as_of_date, computed_at, rule, record, superseded_at FROM market_state_daily_revisions "
+                   "WHERE as_of_date <= :d AND computed_at <= :t AND superseded_at > :t "
+                   "ORDER BY as_of_date DESC LIMIT 1").bindparams(bindparam("t", type_=DateTime()))
 # Display only (#1312): the record the provisional writer computed at the session's close. Read for the post-close
 # brief's own session and shown only while that session's decision record is not there yet.
 _MSP_SQL = text("SELECT as_of_date, computed_at, rule, record FROM market_state_provisional WHERE as_of_date = :d")
@@ -212,7 +219,7 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
     title, key = "Market state", "market_state"
     src = "griddb market_state_daily"  # each row names its own rule (market-state/1, /2 since #1303)
     last = session.day - timedelta(days=1) if kind == "pre_open" else session.day
-    prov_row, prov_problems = None, []
+    prov_row, prov_problems, rev_row, rev_problems = None, [], None, []
     try:
         with engine.connect() as conn:
             if conn.dialect.name == "postgresql":
@@ -222,20 +229,31 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
                     return Section(key, title, "unknown", src, problems=(f"session TimeZone {tz}; computed_at not readable as UTC",))
             rows = conn.execute(_MS_SQL, {"d": last}).fetchall()
             if kind == "post_close":
-                # Last read in the transaction: a failure here leaves the decision record's section as it is.
+                # A failure here leaves the decision record's section as it is.
                 try:
                     if inspect(conn).has_table("market_state_provisional"):
                         prov_row = conn.execute(_MSP_SQL, {"d": session.day}).first()
                 except Exception as exc:  # noqa: BLE001
                     prov_problems.append(f"provisional record read failed ({type(exc).__name__})")
+            # Last read in the transaction. Without it a replay shows an older session's record, never a later one.
+            try:
+                if inspect(conn).has_table("market_state_daily_revisions"):
+                    rev_row = conn.execute(_MS_REV_SQL, {"d": last,
+                                                         "t": as_of.astimezone(UTC).replace(tzinfo=None)}).first()
+            except Exception as exc:  # noqa: BLE001
+                rev_problems.append(f"superseded versions read failed ({type(exc).__name__}); a replay may show an "
+                                    "older session")
     except Exception as exc:  # noqa: BLE001
         return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
     chosen = None
     for r in rows:
         computed = _stored_clock(r[1])
         if computed <= as_of:
-            chosen = (r, computed)
+            chosen = (r, computed, None)
             break
+    if rev_row is not None and (chosen is None or str(rev_row[0]) > str(chosen[0][0])):
+        chosen = (rev_row, _stored_clock(rev_row[1]), _stored_clock(rev_row[4]))
+        src += "; the version that stood at the brief's clock, from griddb market_state_daily_revisions (#1191)"
     prov_lines, prov_facts = [], None
     if kind == "post_close" and (chosen is None or str(chosen[0][0]) != session.day.isoformat()):
         prov_lines, prov_facts, more = _provisional(prov_row, session, as_of)
@@ -247,20 +265,25 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
     if chosen is None:
         return Section(key, title, "empty", src, None, tuple(prov_lines),
                        {"provisional": prov_facts} if prov_facts else {},
-                       ("no record computed before the brief's clock",) + tuple(prov_problems))
-    r, computed = chosen
+                       ("no record computed before the brief's clock",) + tuple(prov_problems + rev_problems))
+    r, computed, superseded = chosen
     rec = r[3] if isinstance(r[3], dict) else json.loads(r[3])
     problems = []
     rec_day = str(r[0])
     body, notable = _record_lines(rec)
-    lines = [f"record for session {rec_day} (rule {r[2]}), computed {iso(computed)}", *body, *prov_lines]
+    head = f"record for session {rec_day} (rule {r[2]}), computed {iso(computed)}"
+    if superseded is not None:
+        head += f"; replaced at {iso(superseded)}, shown as it stood at the brief's clock"
+    lines = [head, *body, *prov_lines]
     if expected is not None and rec_day < expected.isoformat():
         problems.append(f"latest record is for {rec_day}; the writer normally has {expected.isoformat()} by now")
     facts = {"record_date": rec_day, "computed_at": iso(computed), "notable": notable,
              "events": rec.get("events"), "pending": sorted((rec.get("pending") or {}).keys())}
+    if superseded is not None:
+        facts["superseded_at"] = iso(superseded)
     if prov_facts:
         facts["provisional"] = prov_facts
-    return Section(key, title, "ok", src, computed, tuple(lines), facts, tuple(problems + prov_problems))
+    return Section(key, title, "ok", src, computed, tuple(lines), facts, tuple(problems + prov_problems + rev_problems))
 
 
 # ── event calendar (#1293 forward parts) ─────────────────────────────────────
