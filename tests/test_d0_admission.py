@@ -775,3 +775,84 @@ def test_near_spelled_admitted_status_is_refused(label):
 
 def test_committed_manifest_has_unique_ids():
     assert A.identity_errors(json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))) == []
+
+
+# ---- structure: a malformed shape is a structured refusal, never an exception (Codex review of cbe2cf47) ----
+
+@pytest.mark.parametrize("bad", [None, [], "manifest", 7])
+def test_a_manifest_that_is_not_a_mapping_is_refused(bad):
+    errs = A.admission_errors(bad, today=TODAY)
+    assert errs and "not a mapping" in errs[0]
+
+
+@pytest.mark.parametrize("key", ["inputs", "gaps", "hypotheses"])
+@pytest.mark.parametrize("bad", ["x", {"id": "H"}, 5, True])
+def test_a_collection_that_is_not_a_list_is_refused(key, bad):
+    m = json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
+    m[key] = bad
+    errs = A.admission_errors(m, today=TODAY)
+    assert errs == [f"{key} is {type(bad).__name__}, not a list"]
+
+
+@pytest.mark.parametrize("key", ["inputs", "gaps", "hypotheses"])
+@pytest.mark.parametrize("bad", [None, "x", 3, ["a"], [{"id": "H"}]])
+def test_a_member_that_is_not_a_mapping_is_refused_before_any_deeper_step(key, bad):
+    m = json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
+    m[key] = [bad] + m[key]
+    errs = A.admission_errors(m, today=TODAY)
+    if isinstance(bad, dict):
+        assert not _has(errs, "not a mapping")[0]  # a well-formed (if incomplete) member is not a shape error
+    else:
+        assert errs == [f"{key}[0] is {type(bad).__name__}, not a mapping"]
+
+
+def test_a_malformed_member_beside_an_admitted_hypothesis_stops_the_walk(world):
+    m = copy.deepcopy(world["m"])
+    m["hypotheses"].append("not a mapping")
+    errs = A.admission_errors(_resign(world, m), repo_root=world["root"], today=TODAY)
+    assert errs == [f"hypotheses[{len(m['hypotheses']) - 1}] is str, not a mapping"]
+
+
+def test_a_null_or_absent_collection_is_still_accepted_as_empty():
+    for m in ({}, {"inputs": None, "gaps": None, "hypotheses": None}):
+        assert A.admission_errors(m, today=TODAY) == []
+
+
+def _leaf_paths(o, pre=()):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield pre + (k,)
+            yield from _leaf_paths(v, pre + (k,))
+    elif isinstance(o, list):
+        for i, v in enumerate(o[:3]):
+            yield pre + (i,)
+            yield from _leaf_paths(v, pre + (i,))
+
+
+def test_no_wrong_typed_field_makes_the_verifier_raise(world):
+    """Overwrite every field of a fully signed manifest, one at a time, with each wrong type: the
+    verifier must answer with refusals (or accept), never with an exception."""
+    raised = []
+    wrong = [None, "x", 7, [], {}, ["a"], True, 1.5]
+    for path in _leaf_paths(world["m"]):
+        for bad in wrong:
+            m = copy.deepcopy(world["m"])
+            target = m
+            for k in path[:-1]:
+                target = target[k]
+            target[path[-1]] = bad
+            try:
+                A.admission_errors(m, repo_root=world["root"], today=TODAY)
+            except Exception as e:  # noqa: BLE001 - any exception is the defect under test
+                raised.append((path, bad, type(e).__name__))
+    assert not raised, raised[:10]
+
+
+@pytest.mark.parametrize("bad", [[], {}, ["a"], 7, None, True])
+@pytest.mark.parametrize("key", ["inputs", "gaps", "hypotheses"])
+def test_a_non_string_id_is_refused_without_an_exception(key, bad):
+    m = json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
+    m[key][0]["id"] = bad
+    errs = A.admission_errors(m, today=TODAY)
+    label = {"inputs": "input", "gaps": "gap", "hypotheses": "hypothesis"}[key]
+    assert errs == [f"{label} entry without a string id"]
