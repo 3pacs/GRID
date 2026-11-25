@@ -876,8 +876,19 @@ class TestENoFallbackOrBypass:
       - ``intelligence/pair_conviction.py::generate_pair_ticket`` builds a
         ``PairTradeTicket`` from two ``should_i_trade`` responses, served by
         ``/conviction/pair/{long}/{short}`` and ``/conviction/pair/candidates``
-        (``scan_candidate_pairs``). It must abstain when its legs abstain.
+        (``scan_candidate_pairs``). It must abstain when its legs abstain:
+        ``_pair_leg_refusal`` applies ``actionable_refusal_reason`` to each
+        leg's report before any ``PairTradeTicket`` is built (owner-approved
+        pair gate, 2026-11-25).
     """
+
+    def test_e_the_pair_path_checks_the_gate_before_it_builds_a_pair_ticket(self) -> None:
+        lines = _function_call_lines("intelligence/pair_conviction.py", "generate_pair_ticket")
+        (gate,) = lines["_pair_leg_refusal"]
+        (build,) = lines["PairTradeTicket"]
+        assert gate < build
+        refusal_lines = _function_call_lines("intelligence/pair_conviction.py", "_pair_leg_refusal")
+        assert refusal_lines.get("actionable_refusal_reason"), "pair gate must call actionable_refusal_reason"
 
     def test_e_production_ticket_call_sites_and_imports_are_pinned(self) -> None:
         calls, imports = _scan()

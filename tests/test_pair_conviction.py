@@ -423,7 +423,56 @@ def test_run_leg_handles_missing_gateway_module() -> None:
     assert result["direction"] == "long"
 
 
-def test_generate_pair_ticket_happy_path() -> None:
+@pytest.fixture
+def actionable_legs(monkeypatch):
+    """Both legs pass ``actionable_refusal_reason`` (a live, receipted report).
+
+    The fake provenance objects here carry no decision clock or receipts, so
+    without this the #1352 pair gate (``_pair_leg_refusal``) refuses every
+    pair -- which is what ``test_pair_refused_when_a_leg_is_not_actionable``
+    pins. Happy-path tests exercise the pair maths downstream of that gate.
+    """
+    from intelligence import signal_provenance
+
+    monkeypatch.setattr(signal_provenance, "actionable_refusal_reason", lambda report, **kw: None)
+
+
+def test_pair_refused_when_a_leg_is_not_actionable(monkeypatch) -> None:
+    """#1352 Option B: a pair cannot ticket where either leg's report is refused."""
+    from intelligence import signal_provenance
+
+    refused = {"TSM": None, "NVDA": "no_eligible_directional_evidence: no_signed_family_receipt"}
+    monkeypatch.setattr(
+        signal_provenance,
+        "actionable_refusal_reason",
+        lambda report, **kw: refused[report.ticker_for_test],
+    )
+
+    def _fake(engine, ticker, *, account_size_usd, **kwargs):
+        direction = "bullish" if ticker == "TSM" else "bearish"
+        resp = _make_response(ticker, conviction=0.9, signal_direction=direction, entry=100.0)
+        resp.provenance_report.ticker_for_test = ticker
+        return resp
+
+    _install_fake_gateway(_fake)
+    assert generate_pair_ticket(MagicMock(), "TSM", "NVDA", account_size_usd=100_000.0) is None
+
+
+def test_pair_refused_when_a_leg_has_no_provenance_report(actionable_legs) -> None:
+    """Fail closed: a leg with no provenance report refuses the pair."""
+
+    def _fake(engine, ticker, *, account_size_usd, **kwargs):
+        direction = "bullish" if ticker == "TSM" else "bearish"
+        resp = _make_response(ticker, conviction=0.9, signal_direction=direction)
+        if ticker == "NVDA":
+            resp.provenance_report = None
+        return resp
+
+    _install_fake_gateway(_fake)
+    assert generate_pair_ticket(MagicMock(), "TSM", "NVDA", account_size_usd=100_000.0) is None
+
+
+def test_generate_pair_ticket_happy_path(actionable_legs) -> None:
     def _fake(engine, ticker, *, account_size_usd, **kwargs):
         if ticker == "TSM":
             return _make_response(
@@ -536,7 +585,7 @@ def test_generate_pair_ticket_missing_gateway_returns_none() -> None:
     )
 
 
-def test_scan_candidate_pairs_filters_invalid(monkeypatch) -> None:
+def test_scan_candidate_pairs_filters_invalid(monkeypatch, actionable_legs) -> None:
     from intelligence import pair_conviction
 
     # Neutralize sector lookup so correlated-risk trap never fires in this test
