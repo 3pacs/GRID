@@ -139,6 +139,10 @@ PANEL_FACTORY_FAMILY = "panel-factory"
 RECEIPT_V2 = 2
 V2_SOURCES = frozenset({"panel_trials"})
 FACTORY_TABLES = ("factory_feature_values", "factory_fires", "factory_outcomes", "factory_looks")
+# The retirement checks of a passed slot (gex-signals factory_slots.retire, panel-factory/2; 3pacs/GRID#1163). The
+# table is not one of the set above: a panel-factory/1 database has the set and not this table.
+RETIREMENT_TABLE = "factory_retirement_checks"
+CHECK_KEPT = ("checked_at", "through_day", "lapsed", "result_sha256")
 # What a registration row is, in gex-signals' panel_trials: every column but the row's own hash. A row's content
 # digest is taken over exactly these, so a column a later generation adds does not move it.
 TRIAL_CONTENT_COLUMNS = ("seq", "trial_id", "kind", "name", "registered_at", "hypothesis", "metric", "horizon_min", "min_n",
@@ -392,18 +396,43 @@ def panel_history_break(previous: Mapping[str, Any] | None, current: Mapping[str
     was, held = previous.get("factory_looks_table"), previous.get("factory_looks")
     if was not in ("present", "absent") or (was == "present") != isinstance(held, list):
         return "the last receipt's looks cannot be compared with this read"
+    if was == "present":
+        if current.get("factory_looks_table") != "present" or not isinstance(current.get("factory_looks"), list):
+            return "the factory tables the last receipt read are gone"
+        kept = {look.get("trial_id"): look for look in current["factory_looks"] if isinstance(look, dict)}
+        for look in held:
+            same = kept.get(look.get("trial_id")) if isinstance(look, dict) else None
+            if same is None:
+                return "a stored look the last receipt read is gone"
+            if any(same.get(k) != look.get(k) for k in ("looked_at", "through_day", "result_sha256")) \
+                    or ("result" in look and same.get("result") != look["result"]):
+                return "a stored look the last receipt read has changed"
+    return _retirement_history_break(previous, current)
+
+
+def _retirement_history_break(previous: Mapping[str, Any], current: Mapping[str, Any]) -> str | None:
+    """The same rule for the retirement checks: every check the last receipt read is still there, unchanged.
+
+    A check is one row per slot and checkpoint, written once. A receipt from before this source read the checks has
+    no ``factory_retirement_checks_table`` key and holds this read to nothing; one that read the table holds it to
+    every check it saw, and the table cannot go away."""
+    if "factory_retirement_checks_table" not in previous:
+        return None
+    was, held = previous.get("factory_retirement_checks_table"), previous.get("factory_retirement_checks")
+    if was not in ("present", "absent") or (was == "present") != isinstance(held, list):
+        return "the last receipt's retirement checks cannot be compared with this read"
     if was == "absent":
         return None
-    if current.get("factory_looks_table") != "present" or not isinstance(current.get("factory_looks"), list):
-        return "the factory tables the last receipt read are gone"
-    kept = {look.get("trial_id"): look for look in current["factory_looks"] if isinstance(look, dict)}
-    for look in held:
-        same = kept.get(look.get("trial_id")) if isinstance(look, dict) else None
+    now = current.get("factory_retirement_checks")
+    if current.get("factory_retirement_checks_table") != "present" or not isinstance(now, list):
+        return "the retirement checks the last receipt read are gone"
+    kept = {(c.get("trial_id"), c.get("at_fires")): c for c in now if isinstance(c, dict)}
+    for check in held:
+        same = kept.get((check.get("trial_id"), check.get("at_fires"))) if isinstance(check, dict) else None
         if same is None:
-            return "a stored look the last receipt read is gone"
-        if any(same.get(k) != look.get(k) for k in ("looked_at", "through_day", "result_sha256")) \
-                or ("result" in look and same.get("result") != look["result"]):
-            return "a stored look the last receipt read has changed"
+            return "a retirement check the last receipt read is gone"
+        if any(same.get(k) != check.get(k) for k in CHECK_KEPT) or ("result" in check and same.get("result") != check["result"]):
+            return "a retirement check the last receipt read has changed"
     return None
 
 
@@ -463,6 +492,14 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
     be read back as the bytes its hash names.
     A database from before the factory tables has ``factory_looks_table:
     "absent"``, which is not the same as a table that is there and empty.
+
+    The retirement checks of a passed slot (``factory_retirement_checks``,
+    panel-factory/2; 3pacs/GRID#1163) are read the same way: each check's
+    slot, checkpoint, time, last day, lapse flag, exact stored text and that
+    text's sha256. ``factory_retirement_checks_table`` is ``absent`` on a
+    database whose generation has no such table, which is not "no slot has
+    lapsed". Checks are append-only and held to that against the last receipt
+    that read them; a check for a slot with no stored look is unknown.
     """
 
     def read(_cutoff: datetime) -> SourceRead:
@@ -486,6 +523,13 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
             looks = conn.execute(
                 "SELECT trial_id, looked_at, through_day, result FROM factory_looks ORDER BY trial_id"
             ).fetchall() if has_looks else None
+            has_checks = RETIREMENT_TABLE in tables
+            if has_checks and not has_looks:
+                raise SourceUnavailable("an incomplete generation: the retirement checks are there and the factory tables are not")
+            checks = conn.execute(
+                "SELECT trial_id, at_fires, checked_at, through_day, lapsed, result FROM factory_retirement_checks "
+                "ORDER BY trial_id, at_fires"
+            ).fetchall() if has_checks else None
         except sqlite3.Error as exc:
             raise SourceUnavailable(f"the live trial ledger could not be read ({type(exc).__name__})") from None
         finally:
@@ -530,11 +574,24 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
                  "result": row[3], "result_sha256": sha256_hex(str(row[3]).encode("utf-8"))}
                 for row in looks
             ],
+            "factory_retirement_checks_table": "present" if has_checks else "absent",
+            "factory_retirement_checks": None if checks is None else [
+                {"trial_id": row[0], "at_fires": row[1], "checked_at": row[2], "through_day": row[3],
+                 "lapsed": row[4], "result": row[5], "result_sha256": sha256_hex(str(row[5]).encode("utf-8"))}
+                for row in checks
+            ],
         }
         slots = {slot["trial_id"] for slot in payload["factory_slots"]}
         for look in payload["factory_looks"] or []:
             if look["trial_id"] not in slots or not isinstance(look["result"], str):
                 raise SourceUnavailable("a stored look names no registered factory slot, or its text is not text")
+        looked = {look["trial_id"] for look in payload["factory_looks"] or []}
+        for check in payload["factory_retirement_checks"] or []:
+            # Only a slot that had its look is ever checked, at a whole number of fires, and the flag is 0 or 1.
+            if check["trial_id"] not in looked or not isinstance(check["result"], str) or check["lapsed"] not in (0, 1) \
+                    or not isinstance(check["at_fires"], int) or isinstance(check["at_fires"], bool):
+                raise SourceUnavailable("a retirement check names no looked factory slot, or is not a check as gex-signals writes one")
+            check["lapsed"] = bool(check["lapsed"])
         earlier = previous() if previous is not None else None
         broken = panel_history_break(earlier, payload)
         if broken:
@@ -545,7 +602,8 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
                           scope={"database": Path(db).name, "snapshot": "one read-only transaction",
                                  "state": "as read; not limited to the session close",
                                  "proof": "row links only; row hashes are recomputed only by gex-signals",
-                                 "history": "trial rows and stored looks only added since the last receipt"
+                                 "history": "trial rows and stored looks only added since the last receipt; "
+                                            "retirement checks likewise where the last receipt read them"
                                             if payload["continuity"] == "extends_last_receipt" else payload["continuity"]})
 
     return read

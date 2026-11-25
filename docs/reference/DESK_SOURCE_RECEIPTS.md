@@ -112,6 +112,21 @@ only where the chain stood.
   from before the factory and `present` when all of `FACTORY_TABLES` are there. Any other
   layout, the looks table alone included, is `unknown` (an incomplete generation). A look
   must belong to a registered `panel-factory` slot.
+- **A passed slot's retirement checks are read too** (#1163). gex-signals re-checks a
+  passed slot at registered checkpoints and a check below the registered floor lapses it
+  for good (`factory_retirement_checks`, panel-factory/2). The verdict export carries no
+  lapse, so the receipt is where GRID learns of one. The payload holds each check's slot,
+  checkpoint, time, last day, lapse flag, exact stored text and that text's sha256.
+  `factory_retirement_checks_table` is `absent` on a generation without the table, which
+  is not "none lapsed". Checks are append-only and are held to that against the last
+  receipt that read them; a check for a slot with no stored look is `unknown`.
+- **How a lapse reaches the factory ledger.** The nightly `verdicts-witness` command also
+  calls `ledger_steered_exploration.read_factory_retirement` on the same verified receipt.
+  It appends one `factory_retirement_reading` covering every passed verdict whose
+  registration and look the receipt retains, lapsed or not, or it appends nothing and says
+  why. `summarize()["live"]["lapsed"]` is the last reading's count, as of that session. It
+  is `null` while any passed verdict is covered by no reading, and `0` when no verdict has
+  passed. A reading takes nothing back: a recorded lapse stays that lapse.
 - It is a nightly reading: a change made and undone between two closes is not seen.
 
 ## Rules

@@ -406,3 +406,103 @@ def test_the_nightly_script_names_the_database_only_when_it_is_set(tmp_path, nam
         assert argv[argv.index("--panel-trials-db") + 1] == "/some/where/signals.db"
     else:
         assert "--panel-trials-db" not in argv
+
+
+# --- the retirement checks of a passed slot (3pacs/GRID#1163) -----------------------------------
+
+CHECKS_DDL = ("CREATE TABLE factory_retirement_checks (trial_id TEXT NOT NULL, at_fires INTEGER NOT NULL, checked_at TEXT NOT NULL, "
+              "through_day TEXT NOT NULL, lapsed INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY (trial_id, at_fires))")
+CHECK_125 = json.dumps({"at_fires": 125, "lapsed": False, "lower_bound": 0.011, "floor_usd": 0.0, "trial_id": "T-PF-01"}, sort_keys=True)
+CHECK_150 = json.dumps({"at_fires": 150, "lapsed": True, "lower_bound": -0.02, "floor_usd": 0.0, "trial_id": "T-PF-01"}, sort_keys=True)
+INSERT_125 = f"INSERT INTO factory_retirement_checks VALUES ('T-PF-01', 125, '2027-04-09T21:10:00+00:00', '2027-04-09', 0, '{CHECK_125}')"
+INSERT_150 = f"INSERT INTO factory_retirement_checks VALUES ('T-PF-01', 150, '2027-05-07T21:10:00+00:00', '2027-05-07', 1, '{CHECK_150}')"
+
+
+def _run(db, *statements):
+    conn = sqlite3.connect(db)
+    for statement in statements:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_a_database_without_the_retirement_table_says_absent_not_empty(tmp_path):
+    before = _read(_db(tmp_path / "y.db")).payload                           # panel-factory/1: the factory tables, no checks
+    empty = _read(_run(_db(tmp_path / "z.db"), CHECKS_DDL)).payload          # panel-factory/2, no slot checked yet
+
+    assert (before["factory_retirement_checks_table"], before["factory_retirement_checks"]) == ("absent", None)
+    assert (empty["factory_retirement_checks_table"], empty["factory_retirement_checks"]) == ("present", [])
+    assert before["factory_looks_table"] == empty["factory_looks_table"] == "present"   # the looks are read either way
+
+
+def test_the_retirement_checks_are_read_with_their_exact_text(tmp_path):
+    p = _read(_run(_db(tmp_path / "signals.db"), CHECKS_DDL, INSERT_150, INSERT_125)).payload
+
+    first, second = p["factory_retirement_checks"]                           # by slot, then by checkpoint
+    assert (first["trial_id"], first["at_fires"], first["lapsed"], first["through_day"]) == ("T-PF-01", 125, False, "2027-04-09")
+    assert (second["at_fires"], second["lapsed"], second["checked_at"]) == (150, True, "2027-05-07T21:10:00+00:00")
+    assert second["result"] == CHECK_150 and second["result_sha256"] == hashlib.sha256(CHECK_150.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("statements, reason", [
+    ([INSERT_125.replace("T-PF-01", "T-PF-02")], "names no looked factory slot"),       # a registered slot that never had its look
+    ([INSERT_125.replace("T-PF-01", "T-OTHER")], "names no looked factory slot"),
+    ([INSERT_125.replace(", 0, '", ", 2, '")], "not a check as gex-signals writes one"),  # a lapse flag that is neither 0 nor 1
+])
+def test_a_check_that_cannot_be_a_slots_check_is_unknown(tmp_path, statements, reason):
+    with pytest.raises(dsr.SourceUnavailable, match=reason):
+        _read(_run(_db(tmp_path / "signals.db"), CHECKS_DDL, *statements))
+
+
+def test_retirement_checks_without_the_factory_tables_are_an_incomplete_generation(tmp_path):
+    with pytest.raises(dsr.SourceUnavailable, match="retirement checks are there and the factory tables are not"):
+        _read(_run(_db(tmp_path / "signals.db", looks=None), CHECKS_DDL))
+
+
+def test_an_added_check_extends_the_last_receipt_and_a_lapse_is_carried(tmp_path):
+    log, second = _two_receipts(tmp_path, [CHECKS_DDL, INSERT_125, INSERT_150])   # the table arrived with a new generation
+
+    assert second["status"] == "read" and "retirement checks likewise" in second["scope"]["history"]
+    payload = json.loads(log.payload(second["payload_sha256"]))
+    assert payload["continuity"] == "extends_last_receipt"
+    assert [(c["at_fires"], c["lapsed"]) for c in payload["factory_retirement_checks"]] == [(125, False), (150, True)]
+
+
+def test_history_is_append_only_for_retirement_checks():
+    look = {"trial_id": "T", "looked_at": "t", "through_day": "d", "result": "{}", "result_sha256": "s"}
+    base = {"row_hashes": ["1"], "trials": [{"seq": 1, "trial_id": "T", "family": "f", "registered_at": "r", "row_hash": "1",
+                                             "content_sha256": "c"}], "factory_looks_table": "present", "factory_looks": [look]}
+    check = {"trial_id": "T", "at_fires": 125, "checked_at": "t", "through_day": "d", "lapsed": False, "result": "{}", "result_sha256": "s"}
+    read = {**base, "factory_retirement_checks_table": "present", "factory_retirement_checks": [check]}
+    none_yet = {**base, "factory_retirement_checks_table": "absent", "factory_retirement_checks": None}
+
+    assert dsr.panel_history_break(base, read) is None            # the last receipt is from before the checks were read
+    assert dsr.panel_history_break(none_yet, read) is None        # the table arrived since
+    assert dsr.panel_history_break(read, read) is None
+    assert dsr.panel_history_break(read, {**read, "factory_retirement_checks": [check, {**check, "at_fires": 150, "lapsed": True}]}) is None
+    assert "check the last receipt read is gone" in dsr.panel_history_break(read, {**read, "factory_retirement_checks": []})
+    assert "checks the last receipt read are gone" in dsr.panel_history_break(read, none_yet)
+    assert "checks the last receipt read are gone" in dsr.panel_history_break(read, base)
+    for key, value in (("lapsed", True), ("checked_at", "later"), ("through_day", "e"), ("result_sha256", "x"), ("result", "{ }")):
+        assert "has changed" in dsr.panel_history_break(read, {**read, "factory_retirement_checks": [{**check, key: value}]}), key
+    assert "cannot be compared" in dsr.panel_history_break({**read, "factory_retirement_checks": None}, read)
+    assert "cannot be compared" in dsr.panel_history_break({**read, "factory_retirement_checks_table": "maybe"}, read)
+
+
+@pytest.mark.parametrize("change, reason", [
+    (["DELETE FROM factory_retirement_checks WHERE at_fires = 125"], "a retirement check the last receipt read is gone"),
+    (["UPDATE factory_retirement_checks SET lapsed = 1 WHERE at_fires = 125"], "a retirement check the last receipt read has changed"),
+    (["DROP TABLE factory_retirement_checks"], "the retirement checks the last receipt read are gone"),
+])
+def test_a_removed_or_altered_check_is_unknown(tmp_path, change, reason):
+    db = _run(_db(tmp_path / "signals.db"), CHECKS_DDL, INSERT_125)
+    log = dsr.ReceiptLog(tmp_path / "log")
+    source = dsr.panel_trials_source(db, lambda: log.last_payload("panel_trials"))
+    first = log.record({"panel_trials": source}, now=lambda: WED_CLOSE + timedelta(minutes=30))["record"]
+    assert first["sources"]["panel_trials"]["status"] == "read"
+    _run(db, *change)
+
+    second = log.record({"panel_trials": source}, now=lambda: THU_CLOSE + timedelta(minutes=30))["record"]["sources"]["panel_trials"]
+
+    assert second["status"] == "unknown" and reason in second["reason"]

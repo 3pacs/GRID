@@ -1660,7 +1660,8 @@ def main(argv=None) -> int:
     p.add_argument("--external-anchors", required=True, type=Path,
                    help="the anchor copy held outside that log (the vault's witness file); a person checks it is that copy")
     p.add_argument("--session", required=True, help="that receipt's session, YYYY-MM-DD")
-    w = sub.add_parser("verdicts-witness", help="mark live verdicts as witnessed by a Desk receipt that read the same stored look")
+    w = sub.add_parser("verdicts-witness", help="mark live verdicts as witnessed by a Desk receipt that read the same stored look, "
+                                                 "and record what that receipt shows of each passed slot's retirement checks")
     w.add_argument("--receipts", required=True, type=Path, help="the Desk receipt log's folder; it is opened and verified")
     w.add_argument("--external-anchors", required=True, type=Path,
                    help="the anchor copy held outside the log (the vault's witness file); a person checks it is that copy")
@@ -1672,12 +1673,14 @@ def main(argv=None) -> int:
         try:
             ledger = lse.Ledger(a.ledger, anchor=a.anchor)
             appended = lse.witness_factory_verdicts(ledger, a.receipts, a.external_anchors, a.session)
+            # The same receipt, read for every passed slot's retirement checks (#1163): one reading, or the reason for none.
+            reading = lse.read_factory_retirement(ledger, a.receipts, a.external_anchors, a.session)
         except (ValueError, OSError) as e:
             print(json.dumps({"ok": False, "refused": str(e)}))
             return 2
         live = lse.summarize(ledger)["live"]
         print(json.dumps({"ok": True, "witnessed_now": appended, "witnessed": live["witnessed"], "unwitnessed": live["unwitnessed"],
-                          "head_sha256": ledger.head}))
+                          "retirement_reading": reading, "lapsed": live["lapsed"], "head_sha256": ledger.head}))
         return 0
     if a.cmd in ("prescreen", "prescreen-register"):
         from analysis import factory_prescreen  # imported here: that module imports this one

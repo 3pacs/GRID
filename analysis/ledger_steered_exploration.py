@@ -295,10 +295,11 @@ FACTORY_RESULT = "factory_run_result"
 FACTORY_ABANDONED = "factory_run_abandoned"
 FACTORY_FORWARD = "factory_forward_outcome"
 FACTORY_FORWARD_WITNESS = "factory_forward_witness"
+FACTORY_RETIREMENT_READING = "factory_retirement_reading"   # what a nightly receipt showed of each passed slot's retirement checks (#1163)
 FACTORY_PRESCREEN = "factory_prescreen_outcome"
 FACTORY_PRESCREEN_REGISTERED = "factory_prescreen_registered"
 FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED, FACTORY_FORWARD, FACTORY_FORWARD_WITNESS,
-                 FACTORY_PRESCREEN, FACTORY_PRESCREEN_REGISTERED)
+                 FACTORY_PRESCREEN, FACTORY_PRESCREEN_REGISTERED, FACTORY_RETIREMENT_READING)
 PRESCREEN_MAX_LOOKS = 10      # registrations one older-data store takes, ever; also the k its alpha is split over
 PRESCREEN_ALPHA = 0.05        # across the store's looks: PRESCREEN_ALPHA / PRESCREEN_MAX_LOOKS per look
 PRESCREEN_MIN_FIRES = 40      # below this the bootstrap bound passes noise two to three times too often (measured)
@@ -997,6 +998,8 @@ class Ledger:
             validate_factory_forward(record, factory_result_index(self), factory_forward_seen(self))
         elif kind == FACTORY_FORWARD_WITNESS:
             validate_factory_forward_witness(record, factory_forward_index(self), self.of_kind(FACTORY_FORWARD_WITNESS))
+        elif kind == FACTORY_RETIREMENT_READING:
+            validate_factory_retirement_reading(record, factory_forward_index(self), self.of_kind(FACTORY_RETIREMENT_READING))
         elif kind == FACTORY_PRESCREEN_REGISTERED:
             validate_factory_prescreen_registered(record, factory_result_index(self),
                                                   self.of_kind(FACTORY_PRESCREEN_REGISTERED))
@@ -1133,6 +1136,7 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
     factory_forward: set[tuple[str, str]] = set()
     factory_forward_lines: dict[str, dict] = {}
     factory_witnesses: list[dict] = []
+    factory_readings: list[dict] = []
     factory_prescreens: list[dict] = []
     factory_registrations: dict[str, dict] = {}
     line_shas: list[str] = []
@@ -1158,6 +1162,9 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
         elif kind == FACTORY_FORWARD_WITNESS:
             validate_factory_forward_witness(record, factory_forward_lines, factory_witnesses)
             factory_witnesses.append(record)
+        elif kind == FACTORY_RETIREMENT_READING:   # closes no run and opens none
+            validate_factory_retirement_reading(record, factory_forward_lines, factory_readings)
+            factory_readings.append(record)
         elif kind == FACTORY_PRESCREEN_REGISTERED:   # like a live verdict: the open run, if any, stays open
             validate_factory_prescreen_registered(record, factory_results, list(factory_registrations.values()))
             factory_registrations[sha256_bytes(line)] = record
@@ -2548,6 +2555,196 @@ def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anch
     return len(pending)
 
 
+LAPSE_FIELDS = ("at_fires", "checked_at", "through_day", "result_sha256", "n", "lower_bound", "floor_usd")
+
+
+def _number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def validate_factory_retirement_reading(record: dict, forward: dict[str, dict], earlier: list[dict]) -> None:
+    """A reading says what one verified nightly receipt showed of each passed slot's retirement checks (#1163).
+
+    A slot that passed its look goes on recording, and gex-signals re-checks it at registered checkpoints; a check
+    whose bound is below the registered floor lapses the slot for good. The verdict export carries no lapse, so the
+    ledger learns of one from the receipt that read the checks. A reading covers every passed verdict whose
+    registration and look that receipt retains, lapsed or not, so "not lapsed" is a statement as of a session and
+    never an absence. Held to here, on append and on every reload:
+
+    * the receipt reference has the shape a witness's has, and its session is after the last reading's;
+    * every slot names a passed live verdict on this ledger, once, by line sha256, with that verdict's run, trial
+      and stored look;
+    * a lapsed slot carries its lapsing check: checkpoint, times, digest of the stored text, and a bound below the
+      floor. One that is not lapsed carries none;
+    * nothing is taken back: a slot an earlier reading covered is covered, a lapse an earlier reading recorded is
+      this same lapse, and the number of checks read never falls.
+    """
+    receipt = record.get("receipt")
+    validate_receipt_reference(receipt, record.get("checked"))
+    if earlier and not receipt["session"] > earlier[-1]["receipt"]["session"]:
+        raise ValueError("a retirement reading's receipt is for a session after the last reading's")
+    if not isinstance(record.get("read_at"), str) or stamp(record["read_at"]) < stamp(receipt["read_finished_at"]):
+        raise ValueError("a retirement reading cannot arrive before its receipt was read")
+    slots = record.get("slots")
+    if not isinstance(slots, list) or not slots or not all(isinstance(x, dict) for x in slots):
+        raise ValueError("a retirement reading names at least one passed slot")
+    seen: dict[str, dict] = {}
+    for slot in slots:
+        verdict = forward.get(slot.get("forward_sha256") or "")
+        if verdict is None or verdict["verdict"] != "pass":
+            raise ValueError("a retirement reading's slot must name a passed live verdict on this ledger by its line sha256")
+        if slot["forward_sha256"] in seen:
+            raise ValueError("a retirement reading names each slot once")
+        if (slot.get("run_id"), slot.get("trial_id"), slot.get("look_sha256"), slot.get("slot_trial_id")) != (
+                verdict["run_id"], verdict["trial_id"], verdict["look_sha256"], verdict["slot"]["trial_id"]):
+            raise ValueError("the reading's slot is for another verdict, another stored look or another slot")
+        checks, lapsed, lapse = slot.get("checks"), slot.get("lapsed"), slot.get("lapse")
+        if not isinstance(checks, int) or isinstance(checks, bool) or checks < 0 or not isinstance(lapsed, bool):
+            raise ValueError("a reading's slot says how many checks the receipt held and whether one lapsed it")
+        if lapsed:
+            if not isinstance(lapse, dict) or tuple(sorted(lapse)) != tuple(sorted(LAPSE_FIELDS)) or checks < 1 \
+                    or not isinstance(lapse["at_fires"], int) or isinstance(lapse["at_fires"], bool) \
+                    or not isinstance(lapse["n"], int) or isinstance(lapse["n"], bool) \
+                    or not all(isinstance(lapse[k], str) for k in ("checked_at", "through_day")) \
+                    or not _hex64(lapse["result_sha256"]) or not _number(lapse["lower_bound"]) or not _number(lapse["floor_usd"]):
+                raise ValueError(f"a lapsed slot carries its lapsing check: {', '.join(LAPSE_FIELDS)}")
+            if not lapse["lower_bound"] < lapse["floor_usd"]:
+                raise ValueError("a lapse is a check whose bound is below the registered floor; this one is not")
+            if lapse["at_fires"] <= verdict["n"] or stamp(lapse["checked_at"]) < stamp(verdict["looked_at"]):
+                raise ValueError("a lapsing check comes after the look, at more resolved fires than the look counted")
+        elif lapse is not None:
+            raise ValueError("a slot that has not lapsed carries no lapsing check")
+        seen[slot["forward_sha256"]] = slot
+    if earlier:
+        _reading_takes_nothing_back(earlier[-1]["slots"], seen)
+
+
+def _reading_takes_nothing_back(last: list[dict], now_by_verdict: dict[str, dict]) -> None:
+    """Raise unless every slot the last reading covered is covered now, with its lapse unchanged and no fewer checks."""
+    for was in last:
+        now = now_by_verdict.get(was["forward_sha256"])
+        if now is None:
+            raise ValueError("a slot the last reading covered is missing from this one")
+        if now["checks"] < was["checks"] or (was["lapsed"] and (not now["lapsed"] or now["lapse"] != was["lapse"])):
+            raise ValueError("a reading takes nothing back: a recorded lapse stays that lapse, and checks are only added")
+
+
+def read_factory_retirement(ledger: Ledger, receipts: str | Path, external_anchors: str | Path, session: str) -> dict:
+    """Append what a verified Desk receipt shows of every passed slot's retirement checks. One reading, or none.
+
+    As for a witness, nothing is taken on the caller's word: the receipt log is opened and verified against the
+    anchor copy, and the ``panel_trials`` payload is read from the log. A passed verdict is covered only when that
+    payload retains its slot's registration row and the same stored look. Each of the slot's checks is then read
+    from its exact stored text, whose digest is recomputed: the text must be that slot's check at that checkpoint,
+    its lapse flag must be the one its own bound and floor give, and only the last check may be a lapse.
+
+    Returns ``{"appended": bool, "reason": str | None, ...}``. Nothing is appended, and the reason says why, when:
+    no verdict on the ledger passed; the receipt's session is not after the last reading's; the receipt did not
+    read a retirement table (an earlier generation, or an earlier receipt format: unknown, not "none lapsed"); the
+    receipt retains none of the passed slots; or every passed slot it could cover is already recorded as lapsed.
+    A payload that contradicts the ledger or itself is refused with ValueError.
+    """
+    if not ledger.is_factory:
+        raise ValueError("retirement readings belong on a factory ledger")
+    from analysis.desk_receipt_witness import verified_receipt
+
+    forward = factory_forward_index(ledger)
+    passed = {sha: v for sha, v in forward.items() if v["verdict"] == "pass"}
+    earlier = ledger.of_kind(FACTORY_RETIREMENT_READING)
+    last = earlier[-1]["slots"] if earlier else []
+
+    def nothing(reason: str) -> dict:
+        return {"appended": False, "reason": reason, "session": session, "passed": len(passed)}
+
+    if not passed:
+        return nothing("no live verdict on this ledger passed: nothing can lapse")
+    if earlier and not session > earlier[-1]["receipt"]["session"]:
+        return nothing("the last reading is for this session or a later one")
+    receipt = verified_receipt(Path(receipts), Path(external_anchors), session, "panel_trials")
+    body = json.loads(receipt["payload"])
+    if not isinstance(body, dict) or body.get("store") != "panel_trials" \
+            or body.get("continuity") not in ("first_read", "extends_last_receipt"):
+        raise ValueError("that receipt's panel_trials payload was not read against the receipt log's own history")
+    if body.get("factory_retirement_checks_table") != "present" or not isinstance(body.get("factory_retirement_checks"), list):
+        return nothing("that receipt read no retirement checks table: whether a passed slot has lapsed is unknown, not no")
+    slots = {x.get("trial_id"): x for x in body.get("factory_slots") or [] if isinstance(x, dict)}
+    looks = {x.get("trial_id"): x for x in body.get("factory_looks") or [] if isinstance(x, dict)}
+    by_slot: dict[str, list] = {}
+    for check in body["factory_retirement_checks"]:
+        if isinstance(check, dict):
+            by_slot.setdefault(check.get("trial_id"), []).append(check)
+    read = []
+    for sha, v in passed.items():
+        slot = v["slot"]
+        held, look = slots.get(slot["trial_id"]), looks.get(slot["trial_id"])
+        if held is None or held.get("row_hash") != slot["row_hash"] or held.get("registered_at") != slot["registered_at"] \
+                or look is None or look.get("result_sha256") != v["look_sha256"]:
+            continue   # the receipt does not retain this registration and this look: not covered, so unknown
+        lapse = None
+        checks = sorted(by_slot.get(slot["trial_id"], []), key=lambda c: c.get("at_fires") or 0)
+        for i, check in enumerate(checks):
+            text = check.get("result")
+            if not isinstance(text, str) or sha256_bytes(text.encode("utf-8")) != check.get("result_sha256"):
+                raise ValueError(f"the receipt's retirement check for slot {slot['trial_id']} is not the text its digest names")
+            try:
+                stored = json.loads(text)
+            except ValueError:
+                raise ValueError(f"the receipt's retirement check for slot {slot['trial_id']} is not JSON") from None
+            if not isinstance(stored, dict) or (stored.get("trial_id"), stored.get("at_fires")) != (slot["trial_id"], check.get("at_fires")) \
+                    or not _number(stored.get("lower_bound")) or not _number(stored.get("floor_usd")) \
+                    or stored.get("lapsed") is not (stored["lower_bound"] < stored["floor_usd"]) \
+                    or check.get("lapsed") is not stored["lapsed"]:
+                raise ValueError(f"the receipt's retirement check for slot {slot['trial_id']} at {check.get('at_fires')} fires "
+                                 "is not that slot's check, or its lapse flag is not what its own bound and floor give")
+            if stored["lapsed"]:
+                if i != len(checks) - 1:
+                    raise ValueError(f"slot {slot['trial_id']} has a check after the one that lapsed it")
+                lapse = {"at_fires": check["at_fires"], "checked_at": check.get("checked_at"), "through_day": check.get("through_day"),
+                         "result_sha256": check["result_sha256"], "n": stored.get("n"),
+                         "lower_bound": stored["lower_bound"], "floor_usd": stored["floor_usd"]}
+        read.append({"forward_sha256": sha, "run_id": v["run_id"], "trial_id": v["trial_id"], "look_sha256": v["look_sha256"],
+                     "slot_trial_id": slot["trial_id"], "checks": len(checks), "lapsed": lapse is not None, "lapse": lapse})
+    if not read:
+        return nothing("that receipt retains none of the passed slots' registrations and looks")
+    # A receipt that contradicts the last reading is refused before anything else is decided about it.
+    _reading_takes_nothing_back(last, {s["forward_sha256"]: s for s in read})
+    if len(read) == len(last) and all(s["lapsed"] for s in last):
+        return nothing("every passed slot this receipt covers is already recorded as lapsed")
+    at = now_iso()
+    _record, sha = ledger._append({
+        "kind": FACTORY_RETIREMENT_READING, "slots": read,
+        "receipt": {k: receipt[k] for k in ("session", "head_sha256", "log_records", "read_finished_at",
+                                             "payload_sha256", "external_anchor")},
+        "checked": receipt["checked"], "checks_recomputed": True, "read_at": at, "recorded_at": at,
+    })
+    return {"appended": True, "reason": None, "session": session, "passed": len(passed), "covered": len(read),
+            "lapsed": sum(s["lapsed"] for s in read), "sha256": sha}
+
+
+def _factory_retirement(ledger: Ledger, forward: dict[str, dict]) -> dict:
+    """Lapses as the last reading shows them: a count only when every passed verdict was covered, else unknown."""
+    readings = ledger.of_kind(FACTORY_RETIREMENT_READING)
+    latest = readings[-1] if readings else None
+    state = {s["forward_sha256"]: s for s in latest["slots"]} if latest else {}
+    passed = [sha for sha, r in forward.items() if r["verdict"] == "pass"]
+    not_read = [sha for sha in passed if sha not in state]
+    return {
+        "lapsed": None if not_read else sum(state[sha]["lapsed"] for sha in passed),
+        "detail": {
+            "as_of_session": latest["receipt"]["session"] if latest else None,
+            "receipt_head_sha256": latest["receipt"]["head_sha256"] if latest else None,
+            "readings": len(readings),
+            "passed": len(passed), "passed_read": len(passed) - len(not_read), "passed_not_read": len(not_read),
+            "lapsed_among_read": sum(state[sha]["lapsed"] for sha in passed if sha in state),
+            "note": "lapsed is what the last retirement reading showed, as of that session; a passed verdict no reading "
+                    "covers is unknown, so the count is null until every one is covered; with no passed verdict it is 0",
+        },
+        "by_verdict": {sha: ({"status": "not_read"} if sha not in state else
+                             {"status": "lapsed", **state[sha]["lapse"]} if state[sha]["lapsed"] else
+                             {"status": "not_lapsed_at_last_reading", "checks": state[sha]["checks"]}) for sha in passed},
+    }
+
+
 def _prescreen_trial(record: dict, results: dict[str, dict]) -> dict:
     """The recorded result a pre-screen record names; its trial must be a selected representative."""
     result = results.get(record.get("result_sha256") or "")
@@ -2817,6 +3014,7 @@ def _factory_live(ledger: Ledger, trials: list[dict]) -> dict:
     witness = {w["forward_sha256"]: w for w in ledger.of_kind(FACTORY_FORWARD_WITNESS)}
     selected = {t["trial_id"] for t in trials if t.get("selected")}
     class_of = {t["trial_id"]: t.get("class") or "unclassed" for t in trials}
+    retirement = _factory_retirement(ledger, forward)
     by_class: dict[str, dict] = {}
     for r in forward.values():
         c = by_class.setdefault(class_of[r["trial_id"]], {"looked": 0, "passed": 0, "failed": 0, "underpowered": 0})
@@ -2830,7 +3028,8 @@ def _factory_live(ledger: Ledger, trials: list[dict]) -> dict:
         "witnessed": sum(sha in witness for sha in forward),
         "unwitnessed": sum(sha not in witness for sha in forward),
         "looked_not_selected_in_run": sum(r["trial_id"] not in selected for r in forward.values()),
-        "lapsed": None,   # the retirement checker (#1163) is not built
+        "lapsed": retirement["lapsed"],   # None = unknown: a passed verdict no retirement reading covers (#1163)
+        "retirement": retirement["detail"],
         "by_class": dict(sorted(by_class.items())),   # feature class of the trial (factory 3); "unclassed" before classes
         "verdicts": [
             {"run_id": r["run_id"], "trial_id": r["trial_id"], "verdict": r["verdict"], "n": r["n"],
@@ -2839,7 +3038,8 @@ def _factory_live(ledger: Ledger, trials: list[dict]) -> dict:
              "witness": ({"status": "witnessed", "receipt_session": witness[sha]["receipt"]["session"],
                           "receipt_head_sha256": witness[sha]["receipt"]["head_sha256"],
                           "witnessed_at": witness[sha]["witnessed_at"]}
-                         if sha in witness else {"status": "unwitnessed"})}
+                         if sha in witness else {"status": "unwitnessed"}),
+             "retirement": retirement["by_verdict"].get(sha)}   # None for a verdict that did not pass: nothing to retire
             for sha, r in forward.items()
         ],
         "note": "a pass is one forward look at alpha / k of its slot family; candidates still recording are not on this "
