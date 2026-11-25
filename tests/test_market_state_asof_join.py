@@ -170,3 +170,68 @@ def test_the_writer_replace_moves_computed_at_so_the_join_sees_the_revision_time
     with eng.connect() as c:
         stamped = c.execute(text("SELECT computed_at FROM market_state_daily WHERE as_of_date = '2026-11-20'")).scalar_one()
     assert str(stamped) > "2026-11-20 21:05:00"
+
+
+def _archive(eng, day: str, label: str, computed: str, superseded: str) -> None:
+    """An archived version as the Postgres trigger writes it (SQLite has no trigger; forged clocks allowed here)."""
+    with eng.begin() as c:
+        c.execute(text("INSERT INTO market_state_daily_revisions (as_of_date, rule, record, computed_at, "
+                       "computed_at_by_trigger, superseded_at, superseded_by_xid, operation, reason, run_tag, "
+                       "attributed) VALUES (:d, 'market-state/3', :r, :c, TRUE, :s, '1', 'UPDATE', 'test', "
+                       "'test-run', TRUE)"),
+                  {"d": day, "r": json.dumps(_record(label)), "c": computed, "s": superseded})
+
+
+FRI_13 = B.SessionTimes(date(2026, 11, 13), datetime(2026, 11, 13, 14, 30, tzinfo=UTC),
+                        datetime(2026, 11, 13, 21, 0, tzinfo=UTC))
+
+
+def test_an_eligible_row_behind_ten_newer_sessions_written_after_the_clock_is_found(tmp_path):
+    """Codex 6052801895: the read used to take the ten newest sessions and filter them by clock afterwards, so a
+    decision whose ten newest sessions were all backfilled after it found nothing. The clock now filters first."""
+    rows = {"2026-11-02": ("low", "2026-11-02 21:05:00")}
+    rows |= {f"2026-11-{d:02d}": ("high", "2026-12-01 00:00:00") for d in range(3, 13)}
+    eng = _engine(tmp_path, rows)
+    sec = S.market_state(eng, "pre_open", FRI_13, B.default_as_of("pre_open", FRI_13))
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-02" and "vix low" in _vix(sec)
+
+
+def test_ties_break_on_the_clock_then_the_current_row_then_the_newest_archive_row(tmp_path):
+    """The trigger keeps one session's versions from overlapping; if forged or hand-written rows do overlap, the
+    choice is still deterministic."""
+    eng = _engine(tmp_path, {"2026-11-20": ("low", "2026-11-20 21:05:00")})
+    _archive(eng, "2026-11-20", "high", "2026-11-20 21:05:00", "2026-11-30 00:00:00")
+    sec = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert "vix low" in _vix(sec) and "superseded_at" not in sec.facts        # same clock: the current row
+
+    (tmp_path / "archived").mkdir()
+    archived_only = _engine(tmp_path / "archived", {})
+    _archive(archived_only, "2026-11-20", "normal", "2026-11-20 21:05:00", "2026-11-30 00:00:00")
+    _archive(archived_only, "2026-11-20", "low", "2026-11-20 21:06:00", "2026-11-30 00:00:00")
+    _archive(archived_only, "2026-11-20", "high", "2026-11-20 21:06:00", "2026-11-30 00:00:00")
+    sec = S.market_state(archived_only, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert "vix high" in _vix(sec)                                            # latest clock, then newest row
+    assert sec.facts["computed_at"].startswith("2026-11-20T21:06:00")
+
+
+def test_the_record_is_read_in_one_statement_and_its_clock_is_labelled(tmp_path):
+    """One statement is one snapshot: the current table and the archive are never read at different moments."""
+    from sqlalchemy import event
+
+    eng = _engine(tmp_path, CADENCE)
+    seen: list[str] = []
+    event.listen(eng, "before_cursor_execute", lambda conn, cur, statement, *rest: seen.append(statement))
+    sec = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    reads = [s for s in seen if "FROM market_state_daily" in s]
+    assert len(reads) == 1 and "FROM market_state_daily_revisions" in reads[0]
+    assert sec.facts["computed_at_basis"] == S.MS_CLOCK_BASIS and S.MS_CLOCK_BASIS.startswith("mutation")
+
+
+def test_an_unreadable_archive_falls_back_to_the_current_table_and_says_so(tmp_path):
+    eng = _engine(tmp_path, CADENCE)
+    with eng.begin() as c:
+        c.execute(text("DROP TABLE market_state_daily_revisions"))
+        c.execute(text("CREATE TABLE market_state_daily_revisions (id INTEGER PRIMARY KEY)"))
+    sec = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-20"
+    assert any(p.startswith("superseded versions read failed") for p in sec.problems)

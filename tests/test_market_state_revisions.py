@@ -13,6 +13,11 @@ this file in its own step that fails on any skip. Against a real database they p
   alone is ignored; TRUNCATE and as_of_date changes are refused; revisions and the epoch are append-only;
 * a replacement on a database without the trigger refuses and leaves the row as it was;
 * the desk brief, replayed between the original write and the revision, shows the original;
+* one session's versions never overlap (Codex 6052801895): a session deleted and written again starts after the
+  deletion, also when the write races the delete (it waits on the session's lock and reads its clock after the
+  delete commits); a clock not later than the session's history is refused, not bumped; the upgrade refuses a row
+  already stamped at or after its epoch; and only the trigger writes revisions;
+* a replay shows what had been written by its clock, a live read what had committed (a delayed commit);
 * downgrade refuses while revisions exist.
 """
 
@@ -21,6 +26,8 @@ from __future__ import annotations
 import importlib
 import json
 import re
+import threading
+import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -440,6 +447,165 @@ def test_the_migration_boundary_with_concurrent_legacy_writers(scratch):
         conn.execute(text(legacy), params)
         epoch = conn.execute(text("SELECT revisions_from FROM market_state_daily_revision_epoch")).scalar_one()
     assert _row(scratch)[2] > epoch                             # the trigger's clock, never the writer's
+
+
+def _forge_revision(engine: Engine, day: date) -> None:
+    """As the table owner, with the from-trigger guard off for this one INSERT: an archived version of ``day`` that
+    ends an hour from now."""
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE market_state_daily_revisions "
+                          "DISABLE TRIGGER market_state_daily_revisions_from_trigger"))
+        conn.execute(text("INSERT INTO market_state_daily_revisions (as_of_date, rule, record, computed_at, "
+                          "computed_at_by_trigger, superseded_at, superseded_by_xid, operation, reason, run_tag, "
+                          "attributed) VALUES (:d, 'market-state/3', CAST(:r AS JSONB), "
+                          "clock_timestamp() AT TIME ZONE 'UTC', TRUE, "
+                          "clock_timestamp() AT TIME ZONE 'UTC' + interval '1 hour', '1', 'DELETE', 'forged', "
+                          "'forged', TRUE)"), {"d": day, "r": json.dumps(_state("normal", day).to_dict())})
+        conn.execute(text("ALTER TABLE market_state_daily_revisions "
+                          "ENABLE TRIGGER market_state_daily_revisions_from_trigger"))
+
+
+def test_the_migration_refuses_a_row_stamped_at_or_after_its_epoch(scratch):
+    """Such a row would read as trigger-stamped, and a version replacing it could start before it began."""
+    _insert_legacy(scratch, OLD_DAY, "normal", "2026-11-13 12:12:14")
+    _insert_legacy(scratch, DAY, "low", "2099-01-01 00:00:00")
+    with pytest.raises(DBAPIError, match="1 row\\(s\\) stamped at or after the revisions epoch"):
+        _run(scratch, "upgrade")
+    assert not inspect(scratch).has_table("market_state_daily_revision_epoch")     # nothing installed
+    assert _row(scratch)[2] == datetime(2099, 1, 1)
+
+
+def test_revisions_are_written_only_by_the_trigger(scratch):
+    _run(scratch, "upgrade")
+    with pytest.raises(DBAPIError, match="direct INSERT refused"):
+        with scratch.begin() as conn:
+            conn.execute(text("INSERT INTO market_state_daily_revisions (as_of_date, rule, record, computed_at, "
+                              "computed_at_by_trigger, superseded_at, superseded_by_xid, operation, reason, "
+                              "run_tag, attributed) VALUES (:d, 'market-state/3', '{}', '2026-11-20 21:05', TRUE, "
+                              "'2099-01-01', '1', 'UPDATE', 'forged', 'forged', TRUE)"), {"d": DAY})
+    assert _revisions(scratch) == []
+
+
+def test_a_clock_not_later_than_the_sessions_history_is_refused(scratch):
+    """The old trigger bumped such a clock to OLD + 1 µs on UPDATE and DELETE and never checked an INSERT against the
+    archive. Now every change must read a clock later than the epoch, the version it replaces and every archived
+    superseded_at for its session; history that ends in the future refuses the change."""
+    _run(scratch, "upgrade")
+    MS.store_market_state(scratch, _state("low"))
+    first = _row(scratch)
+    _forge_revision(scratch, DAY)
+    _forge_revision(scratch, OLD_DAY)
+    with pytest.raises(DBAPIError, match="is not later than"):
+        MS.store_market_state(scratch, _state("high"), replace=REPLACE)                # UPDATE
+    with pytest.raises(DBAPIError, match="is not later than"):
+        with scratch.begin() as conn:
+            conn.execute(text("DELETE FROM market_state_daily WHERE as_of_date = :d"), {"d": DAY})
+    with pytest.raises(DBAPIError, match="is not later than"):
+        MS.store_market_state(scratch, _state("low", OLD_DAY))                         # INSERT
+    assert _row(scratch) == first and len(_revisions(scratch)) == 2                     # only the two forged rows
+
+
+def test_a_session_deleted_and_written_again_starts_after_its_deletion(scratch):
+    _run(scratch, "upgrade")
+    MS.store_market_state(scratch, _state("low"))
+    with scratch.begin() as conn:
+        conn.execute(text("DELETE FROM market_state_daily WHERE as_of_date = :d"), {"d": DAY})
+    MS.store_market_state(scratch, _state("high"))
+    (deleted,) = _revisions(scratch)
+    new = _row(scratch)
+    assert deleted.operation == "DELETE" and deleted.computed_at < deleted.superseded_at < new[2]
+    gap = (deleted.superseded_at + (new[2] - deleted.superseded_at) / 2).replace(tzinfo=UTC)
+    assert S.market_state(scratch, "post_close", MON, gap).status == "empty"          # nothing stood in between
+
+
+def _advisory_waiters(engine: Engine, day: date) -> int:
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 2 "
+                                 "AND objid = :k AND NOT granted"), {"k": (day - date(2000, 1, 1)).days}).scalar_one()
+
+
+def test_a_write_racing_a_delete_of_its_session_waits_and_starts_after_the_delete_commits(scratch):
+    """The overlap Codex 6052801895 names: B's INSERT used to read its clock at once, then wait on the unique index
+    for A's uncommitted DELETE, and so start before A's deleted version ended. B now waits on the session's lock
+    before its clock is read."""
+    _run(scratch, "upgrade")
+    MS.store_market_state(scratch, _state("low"))
+    done, errors = threading.Event(), []
+
+    def _write_again():
+        try:
+            with scratch.begin() as conn:
+                conn.execute(text("INSERT INTO market_state_daily (as_of_date, rule, record) "
+                                  "VALUES (:d, 'market-state/3', CAST(:r AS JSONB))"),
+                             {"d": DAY, "r": json.dumps(_state("high").to_dict())})
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            done.set()
+
+    conn_a = scratch.connect()
+    trans_a = conn_a.begin()
+    writer = threading.Thread(target=_write_again)
+    try:
+        conn_a.execute(text("DELETE FROM market_state_daily WHERE as_of_date = :d"), {"d": DAY})
+        writer.start()
+        deadline = time.monotonic() + 10
+        while _advisory_waiters(scratch, DAY) == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _advisory_waiters(scratch, DAY) == 1 and not done.is_set()     # B waits on the session's lock
+        before_commit = conn_a.execute(text("SELECT clock_timestamp() AT TIME ZONE 'UTC'")).scalar_one()
+        trans_a.commit()
+    finally:
+        conn_a.close()
+        writer.join(timeout=10)
+    assert done.is_set() and errors == []
+    (deleted,) = _revisions(scratch)
+    assert deleted.superseded_at < before_commit < _row(scratch)[2]
+
+
+def test_a_replay_shows_what_was_written_by_its_clock_and_a_live_read_what_had_committed(scratch):
+    """computed_at is the mutation clock (S.MS_CLOCK_BASIS). A's replace is written at W and committed later: a
+    reader during that time still sees the old version, while a replay at a clock between W and the commit shows A's
+    version. For one session the gap ends at A's commit: the next change waits for it before reading its clock."""
+    _run(scratch, "upgrade")
+    MS.store_market_state(scratch, _state("low"))
+    original = _row(scratch)
+    conn_a = scratch.connect()
+    trans_a = conn_a.begin()
+    try:
+        conn_a.execute(text("SELECT set_config('grid.market_state_reason', 'A', true), "
+                            "set_config('grid.market_state_run', 'run-A', true)"))
+        conn_a.execute(text("UPDATE market_state_daily SET record = CAST(:r AS JSONB) WHERE as_of_date = :d"),
+                       {"r": json.dumps(_state("high").to_dict()), "d": DAY})
+        written = conn_a.execute(text("SELECT computed_at FROM market_state_daily WHERE as_of_date = :d"),
+                                 {"d": DAY}).scalar_one()
+        live = S.market_state(scratch, "post_close", MON, _db_utc_now(scratch).replace(tzinfo=UTC))
+        time.sleep(0.05)
+        before_commit = conn_a.execute(text("SELECT clock_timestamp() AT TIME ZONE 'UTC'")).scalar_one()
+        trans_a.commit()
+    finally:
+        conn_a.close()
+    assert any("vix low" in line for line in live.lines)                      # A had not committed
+    assert live.facts["computed_at"] == B.iso(original[2].replace(tzinfo=UTC))
+    assert original[2] < written < before_commit
+    between = (written + (before_commit - written) / 2).replace(tzinfo=UTC)
+    replay = S.market_state(scratch, "post_close", MON, between)
+    assert any("vix high" in line for line in replay.lines)                   # written by the clock, committed after
+    assert replay.facts["computed_at"] == B.iso(written.replace(tzinfo=UTC))
+    assert replay.facts["computed_at_basis"] == S.MS_CLOCK_BASIS
+    (rev,) = _revisions(scratch)
+    assert rev.superseded_at == written
+
+
+def test_an_unreadable_archive_falls_back_to_the_current_table_in_a_fresh_read_only_transaction(scratch):
+    """On PostgreSQL a failed statement aborts the transaction; the reader rolls back and reads the current table."""
+    _run(scratch, "upgrade")
+    MS.store_market_state(scratch, _state("low"))
+    with scratch.begin() as conn:
+        conn.execute(text("ALTER TABLE market_state_daily_revisions RENAME COLUMN superseded_at TO gone"))
+    sec = S.market_state(scratch, "post_close", MON, _db_utc_now(scratch).replace(tzinfo=UTC))
+    assert sec.status == "ok" and sec.facts["record_date"] == DAY.isoformat()
+    assert any(p.startswith("superseded versions read failed (ProgrammingError)") for p in sec.problems)
 
 
 def test_downgrade_refuses_while_revisions_exist(scratch):
