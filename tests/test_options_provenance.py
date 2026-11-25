@@ -125,7 +125,8 @@ def _signal_days(engine: Any, include: Any) -> set[tuple[str, str]]:
 
 CONSTANTS = {
     "VISIBLE_DAILY_SIGNALS": op.VISIBLE_DAILY_SIGNALS, "VISIBLE_SNAPSHOTS": op.VISIBLE_SNAPSHOTS,
-    "VISIBLE_SNAPSHOTS_ALL": op.VISIBLE_SNAPSHOTS_ALL, "VISIBLE_CAPTURE_BATCHES": op.VISIBLE_CAPTURE_BATCHES,
+    "VISIBLE_SNAPSHOTS_ALL": op.VISIBLE_SNAPSHOTS_ALL, "VISIBLE_BATCH_SNAPSHOTS": op.VISIBLE_BATCH_SNAPSHOTS,
+    "VISIBLE_CAPTURE_BATCHES": op.VISIBLE_CAPTURE_BATCHES,
     "VISIBLE_CAPTURE_BATCH_DAYS": op.VISIBLE_CAPTURE_BATCH_DAYS, "LATEST_DAILY_SIGNALS": op.LATEST_DAILY_SIGNALS,
     "LATEST_SIGNAL_EACH_TICKER": op.LATEST_SIGNAL_EACH_TICKER,
 }
@@ -150,7 +151,8 @@ def test_no_constant_hides_inside_another_or_inside_an_admin_form() -> None:
 
 PLAIN = {
     "VISIBLE_DAILY_SIGNALS": "options_daily_signals", "VISIBLE_SNAPSHOTS": "options_snapshots",
-    "VISIBLE_SNAPSHOTS_ALL": "options_snapshots_all", "VISIBLE_CAPTURE_BATCHES": "options_capture_batches",
+    "VISIBLE_SNAPSHOTS_ALL": "options_snapshots_all", "VISIBLE_BATCH_SNAPSHOTS": "options_snapshots_all",
+    "VISIBLE_CAPTURE_BATCHES": "options_capture_batches",
     "VISIBLE_CAPTURE_BATCH_DAYS": "options_capture_batches", "LATEST_DAILY_SIGNALS": op.LATEST_DAILY_SIGNALS_ALL,
     "LATEST_SIGNAL_EACH_TICKER": "options_daily_signals",
 }
@@ -315,6 +317,116 @@ def test_dealer_gamma_selects_the_latest_non_schwab_batch(db) -> None:
     public = DealerGammaEngine(db).latest_completed_capture_batch("SPY", UNKNOWN_DAY, cutoff)
     assert admin == (SCHWAB_DAY, "spy-schwab")
     assert public == (PUBLIC_DAY, "spy-cboe")
+
+
+def test_visible_batch_snapshots_admits_only_public_batches_on_mixed_day(db) -> None:
+    with db.begin() as conn:
+        _batch(conn, "spy-yahoo-gem", "SPY", SCHWAB_DAY, "yahoo", ordinal=2)
+        # An unbatched row (capture_batch_id IS NULL) must fail closed.
+        conn.execute(text(
+            "INSERT INTO options_snapshots_all (ticker, snap_date, expiry, opt_type, strike, bid, ask, "
+            "volume, open_interest, implied_vol, capture_batch_id, capture_ordinal) "
+            "VALUES ('SPY', :d, :e, 'call', 100, 1, 2, 10, 500, 0.2, NULL, NULL)"),
+            {"d": PUBLIC_DAY.isoformat(), "e": (PUBLIC_DAY + timedelta(days=30)).isoformat()})
+    with db.connect() as conn:
+        public_batches = {r[0] for r in conn.execute(op.visible_sql(
+            "SELECT DISTINCT capture_batch_id FROM " + op.VISIBLE_BATCH_SNAPSHOTS + " s"))}
+        admin_batches = {r[0] for r in conn.execute(op.visible_sql(
+            "SELECT DISTINCT capture_batch_id FROM " + op.VISIBLE_BATCH_SNAPSHOTS + " s", True))}
+        # Day-level VISIBLE_SNAPSHOTS_ALL keeps its stricter day-wide rule unchanged.
+        day_level = {str(r[0]) for r in conn.execute(op.visible_sql(
+            "SELECT DISTINCT snap_date FROM " + op.VISIBLE_SNAPSHOTS_ALL + " s WHERE ticker = 'SPY'"))}
+    assert public_batches == {"spy-cboe", "spy-yahoo-gem", "qqq-legacy", "nuox-yahoo"}
+    assert None not in public_batches
+    assert "spy-schwab" not in public_batches and "qqq-unknown" not in public_batches
+    assert "spy-schwab" in admin_batches and "spy-yahoo-gem" in admin_batches
+    assert day_level == {PUBLIC_DAY.isoformat()}
+
+
+def test_dealer_gamma_reads_public_yahoo_batch_on_mixed_day() -> None:
+    from physics.dealer_gamma import DealerGammaEngine
+
+    engine = _sqlite()
+    day = SCHWAB_DAY  # 2026-11-23, a regular NYSE session
+    yahoo_id = "11111111-1111-4111-8111-111111111111"
+    schwab_id = "22222222-2222-4222-8222-222222222222"
+    started = datetime(day.year, day.month, day.day, 14, 35, tzinfo=timezone.utc)
+    completed = datetime(day.year, day.month, day.day, 14, 40, tzinfo=timezone.utc)
+    quote = datetime(day.year, day.month, day.day, 14, 39, tzinfo=timezone.utc)
+    cutoff = datetime(day.year, day.month, day.day, 23, 59, tzinfo=timezone.utc)
+
+    with engine.begin() as conn:
+        for ddl in SCHEMA:
+            # _load_chain validates aware datetime objects on options_snapshots_all timestamps (TIMESTAMPTZ on Postgres).
+            if "CREATE TABLE options_snapshots_all" in ddl:
+                ddl = (ddl
+                       .replace("created_at TEXT", "created_at TIMESTAMPTZ")
+                       .replace("capture_started_at TEXT", "capture_started_at TIMESTAMPTZ")
+                       .replace("capture_completed_at TEXT", "capture_completed_at TIMESTAMPTZ")
+                       .replace("provider_regular_market_at TEXT", "provider_regular_market_at TIMESTAMPTZ"))
+            conn.execute(text(ddl))
+        for bid, ordinal, provider, src, oi_base in (
+            (yahoo_id, 1, "yahoo", "gem", 600),
+            (schwab_id, 2, "schwab", "daily_scheduler", 900),
+        ):
+            conn.execute(text(
+                "INSERT INTO options_capture_batches (capture_batch_id, ticker, snap_date, capture_ordinal, "
+                "capture_started_at, capture_completed_at, registered_at, row_count, spot_price, capture_source, "
+                "provider_regular_market_at, spot_provider, clock_metadata) "
+                "VALUES (:id, 'SPY', :d, :o, :s, :c, :r, 2, 600.0, :src, :q, :p, :m)"),
+                {"id": bid, "d": day.isoformat(), "o": ordinal, "s": started.isoformat(sep=" "),
+                 "c": completed.isoformat(sep=" "), "r": completed.isoformat(sep=" "),
+                 "src": src, "q": quote.isoformat(sep=" "), "p": provider,
+                 "m": json.dumps({"provider": provider})})
+            for opt_type, strike in (("call", 610.0), ("put", 590.0)):
+                conn.execute(text(
+                    "INSERT INTO options_snapshots_all (ticker, snap_date, expiry, opt_type, strike, bid, ask, "
+                    "volume, open_interest, implied_vol, created_at, capture_batch_id, capture_ordinal, "
+                    "capture_started_at, capture_completed_at, provider_regular_market_at) "
+                    "VALUES ('SPY', :d, :e, :ot, :k, 1.0, 2.0, 10, :oi, 0.2, :cr, :id, :o, :s, :c, :q)"),
+                    {"d": day.isoformat(), "e": date(2027, 1, 15).isoformat(), "ot": opt_type,
+                     "k": strike, "oi": oi_base, "cr": completed.isoformat(sep=" "), "id": bid, "o": ordinal,
+                     "s": started.isoformat(sep=" "), "c": completed.isoformat(sep=" "),
+                     "q": quote.isoformat(sep=" ")})
+
+    try:
+        # Admin picks ordinal 2 (Schwab); public picks ordinal 1 (public Yahoo GEM batch).
+        assert DealerGammaEngine(engine, include_schwab=True).latest_completed_capture_batch("SPY", day, cutoff) == (
+            day, schwab_id)
+        assert DealerGammaEngine(engine).latest_completed_capture_batch("SPY", day, cutoff) == (day, yahoo_id)
+
+        # Public registered-batch replay loads the Yahoo batch and refuses the Schwab batch.
+        pub_engine = DealerGammaEngine(engine)
+        yahoo_chain = pub_engine._load_chain("SPY", day, capture_batch_id=yahoo_id, cutoff=cutoff)
+        schwab_chain = pub_engine._load_chain("SPY", day, capture_batch_id=schwab_id, cutoff=cutoff)
+        assert len(yahoo_chain) == 2 and set(yahoo_chain["open_interest"]) == {600}
+        assert schwab_chain.empty
+        # Default latest-batch view (capture_batch_id=None) stays day-level hidden.
+        assert pub_engine._load_chain("SPY", day, capture_batch_id=None).empty
+    finally:
+        engine.dispose()
+
+
+def test_gex_batch_replay_resolves_public_yahoo_batch_and_refuses_schwab_on_mixed_day() -> None:
+    from paper_log.gex_batch_replay import BatchReplayError, resolve_batch
+
+    # Plain SQLite so SQLAlchemy's .columns(snap_date=Date()) decodes ISO strings once.
+    engine = create_engine("sqlite://")
+    day = SCHWAB_DAY
+    yahoo_id = "11111111-1111-4111-8111-111111111111"
+    schwab_id = "22222222-2222-4222-8222-222222222222"
+    with engine.begin() as conn:
+        for ddl in SCHEMA:
+            conn.execute(text(ddl))
+        _batch(conn, yahoo_id, "SPY", day, "yahoo", ordinal=1)
+        _batch(conn, schwab_id, "SPY", day, "schwab", ordinal=2, metadata_provider="schwab")
+    try:
+        resolved = resolve_batch(engine, "SPY", yahoo_id, 1)
+        assert resolved.capture_batch_id == yahoo_id and resolved.snap_date == day
+        with pytest.raises(BatchReplayError):
+            resolve_batch(engine, "SPY", schwab_id, 2)
+    finally:
+        engine.dispose()
 
 
 # ── Consumers that are not requests ──────────────────────────────────

@@ -76,10 +76,9 @@ from ingestion.market_calendar import is_market_open, last_trading_day
 from physics.greeks import black_scholes as _bs
 from store.availability import unavailable
 from store.options_provenance import (
-    VISIBLE_CAPTURE_BATCH_DAYS,
+    VISIBLE_BATCH_SNAPSHOTS,
     VISIBLE_CAPTURE_BATCHES,
     VISIBLE_SNAPSHOTS,
-    VISIBLE_SNAPSHOTS_ALL,
     include_schwab_rows,
     visible_sql,
 )
@@ -648,14 +647,17 @@ class DealerGammaEngine:
         transaction had committed or was observable at the cutoff. This live
         selector does not establish historical point-in-time admission.
 
-        Unless the engine admits Schwab rows, a day with a Schwab batch is
-        skipped as a whole (``VISIBLE_CAPTURE_BATCH_DAYS``), the same
-        day-level rule ``_load_chain`` applies to the contracts, so a
-        same-day Cboe batch is never chosen only for its chain to be hidden;
-        the read falls back to the latest non-Schwab day.
+        Unless the engine admits Schwab rows, Schwab (and unknown-provider
+        post-cutoff) batches are filtered out per batch
+        (``VISIBLE_CAPTURE_BATCHES``), matching the per-batch rule
+        ``_load_chain`` applies when replaying a specific ``capture_batch_id``
+        (``VISIBLE_BATCH_SNAPSHOTS``). A verified public Yahoo/Cboe batch on a
+        mixed-provider day therefore remains selectable and loadable without
+        ever reading Schwab rows; a Schwab-only day falls back to the latest
+        non-Schwab batch.
         """
         query = visible_sql("""
-            SELECT snap_date, capture_batch_id FROM """ + VISIBLE_CAPTURE_BATCH_DAYS + """ b
+            SELECT snap_date, capture_batch_id FROM """ + VISIBLE_CAPTURE_BATCHES + """ b
             WHERE ticker = :ticker
               AND snap_date <= :on_or_before
               AND capture_completed_at <= :cutoff
@@ -721,7 +723,7 @@ class DealerGammaEngine:
                        s.capture_batch_id, s.capture_ordinal,
                        s.capture_started_at, s.capture_completed_at,
                        s.provider_regular_market_at, b.row_count AS registered_row_count
-                FROM """ + VISIBLE_SNAPSHOTS_ALL + """ s
+                FROM """ + VISIBLE_BATCH_SNAPSHOTS + """ s
                 JOIN """ + VISIBLE_CAPTURE_BATCHES + """ b
                   ON b.capture_batch_id = s.capture_batch_id
                  AND b.capture_ordinal = s.capture_ordinal

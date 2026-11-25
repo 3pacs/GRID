@@ -57,7 +57,7 @@ from paper_log.gex_levels.tested_walls import (
     aggregate_per_strike_gex,
     select_tested_walls,
 )
-from store.options_provenance import VISIBLE_CAPTURE_BATCH_DAYS, VISIBLE_SNAPSHOTS_ALL, visible_sql
+from store.options_provenance import VISIBLE_BATCH_SNAPSHOTS, VISIBLE_CAPTURE_BATCHES, visible_sql
 
 REPLAY_KIND = "preopen_replay"
 
@@ -84,11 +84,11 @@ _BATCH_QUERY = visible_sql(
     SELECT b.capture_batch_id, b.capture_ordinal, b.ticker, b.snap_date,
            b.capture_started_at, b.capture_completed_at, b.row_count,
            b.capture_source, b.backfilled,
-           (SELECT COUNT(*) FROM """ + VISIBLE_SNAPSHOTS_ALL + """ s
+           (SELECT COUNT(*) FROM """ + VISIBLE_BATCH_SNAPSHOTS + """ s
              WHERE s.capture_batch_id = b.capture_batch_id
                AND s.capture_ordinal = b.capture_ordinal
                AND s.ticker = b.ticker AND s.snap_date = b.snap_date) AS stored_rows
-    FROM """ + VISIBLE_CAPTURE_BATCH_DAYS + """ b
+    FROM """ + VISIBLE_CAPTURE_BATCHES + """ b
     WHERE b.capture_batch_id = :batch
     """
 ).columns(snap_date=Date())
@@ -96,7 +96,7 @@ _BATCH_QUERY = visible_sql(
 _BATCH_CHAIN_QUERY = visible_sql(
     """
     SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility, expiry
-    FROM """ + VISIBLE_SNAPSHOTS_ALL + """ s
+    FROM """ + VISIBLE_BATCH_SNAPSHOTS + """ s
     WHERE capture_batch_id = :batch AND capture_ordinal = :ordinal
       AND ticker = :ticker AND snap_date = :snap_date
       AND open_interest > 0 AND implied_vol > 0
