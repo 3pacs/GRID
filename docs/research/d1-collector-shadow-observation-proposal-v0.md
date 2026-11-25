@@ -30,9 +30,12 @@ The goal is to observe the real path once for one new Item 2.02 filing, without 
    - Run #1424's `diagnose_sec_exhibit_evidence` with a recording consumer.
 3. **Output:** the receipt, the document and claim hashes, the clocks and the status, published to the vault (not the consumer's full input; see section 3). No
    database write, no change to the earnings-release hold, no ranking, and no price or outcome read.
-4. **Code:** Codex's Dell delta (sha256 `e284bd17…70550528`, verified; base #1424 `6e7e010d`) is the
-   candidate. It adds a default-off `EarningsEventsPuller.rehearse_sec_exhibit_handoff` that `pull()` never calls.
-   It needs an independent reviewer other than the owner.
+4. **Code:** Codex's Dell delta (sha256 `e284bd17…70550528`, base #1424 `6e7e010d`) adds a default-off
+   `EarningsEventsPuller.rehearse_sec_exhibit_handoff` that `pull()` never calls. The independent review
+   (PR review 6052702790 on #1424) accepted it with notes **as offline replay code only**. Its pins (hashes, span,
+   accession) are for one cached Dell capture, so it makes no SEC request and cannot process a different
+   filing. The one-filing observation below therefore needs different, parameterised code that has its own
+   independent review; see `d1-one-filing-run-plan-v0.md`.
 
 ## 3. Tightened conditions (added after review 6051360420)
 
@@ -42,8 +45,12 @@ Seeing a filing in the 06:00Z run does not guarantee a timely, usable pre-open c
    and a maximum request budget (a fixed count of SEC requests) before fetching anything.
 2. **Real clocks.** Record the actual retrieval time and the scratch readback time, not the 06:00Z run time.
 3. **Two checks, both documented.** (a) The Dell delta's recording consumer runs only inside an isolated fixture
-   injection. (b) The delta's exported `offline_rehearsal_only` receipt must be refused by the unchanged
-   production diagnostic in #1424. The export is never relabelled as `primary_post_commit_readback`.
+   injection. (b) The delta's exported `offline_rehearsal_only` receipt is refused by the unchanged production
+   diagnostic in #1424 **as exported**. This is a label, not an enforced property: the independent review showed
+   that re-ingesting the same bytes and flipping `visibility.kind` makes the diagnostic qualify the receipt,
+   because #1424 checks bindings, not authenticity. The run plan therefore requires an archive-bound marker the
+   diagnostic already rejects (for example a `#rehearsal` fragment on `source_url`) or states the claim as
+   "labelled, not enforced". The export is never relabelled as `primary_post_commit_readback`.
 4. **Publish little.** Only the necessary hashes, clocks and status go to the vault, not the recording
    consumer's full input.
 
