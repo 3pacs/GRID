@@ -105,6 +105,11 @@ TICKER_STATUS:
     acquirer: Fox
     last_session: 2026-11-06
     note: 'The Fox merger closed on 2026-11-06; each Class A share converted into 0.9799 FOX Class A shares plus $95.30 in cash, and Nasdaq trading is halted before the open on 2026-11-09 (Roku Form 8-K dated 2026-11-06, sec.gov/Archives/edgar/data/1428439/000119312526451874/d181620d8k.htm). last_session is the endDate of Tiingo''s ROKU listing (read 2026-11-23): a vendor cutoff that here equals the last Nasdaq session'
+  UTZ:
+    status: acquired
+    acquirer: Intersnack Group GmbH & Co. KG (private)
+    last_session: 2026-11-19
+    note: 'The merger of Idaho Merger Sub, Inc. into Utz Brands, Inc. became effective on 2026-11-20; Utz is now a wholly owned subsidiary of Idaho USA, Inc. and an indirect one of Intersnack Group GmbH & Co. KG, and the company asked the NYSE to suspend trading of the Class A shares before the open that day (Utz Form 8-K filed 2026-11-20, items 1.01 to 9.01, sec.gov/Archives/edgar/data/1739566/000119312526470261/d165801d8k.htm; the NYSE Form 25-NSE of the same day is in the filer''s EDGAR list). last_session is the endDate of Tiingo''s UTZ listing (read 2026-11-23): 2026-11-19, the last NYSE session before the suspension. Read on sec.gov on 2026-11-25'
   ALTM: {status: acquired, acquirer: RIO, last_session: 2025-03-05}
   ARCH:
     status: acquired
