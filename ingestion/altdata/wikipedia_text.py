@@ -16,6 +16,7 @@ No authentication required.
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -58,6 +59,15 @@ WATCHLIST: dict[str, str] = {
 
 WIKI_API = "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article"
 
+# Wikimedia's API policy asks for a descriptive User-Agent with a way to reach
+# the operator, and throttles generic agents first. 2026-11-17..24: every run
+# was PARTIAL, 26 to 37 of the 48 lookups answered HTTP 429, from a bare
+# ``GRID/1.0`` agent firing the 48 requests back to back. A generic client name
+# and the public repository URL identify the client without a personal contact.
+USER_AGENT = "GRID-DataPuller/1.0 (+https://github.com/3pacs/GRID)"
+# Minimum gap between two requests of one run (about 1 s per lookup, 48 lookups).
+MIN_REQUEST_INTERVAL_S = 1.0
+
 
 class WikipediaPuller(BasePuller):
     """Track Wikipedia pageviews and detect attention anomalies."""
@@ -72,6 +82,19 @@ class WikipediaPuller(BasePuller):
         "trust_score": "MED",
         "priority_rank": 45,
     }
+
+    def _pace(self) -> None:
+        """Wait so two requests of this puller are at least ``MIN_REQUEST_INTERVAL_S`` apart.
+
+        Runs before every attempt, so a retry after an HTTP 429 (which
+        ``retry_on_failure`` already spaces by ``Retry-After``) is paced too.
+        """
+        last = getattr(self, "_last_request_at", None)
+        if last is not None:
+            wait = MIN_REQUEST_INTERVAL_S - (time.monotonic() - last)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_request_at = time.monotonic()
 
     @retry_on_failure(max_attempts=3)
     def _fetch_pageviews(
@@ -98,7 +121,8 @@ class WikipediaPuller(BasePuller):
             f"{article}/daily/{start_str}00/{end_str}00"
         )
 
-        resp = requests.get(url, timeout=30, headers={"User-Agent": "GRID/1.0"})
+        self._pace()
+        resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
         resp.raise_for_status()
         data = resp.json()
 
