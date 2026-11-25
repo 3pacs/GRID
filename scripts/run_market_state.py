@@ -2,6 +2,8 @@
 """Writer for ``market_state_daily``: the standardized market-state record (``intelligence/regime/market_state.py``).
 
 One row per session, insert-only: a date that already has a row is left as it is unless ``--replace`` is given.
+``--replace`` needs ``--reason``: on Postgres the superseded version is kept in ``market_state_daily_revisions`` with
+that reason and this run (#1191), and a replace that leaves no revision is refused.
 Computes the prior completed trading session by default (never today's), the same rule as
 ``scripts/run_regime_state_vectors.py``. ``--from/--to`` backfills a range of sessions in date order; every record is
 computed using date bounds and declared source availability policies. Modeled lags on revised backfills do not
@@ -11,6 +13,7 @@ Usage:
     python3 scripts/run_market_state.py                         # prior session
     python3 scripts/run_market_state.py --dry-run --json        # print the record, write nothing
     python3 scripts/run_market_state.py --from 2019-01-02 --to 2026-11-12   # backfill sessions
+    python3 scripts/run_market_state.py --as-of 2026-11-20 --replace --reason "dealer gamma backfilled"
     python3 scripts/run_market_state.py --provisional --json    # today's session at its close, display only
 
 ``--provisional`` (#1312) writes a display-only record for today's UTC session, and only at or after that session's
@@ -20,9 +23,9 @@ Thanksgiving, or a weekend) there is nothing to write: it says so (``outcome: no
 weekday timer does not end failed on a holiday. It runs ``compute_market_state`` with ``known_by`` = that close, an
 exact availability cutoff, so a rerun hours later reads only what GRID held at the close. It never refreshes the FRED
 vintages (``--no-refresh`` is accepted and changes nothing; no flag turns a refresh on). It writes to its own table
-(never ``market_state_daily``), insert-only unless ``--replace``, and never takes ``--from/--to``, ``--as-of`` or
-``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is still the one this
-writer makes the next evening.
+(never ``market_state_daily``), insert-only unless ``--replace``, and never takes ``--from/--to``, ``--as-of``,
+``--require-target-dealer`` or ``--reason`` (its table keeps no revisions). Nothing that decides reads it; the
+decision record for the session is still the one this writer makes the next evening.
 
 Each decision record also carries a ``spells`` block (``intelligence/regime/spells.py``, #1309): every variable's
 current label spell and three named spells, derived from the stored labels of earlier sessions plus this record, and
@@ -67,7 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", dest="end", type=_d, default=None, help="backfill end (inclusive), before today")
     p.add_argument("--dry-run", action="store_true", help="compute without writing")
     p.add_argument("--json", action="store_true", help="print each record (dry run) or summary as JSON")
-    p.add_argument("--replace", action="store_true", help="overwrite an existing row for the same date")
+    p.add_argument("--replace", action="store_true",
+                   help="replace an existing row for the same date (needs --reason; the old version is kept)")
+    p.add_argument("--reason", default=None,
+                   help="why --replace rewrites existing rows; kept with each superseded version (#1191)")
     p.add_argument("--no-refresh", action="store_true",
                    help="skip fetching new FRED vintages of the news indexes first (a dry run never fetches)")
     p.add_argument("--require-target-dealer", action="store_true",
@@ -159,6 +165,12 @@ def main(argv: list[str] | None = None, engine=None) -> int:
     if a.require_target_dealer and (a.replace or a.start or a.end):
         print("market-state: target-dealer gate is daily, insert-only; no --replace or range", file=sys.stderr)
         return 2
+    if a.replace and not (a.reason or "").strip():
+        print("market-state: --replace needs --reason (it is kept with each superseded version)", file=sys.stderr)
+        return 2
+    if a.reason is not None and not a.replace:
+        print("market-state: --reason goes with --replace", file=sys.stderr)
+        return 2
     if a.start or a.end:
         if not (a.start and a.end) or a.start > a.end:
             print("market-state: --from and --to require an ordered pair", file=sys.stderr)
@@ -178,7 +190,13 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         print("market-state: refusing empty or nontrading target sessions", file=sys.stderr)
         return 2
 
-    from intelligence.regime.market_state import RECORD_RULE, compute_market_state, load_calendar, store_market_state
+    from intelligence.regime.market_state import (
+        RECORD_RULE,
+        MarketStateReplacement,
+        compute_market_state,
+        load_calendar,
+        store_market_state,
+    )
     from intelligence.regime.spells import SpellRow, load_rows, record_spells, spells_unavailable
 
     if engine is None:
@@ -187,6 +205,7 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         engine = get_engine()
     started = datetime.now(timezone.utc).isoformat()
     run_id = str(uuid.uuid4())
+    replacement = MarketStateReplacement(a.reason.strip(), f"run_market_state.run:{run_id}") if a.replace else None
     outcomes, pending, preserved = [], [], set()
     for t in targets:
         old = None if a.replace else existing_row(engine, t)   # a read; a dry run needs it to mirror admission
@@ -231,6 +250,8 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             "dry_run": a.dry_run, "target_dealer_required": a.require_target_dealer,
             "execution_origin": "unverified", "code_sha256": code, "readiness": ready,
         }
+        if replacement is not None:
+            state.writer_provenance["replacement_reason"] = replacement.reason
         admission = dry_run_admission(existing=t in preserved, replace=a.replace, hold=hold) if a.dry_run else None
         if admission is not None:
             state.writer_provenance["dry_run_admission"] = admission
@@ -251,7 +272,7 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         elif hold:
             outcome["outcome"] = "held_missing_target_dealer"
             held += 1
-        elif store_market_state(engine, state, replace=a.replace):
+        elif store_market_state(engine, state, replace=replacement):
             written += 1
             outcome["outcome"] = "replaced" if a.replace else "written"
             outcome["written_this_run"] = True
@@ -350,9 +371,9 @@ def run_provisional(a: argparse.Namespace, engine=None) -> int:
     The record is computed with the session's close as its availability cutoff, and this path never refreshes the
     FRED vintages: a refresh writes rows fetched now, and those are after the close by construction.
     """
-    if a.start or a.end or a.as_of or a.require_target_dealer:
-        print("market-state: --provisional targets today's session only; no --from/--to, --as-of or "
-              "--require-target-dealer", file=sys.stderr)
+    if a.start or a.end or a.as_of or a.require_target_dealer or a.reason is not None:
+        print("market-state: --provisional targets today's session only; no --from/--to, --as-of, "
+              "--require-target-dealer or --reason (its table keeps no revisions)", file=sys.stderr)
         return 2
     now = utc_now()
     try:

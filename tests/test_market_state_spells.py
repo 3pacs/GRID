@@ -440,13 +440,15 @@ def test_a_dry_run_range_matches_the_live_range_over_existing_rows(engine, bound
 
 def test_a_dry_replace_range_matches_the_live_replace(engine, bounded, capsys):
     _mixed_store(engine)
-    dry = _dry(engine, capsys, "--replace")
+    dry = _dry(engine, capsys, "--replace", "--reason", "test: recompute")
     assert {r["writer_provenance"]["dry_run_admission"] for r in dry.values()} == {"would_replace"}
     [t] = dry["2026-11-13"]["spells"]["transitions"]
     assert (t["from"], t["ended_spell"]["spell_sessions"]) == ("normal", 3)                # 11-12 recomputed
-    assert W.main(["--no-refresh", "--json", "--replace", "--from", "2026-11-10", "--to", "2026-11-13"],
+    assert W.main(["--no-refresh", "--json", "--replace", "--reason", "test: recompute", "--from", "2026-11-10",
+                   "--to", "2026-11-13"],
                   engine) == 0
     assert dry["2026-11-13"]["spells"] == _stored(engine, TARGET)["spells"]
+    assert _stored(engine, TARGET)["writer_provenance"]["replacement_reason"] == "test: recompute"
 
 
 def test_a_held_target_is_labelled_in_the_dry_run_and_never_stored_live(engine, bounded, capsys):
@@ -471,7 +473,7 @@ def test_a_range_cannot_carry_the_dealer_gate(engine, bounded):
 # ── Read-only CLI ──────────────────────────────────────────────────────────
 
 def _replace_later(engine, day, label):
-    assert M.store_market_state(engine, _state(day, label), replace=True)
+    assert M.store_market_state(engine, _state(day, label), replace=M.MarketStateReplacement("test", "test-run"))
     with engine.begin() as c:       # SQLite's CURRENT_TIMESTAMP has one-second resolution: make "later" certain
         c.execute(text("UPDATE market_state_daily SET computed_at = '2099-01-01 00:00:00' WHERE as_of_date = :d"),
                   {"d": day})

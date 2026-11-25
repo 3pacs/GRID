@@ -162,7 +162,7 @@ def test_storage_is_insert_only_unless_replace(engine):
     st = M.compute_market_state(engine, AS_OF, calendar=CAL)
     assert M.store_market_state(engine, st) is True
     assert M.store_market_state(engine, st) is False
-    assert M.store_market_state(engine, st, replace=True) is True
+    assert M.store_market_state(engine, st, replace=M.MarketStateReplacement("test: recompute", "test-run")) is True
     with engine.connect() as c:
         rows = c.execute(text("SELECT as_of_date, rule, record FROM market_state_daily")).fetchall()
     assert len(rows) == 1 and rows[0][1] == "market-state/3"

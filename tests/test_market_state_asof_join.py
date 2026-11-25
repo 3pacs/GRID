@@ -9,7 +9,9 @@ Session times come from the pinned XNYS calendar: 2026-11-18, -19 and -20 and 20
 close at 21:00Z. The writer stores a session's decision record the next weekday evening (about 23:15Z), so the
 timely row in these tests is a hypothetical one written between a close and the next open. The record that meets
 #1191's timing clause in production is the provisional one (owner's ruling, 2026-11-24), and it is display only:
-no deciding reader reads ``market_state_provisional``.
+no deciding reader reads ``market_state_provisional``. Revised rows keep their original version in
+``market_state_daily_revisions``; here those archive rows are written by hand, as the Postgres trigger writes them
+(``tests/test_market_state_revisions.py`` proves the trigger on real Postgres).
 """
 
 from __future__ import annotations
@@ -100,22 +102,63 @@ def test_a_late_row_is_refused_until_it_was_written_and_the_gap_is_reported(tmp_
     assert after.facts["record_date"] == "2026-11-20"
 
 
-def test_a_revised_row_is_never_shown_before_its_revision_and_its_original_is_not_kept(tmp_path):
-    """A --replace rewrites the row and its computed_at in place. A decision between the original write and the
-    revision therefore never sees the revised values, but it cannot see the original either: the table keeps one
-    version. That is the open part of the addendum ("late/revised rows retaining original vintage"); retaining it
-    needs a revisions archive like regime_history_revisions (#1302)."""
+def _revise(eng, archive: bool) -> None:
+    """11-20's row replaced on 11-25 at 04:00Z. ``archive``: also the revision Postgres's trigger writes in the same
+    transaction (tests/test_market_state_revisions.py proves it does); SQLite has no trigger."""
+    with eng.begin() as c:
+        if archive:
+            c.execute(text("INSERT INTO market_state_daily_revisions (as_of_date, rule, record, computed_at, "
+                           "computed_at_by_trigger, superseded_at, superseded_by_xid, operation, reason, run_tag, "
+                           "attributed) SELECT as_of_date, rule, record, computed_at, TRUE, '2026-11-25 04:00:00', "
+                           "'1', 'UPDATE', 'test', 'test-run', TRUE FROM market_state_daily "
+                           "WHERE as_of_date = '2026-11-20'"))
+        c.execute(text("UPDATE market_state_daily SET record = :r, computed_at = '2026-11-25 04:00:00' "
+                       "WHERE as_of_date = '2026-11-20'"), {"r": json.dumps(_record("high"))})
+
+
+def test_a_revised_row_is_shown_as_it_stood_before_its_revision(tmp_path):
+    """A replace rewrites the row and its computed_at in place, and keeps the superseded version
+    (market_state_daily_revisions, #1191). A replay between the original write and the revision sees the original;
+    after the revision, the revised row."""
     eng = _engine(tmp_path, CADENCE)
     before = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
     assert before.facts["record_date"] == "2026-11-20" and "vix low" in _vix(before)
-    with eng.begin() as c:                                   # what store_market_state(replace=True) does
-        c.execute(text("UPDATE market_state_daily SET record = :r, computed_at = '2026-11-25 04:00:00' "
-                       "WHERE as_of_date = '2026-11-20'"), {"r": json.dumps(_record("high"))})
+    _revise(eng, archive=True)
     replayed = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
-    assert replayed.facts["record_date"] == "2026-11-19"     # not the revised 11-20 row ...
-    assert "vix high" in _vix(replayed)                      # ... and 11-19's own high, not 11-20's original low
+    assert replayed.status == "ok" and replayed.facts["record_date"] == "2026-11-20"
+    assert "vix low" in _vix(replayed)                       # the original, not the revision
+    assert replayed.facts["computed_at"].startswith("2026-11-20T21:05:00")
+    assert replayed.facts["superseded_at"].startswith("2026-11-25T04:00:00")
+    assert "replaced at 2026-11-25T04:00:00" in replayed.lines[0] and replayed.problems == ()
+    assert "market_state_daily_revisions" in replayed.source
+    at_revision = S.market_state(eng, "post_close", MON, z("2026-11-25T04:00:00Z"))
+    assert "vix high" in _vix(at_revision) and "superseded_at" not in at_revision.facts
     now = S.market_state(eng, "post_close", MON, z("2026-11-25T05:00:00Z"))
     assert now.facts["record_date"] == "2026-11-20" and "vix high" in _vix(now)
+    assert "superseded_at" not in now.facts
+
+
+def test_without_the_archived_version_a_replay_falls_back_and_never_shows_the_revision_early(tmp_path):
+    """A database whose replace kept nothing (before the archive, or SQLite): the replay shows 11-19's record, never
+    the revised 11-20 one."""
+    eng = _engine(tmp_path, CADENCE)
+    _revise(eng, archive=False)
+    replayed = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert replayed.facts["record_date"] == "2026-11-19" and "vix high" in _vix(replayed)  # 11-19's own high
+
+
+def test_a_version_that_stood_at_the_clock_never_hides_a_newer_session(tmp_path):
+    """11-19's row was replaced after the clock, but 11-20's timely row stood at it: the newer session wins."""
+    eng = _engine(tmp_path, CADENCE)
+    with eng.begin() as c:
+        c.execute(text("INSERT INTO market_state_daily_revisions (as_of_date, rule, record, computed_at, "
+                       "computed_at_by_trigger, superseded_at, superseded_by_xid, operation, reason, run_tag, "
+                       "attributed) SELECT as_of_date, rule, record, computed_at, TRUE, '2026-11-25 04:00:00', '1', "
+                       "'UPDATE', 'test', 'test-run', TRUE FROM market_state_daily WHERE as_of_date = '2026-11-19'"))
+        c.execute(text("UPDATE market_state_daily SET computed_at = '2026-11-25 04:00:00' "
+                       "WHERE as_of_date = '2026-11-19'"))
+    sec = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert sec.facts["record_date"] == "2026-11-20" and "superseded_at" not in sec.facts
 
 
 def test_the_writer_replace_moves_computed_at_so_the_join_sees_the_revision_time(tmp_path):
@@ -123,7 +166,72 @@ def test_the_writer_replace_moves_computed_at_so_the_join_sees_the_revision_time
     eng = _engine(tmp_path, CADENCE)
     state = MS.MarketState(date(2026, 11, 20))
     state.variables = _record("high")["variables"]
-    assert MS.store_market_state(eng, state, replace=True)
+    assert MS.store_market_state(eng, state, replace=MS.MarketStateReplacement("test: recompute", "test-run"))
     with eng.connect() as c:
         stamped = c.execute(text("SELECT computed_at FROM market_state_daily WHERE as_of_date = '2026-11-20'")).scalar_one()
     assert str(stamped) > "2026-11-20 21:05:00"
+
+
+def _archive(eng, day: str, label: str, computed: str, superseded: str) -> None:
+    """An archived version as the Postgres trigger writes it (SQLite has no trigger; forged clocks allowed here)."""
+    with eng.begin() as c:
+        c.execute(text("INSERT INTO market_state_daily_revisions (as_of_date, rule, record, computed_at, "
+                       "computed_at_by_trigger, superseded_at, superseded_by_xid, operation, reason, run_tag, "
+                       "attributed) VALUES (:d, 'market-state/3', :r, :c, TRUE, :s, '1', 'UPDATE', 'test', "
+                       "'test-run', TRUE)"),
+                  {"d": day, "r": json.dumps(_record(label)), "c": computed, "s": superseded})
+
+
+FRI_13 = B.SessionTimes(date(2026, 11, 13), datetime(2026, 11, 13, 14, 30, tzinfo=UTC),
+                        datetime(2026, 11, 13, 21, 0, tzinfo=UTC))
+
+
+def test_an_eligible_row_behind_ten_newer_sessions_written_after_the_clock_is_found(tmp_path):
+    """Codex 6052801895: the read used to take the ten newest sessions and filter them by clock afterwards, so a
+    decision whose ten newest sessions were all backfilled after it found nothing. The clock now filters first."""
+    rows = {"2026-11-02": ("low", "2026-11-02 21:05:00")}
+    rows |= {f"2026-11-{d:02d}": ("high", "2026-12-01 00:00:00") for d in range(3, 13)}
+    eng = _engine(tmp_path, rows)
+    sec = S.market_state(eng, "pre_open", FRI_13, B.default_as_of("pre_open", FRI_13))
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-02" and "vix low" in _vix(sec)
+
+
+def test_ties_break_on_the_clock_then_the_current_row_then_the_newest_archive_row(tmp_path):
+    """The trigger keeps one session's versions from overlapping; if forged or hand-written rows do overlap, the
+    choice is still deterministic."""
+    eng = _engine(tmp_path, {"2026-11-20": ("low", "2026-11-20 21:05:00")})
+    _archive(eng, "2026-11-20", "high", "2026-11-20 21:05:00", "2026-11-30 00:00:00")
+    sec = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert "vix low" in _vix(sec) and "superseded_at" not in sec.facts        # same clock: the current row
+
+    (tmp_path / "archived").mkdir()
+    archived_only = _engine(tmp_path / "archived", {})
+    _archive(archived_only, "2026-11-20", "normal", "2026-11-20 21:05:00", "2026-11-30 00:00:00")
+    _archive(archived_only, "2026-11-20", "low", "2026-11-20 21:06:00", "2026-11-30 00:00:00")
+    _archive(archived_only, "2026-11-20", "high", "2026-11-20 21:06:00", "2026-11-30 00:00:00")
+    sec = S.market_state(archived_only, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert "vix high" in _vix(sec)                                            # latest clock, then newest row
+    assert sec.facts["computed_at"].startswith("2026-11-20T21:06:00")
+
+
+def test_the_record_is_read_in_one_statement_and_its_clock_is_labelled(tmp_path):
+    """One statement is one snapshot: the current table and the archive are never read at different moments."""
+    from sqlalchemy import event
+
+    eng = _engine(tmp_path, CADENCE)
+    seen: list[str] = []
+    event.listen(eng, "before_cursor_execute", lambda conn, cur, statement, *rest: seen.append(statement))
+    sec = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    reads = [s for s in seen if "FROM market_state_daily" in s]
+    assert len(reads) == 1 and "FROM market_state_daily_revisions" in reads[0]
+    assert sec.facts["computed_at_basis"] == S.MS_CLOCK_BASIS and S.MS_CLOCK_BASIS.startswith("mutation")
+
+
+def test_an_unreadable_archive_falls_back_to_the_current_table_and_says_so(tmp_path):
+    eng = _engine(tmp_path, CADENCE)
+    with eng.begin() as c:
+        c.execute(text("DROP TABLE market_state_daily_revisions"))
+        c.execute(text("CREATE TABLE market_state_daily_revisions (id INTEGER PRIMARY KEY)"))
+    sec = S.market_state(eng, "pre_open", MON, B.default_as_of("pre_open", MON))
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-20"
+    assert any(p.startswith("superseded versions read failed") for p in sec.problems)

@@ -1147,41 +1147,113 @@ _TABLE_SQL = (
 )
 
 
+# market_state_daily keeps every version it replaces (#1191). On Postgres the trigger from alembic migration
+# market_state_revs_20261125 owns computed_at (naive UTC, the mutation clock) and copies each superseded version
+# into market_state_daily_revisions with when it was written, when it was superseded, the reason and the run.
+# A replace names both (MarketStateReplacement) and refuses unless exactly one revision lands in its own
+# transaction, so a database without the trigger cannot lose a version silently. SQLite (tests) has no trigger:
+# its copy of the revisions table exists so readers can be tested on hand-written revisions, and a replace there
+# overwrites as before. Every statement is a whole literal with bound values (.claude/rules/security.md).
+REVISIONS_TABLE = "market_state_daily_revisions"
+REVISIONS_MIGRATION = "market_state_revs_20261125"
+
+_SQLITE_REVISIONS_SQL = (
+    "CREATE TABLE IF NOT EXISTS market_state_daily_revisions ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " as_of_date DATE NOT NULL,"
+    " rule TEXT NOT NULL,"
+    " record JSONB NOT NULL,"
+    " computed_at TIMESTAMP NOT NULL,"
+    " computed_at_by_trigger BOOLEAN NOT NULL,"
+    " superseded_at TIMESTAMP NOT NULL,"
+    " superseded_by_xid TEXT NOT NULL,"
+    " operation TEXT NOT NULL,"
+    " reason TEXT NOT NULL,"
+    " run_tag TEXT NOT NULL,"
+    " attributed BOOLEAN NOT NULL)"
+)
+
+
 def ensure_table(engine: Engine) -> None:
     with engine.begin() as conn:
         conn.execute(text(_TABLE_SQL))
+        if conn.dialect.name != "postgresql":
+            conn.execute(text(_SQLITE_REVISIONS_SQL))
+
+
+@dataclass(frozen=True)
+class MarketStateReplacement:
+    """Why an existing ``market_state_daily`` row is replaced, and by which run; both are kept with the old version."""
+
+    reason: str
+    run_tag: str
+
+    def __post_init__(self) -> None:
+        for name in ("reason", "run_tag"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"a market_state_daily replacement needs a non-empty {name}")
 
 
 # Insert-only by default. CAST(... AS JSONB) only on Postgres: SQLite (tests) would coerce the JSON text to a number.
 _INSERT_SQL = {
-    ("postgresql", False): text("INSERT INTO market_state_daily (as_of_date, rule, record) "
-                                "VALUES (:d, :r, CAST(:rec AS JSONB)) ON CONFLICT (as_of_date) DO NOTHING"),
-    ("postgresql", True): text("INSERT INTO market_state_daily (as_of_date, rule, record) "
-                               "VALUES (:d, :r, CAST(:rec AS JSONB)) ON CONFLICT (as_of_date) DO UPDATE SET "
-                               "rule = EXCLUDED.rule, record = EXCLUDED.record, computed_at = CURRENT_TIMESTAMP"),
-    ("other", False): text("INSERT INTO market_state_daily (as_of_date, rule, record) "
-                           "VALUES (:d, :r, :rec) ON CONFLICT (as_of_date) DO NOTHING"),
-    ("other", True): text("INSERT INTO market_state_daily (as_of_date, rule, record) "
-                          "VALUES (:d, :r, :rec) ON CONFLICT (as_of_date) DO UPDATE SET "
-                          "rule = EXCLUDED.rule, record = EXCLUDED.record, computed_at = CURRENT_TIMESTAMP"),
+    "postgresql": text("INSERT INTO market_state_daily (as_of_date, rule, record) "
+                       "VALUES (:d, :r, CAST(:rec AS JSONB)) ON CONFLICT (as_of_date) DO NOTHING"),
+    "other": text("INSERT INTO market_state_daily (as_of_date, rule, record) "
+                  "VALUES (:d, :r, :rec) ON CONFLICT (as_of_date) DO NOTHING"),
 }
+# SQLite only: no trigger, no archive.
+_SQLITE_UPSERT_SQL = text("INSERT INTO market_state_daily (as_of_date, rule, record) "
+                          "VALUES (:d, :r, :rec) ON CONFLICT (as_of_date) DO UPDATE SET "
+                          "rule = EXCLUDED.rule, record = EXCLUDED.record, computed_at = CURRENT_TIMESTAMP")
+# Postgres replace: lock the row and ask the trigger's own question (does anything change?), name the reason and
+# run for the trigger, update, then count the revision this transaction wrote.
+_LOCK_SQL = text("SELECT rule = :r AND record = CAST(:rec AS JSONB) AS same FROM market_state_daily "
+                 "WHERE as_of_date = :d FOR UPDATE")
+_REASON_SQL = text("SELECT set_config('grid.market_state_reason', :reason, true), "
+                   "set_config('grid.market_state_run', :run_tag, true)")
+_REPLACE_SQL = text("UPDATE market_state_daily SET rule = :r, record = CAST(:rec AS JSONB) WHERE as_of_date = :d")
+_ARCHIVED_SQL = text("SELECT count(*) FROM market_state_daily_revisions WHERE as_of_date = :d "
+                     "AND run_tag = :run_tag AND superseded_by_xid = pg_current_xact_id()::text")
 
 
-def store_market_state(engine: Engine, state: MarketState, *, replace: bool = False) -> bool:
-    """Write one record. Returns False when a row for that date exists and ``replace`` is False.
+def store_market_state(engine: Engine, state: MarketState, *,
+                       replace: MarketStateReplacement | None = None) -> bool:
+    """Write one record; never change an existing one unless ``replace`` says why.
 
-    A provisional record (writer mode ``provisional``, #1312) is refused before the table is touched: it goes to
-    its own table through :func:`store_provisional_market_state`, never here.
+    Returns True if this call inserted the row or replaced it with a different record, False when a row for that
+    date exists and ``replace`` is None, or when the replacement record is identical to the stored one.
+
+    On Postgres a replacement keeps the superseded version in ``market_state_daily_revisions`` with ``replace``'s
+    reason and run. It raises RuntimeError, and the transaction rolls back, if no revision landed (the trigger is
+    missing). A provisional record (writer mode ``provisional``, #1312) is refused before the table is touched: it
+    goes to its own table through :func:`store_provisional_market_state`, never here.
     """
     if is_provisional(state):
         raise ValueError("market_state_daily takes decision records only; a provisional record goes to "
                          "market_state_provisional (#1312)")
+    if replace is not None and not isinstance(replace, MarketStateReplacement):
+        raise ValueError("a market_state_daily replace names its reason and run: pass a MarketStateReplacement")
     ensure_table(engine)
+    params = {"d": state.as_of, "r": RECORD_RULE, "rec": json.dumps(state.to_dict())}
     with engine.begin() as conn:
-        dialect = "postgresql" if conn.dialect.name == "postgresql" else "other"
-        res = conn.execute(_INSERT_SQL[(dialect, bool(replace))],
-                           {"d": state.as_of, "r": RECORD_RULE, "rec": json.dumps(state.to_dict())})
-    return bool(res.rowcount)
+        if conn.dialect.name != "postgresql":
+            return bool(conn.execute(_SQLITE_UPSERT_SQL if replace else _INSERT_SQL["other"], params).rowcount)
+        if replace is None:
+            return bool(conn.execute(_INSERT_SQL["postgresql"], params).rowcount)
+        same = conn.execute(_LOCK_SQL, params).scalar()
+        if same is None:                     # no row yet: an insert loses nothing
+            return bool(conn.execute(_INSERT_SQL["postgresql"], params).rowcount)
+        if same:
+            return False
+        conn.execute(_REASON_SQL, {"reason": replace.reason, "run_tag": replace.run_tag})
+        conn.execute(_REPLACE_SQL, params)
+        archived = conn.execute(_ARCHIVED_SQL, {"d": state.as_of, "run_tag": replace.run_tag}).scalar()
+        if archived != 1:
+            raise RuntimeError(f"market_state_daily {state.as_of}: the replacement left {archived!r} revision rows, "
+                               f"not 1; {REVISIONS_TABLE} or its trigger is missing (alembic migration "
+                               f"{REVISIONS_MIGRATION}), so nothing was replaced")
+    return True
 
 
 # ── Provisional record at the close (#1312): display only ─────────────────

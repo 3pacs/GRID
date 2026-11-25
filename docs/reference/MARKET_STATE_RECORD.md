@@ -129,7 +129,7 @@ display only (owner's decision, bring-up plan rev 100).
   - a same-day decision before the close refuses that session's later row;
   - the next session's decision accepts a row written between the close and its open;
   - a late row stays unusable until it is written, and the brief names the missing record;
-  - a revised row is never shown before its revision.
+  - a revised row is never shown before its revision, and a replay before the revision shows the original.
 - **Granularity.** Both records are daily. A decision during a session sees no row for that session, and this table
   gives it no intraday context.
 - **Timing clause (owner's ruling, 2026-11-24).** #1191 asks for each session's record to be written after that
@@ -137,10 +137,55 @@ display only (owner's decision, bring-up plan rev 100).
   21:15Z, with every read cut at the close. The decision record keeps its next-evening schedule (23:15Z on D+1) and
   is not judged against the clause. The ruling changes what counts as evidence, not what decides. The provisional
   record stays display only, and every other part of #1191's done-when still applies to it.
-- **Open: revisions.** A `--replace` overwrites the row and its `computed_at` in place. A decision replayed between
-  the original write and the revision therefore sees neither version of that row. Keeping the original version
-  ("late/revised rows retaining original vintage") needs a revisions archive like `regime_history_revisions`
-  (#1302).
+
+## Revisions (#1191, `market_state_revs_20261125`)
+
+`market_state_daily` keeps every version it replaces, with the same design as `regime_history`'s archive (#1302).
+
+- **Trigger.** `market_state_daily_keep_revisions` (alembic migration `market_state_revs_20261125`; `schema.sql`
+  declares the same objects) owns `computed_at`.
+  - An INSERT gets the mutation clock: `clock_timestamp() AT TIME ZONE 'UTC'`. It is naive UTC like every earlier
+    clock, and a writer's own value or a session in another time zone cannot shift it.
+  - An UPDATE that changes neither `rule` nor `record` keeps the old clock and writes nothing, so a hand backdate of
+    `computed_at` alone is ignored.
+  - A changing UPDATE or a DELETE copies the old version into `market_state_daily_revisions`: its rule, record and
+    `computed_at`, `superseded_at` (the new version's `computed_at`, strictly later), the transaction id, the
+    operation, the reason and the run.
+  - **One session's versions never overlap** (Codex review 6052801895). Every INSERT, changing UPDATE and DELETE
+    first takes that session's advisory lock, held to its commit, and reads the clock only after it. The clock
+    must be later than the epoch, the version it replaces and every `superseded_at` already archived for the
+    session, or the change is refused. A clock that stepped back is not bumped forward. So a session deleted and
+    written again starts after the deletion, also when the write races the delete.
+  - TRUNCATE and as_of_date changes are refused, and the revisions and the epoch are append-only. Only the trigger
+    writes revisions: a direct INSERT is refused (`pg_trigger_depth()`).
+- **Clocks before the archive.** The old upsert moved `computed_at` on every replace, so a version written before
+  `market_state_daily_revision_epoch` keeps its writer-stamped clock. The upgrade refuses a row already stamped at
+  or after the epoch (griddb had none on 2026-11-25: 1,983 rows, newest 11-24 23:18Z), and the trigger never stamps
+  a clock at or before it. So `computed_at_by_trigger` (`computed_at >= epoch`) is true exactly for the trigger's
+  clocks.
+- **Mutation time, not commit visibility.** `computed_at` is when the database wrote a version. Readers see it only
+  from its commit, later by the rest of its transaction (milliseconds for `store_market_state`). A replay at T shows
+  what had been written by T; a reader at T saw what had committed by T. For one session the two differ only while
+  a change's transaction is open, because the next change to it waits for that commit before it reads its clock.
+  `superseded_by_xid` records the transaction. The brief says so in `facts["computed_at_basis"]`.
+- **Writer.** `--replace` needs `--reason`. The run is `run_market_state.run:<run_id>`, and the new record's
+  `writer_provenance.replacement_reason` repeats the reason. `store_market_state(replace=MarketStateReplacement(...))`
+  names both to the trigger (`grid.market_state_reason`, `grid.market_state_run`), and refuses, rolling back, unless
+  exactly one revision lands in its own transaction. So a database without the trigger cannot lose a version
+  silently. A change made without a reason, such as a hand edit, is archived as unattributed, not refused. An
+  identical replacement writes nothing. The provisional table keeps no revisions: `--provisional` refuses
+  `--reason`.
+- **Reader.** One statement, so one snapshot: the newest session whose version stood at the brief's clock, from the
+  current table (written at or before the clock) and the archive (written at or before it, superseded after it).
+  The time predicates come before the LIMIT, and ties break on the clock, then the current row, then the newest
+  archive row. The desk brief replayed at a clock between a row's original write and its revision shows the
+  original, from the archive: the line says when it was replaced, and the facts carry `superseded_at`. A live brief
+  never reads an archived version, because a version superseded before now did not stand at now. Without the
+  archive table (before the migration), or if reading it fails, the same query runs on the current table alone, and
+  a replay falls back to an older session, never to the revision.
+- **Tests.** `tests/test_market_state_revisions.py` runs on real Postgres; CI runs it in its own step, which fails on
+  any skip. `tests/test_market_state_asof_join.py` covers the reader on SQLite with hand-written archive rows.
+- **Downgrade** refuses while any revision exists.
 
 ## Spells and transitions (market-state-spells/1, #1309)
 
