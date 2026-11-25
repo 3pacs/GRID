@@ -65,6 +65,10 @@ class _Conn:
                 raise RuntimeError("deadlock detected")
             self.engine.fills.append(params)
             return SimpleNamespace(rowcount=self.engine.rowcount(params))
+        if "FROM ticker_metrics_daily" in statement and statement.startswith("SELECT obs_date, close_price"):
+            rows = [(d, c) for (t, d, c) in self.engine.existing
+                    if t == params["ticker"] and d >= params["start"]]
+            return SimpleNamespace(fetchall=lambda: rows)
         if "FROM raw_series" in statement:
             assert params["ok"] == "SUCCESS"
             rows = [
@@ -79,8 +83,10 @@ class _Conn:
 
 class _Engine:
     def __init__(self, work_rows: list[tuple], raw_rows: list[dict] | None = None,
-                 rowcount=lambda params: 1, fail_writes: tuple[str, ...] = ()) -> None:
+                 rowcount=lambda params: 1, fail_writes: tuple[str, ...] = (),
+                 existing: list[tuple] | None = None) -> None:
         self.work_rows, self.raw_rows = work_rows, raw_rows or []
+        self.existing = existing or []          # (ticker, obs_date, close_price) already in ticker_metrics_daily
         self.rowcount, self.fail_writes = rowcount, set(fail_writes)
         self.statements: list[tuple[str, dict]] = []
         self.fills: list[dict] = []
@@ -320,3 +326,38 @@ def test_only_the_universe_unit_is_cut_over():
     assert "close_backfill_universe" in universe and "api.twelvedata.com" not in universe
     gem = (ROOT / "scripts" / "td_backfill_gem_tickers.py").read_text(encoding="utf-8")
     assert "api.twelvedata.com" in gem and "close_backfill_universe" not in gem
+
+
+# ── price basis: never two bases in one series ──────────────────────────────
+
+def test_a_stored_close_on_another_basis_withholds_the_ticker_and_says_so(capsys):
+    """SLQT / SUPN after a reverse split: a split-adjusted close of 6.08 sits in
+    the table where the stored raw close is 0.30. Filling the days around it
+    would put both bases in one series."""
+    engine = _Engine([("SLQT", "STALE_30+"), ("CCC", "STALE_30+")],
+                     [raw("SLQT", THU, 0.30), raw("SLQT", FRI, 0.31), raw("CCC", FRI, 7.0)],
+                     existing=[("SLQT", THU, 6.08)])
+    receipt = _run(engine)
+    assert receipt["basis_conflict"] == ["SLQT"] and receipt["eligible_tickers"] == 1
+    assert [f["ticker"] for f in engine.fills] == ["CCC"]
+    assert "SLQT: withheld, 1 stored closes on another price basis" in capsys.readouterr().out
+
+
+def test_two_decimal_rounding_of_a_sub_dollar_price_is_not_a_basis_conflict():
+    engine = _Engine([("EYPT", "DEAD")], [raw("EYPT", THU, 0.2342), raw("EYPT", FRI, 0.2301)],
+                     existing=[("EYPT", THU, 0.23), ("EYPT", FRI, 0.23)])
+    receipt = _run(engine)
+    assert receipt["basis_conflict"] == [] and receipt["eligible_tickers"] == 1
+
+
+def test_basis_conflict_is_reported_in_a_dry_run_too_and_nothing_is_written():
+    engine = _Engine([("SUPN", "DEAD")], [raw("SUPN", THU, 34.77)], existing=[("SUPN", THU, 41.23)])
+    receipt = _run(engine, dry_run=True)
+    assert receipt["basis_conflict"] == ["SUPN"] and engine.begins == 0 and receipt["eligible_closes"] == 0
+
+
+def test_basis_conflicts_helper_ignores_days_without_a_pair_and_zero_prices():
+    closes = [(THU, 10.0, "TIINGO")]
+    assert mod.basis_conflicts([(FRI, 99.0), (THU, 0)], closes) == []
+    assert mod.basis_conflicts([(THU, 10.05)], closes) == []            # 0.5% apart: rounding
+    assert mod.basis_conflicts([(THU, 20.0)], closes) == [THU]
