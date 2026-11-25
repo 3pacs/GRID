@@ -45,16 +45,22 @@ def check_frozen_run(pin, receipts):
     if (not _id(pin.trial_id) or type(pin.run_id) is not int or pin.run_id <= 0
             or not _digest(pin.manifest_sha256) or not _digest(pin.review_sha256)):
         raise ValueError("invalid frozen run identity")
+    matched = False
     for receipt in receipts:
-        if (receipt.trial_id == pin.trial_id and type(receipt.run_id) is int and receipt.run_id == pin.run_id
-                and receipt.review_sha256 == pin.review_sha256
-                and receipt.manifest_sha256 == pin.manifest_sha256):
-            try:
-                if _time(receipt.witnessed_at) <= frozen_at:
-                    return "FIXTURE_IDENTITY_MATCH"
-            except (TypeError, ValueError, OverflowError):
-                continue
-    return "HOLD_NO_FROZEN_RUN_RECEIPT"
+        if (receipt.trial_id != pin.trial_id or type(receipt.run_id) is not int
+                or receipt.run_id != pin.run_id):
+            continue
+        try:
+            timely = _time(receipt.witnessed_at) <= frozen_at
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not timely:
+            continue
+        if (receipt.review_sha256 != pin.review_sha256
+                or receipt.manifest_sha256 != pin.manifest_sha256):
+            return "HOLD_CONFLICTING_RUN_RECEIPT"
+        matched = True
+    return "FIXTURE_IDENTITY_MATCH" if matched else "HOLD_NO_FROZEN_RUN_RECEIPT"
 
 
 @dataclass(frozen=True)
@@ -100,7 +106,7 @@ def reconcile_opportunities(expected, receipts, *, manifest_sha256, frozen_at, a
     if not cutoffs:
         return {"status": "HOLD_EMPTY_ROSTER", "opportunities": {}, "ignored": {}}
 
-    reconciled, conflicts, ignored = {}, set(), {}
+    reconciled, conflicts, ignored, late_readbacks = {}, set(), {}, []
 
     def ignore(reason):
         ignored[reason] = ignored.get(reason, 0) + 1
@@ -128,15 +134,25 @@ def reconcile_opportunities(expected, receipts, *, manifest_sha256, frozen_at, a
         except (TypeError, ValueError, OverflowError):
             ignore("invalid_clock")
             continue
-        if not frozen < decision <= witness <= cutoffs[receipt.opportunity_id]:
+        cutoff = cutoffs[receipt.opportunity_id]
+        if not frozen < decision <= min(witness, cutoff):
             ignore("not_visible_by_decision_cutoff")
             continue
         # Same immutable receipt replay is idempotent; differing receipt or
         # metadata for a single opportunity may not be silently selected.
         value = (receipt.receipt_sha256, receipt.disposition, decision)
+        if witness > cutoff:
+            late_readbacks.append((receipt.opportunity_id, value))
+            continue
         prior = reconciled.setdefault(receipt.opportunity_id, value)
         if prior != value:
             conflicts.add(receipt.opportunity_id)
+
+    # A later exact readback is only a no-op if a timely record already exists.
+    # Check after scanning to keep the result independent of delivery order.
+    for opportunity_id, value in late_readbacks:
+        if opportunity_id in conflicts or reconciled.get(opportunity_id) != value:
+            ignore("not_visible_by_decision_cutoff")
 
     states = {}
     for opportunity_id, cutoff in sorted(cutoffs.items()):

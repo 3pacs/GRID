@@ -35,7 +35,18 @@ class TestFrozenRun(TestCase):
             replace(self.original, manifest_sha256=B),
             replace(self.original, witnessed_at=R + HOUR),
         ]
-        self.assertEqual(check_frozen_run(self.pin, mismatches), "HOLD_NO_FROZEN_RUN_RECEIPT")
+        self.assertEqual(check_frozen_run(self.pin, mismatches), "HOLD_CONFLICTING_RUN_RECEIPT")
+
+    def test_timely_contradiction_cannot_hide_behind_a_match(self):
+        for field in ("review_sha256", "manifest_sha256"):
+            conflict = replace(self.original, **{field: B})
+            for rows in ([conflict, self.original], [self.original, conflict]):
+                self.assertEqual(check_frozen_run(self.pin, rows), "HOLD_CONFLICTING_RUN_RECEIPT")
+
+    def test_future_contradiction_does_not_rewrite_frozen_match(self):
+        future = replace(self.original, review_sha256=B, witnessed_at=R + HOUR)
+        self.assertEqual(check_frozen_run(self.pin, [future, self.original, self.original]),
+                         "FIXTURE_IDENTITY_MATCH")
 
 
 class TestOpportunityCoverage(TestCase):
@@ -88,6 +99,16 @@ class TestOpportunityCoverage(TestCase):
     def test_witness_redelivery_does_not_duplicate_receipt(self):
         second_readback = replace(self.rows[0], witnessed_at=R + HOUR / 2)
         self.assertEqual(self.reconcile([second_readback, *self.rows]), self.reconcile(self.rows))
+
+    def test_late_exact_readback_is_a_noop_only_with_timely_evidence(self):
+        late = replace(self.rows[0], witnessed_at=R + 2 * HOUR)
+        for rows in ([late, *self.rows], [*self.rows, late]):
+            self.assertEqual(self.reconcile(rows), self.reconcile(self.rows))
+        for other in (replace(late, receipt_sha256=B), replace(late, disposition="NONTRADE"),
+                      replace(late, decision_at=late.decision_at + HOUR / 4)):
+            report = self.reconcile([other, *self.rows])
+            self.assertEqual(report["status"], "HOLD_INCOMPLETE")
+            self.assertEqual(report["ignored"], {"not_visible_by_decision_cutoff": 1})
 
     def test_roster_must_be_nonempty_fixed_and_unique(self):
         self.assertEqual(reconcile_opportunities([], [], manifest_sha256=M, frozen_at=R,
