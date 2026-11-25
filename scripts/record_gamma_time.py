@@ -16,6 +16,19 @@ from config import settings
 
 log = logging.getLogger("grid-gamma-time")
 
+# 2026-11-25: one /chains read starts every STAGGER_SECONDS, at MINUTE_OFFSET_SECONDS past the minute. Until now all three
+# pinned reads started together at :00.15 (ThreadPoolExecutor(max_workers=3)) and finished within 0.12 s of each other.
+# Schwab refused other clients' calls just after that burst: on 2026-11-23 all five other-client 429s came 0.05-5.3 s after
+# it (0 of 3,861 calls outside that window), on 11-24 all eleven came 0-12.6 s after it. The whole app used only 21-26
+# calls in the minute before each, far under the per-minute allowance, so the limit being hit looks like a seconds-scale
+# burst on /chains, inferred from timing (Schwab does not document it). The same three reads, spaced out and moved to the
+# half minute, also clear the other top-of-minute callers (native volume :08, SPY bands :07). The 09:30 opening keeps
+# :00.15 and its retry window (:12-:20), staggered the same way. Frames are keyed by the minute of observed_at, so a
+# read at :30 is still that minute's frame.
+STAGGER_SECONDS = 2.0
+MINUTE_OFFSET_SECONDS = 30.0
+OPENING_OFFSET_SECONDS = 0.15
+
 
 def _utc():
     return datetime.now(timezone.utc)
@@ -118,6 +131,13 @@ def _safe_capture(symbol, opening_minute=None, deadline=None):
         return "unavailable:" + type(exc).__name__
 
 
+def _at(when, *, clock, pause):
+    """Wait until `when` (no wait if it has passed)."""
+    left = (when - clock()).total_seconds()
+    if left > 0:
+        pause(left)
+
+
 def _retry_opening(results, minute, *, clock=_utc, pause=sleep, run=_safe_capture):
     pending = [s for s in PINNED if results.get(s) in {"opening_data_pending", "stale"}]
     if not pending:
@@ -134,8 +154,14 @@ def _retry_opening(results, minute, *, clock=_utc, pause=sleep, run=_safe_captur
     if not retry_at <= clock() <= latest_start:
         return
     pool = ThreadPoolExecutor(max_workers=len(pending))
+
+    def staggered(i, symbol):
+        # One start every STAGGER_SECONDS; capture() still refuses to read or write past the cutoff.
+        _at(retry_at + timedelta(seconds=i * STAGGER_SECONDS), clock=clock, pause=pause)
+        return run(symbol, minute, cutoff)
+
     try:
-        futures = {pool.submit(run, s, minute, cutoff): s for s in pending}
+        futures = {pool.submit(staggered, i, s): s for i, s in enumerate(pending)}
         # A slow provider cannot hold the scheduler across 09:31. Workers
         # enforce the same cutoff again after reading and before persistence.
         done, outstanding = wait(
@@ -171,11 +197,30 @@ def cycle():
             return _safe_capture(symbol, opening, opening + timedelta(minutes=1))
         return _safe_capture(symbol)
 
+    def slot(i, symbol):
+        # Pinned symbols come first (tracked_symbols), so the opening's three reads take the first slots.
+        _at(now + timedelta(seconds=i * STAGGER_SECONDS), clock=_utc, pause=sleep)
+        return first(symbol)
+
     with ThreadPoolExecutor(max_workers=3) as pool:
-        results = dict(zip(symbols, pool.map(first, symbols)))
+        results = dict(zip(symbols, pool.map(slot, range(len(symbols)), symbols)))
     if opening is not None:
         _retry_opening(results, opening)
     return ", ".join(f"{s}={status}" for s, status in results.items())
+
+
+def next_read(now, after=None):
+    """Seconds until the next read: OPENING_OFFSET_SECONDS into the 09:30 New York minute, MINUTE_OFFSET_SECONDS into
+    every other minute. `after` is the minute of the read just made: it and earlier minutes are skipped, so a wake a
+    moment early never reads the same minute twice."""
+    minute = now.replace(second=0, microsecond=0)
+    while True:
+        local = minute.astimezone(NY)
+        opening = (local.hour, local.minute) == (9, 30)
+        at = minute + timedelta(seconds=OPENING_OFFSET_SECONDS if opening else MINUTE_OFFSET_SECONDS)
+        if at > now and (after is None or minute > after):
+            return (at - now).total_seconds()
+        minute += timedelta(minutes=1)
 
 
 def main():
@@ -192,12 +237,13 @@ def main():
         release = os.environ.get("GRID_GAMMA_RELEASE_PATH")
         if release and Path(release).resolve() != Path.cwd():
             return  # systemd restarts in the new deployed release
+        started = _utc()
         status = cycle()
         if args.once or status not in ("disabled", "closed"):
             log.info("Gamma time: %s", status)
         if args.once:
             return
-        sleep(60 - (_utc().timestamp() % 60) + 0.15)
+        sleep(next_read(_utc(), after=started.replace(second=0, microsecond=0)))
 
 
 if __name__ == "__main__":
