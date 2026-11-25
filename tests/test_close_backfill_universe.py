@@ -312,9 +312,11 @@ def test_closes_are_read_through_the_completed_close_reader_only():
     assert not re.search(r"from\s+raw_series\b", source, re.I)
 
 
-def test_the_twelve_data_units_are_not_cut_over_by_this_change():
-    """Cutover waits for measured coverage (Codex HOLD 6031399890): the two
-    unit entry points still are the Twelve Data scripts."""
-    for script in ("td_backfill_universe.py", "td_backfill_gem_tickers.py"):
-        source = (ROOT / "scripts" / script).read_text(encoding="utf-8")
-        assert "api.twelvedata.com" in source and "close_backfill_universe" not in source, script
+def test_only_the_universe_unit_is_cut_over():
+    """The universe entry point delegates to this script; the gem cohort's
+    coverage is not yet measured good enough, so its entry point is still
+    Twelve Data (cutover receipts: the universe-cutover PR)."""
+    universe = (ROOT / "scripts" / "td_backfill_universe.py").read_text(encoding="utf-8")
+    assert "close_backfill_universe" in universe and "api.twelvedata.com" not in universe
+    gem = (ROOT / "scripts" / "td_backfill_gem_tickers.py").read_text(encoding="utf-8")
+    assert "api.twelvedata.com" in gem and "close_backfill_universe" not in gem
