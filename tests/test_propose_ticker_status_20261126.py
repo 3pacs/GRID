@@ -319,3 +319,44 @@ def test_a_tiingo_only_lapse_on_a_live_ticker_stays_partial_before_and_after_the
 
     after = pull()
     assert after["status"] == "PARTIAL" and after["lapsed_tickers"] == ["XYZ"]
+
+
+# ── Codex 6080361067: the output contract and a bad stored record ────────────
+
+@pytest.mark.parametrize("name", ["Xyz\nstatus: acquired\n  acquirer: Evil", "Xyz\r\nsuccessor: BAD", "Xyz\u2028last_session: 2026-01-01"])
+def test_every_physical_line_is_a_comment_whatever_the_issuer_name_contains(name):
+    ev = _ev("XYZ", name=name, tickers=("XYZ", "AB\nCD"), filings=[("25", D("2026-11-20"), "0000000010-26-000010", ())])
+    for text in (_text("XYZ", ev), pts.render(pts.triage(_ev("XYZ", name=name, closes={"TIINGO": None, "yfinance": None})), ev)):
+        assert text.splitlines() and all(line.startswith("#") for line in text.splitlines()), text
+        assert not any(line.lstrip().startswith(("status:", "acquirer:", "successor:", "last_session:")) for line in text.splitlines())
+
+
+def test_the_render_boundary_comments_a_raw_multiline_string_too():
+    assert pts.comment_block(["# a", "b\nc", ""]) == "# a\n# b\n# c\n# "
+
+
+def _engine_with(rows_by_ticker):
+    conn = MagicMock()
+
+    def execute(statement, params=None):
+        res = MagicMock()
+        res.fetchall.return_value = rows_by_ticker.get((params or {}).get("sid", "").split(":")[1] if params else "", [])
+        return res
+
+    conn.execute.side_effect = execute
+    engine = MagicMock()
+    engine.connect.return_value = conn
+    return engine
+
+
+@pytest.mark.parametrize("bad", [
+    [("TIINGO", "garbage", 1.0)], [("TIINGO", None, 1.0)], [("TIINGO", D("2026-11-19"), "nan")],
+    [("TIINGO", D("2026-11-19"), None)], [("TIINGO", D("0001-01-01"), 1.0)], [("TIINGO", D("2999-01-01"), 1.0)],
+])
+def test_a_bad_stored_record_is_one_tickers_unavailable_report_not_a_batch_abort(bad):
+    engine = _engine_with({"BAD": bad, "XYZ": [("TIINGO", D("2026-11-19"), 0.022)]})
+    deps, _ = _deps(closes=pts.db_last_closes(engine))
+    out, err = [], []
+    assert pts.run(["BAD", "XYZ"], out=out.append, err=err.append, **deps) == 2
+    assert any(e.startswith("# BAD: EVIDENCE UNAVAILABLE") and "not a valid date/value" in e for e in err)
+    assert any("# XYZ: STATUS NOT ESTABLISHED" in line for line in out)                # the next ticker still reports

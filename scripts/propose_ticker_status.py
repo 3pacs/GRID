@@ -52,6 +52,7 @@ for the tickers a pull actually names.
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 from collections.abc import Callable
@@ -202,7 +203,10 @@ def gather(
     if cik:
         ev.cik, ev.cik_source = cik.zfill(10), ("--cik" if cik_override else "SEC ticker file")
         anchor = ev.last_tiingo_close[0] if ev.last_tiingo_close else None
-        since = anchor - timedelta(days=LEAD_BEFORE_DAYS) if anchor else None
+        try:
+            since = anchor - timedelta(days=LEAD_BEFORE_DAYS) if anchor else None
+        except OverflowError as exc:
+            raise EvidenceUnavailable(f"stored close date {anchor!r} is out of range") from exc
         ev.edgar_name, ev.edgar_tickers, ev.filings = read_submissions(ev.cik, get, sec_headers, since)
     return ev
 
@@ -271,21 +275,39 @@ UNESTABLISHED = ("not established by this tool: that the filing(s) concern this 
                  "accession(s), then write the sidecar entry yourself.")
 
 
+def _one_line(text: str) -> str:
+    """Display value on one physical line: any line break or control character becomes a space."""
+    return re.sub(r"[\x00-\x1f\x7f\x85\u2028\u2029]+", " ", str(text)).strip()
+
+
+def comment_block(lines: list[str]) -> str:
+    """Every physical line of the output starts with ``#``, whatever the values contain."""
+    out: list[str] = []
+    for line in lines:
+        for physical in str(line).splitlines() or [""]:
+            out.append(physical if physical.startswith("#") else "# " + physical)
+    return "\n".join(out)
+
+
 def render(t: Triage, ev: Evidence) -> str:
+    return comment_block(_render_lines(t, ev))
+
+
+def _render_lines(t: Triage, ev: Evidence) -> list[str]:
     if not t.lead:
-        lines = [f"# {t.ticker}: STATUS NOT ESTABLISHED (no entry proposed)"]
-        lines += [f"#   checked: {c}" for c in t.checked]
-        lines += [f"#   would settle it: {m}" for m in t.missing]
-        return "\n".join(lines)
-    lines = [f"# {t.ticker}: LEAD (triage, not a finding; no entry proposed)"]
-    lines += [f"#   checked: {c}" for c in t.checked]
+        lines = [f"# {_one_line(t.ticker)}: STATUS NOT ESTABLISHED (no entry proposed)"]
+        lines += [f"#   checked: {_one_line(c)}" for c in t.checked]
+        lines += [f"#   would settle it: {_one_line(m)}" for m in t.missing]
+        return lines
+    lines = [f"# {_one_line(t.ticker)}: LEAD (triage, not a finding; no entry proposed)"]
+    lines += [f"#   checked: {_one_line(c)}" for c in t.checked]
     for f in t.filings:
         items = f" (Items: {', '.join(f.items)})" if f.items else ""
-        lines.append(f"#   candidate: {_kind(f)}: Form {f.form} {f.accession} filed {f.filed.isoformat()}{items}")
+        lines.append(_one_line(f"#   candidate: {_kind(f)}: Form {f.form} {f.accession} filed {f.filed.isoformat()}{items}"))
     if t.symbol_lead:
-        lines.append(f"#   candidate: {t.symbol_lead}")
+        lines.append(f"#   candidate: {_one_line(t.symbol_lead)}")
     lines.append(f"#   {UNESTABLISHED}")
-    return "\n".join(lines)
+    return lines
 
 
 # ── inputs ───────────────────────────────────────────────────────────────────
@@ -325,8 +347,17 @@ def db_last_closes(engine: Any) -> Callable[[str], dict[str, tuple[date, float] 
             raise EvidenceUnavailable(f"stored closes for {ticker}: {type(exc).__name__}") from exc
         out: dict[str, tuple[date, float] | None] = {"TIINGO": None, "yfinance": None}
         for name, obs, value in rows:
-            if out.get(name) is None:
-                out[name] = (_date(obs) or date.min, float(value))
+            if out.get(name) is not None:
+                continue
+            when = _date(obs)
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                price = float("nan")
+            if when is None or not (date(1970, 1, 1) <= when <= date.today() + timedelta(days=1)) \
+                    or not math.isfinite(price):        # noqa: DTZ011 -- calendar bound
+                raise EvidenceUnavailable(f"stored close for {ticker} ({name}) is not a valid date/value: {obs!r}, {value!r}")
+            out[name] = (when, price)
         return out
 
     return read
