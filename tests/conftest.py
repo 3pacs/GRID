@@ -9,7 +9,6 @@ scheduling policy that keeps the suite correct when it runs in parallel.
 from __future__ import annotations
 
 import os
-from functools import lru_cache
 from pathlib import Path
 from unittest.mock import MagicMock, create_autospec
 
@@ -17,6 +16,8 @@ import pandas as pd
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+
+from tests import ci_scheduling as _ci
 
 # Mirrors the DB_* defaults in config.Settings (config.py:46-50), so a plain
 # local `pytest` behaves exactly as it did before this was configurable.
@@ -37,85 +38,110 @@ def _db_url() -> str:
 
 
 # ---------------------------------------------------------------------------
-# pytest-xdist scheduling
+# pytest-xdist scheduling and CI shards
 # ---------------------------------------------------------------------------
-# CI runs the suite with `-n auto --dist loadgroup`. Under `loadgroup` every
-# test carrying an `xdist_group(name)` marker is routed to the worker that owns
-# that group, so the grouping below is what decides which tests may run
-# concurrently:
+# CI runs the suite as GRID_TEST_SHARD=i/n jobs, each with
+# `-n auto --dist loadgroup`. The policy lives in tests/ci_scheduling.py:
 #
-#   * Tests that reach a live PostgreSQL all share the single "postgres" group
-#     and therefore run one after another on one worker. They share a single
-#     database, write to the public schema, and do not roll back per test, so
-#     two workers running them at once would clobber each other's rows.
-#     Serialising them keeps their behaviour identical to the old
-#     single-process run, and it costs almost nothing: ~188 of ~7,400 tests.
+#   * a shard keeps only the test files it owns. Ownership comes from the
+#     checked-out tree, not from this runner's collection, and every shard
+#     writes a manifest (GRID_TEST_MANIFEST_DIR) of what it collected and
+#     ran, which the "Backend Tests" job checks for exhaustive, disjoint
+#     coverage;
+#   * tests that reach a live PostgreSQL share one "postgres" unit and run one
+#     after another on one worker -- they share a single database, write to
+#     the public schema, and do not roll back per test, so two workers running
+#     them at once would clobber each other's rows;
+#   * every other file is one unit (`--dist loadfile` semantics: its tests stay
+#     together, in order, on one worker, which keeps its module fixtures),
+#     except the slow files in SPREAD_FILES, whose tests are spread one by one.
 #
-#   * Every other test is grouped by its own file, which reproduces
-#     `--dist loadfile` semantics — a module's tests stay together, in order,
-#     on one worker. That preserves the four module-scoped fixtures in the
-#     suite and whatever incidental intra-file ordering it has grown, which
-#     keeps the parallel run as close to the serial run as scheduling allows.
-#
-# Membership is detected by scanning the module source rather than from a
-# hand-maintained list, so a new database test file is picked up on its own.
-# A false positive only costs a little parallelism, which is the right
-# direction for this to fail in.
-#
-# The hook below MUST stay `tryfirst=True`. xdist encodes the group by
-# appending "@<group>" to each item's nodeid from its own
-# pytest_collection_modifyitems inside the worker (xdist/remote.py), and that
-# implementation runs before an undecorated conftest hook. Without tryfirst the
-# markers are added too late to be seen, no suffix is written, and every group
-# silently degrades to plain `--dist load` scheduling — the database tests
-# scatter across workers with no error and no warning. Verified against
-# pytest-xdist 3.8.0: without tryfirst six database files landed on four
-# different workers; with it, all six land on one.
-_DB_TOKENS = ("pg_engine", "live_engine", "get_engine(", "get_connection(")
-
-# Files whose individual tests are slow enough that keeping them together makes
-# the file the critical path for the whole run. These are left ungrouped so
-# `loadgroup` spreads their tests one at a time like plain `--dist load`.
-# Measured on ubuntu-latest (run 34554188271): test_alpha_signals.py is 49.4 s +
-# 42.9 s of gauntlet work in one file, and test_gauntlet_determinism.py another
-# ~91 s; on alien, which is ~2x slower per core, each is ~3 minutes of forced
-# serial time. Neither file touches a database or a module-scoped fixture, so
-# spreading them is safe.
-_SPREAD_FILES = frozenset({
-    "tests/test_alpha_signals.py",
-    "tests/test_gauntlet_determinism.py",
-})
+# The grouping is applied by a scheduler on the xdist controller, not by
+# `xdist_group` markers. Markers stopped working with pytest 9.2.0: xdist
+# 3.8.0 writes the group to `item._nodeid`, which pytest 9.2 no longer reads,
+# so from 2026-11-05 every `loadgroup` run silently scheduled as plain `load`
+# and the database tests ran on several workers at once. Explicit
+# `xdist_group("postgres")` markers in test files still work: the source scan
+# looks for them. See tests/ci_scheduling.py for the details.
 
 
-@lru_cache(maxsize=None)
-def _module_touches_db(path: str) -> bool:
-    """True if the test module at ``path`` can reach a live database."""
-    if not path:
-        return False
-    try:
-        source = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        # Unreadable module: assume it might touch the database and let it
-        # serialise rather than risk a parallel write collision.
-        return True
-    return any(token in source for token in _DB_TOKENS)
+def _is_xdist_loadgroup_worker(config) -> bool:
+    # On a worker xdist resets `dist` to "no" and keeps the mode in
+    # `option.loadgroup` (xdist/remote.py, setup_config).
+    return hasattr(config, "workerinput") and bool(getattr(config.option, "loadgroup", False))
 
 
-@pytest.hookimpl(tryfirst=True)
+def _writes_manifest_collection(config) -> bool:
+    # One process per run records the collection: the only process without
+    # xdist, or worker gw0 under it (every worker collects the same suite).
+    worker = getattr(config, "workerinput", None)
+    return worker is None or worker.get("workerid") == "gw0"
+
+
+# Node ids that have run in this process (setup reports), recorded only where
+# reports arrive for every test: the xdist controller, or a plain run.
+_EXECUTED: set[str] = set()
+
+
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
-    """Tag every test with the xdist group described above."""
-    if not config.pluginmanager.hasplugin("xdist"):
-        return
+    """Keep this shard's files (GRID_TEST_SHARD) and put heavy units first under loadgroup."""
+    shard = os.environ.get(_ci.SHARD_ENV, "").strip()
+    if shard:
+        try:
+            index, total = _ci.parse_shard(shard)
+        except ValueError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+        manifest_dir = os.environ.get(_ci.MANIFEST_ENV, "").strip()
+        if manifest_dir and _writes_manifest_collection(config):
+            directory = Path(manifest_dir)
+            _ci.write_manifest_lines(directory, _ci.MANIFEST_SHARD, [f"{index}/{total}"])
+            _ci.write_manifest_lines(directory, _ci.MANIFEST_COLLECTED, (_ci.node_key(i.nodeid) for i in items))
+        assignment = _ci.tree_assignment(Path(config.rootpath), total)
+        owned = {
+            module: _ci.shard_of(module, assignment, total) == index
+            for module in {_ci.module_of(item.nodeid) for item in items}
+        }
+        keep = [item for item in items if owned[_ci.module_of(item.nodeid)]]
+        dropped = [item for item in items if not owned[_ci.module_of(item.nodeid)]]
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
+            items[:] = keep
 
-    for item in items:
-        # nodeid prefix ("tests/test_foo.py") keeps the "@group" suffix that
-        # xdist appends short and readable; item.path is the absolute path the
-        # source scan needs.
-        module_id = item.nodeid.split("::")[0]
-        if _module_touches_db(str(getattr(item, "path", "") or "")):
-            item.add_marker(pytest.mark.xdist_group("postgres"))
-        elif module_id not in _SPREAD_FILES:
-            item.add_marker(pytest.mark.xdist_group(module_id))
+    if _is_xdist_loadgroup_worker(config):
+        # Every worker sorts the same collection the same way, as xdist
+        # requires. The controller dispatches units in this order.
+        items.sort(key=lambda item: _ci.dispatch_rank(
+            _ci.module_of(item.nodeid),
+            _ci.module_touches_db(str(config.rootpath / _ci.module_of(item.nodeid))),
+        ))
+
+
+def pytest_runtest_logreport(report):
+    if report.when == "setup" and os.environ.get(_ci.MANIFEST_ENV, "").strip():
+        _EXECUTED.add(_ci.node_key(report.nodeid))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Write the executed node ids of a sharded run (GRID_TEST_MANIFEST_DIR)."""
+    manifest_dir = os.environ.get(_ci.MANIFEST_ENV, "").strip()
+    config = session.config
+    if (
+        not manifest_dir
+        or not os.environ.get(_ci.SHARD_ENV, "").strip()
+        or hasattr(config, "workerinput")   # workers see only their own tests
+        or config.option.collectonly        # the --co pass runs nothing
+    ):
+        return
+    _ci.write_manifest_lines(Path(manifest_dir), _ci.MANIFEST_EXECUTED, _EXECUTED)
+
+
+@pytest.hookimpl(optionalhook=True, tryfirst=True)
+def pytest_xdist_make_scheduler(config, log):
+    """`--dist loadgroup` uses GRID's units (tests/ci_scheduling.py); other modes are xdist's own."""
+    if config.getvalue("dist") != "loadgroup":
+        return None
+    return _ci.make_scheduler(config, log)
 
 
 @pytest.fixture

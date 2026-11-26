@@ -16,7 +16,10 @@ that:
   predicate without the #932 disjunct did -- the prior alternatives (push to
   main, #543, #857, #806) and the ordinary self-hosted path are untouched;
 * the four expressions (``env.ON_SELF_HOSTED`` and the three ``runs-on``)
-  carry byte-identical predicates and the trigger events are unchanged.
+  carry byte-identical predicates and the trigger events are unchanged;
+* ``backend-tests-suite`` (the sharded main suite) takes no part in the
+  routing: it is always hosted with its own ephemeral Postgres, because two
+  shards on one self-hosted host would share its persistent database.
 
 The evaluator follows the documented semantics: ``&&``/``||`` return an
 operand (not a boolean), ``!`` negates truthiness (``null``, ``false``, ``0``
@@ -81,6 +84,8 @@ PR932_CONJUNCTION = (
 HOSTED = "ubuntu-latest"
 SELF_HOSTED = ["self-hosted", "tests"]
 JOBS = ("backend-tests", "frontend-build", "lint")
+# Every job in file order; the suite shards are pinned to hosted runners.
+ALL_JOBS = ("backend-tests-suite", "backend-tests", "frontend-build", "lint")
 
 
 def _templates(predicate: str) -> dict[str, str]:
@@ -426,7 +431,7 @@ def test_predicate_bytes_are_the_candidate_templates(workflow: dict[str, Any]) -
 def test_trigger_events_and_jobs_are_unchanged(workflow: dict[str, Any]) -> None:
     on = workflow.get("on", workflow.get(True))
     assert on == {"push": {"branches": ["main", "develop"]}, "pull_request": {"branches": ["main"]}}
-    assert tuple(workflow["jobs"]) == JOBS
+    assert tuple(workflow["jobs"]) == ALL_JOBS
     assert _step(workflow, "Start ephemeral Postgres (hosted runner)")["if"] == "env.ON_SELF_HOSTED != 'true'"
     assert _step(workflow, "Reset persistent Postgres (self-hosted)")["if"] == "env.ON_SELF_HOSTED == 'true'"
     assert "DROP SCHEMA IF EXISTS public CASCADE" in _step(workflow, "Reset persistent Postgres (self-hosted)")["run"]
@@ -506,3 +511,16 @@ def test_evaluator_semantics() -> None:
     assert evaluate("env.ON_SELF_HOSTED != 'true'", {"env": {"ON_SELF_HOSTED": "false"}}) is True
     with pytest.raises(ValueError):
         evaluate("github.ref == 'a' ?? 1", {})
+
+
+def test_suite_shards_are_always_hosted_with_their_own_postgres(workflow: dict[str, Any]) -> None:
+    """TEST_RUNNER never routes the shards: no self-hosted path, so no shared persistent database."""
+    job = workflow["jobs"]["backend-tests-suite"]
+    assert job["runs-on"] == HOSTED
+    names = [step.get("name") for step in job["steps"]]
+    assert "Reset persistent Postgres (self-hosted)" not in names
+    start = next(step for step in job["steps"] if step.get("name") == "Start ephemeral Postgres")
+    assert "if" not in start
+    assert "docker run -d --name grid-test-pg" in start["run"]
+    # and nothing else in the job is conditioned on the self-hosted switch
+    assert "ON_SELF_HOSTED" not in yaml.safe_dump(job)
