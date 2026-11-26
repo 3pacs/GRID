@@ -1528,7 +1528,33 @@ function LineageFlows({ lineage }) {
 }
 
 // ── Intelligence Feed (unified timeline) ─────────────────────────────
-function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets, sectorTickers }) {
+// A trade ticket that states no kelly size is not a 0.0% bet, and one that states no
+// confidence is not "inferred" (#959): anything that is not a number reads as not reported.
+// Only a finite JSON number, or a non-blank string holding a plain decimal number, is a
+// value. `Number()` coerces blank strings, false, [] and [0] to 0, so it is never applied to
+// an unchecked shape (booleans, arrays, objects, null and undefined all abstain).
+const PLAIN_DECIMAL = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/;
+export function finiteNumberOrNull(value) {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string') {
+        const t = value.trim();
+        if (!PLAIN_DECIMAL.test(t)) return null;
+        const n = Number(t);
+        return Number.isFinite(n) ? n : null;
+    }
+    return null;
+}
+export function ticketKellyText(kelly) {
+    const n = finiteNumberOrNull(kelly);
+    return n === null ? 'kelly not reported' : `kelly ${(n * 100).toFixed(1)}%`;
+}
+export function ticketConfidenceTier(confidence) {
+    const n = finiteNumberOrNull(confidence);
+    if (n === null) return 'unknown';
+    return n >= 0.6 ? 'derived' : 'inferred';
+}
+
+export function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets, sectorTickers }) {
     const feed = useMemo(() => {
         const rows = [];
         const sectorSet = sectorTickers instanceof Set ? sectorTickers : new Set();
@@ -1539,9 +1565,9 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 source: 'ticket',
                 ticker: tk.toUpperCase(),
                 actor: String(t.shock_node || 'contagion').toUpperCase(),
-                action: `${(t.direction || '').toUpperCase()} ${(t.instrument || '').toUpperCase()} $${t.strike} exp ${t.expiry} · kelly ${((t.kelly_size || 0) * 100).toFixed(1)}%`,
+                action: `${(t.direction || '').toUpperCase()} ${(t.instrument || '').toUpperCase()} $${t.strike} exp ${t.expiry} · ${ticketKellyText(t.kelly_size)}`,
                 date: t.generated_at,
-                confidence: (Number(t.confidence) || 0) >= 0.6 ? 'derived' : 'inferred',
+                confidence: ticketConfidenceTier(t.confidence),
             });
         }
         for (const t of insider || []) {
@@ -1572,7 +1598,8 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 actor: c.source || 'convergence',
                 action: c.message || c.alert || '',
                 date: c.date || c.detected_at,
-                confidence: c.confidence || 'derived',
+                // A row that states no tier is unknown, not derived.
+                confidence: c.confidence || 'unknown',
             });
         }
         for (const l of levers || []) {
@@ -1582,7 +1609,7 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 actor: l.name || l.actor || 'Lever puller',
                 action: l.description || l.signal || l.type || '',
                 date: l.date || l.detected_at,
-                confidence: l.confidence || 'inferred',
+                confidence: l.confidence || 'unknown',
             });
         }
         rows.sort((a, b) => {
