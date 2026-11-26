@@ -133,6 +133,53 @@ describe('Dashboard watchlist loading', () => {
         expect(screen.queryByTitle(/yfinance/i)).not.toBeInTheDocument();
     });
 
+    it('says why the PULSE strip is empty when the quote cache is empty (#959)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false, source: 'yfinance' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        const note = await screen.findByTestId('pulse-empty-note');
+        expect(note).toHaveTextContent(/No cached quotes yet/i);
+        expect(note).toHaveTextContent(/not a live feed/i);
+        expect(note).not.toHaveTextContent(/failed/i);
+    });
+
+    it('does not claim an empty cache when the quote read failed (#959)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({ error: true, status: 503, message: 'down' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        const note = await screen.findByTestId('pulse-empty-note');
+        expect(note).toHaveTextContent(/Quotes unavailable: the request failed/i);
+        expect(note).not.toHaveTextContent(/No cached quotes/i);
+    });
+
+    it('shows no empty-strip note while the first quote read is pending or when a quote exists (#959)', async () => {
+        let resolvePrices;
+        api.getWatchlistPrices.mockReturnValue(new Promise(r => { resolvePrices = r; }));
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(api.getWatchlistPrices).toHaveBeenCalled());
+        expect(screen.queryByTestId('pulse-empty-note')).not.toBeInTheDocument();
+
+        await act(async () => { resolvePrices({ prices: { SPY: { price: 500, pct_1d: 0.01 } }, fresh: true, cached: true }); });
+        await waitFor(() => expect(screen.getAllByText('500.00').length).toBeGreaterThan(0));
+        expect(screen.queryByTestId('pulse-empty-note')).not.toBeInTheDocument();
+    });
+
+    it('fills the strip only when the user presses Refresh quotes, and says so if that fails (#959)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false });
+        api.refreshWatchlistPrices.mockResolvedValueOnce({ error: true, status: 502, message: 'upstream' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        const button = await screen.findByTestId('pulse-refresh');
+        expect(api.refreshWatchlistPrices).not.toHaveBeenCalled();
+        fireEvent.click(button);
+        expect(await screen.findByText(/Quote refresh failed, so there are still no quotes/i)).toBeInTheDocument();
+
+        api.refreshWatchlistPrices.mockResolvedValueOnce({ prices: { SPY: { price: 501, pct_1d: 0.02 } } });
+        fireEvent.click(screen.getByTestId('pulse-refresh'));
+        await waitFor(() => expect(screen.queryByTestId('pulse-empty-note')).not.toBeInTheDocument());
+        expect(screen.getAllByText('501.00').length).toBeGreaterThan(0);
+    });
+
     it('shows "time not reported" for a change-feed event with no time, never the brief time (#959)', async () => {
         const generated = new Date(Date.now() - 5 * 60000).toISOString();
         api.getIntelDashboard.mockResolvedValue({

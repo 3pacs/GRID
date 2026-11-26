@@ -335,6 +335,13 @@ export default function Dashboard({ onNavigate }) {
     // 'pending' (first read in flight), 'ok' (a read succeeded; empty means empty), 'failed'.
     const [changeFeedState, setChangeFeedState] = useState('pending');
     const [pulsePrices, setPulsePrices] = useState({});
+    // The quote endpoint serves a cache that only a manual refresh fills, so an
+    // empty strip is a normal state. api._fetch resolves a failure to
+    // {error: true}; neither that nor an empty cache is a price of 0.
+    // 'pending' (first read in flight), 'ok', 'failed'; plus whether a manual refresh is running.
+    const [pulseRead, setPulseRead] = useState('pending');
+    const [pulseRefreshing, setPulseRefreshing] = useState(false);
+    const [pulseRefreshFailed, setPulseRefreshFailed] = useState(false);
     const [watchlistItems, setWatchlistItems] = useState([]);
     const [intelData, setIntelData] = useState(null);
     const [flowsData, setFlowsData] = useState(null);
@@ -365,6 +372,26 @@ export default function Dashboard({ onNavigate }) {
         }
     }, []);
 
+    const applyPulseRead = useCallback((r) => {
+        if (!r || r.error) { setPulseRead('failed'); return; }
+        if (r.prices) setPulsePrices(r.prices);
+        setPulseRead('ok');
+    }, []);
+
+    const refreshPulseQuotes = useCallback(async () => {
+        setPulseRefreshing(true);
+        setPulseRefreshFailed(false);
+        try {
+            const r = await api.refreshWatchlistPrices();
+            if (!r || r.error) { setPulseRefreshFailed(true); return; }
+            applyPulseRead(r);
+        } catch {
+            setPulseRefreshFailed(true);
+        } finally {
+            setPulseRefreshing(false);
+        }
+    }, [applyPulseRead]);
+
     const refreshLiveSnapshot = useCallback(async () => {
         try {
             const regimeRead = startRegimeRead();
@@ -375,7 +402,7 @@ export default function Dashboard({ onNavigate }) {
             ]);
             applyRegimeRead(regimeRead, regime);
             if (status) setSystemStatus(status);
-            if (watchlistPriceResponse?.prices) setPulsePrices(watchlistPriceResponse.prices);
+            applyPulseRead(watchlistPriceResponse);
         } catch {
             // Best-effort catch-up after socket reconnect/visibility restore.
         }
@@ -403,7 +430,7 @@ export default function Dashboard({ onNavigate }) {
                 setIntelData(d);
             }).catch(() => { setChangeFeedState('failed'); });
             api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
-            api.getWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
+            api.getWatchlistPrices().then(applyPulseRead).catch(() => setPulseRead('failed'));
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
         } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
     }, []);
@@ -448,6 +475,13 @@ export default function Dashboard({ onNavigate }) {
             source: best?.source, updatedAt: best?.updated_at,
         };
     }), [pulsePrices, livePriceUpdates, wsPrices]);
+
+    // Say why the strip is empty instead of leaving four bare dashes.
+    const pulseHasQuote = pulse.some(p => p.price != null);
+    const pulseEmptyNote = pulseHasQuote || pulseRead === 'pending' ? null
+        : pulseRefreshFailed ? 'Quote refresh failed, so there are still no quotes.'
+        : pulseRead === 'failed' ? 'Quotes unavailable: the request failed, so these dashes are not prices.'
+        : 'No cached quotes yet. They load only when refreshed; this strip is not a live feed.';
 
     const direction = thesis?.overall_direction || 'NEUTRAL';
     const conviction = thesis?.conviction;
@@ -752,6 +786,20 @@ export default function Dashboard({ onNavigate }) {
                         {!isMobile && i < pulse.length - 1 && <span style={{ color: colors.border, margin: '0 4px', fontSize: '10px' }}>|</span>}
                     </React.Fragment>
                 ))}
+                {pulseEmptyNote && (
+                    <span data-testid="pulse-empty-note" style={{ display: 'inline-flex', alignItems: 'center', gap: '8px',
+                        marginLeft: isMobile ? 0 : '14px', color: colors.textDim, fontSize: '10px',
+                        width: isMobile ? '100%' : 'auto' }}>
+                        <span>{pulseEmptyNote}</span>
+                        <button type="button" onClick={refreshPulseQuotes} disabled={pulseRefreshing}
+                            data-testid="pulse-refresh"
+                            style={{ fontFamily: MONO, fontSize: '10px', padding: '2px 8px', borderRadius: '4px',
+                                background: 'transparent', color: colors.accent,
+                                border: `1px solid ${colors.accent}40`, cursor: pulseRefreshing ? 'wait' : 'pointer' }}>
+                            {pulseRefreshing ? 'Refreshing' : 'Refresh quotes'}
+                        </button>
+                    </span>
+                )}
             </div>
 
             <div style={{ height: '60px' }} />
