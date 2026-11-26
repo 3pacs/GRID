@@ -23,6 +23,12 @@ section 6.2 strikes both D2-H1 cells before any fetch. No D2 outcome had been re
   own costs) but stays open for any later E2 scoring of options.
 - **§10.5:** revision log.
 
+The old D2-H1 text is kept, not deleted, but only inside marked history blocks (`D2-H1-HISTORY-BEGIN` / `END`) or
+struck table rows. A test renders the revision 7 body, removes the history and the revision log, and fails if any remaining
+live line names H1a, H1b or D2-H1 without saying it is struck, or if the GO, HOLD, precedence and RETIRE rules differ from
+revision 7's (D2-H2 FAIL is RETIRE; D2-H2 PASS or UNDERPOWERED is HOLD; GO is not reachable; D2-H3 decides only itself). That
+check is lexical: it finds a surviving live H1 rule, not a mistaken one, so the reviewer's reading still matters.
+
 D2-H2, D2-H3 and every D1 rule are unchanged. This is a real tightening, not a relaxation: removing the replication would
 otherwise make GO easier, so GO is made unreachable instead.
 
