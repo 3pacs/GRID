@@ -106,6 +106,8 @@ def _build(root: Path, hid: str, n: int) -> dict:
     spec = A.FROZEN_SPEC["hypotheses"][hid]
     _write(root, str(M.CONTRACT_PATH), (M.REPO / M.CONTRACT_PATH).read_bytes())
     m = json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
+    # the synthetic world fixes its own owner date: its chronology must not move when the committed manifest is re-signed
+    m["signed_at"] = "2026-11-14"
     for iid in spec["required_inputs"]:
         prefix = "receipts/" if iid == INP else f"receipts/{iid}/"
         inp = _synthetic_input(root, iid, prefix)
@@ -396,13 +398,12 @@ def test_frozen_numbers_are_the_signed_contract_body():
     for needle in ("≥ 200 events in the top quintile and ≥ 60 distinct event weeks per cell in the holdout",
                    "1 − 0.05/4 = 0.9875", "Holdout: 2019-01-01 .. 2025-12-31", "Development: acceptance dates 2012-01-01 .. 2018-12-31",
                    "[entry, +5 sessions] and [entry, +20 sessions]", "1 − 0.05/2 = 0.975",
-                   "D2-H1a and D2-H1b n ≥ 300 sessions each; D2-H2 n = 100; D2-H3 n = 50",
-                   "2018-01-02 .. 2022-11-11", "levels (0.95) unchanged", "live Schwab chain, ledger `fly_days`",
-                   "| D1-F1, D1-F2 history |", "| all D1 history |", "| D2-H1a, D2-H1b |",
+                   "D2-H2 n = 100; D2-H3 n = 50", "levels (0.95) unchanged", "live Schwab chain, ledger `fly_days`",
+                   "| D1-F1, D1-F2 history |", "| all D1 history |",
                    "every judged historical D1 result; the D1 holdout stays unopened"):
         assert needle in body, needle
     hyps = A.FROZEN_SPEC["hypotheses"]
-    assert set(hyps) == {"D1-F1", "D1-F2", "D2-H1a", "D2-H1b", "D2-H2", "D2-H3"}  # D1-F3 is evidence-only
+    assert set(hyps) == {"D1-F1", "D1-F2", "D2-H2", "D2-H3"}  # D1-F3 is evidence-only; D2-H1a/b struck in revision 7
     assert all("G15" in hyps[h]["blocking_gaps"] and hyps[h]["judged_historical_d1"] for h in ("D1-F1", "D1-F2"))
 
 
@@ -583,11 +584,11 @@ def test_one_is_not_true_for_the_reviewer_in_the_entry_point():
 
 def test_a_manifest_drift_is_refused_by_validate_even_without_admission():
     m = json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
-    _hyp(m, "D2-H1a")["n_floor"] = 250
+    _hyp(m, "D2-H2")["n_floor"] = 250
     _hyp(m, "D1-F2")["blocking_gaps"] = ["G2", "G3"]
     m["hypotheses"] = [h for h in m["hypotheses"] if h["id"] != "D2-H3"]
     errs = M.validate(m)
-    for needle in ("D2-H1a: manifest n_floor 250 differs", "D1-F2: manifest blocking_gaps omits frozen blocking gap G15",
+    for needle in ("D2-H2: manifest n_floor 250 differs", "D1-F2: manifest blocking_gaps omits frozen blocking gap G15",
                    "D2-H3: supported hypothesis missing from the manifest"):
         assert any(needle in e for e in errs), (needle, errs)
 
@@ -856,3 +857,22 @@ def test_a_non_string_id_is_refused_without_an_exception(key, bad):
     errs = A.admission_errors(m, today=TODAY)
     label = {"inputs": "input", "gaps": "gap", "hypotheses": "hypothesis"}[key]
     assert errs == [f"{label} entry without a string id"]
+
+
+@pytest.mark.parametrize("hid", ["D2-H1a", "D2-H1b"])
+def test_a_struck_hypothesis_cannot_be_admitted_or_supported(world, hid):
+    """Revision 7 struck D2-H1a and D2-H1b: no frozen spec, so an ADMITTED row is refused as unsupported."""
+    assert A.frozen_hypothesis(hid) is None
+    m = copy.deepcopy(world["m"])
+    h = _hyp(m, hid)
+    assert h["status"].startswith("STRUCK")  # the committed manifest says so
+    h["status"] = "ADMITTED"
+    errs = _errs(world, m)
+    assert any(f"{hid}: not a supported hypothesis" in e for e in errs), errs
+
+
+def test_the_committed_manifest_marks_both_struck_cells_and_admits_nothing():
+    m = json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
+    st = {h["id"]: h["status"] for h in m["hypotheses"]}
+    assert st["D2-H1a"].startswith("STRUCK") and st["D2-H1b"].startswith("STRUCK")
+    assert not any(h.get("status") == "ADMITTED" for h in m["hypotheses"]) and m["revision"] == 7

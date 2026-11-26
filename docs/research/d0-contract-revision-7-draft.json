@@ -1,11 +1,11 @@
 {
  "schema": "d0-contract-revision-7-draft/1",
- "status": "DRAFT_NOT_EFFECTIVE",
+ "status": "APPLIED_AT_SIGNING_2026-11-26",
  "drafted": "2026-11-26",
  "authority": "operator, 2026-11-26: 'Yes, drop D2-H1 and draft it' (drafting only; signing and pinning need the reviewer's ACCEPT and the operator's separate go)",
  "base_revision": 6,
  "base_body_sha256": "7643c1e096d8c75567598d16ebf077a246e862c0c922a8f674e82574e2681285",
- "note": "Not effective. The signed revision 6 body stays pinned and unedited. Each change gives an anchor that must occur exactly once in that body, and replacement text; applying them mechanically yields the revision 7 body that would be signed.",
+ "note": "Applied: this record is history. The signed body is the contract file; the tests in tests/test_d0_contract_revision7.py check the signed body directly. The sections listed in reworded_at_signing carry their signed wording instead of the draft's.",
  "changes": [
   {
    "section": "Header Version row",
@@ -28,8 +28,8 @@
   {
    "section": "§4 ledger",
    "anchor": "| #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |",
-   "replacement": "| #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |\n| GEX edge6 follow-up: SPX (fb0c73b, 3fbba8d, 059876a) | the 15:00 short iron fly on SPXW; 14:00 and 14:30 entries reported only | sample A 2016-11-15 .. 2022-11-11 and sample B 2022-11-14 .. 2026-11-09 | FAIL on both samples | revision 7, G5 reconciliation |\n| GEX edge9 | analog library of SPY intraday moments (price paths, no option premium) | burn-in 2018-05-01 .. 2018-12-31; holdout trades 2019-01-02 .. 2022-11-11; development 2022-11-14 .. 2024-11-08 | look result exists | revision 7, G5 reconciliation |\n| GEX eod-flows and playbook evidence cuts | SPY and QQQ late-day follow; decision-minute to close SPY moves (exploratory) | 2018-05-01 .. 2026-11-10 | exploratory, no verdict | revision 7, G5 reconciliation |\n| GEX edge10, edge11, edge12 | equity cross-section families (daily; no SPY option data) | edge10 holdout 2018-06-01 .. 2022-12-30; edge11 2018-08 .. 2026-11; edge12 dev 2010-01-04 .. 2022-12-29, holdout 2022-12-30 .. 2026-11-12 | see their records | revision 7, G5 reconciliation |",
-   "why": "section 4 omitted these lane records (full list, windows and the one unconfirmed item: docs/research/d2-h1-ledger-reconciliation-v0.json)"
+   "replacement": "| #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |\n| GEX edge6 follow-up: SPX (fb0c73b, 3fbba8d, 059876a) | the 15:00 short iron fly on SPXW; 14:00 and 14:30 entries reported only | sample A 2016-11-15 .. 2022-11-11 and sample B 2022-11-14 .. 2026-11-09 | FAIL on both samples | revision 7, G5 reconciliation |\n| GEX edge9 | analog library of SPY intraday moments (price paths, no option premium) | burn-in 2018-05-01 .. 2018-12-31; holdout trades 2019-01-02 .. 2022-11-11; development 2022-11-14 .. 2024-11-08 | look result exists | revision 7, G5 reconciliation |\n| GEX eod-flows and playbook evidence cuts | SPY and QQQ late-day follow; decision-minute to close SPY moves (exploratory) | 2018-05-01 .. 2026-11-10 | exploratory, no verdict | revision 7, G5 reconciliation |\n| GEX edge10, edge11, edge12 | equity cross-section families (daily; no SPY option data) | edge10 holdout 2018-06-01 .. 2022-12-30; edge11 2018-08 .. 2026-11; edge12 dev 2010-01-04 .. 2022-12-29, holdout 2022-12-30 .. 2026-11-12 | see their records | revision 7, G5 reconciliation |\n| GEX gamma-vol, part 1 | dealer gamma against next-session volatility (exploratory regression and ladder look); outside the target window, no SPY option premium before 2022-11-14 | option data: the trailing free year only (first fetched session 2025-11-19, through 2026-11-09); regression sessions 2022-11-14 .. 2026-11-09 | exploratory, no verdict | revision 7, G5 reconciliation |\n| GEX gamma-vol, part 2 | a long daily index-gamma series against volatility over the next 1, 5 and 21 sessions (judged). It overlaps the target window by date only: a daily-series family, not option premium | fit through 2019-12-31; check 2020-01-02 .. 2026-11-17 | see its record | revision 7, G5 reconciliation |",
+   "why": "section 4 omitted these lane records (full list, windows and the one unconfirmed item: docs/research/d2-h1-ledger-reconciliation-v0.json); the two gamma-vol rows were added before signing (reconciled in #1472, Codex's final-text review of c4a24419)"
   },
   {
    "section": "§4 consequence",
@@ -201,15 +201,18 @@
   }
  ],
  "at_signing_not_in_this_draft": [
-  "docs/research/d0-research-contract-v0.md: apply every change above (body edit), and replace the 'Revision 7 is not signed' wording, the title and the Version row's 'unsigned draft' wording with the actual signature date at the moment of signing",
-  "analysis/d0_manifest.py: D0_CONTRACT_BODY_SHA256 re-pinned to the new body hash",
-  "docs/research/d0-coverage-manifest-v0.json: contract_body_sha256 and signed_at updated; hypotheses D2-H1a and D2-H1b set to a STRUCK status",
-  "analysis/d0_admission.py: D2-H1a and D2-H1b removed from the frozen hypothesis definitions, so an ADMITTED row for either is refused",
-  "tests: the pin test, the admission test that names D2-H1, and the effective-rule test below re-pointed at the signed body"
+  "DONE in the signing commit: contract body edit, D0_CONTRACT_BODY_SHA256 re-pinned, coverage manifest signed_at/contract_body_sha256/revision and D2-H1a/b STRUCK, D2-H1a/b removed from the frozen admission spec and FROZEN_SPEC_SHA256 re-pinned, tests re-pointed"
  ],
  "not_changed": [
   "D2-H2 and D2-H3 (adopted unchanged)",
   "every D1 rule",
   "the D0 gates, the verifier flag VERIFIER_ACCEPTED, any key or signature"
+ ],
+ "reworded_at_signing": [
+  "Title line",
+  "Header Version row tail",
+  "Header signature row",
+  "Header status paragraph",
+  "§10.6 new"
  ]
 }
