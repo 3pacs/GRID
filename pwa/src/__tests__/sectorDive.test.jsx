@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, beforeAll, beforeEach } from 'vitest';
-import SectorDive, { IntelligenceFeed, ticketKellyText, ticketConfidenceTier } from '../views/SectorDive.jsx';
+import SectorDive, { IntelligenceFeed, ticketKellyText, ticketConfidenceTier, finiteNumberOrNull } from '../views/SectorDive.jsx';
 import { api } from '../api.js';
 
 vi.mock('../api.js', () => ({
@@ -209,6 +209,49 @@ describe('SectorDive intelligence feed defaults (#959, Codex hold)', () => {
         expect(titles.filter(t => t === 'unknown').length).toBe(3);
         expect(titles).not.toContain('inferred');
         expect(titles).not.toContain('derived');
+    });
+
+    // Codex finding on #1485: Number('  '), Number(false) and Number([]) are all 0, so these shapes
+    // still rendered as a measured zero. Only real numbers (or plain numeric strings) are values.
+    const NOT_NUMBERS = [undefined, null, '', '   ', '\t\n', false, true, [], [0], [0.05], {}, { valueOf: () => 0 },
+        'abc', '0x10', '1,5', 'NaN', 'Infinity', '-Infinity', '.', '+', '1e', NaN, Infinity, -Infinity, 10n];
+
+    it.each(NOT_NUMBERS.map(v => [typeof v === 'bigint' ? '10n' : JSON.stringify(v) ?? String(v), v]))(
+        'non-number %s is not a value for kelly or confidence', (_label, v) => {
+            expect(finiteNumberOrNull(v)).toBeNull();
+            expect(ticketKellyText(v)).toBe('kelly not reported');
+            expect(ticketConfidenceTier(v)).toBe('unknown');
+        },
+    );
+
+    it('real numbers and plain numeric strings are values, and a stated zero stays a zero', () => {
+        expect(finiteNumberOrNull(0)).toBe(0);
+        expect(finiteNumberOrNull('0')).toBe(0);
+        expect(finiteNumberOrNull(' 0.05 ')).toBe(0.05);
+        expect(finiteNumberOrNull('1e-2')).toBe(0.01);
+        expect(finiteNumberOrNull('.5')).toBe(0.5);
+        expect(finiteNumberOrNull(-0.2)).toBe(-0.2);
+        expect(ticketKellyText(0)).toBe('kelly 0.0%');
+        expect(ticketKellyText('0')).toBe('kelly 0.0%');
+        expect(ticketKellyText(' 0.05 ')).toBe('kelly 5.0%');
+        expect(ticketConfidenceTier(0)).toBe('inferred');
+        expect(ticketConfidenceTier('0.7')).toBe('derived');
+    });
+
+    it('a rendered ticket with a non-numeric kelly or confidence shows neither a zero nor a tier', () => {
+        const { container } = render(
+            <IntelligenceFeed
+                insider={[]} congress={[]} convergence={[]} levers={[]}
+                tradeTickets={[{ ticker: 'acme', direction: 'put', instrument: 'option', strike: 10, expiry: '2026-12-18',
+                    kelly_size: '   ', confidence: false, generated_at: '2026-11-25T12:00:00Z' }]}
+                sectorTickers={new Set(['acme'])}
+            />,
+        );
+        expect(container.textContent).toContain('kelly not reported');
+        expect(container.textContent).not.toMatch(/kelly 0\.0%/);
+        const titles = [...container.querySelectorAll('[title]')].map(e => e.title);
+        expect(titles).toContain('unknown');
+        expect(titles).not.toContain('inferred');
     });
 
     it('rows that state their own tier keep it', () => {

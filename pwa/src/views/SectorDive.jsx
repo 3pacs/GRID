@@ -1529,14 +1529,28 @@ function LineageFlows({ lineage }) {
 
 // ── Intelligence Feed (unified timeline) ─────────────────────────────
 // A trade ticket that states no kelly size is not a 0.0% bet, and one that states no
-// confidence is not "inferred" (#959): absent or non-finite values read as not reported.
+// confidence is not "inferred" (#959): anything that is not a number reads as not reported.
+// Only a finite JSON number, or a non-blank string holding a plain decimal number, is a
+// value. `Number()` coerces blank strings, false, [] and [0] to 0, so it is never applied to
+// an unchecked shape (booleans, arrays, objects, null and undefined all abstain).
+const PLAIN_DECIMAL = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/;
+export function finiteNumberOrNull(value) {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string') {
+        const t = value.trim();
+        if (!PLAIN_DECIMAL.test(t)) return null;
+        const n = Number(t);
+        return Number.isFinite(n) ? n : null;
+    }
+    return null;
+}
 export function ticketKellyText(kelly) {
-    const n = kelly == null || kelly === '' ? NaN : Number(kelly);
-    return Number.isFinite(n) ? `kelly ${(n * 100).toFixed(1)}%` : 'kelly not reported';
+    const n = finiteNumberOrNull(kelly);
+    return n === null ? 'kelly not reported' : `kelly ${(n * 100).toFixed(1)}%`;
 }
 export function ticketConfidenceTier(confidence) {
-    const n = confidence == null || confidence === '' ? NaN : Number(confidence);
-    if (!Number.isFinite(n)) return 'unknown';
+    const n = finiteNumberOrNull(confidence);
+    if (n === null) return 'unknown';
     return n >= 0.6 ? 'derived' : 'inferred';
 }
 
