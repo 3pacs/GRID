@@ -38,15 +38,35 @@ export function ReadingsProvenance({ provenance }) {
     ? `newest obs ${p.max_obs_date}${ageParts.length ? ` (${ageParts.join(', ')})` : ''}`
     : 'newest obs date unknown';
   const isStale = p.unavailable === true && p.reason === 'stale';
+  // Provenance describes materialization state, not data truth
+  // (docs/flows_provenance_contract.md): `unavailable: false` only says the table has rows
+  // and its newest observation date is within threshold. It is not a confidence claim, so it
+  // must not be shown as OBSERVED/"confirmed". Only an explicit `false` earns the
+  // within-threshold chip; a missing flag is UNKNOWN, never a pass.
+  const withinThreshold = p.unavailable === false;
   return (
     <div data-testid="readings-provenance" style={{ ...textStyle, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
-      <FreshnessIndicator
-        confidence={p.unavailable === true ? null : 'confirmed'}
-        asOf={p.max_obs_date}
-        stale={isStale}
-        unavailable={p.unavailable === true && !isStale}
-        reason={p.reason}
-      />
+      {withinThreshold ? (
+        <span
+          data-testid="readings-within-threshold"
+          title="Materialization state only: the readings table has rows and its newest observation date is within its freshness threshold. It does not say the values are confirmed, complete or free of vendor errors."
+          style={{
+            fontSize: '9px', fontFamily: colors.mono, fontWeight: 700, letterSpacing: '0.5px',
+            padding: '1px 6px', borderRadius: 3, color: colors.textMuted,
+            border: `1px solid ${colors.textDim}`,
+          }}
+        >
+          WITHIN THRESHOLD{p.max_obs_date ? ` · as of ${p.max_obs_date}` : ''}
+        </span>
+      ) : (
+        <FreshnessIndicator
+          confidence={null}
+          asOf={p.max_obs_date}
+          stale={isStale}
+          unavailable={p.unavailable === true && !isStale}
+          reason={p.reason}
+        />
+      )}
       <span>junction_point_readings: {newest}{p.unavailable === true && p.reason ? ` — ${p.reason}` : ''}</span>
     </div>
   );
