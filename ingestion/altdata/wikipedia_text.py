@@ -16,6 +16,7 @@ No authentication required.
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -58,6 +59,30 @@ WATCHLIST: dict[str, str] = {
 
 WIKI_API = "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article"
 
+# Wikimedia's API policy asks for a descriptive User-Agent with a way to reach
+# the operator, and throttles generic agents first. 2026-11-17..24: every run
+# was PARTIAL, 26 to 37 of the 48 lookups answered HTTP 429, from a bare
+# ``GRID/1.0`` agent firing the 48 requests back to back. A generic client name
+# and the public repository URL identify the client without a personal contact.
+USER_AGENT = "GRID-DataPuller/1.0 (+https://github.com/3pacs/GRID)"
+# Minimum gap between two requests of one run (about 1 s per lookup, 48 lookups).
+MIN_REQUEST_INTERVAL_S = 1.0
+# A Retry-After longer than this is not waited out inside a run: the rest of the
+# run is deferred instead of hitting the same API again (Codex review 6061698849:
+# the retry decorator skips a wait over its own 30 s cap, and the next lookup
+# started one second later). Consecutive lookups that ended in HTTP 429 after
+# their retries also stop the run.
+MAX_COOLDOWN_WAIT_S = 30.0
+MAX_CONSECUTIVE_THROTTLED = 3
+DEFAULT_RETRY_AFTER_S = 60.0
+
+
+class ThrottleDeferred(RuntimeError):
+    """Wikimedia asked this client to wait longer than the run will: stop, do not retry.
+
+    Deliberately not an ``OSError``, so ``retry_on_failure`` does not retry it.
+    """
+
 
 class WikipediaPuller(BasePuller):
     """Track Wikipedia pageviews and detect attention anomalies."""
@@ -72,6 +97,41 @@ class WikipediaPuller(BasePuller):
         "trust_score": "MED",
         "priority_rank": 45,
     }
+
+    def _pace(self) -> None:
+        """Wait so two requests of this puller are at least ``MIN_REQUEST_INTERVAL_S`` apart.
+
+        Runs before every attempt, so a retry after an HTTP 429 is paced too.
+        An origin-level deadline survives across lookups: when Wikimedia sent a
+        ``Retry-After`` that is still running, this waits for it if it is within
+        ``MAX_COOLDOWN_WAIT_S`` and raises :class:`ThrottleDeferred` otherwise,
+        and so does a run of ``MAX_CONSECUTIVE_THROTTLED`` throttled lookups.
+        """
+        now = time.monotonic()
+        if getattr(self, "_throttled_in_a_row", 0) >= MAX_CONSECUTIVE_THROTTLED:
+            raise ThrottleDeferred(f"{self._throttled_in_a_row} lookups in a row ended in HTTP 429")
+        until = getattr(self, "_cooldown_until", None)
+        if until is not None and until > now:
+            remaining = until - now
+            if remaining > MAX_COOLDOWN_WAIT_S:
+                raise ThrottleDeferred(f"Wikimedia asked for a {remaining:.0f}s cooldown")
+            time.sleep(remaining)
+        last = getattr(self, "_last_request_at", None)
+        if last is not None:
+            wait = MIN_REQUEST_INTERVAL_S - (time.monotonic() - last)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_request_at = time.monotonic()
+
+    def _note_throttle(self, resp: Any) -> None:
+        """Record an HTTP 429's ``Retry-After`` as the origin-level cooldown."""
+        raw = (getattr(resp, "headers", None) or {}).get("Retry-After")
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            seconds = DEFAULT_RETRY_AFTER_S if raw is not None else 0.0     # an HTTP-date or junk: assume a minute
+        if seconds > 0:
+            self._cooldown_until = time.monotonic() + seconds
 
     @retry_on_failure(max_attempts=3)
     def _fetch_pageviews(
@@ -98,7 +158,10 @@ class WikipediaPuller(BasePuller):
             f"{article}/daily/{start_str}00/{end_str}00"
         )
 
-        resp = requests.get(url, timeout=30, headers={"User-Agent": "GRID/1.0"})
+        self._pace()
+        resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+        if resp.status_code == 429:
+            self._note_throttle(resp)
         resp.raise_for_status()
         data = resp.json()
 
@@ -132,10 +195,13 @@ class WikipediaPuller(BasePuller):
         entities_short = 0
         rows_inserted = 0
         errors: list[str] = []
+        deferred = 0
+        self._throttled_in_a_row, self._cooldown_until = 0, None      # a new run starts clean
 
         for display_name, article_title in WATCHLIST.items():
             try:
                 data = self._fetch_pageviews(article_title, start_date, end_date)
+                self._throttled_in_a_row = 0
                 if len(data) < 30:
                     # A checked article with too little history; not a failure.
                     entities_short += 1
@@ -176,7 +242,15 @@ class WikipediaPuller(BasePuller):
                                 "mean_30d": round(rolling_mean, 0),
                             })
 
+            except ThrottleDeferred as exc:
+                # Honest accounting: this lookup and every later one were not attempted.
+                deferred = len(WATCHLIST) - entities_pulled - entities_short - len(errors)
+                errors.append(f"{display_name}: deferred, {exc}; {deferred} lookups not attempted")
+                log.warning("Wikipedia pull deferred at {e}: {err}", e=display_name, err=str(exc))
+                break
             except Exception as exc:
+                if "429" in str(exc):
+                    self._throttled_in_a_row = getattr(self, "_throttled_in_a_row", 0) + 1
                 errors.append(f"{display_name}: {exc}")
                 log.debug("Wikipedia pull failed for {e}: {err}", e=display_name, err=str(exc))
 
@@ -204,7 +278,10 @@ class WikipediaPuller(BasePuller):
             "anomalies": anomalies,
         }
         if errors:
-            result["error"] = f"{len(errors)} of {len(WATCHLIST)} lookups failed: {errors[0]}"
+            failed = len(errors) + max(deferred - 1, 0)            # the deferral entry stands for all not attempted
+            result["error"] = f"{failed} of {len(WATCHLIST)} lookups failed: {errors[0]}"
+            if deferred:
+                result["entities_deferred"] = deferred
         return result
 
     def _store_anomalies(self, anomalies: list[dict[str, Any]]) -> None:
