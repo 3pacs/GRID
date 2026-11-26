@@ -707,7 +707,7 @@ def batch_postmortem(
         SELECT id FROM options_recommendations
         WHERE outcome IN ('LOSS', 'EXPIRED')
           AND closed_at >= :cutoff
-          AND actual_return IS NOT NULL
+          AND """ + FINITE_ACTUAL_RETURN_SQL + """
           AND id NOT IN (
               SELECT trade_id FROM trade_postmortems
               WHERE trade_id IS NOT NULL

@@ -51,7 +51,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from db import get_engine
-from intelligence.postmortem import FINITE_PNL_PCT_SQL
+from intelligence.postmortem import FINITE_ACTUAL_RETURN_SQL, FINITE_PNL_PCT_SQL
 from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
@@ -71,7 +71,7 @@ def _count_candidates(engine, days: int = 30) -> tuple[int, int]:
             SELECT COUNT(*) FROM options_recommendations
             WHERE outcome IN ('LOSS', 'EXPIRED')
               AND closed_at >= CURRENT_DATE - (:d || ' days')::interval
-              AND actual_return IS NOT NULL
+              AND """ + FINITE_ACTUAL_RETURN_SQL + """
               AND id NOT IN (SELECT trade_id FROM trade_postmortems WHERE trade_id IS NOT NULL)
         """), {"d": int(days)}).scalar() or 0)
         n_pred = int(c.execute(text("""
@@ -154,7 +154,7 @@ def _worker_main() -> int:
             SELECT id FROM options_recommendations
             WHERE outcome IN ('LOSS', 'EXPIRED')
               AND closed_at >= CURRENT_DATE - (:d || ' days')::interval
-              AND actual_return IS NOT NULL
+              AND """ + FINITE_ACTUAL_RETURN_SQL + """
               AND id NOT IN (SELECT trade_id FROM trade_postmortems WHERE trade_id IS NOT NULL)
               AND MOD(ABS(id), :n) = :i
             ORDER BY closed_at DESC
