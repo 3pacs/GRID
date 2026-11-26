@@ -121,6 +121,7 @@ def test_unknown_status_and_unsigned_hypothesis_admission_are_refused():
     m = _real()
     bad = copy.deepcopy(m["inputs"][0])
     bad["admission_status"] = "APPROVED"
+    bad["id"] += ".unique_copy"  # a duplicate id is refused first (identity), so give the copy its own
     m["inputs"].append(bad)
     m["hypotheses"][0] = dict(m["hypotheses"][0], status="ADMITTED")
     errs = " | ".join(M.validate(m))

@@ -91,7 +91,8 @@ def contract_pin_errors(manifest: dict[str, Any], repo_root: Path = REPO,
         return [f"contract body unreadable: {exc}"]
     if actual != pinned:
         errs.append(f"contract body sha256 {actual} != pinned {pinned} (a body edit is a new version)")
-    owner = manifest.get("research_owner") or {}
+    owner = manifest.get("research_owner")
+    owner = owner if isinstance(owner, dict) else {}  # a non-mapping owner has not signed
     if owner.get("signed") is True:
         if manifest.get("contract_body_sha256") != pinned:
             errs.append("manifest contract_body_sha256 does not equal the pinned body hash")

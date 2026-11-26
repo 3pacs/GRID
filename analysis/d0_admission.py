@@ -565,7 +565,8 @@ def reviewer_signed_on(manifest: dict[str, Any]) -> date | None:
 
 def _owner_errors(manifest: dict[str, Any], repo_root: Path, today: date) -> list[str]:
     errs = list(M.contract_pin_errors(manifest, repo_root=repo_root))
-    if (manifest.get("research_owner") or {}).get("signed") is not True:
+    owner = manifest.get("research_owner")
+    if not isinstance(owner, dict) or owner.get("signed") is not True:
         errs.append("research owner has not signed (research_owner.signed must be exactly true)")
     owner_on = parse_date(manifest.get("signed_at"))
     if owner_on is None:
@@ -759,11 +760,69 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
     return errs
 
 
+def structure_errors(manifest: Any) -> list[str]:
+    """Refuse a manifest whose shape the verifier cannot traverse, before anything reads into it.
+
+    The manifest must be a mapping; ``inputs``, ``gaps`` and ``hypotheses`` must each be absent or
+    a list; every member of those lists must be a mapping. Anything else is a structured refusal,
+    never an exception, and the caller stops here so no deeper step meets a malformed member.
+    """
+    if not isinstance(manifest, dict):
+        return [f"manifest is {type(manifest).__name__}, not a mapping"]
+    errs: list[str] = []
+    for key in ("inputs", "gaps", "hypotheses"):
+        coll = manifest.get(key)
+        if coll is None:
+            continue
+        if not isinstance(coll, list):
+            errs.append(f"{key} is {type(coll).__name__}, not a list")
+            continue
+        for i, entry in enumerate(coll):
+            if not isinstance(entry, dict):
+                errs.append(f"{key}[{i}] is {type(entry).__name__}, not a mapping")
+    return errs
+
+
+def identity_errors(manifest: dict[str, Any]) -> list[str]:
+    """Refuse ambiguous identity in the manifest, whether or not anything is admitted.
+
+    The verifier looks inputs, gaps and hypotheses up by id. With two entries under one id, one
+    is shadowed (a dict keeps the last, ``next`` keeps the first), so a bad entry could sit
+    unchecked beside a good one, or the statement that is signed could come from another entry
+    than the one that is verified. Duplicate ids are refused for all three lists.
+
+    A hypothesis ``status`` that reads as ADMITTED after case and whitespace folding but is not
+    exactly ``ADMITTED`` is refused too: the verifier only judges the exact label, so a near
+    spelling would otherwise pass as an unverified admission claim.
+    """
+    errs: list[str] = []
+    for key, label in (("inputs", "input"), ("gaps", "gap"), ("hypotheses", "hypothesis")):
+        seen: set[Any] = set()
+        for entry in manifest.get(key) or []:
+            eid = entry.get("id") if isinstance(entry, dict) else None
+            if not isinstance(eid, str) or not eid:
+                errs.append(f"{label} entry without a string id")
+            elif eid in seen:
+                errs.append(f"{label} id {eid!r} appears more than once")
+            else:
+                seen.add(eid)
+    for h in manifest.get("hypotheses") or []:
+        status = h.get("status") if isinstance(h, dict) else None
+        if isinstance(status, str) and status != "ADMITTED" and status.strip().upper() == "ADMITTED":
+            errs.append(f"{h.get('id')}: status {status!r} is not exactly 'ADMITTED' (near spellings are refused)")
+    return errs
+
+
 def admission_errors(manifest: dict[str, Any], repo_root: Path = M.REPO, today: date | None = None,
                      accepted: bool | None = None) -> list[str]:
     """Why any ADMITTED label in the manifest is not authenticated (empty = none, or all verified)."""
     accepted = VERIFIER_ACCEPTED if accepted is None else accepted
-    errs: list[str] = []
+    errs: list[str] = structure_errors(manifest)
+    if errs:  # a malformed shape stops here; nothing below may meet a member it cannot read
+        return errs
+    errs = identity_errors(manifest)
+    if errs:  # ambiguous or non-string ids: every later lookup is by id, so none may run
+        return errs
     hyps = [h for h in manifest.get("hypotheses") or [] if h.get("status") == "ADMITTED"]
     covered: set[str] = set()
     for h in hyps:
