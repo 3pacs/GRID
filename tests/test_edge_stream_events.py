@@ -765,3 +765,54 @@ def test_policy_4_adds_one_owner_decision_and_loosens_nothing_else():
     assert decision["id"] == "GRID#1336" and decision["url"].startswith("https://github.com/3pacs/GRID/issues/1336#issuecomment-")
     assert new["unread_abandonment"]["decision"] == decision["id"]
     assert new["unread_abandonment"]["cause"] == L.CODE_CHANGED
+
+
+# --- a forward window that has not started yet (2026-11-26: polygon 400 on day one) -----
+
+
+def _polygon_daily(tmp_path, now):
+    """The real daily source over a fake Polygon that refuses a range whose end is before its start,
+    as Polygon did on 2026-11-26 (``/range/1/day/2026-11-26/2026-11-25``)."""
+    minute = D.PolygonMinuteSource(tmp_path / "b.sqlite3", api_key="k", gap_s=0, now=now)
+    calls = []
+
+    def fake_get(path):
+        calls.append(path)
+        lo, hi = path.split("?")[0].rsplit("/", 2)[-2:]
+        if hi < lo:
+            raise D.SourceError(f"polygon 400 for {path}")
+        return {"results": []}
+
+    minute._get = fake_get
+    return minute, {"daily": D.PolygonDailySource(minute), "events": StaticEventSource({})}, calls
+
+
+def _ec1_forward(day: date):
+    led = L.memory()
+    prop = F.build_proposal(ec1_item(lane="forward"), day)
+    sha = L.append_registration(led, {**prop, "sanity": {"G": "ok"}, "recorded_at": f"{day.isoformat()}T12:00:00+00:00"})
+    return led, sha, prop
+
+
+def test_a_forward_window_that_has_not_started_is_not_read(tmp_path):
+    led, sha, prop = _ec1_forward(date(2026, 11, 25))
+    start = date.fromisoformat(prop["window"]["start"])
+    assert start == date(2026, 11, 26)
+    now = datetime(2026, 11, 26, 11, 3, tzinfo=timezone.utc)  # the first cycle after it was sealed
+    minute, extras, calls = _polygon_daily(tmp_path, now)
+    s = R.run_cycle(led, minute, tmp_path, now=now, extras=extras, register=False)
+    state = L.load_state(led)
+    assert calls == [] and not (tmp_path / "attempts.jsonl").exists()
+    assert s["forward"] == [{"registration": sha[:16], "sessions": 0, "ready": False, "not_started": start.isoformat()}]
+    assert s["looks"] == [] and s["abandoned"] == [] and not state.closed(sha)
+    assert state.reads.get(sha, set()) == set()  # nothing read, nothing recorded as read
+
+
+def test_the_first_cycle_after_the_window_opens_reads_it(tmp_path):
+    led, sha, prop = _ec1_forward(date(2026, 11, 25))
+    now = datetime(2026, 11, 27, 11, 3, tzinfo=timezone.utc)
+    minute, extras, calls = _polygon_daily(tmp_path, now)
+    s = R.run_cycle(led, minute, tmp_path, now=now, extras=extras, register=False)
+    assert calls and "/range/1/day/2026-11-26/2026-11-26?" in calls[0]
+    assert s["forward"][0]["sessions"] == 0 and "not_started" not in s["forward"][0]
+    assert L.load_state(led).reads[sha] == {"progress"} and not (tmp_path / "attempts.jsonl").exists()
