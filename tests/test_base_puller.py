@@ -647,3 +647,68 @@ class TestBCBNonDictGuard:
              patch.object(puller, "_row_exists", return_value=False):
             res = puller.pull_series(11, "2024-01-01")
         assert res["status"] == "SUCCESS"
+
+
+# ---------------------------------------------------------------------------
+# retry_on_failure(before_sleep=...): the caller can refuse a retry's wait
+# ---------------------------------------------------------------------------
+
+
+def test_before_sleep_gets_the_instance_and_the_delay_before_each_wait(monkeypatch):
+    import ingestion.base as base
+
+    slept: list[float] = []
+    seen: list[tuple[object, float]] = []
+    monkeypatch.setattr(base.time, "sleep", slept.append)
+
+    class Puller:
+        calls = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01,
+                          before_sleep=lambda self, delay: seen.append((self, delay)))
+        def run(self):
+            self.calls += 1
+            raise ConnectionError("down")
+
+    puller = Puller()
+    with pytest.raises(ConnectionError):
+        puller.run()
+    assert puller.calls == 3
+    assert [who for who, _delay in seen] == [puller, puller]
+    assert [delay for _who, delay in seen] == slept          # each wait was offered before it was slept
+
+
+def test_before_sleep_can_refuse_the_wait_which_ends_the_retries(monkeypatch):
+    import ingestion.base as base
+
+    slept: list[float] = []
+    monkeypatch.setattr(base.time, "sleep", slept.append)
+
+    class Refused(RuntimeError):
+        pass
+
+    def refuse(_self, _delay):
+        raise Refused("the wait would pass the deadline")
+
+    class Puller:
+        calls = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01, before_sleep=refuse)
+        def run(self):
+            self.calls += 1
+            raise ConnectionError("down")
+
+    puller = Puller()
+    with pytest.raises(Refused):
+        puller.run()
+    assert puller.calls == 1 and slept == []                 # no wait, no second attempt
+
+
+def test_before_sleep_is_not_called_when_the_first_attempt_succeeds():
+    seen: list[float] = []
+
+    @retry_on_failure(max_attempts=3, backoff=0.01, before_sleep=lambda _self, delay: seen.append(delay))
+    def ok(_self=None):
+        return "ok"
+
+    assert ok() == "ok" and seen == []

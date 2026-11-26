@@ -566,8 +566,13 @@ class _BudgetSpent(RuntimeError):
     fetchers turn those into "could not be read" snapshots and
     ``retry_on_failure`` retries them. This one passes through both, so a
     request refused for lack of time is never recorded as a finding about a
-    filing and is never retried.
+    filing and is never retried. ``phase`` says what was refused: a request
+    (``request_refused``) or the wait before a retry (``retry_wait_refused``).
     """
+
+    def __init__(self, what: str, phase: str = "request_refused") -> None:
+        super().__init__(what)
+        self.phase = phase
 
 
 class _RunBudget:
@@ -610,6 +615,20 @@ class _RunBudget:
             return float(_REQUEST_TIMEOUT)
         left = self._deadline_at - _monotonic()
         return max(_MIN_REQUEST_TIMEOUT, min(float(_REQUEST_TIMEOUT), left))
+
+    def time_left(self) -> float | None:
+        """Seconds until ``deadline_at``, never negative; None with no deadline."""
+        if self._deadline_at is None:
+            return None
+        return max(0.0, self._deadline_at - _monotonic())
+
+    def refuses_wait(self, seconds: float) -> bool:
+        """True when a wait of ``seconds`` must not start: the budget is
+        spent, or the wait would end after the deadline."""
+        if self.spent():
+            return True
+        left = self.time_left()
+        return left is not None and seconds > left
 
     def overrun_s(self) -> float | None:
         """Seconds past ``deadline_at`` now; None when no deadline was given."""
@@ -860,6 +879,16 @@ class InstitutionalFlowsPuller(BasePuller):
             raise _BudgetSpent(url)
         return requests.get(url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
 
+    def _before_retry_sleep(self, delay: float) -> None:
+        """Refuse a retry's wait that would end after the run's deadline.
+
+        ``retry_on_failure`` waits between attempts (its back-off, or a 429's
+        Retry-After up to 30 s). A wait that passes the deadline is not
+        started: the run stops and reports instead of sleeping past it.
+        """
+        if self._budget.refuses_wait(delay):
+            raise _BudgetSpent(f"retry wait of {delay:.1f} s", phase="retry_wait_refused")
+
     # ── ETF Flow Proxy ─────────────────────────────────────────────────────
 
     def _pull_etf_flows(
@@ -1022,6 +1051,7 @@ class InstitutionalFlowsPuller(BasePuller):
         max_attempts=3,
         backoff=2.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError),
+        before_sleep=lambda self, delay: self._before_retry_sleep(delay),
     )
     def _fetch_13f_index(
         self,
@@ -1207,6 +1237,7 @@ class InstitutionalFlowsPuller(BasePuller):
         max_attempts=2,
         backoff=1.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError),
+        before_sleep=lambda self, delay: self._before_retry_sleep(delay),
     )
     def _fetch_13f_holdings(
         self,
@@ -1274,6 +1305,7 @@ class InstitutionalFlowsPuller(BasePuller):
         max_attempts=2,
         backoff=1.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError),
+        before_sleep=lambda self, delay: self._before_retry_sleep(delay),
     )
     def _fetch_13f_filing(self, cik: str, filing: dict[str, Any]) -> FilingSnapshot:
         """Read one filing's holdings with evidence that they are complete.
@@ -1616,9 +1648,9 @@ class InstitutionalFlowsPuller(BasePuller):
 
         Must be the first statement of the transaction that looks the stored
         rows up and inserts (see the note above ``_LATEST_CHANGE_ROWS_SQL``).
-        Waits at most ``_CHANGE_ROW_LOCK_WAIT_S``, and at most
-        ``_CHANGE_ROW_LOCK_BUDGET_S`` over the whole run; with the budget
-        spent it only tries the lock. PostgreSQL only; other dialects (the
+        Waits at most ``_CHANGE_ROW_LOCK_WAIT_S``, at most
+        ``_CHANGE_ROW_LOCK_BUDGET_S`` over the whole run, and never past the
+        run's deadline; with either spent it only tries the lock. PostgreSQL only; other dialects (the
         SQLite test engines) have one writer and no advisory locks.
 
         Raises:
@@ -1630,6 +1662,11 @@ class InstitutionalFlowsPuller(BasePuller):
         key = _stable_lock_key(self.SOURCE_NAME, "13F-change-rows", cik, obs_date.isoformat())
         spent = getattr(self, "_change_row_lock_wait_s", 0.0)
         wait_s = min(_CHANGE_ROW_LOCK_WAIT_S, _CHANGE_ROW_LOCK_BUDGET_S - spent)
+        left = self._budget.time_left()
+        if left is not None:
+            # Never wait for the lock past the run's deadline: with no time
+            # left it is only tried.
+            wait_s = min(wait_s, left)
         if wait_s <= 0:
             if not conn.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": key}).scalar():
                 raise ChangeRowsBusy(f"13F change rows of {cik} for {obs_date} are held by another writer")
@@ -2121,10 +2158,11 @@ class InstitutionalFlowsPuller(BasePuller):
                     "reason": "change_rows_held_by_another_writer",
                     "rows_inserted": 0,
                 })
-            except _BudgetSpent:
-                # A request was refused because the budget was already spent
-                # (_edgar_get). Nothing was written for this manager.
-                stopped_at, stopped_phase = position, "request_refused"
+            except _BudgetSpent as refused:
+                # A request (_edgar_get) or the wait before a retry
+                # (_before_retry_sleep) was refused for lack of time. Nothing
+                # was written for this manager.
+                stopped_at, stopped_phase = position, refused.phase
                 break
             except requests.HTTPError as http_exc:
                 if budget.spent():

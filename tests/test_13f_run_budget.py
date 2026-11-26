@@ -457,9 +457,11 @@ class _Clock:
         return self.now
 
 
-def _replay(monkeypatch, deadline_after: float | None, get_wrapper=None):
+def _replay(monkeypatch, deadline_after: float | None, get_wrapper=None, sleeps: list | None = None):
     """One run on the fake clock. Each request starts at the current tick and
-    takes one tick. Returns (engine, recorder, request start times, results)."""
+    takes one tick. Returns (engine, recorder, request start times, results).
+    With ``sleeps``, every time.sleep is recorded as (started at, seconds) and
+    moves the clock; without it sleeps take no time."""
     engine = s.make_sqlite_engine()
     clock = _Clock()
     monkeypatch.setattr(inst, "_monotonic", clock)
@@ -475,7 +477,14 @@ def _replay(monkeypatch, deadline_after: float | None, get_wrapper=None):
     recorder.on_request = on_request
     get = get_wrapper(recorder, clock) if get_wrapper else recorder.get
     budget = {} if deadline_after is None else {"deadline_at": START + deadline_after}
-    results = _run(engine, monkeypatch, get, REPLAY_FILERS, **budget)
+    puller = _puller(engine, monkeypatch, get, REPLAY_FILERS)
+    if sleeps is not None:
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append((clock.now, seconds))
+            clock.now += seconds
+
+        monkeypatch.setattr(inst.time, "sleep", fake_sleep)
+    results = puller.pull_13f_only(**budget)
     return engine, recorder, started, results
 
 
@@ -559,7 +568,7 @@ def test_a_retry_after_the_deadline_is_not_sent(monkeypatch):
 
     assert len(attempts) == 1                                                   # no retry was sent
     assert not [r for r in results if r["status"] == "FAILED"]
-    assert _stop(results)["stopped_phase"] == "request_refused"
+    assert _stop(results)["stopped_phase"] == "retry_wait_refused"
     assert _stop(results)["next_manager_cik"] == s.CIK_BETA
 
 
@@ -605,3 +614,111 @@ def test_the_gateway_refuses_once_the_budget_is_spent(engine, monkeypatch):
         puller._edgar_get("https://data.sec.gov/submissions/CIK0000000001.json")
     # Not one of the errors the fetchers record as a finding or the retry decorator retries.
     assert not issubclass(inst._BudgetSpent, (requests.RequestException, OSError, TimeoutError, ValueError))
+
+
+# ── Waits are bounded to the deadline too ──────────────────────────────────
+#
+# Codex review 6080581843: "Bound in-flight waits separately." retry_on_failure
+# waits between attempts (its back-off, or a 429's Retry-After up to 30 s);
+# that wait used to be free to run past the deadline. The puller now refuses a
+# wait that would end after it, and the change-row lock wait is cut the same way.
+
+DEADLINE = 1000.0
+
+
+def _beta_index_fails_once(fail, seconds_left: float | None):
+    """Beta's manager index fails on its first request (``fail`` builds the
+    failure), optionally with only ``seconds_left`` before the deadline."""
+    calls: list[str] = []
+
+    def wrapper(recorder, clock):
+        def get(url, headers=None, timeout=None):
+            if "submissions" in url and s.CIK_BETA in url:
+                calls.append(url)
+                if len(calls) == 1:
+                    if seconds_left is not None:
+                        clock.now = START + DEADLINE - seconds_left
+                    return fail()
+            return recorder.get(url, headers=headers, timeout=timeout)
+        return get
+
+    return wrapper, calls
+
+
+def _rate_limited_20s():
+    response = s._Resp(status=429)
+    response.headers = {"Retry-After": "20"}
+    return response
+
+
+def _connection_reset():
+    raise requests.ConnectionError("connection reset")
+
+
+@pytest.mark.parametrize("fail,seconds_left", [(_rate_limited_20s, 5.0), (_connection_reset, 1.0)],
+                         ids=["retry_after_20s_with_5s_left", "backoff_with_1s_left"])
+def test_a_retry_wait_that_would_pass_the_deadline_is_not_started(monkeypatch, fail, seconds_left):
+    wrapper, calls = _beta_index_fails_once(fail, seconds_left)
+    sleeps: list[tuple[float, float]] = []
+
+    engine, _recorder, _started, results = _replay(monkeypatch, DEADLINE, wrapper, sleeps)
+
+    assert len(calls) == 1                                                      # no second attempt
+    assert all(at + seconds <= START + DEADLINE for at, seconds in sleeps)      # no wait ran past the deadline
+    stop = _stop(results)
+    assert stop["stopped_phase"] == "retry_wait_refused" and stop["next_manager_cik"] == s.CIK_BETA
+    assert stop["deadline_overrun_s"] == 0.0                                    # stopped before it, not after
+    assert not [r for r in results if r["status"] == "FAILED"]
+    assert _count(engine, f"13F%:{s.CIK_BETA}:%") == 0
+    assert _classify_outcome(results)[0] == "PARTIAL"
+
+
+@pytest.mark.parametrize("fail,least_wait", [(_rate_limited_20s, 20.0), (_connection_reset, 2.0)],
+                         ids=["retry_after_20s", "backoff"])
+def test_control_with_time_left_the_wait_is_taken_and_the_retry_succeeds(monkeypatch, fail, least_wait):
+    wrapper, calls = _beta_index_fails_once(fail, None)
+    sleeps: list[tuple[float, float]] = []
+
+    _engine, _recorder, _started, results = _replay(monkeypatch, DEADLINE, wrapper, sleeps)
+
+    assert len(calls) == 2 and any(seconds >= least_wait for _at, seconds in sleeps)
+    assert not [r for r in results if r.get("stopped_by_budget")]
+    assert [r["status"] for r in results if r["feature"] == f"13F:{s.CIK_BETA}"] == ["SUCCESS"]
+
+
+def test_refuses_wait():
+    assert inst._RunBudget().refuses_wait(3600) is False                        # no budget: never refuses
+    assert inst._RunBudget(should_continue=lambda: False).refuses_wait(0) is True
+    budget = inst._RunBudget(deadline_at=time.monotonic() + 60)
+    assert budget.refuses_wait(1) is False and budget.refuses_wait(120) is True
+    assert 0 < budget.time_left() <= 60 and inst._RunBudget().time_left() is None
+    assert inst._RunBudget(deadline_at=time.monotonic() - 5).time_left() == 0.0
+
+
+class _PgConn:
+    dialect = type("D", (), {"name": "postgresql"})()
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict]] = []
+
+    def execute(self, sql, params=None):
+        self.sent.append((str(sql), dict(params or {})))
+        return type("R", (), {"scalar": lambda _s: True})()
+
+
+def test_the_change_row_lock_wait_is_cut_to_the_time_left_and_only_tried_after_the_deadline(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(inst, "_monotonic", clock)
+    puller = inst.InstitutionalFlowsPuller.__new__(inst.InstitutionalFlowsPuller)
+    puller._change_row_lock_wait_s = 0.0
+    puller._budget = inst._RunBudget(deadline_at=START + 1.5)
+
+    conn = _PgConn()
+    puller._lock_change_rows(conn, "1067983", date(2026, 11, 14))
+    assert conn.sent[0][1] == {"ms": "1500ms"}                                  # not the usual 5 s
+
+    clock.now = START + 2.0
+    puller._change_row_lock_wait_s = 0.0
+    conn = _PgConn()
+    puller._lock_change_rows(conn, "1067983", date(2026, 11, 14))
+    assert ["pg_try_advisory_xact_lock" in sql for sql, _p in conn.sent] == [True]   # tried, never waited for
