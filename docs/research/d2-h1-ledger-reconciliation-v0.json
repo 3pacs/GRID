@@ -1,0 +1,333 @@
+{
+ "schema": "d2-h1-ledger-reconciliation/1",
+ "status": "DRAFT_FOR_REVIEW",
+ "as_of": "2026-11-26",
+ "target_window": {
+  "first": "2018-01-02",
+  "last": "2022-11-11",
+  "instrument": "SPY options",
+  "cells": [
+   "D2-H1a 14:00",
+   "D2-H1b 15:00"
+  ]
+ },
+ "finding": {
+  "spy_option_premium_fetched_before_2022_11_14": "none. The four OPRA fetchers read (edge2 fetch_databento, edge4 fetch_gexhist, edge6 xsp_edge6, edge6 spx_fetch) start SPY and XSP at 2022-11-14; only SPXW starts earlier (2016-11-15).",
+  "overlaps": [
+   "gex.edge6_spx",
+   "gex.edge9",
+   "gex.eod_flows",
+   "gex.playbook_evidence"
+  ],
+  "section_4_omits": [
+   "gex.edge6_spx",
+   "gex.edge9",
+   "gex.edge10",
+   "gex.edge11",
+   "gex.edge12",
+   "gex.eod_flows",
+   "gex.playbook_evidence",
+   "gex.flow_sign",
+   "gex.factory_dev_data"
+  ],
+  "needs_a_decision": "Section 6.2 strikes a cell if the SPY option-premium family, entry time or contract scope was tested on 2018..2022-11. The SPXW 15:00 fly (and its reported-only 14:00 entry) was judged on the same sessions. Whether that is the same family for section 6.2 is the reviewer's and owner's call. This file records the facts and does not decide it."
+ },
+ "rows": [
+  {
+   "id": "gex.panel_trials_row10",
+   "family": "volume-climax fade",
+   "instrument": "SPY 1-min",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2025-05..2026",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "contract section 4"
+  },
+  {
+   "id": "gex.range_offsides",
+   "family": "range fakeout fade",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2026-03-25..2026-11-04",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "contract section 4"
+  },
+  {
+   "id": "gex.edge1_dayside",
+   "family": "late-day prior-close side",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2025-04-02..2026-03-24",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "contract section 4"
+  },
+  {
+   "id": "gex.rules2_level_fade",
+   "family": "shadow level fade",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2026-11-04..forward",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "contract section 4"
+  },
+  {
+   "id": "gex.edge2",
+   "family": "option flow, skew shock, vol-gamma magnet, overnight shares",
+   "instrument": "SPY options",
+   "data_kind": "OPTION_PREMIUM",
+   "window": "dev 2024-11..2026-11; holdout 2022-11-14..2024-11-08",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "SPY option quotes fetched only from 2022-11-14 (fetch_databento.py, fetch_gexhist.py read 2026-11-26)",
+   "source": "edge2 registration; fetchers"
+  },
+  {
+   "id": "gex.edge3",
+   "family": "calendar rules: turn of month, pre-FOMC, VIX spike, pre-holiday",
+   "instrument": "SPY daily",
+   "data_kind": "DAILY_OR_WEEKLY_PRICE",
+   "window": "dev 1993..2012; holdout 2013-01-02..2026-11-10",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "YES",
+   "note": "daily SPY closes, calendar rules only; protected reservation, not opened by a D2 fetch; no option premium",
+   "source": "contract section 4; edge3 registration"
+  },
+  {
+   "id": "gex.edge4",
+   "family": "pin-range, gamma-break, em-exhaustion replay",
+   "instrument": "SPY options",
+   "data_kind": "OPTION_PREMIUM",
+   "window": "2022-11-14..2026-03-25",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "edge4 protocol"
+  },
+  {
+   "id": "gex.edge5",
+   "family": "day-type levers",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "dev 2024-11-11..2026-11-09; holdout 2022-11-14..2024-11-08",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "edge5 registration"
+  },
+  {
+   "id": "gex.edge6",
+   "family": "0DTE short iron fly, held to settlement (follow-ups: 15:45 exit, Schwab exit, XSP)",
+   "instrument": "SPY options",
+   "data_kind": "OPTION_PREMIUM",
+   "window": "2022-11-14..2026-11-09",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "all four variants use the same 2022-11-14..2026-11-09 sessions; the 15:45-exit record names the 2018-2022 SPY expiries as an untested window",
+   "source": "edge6 records"
+  },
+  {
+   "id": "gex.edge6_spx",
+   "family": "same 15:00 short iron fly on SPXW; 14:00 and 14:30 entries reported only",
+   "instrument": "SPXW options (not SPY)",
+   "data_kind": "OPTION_PREMIUM",
+   "window": "sample A 2016-11-15..2022-11-11 (fetched and judged); sample B 2022-11-14..2026-11-09",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "OVERLAP, NOT IN SECTION 4: a judged look at the same strategy on index options, on the same sessions as the target window. The gates in that look read SPY 1-minute bars from 2018-05-01 for realised movement. Verdict class: FAIL on both samples. This look is the reason the SPY premium question is already shaped.",
+   "source": "edge6 SPX protocol, correction 1, result"
+  },
+  {
+   "id": "gex.edge7",
+   "family": "pin setups",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2022-11-14..2026-11-09",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "edge7 registration"
+  },
+  {
+   "id": "gex.edge8",
+   "family": "trade-flow turn markers",
+   "instrument": "SPY trades",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "dev 2024-11..2026-11; holdout 2022-11-14..2024-11-08",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "after the target window",
+   "source": "edge8 registration"
+  },
+  {
+   "id": "gex.edge9",
+   "family": "analog library of SPY intraday moments",
+   "instrument": "SPY 1-min bars, SPY trades",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "burn-in 2018-05-01..2018-12-31; holdout trades 2019-01-02..2022-11-11; development 2022-11-14..2024-11-08",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "OVERLAP, NOT IN SECTION 4: a holdout look over the same sessions on SPY intraday price paths. No option premium is read. A D2-H1 payoff proxy depends on the same price path to 15:59, so the look is disclosed in the selection ledger.",
+   "source": "edge9 protocol; look result exists"
+  },
+  {
+   "id": "gex.edge10",
+   "family": "attention herding, daily equity cross-section",
+   "instrument": "equities daily",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "holdout 2018-06-01..2022-12-30",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "different family and instrument; date overlap only; no option data; not in section 4",
+   "source": "edge10 protocol"
+  },
+  {
+   "id": "gex.edge11",
+   "family": "daily short volume",
+   "instrument": "equities daily",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "2018-08..2026-11",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "different family and instrument; date overlap only; not in section 4",
+   "source": "edge11 protocol"
+  },
+  {
+   "id": "gex.edge12",
+   "family": "sector card",
+   "instrument": "equities daily",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "dev 2010-01-04..2022-12-29; holdout 2022-12-30..2026-11-12",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "different family and instrument; date overlap only; not in section 4",
+   "source": "edge12 protocol"
+  },
+  {
+   "id": "gex.eod_flows",
+   "family": "SPY and QQQ late-day flow follow (exploratory, no verdict)",
+   "instrument": "SPY, QQQ 1-min bars and trades",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2018-05-02..2026-11-10",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "OVERLAP, NOT IN SECTION 4: exploratory read of SPY price paths over the whole target window; nothing here is a pass or fail",
+   "source": "eod-flows result"
+  },
+  {
+   "id": "gex.playbook_evidence",
+   "family": "decision-minute to close SPY moves (exploratory)",
+   "instrument": "SPY 1-min bars",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2018-05-01..2026-11-09 (cross-asset cut); unseen-years cut 2018-08-01..2024-11-12",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "OVERLAP, NOT IN SECTION 4: exploratory read of SPY price paths over the target window",
+   "source": "playbook results"
+  },
+  {
+   "id": "gex.flow_sign",
+   "family": "charm and vanna flow sign (exploratory)",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2022-11-14..2026-11-09",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "after the target window",
+   "source": "flow-sign result"
+  },
+  {
+   "id": "gex.factory_dev_data",
+   "family": "development data staging",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "2022-11-14..2026-11-10",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "after the target window",
+   "source": "factory/stage_dev_data.py"
+  },
+  {
+   "id": "grid.1065_v1_v6",
+   "family": "ETF rotation, trend, vol-managed, mean reversion, inverse-vol, regime",
+   "instrument": "ETFs weekly",
+   "data_kind": "DAILY_OR_WEEKLY_PRICE",
+   "window": "2017-01..2026-10 (v6 also 1926..2026)",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "YES",
+   "note": "no option data; weekly ETF returns",
+   "source": "contract section 4"
+  },
+  {
+   "id": "grid.647_gex_levels_v1",
+   "family": "SPY GEX levels",
+   "instrument": "SPY",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "forward from registration",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "YES",
+   "note": "forward only",
+   "source": "contract section 4"
+  },
+  {
+   "id": "grid.vs1",
+   "family": "insider density, sector ETF relative",
+   "instrument": "Form 4, sector ETFs",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "discovery windows in each preregistration",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "YES",
+   "note": "different family; no option data",
+   "source": "contract section 4"
+  }
+ ],
+ "not_read": [
+  {
+   "id": "gex.gamma_vol (optflow)",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.exits (trail-arm)",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.burnin_v2",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.overnight_shadow",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.nvda_watch",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.gex_trader",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.desk_state",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.bounce_shadow",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  },
+  {
+   "id": "gex.fly_shadow",
+   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+  }
+ ],
+ "limits": [
+  "Built from the GEX research lane's records as read on 2026-11-26; that repository is private, so only ids, windows and verdict classes are copied here.",
+  "A row marked False for overlap was read for its window, not re-run.",
+  "Nothing here opens a protected reservation, fetches data, or spends money."
+ ]
+}
