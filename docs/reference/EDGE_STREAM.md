@@ -33,7 +33,7 @@ Look reports: `looks/<registration sha[:16]>.json` (0444, schema `edge-look-repo
 | noise is measured per day or ISO week; a finer unit in a trade's `session` is refused | `stats.judge` |
 | no reuse of (group, horizon class, period): prior consumption table + every registration | `ledger.conflicts` |
 | forward windows start after registration; no outcome computed before the look | `runner.forward_progress` (presence only) |
-| look runs only on the registered family code (`code_sha256`), else abandoned; the check runs first in every cycle, on every lane, before any data is read (a forward registration is not left to collect to its look) | `runner._check_code` |
+| look runs only on the registered family code (`code_sha256`): the live package when it reproduces the hash, else the sealed tree that does (below), else abandoned; the check runs first in every cycle, on every lane, before any data is read (a forward registration is not left to collect to its look) | `runner._evaluator`, `sealed.evaluator` |
 | the hash is per family: its own class, the shared code of `families.py` and the other evaluation modules (`stats`, `runner`, `data`, `policy`); other families' classes, the `FAMILIES` registry and the queue (`template_queue.py`) are left out, so adding or changing one family abandons no other family's registration | `families.code_sha256` |
 | unread status is a positive receipt in the ledger: before the first read of each kind of an open registration's window (`progress`, `look`) the runner appends an `edge_read` record to the hash-chained, anchored ledger, so a lost or restored data dir cannot hide one; a dry run reads no open window. Under policy 4 only a registration (either lane) sealed under policy 4+ with no `edge_read` record at all, abandoned at the code check with no failed attempt or staged report, frees its window and may register again. A forward presence count is a read: that window stays consumed and that (family, group, lane) closed. Registrations sealed before policy 4 free and reopen nothing; contrary or partial evidence keeps everything closed. Alpha stays spent | `ledger.append_read` / `StreamState.unread_abandoned` / `reregistrable`, `runner.read_evidence`, `policy.UNREAD_ABANDONMENT` |
 | bars after the decision minute never reach the rule | `families.decision_bars` / `assert_no_lookahead` |
@@ -107,9 +107,26 @@ change), except for the fields a new entry in `policy.OWNER_DECISIONS` waives. A
 edited or removed afterwards, and never lifts the yearly budget. Anything else that loosens is refused: the cycle
 reports it under `errors` and registers nothing until the code is put right.
 
-**Deploying any change to `families`, `stats`, `runner`, `data` or `policy` abandons the registration that is open
-at that moment** (its look and its window are spent): their code is hashed into every registration. Land such a
-change when the open registration is the one you can best afford to lose, and say so in the PR.
+**Deploying any change to `families`, `stats`, `runner`, `data` or `policy` abandons the registrations open at that
+moment** (their looks and their windows are spent): their code is hashed into every registration. The policy
+payload, numpy's major.minor and Python's `ast.dump` (so the interpreter's minor version, 3.14 on grid-hermes)
+are in the hash too. **Unless the same PR adds a sealed tree:**
+
+- **What it is.** `alpha_research/edge_stream/sealed/<name>/` is a byte copy of the edge-stream package as
+  deployed (every module but `__main__` and `hermes`, never edited). Its provenance is in `sealed.TREES`: the
+  release's git tree id, the file sha256s, and the open registrations it seals. `tests/test_edge_stream_sealed.py`
+  pins the bytes and, on Python 3.14, that the tree reproduces each sealed hash.
+- **How it is used.** On every cycle a registration whose hash the live code no longer reproduces is matched to
+  the tree whose own files reproduce it, recomputed from those files; no hash-to-tree map is trusted. Its code
+  check, presence count, look and report then run in that tree (the runner's ledger records, read receipts and
+  report file stay the live ones). An edited tree reproduces nothing, and the registration is abandoned as before.
+- **When a tree goes.** Remove one only when no open registration in the live ledger reproduces under it.
+- **The first tree.** `tree_a1d9bd4c` (#1337, release tree `a1d9bd4c`, deployed from `ca04a2d5` on 2026-11-18)
+  keeps the two forward registrations open on 2026-11-25: the SPY/QQQ/IWM test `69a84820` and EC1's confirmation
+  `60b49abd`, both sealed under policy 3.
+
+Without a tree, land such a change when the open registrations are the ones you can best afford to lose, and say
+so in the PR.
 
 Adding a family = a reviewed PR to `families.py` (its source is hashed into registrations). An inbox proposal
 (`{"family": "IM1", "group": "...", "instruments": [...], "lane": "history"|"forward", "proposer": "codex"}`) may only

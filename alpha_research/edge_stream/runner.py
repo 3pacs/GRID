@@ -33,6 +33,7 @@ from loguru import logger as log  # same logger config.log re-exports; no settin
 from . import ledger as L
 from . import policy as P
 from . import sanity
+from . import sealed as S
 from .data import BarSource, RequestCapReached, SourceError, manifest_sha256, today_et
 from .ledger import sha256_bytes
 from .families import FAMILIES, build_proposal, code_sha256
@@ -145,6 +146,36 @@ def _check_code(reg: dict):
     if family is None or code_sha256(family) != reg["code_sha256"]:
         raise CodeChanged(f"family {reg['family']} code differs from the registered sha")
     return family
+
+
+def _evaluator(reg: dict):
+    """The module that judges ``reg``: ``None`` for this one when the live code reproduces its
+    hash, else the sealed tree whose own files reproduce it (:mod:`.sealed`). Neither:
+    :class:`CodeChanged`. Reads no data."""
+    family = FAMILIES.get(reg["family"])
+    if family is not None and code_sha256(family) == reg["code_sha256"]:
+        return None
+    sealed_runner = S.evaluator(reg)
+    if sealed_runner is None:
+        raise CodeChanged(f"family {reg['family']} code differs from the registered sha")
+    return sealed_runner
+
+
+def _judged_by(ev, name: str, *args):
+    """``forward_progress`` or ``compute_look`` from the module :func:`_evaluator` chose. A sealed
+    tree's own exceptions come back as this module's, so the cycle treats them as it always has."""
+    if ev is None:
+        return {"forward_progress": forward_progress, "compute_look": compute_look}[name](*args)
+    try:
+        return getattr(ev, name)(*args)
+    except ev.NotReady as exc:
+        raise NotReady(str(exc)) from exc
+    except ev.CodeChanged as exc:
+        raise CodeChanged(str(exc)) from exc
+    except ev.RequestCapReached as exc:
+        raise RequestCapReached(str(exc)) from exc
+    except ev.SourceError as exc:
+        raise SourceError(str(exc)) from exc
 
 
 def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date,
@@ -353,21 +384,22 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
         # 1. looks
         for reg_sha, reg in state.open_registrations():
             try:
-                # before any data: a registration whose family code changed is abandoned now,
-                # unread, on every lane (a forward one would otherwise collect to its look first)
-                _check_code(reg)
+                # before any data: a registration whose code neither the live code nor a sealed tree
+                # reproduces is abandoned now, unread, on every lane (a forward one would otherwise
+                # collect to its look first); one a sealed tree reproduces is judged by that tree
+                ev = _evaluator(reg)
                 if dry_run:  # a dry run reads no open registration's window (it records no edge_read)
                     summary["forward" if reg["lane"] == "forward" else "looks"].append(
                         {"registration": reg_sha[:16], "dry_run": "window not read"})
                     continue
                 if reg["lane"] == "forward":
                     L.append_read(ledger, reg_sha, "progress", now.isoformat())
-                    prog = forward_progress(reg, source, today, extras)
+                    prog = _judged_by(ev, "forward_progress", reg, source, today, extras)
                     summary["forward"].append({"registration": reg_sha[:16], **prog})
                     if not prog["ready"]:
                         continue
                 L.append_read(ledger, reg_sha, "look", now.isoformat())
-                look, body = compute_look(reg_sha, reg, source, today, extras)
+                look, body = _judged_by(ev, "compute_look", reg_sha, reg, source, today, extras)
             except CodeChanged as exc:
                 if not dry_run:
                     L.append_abandoned(ledger, reg_sha, str(exc), now.isoformat(), cause=L.CODE_CHANGED,
@@ -394,7 +426,8 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
                                      "verdict": look["verdict"]})
             log.info("edge_stream look {p}: {v}", p=reg["proposal_id"], v=look["verdict"])
         # the code's policy must be the policy in force before anything new is sealed; an open
-        # registration sealed under the old one was closed above (its code hash carries the policy)
+        # registration sealed under the old one was judged above by the sealed tree that reproduces
+        # its code hash (the hash carries the policy), or abandoned when none does
         if not dry_run:
             try:
                 amended = L.amend_policy(ledger, f"code policy {P.POLICY_VERSION}", now.isoformat())
