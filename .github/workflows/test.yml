@@ -178,33 +178,18 @@ jobs:
         if: always()
         run: docker rm -f grid-test-pg 2>/dev/null || true
 
-  backend-tests:
-    name: Backend Tests
-    needs: backend-tests-suite
-    # a failed shard still runs this job (so the check fails, not skips);
-    # a cancelled run does not
-    if: ${{ !cancelled() }}
+  # The PostgreSQL contract steps: each reruns one test file against a real
+  # database and fails if it skipped. They read nothing the suite produces, so
+  # they run at the same time as the suite shards instead of after them (they
+  # were the second half of the "Backend Tests" job until 2026-11-26). Routed
+  # like the other jobs: on a self-hosted `tests` runner they reset that host's
+  # persistent griddb_test, and they are the only job in this workflow that can.
+  backend-tests-contracts:
+    name: Backend Tests contracts
     runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
-    # The whole suite ran here before backend-tests-suite split it out; this
-    # job now runs the #1352 witness and the PostgreSQL contracts (~5 min).
     timeout-minutes: 25
 
     steps:
-      # The main suite runs in backend-tests-suite (above). This job keeps the
-      # "Backend Tests" check name that evals/e3/gates.py (MANDATORY_CI) and the
-      # #1352 release check read: it runs after every shard and fails unless all
-      # of them passed and their manifests show each collected test ran exactly
-      # once; then it runs the #1352 witness and the PostgreSQL contracts.
-      - name: Main suite shards passed
-        env:
-          SUITE_RESULT: ${{ needs.backend-tests-suite.result }}
-        run: |
-          if [ "$SUITE_RESULT" != "success" ]; then
-            echo "::error::Backend Tests suite shards did not all pass (result: $SUITE_RESULT)"
-            exit 1
-          fi
-          echo "every Backend Tests suite shard passed"
-
       - uses: actions/checkout@v7
 
       - name: Set up Python
@@ -212,18 +197,6 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
-      # Proof, not assumption, that the shards partitioned the suite: every
-      # shard ran, all collected the same node ids, none ran twice, none was
-      # missed (tests/ci_scheduling.py, verify_manifests). Standard library only.
-      - name: Download suite shard manifests
-        uses: actions/download-artifact@v8
-        with:
-          pattern: backend-suite-manifest-*
-          path: /tmp/grid-suite-manifests
-
-      - name: Suite shards ran every collected test exactly once
-        run: python -m tests.ci_scheduling verify --shards 2 /tmp/grid-suite-manifests/backend-suite-manifest-*
 
       # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
       # Postgres container. Self-hosted `tests` runners keep a persistent
@@ -252,32 +225,6 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest pytest-cov pytest-xdist
-
-      # #1352 Option B release witness (tests/test_1352_option_b_release_witness.py),
-      # run on its own so this step's log keeps the full per-test report: the
-      # main suite above keeps only its last 300 lines, so it cannot prove each
-      # witness node ID. The release check (check-1352-release.sh pre) reads the
-      # block between the BEGIN/END markers and requires every pinned node ID to
-      # be PASSED at the exact head. Offline: no database, network or LLM.
-      # Fails on any failed or errored test and on any skip/xfail/deselect.
-      - name: Option B release witness (#1352)
-        env:
-          DB_PASSWORD: testpass
-          GRID_JWT_SECRET: test-secret-ci
-          TESTING: "true"
-          WITNESS_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          WITNESS_TESTED_SHA: ${{ github.sha }}
-        run: |
-          set -o pipefail
-          echo "GRID-1352-WITNESS-BEGIN head=${WITNESS_HEAD_SHA} tested=${WITNESS_TESTED_SHA}"
-          python -m pytest tests/test_1352_option_b_release_witness.py \
-            -p no:xdist -p no:cacheprovider -rA -v --tb=short 2>&1 | tee /tmp/grid-1352-witness.txt
-          summary=$(tail -1 /tmp/grid-1352-witness.txt)
-          echo "GRID-1352-WITNESS-END summary=${summary}"
-          if grep -qE '[0-9]+ (skipped|xfailed|xpassed|deselected)' <<<"$summary"; then
-            echo "witness: skipped, xfailed, xpassed or deselected tests are not allowed: $summary"
-            exit 1
-          fi
 
       # 13F holdings observations (intelligence/holdings_observations_13f.py):
       # the real 13F writer -> reader -> deep_graph layer 9 -> served route on
@@ -1345,6 +1292,95 @@ jobs:
       - name: Stop ephemeral Postgres (hosted runner)
         if: always() && env.ON_SELF_HOSTED != 'true'
         run: docker rm -f grid-test-pg 2>/dev/null || true
+
+  # The required check. evals/e3/gates.py (MANDATORY_CI) and the #1352 release
+  # check read it by this name. It runs after the suite shards and the
+  # contracts job (which run at the same time) and fails unless both passed.
+  # Then it checks the shards' manifests and runs the #1352 witness. No
+  # database: the witness is offline.
+  backend-tests:
+    name: Backend Tests
+    needs: [backend-tests-suite, backend-tests-contracts]
+    # a failed shard or contracts job still runs this job (so the check fails,
+    # not skips); a cancelled run does not
+    if: ${{ !cancelled() }}
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
+    timeout-minutes: 25
+
+    steps:
+      # The tested checkout first: the #1352 release kit's workflow guard binds
+      # this job to it.
+      - uses: actions/checkout@v7
+
+      # Fails unless every suite shard and the contracts job passed, so this
+      # check (the name evals/e3/gates.py MANDATORY_CI and the #1352 release
+      # check read) covers all of them.
+      - name: Suite shards and contracts passed
+        env:
+          SUITE_RESULT: ${{ needs.backend-tests-suite.result }}
+          CONTRACTS_RESULT: ${{ needs.backend-tests-contracts.result }}
+        run: |
+          if [ "$SUITE_RESULT" != "success" ]; then
+            echo "::error::Backend Tests suite shards did not all pass (result: $SUITE_RESULT)"
+            exit 1
+          fi
+          if [ "$CONTRACTS_RESULT" != "success" ]; then
+            echo "::error::Backend Tests contracts did not pass (result: $CONTRACTS_RESULT)"
+            exit 1
+          fi
+          echo "every Backend Tests suite shard and the contracts job passed"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # Proof, not assumption, that the shards partitioned the suite: every
+      # shard ran, all collected the same node ids, none ran twice, none was
+      # missed (tests/ci_scheduling.py, verify_manifests). Standard library only.
+      # runner.temp is emptied at the start and end of every job, so on a
+      # self-hosted runner a stale manifest from an earlier run cannot fill a
+      # missing shard (Codex review 6070573984).
+      - name: Download suite shard manifests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: backend-suite-manifest-*
+          path: ${{ runner.temp }}/grid-suite-manifests
+
+      - name: Suite shards ran every collected test exactly once
+        run: python -m tests.ci_scheduling verify --shards 2 ${{ runner.temp }}/grid-suite-manifests/backend-suite-manifest-*
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-xdist
+
+      # #1352 Option B release witness (tests/test_1352_option_b_release_witness.py),
+      # run on its own so this step's log keeps the full per-test report: the
+      # main suite above keeps only its last 300 lines, so it cannot prove each
+      # witness node ID. The release check (check-1352-release.sh pre) reads the
+      # block between the BEGIN/END markers and requires every pinned node ID to
+      # be PASSED at the exact head. Offline: no database, network or LLM.
+      # Fails on any failed or errored test and on any skip/xfail/deselect.
+      - name: Option B release witness (#1352)
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+          WITNESS_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          WITNESS_TESTED_SHA: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          echo "GRID-1352-WITNESS-BEGIN head=${WITNESS_HEAD_SHA} tested=${WITNESS_TESTED_SHA}"
+          python -m pytest tests/test_1352_option_b_release_witness.py \
+            -p no:xdist -p no:cacheprovider -rA -v --tb=short 2>&1 | tee /tmp/grid-1352-witness.txt
+          summary=$(tail -1 /tmp/grid-1352-witness.txt)
+          echo "GRID-1352-WITNESS-END summary=${summary}"
+          if grep -qE '[0-9]+ (skipped|xfailed|xpassed|deselected)' <<<"$summary"; then
+            echo "witness: skipped, xfailed, xpassed or deselected tests are not allowed: $summary"
+            exit 1
+          fi
 
   frontend-build:
     name: Frontend Build

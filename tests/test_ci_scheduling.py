@@ -562,14 +562,14 @@ def test_suite_matrix_covers_every_shard_once(workflow: dict[str, Any]) -> None:
 def test_backend_tests_fails_unless_every_suite_shard_passed(workflow: dict[str, Any]) -> None:
     job = workflow["jobs"]["backend-tests"]
     assert job["name"] == "Backend Tests"
-    assert job["needs"] == "backend-tests-suite"
-    # runs (and fails) when a shard failed, but not when the run was cancelled
+    assert job["needs"] == ["backend-tests-suite", "backend-tests-contracts"]
+    # runs (and fails) when a shard or the contracts failed, but not when the run was cancelled
     assert job["if"] == "${{ !cancelled() }}"
-    gate = job["steps"][0]
-    assert gate["name"] == "Main suite shards passed"
+    gate = job["steps"][1]
+    assert gate["name"] == "Suite shards and contracts passed"
     assert gate["env"]["SUITE_RESULT"] == "${{ needs.backend-tests-suite.result }}"
     assert '[ "$SUITE_RESULT" != "success" ]' in gate["run"] and "exit 1" in gate["run"]
-    # the main suite no longer runs here; the #1352 witness and the contracts still do
+    # neither the main suite nor the contracts run here; the #1352 witness does
     names = [step.get("name") for step in job["steps"]]
     assert "Run tests" not in names
     assert "Option B release witness (#1352)" in names

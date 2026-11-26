@@ -420,9 +420,11 @@ two `Backend Tests suite (n/2)` jobs at the same time (`backend-tests-suite`
 in `test.yml`, split by `tests/ci_scheduling.py`). That job is pinned to
 `ubuntu-latest` whatever `TEST_RUNNER` says: on one self-hosted host both
 shards would reset and write the same `griddb_test` at once (alien runs three
-`tests` runners). `TEST_RUNNER` still routes Backend Tests (the PostgreSQL
-contracts and the #1352 witness), Frontend Build and Lint. Letting the
-shards onto self-hosted runners would first need one database per runner.
+`tests` runners). `TEST_RUNNER` still routes Backend Tests contracts (the
+PostgreSQL contract steps, the one routed job that resets `griddb_test`), the
+Backend Tests aggregate (shard and contracts results, manifest check, #1352
+witness; no database), Frontend Build and Lint. Letting the shards onto
+self-hosted runners would first need one database per runner.
 
 
 ### Where it actually lives (verified 2026-09-11)
