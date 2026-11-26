@@ -1398,3 +1398,33 @@ def test_pg_tolerated_legacy_entry_cannot_remove_an_existing_current_row(snapsho
     with pytest.raises(ValueError, match="duration"):
         _snapshot_with_extra_facts(current_period, second=20)
     assert stored(engine) == before                              # refused before the writer: projection retained
+
+
+def test_pg_tolerated_stray_point_cannot_remove_an_existing_current_row(snapshot_db):
+    """An event-dated start-less point (not a reporting-period end, in an accession whose
+    periods are known) changes nothing the normalizer emits: the writer replaces the owned
+    projection with the same rows. At the filing's period end it is refused before the writer."""
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    first = snapshot()
+    assert write_snapshot(engine, first)["status"] == "applied"
+    before = stored(engine)
+    assert len(before) == 1
+
+    stray = {"PaymentsOfDividends": {"units": {"USD": [dict(
+        end="2026-06-15", val=1000, accn="0001045810-26-000075", filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    later = _snapshot_with_extra_facts(stray, second=30)
+    assert later.tolerated_stray_points == (("PaymentsOfDividends", "2026-06-15", "0001045810-26-000075"),)
+    assert later.rows == first.rows and later.snapshot_id != first.snapshot_id
+    result = write_snapshot(engine, later)
+    assert result["status"] == "applied" and result["rows_written"] == len(first.rows)
+    assert result["rows_removed"] == len(first.rows)             # the same owned rows replaced by the same rows
+    assert stored(engine) == before                              # no current row lost or changed
+
+    at_period_end = {"PaymentsOfDividends": {"units": {"USD": [dict(
+        end="2026-07-26", val=5, accn="0001045810-26-000075", filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    with pytest.raises(ValueError, match="duration"):
+        _snapshot_with_extra_facts(at_period_end, second=40)
+    assert stored(engine) == before                              # refused before the writer: projection retained

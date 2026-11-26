@@ -135,3 +135,15 @@ def test_no_cik_is_attempted_not_successful(runner,monkeypatch):
     assert checkpoints[0][0]==[] and checkpoints[0][3]==['NVDA']
     fetch.assert_not_called()
     write.assert_not_called()
+
+
+def test_summary_counts_tolerated_stray_points_and_the_issuer_is_still_written(runner):
+    puller,fetch,write,checkpoints=runner
+    raw,now,_=response()
+    data=json.loads(raw)
+    data['facts']['us-gaap']['PaymentsOfDividends']={'units':{'USD':[dict(
+        end='2026-06-15',val=1,form='10-Q',fp='Q2',accn='0001045810-26-000075',filed='2026-08-26')]}}
+    fetch.return_value=(json.dumps(data).encode(),now,now)
+    result=puller.pull_all()
+    assert result[0]['status']=='SUCCESS' and result[-1]['tolerated_stray_points']==1
+    assert write.call_count==1 and write.call_args.args[1].tolerated_stray_points[0][1]=='2026-06-15'

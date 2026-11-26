@@ -98,6 +98,9 @@ class FinancialSnapshot:
     # Not part of the identity: how many unusable legacy entries the gate let
     # through (for the post-run receipt; the source bytes hold the entries).
     tolerated_legacy_entries: int = field(default=0, compare=False)
+    # (tag, end, accession) of each recent start-less mapped-flow point that was tolerated
+    # (event-dated, not a reporting-period end): counted and traceable, never part of the identity.
+    tolerated_stray_points: tuple[tuple[str, str, str], ...] = field(default=(), compare=False)
 
     @property
     def rows(self) -> list[dict[str, Any]]:
@@ -145,6 +148,14 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                      | {_IFRS_DEBT_PROCEEDS_TAG, _IFRS_DEBT_REPAY_TAG},
     }
     unusable_ends: list[date] = []
+    # A start-less mapped-flow entry (a stray point-in-time datum tagged with a flow
+    # concept) can never become a flow row: the normalizer needs a duration. It can
+    # only matter if it stands in for a reporting period the projection would then
+    # lack. These indexes let the gate tell such a period stand-in from an
+    # event-dated stray point; see the tolerance rule below.
+    unusable: list[tuple[str, str, date, str, bool]] = []            # (taxonomy, tag, end, accn, is_stray_point)
+    usable_ends_all: set[date] = set()
+    usable_ends_by_accn: dict[str, set[date]] = {}
     for taxonomy in ('us-gaap', 'ifrs-full'):
         namespace = facts.get(taxonomy, {})
         if not isinstance(namespace, dict):
@@ -175,10 +186,29 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                     # Whole-company responses also contain forward-looking and
                     # instant non-flow concepts. Only our mapped duration flows
                     # require a start and a reporting end not after filing.
-                    if tag_name in mapped_tags[taxonomy] and (start is None or filed < end):
-                        unusable_ends.append(end)
+                    if tag_name in mapped_tags[taxonomy]:
+                        if start is None or filed < end:
+                            unusable_ends.append(end)
+                            unusable.append((taxonomy, tag_name, end, str(entry['accn']), start is None and filed >= end))
+                        elif start < end:
+                            usable_ends_all.add(end)
+                            usable_ends_by_accn.setdefault(str(entry['accn']), set()).add(end)
     capture_day = received.date()
-    if any((capture_day - end).days <= LEGACY_ENTRY_HORIZON_DAYS for end in unusable_ends):
+    tolerated_points: list[tuple[str, str, str]] = []
+    for taxonomy, tag_name, end, accn, is_stray_point in unusable:
+        if (capture_day - end).days > LEGACY_ENTRY_HORIZON_DAYS:
+            continue                                   # legacy: cannot affect a current row
+        # A recent unusable entry refuses the issuer, EXCEPT an event-dated stray point:
+        # a start-less entry (it can never be a flow row: the normalizer needs a
+        # duration) (1) whose accession has reporting periods known from its own usable
+        # entries, so it is not the filing's only evidence, and (2) whose end is none
+        # of the issuer's reporting-period ends, so it cannot stand in for a period the
+        # projection would then lack. Real shapes: a one-day debt issuance, share
+        # issuance or buyback in a notes disclosure, tagged with a flow concept but no
+        # start (2026-11-26: INTC, EOG, ON, WLK, DHI, RPD, NXE, each refused for one).
+        if is_stray_point and usable_ends_by_accn.get(accn) and end not in usable_ends_all:
+            tolerated_points.append((tag_name, end.isoformat(), accn))
+            continue
         raise ValueError("Invalid mapped financial-flow duration")
     rates = _AppliedFxRates(json.loads(_json(fx_rates)))
     rows = _collect_all_flows(payload, rates)
@@ -196,6 +226,7 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
         normalizer_version=NORMALIZER_VERSION, source_body=source_body,
         normalized_json=normalized_json, fx_json=fx_json,
         tolerated_legacy_entries=len(unusable_ends),
+        tolerated_stray_points=tuple(tolerated_points),
     )
 
 

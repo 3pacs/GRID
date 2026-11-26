@@ -320,3 +320,117 @@ def test_tolerated_legacy_entries_are_counted_but_not_part_of_the_identity():
     s = prepared(data)
     assert s.tolerated_legacy_entries == 2 and clean.tolerated_legacy_entries == 0
     validate_snapshot(s)                                    # replay at the write boundary still matches
+
+
+# ── event-dated stray points do not refuse the issuer (2026-11-26) ────────────
+# INTC, EOG, ON, WLK (and later DHI, RPD, NXE) were refused "Invalid mapped
+# financial-flow duration" for ONE or TWO start-less entries each: a one-day debt
+# issuance, share issuance or buyback in a notes disclosure, tagged with a flow
+# concept but no start (INTC ProceedsFromIssuanceOfCommonStock end 2025-08-27,
+# EOG ProceedsFromIssuanceOfLongTermDebt end 2025-07-01, ON
+# PaymentsForRepurchaseOfCommonStock end 2026-05-11, WLK RepaymentsOfLongTermDebt
+# end 2026-05-29). Such an entry can never be a flow row, and when its end is not a
+# reporting-period end of the issuer it cannot stand in for a period either.
+
+OWN = '0001045810-26-000075'          # the accession of payload()'s usable Q2 entry (period end 2026-07-26)
+
+
+def _stray(end, *, accn=OWN, filed='2026-08-26', **extra):
+    return _legacy(end=end, filed=filed, accn=accn, form='10-Q', fp='Q2', **extra)
+
+
+def test_an_event_dated_stray_point_does_not_refuse_the_issuer_and_is_traceable():
+    clean = prepared()
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2026-06-15')
+    s = prepared(data)
+    assert s.rows == clean.rows and s.normalized_sha256 == clean.normalized_sha256
+    assert s.tolerated_stray_points == (('PaymentsOfDividends', '2026-06-15', OWN),)
+    assert s.tolerated_legacy_entries == 1 and clean.tolerated_stray_points == ()
+    validate_snapshot(s)                                   # the write-boundary replay agrees; not part of the identity
+    assert s.source_sha256 != clean.source_sha256
+
+
+def test_a_stray_point_at_a_reporting_period_end_stays_fatal():
+    """The period's flow could be missing: it is the existing current-period case, whatever the tag."""
+    for end in ('2026-07-26',):
+        data = payload()
+        data['facts']['us-gaap']['PaymentsOfDividends'] = _stray(end)
+        with pytest.raises(ValueError, match='duration'):
+            prepared(data)
+
+
+def test_a_stray_point_at_a_period_end_reported_by_another_accession_stays_fatal():
+    data = payload()
+    prior = dict(start='2025-04-28', end='2025-07-27', val=1, accn='0001045810-25-000070',
+                 filed='2025-08-27', form='10-Q', fp='Q2')
+    data['facts']['us-gaap']['Revenues']['units']['USD'].append(prior)
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2025-07-27')       # a comparative period end
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+
+
+def test_a_stray_point_in_an_accession_with_no_usable_period_stays_fatal():
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2026-06-15', accn='0001045810-26-000099')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+
+
+def test_a_recent_entry_filed_before_its_end_stays_fatal_even_when_not_a_period_end():
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = {'units': {'USD': [dict(
+        start='2026-06-01', end='2026-09-30', val=5, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2')]}}
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+
+
+def test_one_tolerable_and_one_fatal_entry_still_refuse():
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2026-06-15')
+    data['facts']['us-gaap']['PaymentsForRepurchaseOfCommonStock'] = _stray('2026-07-26')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+
+
+@pytest.mark.parametrize('days_before_capture, tolerated_as', [(10, 'stray'), (730, 'stray'), (731, 'legacy'), (4000, 'legacy')])
+def test_the_horizon_still_decides_what_is_legacy(days_before_capture, tolerated_as):
+    data = payload()
+    end = (AT.date() - timedelta(days=days_before_capture)).isoformat()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray(end, filed=AT.date().isoformat())
+    s = prepared(data)
+    assert s.tolerated_legacy_entries == 1
+    assert (len(s.tolerated_stray_points) == 1) == (tolerated_as == 'stray')
+
+
+@pytest.mark.parametrize('name, taxonomy, tag, stray_end', [
+    ('INTC', 'us-gaap', 'ProceedsFromIssuanceOfCommonStock', '2026-06-29'),
+    ('EOG', 'us-gaap', 'ProceedsFromIssuanceOfLongTermDebt', '2026-07-01'),
+    ('ON', 'us-gaap', 'PaymentsForRepurchaseOfCommonStock', '2026-05-11'),
+    ('WLK', 'us-gaap', 'RepaymentsOfLongTermDebt', '2026-05-29'),
+    ('DHI', 'us-gaap', 'PaymentsToAcquireBusinessesNetOfCashAcquired', '2026-07-27'),
+    ('RPD', 'us-gaap', 'ProceedsFromIssuanceOfCommonStock', '2026-03-14'),
+    ('NXE', 'ifrs-full', 'ProceedsFromIssuingShares', '2026-04-15'),
+])
+def test_the_refused_issuers_shapes_are_admitted(name, taxonomy, tag, stray_end):
+    data = payload()
+    data['facts'].setdefault(taxonomy, {})[tag] = _stray(stray_end)
+    s = prepared(data)
+    assert s.rows[0]['amount_usd'] == 96_221_000_000
+    assert s.tolerated_stray_points == ((tag, stray_end, OWN),), name
+
+
+def test_the_wolf_and_ee_shapes_stay_refused():
+    """WOLF: core income-statement lines with no start AT the 10-Q's period end (real missing
+    periods). EE: a start-less point at a period end the issuer reports elsewhere."""
+    wolf = payload()
+    for tag in ('OperatingExpenses', 'ResearchAndDevelopmentExpense', 'IncomeTaxExpenseBenefit'):
+        wolf['facts']['us-gaap'][tag] = _stray('2026-07-26')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(wolf)
+    ee = payload()
+    ee['facts']['us-gaap']['Revenues']['units']['USD'].append(dict(
+        start='2025-04-28', end='2025-07-27', val=1, accn='0001045810-25-000070', filed='2025-08-27', form='10-Q', fp='Q2'))
+    ee['facts']['us-gaap']['ProceedsFromIssuanceOfCommonStock'] = _stray('2025-07-27')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(ee)

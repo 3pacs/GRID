@@ -1148,6 +1148,7 @@ class SECXBRLFinancialsPuller:
         processed = 0
         rows_this_run = 0
         tolerated_total = 0
+        stray_points_total = 0
         no_cik_tickers: list[str] = []
         cik_lost = 0
         coverage_unavailable = 0
@@ -1249,6 +1250,11 @@ class SECXBRLFinancialsPuller:
                 "tolerated_legacy_entries": snapshot.tolerated_legacy_entries,
             })
             tolerated_total += snapshot.tolerated_legacy_entries
+            if snapshot.tolerated_stray_points:
+                stray_points_total += len(snapshot.tolerated_stray_points)
+                log.info("SEC_XBRL: {t} tolerated {n} stray start-less point(s) that are not a reporting-period end: {p}",
+                         t=ticker, n=len(snapshot.tolerated_stray_points),
+                         p="; ".join(f"{tag} end {end} {accn}" for tag, end, accn in snapshot.tolerated_stray_points[:5]))
             record_attempt(ticker, success=True)
 
         if carried:
@@ -1274,6 +1280,7 @@ class SECXBRLFinancialsPuller:
             "tickers_processed": processed,
             "rows_written": rows_this_run,
             "tolerated_legacy_entries": tolerated_total,
+            "tolerated_stray_points": stray_points_total,
             "no_cik": len(no_cik_tickers),
             "no_cik_tickers": no_cik_tickers[:50],
             "cik_lost": cik_lost,
