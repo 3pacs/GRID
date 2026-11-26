@@ -1516,3 +1516,54 @@ def test_pg_a_tolerating_capture_never_erases_a_stored_period_but_a_clean_one_ma
     assert not clean.tolerated_stray_points
     assert write_snapshot(engine, clean)["status"] == "applied"
     assert len(stored(engine)) == 1
+
+
+def test_pg_fresh_insert_with_only_prior_year_evidence_is_refused_before_the_writer(snapshot_db):
+    """Codex 6081419580 (1): no stored head; the filing has only the prior-year Assets instant and
+    prior-year qualifying Revenue plus a start-less 2026 Revenue. Nothing may be admitted or stored."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    import pytest
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+
+    engine = snapshot_db
+    tag = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    facts = {tag: {"units": {"USD": [
+        dict(start="2025-04-28", end="2025-07-27", val=1, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2"),
+        dict(end="2026-07-26", val=100, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}},
+        "Assets": {"units": {"USD": [dict(end="2025-07-27", val=1, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    started = datetime(2026, 11, 1, tzinfo=timezone.utc) + timedelta(seconds=100)
+    with pytest.raises(ValueError, match="duration"):
+        prepare_snapshot(
+            source_body=json.dumps({"cik": 1045810, "entityName": "Synthetic Test Issuer", "facts": {"us-gaap": facts}}).encode(),
+            actor_id="nvda", cik="1045810", request_started_at=started, received_at=started + timedelta(seconds=1),
+            fx_rates={"USD": 1.0})
+    assert stored(engine) == []
+
+
+def test_pg_dropping_tolerance_metadata_cannot_bypass_the_writer_guard(snapshot_db):
+    """Codex 6081419580 (2): with owned rows stored, a tolerating capture lacking one of them is rejected
+    by the guard; the same snapshot with tolerated_stray_points removed (same bytes, same identity) must
+    fail the write-boundary replay instead of applying and dropping the owned row."""
+    from dataclasses import replace
+
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    dividends = {"PaymentsOfDividends": {"units": {"USD": [dict(
+        start="2026-04-27", end="2026-07-26", val=40, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    assert write_snapshot(engine, _snapshot_with_extra_facts(dividends, second=110))["status"] == "applied"
+    before = stored(engine)
+    assert len(before) == 2
+
+    tolerating = _snapshot_with_extra_facts({**_BALANCE, **_stray_fact("PaymentsForRepurchaseOfCommonStock")}, second=120)
+    assert tolerating.tolerated_stray_points and len(tolerating.rows) == 1
+    drifted = replace(tolerating, tolerated_stray_points=())
+    assert drifted == tolerating                                   # same identity: the dataclass cannot tell
+    with pytest.raises(ValueError, match="tolerance metadata"):
+        write_snapshot(engine, drifted)
+    assert stored(engine) == before                                # the owned dividends row survives
+    assert write_snapshot(engine, tolerating)["status"] == "rejected_stray_would_remove_rows"
+    assert stored(engine) == before

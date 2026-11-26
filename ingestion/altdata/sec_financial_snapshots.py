@@ -26,6 +26,10 @@ MAX_SOURCE_BYTES = 32 * 1024 * 1024
 # within this many days of the capture, or after it, is a current or forward
 # period that would be silently dropped, and stays fatal.
 LEGACY_ENTRY_HORIZON_DAYS = 730
+# A filing's report-period end must be recent relative to the filing itself (10-Q/10-K/20-F/40-F
+# deadlines, with room for extensions); an older "latest" balance-sheet date means the current
+# period's balance sheet is absent and the date is a prior-year comparative.
+REPORT_END_MAX_AGE_DAYS = 150
 # Balance-sheet instants whose latest `end` in a filing is that filing's report-period end.
 _BALANCE_SHEET_TAGS: dict[str, frozenset[str]] = {
     'us-gaap': frozenset({'Assets', 'LiabilitiesAndStockholdersEquity'}),
@@ -161,7 +165,7 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
     unusable: list[tuple[str, str, date, str, bool]] = []            # (taxonomy, tag, end, accn, is_stray_point)
     qualifying_ends_all: set[date] = set()                           # ends of entries the normalizer accepts
     qualifying_ends_by_accn: dict[str, set[date]] = {}
-    report_end_by_accn: dict[str, date] = {}                         # the filing's period end, from its balance sheet
+    report_end_by_accn: dict[str, tuple[date, date]] = {}            # accn -> (period end, filed) from its balance sheet
     for taxonomy in ('us-gaap', 'ifrs-full'):
         namespace = facts.get(taxonomy, {})
         if not isinstance(namespace, dict):
@@ -204,7 +208,8 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                             qualifying_ends_by_accn.setdefault(str(entry['accn']), set()).add(end)
                     elif start is None and tag_name in _BALANCE_SHEET_TAGS[taxonomy] and filed >= end:
                         accn = str(entry['accn'])
-                        report_end_by_accn[accn] = max(end, report_end_by_accn.get(accn, end))
+                        if accn not in report_end_by_accn or end > report_end_by_accn[accn][0]:
+                            report_end_by_accn[accn] = (end, filed)
     capture_day = received.date()
     tolerated_points: list[tuple[str, str, str]] = []
     for taxonomy, tag_name, end, accn, is_stray_point in unusable:
@@ -222,8 +227,12 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
         #  (3) the point's end is not R and not the end of any qualifying flow.
         # Real shapes: a one-day debt issuance, share issuance or buyback in a notes
         # disclosure (2026-11-26: INTC, EOG, ON, WLK, DHI, RPD, NXE, each refused for one).
-        report_end = report_end_by_accn.get(accn)
+        report_end, filed_at = report_end_by_accn.get(accn, (None, None))
+        # (1b) the latest balance-sheet date must itself be a plausible report-period end for
+        # this filing: not after it was filed and at most REPORT_END_MAX_AGE_DAYS before it,
+        # else the current balance sheet is absent and the date is a prior-year comparative.
         if (is_stray_point and report_end is not None
+                and 0 <= (filed_at - report_end).days <= REPORT_END_MAX_AGE_DAYS
                 and report_end in qualifying_ends_by_accn.get(accn, ())
                 and end != report_end and end not in qualifying_ends_all):
             tolerated_points.append((tag_name, end.isoformat(), accn))
@@ -256,6 +265,11 @@ def validate_snapshot(snapshot: FinancialSnapshot) -> None:
                                 received_at=snapshot.received_at, fx_rates=json.loads(snapshot.fx_json))
     if expected != snapshot:
         raise ValueError("Snapshot content or normalization identity mismatch")
+    # These fields are outside the identity (compare=False) but drive write-boundary
+    # decisions (the stray-tolerance guard), so the replay must reproduce them exactly.
+    if (expected.tolerated_stray_points != snapshot.tolerated_stray_points
+            or expected.tolerated_legacy_entries != snapshot.tolerated_legacy_entries):
+        raise ValueError("Snapshot tolerance metadata does not match the replayed admission")
 
 
 def build_reconciliation_manifest(snapshot: FinancialSnapshot,

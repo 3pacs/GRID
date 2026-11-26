@@ -497,3 +497,50 @@ def test_the_wolf_and_ee_shapes_stay_refused():
     ee['facts']['us-gaap']['ProceedsFromIssuanceOfCommonStock'] = _stray('2025-07-27')
     with pytest.raises(ValueError, match='duration'):
         prepared(ee)
+
+
+def test_a_prior_year_balance_sheet_is_not_the_report_period_end():
+    """Codex 6081419580 (1): the filing (filed 2026-08-26) carries only the prior-year Assets instant and
+    prior-year qualifying Revenue; its 2026 Revenue is start-less. The latest balance-sheet date is 395
+    days before the filing, so it is a comparative, not the report-period end: nothing is tolerated."""
+    data = {'cik': 1045810, 'entityName': 'NVIDIA CORP', 'facts': {'us-gaap': {
+        'Revenues': {'units': {'USD': [
+            dict(start='2025-04-28', end='2025-07-27', val=1, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2'),
+            dict(end='2026-07-26', val=96_221_000_000, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2')]}},
+        'Assets': {'units': {'USD': [dict(end='2025-07-27', val=1, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2')]}}}}}
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+    data['facts']['us-gaap']['Revenues']['units']['USD'].pop()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2026-06-15')       # an event-shaped point beside it
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)
+
+
+@pytest.mark.parametrize('age_days, refused', [(0, False), (31, False), (150, False), (151, True), (395, True)])
+def test_the_report_end_must_be_within_the_filing_age_bound(age_days, refused):
+    from datetime import date
+    filed = date(2026, 8, 26)
+    r = filed - timedelta(days=age_days)
+    data = {'cik': 1045810, 'entityName': 'NVIDIA CORP', 'facts': {'us-gaap': {
+        'Revenues': {'units': {'USD': [dict(start=(r - timedelta(days=89)).isoformat(), end=r.isoformat(), val=96_221_000_000,
+                                            accn=OWN, filed=filed.isoformat(), form='10-Q', fp='Q2')]}},
+        'Assets': {'units': {'USD': [dict(end=r.isoformat(), val=1, accn=OWN, filed=filed.isoformat(), form='10-Q', fp='Q2')]}},
+        'PaymentsOfDividends': _stray((r - timedelta(days=40)).isoformat())}}}
+    if refused:
+        with pytest.raises(ValueError, match='duration'):
+            prepared(data)
+    else:
+        assert len(prepared(data).tolerated_stray_points) == 1
+
+
+def test_tolerance_metadata_cannot_be_dropped_without_failing_the_replay():
+    """Codex 6081419580 (2): tolerated_stray_points is outside the identity but drives the writer's
+    guard, so a snapshot with it removed (same source bytes, same identity) must fail validation."""
+    from dataclasses import replace
+    s = prepared(_stray_payload())
+    assert s.tolerated_stray_points
+    for tampered in (replace(s, tolerated_stray_points=()), replace(s, tolerated_legacy_entries=0),
+                     replace(s, tolerated_stray_points=(('PaymentsOfDividends', '2026-06-16', OWN),))):
+        with pytest.raises(ValueError, match='tolerance metadata|identity mismatch'):
+            validate_snapshot(tampered)
+    validate_snapshot(s)
