@@ -115,7 +115,7 @@ describe('LessonsWidget', () => {
         // sat above "No post-mortem lessons" because the object shape normalized to [].
         api.getPostmortemLessons.mockResolvedValue({
             lessons: {
-                text: '- Cover the puts before earnings.\n- Avoid Friday OPEX bull runs.',
+                text: 'Cover the puts before earnings.\nAvoid Friday OPEX bull runs.',
                 count: 5,
                 label: 'LLM summary of 5 postmortems dated 2026-11-26',
             },
@@ -126,9 +126,38 @@ describe('LessonsWidget', () => {
 
         render(<LessonsWidget />);
 
-        expect(await screen.findByText('Cover the puts before earnings.')).toBeInTheDocument();
-        expect(screen.getByText('Avoid Friday OPEX bull runs.')).toBeInTheDocument();
+        const report = await screen.findByTestId('lessons-report');
+        expect(report).toHaveTextContent('Cover the puts before earnings.');
+        expect(report).toHaveTextContent('Avoid Friday OPEX bull runs.');
         expect(screen.queryByText(/No post-mortem lessons/i)).not.toBeInTheDocument();
+    });
+
+    it('shows the whole multi-section text report, not its first n lines (#959)', async () => {
+        // Measured on the served build 2026-11-26 (c6cdc663): the report was split into
+        // lines and capped at n=5, so only the ruler lines, the title and the first two
+        // stats showed and every section after them was cut off.
+        const text = [
+            '='.repeat(60), '  GRID Post-Mortem — Lessons Learned', '='.repeat(60), '',
+            'Failures analysed: 5', 'Average return:    -8.00%', '',
+            '-- Failure Category Breakdown --', '  wrong_signal                          3  (60%)', '',
+            '-- Most Affected Tickers --', '  ACME      2 failures', '',
+            '-- Recommendations --', '  [!] >40% of failures are wrong signals — review scanner signal quality.',
+        ].join('\n');
+        api.getPostmortemLessons.mockResolvedValue({
+            lessons: { text, count: 5, label: 'Rule-based summary of 5 postmortems' },
+            generated_at: new Date().toISOString(), label: 'Rule-based summary of 5 postmortems',
+        });
+
+        render(<LessonsWidget />);
+
+        const report = await screen.findByTestId('lessons-report');
+        expect(report).toHaveTextContent('-- Failure Category Breakdown --');
+        expect(report).toHaveTextContent('wrong_signal');
+        expect(report).toHaveTextContent('-- Most Affected Tickers --');
+        expect(report).toHaveTextContent('-- Recommendations --');
+        expect(report).toHaveTextContent('review scanner signal quality');
+        // Layout is kept as written (columns, indents), not reflowed into bullets.
+        expect(report.textContent).toBe(text);
     });
 
     it('still reads an empty window as empty when the object says count 0 (#959)', async () => {
@@ -159,18 +188,18 @@ describe('LessonsWidget', () => {
             .toBeInTheDocument();
     });
 
-    it('tolerates a legacy LLM blob (string lessons) by splitting into bullets', async () => {
+    it('tolerates a legacy text blob (string lessons) and shows it whole', async () => {
         api.getPostmortemLessons.mockResolvedValue({
-            lessons: '- First bullet\n- Second bullet\n* Third bullet',
+            lessons: '- First bullet\n- Second bullet\n* Third bullet\n- Fourth\n- Fifth\n- Sixth bullet',
             generated_at: null,
         });
 
         render(<LessonsWidget />);
 
-        await waitFor(() => {
-            expect(screen.getByText('First bullet')).toBeInTheDocument();
-        });
-        expect(screen.getByText('Second bullet')).toBeInTheDocument();
-        expect(screen.getByText('Third bullet')).toBeInTheDocument();
+        const report = await screen.findByTestId('lessons-report');
+        expect(report).toHaveTextContent('First bullet');
+        expect(report).toHaveTextContent('Third bullet');
+        // Past the old n=5 cap.
+        expect(report).toHaveTextContent('Sixth bullet');
     });
 });

@@ -35,37 +35,34 @@ function timeAgo(ts) {
     return `${Math.floor(hrs / 24)}d ago`;
 }
 
-function splitBlob(text) {
-    // Split an LLM text blob into bullets, permissively.
-    return text
-        .split(/\n+/)
-        .map(line => line.replace(/^\s*[-*•]\s*/, '').trim())
-        .filter(Boolean);
-}
-
 /**
- * Normalize the endpoint payload into an array of lesson strings.
+ * Normalize the endpoint payload into `{items, report}`.
  * The backend sends `lessons` as one of: an array of strings (older rows), a
- * string (legacy LLM blob), or an object `{text, count, label}` (the shape the
+ * string (legacy text blob), or an object `{text, count, label}` (the shape the
  * endpoint writes and returns today, with `count` the number of post-mortems
  * summarized; `{lessons: [...]}` inside the object is also tolerated).
- * An object with `count: 0` is an empty window, not a lesson to display.
+ * `items` are separate lessons to list; `report` is a multi-line text report
+ * (ruler lines, "-- Section --" headers, indented rows) that is shown whole, as
+ * written: splitting it into bullets and capping the list at `n` showed only
+ * its header lines. An object with `count: 0` is an empty window, not a lesson.
  */
 function normalizeLessons(payload) {
-    if (!payload || payload.error) return [];
+    const none = { items: [], report: null };
+    if (!payload || payload.error) return none;
     const raw = payload.lessons;
-    if (Array.isArray(raw)) return raw.filter(Boolean);
-    if (typeof raw === 'string' && raw.trim()) return splitBlob(raw);
+    if (Array.isArray(raw)) return { items: raw.filter(Boolean), report: null };
+    if (typeof raw === 'string' && raw.trim()) return { items: [], report: raw.trimEnd() };
     if (raw && typeof raw === 'object') {
-        if (Array.isArray(raw.lessons)) return raw.lessons.filter(Boolean);
-        if (raw.count === 0) return [];
-        if (typeof raw.text === 'string' && raw.text.trim()) return splitBlob(raw.text);
+        if (Array.isArray(raw.lessons)) return { items: raw.lessons.filter(Boolean), report: null };
+        if (raw.count === 0) return none;
+        if (typeof raw.text === 'string' && raw.text.trim()) return { items: [], report: raw.text.trimEnd() };
     }
-    return [];
+    return none;
 }
 
 export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMobile = false }) {
     const [lessons, setLessons] = useState([]);
+    const [report, setReport] = useState(null);
     const [generatedAt, setGeneratedAt] = useState(null);
     const [label, setLabel] = useState(null);
     const [note, setNote] = useState(null);
@@ -88,7 +85,9 @@ export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMo
                 // Show a friendly message instead of crashing.
                 setError(result.message || `Lessons unavailable (status ${result.status || '?'})`);
             } else {
-                setLessons(normalizeLessons(result));
+                const parsed = normalizeLessons(result);
+                setLessons(parsed.items);
+                setReport(parsed.report);
                 setGeneratedAt(result?.generated_at || null);
                 setLabel(result?.label || null);
                 setNote(result?.note || null);
@@ -124,7 +123,7 @@ export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMo
         fetchLessons(true);
     };
 
-    const showEmpty = !loading && !refreshing && !error && lessons.length === 0;
+    const showEmpty = !loading && !refreshing && !error && lessons.length === 0 && !report;
     const isBusy = loading || refreshing;
     const labelText = refreshing ? 'Regenerating... (~30s)' : 'Loading lessons...';
 
@@ -210,6 +209,13 @@ export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMo
                 }}>
                     No post-mortem lessons in the last {days} days.
                 </div>
+            ) : report ? (
+                <pre data-testid="lessons-report" style={{
+                    margin: 0, padding: '8px 10px', borderRadius: tokens.radius.sm,
+                    background: `${colors.accent}06`, borderLeft: `2px solid ${colors.accent}50`,
+                    fontFamily: MONO, fontSize: '11px', lineHeight: 1.5, color: colors.text,
+                    whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: '360px', overflowY: 'auto',
+                }}>{report}</pre>
             ) : (
                 <ul style={{
                     margin: 0, padding: 0, listStyle: 'none',
