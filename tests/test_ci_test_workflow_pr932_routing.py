@@ -80,7 +80,9 @@ PR932_CONJUNCTION = (
 
 HOSTED = "ubuntu-latest"
 SELF_HOSTED = ["self-hosted", "tests"]
-JOBS = ("backend-tests", "frontend-build", "lint")
+# backend-suite (the shards), backend-gates and backend-tests (the aggregate "Backend
+# Tests" check) share the one routing predicate; so do frontend-build and lint.
+JOBS = ("backend-suite", "backend-gates", "backend-tests", "frontend-build", "lint")
 
 
 def _templates(predicate: str) -> dict[str, str]:
@@ -364,10 +366,16 @@ def _strip(expr: str) -> str:
 
 
 def _step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
-    for step in workflow["jobs"]["backend-tests"]["steps"]:
-        if step.get("name") == name:
-            return step
-    raise AssertionError(f"step {name!r} not found")
+    """The step of that name; the database steps are identical in every job that has them."""
+    found = [
+        step
+        for job in ("backend-suite", "backend-gates")
+        for step in workflow["jobs"][job]["steps"]
+        if step.get("name") == name
+    ]
+    assert found, f"step {name!r} not found"
+    assert all(step == found[0] for step in found), f"step {name!r} differs between jobs"
+    return found[0]
 
 
 def routing(workflow: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
@@ -418,9 +426,9 @@ def test_predicate_bytes_are_the_candidate_templates(workflow: dict[str, Any]) -
     for job in JOBS:
         assert _strip(workflow["jobs"][job]["runs-on"]) == CANDIDATE["runs-on"], job
     text = WORKFLOW.read_text(encoding="utf-8")
-    assert text.count(PR932_CONJUNCTION) == 4
-    assert text.count(PRIOR_ALTERNATIVES) == 4
-    assert text.count(PR918_CONJUNCTION) == 4
+    assert text.count(PR932_CONJUNCTION) == 1 + len(JOBS)  # ON_SELF_HOSTED + one runs-on per job
+    assert text.count(PRIOR_ALTERNATIVES) == 1 + len(JOBS)
+    assert text.count(PR918_CONJUNCTION) == 1 + len(JOBS)
 
 
 def test_trigger_events_and_jobs_are_unchanged(workflow: dict[str, Any]) -> None:

@@ -18,6 +18,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from tests import ci_shard
+
 # Mirrors the DB_* defaults in config.Settings (config.py:46-50), so a plain
 # local `pytest` behaves exactly as it did before this was configurable.
 # Point the suite at a throwaway database by exporting GRID_TEST_DB_URL.
@@ -81,10 +83,39 @@ _DB_TOKENS = ("pg_engine", "live_engine", "get_engine(", "get_connection(")
 # ~91 s; on alien, which is ~2x slower per core, each is ~3 minutes of forced
 # serial time. Neither file touches a database or a module-scoped fixture, so
 # spreading them is safe.
+#
+# tests/test_e0_calibration.py: test_parameter_recovery (its module-scoped
+# `recovery` fixture, ~4 min on ubuntu-latest, is used by that one test only) and
+# test_no_db (~3 min) are the two longest tests in the suite and the rest of the
+# file is milliseconds. Grouped, the file kept one worker busy for ~7 min while
+# the others went idle; spread, the two run side by side.
 _SPREAD_FILES = frozenset({
     "tests/test_alpha_signals.py",
     "tests/test_gauntlet_determinism.py",
+    "tests/test_e0_calibration.py",
 })
+
+
+# ---------------------------------------------------------------------------
+# CI sharding
+# ---------------------------------------------------------------------------
+# With GRID_TEST_SHARD="<index>/<total>" set, this process collects only the
+# test files that tests/ci_shard.py assigns to that shard; every other test
+# file is neither imported nor run. Unset (every local run, and any job that
+# does not shard) nothing is skipped. The unit is the file, so the xdist
+# grouping below is unchanged inside a shard.
+def pytest_ignore_collect(collection_path, config):
+    spec = os.environ.get(ci_shard.SHARD_ENV)
+    if not spec:
+        return None
+    try:
+        index, total = ci_shard.parse_shard(spec)
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from None
+    if not collection_path.is_file() or not ci_shard.is_test_file(collection_path.name):
+        return None
+    rel = collection_path.relative_to(config.rootpath).as_posix()
+    return True if ci_shard.shard_of(rel, total) != index else None
 
 
 @lru_cache(maxsize=None)

@@ -36,13 +36,28 @@ env:
   ON_SELF_HOSTED: ${{ !((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && vars.TEST_RUNNER != '' }}
 
 jobs:
-  backend-tests:
-    name: Backend Tests
+  # The backend suite is one pytest run of ~29,000 tests plus ~65 PostgreSQL
+  # contract steps. As a single job it took 15-25 min on ubuntu-latest, against
+  # a 25 min limit. It is split along its natural seams and the three parts run
+  # at the same time:
+  #   backend-suite  the plain pytest run, in N shards (tests/ci_shard.py splits the
+  #                  test FILES by path hash; GRID_TEST_SHARD=<i>/<N>)
+  #   backend-gates  the "fails instead of skipping" PostgreSQL contracts, the E1
+  #                  integrity gates and the release witnesses: every step below
+  #                  "Run tests" in the old single job, unchanged
+  #   backend-tests  "Backend Tests": the one check name other tooling reads
+  #                  (evals/e3/gates.py); it passes only if every part passed
+
+  backend-suite:
+    name: Backend Tests shard ${{ matrix.shard }}
     runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
-    # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
-    # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
-    # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
-    timeout-minutes: 25
+    # A shard takes ~6-10 min on ubuntu-latest. The limit is 2x that, not the
+    # suite-wide 25 min it replaced: a hung shard should fail fast.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     steps:
       - uses: actions/checkout@v7
@@ -67,6 +82,18 @@ jobs:
             docker exec grid-test-pg pg_isready -U grid > /dev/null 2>&1 && break
             sleep 1
           done
+      # The suite, the PostgreSQL contracts and the other jobs of this workflow run
+      # at the same time. The hosted runner gives every job its own ephemeral
+      # container; the persistent PostgreSQL of a self-hosted `tests` runner is
+      # one database that the reset step below empties, so concurrent jobs would
+      # wipe each other's schema mid-run. Fail loudly instead (TEST_RUNNER is
+      # unset today); a self-hosted route needs one database per job first.
+      - name: Refuse concurrent jobs on one persistent PostgreSQL (self-hosted)
+        if: env.ON_SELF_HOSTED == 'true'
+        run: |
+          echo "::error::test.yml runs its backend jobs in parallel; a self-hosted runner shares one persistent PostgreSQL between them. Unset vars.TEST_RUNNER or give each job its own database."
+          exit 1
+
 
       - name: Reset persistent Postgres (self-hosted)
         if: env.ON_SELF_HOSTED == 'true'
@@ -81,6 +108,7 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov pytest-xdist
 
+
       - name: Run tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -92,7 +120,10 @@ jobs:
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
+          # This job's share of the test files (tests/ci_shard.py): "<index>/<total>".
+          GRID_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: |
+          echo "test shard ${GRID_TEST_SHARD}"
           set +e
           python -m pytest tests/ -v --tb=short --co -q > /tmp/grid-pytest-collection.txt 2>/tmp/grid-pytest-collection.err
           collection_status=$?
@@ -135,6 +166,66 @@ jobs:
           tail -300 /tmp/grid-pytest-output.txt
           echo "::endgroup::"
           exit "$pytest_status"
+
+
+      - name: Stop ephemeral Postgres (hosted runner)
+        if: always() && env.ON_SELF_HOSTED != 'true'
+        run: docker rm -f grid-test-pg 2>/dev/null || true
+
+  backend-gates:
+    name: Backend Gates (PostgreSQL contracts)
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
+      # Postgres container. Self-hosted `tests` runners keep a persistent
+      # PostgreSQL 15 + TimescaleDB service (see docs/SERVER-SERVICES.md)
+      # that the next step resets instead of pulling+starting a container.
+      - name: Start ephemeral Postgres (hosted runner)
+        if: env.ON_SELF_HOSTED != 'true'
+        run: |
+          docker run -d --name grid-test-pg \
+            -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
+            -p 5432:5432 postgres:15
+          for i in $(seq 1 30); do
+            docker exec grid-test-pg pg_isready -U grid > /dev/null 2>&1 && break
+            sleep 1
+          done
+      # The suite, the PostgreSQL contracts and the other jobs of this workflow run
+      # at the same time. The hosted runner gives every job its own ephemeral
+      # container; the persistent PostgreSQL of a self-hosted `tests` runner is
+      # one database that the reset step below empties, so concurrent jobs would
+      # wipe each other's schema mid-run. Fail loudly instead (TEST_RUNNER is
+      # unset today); a self-hosted route needs one database per job first.
+      - name: Refuse concurrent jobs on one persistent PostgreSQL (self-hosted)
+        if: env.ON_SELF_HOSTED == 'true'
+        run: |
+          echo "::error::test.yml runs its backend jobs in parallel; a self-hosted runner shares one persistent PostgreSQL between them. Unset vars.TEST_RUNNER or give each job its own database."
+          exit 1
+
+
+      - name: Reset persistent Postgres (self-hosted)
+        if: env.ON_SELF_HOSTED == 'true'
+        env:
+          PGPASSWORD: testpass
+        run: |
+          psql -h localhost -U grid -d griddb_test -c \
+            'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-xdist
+
 
       # #1352 Option B release witness (tests/test_1352_option_b_release_witness.py),
       # run on its own so this step's log keeps the full per-test report: the
@@ -1225,9 +1316,24 @@ jobs:
             echo "No SQL injection patterns detected"
           fi
 
+
       - name: Stop ephemeral Postgres (hosted runner)
         if: always() && env.ON_SELF_HOSTED != 'true'
         run: docker rm -f grid-test-pg 2>/dev/null || true
+
+  backend-tests:
+    name: Backend Tests
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
+    needs: [backend-suite, backend-gates]
+    if: ${{ always() }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Every backend part passed
+        run: |
+          echo "backend-suite: ${{ needs.backend-suite.result }}"
+          echo "backend-gates: ${{ needs.backend-gates.result }}"
+          [ "${{ needs.backend-suite.result }}" = success ] && [ "${{ needs.backend-gates.result }}" = success ]
 
   frontend-build:
     name: Frontend Build
