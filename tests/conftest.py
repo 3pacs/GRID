@@ -9,6 +9,7 @@ scheduling policy that keeps the suite correct when it runs in parallel.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, create_autospec
 
 import pandas as pd
@@ -42,8 +43,11 @@ def _db_url() -> str:
 # CI runs the suite as GRID_TEST_SHARD=i/n jobs, each with
 # `-n auto --dist loadgroup`. The policy lives in tests/ci_scheduling.py:
 #
-#   * a shard keeps only the test files it owns (every file goes to exactly
-#     one shard, so the shards together run the whole suite once);
+#   * a shard keeps only the test files it owns. Ownership comes from the
+#     checked-out tree, not from this runner's collection, and every shard
+#     writes a manifest (GRID_TEST_MANIFEST_DIR) of what it collected and
+#     ran, which the "Backend Tests" job checks for exhaustive, disjoint
+#     coverage;
 #   * tests that reach a live PostgreSQL share one "postgres" unit and run one
 #     after another on one worker -- they share a single database, write to
 #     the public schema, and do not roll back per test, so two workers running
@@ -67,6 +71,18 @@ def _is_xdist_loadgroup_worker(config) -> bool:
     return hasattr(config, "workerinput") and bool(getattr(config.option, "loadgroup", False))
 
 
+def _writes_manifest_collection(config) -> bool:
+    # One process per run records the collection: the only process without
+    # xdist, or worker gw0 under it (every worker collects the same suite).
+    worker = getattr(config, "workerinput", None)
+    return worker is None or worker.get("workerid") == "gw0"
+
+
+# Node ids that have run in this process (setup reports), recorded only where
+# reports arrive for every test: the xdist controller, or a plain run.
+_EXECUTED: set[str] = set()
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
     """Keep this shard's files (GRID_TEST_SHARD) and put heavy units first under loadgroup."""
@@ -76,14 +92,18 @@ def pytest_collection_modifyitems(config, items):
             index, total = _ci.parse_shard(shard)
         except ValueError as exc:
             raise pytest.UsageError(str(exc)) from exc
-        counts: dict[str, int] = {}
-        for item in items:
-            module = _ci.module_of(item.nodeid)
-            counts[module] = counts.get(module, 0) + 1
-        db_files = {m for m in counts if _ci.module_touches_db(str(config.rootpath / m))}
-        owner = _ci.assign_shards(_ci.file_weights(counts), db_files, total)
-        keep = [item for item in items if owner[_ci.module_of(item.nodeid)] == index]
-        dropped = [item for item in items if owner[_ci.module_of(item.nodeid)] != index]
+        manifest_dir = os.environ.get(_ci.MANIFEST_ENV, "").strip()
+        if manifest_dir and _writes_manifest_collection(config):
+            directory = Path(manifest_dir)
+            _ci.write_manifest_lines(directory, _ci.MANIFEST_SHARD, [f"{index}/{total}"])
+            _ci.write_manifest_lines(directory, _ci.MANIFEST_COLLECTED, (_ci.node_key(i.nodeid) for i in items))
+        assignment = _ci.tree_assignment(Path(config.rootpath), total)
+        owned = {
+            module: _ci.shard_of(module, assignment, total) == index
+            for module in {_ci.module_of(item.nodeid) for item in items}
+        }
+        keep = [item for item in items if owned[_ci.module_of(item.nodeid)]]
+        dropped = [item for item in items if not owned[_ci.module_of(item.nodeid)]]
         if dropped:
             config.hook.pytest_deselected(items=dropped)
             items[:] = keep
@@ -95,6 +115,25 @@ def pytest_collection_modifyitems(config, items):
             _ci.module_of(item.nodeid),
             _ci.module_touches_db(str(config.rootpath / _ci.module_of(item.nodeid))),
         ))
+
+
+def pytest_runtest_logreport(report):
+    if report.when == "setup" and os.environ.get(_ci.MANIFEST_ENV, "").strip():
+        _EXECUTED.add(_ci.node_key(report.nodeid))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Write the executed node ids of a sharded run (GRID_TEST_MANIFEST_DIR)."""
+    manifest_dir = os.environ.get(_ci.MANIFEST_ENV, "").strip()
+    config = session.config
+    if (
+        not manifest_dir
+        or not os.environ.get(_ci.SHARD_ENV, "").strip()
+        or hasattr(config, "workerinput")   # workers see only their own tests
+        or config.option.collectonly        # the --co pass runs nothing
+    ):
+        return
+    _ci.write_manifest_lines(Path(manifest_dir), _ci.MANIFEST_EXECUTED, _EXECUTED)
 
 
 @pytest.hookimpl(optionalhook=True, tryfirst=True)

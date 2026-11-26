@@ -40,21 +40,21 @@ jobs:
   # each on its own runner with its own ephemeral Postgres. Run on one 4-vCPU
   # ubuntu-latest job, the suite (29,066 tests on 2026-11-26) took 15-19 min
   # of pytest and brought the job to 24m31s against its 25-minute timeout.
-  # tests/ci_scheduling.py assigns the files (a partition: each test runs in
-  # exactly one shard) and orders the xdist units inside each shard. To add a
-  # shard, extend the matrix and the /2 in GRID_TEST_SHARD together
+  # tests/ci_scheduling.py assigns each test file to one shard from the
+  # checked-out tree (never from what a runner collected) and orders the xdist
+  # units inside each shard. Every shard uploads a manifest of the node ids it
+  # collected and ran; the "Backend Tests" job below fails unless together
+  # they ran every collected test exactly once. To add a shard, change the
+  # matrix, the /2 in GRID_TEST_SHARD and `verify --shards 2` together
   # (tests/test_ci_scheduling.py checks they agree).
   #
-  # Self-hosted `tests` runners on one host share that host's persistent
-  # griddb_test, so two shards there would reset each other's schema. Before
-  # setting TEST_RUNNER again, give each runner its own database (see
-  # docs/SERVER-SERVICES.md, "Alien Runner").
+  # Always hosted, whatever TEST_RUNNER says: self-hosted `tests` runners on one
+  # host share that host's persistent griddb_test, and two shards there would
+  # reset and write the same database at once. Each hosted shard gets its own
+  # VM and its own ephemeral Postgres.
   backend-tests-suite:
     name: Backend Tests suite (${{ matrix.shard }}/2)
-    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
-    # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
-    # whole suite took ~14.5 min there and TestGauntlet::test_run_gauntlet alone
-    # ~90 s, so both timeouts need headroom (measured 2026-09-11).
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       # every shard reports its own failures; one failing must not cancel the other
@@ -71,12 +71,8 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
-      # Postgres container. Self-hosted `tests` runners keep a persistent
-      # PostgreSQL 15 + TimescaleDB service (see docs/SERVER-SERVICES.md)
-      # that the next step resets instead of pulling+starting a container.
-      - name: Start ephemeral Postgres (hosted runner)
-        if: env.ON_SELF_HOSTED != 'true'
+      # One ephemeral Postgres per shard VM (this job is always hosted).
+      - name: Start ephemeral Postgres
         run: |
           docker run -d --name grid-test-pg \
             -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
@@ -85,14 +81,6 @@ jobs:
             docker exec grid-test-pg pg_isready -U grid > /dev/null 2>&1 && break
             sleep 1
           done
-
-      - name: Reset persistent Postgres (self-hosted)
-        if: env.ON_SELF_HOSTED == 'true'
-        env:
-          PGPASSWORD: testpass
-        run: |
-          psql -h localhost -U grid -d griddb_test -c \
-            'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'
 
       - name: Install dependencies
         run: |
@@ -113,6 +101,8 @@ jobs:
           # This job's share of the suite (tests/ci_scheduling.py): whole files,
           # every collected file in exactly one shard.
           GRID_TEST_SHARD: ${{ matrix.shard }}/2
+          # shard.txt, collected.txt (before the shard filter), executed.txt
+          GRID_TEST_MANIFEST_DIR: /tmp/grid-suite-manifest
         run: |
           echo "shard ${GRID_TEST_SHARD} on $(nproc) vCPU: $(lscpu | sed -n 's/^Model name: *//p')"
           set +e
@@ -175,8 +165,17 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
-      - name: Stop ephemeral Postgres (hosted runner)
-        if: always() && env.ON_SELF_HOSTED != 'true'
+      - name: Upload shard manifest
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-suite-manifest-${{ matrix.shard }}
+          path: /tmp/grid-suite-manifest
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Stop ephemeral Postgres
+        if: always()
         run: docker rm -f grid-test-pg 2>/dev/null || true
 
   backend-tests:
@@ -194,7 +193,8 @@ jobs:
       # The main suite runs in backend-tests-suite (above). This job keeps the
       # "Backend Tests" check name that evals/e3/gates.py (MANDATORY_CI) and the
       # #1352 release check read: it runs after every shard and fails unless all
-      # of them passed, then runs the #1352 witness and the PostgreSQL contracts.
+      # of them passed and their manifests show each collected test ran exactly
+      # once; then it runs the #1352 witness and the PostgreSQL contracts.
       - name: Main suite shards passed
         env:
           SUITE_RESULT: ${{ needs.backend-tests-suite.result }}
@@ -212,6 +212,18 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+
+      # Proof, not assumption, that the shards partitioned the suite: every
+      # shard ran, all collected the same node ids, none ran twice, none was
+      # missed (tests/ci_scheduling.py, verify_manifests). Standard library only.
+      - name: Download suite shard manifests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: backend-suite-manifest-*
+          path: /tmp/grid-suite-manifests
+
+      - name: Suite shards ran every collected test exactly once
+        run: python -m tests.ci_scheduling verify --shards 2 /tmp/grid-suite-manifests/backend-suite-manifest-*
 
       # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
       # Postgres container. Self-hosted `tests` runners keep a persistent

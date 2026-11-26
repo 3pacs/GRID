@@ -15,11 +15,11 @@ that:
   branch or event; an ordinary other PR; pushes) routes exactly as the
   predicate without the #932 disjunct did -- the prior alternatives (push to
   main, #543, #857, #806) and the ordinary self-hosted path are untouched;
-* the five expressions (``env.ON_SELF_HOSTED`` and the four ``runs-on``)
+* the four expressions (``env.ON_SELF_HOSTED`` and the three ``runs-on``)
   carry byte-identical predicates and the trigger events are unchanged;
-* both jobs that start a database (``backend-tests-suite``, the sharded main
-  suite, and ``backend-tests``) pick the ephemeral or persistent Postgres the
-  same way.
+* ``backend-tests-suite`` (the sharded main suite) takes no part in the
+  routing: it is always hosted with its own ephemeral Postgres, because two
+  shards on one self-hosted host would share its persistent database.
 
 The evaluator follows the documented semantics: ``&&``/``||`` return an
 operand (not a boolean), ``!`` negates truthiness (``null``, ``false``, ``0``
@@ -83,10 +83,9 @@ PR932_CONJUNCTION = (
 
 HOSTED = "ubuntu-latest"
 SELF_HOSTED = ["self-hosted", "tests"]
-# backend-tests-suite runs the main suite in shards; backend-tests runs after it.
-JOBS = ("backend-tests-suite", "backend-tests", "frontend-build", "lint")
-# The jobs that bring up a database, each with the same two steps.
-DB_JOBS = ("backend-tests-suite", "backend-tests")
+JOBS = ("backend-tests", "frontend-build", "lint")
+# Every job in file order; the suite shards are pinned to hosted runners.
+ALL_JOBS = ("backend-tests-suite", "backend-tests", "frontend-build", "lint")
 
 
 def _templates(predicate: str) -> dict[str, str]:
@@ -369,8 +368,8 @@ def _strip(expr: str) -> str:
     return expr[3:-2].strip()
 
 
-def _step(workflow: dict[str, Any], name: str, job: str = "backend-tests") -> dict[str, Any]:
-    for step in workflow["jobs"][job]["steps"]:
+def _step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
+    for step in workflow["jobs"]["backend-tests"]["steps"]:
         if step.get("name") == name:
             return step
     raise AssertionError(f"step {name!r} not found")
@@ -381,21 +380,13 @@ def routing(workflow: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     on_self_hosted = evaluate(workflow["env"]["ON_SELF_HOSTED"], ctx)
     assert isinstance(on_self_hosted, bool)
     step_ctx = dict(ctx, env={"ON_SELF_HOSTED": "true" if on_self_hosted else "false"})
-    decisions = {
-        job: (
-            bool(evaluate(_step(workflow, "Start ephemeral Postgres (hosted runner)", job)["if"], step_ctx)),
-            bool(evaluate(_step(workflow, "Reset persistent Postgres (self-hosted)", job)["if"], step_ctx)),
-        )
-        for job in DB_JOBS
-    }
-    # every database job decides the same way, so one answer describes them all
-    assert len(set(decisions.values())) == 1, decisions
-    ephemeral, reset = decisions["backend-tests"]
+    ephemeral = _step(workflow, "Start ephemeral Postgres (hosted runner)")
+    reset = _step(workflow, "Reset persistent Postgres (self-hosted)")
     return {
         "ON_SELF_HOSTED": on_self_hosted,
         "runs-on": {job: evaluate(workflow["jobs"][job]["runs-on"], ctx) for job in JOBS},
-        "ephemeral_postgres": ephemeral,
-        "persistent_reset": reset,
+        "ephemeral_postgres": bool(evaluate(ephemeral["if"], step_ctx)),
+        "persistent_reset": bool(evaluate(reset["if"], step_ctx)),
     }
 
 
@@ -432,20 +423,18 @@ def test_predicate_bytes_are_the_candidate_templates(workflow: dict[str, Any]) -
     for job in JOBS:
         assert _strip(workflow["jobs"][job]["runs-on"]) == CANDIDATE["runs-on"], job
     text = WORKFLOW.read_text(encoding="utf-8")
-    # env.ON_SELF_HOSTED plus one runs-on per job
-    assert text.count(PR932_CONJUNCTION) == 1 + len(JOBS)
-    assert text.count(PRIOR_ALTERNATIVES) == 1 + len(JOBS)
-    assert text.count(PR918_CONJUNCTION) == 1 + len(JOBS)
+    assert text.count(PR932_CONJUNCTION) == 4
+    assert text.count(PRIOR_ALTERNATIVES) == 4
+    assert text.count(PR918_CONJUNCTION) == 4
 
 
 def test_trigger_events_and_jobs_are_unchanged(workflow: dict[str, Any]) -> None:
     on = workflow.get("on", workflow.get(True))
     assert on == {"push": {"branches": ["main", "develop"]}, "pull_request": {"branches": ["main"]}}
-    assert tuple(workflow["jobs"]) == JOBS
-    for job in DB_JOBS:
-        assert _step(workflow, "Start ephemeral Postgres (hosted runner)", job)["if"] == "env.ON_SELF_HOSTED != 'true'"
-        assert _step(workflow, "Reset persistent Postgres (self-hosted)", job)["if"] == "env.ON_SELF_HOSTED == 'true'"
-        assert "DROP SCHEMA IF EXISTS public CASCADE" in _step(workflow, "Reset persistent Postgres (self-hosted)", job)["run"]
+    assert tuple(workflow["jobs"]) == ALL_JOBS
+    assert _step(workflow, "Start ephemeral Postgres (hosted runner)")["if"] == "env.ON_SELF_HOSTED != 'true'"
+    assert _step(workflow, "Reset persistent Postgres (self-hosted)")["if"] == "env.ON_SELF_HOSTED == 'true'"
+    assert "DROP SCHEMA IF EXISTS public CASCADE" in _step(workflow, "Reset persistent Postgres (self-hosted)")["run"]
 
 
 # --------------------------------------------------------------------------
@@ -522,3 +511,16 @@ def test_evaluator_semantics() -> None:
     assert evaluate("env.ON_SELF_HOSTED != 'true'", {"env": {"ON_SELF_HOSTED": "false"}}) is True
     with pytest.raises(ValueError):
         evaluate("github.ref == 'a' ?? 1", {})
+
+
+def test_suite_shards_are_always_hosted_with_their_own_postgres(workflow: dict[str, Any]) -> None:
+    """TEST_RUNNER never routes the shards: no self-hosted path, so no shared persistent database."""
+    job = workflow["jobs"]["backend-tests-suite"]
+    assert job["runs-on"] == HOSTED
+    names = [step.get("name") for step in job["steps"]]
+    assert "Reset persistent Postgres (self-hosted)" not in names
+    start = next(step for step in job["steps"] if step.get("name") == "Start ephemeral Postgres")
+    assert "if" not in start
+    assert "docker run -d --name grid-test-pg" in start["run"]
+    # and nothing else in the job is conditioned on the self-hosted switch
+    assert "ON_SELF_HOSTED" not in yaml.safe_dump(job)

@@ -415,13 +415,14 @@ jobs fall back to `ubuntu-latest` so CI never blocks on a runner host being
 offline. Every `tests` runner must provide the same persistent Postgres
 contract (PostgreSQL 15 + TimescaleDB, `grid`/`testpass`, `griddb_test`, UTC).
 
-**Shards share a host's database.** Since 2026-11-26 the main suite runs as
+**The suite shards never run here.** Since 2026-11-26 the main suite runs as
 two `Backend Tests suite (n/2)` jobs at the same time (`backend-tests-suite`
-in `test.yml`, split by `tests/ci_scheduling.py`). On hosted runners each
-shard has its own VM and Postgres container. Self-hosted, both shards can
-land on one host (alien runs three `tests` runners) and would reset and write
-the same `griddb_test` at once. Before setting `TEST_RUNNER` again, give each
-runner its own database (or one `tests` runner per host).
+in `test.yml`, split by `tests/ci_scheduling.py`). That job is pinned to
+`ubuntu-latest` whatever `TEST_RUNNER` says: on one self-hosted host both
+shards would reset and write the same `griddb_test` at once (alien runs three
+`tests` runners). `TEST_RUNNER` still routes Backend Tests (the PostgreSQL
+contracts and the #1352 witness), Frontend Build and Lint. Letting the
+shards onto self-hosted runners would first need one database per runner.
 
 
 ### Where it actually lives (verified 2026-09-11)

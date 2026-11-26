@@ -25,6 +25,15 @@ REPO = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests call the conftest hooks directly. In a CI shard GRID_TEST_MANIFEST_DIR
+    points at that shard's real manifest, which they must never write; and the
+    recorded node ids of the real run must not pick up the fake ones."""
+    monkeypatch.delenv(ci.MANIFEST_ENV, raising=False)
+    monkeypatch.setattr(conftest, "_EXECUTED", set())
+
+
 # --------------------------------------------------------------------------
 # parse_shard
 # --------------------------------------------------------------------------
@@ -239,6 +248,205 @@ def test_scheduler_hook_only_replaces_loadgroup() -> None:
     assert conftest.pytest_xdist_make_scheduler(SimpleNamespace(getvalue={"dist": "load"}.__getitem__), None) is None
 
 
+def _items(counts: dict[str, int]) -> list[SimpleNamespace]:
+    return [SimpleNamespace(nodeid=f"{module}::test_{k}") for module, k_max in counts.items() for k in range(k_max)]
+
+
+def test_runners_that_collect_differently_still_agree_on_every_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Codex review 6070328480's control: shard 1 collects A=1/B=1/C=1, shard 2 collects A=1/B=2/C=1.
+
+    Weighing the partition by each runner's own counts let A and C run twice
+    and B never. Ownership now comes from the tree, so each file still has
+    exactly one owner. A file outside the tree is placed by a hash of its path.
+    """
+    files = sorted(p.relative_to(REPO).as_posix() for p in (REPO / "tests").glob("test_*.py"))
+    a, b, c = files[0], files[len(files) // 2], files[-1]
+    outside = "tests/not_on_disk/test_virtual.py"
+    collections = {1: {a: 1, b: 1, c: 1, outside: 1}, 2: {a: 1, b: 2, c: 1, outside: 3}}
+    for total in (2, 3):
+        owners: dict[str, list[int]] = {}
+        for index in range(1, total + 1):
+            monkeypatch.setenv(ci.SHARD_ENV, f"{index}/{total}")
+            items = _items(collections[1 if index == 1 else 2])
+            conftest.pytest_collection_modifyitems(_config(), items)
+            for module in {ci.module_of(i.nodeid) for i in items}:
+                owners.setdefault(module, []).append(index)
+        assert owners.keys() == {a, b, c, outside}
+        assert all(len(shards) == 1 for shards in owners.values()), owners
+
+
+def test_conftest_writes_the_collected_and_executed_manifests(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(ci.SHARD_ENV, "2/2")
+    monkeypatch.setenv(ci.MANIFEST_ENV, str(tmp_path))
+    items = _collection()
+    every = sorted(i.nodeid for i in items)
+    conftest.pytest_collection_modifyitems(_config(), items)
+    assert (tmp_path / ci.MANIFEST_SHARD).read_text() == "2/2\n"
+    # collected = the whole suite this runner saw, before the shard filter
+    assert (tmp_path / ci.MANIFEST_COLLECTED).read_text().splitlines() == every
+
+    for item in items:
+        for when in ("setup", "call", "teardown"):
+            conftest.pytest_runtest_logreport(SimpleNamespace(nodeid=item.nodeid, when=when))
+    conftest.pytest_runtest_logreport(SimpleNamespace(nodeid=f"{items[0].nodeid}@postgres", when="setup"))
+    session = SimpleNamespace(config=SimpleNamespace(option=SimpleNamespace(collectonly=False)))
+    conftest.pytest_sessionfinish(session, 0)
+    assert (tmp_path / ci.MANIFEST_EXECUTED).read_text().splitlines() == sorted(i.nodeid for i in items)
+
+
+@pytest.mark.parametrize("worker,collectonly", [(True, False), (False, True)])
+def test_workers_and_the_collect_only_pass_write_no_executed_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, worker: bool, collectonly: bool,
+) -> None:
+    monkeypatch.setenv(ci.SHARD_ENV, "1/2")
+    monkeypatch.setenv(ci.MANIFEST_ENV, str(tmp_path))
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=collectonly))
+    if worker:
+        config.workerinput = {"workerid": "gw0"}
+    conftest.pytest_sessionfinish(SimpleNamespace(config=config), 0)
+    assert not (tmp_path / ci.MANIFEST_EXECUTED).exists()
+
+
+def test_only_worker_gw0_records_the_collection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(ci.SHARD_ENV, "1/2")
+    monkeypatch.setenv(ci.MANIFEST_ENV, str(tmp_path))
+    gw1 = _config(worker=True)
+    gw1.workerinput = {"workerid": "gw1"}
+    conftest.pytest_collection_modifyitems(gw1, _collection())
+    assert not (tmp_path / ci.MANIFEST_COLLECTED).exists()
+    gw0 = _config(worker=True)
+    gw0.workerinput = {"workerid": "gw0"}
+    conftest.pytest_collection_modifyitems(gw0, _collection())
+    assert (tmp_path / ci.MANIFEST_COLLECTED).exists()
+
+
+# --------------------------------------------------------------------------
+# tree_assignment: ownership from the checked-out tree
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("total", [2, 3])
+def test_tree_assignment_owns_every_test_file_on_disk_once(total: int) -> None:
+    files = ci.tree_test_files(REPO)
+    assert "tests/test_ci_scheduling.py" in files and all(f.startswith("tests/") for f in files)
+    owner = ci.tree_assignment(REPO, total)
+    assert set(owner) == set(files)
+    assert set(owner.values()) == set(range(1, total + 1))
+
+
+def test_tree_assignment_reads_only_the_tree(tmp_path: Path) -> None:
+    for rel, body in {
+        "tests/test_a.py": "def test_1():\n    pass\ndef test_2():\n    pass\n",
+        "tests/sub/test_b.py": "async def test_x():\n    pass\n",
+        "tests/sub/c_test.py": "class T:\n    def test_y(self):\n        pass\n",
+        "tests/helpers.py": "def test_not_a_test_file():\n    pass\n",
+    }.items():
+        _write(tmp_path, rel, body)
+    assert ci.tree_test_files(tmp_path) == ["tests/sub/c_test.py", "tests/sub/test_b.py", "tests/test_a.py"]
+    assert ci.source_test_count(tmp_path / "tests/test_a.py") == 2
+    assert ci.source_test_count(tmp_path / "tests/helpers_missing.py") == 1
+    first = ci.tree_assignment(tmp_path, 2)
+    ci.tree_assignment.cache_clear()
+    assert ci.tree_assignment(tmp_path, 2) == first
+
+
+def test_shard_of_falls_back_to_a_stable_hash_off_the_tree() -> None:
+    owner = {"tests/test_a.py": 2}
+    assert ci.shard_of("tests/test_a.py", owner, 2) == 2
+    off_tree = [ci.shard_of(f"tests/gen/test_{k}.py", owner, 3) for k in range(30)]
+    assert off_tree == [ci.shard_of(f"tests/gen/test_{k}.py", {}, 3) for k in range(30)]
+    assert set(off_tree) <= {1, 2, 3} and len(set(off_tree)) > 1
+
+
+# --------------------------------------------------------------------------
+# verify_manifests: the gate's coverage proof
+# --------------------------------------------------------------------------
+
+
+def _manifest(root: Path, name: str, shard: str, collected: list[str], executed: list[str]) -> Path:
+    directory = root / name
+    ci.write_manifest_lines(directory, ci.MANIFEST_SHARD, [shard])
+    ci.write_manifest_lines(directory, ci.MANIFEST_COLLECTED, collected)
+    ci.write_manifest_lines(directory, ci.MANIFEST_EXECUTED, executed)
+    return directory
+
+
+SUITE = ["tests/test_a.py::t1", "tests/test_a.py::t2", "tests/test_b.py::t1", "tests/test_c.py::t1"]
+
+
+def test_verify_accepts_an_exhaustive_disjoint_split(tmp_path: Path) -> None:
+    dirs = [
+        _manifest(tmp_path, "m1", "1/2", SUITE, SUITE[:2]),
+        _manifest(tmp_path, "m2", "2/2", SUITE, SUITE[2:]),
+    ]
+    problems, summary = ci.verify_manifests(dirs, 2)
+    assert problems == []
+    assert "4 distinct ran, 4 collected" in summary
+    assert ci.main(["verify", "--shards", "2", *map(str, dirs)]) == 0
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("missed", "ran in no shard"),
+    ("twice", "ran in shard 1 and shard 2"),
+    ("different suite", "collected a different suite"),
+    ("extra", "ran that no shard collected"),
+    ("same shard twice", "appears twice"),
+    ("wrong total", "expected one of 2"),
+    ("one shard only", "no manifest for shard(s) [2]"),
+    ("unreadable", "unreadable manifest"),
+])
+def test_verify_rejects_every_broken_split(tmp_path: Path, case: str, expected: str) -> None:
+    one = (SUITE, SUITE[:2])
+    two = (SUITE, SUITE[2:])
+    shards = {"1/2": one, "2/2": two}
+    if case == "missed":
+        shards["2/2"] = (SUITE, SUITE[2:3])
+    elif case == "twice":
+        shards["2/2"] = (SUITE, SUITE[1:])
+    elif case == "different suite":
+        shards["2/2"] = (SUITE + ["tests/test_d.py::t1"], SUITE[2:] + ["tests/test_d.py::t1"])
+    elif case == "extra":
+        shards["2/2"] = (SUITE, SUITE[2:] + ["tests/test_z.py::t9"])
+    dirs = [_manifest(tmp_path, f"m{i}", shard, *lists) for i, (shard, lists) in enumerate(shards.items())]
+    if case == "same shard twice":
+        dirs[1] = _manifest(tmp_path, "dup", "1/2", *two)
+    elif case == "wrong total":
+        dirs[1] = _manifest(tmp_path, "w", "2/3", *two)
+    elif case == "one shard only":
+        dirs = dirs[:1]
+    elif case == "unreadable":
+        dirs.append(tmp_path / "missing")
+    problems, _ = ci.verify_manifests(dirs, 2)
+    assert any(expected in p for p in problems), problems
+    assert ci.main(["verify", "--shards", "2", *map(str, dirs)]) == 1
+
+
+def test_the_gate_catches_runners_that_collected_differently(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """End to end through the conftest hooks: two runners, different collections -> the gate fails."""
+    base = _collection()
+    variants = {1: base, 2: base + [SimpleNamespace(nodeid=f"{base[0].nodeid}_extra")]}
+    dirs = []
+    for index, collection in variants.items():
+        out = tmp_path / f"s{index}"
+        monkeypatch.setenv(ci.SHARD_ENV, f"{index}/2")
+        monkeypatch.setenv(ci.MANIFEST_ENV, str(out))
+        monkeypatch.setattr(conftest, "_EXECUTED", set())
+        items = list(collection)
+        conftest.pytest_collection_modifyitems(_config(), items)
+        for item in items:
+            conftest.pytest_runtest_logreport(SimpleNamespace(nodeid=item.nodeid, when="setup"))
+        conftest.pytest_sessionfinish(SimpleNamespace(config=SimpleNamespace(option=SimpleNamespace(collectonly=False))), 0)
+        dirs.append(out)
+    problems, _ = ci.verify_manifests(dirs, 2)
+    assert any("collected a different suite" in p for p in problems), problems
+    # and with identical collections the same path proves the split
+    ci.write_manifest_lines(dirs[1], ci.MANIFEST_COLLECTED,
+                            (tmp_path / "s1" / ci.MANIFEST_COLLECTED).read_text().splitlines())
+    executed_2 = set((dirs[1] / ci.MANIFEST_EXECUTED).read_text().splitlines()) - {f"{base[0].nodeid}_extra"}
+    ci.write_manifest_lines(dirs[1], ci.MANIFEST_EXECUTED, executed_2)
+    assert ci.verify_manifests(dirs, 2)[0] == []
+
+
 # --------------------------------------------------------------------------
 # Guards on the tables and markers
 # --------------------------------------------------------------------------
@@ -316,6 +524,25 @@ def test_suite_matrix_covers_every_shard_once(workflow: dict[str, Any]) -> None:
     assert job["strategy"]["fail-fast"] is False
     run = next(step for step in job["steps"] if step.get("name") == "Run tests")
     assert run["env"][ci.SHARD_ENV] == f"${{{{ matrix.shard }}}}/{len(shards)}"
+    manifest_dir = run["env"][ci.MANIFEST_ENV]
+    upload = next(step for step in job["steps"] if step.get("name") == "Upload shard manifest")
+    assert upload["uses"].startswith("actions/upload-artifact@")
+    assert upload["if"] == "always()"
+    assert upload["with"] == {
+        "name": "backend-suite-manifest-${{ matrix.shard }}", "path": manifest_dir,
+        "if-no-files-found": "error", "retention-days": 7,
+    }
+    gate = workflow["jobs"]["backend-tests"]["steps"]
+    download = next(step for step in gate if step.get("name") == "Download suite shard manifests")
+    assert download["uses"].startswith("actions/download-artifact@")
+    assert download["with"]["pattern"] == "backend-suite-manifest-*"
+    verify = next(step for step in gate if step.get("name") == "Suite shards ran every collected test exactly once")
+    assert verify["run"] == (
+        f"python -m tests.ci_scheduling verify --shards {len(shards)} "
+        f"{download['with']['path']}/backend-suite-manifest-*"
+    )
+    names = [step.get("name") or step.get("uses") for step in gate]
+    assert names.index("Download suite shard manifests") < names.index("Suite shards ran every collected test exactly once")
     # the shard runs the whole tests/ tree under GRID's xdist units, unfiltered
     assert "python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180" in run["run"]
     assert "-n auto --dist loadgroup" in run["run"]
