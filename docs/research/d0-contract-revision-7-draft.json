@@ -10,7 +10,7 @@
   {
    "section": "Header Version row",
    "anchor": "**revision 6** (revision 2 answered",
-   "replacement": "**revision 7** (revision 7: D2-H1 struck, §10.5; revision 2 answered",
+   "replacement": "**revision 7** (revision 7: D2-H1 struck, §10.6; revision 2 answered",
    "why": "version label"
   },
   {
@@ -22,7 +22,7 @@
   {
    "section": "Header status paragraph",
    "anchor": "The research owner signed this body\non 2026-11-14 and its hash is pinned",
-   "replacement": "The research owner signed revision 6 of this body\non 2026-11-14 (revision 7 is not yet signed or pinned)",
+   "replacement": "The research owner signed revision 6 of this body on 2026-11-14\n(revision 7 is not yet signed or pinned) and revision 6's hash is pinned",
    "why": "same, in the status paragraph"
   },
   {
@@ -176,14 +176,32 @@
    "why": "closed row carries no directive"
   },
   {
-   "section": "§10.5 new",
+   "section": "§10.6 new",
    "anchor": "<!-- D0-CONTRACT-BODY-END -->",
-   "replacement": "### 10.5 Revision 7: D2-H1 struck (2026-11-26)\n\n| Change | Where |\n|---|---|\n| D2-H1a and D2-H1b are struck: the SPXW 15:00 fly (14:00 and 14:30 reported) was judged on the same sessions, same family; reviewer and owner agree | §6.2 |\n| The fly structure cannot reach GO in this version; D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`); D2-H2 FAIL is RETIRE | §6.5 |\n| No OPRA spend; G5 closed; G4 not blocking | §6.6, §9 |\n| Section 4 ledger adds the omitted lane records | §4 |\n| Selection disclosure adds the SPXW look and the SPY price-path reads | §6.4 |\n\nNo outcome of any D2 look had been read when this was recorded. D2-H2 and D2-H3 are unchanged.\n\n<!-- D0-CONTRACT-BODY-END -->",
+   "replacement": "### 10.6 Revision 7: D2-H1 struck (2026-11-26)\n\n| Change | Where |\n|---|---|\n| D2-H1a and D2-H1b are struck: the SPXW 15:00 fly (14:00 and 14:30 reported) was judged on the same sessions, same family; reviewer and owner agree | §6.2 |\n| The fly structure cannot reach GO in this version; D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`); D2-H2 FAIL is RETIRE | §6.5 |\n| No OPRA spend; G5 closed; G4 not blocking | §6.6, §9 |\n| Section 4 ledger adds the omitted lane records | §4 |\n| Selection disclosure adds the SPXW look and the SPY price-path reads | §6.4 |\n\nNo outcome of any D2 look had been read when this was recorded. D2-H2 and D2-H3 are unchanged.\n\n<!-- D0-CONTRACT-BODY-END -->",
    "why": "revision log"
+  },
+  {
+   "section": "Title line",
+   "anchor": "v0 (owner-signed 2026-11-14)",
+   "replacement": "v0 (revision 6 owner-signed 2026-11-14; revision 7 unsigned draft)",
+   "why": "the title is outside the pinned body but is part of the rendered header; it must not claim the old signature for revision 7"
+  },
+  {
+   "section": "Header Version row tail",
+   "anchor": "— **signed by the research owner 2026-11-14** (§10.5).",
+   "replacement": "— **revision 6 signed by the research owner 2026-11-14** (§10.5); **revision 7 is an unsigned draft** (§10.6).",
+   "why": "signature display is revision-specific"
+  },
+  {
+   "section": "§3.1 OPRA row",
+   "anchor": "Pre-2022-11 not fetched by this lane: a **candidate** replication window, not untouched by assertion (§6.2, G5) |",
+   "replacement": "Pre-2022-11 not fetched by this lane. In revision 7 it is not a candidate replication window for the 0DTE short iron fly family (spent by the SPXW look, §4); any future replication is a separate, separately authorised, non-independent registration (§6.5). Other families are not presumed untouched (§4) |",
+   "why": "align section 3.1 with the strike"
   }
  ],
  "at_signing_not_in_this_draft": [
-  "docs/research/d0-research-contract-v0.md: apply every change above (body edit), and replace the 'Revision 7 is not signed' wording with the actual signature date at the moment of signing",
+  "docs/research/d0-research-contract-v0.md: apply every change above (body edit), and replace the 'Revision 7 is not signed' wording, the title and the Version row's 'unsigned draft' wording with the actual signature date at the moment of signing",
   "analysis/d0_manifest.py: D0_CONTRACT_BODY_SHA256 re-pinned to the new body hash",
   "docs/research/d0-coverage-manifest-v0.json: contract_body_sha256 and signed_at updated; hypotheses D2-H1a and D2-H1b set to a STRUCK status",
   "analysis/d0_admission.py: D2-H1a and D2-H1b removed from the frozen hypothesis definitions, so an ADMITTED row for either is refused",

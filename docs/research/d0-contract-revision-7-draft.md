@@ -13,6 +13,7 @@ section 6.2 strikes both D2-H1 cells before any fetch. No D2 outcome had been re
 
 ## What changes in the contract
 
+- **Header, title and §3.1:** every signature display now says revision 6 was signed and revision 7 is an unsigned draft; §3.1 no longer calls the pre-2022 window a candidate replication window.
 - **§6.2:** D2-H1a and D2-H1b are struck and kept as history. The pre-2022 window paragraph records the outcome.
 - **§6.5:** the GO rule required D2-H1 PASS, so it is rewritten rather than left dangling. **The fly structure cannot reach
   GO in this version.** A D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`); a D2-H2 FAIL is still RETIRE. A GO needs a
@@ -21,7 +22,7 @@ section 6.2 strikes both D2-H1 cells before any fetch. No D2 outcome had been re
   spend is authorised or needed.
 - **§4 / §9:** the ledger gains the omitted lane records; G5 is closed; G4 is no longer blocking (D2-H2 and D2-H3 keep their
   own costs) but stays open for any later E2 scoring of options.
-- **§10.5:** revision log.
+- **§10.6:** revision log (the existing §10.5 is the revision 6 owner signature and is kept).
 
 The old D2-H1 text is kept, not deleted, but only inside marked history blocks (`D2-H1-HISTORY-BEGIN` / `END`) or
 struck table rows. A test renders the revision 7 body, removes the history and the revision log, and fails if any remaining

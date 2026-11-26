@@ -57,7 +57,7 @@ def test_applying_the_draft_yields_a_valid_body_with_the_new_rules():
     new = apply(TEXT)
     M.contract_body(new)  # markers still present exactly once
     assert new != TEXT and M.body_sha256(M.contract_body(new)) != M.D0_CONTRACT_BODY_SHA256
-    assert "**revision 7**" in new and "### 10.5 Revision 7" in new
+    assert "**revision 7**" in new and "### 10.6 Revision 7" in new
     assert new.count(B) == new.count(E) >= 4
 
 
@@ -118,3 +118,29 @@ def test_the_draft_carries_no_private_paths():
     text = (ROOT / "docs/research/d0-contract-revision-7-draft.json").read_text(encoding="utf-8")
     for bad in ("/home/", "~/", "api-key"):
         assert bad not in text
+
+
+def test_every_rendered_signature_display_is_revision_specific():
+    new = apply(TEXT)
+    head = new.splitlines()[:22]  # the title and the header table, outside and inside the pinned body
+    shown = [ln for ln in head if "2026-11-14" in ln and ("igned" in ln)]
+    assert shown, "expected the inherited revision 6 signature to still be shown"
+    for ln in shown:
+        assert "revision 6" in ln.lower(), ln[:120]
+    assert "owner-signed 2026-11-14)" not in new.splitlines()[0]
+    assert "unsigned draft" in new.splitlines()[0]
+    assert "**signed by the research owner 2026-11-14**" not in new
+    assert "revision 7 is an unsigned draft" in new
+
+
+def test_section_numbers_do_not_collide_and_the_old_signature_pointer_survives():
+    new = apply(TEXT)
+    assert new.count("### 10.5 Owner signature (2026-11-14)") == 1 and new.count("### 10.6 Revision 7") == 1
+    assert "### 10.5 Revision 7" not in new
+
+
+def test_section_3_1_no_longer_calls_the_pre_2022_window_a_candidate():
+    new = apply(TEXT)
+    row = next(ln for ln in new.splitlines() if ln.startswith("| OPRA cbbo-1m, near-spot 0DTE strikes"))
+    assert "a **candidate** replication window" not in row
+    assert "not a candidate replication window" in row and "separately authorised" in row
