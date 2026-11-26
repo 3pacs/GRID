@@ -1317,7 +1317,8 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "prediction_pmxt",   "mod": "ingestion.altdata.prediction_pmxt",   "cls": "PmxtPredictionPuller",     "method": "pull",          "freq_h": 12, "timeout_s": 120},
     {"name": "smart_money",       "mod": "ingestion.altdata.smart_money",       "cls": "SmartMoneyPuller",         "method": "pull_all",      "freq_h": 1, "timeout_s": 240},  # hourly: 5 Arctic Shift reads per run (free community API; Reddit RSS 404 since 2026-11-17)
     {"name": "fed_liquidity",     "mod": "ingestion.altdata.fed_liquidity",     "cls": "FedLiquidityPuller",       "method": "pull_all",      "freq_h": 12, "timeout_s": 60, "api_key": "FRED_API_KEY"},
-    {"name": "etf_flows",         "mod": "ingestion.altdata.institutional_flows","cls": "InstitutionalFlowsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 600},  # full 13F read measured 346 s (2026-11-23); 120 s timed out every run after 11-22 16:37Z. Raised once the #1409 re-run dedupe was live
+    {"name": "etf_flows",         "mod": "ingestion.altdata.institutional_flows","cls": "InstitutionalFlowsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 600,  # full 13F read measured 346 s (2026-11-23); 120 s timed out every run after 11-22 16:37Z. Raised once the #1409 re-run dedupe was live
+     "repair_hold_reason": "its scheduled run is its only writer: Hermes repair retries ran the full 13F pass 89 times in 2.6 days (2026-11-24..26), each abandoned at 60 s while it kept writing, with no pull_log row (GRID #1492)"},
     {"name": "analyst_ratings",   "mod": "ingestion.altdata.analyst_ratings",   "cls": "AnalystRatingsPuller",     "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
     {
         "name": "gdelt",

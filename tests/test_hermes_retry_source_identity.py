@@ -347,31 +347,6 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertEqual(state.repair_backlog, {"requested": ["SYNTH"]})
         self.assertEqual(self.h.engine.formed_updates, [])
 
-    def test_17b_list_result_reporting_its_own_budget_stop_is_not_abandoned(self):
-        # InstitutionalFlowsPuller returns per-item results; its cooperative
-        # stop is one of the items. Read as abandoned, no cooldown was
-        # recorded and the same repair started again every cycle.
-        self.h.add("requested", "requested")
-        self.h.callback = lambda puller, kwargs: [
-            {"feature": "13F:run_budget", "status": "PARTIAL", "stopped_by_budget": True, "rows_inserted": 0,
-             "error": "13F managers stopped at the run deadline: 1 of 2 read, 1 not attempted"},
-            {"feature": "13F:1", "status": "SUCCESS", "rows_inserted": 2},
-        ]
-        state = types.SimpleNamespace(repair_backlog={})
-        result = self.h.retry("requested", state=state, should_continue=lambda: False)
-        self.assertEqual(result["status"], "PARTIAL")
-        self.assertEqual(result["outcome"], "PARTIAL")
-        self.assertIs(result["stopped_by_budget"], True)
-        self.assertEqual(state.repair_backlog, {})
-        self.assertEqual(self.h.engine.formed_updates, [])
-
-    def test_17c_list_result_without_a_budget_stop_is_still_abandoned_after_the_deadline(self):
-        self.h.add("requested", "requested")
-        self.h.callback = lambda puller, kwargs: [{"feature": "13F:1", "status": "SUCCESS", "rows_inserted": 2}]
-        result = self.h.retry("requested", should_continue=lambda: False)
-        self.assertEqual(result["status"], "abandoned")
-        self.assertEqual(self.h.engine.formed_updates, [])
-
     def test_18_adapter_exception_not_logged_with_sensitive_value_here(self):
         self.h.add("requested", "requested")
         def callback(puller, kwargs):

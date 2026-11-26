@@ -149,6 +149,19 @@ RECEIPT_MEASURE = "13f_filing_comparison_receipt"
 SNAPSHOT_COMPLETE = "complete"
 SNAPSHOT_VERIFIED_EMPTY = "verified_empty"
 COMPLETE_SNAPSHOT_STATUSES: frozenset[str] = frozenset({SNAPSHOT_COMPLETE, SNAPSHOT_VERIFIED_EMPTY})
+
+# One 13F writer at a time, whoever calls (2026-11-26, GRID #1492). Between
+# 11-24 03:47Z and 11-26 18:27Z griddb held 6,622 receipts for 73 filings: about
+# 92 full passes, against 7 logged smart:etf_flows runs. The rest were Hermes
+# repair retries (89 "Retrying INSTITUTIONAL_FLOWS" in the grid-hermes journal,
+# each "abandoned" after 60 s while its thread went on writing), and passes
+# overlapped (7 in one 31-minute window). The session-level lock below spans
+# the whole 13F pass on its own connection. A second writer that finds it held
+# (an orphaned thread still running, a manual run) skips the pass and writes
+# nothing; PostgreSQL drops the lock if the holder's connection dies. The
+# per-manager change-row lock (_lock_change_rows) stays as the inner guard.
+_13F_RUN_LOCK_KEY: int = _stable_lock_key("INSTITUTIONAL_FLOWS", "13F-run")
+
 # The 13F cover page (form 13F-HR XML): period, amendment type and the
 # summary-page entry/value totals the information table must match.
 _13F_COVER_DOCUMENT = "primary_doc.xml"
@@ -1610,6 +1623,58 @@ class InstitutionalFlowsPuller(BasePuller):
         should_continue: Callable[[], bool] | None = None,
         deadline_at: float | None = None,
     ) -> list[dict[str, Any]]:
+        """Run the 13F pass as the only 13F writer, or skip it.
+
+        Takes ``_13F_RUN_LOCK_KEY`` (see the note above it) on a dedicated
+        connection held for the whole pass. When another writer holds it,
+        nothing is read or written and one SKIPPED result is returned.
+        PostgreSQL only; other dialects (the SQLite test engines) have one
+        writer and no advisory locks.
+        """
+        lock_conn = None
+        if self.engine.dialect.name == "postgresql":
+            lock_conn = self.engine.connect()
+            try:
+                acquired = lock_conn.execute(
+                    text("SELECT pg_try_advisory_lock(:k)"), {"k": _13F_RUN_LOCK_KEY},
+                ).scalar()
+                lock_conn.commit()
+            except Exception:
+                lock_conn.close()
+                raise
+            if not acquired:
+                lock_conn.close()
+                log.warning("13F pass skipped: another 13F writer holds the run lock")
+                return [{
+                    "feature": "13f_filings",
+                    "status": "SKIPPED",
+                    "reason": "another 13F writer holds the run lock",
+                    "rows_inserted": 0,
+                }]
+        try:
+            # The budget goes to the inner pass; the lock is held until that
+            # pass returns, including a pass that stops itself at its deadline.
+            return self._pull_13f_managers(should_continue, deadline_at)
+        finally:
+            if lock_conn is not None:
+                try:
+                    lock_conn.execute(
+                        text("SELECT pg_advisory_unlock(:k)"), {"k": _13F_RUN_LOCK_KEY},
+                    )
+                    lock_conn.commit()
+                except Exception as exc:
+                    log.warning(
+                        "13F run lock release failed (PostgreSQL releases it when "
+                        "the connection closes): {e}", e=str(exc),
+                    )
+                finally:
+                    lock_conn.close()
+
+    def _pull_13f_managers(
+        self,
+        should_continue: Callable[[], bool] | None = None,
+        deadline_at: float | None = None,
+    ) -> list[dict[str, Any]]:
         """Pull and process 13F filings for all tracked institutional managers.
 
         For each manager:
@@ -1985,7 +2050,9 @@ class InstitutionalFlowsPuller(BasePuller):
             next_cik = managers[stopped_at][0]
             InstitutionalFlowsPuller._resume_13f_at_cik = next_cik
             stop = _budget_stop(
-                "13F:run_budget", "13F managers", stopped_at, len(managers), next_manager_cik=next_cik,
+                "13F:run_budget", "13F managers", stopped_at, len(managers),
+                next_manager_cik=next_cik,
+                managers_not_attempted=[c for c, _m in managers[stopped_at:]],
             )
             results.append(stop)
             log.warning("{e}; the next run starts at CIK={c}", e=stop["error"], c=next_cik)

@@ -240,6 +240,18 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_13f_holdings_graph_pg.py -q -rA
 
+      # etf_flows single 13F writer (GRID #1492): a second real session
+      # skips the 13F pass while the first holds the run advisory lock. The
+      # test fails instead of skipping when REQUIRE_ETF_FLOWS_LOCK_PG=1.
+      - name: 13F run-lock PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_ETF_FLOWS_LOCK_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_etf_flows_single_writer_20261126.py -q -rA -k second_real_session
+
       # Stored-close backfill (scripts/close_backfill_universe.py): the work
       # queries, the completed-close reader and the fill-only write on
       # PostgreSQL. The test fails instead of skipping when
