@@ -333,7 +333,6 @@ def _sector_map_tickers() -> list[str]:
         log.error("Could not import SECTOR_MAP: {e}", e=str(exc))
         return []
 
-    excluded = _non_filer_tickers()
     seen: set[str] = set()
     ordered: list[str] = []
     for _sector_name, sector in SECTOR_MAP.items():
@@ -349,7 +348,7 @@ def _sector_map_tickers() -> list[str]:
                 if ticker in seen:
                     continue
                 seen.add(ticker)
-                if ticker in excluded or _is_structural_non_filer(ticker):
+                if _is_structural_non_filer(ticker):
                     continue
                 ordered.append(ticker)
     return ordered
@@ -363,25 +362,6 @@ def _is_structural_non_filer(ticker: str) -> bool:
     from tiingo_symbol_contract import is_tiingo_equity
 
     return "=" in ticker or not is_tiingo_equity(ticker)
-
-
-def _non_filer_tickers() -> frozenset[str]:
-    """Tickers the lifecycle sidecar marks acquired, delisted or foreign-listed.
-
-    Such a symbol stops filing under its own CIK (or never had one). A
-    ``renamed`` symbol is kept: the issuer still files, under a new symbol, and
-    its old symbol is reported as NO_CIK like any other symbol the SEC ticker
-    file does not list.
-    """
-    try:
-        from analysis.sector_map import TICKER_STATUS
-    except Exception as exc:  # noqa: BLE001 -- no sidecar: only the symbol rule applies
-        log.warning("SEC_XBRL: ticker status sidecar unavailable: {e}", e=str(exc))
-        return frozenset()
-    return frozenset(
-        str(t).upper() for t, entry in TICKER_STATUS.items()
-        if isinstance(entry, dict) and entry.get("status") in {"acquired", "delisted", "foreign_listing"}
-    )
 
 
 # ── CIK lookup ──────────────────────────────────────────────────────────
@@ -440,18 +420,20 @@ def company_facts_not_found(cik_padded: str) -> bool:
     return cik_padded in _COMPANY_FACTS_NOT_FOUND
 
 
-def _stored_snapshot_actors(engine: Any) -> frozenset[str]:
+def _stored_snapshot_actors(engine: Any) -> frozenset[str] | None:
     """``actor_id`` of every issuer that has a stored SEC financial snapshot.
 
-    Empty on a read failure, which only turns a lost-CIK failure into a
-    NO_CIK skip for this run; it never blocks the pull.
+    ``None`` when the heads could not be read: that is "unknown", never an
+    empty set. A covered issuer cannot be told from a symbol that never filed
+    without it, so the caller must not report a CIK-less symbol as checked.
     """
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT actor_id FROM sec_financial_snapshot_heads")).fetchall()
     except Exception as exc:  # noqa: BLE001
-        log.warning("SEC_XBRL: stored snapshot actors unreadable ({e}); lost-CIK check off", e=type(exc).__name__)
-        return frozenset()
+        log.warning("SEC_XBRL: stored snapshot actors unreadable ({e}); CIK-less symbols are not classified this run",
+                    e=type(exc).__name__)
+        return None
     return frozenset(str(r[0]) for r in rows if r and r[0])
 
 
@@ -1154,7 +1136,8 @@ class SECXBRLFinancialsPuller:
             return [{"status": "FAILED", "error": "cik map empty"}]
         # Issuers that already have a stored snapshot: one of them missing from
         # the SEC ticker file is a lost CIK (rename, delisting, a truncated
-        # file), not a symbol that never filed.
+        # file), not a symbol that never filed. None = the heads could not be
+        # read, so no CIK-less symbol can be classified this run.
         covered_actors = _stored_snapshot_actors(self.engine)
 
         # Small courtesy delay after the first SEC call.
@@ -1166,6 +1149,7 @@ class SECXBRLFinancialsPuller:
         tolerated_total = 0
         no_cik_tickers: list[str] = []
         cik_lost = 0
+        coverage_unavailable = 0
         completed_list: list[str] = sorted(already_done)
         attempted_list: list[str] = sorted(already_attempted)
 
@@ -1191,6 +1175,16 @@ class SECXBRLFinancialsPuller:
             cik_padded = cik_map.get(ticker)
             if not cik_padded:
                 processed += 1
+                if covered_actors is None:
+                    # Unknown, not "never filed": a visible failed item, and NOT
+                    # recorded as attempted so the next run looks at it again.
+                    log.warning("SEC_XBRL: {t} has no CIK and the stored snapshot heads are unreadable — retry", t=ticker)
+                    coverage_unavailable += 1
+                    results.append({
+                        "ticker": ticker, "status": "FAILED", "rows": 0,
+                        "error": "coverage check unavailable: stored snapshot heads could not be read; retried next run",
+                    })
+                    continue
                 if actor_id in covered_actors:
                     # A covered issuer must not look like a symbol that never
                     # filed: it is reported as a failed item with its reason.
@@ -1266,6 +1260,7 @@ class SECXBRLFinancialsPuller:
             "no_cik": len(no_cik_tickers),
             "no_cik_tickers": no_cik_tickers[:50],
             "cik_lost": cik_lost,
+            "coverage_check_unavailable": coverage_unavailable,
             "elapsed_seconds": round(elapsed, 1),
         })
         return results
