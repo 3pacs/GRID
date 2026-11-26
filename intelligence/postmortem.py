@@ -452,6 +452,17 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
 
 # ── 2. Generate Post-Mortem for an Oracle Prediction ──────────────────────
 
+def _finite_or_none(value: Any) -> float | None:
+    """``float(value)`` when it is a finite number, else None (missing, blank or NaN/inf)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMortem | None:
     """Generate a full post-mortem for a failed oracle prediction.
 
@@ -514,7 +525,20 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     # {:+.2%} formatters and PostmortemCompleted.realized_pnl expect one, so
     # convert here. Without it a -3.81% miss read "-381.00%" and the lessons
     # report averaged two units together.
-    actual_ret = float(pnl_pct) / 100.0 if pnl_pct else 0.0
+    # A prediction scored a miss with no recorded return has no measured return. Storing
+    # `0.0` there stored a measured 0% (narrated as "Return: +0.00%", averaged into the
+    # lessons report and emitted as realized_pnl), and #1471's reader cannot tell that zero
+    # from a real one afterwards. Without a return there is nothing true to analyse here, so
+    # no post-mortem is written; batch_postmortem does not select such rows either.
+    pnl_f = _finite_or_none(pnl_pct)
+    if pnl_f is None:
+        log.warning(
+            "Post-mortem: prediction {id} is a miss with no recorded return (pnl_pct={p!r}); "
+            "not generating, a missing return is not a 0% return",
+            id=prediction_id, p=pnl_pct,
+        )
+        return None
+    actual_ret = pnl_f / 100.0
     conf = float(confidence) if confidence is not None else None
 
     signals = _parse_json(signals_json)
@@ -669,6 +693,7 @@ def batch_postmortem(
         SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE verdict = 'miss'
           AND scored_at >= :cutoff
+          AND pnl_pct IS NOT NULL
           AND id NOT LIKE 'astrogrid:%'
           AND id NOT IN (
               SELECT prediction_id FROM trade_postmortems
