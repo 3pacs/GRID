@@ -1528,7 +1528,19 @@ function LineageFlows({ lineage }) {
 }
 
 // ── Intelligence Feed (unified timeline) ─────────────────────────────
-function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets, sectorTickers }) {
+// A trade ticket that states no kelly size is not a 0.0% bet, and one that states no
+// confidence is not "inferred" (#959): absent or non-finite values read as not reported.
+export function ticketKellyText(kelly) {
+    const n = kelly == null || kelly === '' ? NaN : Number(kelly);
+    return Number.isFinite(n) ? `kelly ${(n * 100).toFixed(1)}%` : 'kelly not reported';
+}
+export function ticketConfidenceTier(confidence) {
+    const n = confidence == null || confidence === '' ? NaN : Number(confidence);
+    if (!Number.isFinite(n)) return 'unknown';
+    return n >= 0.6 ? 'derived' : 'inferred';
+}
+
+export function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets, sectorTickers }) {
     const feed = useMemo(() => {
         const rows = [];
         const sectorSet = sectorTickers instanceof Set ? sectorTickers : new Set();
@@ -1539,9 +1551,9 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 source: 'ticket',
                 ticker: tk.toUpperCase(),
                 actor: String(t.shock_node || 'contagion').toUpperCase(),
-                action: `${(t.direction || '').toUpperCase()} ${(t.instrument || '').toUpperCase()} $${t.strike} exp ${t.expiry} · kelly ${((t.kelly_size || 0) * 100).toFixed(1)}%`,
+                action: `${(t.direction || '').toUpperCase()} ${(t.instrument || '').toUpperCase()} $${t.strike} exp ${t.expiry} · ${ticketKellyText(t.kelly_size)}`,
                 date: t.generated_at,
-                confidence: (Number(t.confidence) || 0) >= 0.6 ? 'derived' : 'inferred',
+                confidence: ticketConfidenceTier(t.confidence),
             });
         }
         for (const t of insider || []) {
@@ -1572,7 +1584,8 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 actor: c.source || 'convergence',
                 action: c.message || c.alert || '',
                 date: c.date || c.detected_at,
-                confidence: c.confidence || 'derived',
+                // A row that states no tier is unknown, not derived.
+                confidence: c.confidence || 'unknown',
             });
         }
         for (const l of levers || []) {
@@ -1582,7 +1595,7 @@ function IntelligenceFeed({ insider, congress, convergence, levers, tradeTickets
                 actor: l.name || l.actor || 'Lever puller',
                 action: l.description || l.signal || l.type || '',
                 date: l.date || l.detected_at,
-                confidence: l.confidence || 'inferred',
+                confidence: l.confidence || 'unknown',
             });
         }
         rows.sort((a, b) => {

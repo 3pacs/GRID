@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, beforeAll, beforeEach } from 'vitest';
-import SectorDive from '../views/SectorDive.jsx';
+import SectorDive, { IntelligenceFeed, ticketKellyText, ticketConfidenceTier } from '../views/SectorDive.jsx';
 import { api } from '../api.js';
 
 vi.mock('../api.js', () => ({
@@ -170,5 +170,57 @@ describe('SectorDive truthfulness', () => {
         const note = await screen.findByTestId('note-Dark Pool Signal');
         expect(note.textContent).toBe('week of 2026-10-05');
         expect(screen.queryByTestId('note-Congressional (60d)')).toBeNull();
+    });
+});
+
+describe('SectorDive intelligence feed defaults (#959, Codex hold)', () => {
+    it('a ticket with no kelly size says so instead of 0.0%', () => {
+        expect(ticketKellyText(undefined)).toBe('kelly not reported');
+        expect(ticketKellyText(null)).toBe('kelly not reported');
+        expect(ticketKellyText('')).toBe('kelly not reported');
+        expect(ticketKellyText('abc')).toBe('kelly not reported');
+        expect(ticketKellyText(0)).toBe('kelly 0.0%');         // a measured zero is a zero
+        expect(ticketKellyText(0.05)).toBe('kelly 5.0%');
+    });
+
+    it('a ticket with no confidence is unknown, not inferred', () => {
+        expect(ticketConfidenceTier(undefined)).toBe('unknown');
+        expect(ticketConfidenceTier(null)).toBe('unknown');
+        expect(ticketConfidenceTier('')).toBe('unknown');
+        expect(ticketConfidenceTier(NaN)).toBe('unknown');
+        expect(ticketConfidenceTier(0)).toBe('inferred');      // a stated 0 is a stated value
+        expect(ticketConfidenceTier(0.59)).toBe('inferred');
+        expect(ticketConfidenceTier(0.6)).toBe('derived');
+    });
+
+    it('feed rows without a stated tier read unknown, and a ticket without kelly says not reported', () => {
+        const { container } = render(
+            <IntelligenceFeed
+                insider={[]} congress={[]}
+                tradeTickets={[{ ticker: 'acme', shock_node: 'fab', direction: 'put', instrument: 'option', strike: 10, expiry: '2026-12-18', generated_at: '2026-11-25T12:00:00Z' }]}
+                convergence={[{ ticker: 'ACME', source: 'x', message: 'aligned', date: '2026-11-25T11:00:00Z' }]}
+                levers={[{ ticker: 'ACME', name: 'Fab', description: 'moved', date: '2026-11-25T10:00:00Z' }]}
+                sectorTickers={new Set(['acme'])}
+            />,
+        );
+        expect(container.textContent).toContain('kelly not reported');
+        expect(container.textContent).not.toMatch(/kelly 0\.0%/);
+        const titles = [...container.querySelectorAll('[title]')].map(e => e.title);
+        expect(titles.filter(t => t === 'unknown').length).toBe(3);
+        expect(titles).not.toContain('inferred');
+        expect(titles).not.toContain('derived');
+    });
+
+    it('rows that state their own tier keep it', () => {
+        const { container } = render(
+            <IntelligenceFeed
+                insider={[]} congress={[]} tradeTickets={[]}
+                convergence={[{ ticker: 'ACME', message: 'm', confidence: 'confirmed', date: '2026-11-25T11:00:00Z' }]}
+                levers={[{ ticker: 'ACME', name: 'Fab', confidence: 'estimated', date: '2026-11-25T10:00:00Z' }]}
+                sectorTickers={new Set()}
+            />,
+        );
+        const titles = [...container.querySelectorAll('[title]')].map(e => e.title);
+        expect(titles).toEqual(expect.arrayContaining(['confirmed', 'estimated']));
     });
 });
