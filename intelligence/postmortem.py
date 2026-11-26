@@ -471,9 +471,12 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
 # In PostgreSQL NaN compares equal to itself, so NOT IN excludes it. A measured 0 stays selected.
 _NON_FINITE_FLOAT8_SQL = "'NaN'::float8, 'Infinity'::float8, '-Infinity'::float8"
 FINITE_PNL_PCT_SQL = "pnl_pct IS NOT NULL AND pnl_pct::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
-FINITE_ACTUAL_RETURN_SQL = (
-    "actual_return IS NOT NULL AND actual_return::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
-)
+# options_recommendations.actual_return is unconstrained NUMERIC, so it is compared in NUMERIC and never
+# cast to float8: a value outside float8's range (e.g. 1e400) makes `::float8` raise and abort the whole
+# selection, starving every older valid row (Codex hold on #1488). PostgreSQL orders NaN and +/-Infinity
+# above every finite NUMERIC, so `ABS(x) < 1e300` rejects them and anything the writer's float() cannot
+# hold, and keeps every real return (a return is a small fraction) including a measured 0.
+FINITE_ACTUAL_RETURN_SQL = "actual_return IS NOT NULL AND ABS(actual_return) < 1e300"
 
 
 def _finite_or_none(value: Any) -> float | None:

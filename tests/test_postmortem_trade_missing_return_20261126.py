@@ -102,7 +102,9 @@ def test_batch_selection_skips_trades_with_no_recorded_return(monkeypatch):
     trade_sql = [q for q in seen_sql if "FROM options_recommendations" in q and "'LOSS', 'EXPIRED'" in q]
     assert trade_sql and all("actual_return IS NOT NULL" in q for q in trade_sql)
     # NaN (and +/-Infinity where NUMERIC allows it) must not fill the LIMIT either.
-    assert all("actual_return::float8 NOT IN ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)" in q for q in trade_sql)
+    assert all("ABS(actual_return) < 1e300" in q for q in trade_sql)
+    # Compared in NUMERIC: a float8 cast raises out of range on e.g. 1e400 and aborts the whole selection.
+    assert all("::float8" not in q.split("actual_return", 1)[1] for q in trade_sql)
 
 
 def _real_pm(ret):

@@ -100,7 +100,7 @@ def _insert_trade(engine, tid, hours_ago, ret_sql, outcome="LOSS"):
 
 
 def test_newer_non_finite_trades_do_not_fill_the_limit(selector_pg, monkeypatch):
-    # NUMERIC holds NaN (Infinity only from PostgreSQL 14, so it is not used here).
+    # NUMERIC holds NaN (Infinity only from PostgreSQL 14, so it is not used here) and values far beyond float8.
     _insert_trade(selector_pg, 1, 1, "'NaN'::numeric")
     _insert_trade(selector_pg, 2, 2, "NULL")
     _insert_trade(selector_pg, 3, 3, "'NaN'::numeric", outcome="EXPIRED")
@@ -109,6 +109,9 @@ def test_newer_non_finite_trades_do_not_fill_the_limit(selector_pg, monkeypatch)
     _insert_trade(selector_pg, 6, 6, "-0.62")
     _insert_trade(selector_pg, 7, 7, "-1.0")
     _insert_trade(selector_pg, 8, 1, "-0.3", outcome="WIN")         # not a failure
+    # Storable in unconstrained NUMERIC but outside float8: must be skipped, not abort the selection.
+    _insert_trade(selector_pg, 9, 1, "1e400::numeric")
+    _insert_trade(selector_pg, 10, 1, "-1e400::numeric", outcome="EXPIRED")
 
     _, trade_calls = _run_batch(monkeypatch, selector_pg, limit=2)
     assert trade_calls == [5, 6]

@@ -121,7 +121,8 @@ def test_trade_candidate_query_excludes_trades_with_no_recorded_return(monkeypat
     _, seen_sql = _run_trade_worker(monkeypatch, [], {}, max_rows=5)
     trade_sql = [q for q in seen_sql if "FROM options_recommendations" in q and "'LOSS', 'EXPIRED'" in q]
     assert trade_sql and all("actual_return IS NOT NULL" in q for q in trade_sql)
-    assert all("actual_return::float8 NOT IN ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)" in q for q in trade_sql)
+    assert all("ABS(actual_return) < 1e300" in q for q in trade_sql)
+    assert all("actual_return::float8" not in q for q in trade_sql)
 
 
 def test_a_skipped_trade_does_not_spend_the_row_budget(monkeypatch):
