@@ -116,10 +116,32 @@ are in the hash too. **Unless the same PR adds a sealed tree:**
   deployed (every module but `__main__` and `hermes`, never edited). Its provenance is in `sealed.TREES`: the
   release's git tree id, the file sha256s, and the open registrations it seals. `tests/test_edge_stream_sealed.py`
   pins the bytes and, on Python 3.14, that the tree reproduces each sealed hash.
-- **How it is used.** On every cycle a registration whose hash the live code no longer reproduces is matched to
-  the tree whose own files reproduce it, recomputed from those files; no hash-to-tree map is trusted. Its code
-  check, presence count, look and report then run in that tree (the runner's ledger records, read receipts and
-  report file stay the live ones). An edited tree reproduces nothing, and the registration is abandoned as before.
+- **How it is used.** On every cycle a registration whose hash the live code no longer reproduces is matched to a
+  tree, failing closed at each step (`sealed.evaluator`):
+  1. every file is byte-equal to the pinned manifest, with no file missing, unreadable or extra. This covers
+     `ledger`, `sanity`, `universe` and `__init__`, which the hash leaves out but the sealed runner imports;
+  2. only then is the tree imported (an import error excludes it);
+  3. each imported module must come from the tree's own directory;
+  4. the tree's own `code_sha256`, recomputed from its files, must equal the registration's. No hash-to-tree map
+     is trusted.
+
+  Its code check, presence count, look and report then run in that tree (the runner's ledger records, read
+  receipts and report file stay the live ones). A tree failing any step judges nothing, and the registration is
+  abandoned as before.
+- **Trust boundary.** The bytes are checked on disk just before import, and re-checked on every call. The code in
+  memory is what was imported, so this assumes the deployed release root is immutable while a cycle runs: written
+  only by the deploy, owned by `grid`, never edited in place. Stale bytecode is trusted as Python trusts it.
+- **What a tree does not freeze.** A sealed look reads bars through the *live* sources and `extras`. Its failed
+  attempts are counted by the *live* `runner._attempt_failed` under live policy thresholds.
+  `tests/test_edge_stream_sealed.py` holds them to the tree:
+  - live `data.py` is AST-equal to the tree's;
+  - `_attempt_failed` and the three retry thresholds are equal;
+  - a cap is never counted;
+  - source errors abandon on the tree's day;
+  - readiness and date coverage (before the window, a gap, a holiday) match.
+
+  While a sealed registration is open, a change to any of these fails CI. It then needs a frozen adapter, or the
+  registration's loss accepted in the PR.
 - **When a tree goes.** Remove one only when no open registration in the live ledger reproduces under it.
 - **The first tree.** `tree_a1d9bd4c` (#1337, release tree `a1d9bd4c`, deployed from `ca04a2d5` on 2026-11-18)
   keeps the two forward registrations open on 2026-11-25: the SPY/QQQ/IWM test `69a84820` and EC1's confirmation

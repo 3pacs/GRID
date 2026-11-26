@@ -7,10 +7,34 @@ would then be abandoned rather than judged on code it was not sealed with.
 
 A tree here is a verbatim copy of the edge-stream package as deployed when a registration was
 sealed. A registration whose hash the live code no longer reproduces is judged by the tree that
-does reproduce it, recomputed from the tree's own files on every call (:func:`evaluator`). Its
-code check, readiness, look and report then run on exactly the code it was sealed with. No map
-from hash to tree is trusted: a tree that has been edited no longer reproduces any hash, and the
-registration is abandoned as before.
+does reproduce it (:func:`evaluator`). Its code check, readiness, look and report then run on
+exactly the code it was sealed with. On every call, in this order, failing closed at each step:
+
+1. every file of the tree is present, readable and byte-equal to its pinned sha256 in
+   :data:`TREES`, and the tree holds no other ``.py`` file. This covers the modules the
+   registration hash leaves out (``ledger``, ``sanity``, ``universe``, ``__init__``), which the
+   sealed runner still imports;
+2. only then is the tree imported; an import error excludes the tree;
+3. every imported module of the tree must come from the tree's own directory;
+4. the tree's own ``families.code_sha256``, recomputed from its files, must equal the
+   registration's ``code_sha256``. No map from hash to tree is trusted.
+
+A tree that fails any step judges nothing, and the registration is abandoned as before.
+
+**Trust boundary.** The bytes are checked from disk just before import. A tree already imported
+in this process is re-checked on disk at every call, but the code in memory is what was imported.
+So the check assumes the deployed release root is immutable while a cycle runs: it is written
+only by the deploy, owned by ``grid``, and never edited in place. Stale bytecode is covered by the
+same assumption (a ``__pycache__`` entry is trusted as Python trusts it).
+
+**What the tree does not freeze.** The sealed look reads bars through the *live* sources and
+``extras`` the cycle passes in. The live runner records reads, failed attempts and abandonments
+under the *live* fetch-retry rules (:func:`runner._attempt_failed`). ``tests/test_edge_stream_sealed.py``
+holds both to the tree. It checks that the live ``data`` module is AST-equal to the tree's, that the
+retry thresholds are equal, and that a cap is not counted against a sealed registration, while
+a source error is counted and abandons it on the same days as the tree's own rules would.
+Changing any of that while a sealed registration is open fails that test. It then needs a frozen
+adapter, or the registration's loss accepted in the PR.
 
 A tree is added only by a reviewed PR, as a byte copy of a deployed release tree, with its file
 digests pinned in :data:`TREES` and checked by ``tests/test_edge_stream_sealed.py``. A tree is
@@ -19,8 +43,13 @@ never edited. It is removed only once no open registration in the live ledger re
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import sys
+from pathlib import Path
 from types import ModuleType
+
+from loguru import logger as log  # same logger config.log re-exports; no settings import
 
 #: name -> provenance. ``git_tree`` is ``git rev-parse <release>:alpha_research/edge_stream``
 #: of the deployed release the copy was taken from; ``files`` are the copied files' sha256.
@@ -50,15 +79,53 @@ TREES: dict[str, dict] = {
 }
 
 
+def tree_dir(name: str) -> Path:
+    return Path(__file__).resolve().parent / name
+
+
+def verified(name: str, root: Path | None = None) -> bool:
+    """Step 1: the tree's files are exactly the pinned ones, byte for byte. Missing, unreadable,
+    changed or extra ``.py`` files: False."""
+    root = tree_dir(name) if root is None else root
+    pinned = TREES[name]["files"]
+    try:
+        if sorted(p.name for p in root.iterdir() if p.suffix == ".py") != sorted(pinned):
+            return False
+        return all(hashlib.sha256((root / f).read_bytes()).hexdigest() == sha for f, sha in pinned.items())
+    except OSError:
+        return False
+
+
 def _modules(name: str) -> tuple[ModuleType, ModuleType]:
     base = f"{__name__}.{name}"
     return importlib.import_module(f"{base}.families"), importlib.import_module(f"{base}.runner")
 
 
+def _imported_from_tree(name: str) -> bool:
+    """Step 3: every module of the tree loaded in this process was loaded from the tree's files."""
+    root, base = tree_dir(name), f"{__name__}.{name}"
+    for f in TREES[name]["files"]:
+        mod = sys.modules.get(base if f == "__init__.py" else f"{base}.{f[:-3]}")
+        if mod is not None and Path(getattr(mod, "__file__", "") or "").resolve() != root / f:
+            return False
+    return True
+
+
 def evaluator(reg: dict) -> ModuleType | None:
-    """The sealed ``runner`` module whose own files reproduce ``reg["code_sha256"]``, or None."""
+    """The sealed ``runner`` module of the verified tree whose own files reproduce
+    ``reg["code_sha256"]``, or None (see the module docstring for the four steps)."""
     for name in TREES:
-        families, runner = _modules(name)
+        if not verified(name):
+            log.warning("edge_stream sealed tree {n}: files differ from the pinned bytes; not used", n=name)
+            continue
+        try:
+            families, runner = _modules(name)
+        except Exception as exc:  # a tree that cannot be imported judges nothing
+            log.warning("edge_stream sealed tree {n} failed to import: {e}", n=name, e=repr(exc))
+            continue
+        if not _imported_from_tree(name):
+            log.warning("edge_stream sealed tree {n}: a module was loaded from elsewhere; not used", n=name)
+            continue
         family = families.FAMILIES.get(reg.get("family"))
         if family is not None and families.code_sha256(family) == reg.get("code_sha256"):
             return runner
