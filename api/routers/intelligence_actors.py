@@ -831,7 +831,7 @@ def get_lessons_learned(
     lookback window using LLM analysis with rule-based fallback.
     """
     try:
-        from intelligence.postmortem import load_postmortems, generate_lessons_learned, PostMortem
+        from intelligence.postmortem import load_postmortems, generate_lessons_learned, postmortems_from_records
 
         engine = get_db_engine()
         records = load_postmortems(engine, days=days)
@@ -839,38 +839,13 @@ def get_lessons_learned(
         if not records:
             return {"lessons": "No post-mortems found in the last {days} days.", "count": 0}
 
-        # Reconstruct PostMortem objects from stored records for the synthesis
-        pms = []
-        for r in records:
-            full = r.get("full_analysis", {})
-            if not full:
-                continue
-            try:
-                pms.append(PostMortem(
-                    trade_id=full.get("trade_id", 0),
-                    ticker=full.get("ticker", r.get("ticker", "")),
-                    direction=full.get("direction", ""),
-                    outcome=full.get("outcome", r.get("outcome", "")),
-                    actual_return=full.get("actual_return", 0.0),
-                    data_at_decision=full.get("data_at_decision", {}),
-                    thesis_at_decision=full.get("thesis_at_decision", ""),
-                    sanity_results_at_decision=full.get("sanity_results_at_decision", {}),
-                    what_actually_happened=full.get("what_actually_happened", ""),
-                    price_path=full.get("price_path", []),
-                    failure_category=full.get("failure_category", r.get("failure_category", "")),
-                    root_cause=full.get("root_cause", r.get("root_cause", "")),
-                    which_signals_were_wrong=full.get("which_signals_were_wrong", []),
-                    which_signals_were_right=full.get("which_signals_were_right", []),
-                    what_we_missed=full.get("what_we_missed", r.get("what_we_missed", "")),
-                    recommended_fix=full.get("recommended_fix", r.get("recommended_fix", "")),
-                    confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
-                    generated_at=full.get("generated_at", ""),
-                ))
-            except Exception:
-                continue
+        # Reconstruct PostMortem objects from stored records for the synthesis.
+        # ``postmortems_from_records`` puts every return in one unit (a fraction)
+        # whichever writer stored it, and leaves out a row whose unit it cannot tell.
+        pms, excluded = postmortems_from_records(records)
 
         lessons = generate_lessons_learned(engine, pms)
-        return {"lessons": lessons, "count": len(pms)}
+        return {"lessons": lessons, "count": len(pms), "excluded_unknown_return": excluded}
 
     except Exception as exc:
         log.warning("Lessons learned generation failed: {e}", e=str(exc))

@@ -29,6 +29,16 @@ router = APIRouter(prefix="/api/v1", tags=["intelligence"])
 
 
 _CACHE_TTL = timedelta(hours=6)
+
+# Unit of the returns a lessons summary was computed from. Summaries cached
+# before the 2026-11-26 unit fix carry no marker (their average mixed percent
+# points and fractions, e.g. "Average return: -841.60%"), so they are never
+# served, fresh or as a fallback.
+RETURN_UNITS = "fraction"
+_STALE_CACHE_NOTE = (
+    "a cached summary from before the return-unit fix was withheld; "
+    "it is regenerated on the next successful run"
+)
 _CACHE_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS postmortem_lessons_cached (
     id           INTEGER PRIMARY KEY DEFAULT 1,
@@ -85,6 +95,14 @@ def _write_cache(engine, lessons_payload: Any, n: int, days: int) -> str:
             "days": int(days),
         })
     return now.isoformat()
+
+
+def _cache_usable(cached: dict[str, Any] | None) -> bool:
+    """True for a cached row computed with returns in one unit."""
+    if not cached:
+        return False
+    lessons = cached.get("lessons")
+    return isinstance(lessons, dict) and lessons.get("return_units") == RETURN_UNITS
 
 
 def _is_fresh(ts: datetime | None) -> bool:
@@ -150,7 +168,7 @@ def _generate(engine, n: int, days: int) -> Any:
     from intelligence.postmortem import (
         load_postmortems,
         generate_lessons_learned,
-        PostMortem,
+        postmortems_from_records,
     )
 
     records = load_postmortems(engine, days=days)
@@ -163,34 +181,9 @@ def _generate(engine, n: int, days: int) -> Any:
 
     records = records[: int(n)] if n and n > 0 else records
 
-    pms: list[PostMortem] = []
-    for r in records:
-        full = r.get("full_analysis") or {}
-        if not full:
-            continue
-        try:
-            pms.append(PostMortem(
-                trade_id=full.get("trade_id", 0),
-                ticker=full.get("ticker", r.get("ticker", "")),
-                direction=full.get("direction", ""),
-                outcome=full.get("outcome", r.get("outcome", "")),
-                actual_return=full.get("actual_return", 0.0),
-                data_at_decision=full.get("data_at_decision", {}),
-                thesis_at_decision=full.get("thesis_at_decision", ""),
-                sanity_results_at_decision=full.get("sanity_results_at_decision", {}),
-                what_actually_happened=full.get("what_actually_happened", ""),
-                price_path=full.get("price_path", []),
-                failure_category=full.get("failure_category", r.get("failure_category", "")),
-                root_cause=full.get("root_cause", r.get("root_cause", "")),
-                which_signals_were_wrong=full.get("which_signals_were_wrong", []),
-                which_signals_were_right=full.get("which_signals_were_right", []),
-                what_we_missed=full.get("what_we_missed", r.get("what_we_missed", "")),
-                recommended_fix=full.get("recommended_fix", r.get("recommended_fix", "")),
-                confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
-                generated_at=full.get("generated_at", ""),
-            ))
-        except Exception:
-            continue
+    # Every return is put in one unit (a fraction) whichever writer stored it;
+    # a row whose unit cannot be told is left out and counted.
+    pms, excluded = postmortems_from_records(records)
 
     if not pms:
         return {
@@ -205,6 +198,10 @@ def _generate(engine, n: int, days: int) -> Any:
         "text": text_out,
         "count": len(pms),
         "label": _lessons_label(len(pms), date_range),
+        # Marks the text as computed with returns in one unit. A cached summary
+        # without it was written before the unit fix and is never served.
+        "return_units": RETURN_UNITS,
+        "excluded_unknown_return": excluded,
     }
 
 
@@ -224,7 +221,7 @@ def get_postmortem_lessons(
 
     if not refresh:
         cached = _read_cache(engine)
-        if cached and _is_fresh(cached.get("_ts")):
+        if _cache_usable(cached) and _is_fresh(cached.get("_ts")):
             if cached.get("n") == int(n) and cached.get("days") == int(days):
                 return {
                     "lessons": cached["lessons"],
@@ -240,6 +237,9 @@ def get_postmortem_lessons(
     except Exception as exc:
         log.warning("postmortem-lessons synthesis failed: {e}", e=str(exc))
         cached = _read_cache(engine)
+        if cached and not _cache_usable(cached):
+            return {"lessons": None, "generated_at": None, "error": str(exc),
+                    "cached": False, "note": _STALE_CACHE_NOTE}
         if cached:
             return {
                 "lessons": cached["lessons"],
@@ -261,6 +261,9 @@ def get_postmortem_lessons(
         # window would instead read as "nothing was ever learned."
         note = f"no postmortems in the last {days} days"
         cached = _read_cache(engine)
+        if cached and not _cache_usable(cached):
+            note = f"{note}; {_STALE_CACHE_NOTE}"
+            cached = None
         if cached:
             return {
                 "lessons": cached["lessons"],

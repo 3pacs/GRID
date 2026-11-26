@@ -96,8 +96,103 @@ class PostMortem:
     confidence_in_analysis: float         # 0-1
     generated_at: str
 
+    # Unit of ``actual_return``. New rows are always a fraction (-0.5 = -50%).
+    # Rows stored before 2026-11-26 carry no marker, and their unit depends on
+    # the writer: see ``stored_return_fraction``.
+    actual_return_unit: str = "fraction"
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+RETURN_UNIT_FRACTION = "fraction"
+RETURN_UNIT_PERCENT_POINTS = "percent_points"
+
+
+def stored_return_fraction(record: dict[str, Any]) -> float | None:
+    """``actual_return`` of a stored ``trade_postmortems`` record, as a fraction.
+
+    Rows written from 2026-11-26 carry ``full_analysis.actual_return_unit``.
+    Older rows carry none, and the unit follows the writer, which the table
+    records exactly (every row has one of ``trade_id`` / ``prediction_id``,
+    never both: 860 / 1,108,188 rows when checked):
+
+    * ``prediction_id`` set: copied from ``oracle_predictions.pnl_pct``, in
+      percent points (-50.24 = -50.24%), so divided by 100;
+    * ``trade_id`` set: copied from ``options_recommendations.actual_return``,
+      already a fraction.
+
+    No decision uses the magnitude of the value. Returns None (the row is
+    left out of any average) for a missing or non-finite return, an unknown
+    marker, or a row whose writer cannot be told.
+    """
+    full = record.get("full_analysis") or {}
+    if not isinstance(full, dict):
+        return None
+    try:
+        value = float(full.get("actual_return"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    unit = full.get("actual_return_unit")
+    if unit == RETURN_UNIT_FRACTION:
+        return value
+    if unit == RETURN_UNIT_PERCENT_POINTS:
+        return value / 100.0
+    if unit is not None:
+        return None
+    has_prediction = record.get("prediction_id") is not None
+    has_trade = record.get("trade_id") is not None
+    if has_prediction and not has_trade:
+        return value / 100.0
+    if has_trade and not has_prediction:
+        return value
+    return None
+
+
+def postmortems_from_records(records: list[dict[str, Any]]) -> tuple[list["PostMortem"], int]:
+    """Hydrate ``PostMortem`` objects from ``load_postmortems`` records.
+
+    ``actual_return`` is always a fraction (``stored_return_fraction``).
+    Returns ``(postmortems, excluded)``: ``excluded`` counts records left out
+    because they have no analysis blob or no return that can be put in a
+    known unit, so a mixed history cannot reach an average.
+    """
+    pms: list[PostMortem] = []
+    excluded = 0
+    for r in records:
+        full = r.get("full_analysis") or {}
+        if not full:
+            continue
+        ret = stored_return_fraction(r)
+        if ret is None:
+            excluded += 1
+            continue
+        try:
+            pms.append(PostMortem(
+                trade_id=full.get("trade_id", 0),
+                ticker=full.get("ticker", r.get("ticker", "")),
+                direction=full.get("direction", ""),
+                outcome=full.get("outcome", r.get("outcome", "")),
+                actual_return=ret,
+                data_at_decision=full.get("data_at_decision", {}),
+                thesis_at_decision=full.get("thesis_at_decision", ""),
+                sanity_results_at_decision=full.get("sanity_results_at_decision", {}),
+                what_actually_happened=full.get("what_actually_happened", ""),
+                price_path=full.get("price_path", []),
+                failure_category=full.get("failure_category", r.get("failure_category", "")),
+                root_cause=full.get("root_cause", r.get("root_cause", "")),
+                which_signals_were_wrong=full.get("which_signals_were_wrong", []),
+                which_signals_were_right=full.get("which_signals_were_right", []),
+                what_we_missed=full.get("what_we_missed", r.get("what_we_missed", "")),
+                recommended_fix=full.get("recommended_fix", r.get("recommended_fix", "")),
+                confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
+                generated_at=full.get("generated_at", ""),
+            ))
+        except Exception:
+            continue
+    return pms, excluded
 
 
 # ── Table Setup ───────────────────────────────────────────────────────────
@@ -1337,7 +1432,7 @@ def load_postmortems(
 
     results = []
     for r in rows:
-        results.append({
+        record = {
             "id": r[0],
             "trade_id": r[1],
             "prediction_id": r[2],
@@ -1352,7 +1447,12 @@ def load_postmortems(
             "full_analysis": _parse_json(r[11]),
             "confidence": float(r[12]) if r[12] is not None else None,
             "generated_at": r[13].isoformat() if r[13] else None,
-        })
+        }
+        # The return in a known unit, so no reader has to guess from
+        # ``full_analysis.actual_return`` (percent points for older prediction
+        # rows). None when it cannot be told.
+        record["actual_return_fraction"] = stored_return_fraction(record)
+        results.append(record)
 
     return results
 

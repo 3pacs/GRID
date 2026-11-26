@@ -28,7 +28,7 @@ def _record(generated_at: str, **overrides) -> dict:
         "signals_right": [],
         "what_we_missed": "",
         "recommended_fix": "",
-        "full_analysis": {"trade_id": 1, "ticker": "AAPL", "outcome": "LOSS"},
+        "full_analysis": {"trade_id": 1, "ticker": "AAPL", "outcome": "LOSS", "actual_return": -0.1},
         "confidence": 0.5,
         "generated_at": generated_at,
     }
@@ -128,7 +128,8 @@ class TestEndpointEmptyWindowGuard:
         still-useful prior cached summary."""
         prior_cache = {
             "lessons": {"text": "Cover puts before earnings.", "count": 5,
-                        "label": "LLM summary of 5 postmortems dated 2026-09-14 to 2026-09-18"},
+                        "label": "LLM summary of 5 postmortems dated 2026-09-14 to 2026-09-18",
+                        "return_units": "fraction"},
             "generated_at": "2026-09-24T13:03:00+00:00",
             "n": 5,
             "days": 30,
