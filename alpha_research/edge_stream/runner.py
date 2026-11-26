@@ -393,6 +393,14 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
                         {"registration": reg_sha[:16], "dry_run": "window not read"})
                     continue
                 if reg["lane"] == "forward":
+                    # a window that opens today or later has no completed session yet: nothing to
+                    # read, so no read is recorded and no source is asked (on 2026-11-26 a daily
+                    # source asked Polygon for start..yesterday, got a 400, and the registration
+                    # was charged a failure day)
+                    if date.fromisoformat(reg["window"]["start"]) >= today:
+                        summary["forward"].append({"registration": reg_sha[:16], "sessions": 0, "ready": False,
+                                                   "not_started": reg["window"]["start"]})
+                        continue
                     L.append_read(ledger, reg_sha, "progress", now.isoformat())
                     prog = _judged_by(ev, "forward_progress", reg, source, today, extras)
                     summary["forward"].append({"registration": reg_sha[:16], **prog})

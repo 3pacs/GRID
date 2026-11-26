@@ -243,7 +243,7 @@ class _Failing(StaticSource):
 def test_a_cap_is_not_counted_against_a_sealed_registration(tmp_path, monkeypatch):
     led, sha, prop = _sealed_forward(monkeypatch)
     for d in range(SP.FORWARD_FAILURE_DAYS_BEFORE_ABANDON + 2):
-        now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc) + timedelta(days=d)
+        now = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc) + timedelta(days=d)  # the window opens 11-16
         s = R.run_cycle(led, _Failing(RequestCapReached("cap"), today=now.date()), tmp_path, now=now, register=False)
         assert s["looks"] == [{"registration": sha[:16], "status": "deferred: request cap reached this cycle"}]
     assert not (tmp_path / "attempts.jsonl").exists() and not L.load_state(led).closed(sha)
@@ -253,7 +253,7 @@ def test_source_errors_abandon_a_sealed_registration_on_the_trees_day(tmp_path, 
     led, sha, prop = _sealed_forward(monkeypatch)
     limit = SP.FORWARD_FAILURE_DAYS_BEFORE_ABANDON
     for d in range(limit):
-        now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc) + timedelta(days=d)
+        now = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc) + timedelta(days=d)  # the window opens 11-16
         s = R.run_cycle(led, _Failing(SourceError("down"), today=now.date()), tmp_path, now=now, register=False)
         status = s["looks"][0]["status"]
         assert status == ("abandoned" if d == limit - 1 else f"retry later (failed on {d + 1} day(s))"), d
@@ -271,3 +271,16 @@ def test_readiness_and_date_coverage_match_the_tree(monkeypatch, today, end):
         sessions[t].pop("2026-11-26", None)
     src = StaticSource(sessions, today=today)
     assert R._judged_by(SR, "forward_progress", prop, src, today, None) == R.forward_progress(prop, src, today)
+
+
+def test_a_sealed_forward_window_that_has_not_started_is_not_read(tmp_path, monkeypatch):
+    led, sha, prop = _sealed_forward(monkeypatch)
+    assert prop["window"]["start"] == "2026-11-16"
+    called = []
+    monkeypatch.setattr(SR, "forward_progress", lambda *a, **k: called.append(1))
+    now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+    s = R.run_cycle(led, _Failing(SourceError("would be a failure day"), today=now.date()), tmp_path, now=now,
+                    register=False)
+    assert called == [] and s["looks"] == [] and s["abandoned"] == []
+    assert s["forward"] == [{"registration": sha[:16], "sessions": 0, "ready": False, "not_started": "2026-11-16"}]
+    assert L.load_state(led).reads.get(sha, set()) == set() and not (tmp_path / "attempts.jsonl").exists()
