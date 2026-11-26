@@ -76,6 +76,7 @@ def _count_candidates(engine, days: int = 30) -> tuple[int, int]:
             SELECT COUNT(*) FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict = 'miss'
               AND scored_at >= CURRENT_DATE - (:d || ' days')::interval
+              AND pnl_pct IS NOT NULL
               AND id NOT IN (SELECT prediction_id FROM trade_postmortems WHERE prediction_id IS NOT NULL)
         """), {"d": int(days)}).scalar() or 0)
     return n_trade, n_pred
@@ -159,6 +160,7 @@ def _worker_main() -> int:
             SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict = 'miss'
               AND scored_at >= CURRENT_DATE - (:d || ' days')::interval
+              AND pnl_pct IS NOT NULL
               AND id NOT IN (SELECT prediction_id FROM trade_postmortems WHERE prediction_id IS NOT NULL)
               AND MOD(ABS(HASHTEXT(id::text)), :n) = :i
             ORDER BY scored_at DESC
@@ -182,8 +184,10 @@ def _worker_main() -> int:
         if max_rows is not None and processed >= max_rows:
             break
         try:
-            generate_prediction_postmortem(engine, pid)
-            processed += 1
+            # A skipped prediction (None: no recorded return, not a failure) wrote nothing,
+            # so it must not spend the --max-rows budget (Codex hold on #1486).
+            if generate_prediction_postmortem(engine, pid) is not None:
+                processed += 1
         except Exception as exc:  # noqa: BLE001
             log.debug("worker {i} pred {p} failed: {e}", i=idx, p=pid, e=str(exc))
 
