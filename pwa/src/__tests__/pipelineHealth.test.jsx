@@ -33,6 +33,39 @@ describe('PipelineHealth availability contract', () => {
         expect(screen.queryByText('Total Sources')).toBeNull();
     });
 
+    it('says recent errors are unreadable without blanking the summary (#959)', async () => {
+        api.getPipelineHealth.mockResolvedValue({
+            summary: { total_sources: 1, healthy: 1, stale: 0, broken: 0 },
+            sources: [],
+            coverage: {},
+            recent_errors: [],
+            resolver_status: {},
+            availability: 'available',
+            stale_reason: null,
+            recent_errors_availability: 'unavailable',
+            recent_errors_stale_reason: 'consumer_query_mismatch',
+        });
+
+        render(<PipelineHealth />);
+
+        const line = await screen.findByTestId('recent-errors-unavailable');
+        expect(line).toHaveTextContent('Recent errors unavailable: query/schema mismatch');
+        expect(screen.getByText('Total Sources')).toBeTruthy();
+        expect(screen.queryByText(/Pipeline health unavailable/)).toBeNull();
+    });
+
+    it('does not claim recent errors are unavailable when the feed was read (#959)', async () => {
+        api.getPipelineHealth.mockResolvedValue({
+            summary: { total_sources: 1, healthy: 1, stale: 0, broken: 0 },
+            sources: [], coverage: {}, recent_errors: [], resolver_status: {},
+            availability: 'available', stale_reason: null,
+            recent_errors_availability: 'available', recent_errors_stale_reason: null,
+        });
+        render(<PipelineHealth />);
+        await screen.findByText('Total Sources');
+        expect(screen.queryByTestId('recent-errors-unavailable')).toBeNull();
+    });
+
     it('renders normal summary tiles when available', async () => {
         api.getPipelineHealth.mockResolvedValue({
             summary: { total_sources: 1, healthy: 1, stale: 0, broken: 0 },

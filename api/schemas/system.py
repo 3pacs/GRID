@@ -237,6 +237,12 @@ class PipelineHealthResponse(BaseModel):
     sources: list[PipelineSourceStatus] = []
     coverage: dict[str, Any] = {}
     recent_errors: list[PipelineError] = []
+    # The recent-errors list is its own sub-feed. When it cannot be read (e.g.
+    # its source table is missing) these say so, and the rest of the response
+    # keeps its own availability: an empty list with "available" means "no
+    # recent errors", an empty list with "unavailable" means "not readable".
+    recent_errors_availability: str = "available"
+    recent_errors_stale_reason: str | None = None
     resolver_status: ResolverStatus = ResolverStatus()
     # Contract addition: whole-response availability. "available" (default,
     # preserves prior behaviour) unless the pipeline-health query itself

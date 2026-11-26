@@ -433,7 +433,7 @@ export default function PipelineHealth() {
         );
     }
 
-    const { summary = {}, coverage = {}, recent_errors = [], resolver_status = {}, availability, stale_reason, daily_audit } = data || {};
+    const { summary = {}, coverage = {}, recent_errors = [], resolver_status = {}, availability, stale_reason, daily_audit, recent_errors_availability, recent_errors_stale_reason } = data || {};
     const byFamily = coverage.by_family || {};
     const isUnavailable = availability === 'unavailable';
     const dailyAudit = daily_audit || {};
@@ -715,6 +715,15 @@ export default function PipelineHealth() {
             </div>
 
             {/* ── Error Log ──────────────────────────────────────── */}
+            {/* An unreadable error feed is not an empty one; the rest of the page keeps its own state. */}
+            {recent_errors_availability === 'unavailable' && (
+                <div style={s.section}>
+                    <div style={s.sectionTitle}>RECENT ERRORS</div>
+                    <div data-testid="recent-errors-unavailable" style={{ ...s.card, color: colors.textMuted }}>
+                        Recent errors unavailable: {staleReasonText(recent_errors_stale_reason) || 'unknown reason'}
+                    </div>
+                </div>
+            )}
             {recent_errors.length > 0 && (
                 <div style={s.section}>
                     <div style={s.sectionTitle}>RECENT ERRORS ({recent_errors.length})</div>

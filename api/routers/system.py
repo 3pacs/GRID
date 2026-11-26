@@ -947,6 +947,9 @@ def pipeline_health(
     recent_errors: list[PipelineError] = []
     resolver = ResolverStatus()
     query_failed_reason: str | None = None
+    # Recent errors are a separate sub-feed: when it cannot be read it reports
+    # itself unavailable and does not blank the rest of the response.
+    recent_errors_reason: str | None = None
     status_basis = "pull_log+raw_series"
 
     try:
@@ -1079,8 +1082,8 @@ def pipeline_health(
                         message=row[2] or "",
                     ))
             except Exception as exc:
-                log.debug("Pipeline: server_log table unavailable: {e}", e=str(exc))
-                query_failed_reason = query_failed_reason or _classify_query_failure(exc)
+                log.debug("Pipeline: recent-errors read failed (server_log): {e}", e=str(exc))
+                recent_errors_reason = _classify_query_failure(exc)
 
             # ── Resolver status ────────────────────────────────────────
             try:
@@ -1162,6 +1165,10 @@ def pipeline_health(
         sources=sources,
         coverage=coverage,
         recent_errors=recent_errors,
+        recent_errors_availability=(
+            FIELD_AVAILABILITY_UNAVAILABLE if recent_errors_reason else FIELD_AVAILABILITY_AVAILABLE
+        ),
+        recent_errors_stale_reason=recent_errors_reason,
         resolver_status=resolver,
         availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
         stale_reason=query_failed_reason,
