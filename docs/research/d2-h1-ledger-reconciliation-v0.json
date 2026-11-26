@@ -34,7 +34,9 @@
    "gex.bounce_shadow",
    "gex.fly_shadow",
    "gex.desk_state_ark",
-   "gex.burnin_v2_nvda_watch_gex_trader"
+   "gex.burnin_v2_nvda_watch_gex_trader",
+   "gex.gamma_vol_part1",
+   "gex.gamma_vol_part2"
   ],
   "needs_a_decision": "Section 6.2 strikes a cell if the SPY option-premium family, entry time or contract scope was tested on 2018..2022-11. Reviewer position (Codex review 6068505242 at 0e109fad): the SPXW fly is the same selection family for 6.2; strike D2-H1b (15:00) and keep D2-H1a (14:00) off the fetch manifest too, because reported-only inspection is still inspection; record the owner decision in a versioned contract; any replication must be explicitly non-independent and separately authorized, never called untouched. Owner position (Claude): agree with the reviewer. The versioned contract revision is not yet made and the operator has been asked; this file does not decide it.",
   "owner_position": "AGREES_WITH_REVIEWER",
@@ -360,14 +362,31 @@
    "listed_in_contract_section_4": "NO",
    "note": "code only: no record file and no pre-2022 date constants found; read for dates, not for behaviour",
    "source": "burnin-v2, nvda-watch, gex-trader sources"
-  }
- ],
- "not_read": [
+  },
   {
-   "id": "gex.gamma_vol (optflow)",
-   "reason": "the directory is on branch docs/gamma-ladder-defs-20261118, not in the checkout read; the lane's data note says it holds the trailing free year only; unconfirmed"
+   "id": "gex.gamma_vol_part1",
+   "family": "dealer gamma against next-session volatility, exploratory regression and ladder look",
+   "instrument": "SPY options (own capture), SPY bars",
+   "data_kind": "OPTION_PREMIUM",
+   "window": "option data: trailing free year only (first fetched session 2025-11-19, sessions end 2026-11-09); regression sessions 2022-11-14..2026-11-09",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "no SPY option premium before 2022-11-14; read from its branch (docs/gamma-ladder-defs-20261118) on 2026-11-26",
+   "source": "gamma-vol defs, addendum 1, exploratory record"
+  },
+  {
+   "id": "gex.gamma_vol_part2",
+   "family": "long index-gamma series against volatility over the next 1, 5 and 21 sessions (judged)",
+   "instrument": "daily index-gamma series (DIX/GEX) against VIX",
+   "data_kind": "DAILY_OR_WEEKLY_PRICE",
+   "window": "fit through 2019-12-31; check 2020-01-02..2026-11-17",
+   "overlaps_target_window": true,
+   "listed_in_contract_section_4": "NO",
+   "note": "a judged look on daily series over most of the target window's dates; no option premium traded or priced; different family and instrument; not in section 4",
+   "source": "gamma-vol look_part2 (docs/gamma-ladder-defs-20261118)"
   }
  ],
+ "not_read": [],
  "limits": [
   "Built from the GEX research lane's records as read on 2026-11-26; that repository is private, so only ids, windows and verdict classes are copied here.",
   "A row marked False for overlap was read for its window, not re-run.",

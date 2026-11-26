@@ -12,7 +12,7 @@ was.
 
 1. **No SPY option premium before 2022-11-14 has ever been fetched.** The four OPRA fetchers in the research lane (edge2,
    edge4, edge6 XSP, edge6 SPXW) start SPY and XSP at 2022-11-14. Only SPXW starts earlier, at 2016-11-15.
-2. **Section 4 of the contract is incomplete.** It omits fifteen records that exist in the lane (the JSON lists each).
+2. **Section 4 of the contract is incomplete.** It omits seventeen records that exist in the lane (the JSON lists each).
    Four bear on the target window: edge6-SPX, edge9, eod-flows and the playbook evidence cuts (below). Edge10, edge11 and
    edge12 share dates but are different families and instruments. The rest are later than the window or forward-only.
 3. **One judged look is on the target window's sessions with the same strategy:** the edge6 follow-up that ran the 15:00
@@ -41,11 +41,11 @@ Section 6.2: "if reconciliation finds an overlap, that cell is struck before the
 
 ## Not read
 
-Eight of the nine items first listed as unread are now read: the forward shadows (fly, bounce, overnight), the trailing-exit
-registration, the ARK desk-state results (2023 onward) and three operational servers (no historical window, no pre-2022 date
-constants) do not touch the target window. **Still unconfirmed: gamma-vol (optflow)**, which lives on another branch that was
-not in the checkout read; the lane's data note says it holds the trailing free year only. The reconciliation is therefore
-complete except for that one item.
+None remain. The last item, gamma-vol (optflow), was read from its branch on 2026-11-26: its option data is the free
+trailing year only (from 2025-11-19), so it holds no SPY option premium before 2022-11-14. Its second look is a judged
+regression of a long daily index-gamma series against volatility, with a fit through 2019-12-31 and a check from 2020-01-02
+to 2026-11-17. That is a daily-series look over most of the target window's dates, not an option-premium look, so it is
+disclosed beside edge3 and edge9 and does not change the same-family finding.
 
 ## Limits
 
