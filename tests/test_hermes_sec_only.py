@@ -744,6 +744,13 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # 84-124 s) with a trailing comment. etf_flows stays at 120. No SEC,
         # FINRA or dispatch code changes. Needs reviewer acceptance like the
         # prior pins.
+        # SCHED re-pinned da7202ec -> 79bf6899 (2026-11-26,
+        # claude/etf-flows-timeout-600-20261126, on main 7686d834): the only
+        # scheduler edit is PULLER_REGISTRY data -- etf_flows timeout_s
+        # 120 -> 600 (full 13F read 346 s; the #1409 re-run dedupe it waited
+        # for is in the running scheduler) with a trailing comment. No SEC,
+        # FINRA or dispatch code changes. Needs reviewer acceptance like the
+        # prior pins.
         # OPER re-pinned 7a85e9a0 -> 754dfee2 (2026-11-22,
         # claude/hermes-weekly-due-20261122): the Sunday weekly block leaves
         # run_intelligence_tasks for its own step (_run_weekly_intel_step,
@@ -758,7 +765,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','da7202ecac77ff70a548ad2b9cc8bbf05137ccdea00b2870778f24fb90557a72')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','79bf689940069c2c7f1c61011bf6c0056db7c4eb1fe6ad542526e5eaec52a026')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
