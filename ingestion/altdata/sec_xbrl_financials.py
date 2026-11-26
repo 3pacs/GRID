@@ -408,6 +408,23 @@ def company_facts_not_found(cik_padded: str) -> bool:
     return cik_padded in _COMPANY_FACTS_NOT_FOUND
 
 
+def _stored_snapshot_actors(engine: Any) -> frozenset[str] | None:
+    """``actor_id`` of every issuer that has a stored SEC financial snapshot.
+
+    ``None`` when the heads could not be read: that is "unknown", never an
+    empty set. A covered issuer cannot be told from a symbol that never filed
+    without it, so the caller must not report a CIK-less symbol as checked.
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT actor_id FROM sec_financial_snapshot_heads")).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("SEC_XBRL: stored snapshot actors unreadable ({e}); CIK-less symbols are not classified this run",
+                    e=type(exc).__name__)
+        return None
+    return frozenset(str(r[0]) for r in rows if r and r[0])
+
+
 def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
     """Capture original successful response bytes and actual request boundaries."""
     from ingestion.altdata.sec_financial_snapshots import MAX_SOURCE_BYTES
@@ -1000,6 +1017,7 @@ def _load_checkpoint() -> dict[str, Any]:
 
 def _save_checkpoint(
     completed: list[str], last_ticker: str, total_rows: int, attempted: list[str],
+    deferred: list[str] | None = None,
 ) -> None:
     """Atomically write checkpoint to /tmp."""
     from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION
@@ -1009,6 +1027,7 @@ def _save_checkpoint(
         "last_ticker": last_ticker,
         "completed": completed,
         "attempted": attempted,
+        "deferred": deferred or [],
         "total_rows": total_rows,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1091,6 +1110,22 @@ class SECXBRLFinancialsPuller:
             # after every issuer succeeded. Failure never means completion.
             checkpoint, already_done, already_attempted = {}, set(), set()
         total_rows_before: int = int(checkpoint.get("total_rows") or 0)
+        # Issuers that already have a stored snapshot: one of them missing from
+        # the SEC ticker file is a lost CIK (rename, delisting, a truncated
+        # file), not a symbol that never filed. None = the heads could not be
+        # read, so no CIK-less symbol can be classified this run.
+        covered_actors = _stored_snapshot_actors(self.engine)
+        # Symbols a run could not classify (heads unreadable): neither attempted
+        # nor retried ahead of the rest of the sweep, so a degraded heads read
+        # cannot make bounded runs revisit the same window forever. They are
+        # retried once every other symbol of the sweep has been attempted.
+        deferred: set[str] = set(checkpoint.get("deferred") or [])
+        pending = [t for t in universe if t not in already_attempted]
+        if covered_actors is not None or (pending and deferred and all(t in deferred for t in pending)):
+            # The heads are readable again (the reason for the deferral is gone), or
+            # only deferred symbols remain: retry them now.
+            deferred = set()
+        carried = frozenset(deferred)        # still deferred from earlier runs; skipped this run
 
         # Pre-load FX rates once so every ticker's facts can convert
         # non-USD amounts to USD without a DB hit per row.
@@ -1113,6 +1148,9 @@ class SECXBRLFinancialsPuller:
         processed = 0
         rows_this_run = 0
         tolerated_total = 0
+        no_cik_tickers: list[str] = []
+        cik_lost = 0
+        coverage_unavailable = 0
         completed_list: list[str] = sorted(already_done)
         attempted_list: list[str] = sorted(already_attempted)
 
@@ -1121,7 +1159,7 @@ class SECXBRLFinancialsPuller:
             if success:
                 completed_list.append(ticker)
             _save_checkpoint(completed_list.copy(), ticker, total_rows_before + rows_this_run,
-                             attempted_list.copy())
+                             attempted_list.copy(), deferred=sorted(deferred))
 
         for ticker in universe:
             if limit is not None and processed >= limit:
@@ -1131,17 +1169,47 @@ class SECXBRLFinancialsPuller:
                 log.warning("SEC_XBRL: runtime cap reached — stopping")
                 break
 
-            if ticker in already_attempted:
+            if ticker in already_attempted or ticker in deferred:
                 continue
 
             actor_id = ticker.lower()
             cik_padded = cik_map.get(ticker)
             if not cik_padded:
-                log.info("SEC_XBRL: {t} has no CIK — skip", t=ticker)
-                results.append({
-                    "ticker": ticker, "status": "NO_CIK", "rows": 0,
-                })
                 processed += 1
+                if covered_actors is None:
+                    # Unknown, not "never filed": a visible failed item, NOT
+                    # recorded as attempted, and deferred behind the rest of the
+                    # sweep so it is retried without starving later issuers.
+                    log.warning("SEC_XBRL: {t} has no CIK and the stored snapshot heads are unreadable — deferred", t=ticker)
+                    coverage_unavailable += 1
+                    deferred.add(ticker)
+                    _save_checkpoint(completed_list.copy(), ticker, total_rows_before + rows_this_run,
+                                     attempted_list.copy(), deferred=sorted(deferred))
+                    results.append({
+                        "ticker": ticker, "status": "FAILED", "rows": 0,
+                        "error": "coverage check unavailable: stored snapshot heads could not be read; retried later in the sweep",
+                    })
+                    continue
+                if actor_id in covered_actors:
+                    # A covered issuer must not look like a symbol that never
+                    # filed: it is reported as a failed item with its reason.
+                    log.warning("SEC_XBRL: {t} has a stored snapshot but no CIK in the SEC ticker file", t=ticker)
+                    cik_lost += 1
+                    results.append({
+                        "ticker": ticker, "status": "FAILED", "rows": 0,
+                        "error": "CIK lost: a stored snapshot exists but the ticker is not in the SEC ticker file",
+                    })
+                else:
+                    log.info("SEC_XBRL: {t} has no CIK — skip", t=ticker)
+                    no_cik_tickers.append(ticker)
+                    # NO_DATA is the pullers' "checked, nothing to fetch" leaf
+                    # that the outcome classifier already counts as a checked
+                    # item (ingestion/smart_scheduler.py); ``reason`` keeps the
+                    # specific cause. It used to be a status of its own,
+                    # NO_CIK, which the classifier logged as an item failure.
+                    results.append({
+                        "ticker": ticker, "status": "NO_DATA", "reason": "NO_CIK", "rows": 0,
+                    })
                 record_attempt(ticker)
                 continue
 
@@ -1183,16 +1251,34 @@ class SECXBRLFinancialsPuller:
             tolerated_total += snapshot.tolerated_legacy_entries
             record_attempt(ticker, success=True)
 
+        if carried:
+            # Deferred coverage from earlier runs is still unresolved and was skipped
+            # this run so later symbols could make progress. It must not read as a
+            # clean run: one explicit incomplete item carries the count (the
+            # scheduler classifies per item and ignores SUMMARY counts).
+            log.warning("SEC_XBRL: {n} symbol(s) deferred by earlier runs are still unresolved", n=len(carried))
+            results.append({
+                "status": "FAILED", "rows": 0,
+                "error": (f"coverage incomplete: {len(carried)} symbol(s) deferred because the stored snapshot "
+                          "heads were unreadable are still unresolved"),
+            })
+
         elapsed = time.monotonic() - start_ts
         log.info(
-            "SEC_XBRL complete — {p} tickers, {r} rows, {t} unusable legacy entries tolerated, {e:.1f}s",
-            p=processed, r=rows_this_run, t=tolerated_total, e=elapsed,
+            "SEC_XBRL complete — {p} tickers, {r} rows, {t} unusable legacy entries tolerated, "
+            "{n} without a CIK, {c} covered issuers with a lost CIK, {e:.1f}s",
+            p=processed, r=rows_this_run, t=tolerated_total, n=len(no_cik_tickers), c=cik_lost, e=elapsed,
         )
         results.append({
             "status": "SUMMARY",
             "tickers_processed": processed,
             "rows_written": rows_this_run,
             "tolerated_legacy_entries": tolerated_total,
+            "no_cik": len(no_cik_tickers),
+            "no_cik_tickers": no_cik_tickers[:50],
+            "cik_lost": cik_lost,
+            "coverage_check_unavailable": coverage_unavailable,      # new this run
+            "coverage_deferred_outstanding": len(carried),           # carried from earlier runs
             "elapsed_seconds": round(elapsed, 1),
         })
         return results
