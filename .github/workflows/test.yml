@@ -250,7 +250,7 @@ jobs:
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
-        run: python -m pytest tests/test_etf_flows_single_writer_20261126.py -q -rA -k second_real_session
+        run: python -m pytest tests/test_etf_flows_single_writer_20261126.py -q -rA -k real_session
 
       # Stored-close backfill (scripts/close_backfill_universe.py): the work
       # queries, the completed-close reader and the fill-only write on

@@ -23,9 +23,11 @@ after the reads, ``deadline_at`` and a resume point.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -228,14 +230,9 @@ def test_the_run_lock_key_is_distinct_from_the_change_row_locks() -> None:
 
 @pytest.mark.xdist_group("postgres")
 def test_a_second_real_session_skips_while_the_first_holds_the_lock(monkeypatch) -> None:
-    url = os.environ.get("GRID_TEST_DB_URL")
-    if not url:
-        if os.environ.get("REQUIRE_ETF_FLOWS_LOCK_PG") == "1":
-            pytest.fail("GRID_TEST_DB_URL is required for the 13F run-lock PG proof (REQUIRE_ETF_FLOWS_LOCK_PG=1)")
-        pytest.skip("GRID_TEST_DB_URL is required for the PostgreSQL lock proof")
     from sqlalchemy import create_engine, text
 
-    engine = create_engine(url)
+    engine = create_engine(_pg_url())
     try:
         holder = engine.connect()
         assert holder.execute(text("SELECT pg_try_advisory_lock(:k)"),
@@ -251,6 +248,223 @@ def test_a_second_real_session_skips_while_the_first_holds_the_lock(monkeypatch)
         assert puller._pull_13f_filings() == [] and ran == [1]
     finally:
         engine.dispose()
+
+
+# ── 3b. The release is confirmed, or the session is ended ──────────────────
+#
+# Codex review 6080519392: a pooled close() after a failed unlock only checks
+# the connection in; the backend session keeps the session-level lock and
+# every later pass skips.
+
+class _ScriptedConn:
+    """A lock connection whose acquire / unlock / commit outcomes are scripted."""
+
+    def __init__(self, *, acquire=True, unlock=True, commit_fails_on: int | None = None,
+                 invalidate_fails: bool = False) -> None:
+        self.acquire, self.unlock = acquire, unlock
+        self.commit_fails_on, self.invalidate_fails = commit_fails_on, invalidate_fails
+        self.sent: list[str] = []
+        self.commits = 0
+        self.closed = self.invalidated = False
+
+    def execute(self, sql, params=None):
+        statement = str(sql)
+        self.sent.append(statement)
+        outcome = self.unlock if "pg_advisory_unlock" in statement else self.acquire
+        if isinstance(outcome, Exception):
+            raise outcome
+        return type("R", (), {"scalar": lambda _s: outcome})()
+
+    def commit(self) -> None:
+        self.commits += 1
+        if self.commit_fails_on == self.commits:
+            raise RuntimeError("commit failed")
+
+    def invalidate(self) -> None:
+        self.invalidated = True
+        if self.invalidate_fails:
+            raise RuntimeError("invalidate failed")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _locked_run(monkeypatch, conn: _ScriptedConn):
+    puller = _with_engine(_Engine(conn))
+    ran: list[int] = []
+    monkeypatch.setattr(puller, "_pull_13f_managers", lambda *_a, **_k: ran.append(1) or [], raising=False)
+    return puller, ran
+
+
+def test_a_confirmed_release_is_an_ordinary_check_in(monkeypatch) -> None:
+    conn = _ScriptedConn()
+    puller, ran = _locked_run(monkeypatch, conn)
+    assert puller._pull_13f_filings() == [] and ran == [1]
+    assert conn.closed and not conn.invalidated
+
+
+@pytest.mark.parametrize("conn", [
+    _ScriptedConn(unlock=False),                                # this session did not hold it
+    _ScriptedConn(unlock=None),
+    _ScriptedConn(unlock=RuntimeError("unlock statement failed")),
+    _ScriptedConn(commit_fails_on=2),                           # the commit after the unlock
+], ids=["unlock_false", "unlock_none", "unlock_raises", "commit_after_unlock_raises"])
+def test_an_unconfirmed_release_ends_the_session(monkeypatch, conn) -> None:
+    puller, ran = _locked_run(monkeypatch, conn)
+    assert puller._pull_13f_filings() == [] and ran == [1]      # the pass itself ran and is reported
+    assert conn.invalidated and conn.closed
+
+
+def test_an_unconfirmed_release_after_a_failed_pass_ends_the_session_and_keeps_the_error(monkeypatch) -> None:
+    conn = _ScriptedConn(unlock=RuntimeError("unlock statement failed"))
+    puller = _with_engine(_Engine(conn))
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("EDGAR down")
+
+    monkeypatch.setattr(puller, "_pull_13f_managers", _boom, raising=False)
+    with pytest.raises(RuntimeError, match="EDGAR down"):
+        puller._pull_13f_filings()
+    assert conn.invalidated and conn.closed
+
+
+@pytest.mark.parametrize("conn,raises", [
+    (_ScriptedConn(acquire=RuntimeError("acquire statement failed")), True),
+    (_ScriptedConn(commit_fails_on=1), True),                   # the commit after the acquire
+    (_ScriptedConn(acquire=None), False),                       # neither true nor false
+], ids=["acquire_raises", "commit_after_acquire_raises", "acquire_none"])
+def test_an_uncertain_acquisition_ends_the_session_and_runs_nothing(monkeypatch, conn, raises) -> None:
+    puller, ran = _locked_run(monkeypatch, conn)
+    if raises:
+        with pytest.raises(RuntimeError):
+            puller._pull_13f_filings()
+    else:
+        (out,) = puller._pull_13f_filings()
+        assert out["status"] == "SKIPPED"
+    assert ran == [] and conn.invalidated and conn.closed
+
+
+def test_a_lock_held_elsewhere_is_an_ordinary_check_in(monkeypatch) -> None:
+    conn = _ScriptedConn(acquire=False)
+    puller, ran = _locked_run(monkeypatch, conn)
+    (out,) = puller._pull_13f_filings()
+    assert out["status"] == "SKIPPED" and ran == []
+    assert conn.closed and not conn.invalidated                # this session holds nothing
+
+
+def test_a_failed_invalidate_does_not_mask_the_pass_and_still_closes(monkeypatch) -> None:
+    conn = _ScriptedConn(unlock=False, invalidate_fails=True)
+    puller, ran = _locked_run(monkeypatch, conn)
+    assert puller._pull_13f_filings() == [] and ran == [1]
+    assert conn.invalidated and conn.closed
+
+
+# ── 3c. Every caller of the 13F writer goes through the run lock ───────────
+
+def test_both_public_13f_entry_points_take_the_run_lock(monkeypatch) -> None:
+    """pull_all is the scheduled smart:etf_flows run; pull_13f_only is the
+    ingestion scheduler's weekly SEC_13F job and its monthly path."""
+    for call in ("pull_13f_only", "pull_all"):
+        conn = _ScriptedConn(acquire=False)
+        puller, ran = _locked_run(monkeypatch, conn)
+        monkeypatch.setattr(puller, "_get_latest_date", lambda _sid: None, raising=False)
+        monkeypatch.setattr(puller, "_pull_etf_flows", lambda _s, _e, _budget=None: [], raising=False)
+        out = getattr(puller, call)()
+        assert [r["status"] for r in out] == ["SKIPPED"], call
+        assert ran == [] and "pg_try_advisory_lock" in conn.sent[0], call
+
+
+def test_nothing_outside_the_puller_reaches_the_13f_pass_without_the_lock() -> None:
+    """Callers by source: the registry entry (pull_all), the ingestion
+    scheduler's weekly and monthly jobs (pull_13f_only). The Hermes repair is
+    held out (section 1). No other module calls the inner pass or the wrapper."""
+    root = Path(inst.__file__).resolve().parents[2]
+    module = Path(inst.__file__).resolve()
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        parts = path.relative_to(root).parts
+        if path == module or parts[0] in ("tests", ".venv", "node_modules") or "site-packages" in parts:
+            continue
+        source = path.read_text(errors="ignore")
+        if "_pull_13f_managers" in source or "_pull_13f_filings" in source:
+            offenders.append(str(path.relative_to(root)))
+    assert offenders == []
+
+    scheduler = (root / "ingestion" / "scheduler.py").read_text()
+    calls = [line.strip() for line in scheduler.splitlines()
+             if "InstitutionalFlowsPuller(" in line or "puller.pull_13f" in line]
+    assert any('"pull_13f_only"' in line for line in calls) and any("pull_13f_only()" in line for line in calls)
+    assert _entry()["method"] == "pull_all"
+
+    inner_callers = [
+        fn.name for fn in ast.walk(ast.parse(module.read_text())) if isinstance(fn, ast.FunctionDef)
+        and any(isinstance(n, ast.Attribute) and n.attr == "_pull_13f_managers" for n in ast.walk(fn))
+    ]
+    assert inner_callers == ["_pull_13f_filings"]
+
+
+class _FailingUnlock:
+    """A real connection whose unlock statement fails; invalidate() optional."""
+
+    def __init__(self, real, invalidate: bool) -> None:
+        self._real, self._invalidate = real, invalidate
+
+    def execute(self, sql, params=None):
+        if "pg_advisory_unlock" in str(sql):
+            raise RuntimeError("forced unlock failure")
+        return self._real.execute(sql, params)
+
+    def commit(self) -> None:
+        self._real.commit()
+
+    def invalidate(self) -> None:
+        if self._invalidate:
+            self._real.invalidate()
+
+    def close(self) -> None:
+        self._real.close()
+
+
+def _pg_url() -> str:
+    url = os.environ.get("GRID_TEST_DB_URL")
+    if not url:
+        if os.environ.get("REQUIRE_ETF_FLOWS_LOCK_PG") == "1":
+            pytest.fail("GRID_TEST_DB_URL is required for the 13F run-lock PG proof (REQUIRE_ETF_FLOWS_LOCK_PG=1)")
+        pytest.skip("GRID_TEST_DB_URL is required for the PostgreSQL lock proof")
+    return url
+
+
+@pytest.mark.xdist_group("postgres")
+@pytest.mark.parametrize("invalidate", [True, False], ids=["session_ended", "control_pooled_close_only"])
+def test_after_a_failed_unlock_a_second_real_session_gets_the_lock_only_if_the_first_was_ended(
+    monkeypatch, invalidate
+) -> None:
+    """The hazard and its fix on real PostgreSQL. The pooled engine keeps the
+    backend session after close(); only ending it frees a session-level lock."""
+    from sqlalchemy import create_engine, text
+
+    pooled = create_engine(_pg_url(), pool_size=1, max_overflow=0)
+    other = create_engine(_pg_url())
+    try:
+        real_connect = pooled.connect
+        monkeypatch.setattr(pooled, "connect", lambda: _FailingUnlock(real_connect(), invalidate), raising=False)
+        puller = _with_engine(pooled)
+        ran: list[int] = []
+        monkeypatch.setattr(puller, "_pull_13f_managers", lambda *_a, **_k: ran.append(1) or [], raising=False)
+
+        assert puller._pull_13f_filings() == [] and ran == [1]
+
+        with other.connect() as second:
+            got = second.execute(text("SELECT pg_try_advisory_lock(:k)"),
+                                 {"k": inst._13F_RUN_LOCK_KEY}).scalar()
+            if got:
+                second.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": inst._13F_RUN_LOCK_KEY})
+        # With the session ended the lock is free. Without it (what a pooled
+        # close() alone does) the idle pooled session still holds it.
+        assert got is invalidate
+    finally:
+        pooled.dispose()
+        other.dispose()
 
 
 def test_a_repull_command_for_etf_flows_runs_nothing_and_records_no_cooldown(monkeypatch) -> None:

@@ -555,6 +555,20 @@ _REQUEST_TIMEOUT: int = 30
 # A request started just before the run's deadline still gets this long.
 _MIN_REQUEST_TIMEOUT: float = 1.0
 
+# The run budget's clock. One name so a test can replay a run on a fake clock.
+_monotonic = time.monotonic
+
+
+class _BudgetSpent(RuntimeError):
+    """Raised instead of starting a 13F request once the run budget is spent.
+
+    Deliberately not a ``requests`` / ``OSError`` / ``ValueError``: the
+    fetchers turn those into "could not be read" snapshots and
+    ``retry_on_failure`` retries them. This one passes through both, so a
+    request refused for lack of time is never recorded as a finding about a
+    filing and is never retried.
+    """
+
 
 class _RunBudget:
     """The caller's time budget for one run.
@@ -579,22 +593,38 @@ class _RunBudget:
         self._deadline_at = deadline_at
 
     def spent(self) -> bool:
-        if self._deadline_at is not None and time.monotonic() >= self._deadline_at:
+        if self._deadline_at is not None and _monotonic() >= self._deadline_at:
             return True
         return self._should_continue is not None and not self._should_continue()
 
     def request_timeout(self) -> float:
-        """``_REQUEST_TIMEOUT``, cut to what is left before the deadline."""
+        """``_REQUEST_TIMEOUT``, cut to what is left before the deadline.
+
+        A socket timeout, not a wall clock: it bounds connect and each read,
+        and a request already in flight can outlast the deadline. What keeps
+        the run inside its budget is that no request *starts* after it
+        (``InstitutionalFlowsPuller._edgar_get``); how far a request or a
+        commit in flight ran past it is reported by ``overrun_s``.
+        """
         if self._deadline_at is None:
             return float(_REQUEST_TIMEOUT)
-        left = self._deadline_at - time.monotonic()
+        left = self._deadline_at - _monotonic()
         return max(_MIN_REQUEST_TIMEOUT, min(float(_REQUEST_TIMEOUT), left))
+
+    def overrun_s(self) -> float | None:
+        """Seconds past ``deadline_at`` now; None when no deadline was given."""
+        if self._deadline_at is None:
+            return None
+        return round(max(0.0, _monotonic() - self._deadline_at), 3)
 
 
 def _budget_stop(feature: str, what: str, read: int, total: int, **extra: Any) -> dict[str, Any]:
     """The result item for a run that stopped itself at its caller's deadline.
 
-    PARTIAL, never SUCCESS: the items after the stop were not read.
+    PARTIAL, never SUCCESS: the items after the stop were not read. ``extra``
+    carries where the stop was noticed (``stopped_phase``) and how far past
+    the deadline the run was by then (``deadline_overrun_s``): the length of
+    the request or commit that was in flight when the deadline passed.
     """
     return {
         "feature": feature,
@@ -625,20 +655,53 @@ def _from_resume_point(managers: list[tuple[str, str]], resume_cik: str | None) 
     return managers
 
 
-def _snapshot_fetch_failure(snap: FilingSnapshot) -> str | None:
-    """``fetch_failed:<kind>`` when a failed fetch is why ``snap`` is incomplete.
+# What counts as "read in full" for a withheld comparison (Codex review
+# 6080519392). A side is read in full when it is complete, or when its status
+# is one of these: each is a finding that rests on documents that were fetched
+# and parsed. Everything else (a failed or refused fetch, a document that did
+# not parse, a status not listed here) is not a finding about the filing.
+READ_IN_FULL_NOT_COMPARABLE: frozenset[str] = frozenset({
+    "entry_count_mismatch",                 # cover and table parsed; their entry counts disagree
+    "unreadable_entries",                   # table parsed; some of its entries are not holdings
+    "missing_cover_page",                   # the filing's index was read and lists no cover page
+    "missing_infotable",                    # index and cover read; no document holds table entries
+    "missing_report_period",                # cover parsed; it states no period
+    "report_date_mismatch",                 # cover parsed; its period is not the index's
+    "form_mismatch",                        # cover parsed; its form is not the index's
+    "amendment_not_verified_restatement",   # cover parsed; not a restatement
+    "amendment_flag_mismatch",              # cover parsed; it says amendment, the index does not
+    "missing_table_entry_total",            # cover parsed; it states no entry count
+    "additive_supplement_not_merged",       # a later amendment's cover was parsed as NEW HOLDINGS
+})
+# An amendment's own cover, when that is what the side's status rests on.
+AMENDMENT_COVER_READ: frozenset[str] = frozenset({
+    "missing_filing_index",                 # 404/410 on the amendment's index
+    "missing_cover_page",
+    "cover_not_an_amendment",
+    "report_date_mismatch",
+    "unknown_amendment_type",
+    "no_report_period",
+})
 
-    A filing that was read and is incomplete in itself (entry-count mismatch,
-    no cover page, an additive supplement) returns None: reading it again
-    gives the same answer. A failed fetch is this run's failure and the next
-    run may succeed.
+
+def _not_read_in_full(snap: FilingSnapshot) -> str | None:
+    """Why ``snap`` is not a read-in-full side of a filing pair, or None if it is.
+
+    A withheld pair is a finished check only when this is None for both
+    sides: reading again would give the same answer. Otherwise the run did
+    not establish what the filing says (the fetch failed or was refused, a
+    document did not parse) and the next run may.
     """
-    reasons = [
-        snap.status,
-        str(snap.evidence.get("classification_reason") or ""),
-        *(str(u.get("reason") or "") for u in snap.evidence.get("unresolved_amendments") or []),
-    ]
-    return next((r for r in reasons if r.startswith("fetch_failed:")), None)
+    if snap.complete or snap.status in READ_IN_FULL_NOT_COMPARABLE:
+        return None
+    if snap.status == "unclassified_amendment":
+        reason = str(snap.evidence.get("classification_reason") or "unknown")
+        return None if reason in AMENDMENT_COVER_READ else reason
+    if snap.status == "unresolved_undated_amendment":
+        reasons = [str(u.get("reason") or "unknown") for u in snap.evidence.get("unresolved_amendments") or []]
+        return next((r for r in reasons if r not in AMENDMENT_COVER_READ), None if reasons else "unknown")
+    return snap.status
+
 
 # ── Re-runs write nothing new ────────────────────────────────────────────
 # The change rows used BasePuller._row_exists, whose window is one hour: every
@@ -784,6 +847,18 @@ class InstitutionalFlowsPuller(BasePuller):
             "InstitutionalFlowsPuller initialised — source_id={sid}",
             sid=self.source_id,
         )
+
+    def _edgar_get(self, url: str) -> requests.Response:
+        """Start one EDGAR request, unless the run budget is already spent.
+
+        Every 13F request in this module starts here (index, amendment
+        covers, filing index, cover page, information tables, the one-filing
+        fallback), including each retry of ``retry_on_failure``. After the
+        deadline it raises ``_BudgetSpent`` instead: no new call.
+        """
+        if self._budget.spent():
+            raise _BudgetSpent(url)
+        return requests.get(url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
 
     # ── ETF Flow Proxy ─────────────────────────────────────────────────────
 
@@ -972,7 +1047,7 @@ class InstitutionalFlowsPuller(BasePuller):
         url = (
             f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
         )
-        resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
+        resp = self._edgar_get(url)
         # Permanent client errors (bad/retired CIK, forbidden) will never
         # recover from a retry — short-circuit and blacklist the CIK for
         # the remainder of this process so we don't re-hit it every cycle.
@@ -1101,7 +1176,7 @@ class InstitutionalFlowsPuller(BasePuller):
         """
         base_url = f"{_EDGAR_13F_XML_BASE}/{cik}/{accession.replace('-', '')}"
         try:
-            resp = requests.get(f"{base_url}/index.json", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
+            resp = self._edgar_get(f"{base_url}/index.json")
             if resp.status_code in (404, 410):
                 return None, "missing_filing_index", None
             resp.raise_for_status()
@@ -1109,8 +1184,7 @@ class InstitutionalFlowsPuller(BasePuller):
             if _13F_COVER_DOCUMENT not in {n.lower() for n in names}:
                 return None, "missing_cover_page", None
             time.sleep(_EDGAR_RATE_DELAY)
-            resp = requests.get(f"{base_url}/{_13F_COVER_DOCUMENT}", headers=_EDGAR_HEADERS,
-                                timeout=self._budget.request_timeout())
+            resp = self._edgar_get(f"{base_url}/{_13F_COVER_DOCUMENT}")
             if resp.status_code in (404, 410):
                 return None, "missing_cover_page", None
             resp.raise_for_status()
@@ -1162,9 +1236,7 @@ class InstitutionalFlowsPuller(BasePuller):
 
         # First, get the filing index to find the infotable document
         index_url = f"{base_url}/index.json"
-        resp = requests.get(
-            index_url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout()
-        )
+        resp = self._edgar_get(index_url)
         resp.raise_for_status()
         index_data = resp.json()
 
@@ -1186,9 +1258,7 @@ class InstitutionalFlowsPuller(BasePuller):
 
         # Fetch and parse the infotable XML
         xml_url = f"{base_url}/{infotable_name}"
-        resp = requests.get(
-            xml_url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout()
-        )
+        resp = self._edgar_get(xml_url)
         resp.raise_for_status()
 
         try:
@@ -1232,7 +1302,7 @@ class InstitutionalFlowsPuller(BasePuller):
             return snap("unknown_filing_date_or_accession")
 
         base_url = f"{_EDGAR_13F_XML_BASE}/{cik}/{accession.replace('-', '')}"
-        resp = requests.get(f"{base_url}/index.json", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
+        resp = self._edgar_get(f"{base_url}/index.json")
         resp.raise_for_status()
         names = [
             str(item.get("name") or "")
@@ -1244,7 +1314,7 @@ class InstitutionalFlowsPuller(BasePuller):
         if cover_name is None:
             return snap("missing_cover_page")
         time.sleep(_EDGAR_RATE_DELAY)
-        resp = requests.get(f"{base_url}/{cover_name}", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
+        resp = self._edgar_get(f"{base_url}/{cover_name}")
         if resp.status_code in (404, 410):
             return snap("missing_cover_page")
         resp.raise_for_status()
@@ -1291,7 +1361,7 @@ class InstitutionalFlowsPuller(BasePuller):
         value_total: float | None = None
         for name in candidates:
             time.sleep(_EDGAR_RATE_DELAY)
-            resp = requests.get(f"{base_url}/{name}", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
+            resp = self._edgar_get(f"{base_url}/{name}")
             if resp.status_code in (404, 410):
                 continue
             resp.raise_for_status()
@@ -1640,10 +1710,14 @@ class InstitutionalFlowsPuller(BasePuller):
                 ).scalar()
                 lock_conn.commit()
             except Exception:
-                lock_conn.close()
+                # Whether this session took the lock is unknown.
+                self._discard_lock_connection(lock_conn)
                 raise
-            if not acquired:
-                lock_conn.close()
+            if acquired is not True:
+                if acquired is False:
+                    lock_conn.close()               # nothing held: an ordinary check-in
+                else:
+                    self._discard_lock_connection(lock_conn)
                 log.warning("13F pass skipped: another 13F writer holds the run lock")
                 return [{
                     "feature": "13f_filings",
@@ -1657,18 +1731,49 @@ class InstitutionalFlowsPuller(BasePuller):
             return self._pull_13f_managers(should_continue, deadline_at)
         finally:
             if lock_conn is not None:
-                try:
-                    lock_conn.execute(
-                        text("SELECT pg_advisory_unlock(:k)"), {"k": _13F_RUN_LOCK_KEY},
-                    )
-                    lock_conn.commit()
-                except Exception as exc:
-                    log.warning(
-                        "13F run lock release failed (PostgreSQL releases it when "
-                        "the connection closes): {e}", e=str(exc),
-                    )
-                finally:
-                    lock_conn.close()
+                self._release_run_lock(lock_conn)
+
+    def _release_run_lock(self, lock_conn: Any) -> None:
+        """Release the run lock and confirm it, or drop the session that holds it.
+
+        ``pg_advisory_unlock`` returns true only when this session held the
+        lock and released it. Anything else (false, an error, a failed
+        commit) leaves the release unknown, and a pooled ``close()`` would
+        only check the connection in: the backend session lives on in the
+        pool with the session-level lock still held, and every later 13F
+        pass would skip. So an unconfirmed release ends the session.
+        """
+        released = False
+        try:
+            unlocked = lock_conn.execute(
+                text("SELECT pg_advisory_unlock(:k)"), {"k": _13F_RUN_LOCK_KEY},
+            ).scalar()
+            lock_conn.commit()
+            released = unlocked is True
+            if not released:
+                log.warning("13F run lock release not confirmed (pg_advisory_unlock returned {r!r})", r=unlocked)
+        except Exception as exc:
+            log.warning("13F run lock release failed: {e}", e=str(exc))
+        if released:
+            lock_conn.close()
+        else:
+            self._discard_lock_connection(lock_conn)
+
+    @staticmethod
+    def _discard_lock_connection(lock_conn: Any) -> None:
+        """End the physical session, so PostgreSQL drops any lock it holds."""
+        try:
+            lock_conn.invalidate()
+        except Exception as exc:
+            log.error(
+                "13F run lock connection could not be invalidated; the run lock may "
+                "stay held until that session ends: {e}", e=str(exc),
+            )
+        finally:
+            try:
+                lock_conn.close()
+            except Exception:
+                pass
 
     def _pull_13f_managers(
         self,
@@ -1710,10 +1815,11 @@ class InstitutionalFlowsPuller(BasePuller):
             list(TOP_13F_FILERS.items()), InstitutionalFlowsPuller._resume_13f_at_cik
         )
         stopped_at: int | None = None
+        stopped_phase: str | None = None
 
         for position, (cik, manager_name) in enumerate(managers):
             if budget.spent():
-                stopped_at = position
+                stopped_at, stopped_phase = position, "between_managers"
                 break
             try:
                 log.info(
@@ -1729,7 +1835,7 @@ class InstitutionalFlowsPuller(BasePuller):
                 )
                 time.sleep(_EDGAR_RATE_DELAY)
                 if budget.spent():
-                    stopped_at = position
+                    stopped_at, stopped_phase = position, "after_index_read"
                     break
 
                 if len(filings) < 2:
@@ -1792,13 +1898,18 @@ class InstitutionalFlowsPuller(BasePuller):
 
                 curr_snap = self._read_filing_snapshot(cik, curr_filing)
                 time.sleep(_EDGAR_RATE_DELAY)
+                if budget.spent():
+                    # The current filing used the last of the budget: the
+                    # prior filing's read is not started.
+                    stopped_at, stopped_phase = position, "after_current_filing_read"
+                    break
                 prev_snap = self._read_filing_snapshot(cik, prev_filing)
                 time.sleep(_EDGAR_RATE_DELAY)
                 if budget.spent():
                     # A read cut short by the deadline is not a finding about
                     # the filing: no receipt and no change row for this
                     # manager. The next run starts with it.
-                    stopped_at = position
+                    stopped_at, stopped_phase = position, "after_filing_reads"
                     break
                 # The cover page is authoritative for a period the index omits.
                 curr_report_date = curr_report_date or curr_snap.evidence.get("cover_report_date")
@@ -1841,14 +1952,15 @@ class InstitutionalFlowsPuller(BasePuller):
                     with self.engine.begin() as conn:
                         receipts_inserted = self._insert_receipt(conn, receipt_series, obs_date, receipt,
                                                                  curr_snap)
-                    # Both filings read and the withheld receipt stored is a
-                    # finished check with nothing to compare (NO_DATA): the
-                    # same read gives the same answer until the manager files
-                    # again. A side that could not be fetched is a failure of
-                    # this run and says which kind.
-                    fetch_failure = (
-                        _snapshot_fetch_failure(curr_snap) or _snapshot_fetch_failure(prev_snap)
-                    )
+                    # Both sides read in full (_not_read_in_full) and the
+                    # withheld receipt stored is a finished check with nothing
+                    # to compare (NO_DATA): the same read gives the same
+                    # answer until the manager files again. A side that was
+                    # not read in full is a failure of this run and says why.
+                    # Either way no change row is written, and the receipt
+                    # keeps the manager's latest filing reported as
+                    # unverified downstream.
+                    fetch_failure = _not_read_in_full(curr_snap) or _not_read_in_full(prev_snap)
                     withheld = {
                         "feature": f"13F:{cik}",
                         "manager": manager_name,
@@ -1862,7 +1974,7 @@ class InstitutionalFlowsPuller(BasePuller):
                     }
                     if fetch_failure:
                         withheld["error"] = (
-                            f"13F {manager_name} (CIK={cik}): filing not read "
+                            f"13F {manager_name} (CIK={cik}): filing not read in full "
                             f"({fetch_failure}); comparison withheld"
                         )
                     results.append(withheld)
@@ -2009,9 +2121,14 @@ class InstitutionalFlowsPuller(BasePuller):
                     "reason": "change_rows_held_by_another_writer",
                     "rows_inserted": 0,
                 })
+            except _BudgetSpent:
+                # A request was refused because the budget was already spent
+                # (_edgar_get). Nothing was written for this manager.
+                stopped_at, stopped_phase = position, "request_refused"
+                break
             except requests.HTTPError as http_exc:
                 if budget.spent():
-                    stopped_at = position
+                    stopped_at, stopped_phase = position, "request_failed_at_deadline"
                     break
                 # Permanent HTTP failures (404 / 403) — log once at WARNING,
                 # not ERROR.  Retries are already disabled at the fetcher.
@@ -2029,7 +2146,7 @@ class InstitutionalFlowsPuller(BasePuller):
                 if budget.spent():
                     # A request cut to the time left failed at the deadline:
                     # not attempted, not a failed manager.
-                    stopped_at = position
+                    stopped_at, stopped_phase = position, "request_failed_at_deadline"
                     break
                 log.opt(exception=True).error(
                     "13F {m} (CIK={c}) failed: {e}",
@@ -2053,6 +2170,8 @@ class InstitutionalFlowsPuller(BasePuller):
                 "13F:run_budget", "13F managers", stopped_at, len(managers),
                 next_manager_cik=next_cik,
                 managers_not_attempted=[c for c, _m in managers[stopped_at:]],
+                stopped_phase=stopped_phase,
+                deadline_overrun_s=budget.overrun_s(),
             )
             results.append(stop)
             log.warning("{e}; the next run starts at CIK={c}", e=stop["error"], c=next_cik)
@@ -2183,9 +2302,12 @@ class InstitutionalFlowsPuller(BasePuller):
             deadline_at: ``time.monotonic()`` instant of the same budget.
 
         Returns:
-            List of result dicts for 13F filings.
+            List of result dicts for 13F filings, a ``stopped_by_budget``
+            item first (as in ``pull_all``) so the run's status names it.
         """
-        return self._pull_13f_filings(should_continue=should_continue, deadline_at=deadline_at)
+        results = self._pull_13f_filings(should_continue=should_continue, deadline_at=deadline_at)
+        results.sort(key=lambda r: not r.get("stopped_by_budget"))
+        return results
 
 
 if __name__ == "__main__":

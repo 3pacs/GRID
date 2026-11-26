@@ -23,11 +23,13 @@ The real writer runs against the fake EDGAR of
 
 from __future__ import annotations
 
+import ast
 import inspect
 import sys
 import time
 import types
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 import requests
@@ -85,16 +87,16 @@ class _Recorder:
         return seen
 
 
-def _puller(engine, monkeypatch, get) -> inst.InstitutionalFlowsPuller:
+def _puller(engine, monkeypatch, get, filers=None) -> inst.InstitutionalFlowsPuller:
     monkeypatch.setattr(inst.requests, "get", get)
     monkeypatch.setattr(inst.time, "sleep", lambda *_a: None)
-    monkeypatch.setattr(inst, "TOP_13F_FILERS", dict(s.FILERS))
+    monkeypatch.setattr(inst, "TOP_13F_FILERS", dict(filers or s.FILERS))
     inst._DEAD_CIKS.clear()
     return inst.InstitutionalFlowsPuller(engine)
 
 
-def _run(engine, monkeypatch, get, **budget) -> list[dict]:
-    return _puller(engine, monkeypatch, get).pull_13f_only(**budget)
+def _run(engine, monkeypatch, get, filers=None, **budget) -> list[dict]:
+    return _puller(engine, monkeypatch, get, filers).pull_13f_only(**budget)
 
 
 def _stop(results: list[dict]) -> dict:
@@ -110,10 +112,11 @@ def test_out_of_budget_between_managers_the_run_stops_and_says_how_far_it_got(en
 
     results = _run(engine, monkeypatch, edgar.get, should_continue=lambda: _receipts(engine) == 0)
 
-    assert [r["feature"] for r in results] == [f"13F:{s.CIK_ALPHA}", STOP]
-    assert results[0]["status"] == "SUCCESS" and results[0]["rows_inserted"] > 0
+    assert [r["feature"] for r in results] == [STOP, f"13F:{s.CIK_ALPHA}"]    # the stop is listed first
+    assert results[1]["status"] == "SUCCESS" and results[1]["rows_inserted"] > 0
     stop = _stop(results)
-    assert stop["status"] == "PARTIAL"
+    assert stop["status"] == "PARTIAL" and stop["stopped_phase"] == "between_managers"
+    assert stop["deadline_overrun_s"] is None                  # no deadline_at was given
     assert (stop["items_read"], stop["items_total"], stop["items_not_attempted"]) == (1, 2, 1)
     assert stop["next_manager_cik"] == s.CIK_BETA
     assert _count(engine, f"13F%:{s.CIK_BETA}:%") == 0
@@ -192,7 +195,7 @@ def test_runs_cut_short_every_time_still_reach_every_manager(engine, monkeypatch
     results = _run(engine, monkeypatch, second.get, should_continue=lambda: _receipts(engine) < 2)
 
     assert second.ciks() == [s.CIK_BETA]                       # not Alpha again
-    assert [r["feature"] for r in results] == [f"13F:{s.CIK_BETA}", STOP]
+    assert [r["feature"] for r in results] == [STOP, f"13F:{s.CIK_BETA}"]
     assert _count(engine, f"13F-FILING:{s.CIK_BETA}:%") == 1
     assert _stop(results)["next_manager_cik"] == s.CIK_ALPHA
 
@@ -290,21 +293,86 @@ def test_a_filing_that_could_not_be_fetched_is_a_failed_manager_naming_the_failu
     assert outcome == "PARTIAL" and f"fetch_failed:{kind}" in note
 
 
-def test_snapshot_fetch_failure_reads_every_place_a_failed_fetch_is_recorded():
-    def snap(status: str, **evidence) -> inst.FilingSnapshot:
-        return inst.FilingSnapshot(accession="A", status=status, evidence=evidence)
+def _snap(status: str, **evidence) -> inst.FilingSnapshot:
+    return inst.FilingSnapshot(accession="A", status=status, evidence=evidence)
 
-    assert inst._snapshot_fetch_failure(snap("fetch_failed:timeout")) == "fetch_failed:timeout"
-    assert inst._snapshot_fetch_failure(
-        snap("unclassified_amendment", classification_reason="fetch_failed:http_503")) == "fetch_failed:http_503"
-    assert inst._snapshot_fetch_failure(snap(
-        "unresolved_undated_amendment",
-        unresolved_amendments=[{"accession": "B", "reason": "fetch_failed:connection"}],
-    )) == "fetch_failed:connection"
-    for status in ("entry_count_mismatch", "missing_cover_page", "additive_supplement_not_merged"):
-        assert inst._snapshot_fetch_failure(snap(status)) is None
-    assert inst._snapshot_fetch_failure(
-        snap("unclassified_amendment", classification_reason="unknown_amendment_type")) is None
+
+@pytest.mark.parametrize("status", sorted(inst.READ_IN_FULL_NOT_COMPARABLE) + ["complete", "verified_empty"])
+def test_read_in_full_is_a_named_list_of_statuses(status):
+    assert inst._not_read_in_full(_snap(status)) is None
+
+
+@pytest.mark.parametrize("status", [
+    "fetch_failed:timeout", "fetch_failed:http_503", "fetch_failed:http_403",   # failed or refused fetch
+    "unparseable_cover_page", "unparseable_infotable",                         # a document that did not parse
+    "unknown_filing_date_or_accession",                                        # nothing was fetched
+    "a_status_added_later",                                                    # not listed: not read in full
+])
+def test_everything_else_is_not_read_in_full_and_says_why(status):
+    assert inst._not_read_in_full(_snap(status)) == status
+
+
+def test_an_amendment_side_is_read_in_full_only_when_its_cover_was_read():
+    for reason in sorted(inst.AMENDMENT_COVER_READ):
+        assert inst._not_read_in_full(_snap("unclassified_amendment", classification_reason=reason)) is None
+        assert inst._not_read_in_full(_snap(
+            "unresolved_undated_amendment", unresolved_amendments=[{"accession": "B", "reason": reason}])) is None
+    for reason in ("fetch_failed:http_503", "unparseable_cover_page"):
+        assert inst._not_read_in_full(_snap("unclassified_amendment", classification_reason=reason)) == reason
+        assert inst._not_read_in_full(_snap("unresolved_undated_amendment", unresolved_amendments=[
+            {"accession": "B", "reason": "missing_cover_page"}, {"accession": "C", "reason": reason},
+        ])) == reason
+    # No recorded reason is not evidence that anything was read.
+    assert inst._not_read_in_full(_snap("unclassified_amendment")) == "unknown"
+    assert inst._not_read_in_full(_snap("unresolved_undated_amendment")) == "unknown"
+
+
+@pytest.mark.parametrize("knob,value,status", [
+    ("infotable", "malformed", "unparseable_infotable"),
+    ("cover", "malformed", "unparseable_cover_page"),
+])
+def test_a_document_that_did_not_parse_is_a_failed_manager_not_a_finished_check(
+    engine, monkeypatch, knob, value, status
+):
+    edgar = s.two_quarter_scenario()
+    setattr(edgar.filings[s.CIK_ALPHA][1], knob, value)
+
+    alpha = _run(engine, monkeypatch, edgar.get)[0]
+
+    assert alpha["status"] == "FAILED" and alpha["curr_snapshot"] == status
+    assert status in alpha["error"] and _count(engine, f"13F:{s.CIK_ALPHA}:%") == 0
+
+
+def test_a_refused_fetch_is_a_failed_manager(engine, monkeypatch):
+    edgar = s.two_quarter_scenario()
+    curr = edgar.filings[s.CIK_ALPHA][1]
+    curr.fail, curr.fail_on = "403", "cover"
+
+    alpha = _run(engine, monkeypatch, edgar.get)[0]
+
+    assert alpha["status"] == "FAILED" and "fetch_failed:http_403" in alpha["error"]
+
+
+def test_a_finished_check_still_reads_downstream_as_an_unverified_latest_filing(engine, monkeypatch):
+    """NO_DATA is the run's status only. The holdings reader goes by the
+    stored receipt: the manager's latest filing is unverified and none of its
+    holdings are served."""
+    from intelligence import dollar_flows
+    from intelligence import holdings_observations_13f as h13f
+
+    monkeypatch.setattr(dollar_flows, "_get_cusip_ticker_map", lambda: None)
+    edgar = s.two_quarter_scenario()
+    edgar.filings[s.CIK_ALPHA][1].cover_entry_total = 99
+
+    results = _run(engine, monkeypatch, edgar.get)
+    assert results[0]["status"] == "NO_DATA"
+
+    h13f.clear_snapshot_cache()
+    snapshot = h13f.read_13f_holdings_snapshot(engine)
+    h13f.clear_snapshot_cache()
+    assert snapshot.counts.get("managers_latest_filing_unverified") == 1
+    assert s.CIK_ALPHA not in {h.manager_cik for h in snapshot.holdings}
+    assert s.CIK_BETA in {h.manager_cik for h in snapshot.holdings}            # control: Beta compared
 
 
 # ── pull_all: what SmartScheduler and the Hermes repair call ───────────────
@@ -350,3 +418,190 @@ def test_etf_flows_stop_at_the_deadline_without_calling_the_provider(engine, mon
     assert stop["feature"] == "ETF_FLOW:run_budget" and stop["stopped_by_budget"] is True
     assert (stop["items_read"], stop["items_total"]) == (0, len(inst.ETF_FLOW_TICKERS))
     assert _classify_outcome(results)[0] == "FAILED"
+
+
+# ── No new request after the deadline: replay on a fake clock ──────────────
+#
+# Codex review 6080519392: with the deadline exhausted by the current filing,
+# the loop still started the prior filing's read, and a request timeout is not
+# a wall clock. Every 13F request now starts in _edgar_get, which refuses once
+# the budget is spent. These replay a whole run on a clock that only the fake
+# EDGAR moves (one tick per request) with the deadline placed after every
+# request in turn.
+
+CIK_GAMMA = "9000000003"
+GAMMA = "Fixture One Filing Gamma LP"
+# Alpha: two quarters plus a restatement of the current one (amendment-cover
+# path). Gamma: a single filing (the one-filing fallback). Beta: two quarters,
+# last, so the run's final request belongs to a manager that would be written.
+REPLAY_FILERS = {s.CIK_ALPHA: s.ALPHA, CIK_GAMMA: GAMMA, s.CIK_BETA: s.BETA}
+START = 1000.0
+
+
+def _replay_edgar() -> s.FakeEdgar:
+    edgar = s.two_quarter_scenario()
+    curr = edgar.filings[s.CIK_ALPHA][1]
+    edgar.add(s.CIK_ALPHA, s.Filing(
+        "9000000001-26-000003", curr.filing_date + timedelta(days=3), curr.report_date,
+        dict(curr.holdings), form="13F-HR/A"))
+    edgar.add(CIK_GAMMA, s.Filing("9000000003-26-000001", curr.filing_date, curr.report_date, {
+        s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 10_000, 100)}))
+    return edgar
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = START
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _replay(monkeypatch, deadline_after: float | None, get_wrapper=None):
+    """One run on the fake clock. Each request starts at the current tick and
+    takes one tick. Returns (engine, recorder, request start times, results)."""
+    engine = s.make_sqlite_engine()
+    clock = _Clock()
+    monkeypatch.setattr(inst, "_monotonic", clock)
+    # Each replay is a first run: no resume point left by the one before it.
+    monkeypatch.setattr(inst.InstitutionalFlowsPuller, "_resume_13f_at_cik", None)
+    recorder = _Recorder(_replay_edgar())
+    started: list[float] = []
+
+    def on_request(_url: str) -> None:
+        started.append(clock.now)
+        clock.now += 1.0
+
+    recorder.on_request = on_request
+    get = get_wrapper(recorder, clock) if get_wrapper else recorder.get
+    budget = {} if deadline_after is None else {"deadline_at": START + deadline_after}
+    results = _run(engine, monkeypatch, get, REPLAY_FILERS, **budget)
+    return engine, recorder, started, results
+
+
+def _full_run_urls(monkeypatch) -> list[str]:
+    _engine, recorder, _started, results = _replay(monkeypatch, None)
+    assert not [r for r in results if r.get("stopped_by_budget")]
+    assert {r["feature"]: r["status"] for r in results} == {
+        f"13F:{s.CIK_ALPHA}": "SUCCESS", f"13F:{CIK_GAMMA}": "PARTIAL", f"13F:{s.CIK_BETA}": "SUCCESS"}
+    return list(recorder.urls)
+
+
+def test_the_replay_covers_every_request_path(monkeypatch):
+    urls = _full_run_urls(monkeypatch)
+    assert any("9000000001-26-000003".replace("-", "") in u for u in urls)      # amendment cover / restated filing
+    assert any(CIK_GAMMA in u and "/Archives/" in u for u in urls)             # one-filing fallback
+    assert sum("submissions" in u for u in urls) == 3                          # one index per manager
+
+
+def test_wherever_the_deadline_falls_no_request_starts_after_it_and_the_run_is_never_green(monkeypatch):
+    full = _full_run_urls(monkeypatch)
+    phases: set[str] = set()
+    for k in range(len(full)):
+        # The deadline falls half a tick into request k: that request is in
+        # flight when it passes, and it is the last one.
+        deadline = k + 0.5
+        engine, recorder, started, results = _replay(monkeypatch, deadline)
+        where = f"deadline during request {k}: {full[k]}"
+
+        assert recorder.urls == full[:k + 1], where                             # no new call, on any path
+        assert all(t < START + deadline for t in started), where
+        stop = _stop(results)
+        phases.add(stop["stopped_phase"])
+        assert stop["deadline_overrun_s"] == 0.5, where                         # the in-flight request, accounted
+        # False-green refusal: the run cannot be logged complete, and nothing
+        # is on record for a manager that was not finished.
+        outcome, _rows, note = _classify_outcome(results)
+        assert outcome in ("PARTIAL", "FAILED") and "stopped at the run deadline" in note, where
+        for cik in stop["managers_not_attempted"]:
+            assert not [r for r in results if r["feature"] == f"13F:{cik}"], where
+            assert _count(engine, f"13F%:{cik}:%") == 0, where
+        assert stop["managers_not_attempted"][0] == stop["next_manager_cik"], where
+
+    # between_managers: the deadline passed during Gamma's one-filing read,
+    # which writes nothing; the stop is noticed before the next manager.
+    assert phases == {"after_index_read", "after_current_filing_read", "after_filing_reads",
+                      "request_refused", "between_managers"}
+
+
+def test_a_current_filing_that_uses_up_the_deadline_does_not_start_the_prior_read(monkeypatch):
+    full = _full_run_urls(monkeypatch)
+    prior = "9000000001-26-000001".replace("-", "")
+    first_prior = next(i for i, u in enumerate(full) if prior in u)
+
+    # The deadline passes during the request just before the prior filing's first.
+    engine, recorder, _started, results = _replay(monkeypatch, first_prior - 0.5)
+
+    assert not [u for u in recorder.urls if prior in u]
+    stop = _stop(results)
+    assert stop["stopped_phase"] == "after_current_filing_read" and stop["next_manager_cik"] == s.CIK_ALPHA
+    assert _count(engine, "13F%") == 0                                          # no receipt, no change row
+
+
+def test_a_retry_after_the_deadline_is_not_sent(monkeypatch):
+    """retry_on_failure retries a connection error. Its second attempt comes
+    back through _edgar_get, which refuses it."""
+    attempts: list[str] = []
+
+    def wrapper(recorder, clock):
+        def get(url, headers=None, timeout=None):
+            if s.CIK_BETA in url:
+                attempts.append(url)
+                clock.now += 5.0                                                # the failed attempt crosses the deadline
+                raise requests.ConnectionError("connection reset")
+            return recorder.get(url, headers=headers, timeout=timeout)
+        return get
+
+    full = _full_run_urls(monkeypatch)
+    beta_index = next(i for i, u in enumerate(full) if s.CIK_BETA in u)
+
+    _engine, _recorder, _started, results = _replay(monkeypatch, beta_index + 2.0, wrapper)
+
+    assert len(attempts) == 1                                                   # no retry was sent
+    assert not [r for r in results if r["status"] == "FAILED"]
+    assert _stop(results)["stopped_phase"] == "request_refused"
+    assert _stop(results)["next_manager_cik"] == s.CIK_BETA
+
+
+def test_control_the_same_connection_error_with_budget_left_is_retried(monkeypatch):
+    attempts: list[str] = []
+
+    def wrapper(recorder, _clock):
+        def get(url, headers=None, timeout=None):
+            if s.CIK_BETA in url:
+                attempts.append(url)
+                raise requests.ConnectionError("connection reset")
+            return recorder.get(url, headers=headers, timeout=timeout)
+        return get
+
+    _engine, _recorder, _started, results = _replay(monkeypatch, None, wrapper)
+
+    assert len(attempts) > 1
+    assert [r["status"] for r in results if r["feature"] == f"13F:{s.CIK_BETA}"] == ["FAILED"]
+
+
+def test_every_13f_request_starts_in_the_one_gateway():
+    """A request path added later cannot skip the deadline check unnoticed."""
+    tree = ast.parse(Path(inst.__file__).read_text())
+    callers = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "requests"):
+                callers.append(fn.name)
+    assert callers == ["_edgar_get"]
+
+
+def test_the_gateway_refuses_once_the_budget_is_spent(engine, monkeypatch):
+    def get(*_a, **_k):
+        raise AssertionError("a request was started after the deadline")
+
+    puller = _puller(engine, monkeypatch, get)
+    puller._budget = inst._RunBudget(should_continue=lambda: False)
+
+    with pytest.raises(inst._BudgetSpent):
+        puller._edgar_get("https://data.sec.gov/submissions/CIK0000000001.json")
+    # Not one of the errors the fetchers record as a finding or the retry decorator retries.
+    assert not issubclass(inst._BudgetSpent, (requests.RequestException, OSError, TimeoutError, ValueError))
