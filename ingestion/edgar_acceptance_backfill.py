@@ -322,7 +322,7 @@ def _columnar(block: dict) -> Iterable[dict]:
 def stage_extract(out: Path) -> dict:
     plan = {p.accession: p for p in load_plan(out)}
     seen = _load_manifest(out)
-    found: dict[str, dict] = {}
+    candidates: dict[str, list[dict]] = {}  # every valid source row per accession; none is dropped
     problems: list[dict] = []
     for name, e in sorted(seen.items()):
         if e.get("status") != "OK":
@@ -353,24 +353,44 @@ def stage_extract(out: Path) -> dict:
                 row = {"accession": acc, "ciks": list(plan[acc].ciks), "form": r["form"], "filing_date": r["filingDate"],
                        "acceptance_utc": _utc_iso(acc_utc), "items": [i for i in (r.get("items") or "").split(",") if i],
                        "source_file": name, "source_retrieved_at": e["retrieved_at"], "source_sha256": e["sha256"]}
-                if acc in found:
-                    keep = ("form", "filing_date", "acceptance_utc", "items")
-                    if any(found[acc][k] != row[k] for k in keep):
-                        problems.append({"accession": acc, "problem": "co-registrant source files disagree"})
-                    continue  # first source (sorted by file name) stays
-                found[acc] = row
-    missing = sorted(set(plan) - set(found))
-    rows = [found[a] for a in sorted(found)]
-    body = ("\n".join(json.dumps(r, sort_keys=True) for r in rows) + ("\n" if rows else "")).encode()
-    _atomic_write(out / "acceptance_8k.jsonl", body)
-    rec = {"schema": SCHEMA, "planned": len(plan), "with_acceptance": len(found), "missing": len(missing),
-           "missing_accessions": missing[:1000], "problems": problems[:1000], "problem_count": len(problems),
-           "rows_sha256": sha256_bytes(body),
+                candidates.setdefault(acc, []).append(row)
+    keep = ("form", "filing_date", "acceptance_utc", "items")
+    accepted: dict[str, dict] = {}
+    conflicts: list[dict] = []
+    for acc in sorted(candidates):
+        srcs = candidates[acc]
+        if len({tuple(json.dumps(r[k]) for k in keep) for r in srcs}) > 1:
+            # sources disagree: quarantined, never emitted as accepted; every source row is kept as evidence
+            conflicts.append({"accession": acc, "ciks": srcs[0]["ciks"], "sources": srcs})
+        else:
+            accepted[acc] = {**srcs[0], "n_sources": len(srcs)}
+    conflicted = {c["accession"] for c in conflicts}
+    missing = sorted(set(plan) - set(accepted) - conflicted)
+
+    def jl(items) -> bytes:
+        items = list(items)
+        return ("\n".join(json.dumps(i, sort_keys=True) for i in items) + ("\n" if items else "")).encode()
+
+    files = {"acceptance_8k.jsonl": jl(accepted[a] for a in sorted(accepted)), "conflicts.jsonl": jl(conflicts),
+             "missing.jsonl": jl({"accession": a} for a in missing), "problems.jsonl": jl(problems)}
+    for fname, body in files.items():
+        _atomic_write(out / fname, body)
+    assert len(plan) == len(accepted) + len(conflicted) + len(missing)
+    rec = {"schema": SCHEMA, "planned": len(plan), "accepted": len(accepted), "conflicted": len(conflicted),
+           "missing": len(missing), "problem_count": len(problems),
+           "rows_sha256": sha256_bytes(files["acceptance_8k.jsonl"]),
+           "detail_files": {f: {"sha256": sha256_bytes(b), "lines": b.count(b"\n")}
+                            for f, b in files.items() if f != "acceptance_8k.jsonl"},
+           "counts_note": "planned = accepted + conflicted + missing. problem_count counts record-level defects and is a "
+                          "separate diagnostic: one accession can have a problem and still be accepted from another source. "
+                          "Full lists are in the detail files; nothing is truncated.",
            "limits": ["acceptance_utc is EDGAR's acceptance instant, not GRID's historical visibility",
                       "source_retrieved_at is the 2026 collection time; historical use is PROXY / DIAGNOSTIC_ONLY (contract 5.1)",
-                      "a planned accession with no acceptance time is listed in missing_accessions, never dropped"]}
+                      "a planned accession with no acceptance time is listed in missing.jsonl, never dropped",
+                      "an accession whose co-registrant sources disagree is quarantined in conflicts.jsonl with every source row, "
+                      "and is excluded from acceptance_8k.jsonl until resolved against the authoritative filing header"]}
     _atomic_write(out / "reconciliation.json", (json.dumps(rec, indent=1, sort_keys=True) + "\n").encode())
-    return {k: rec[k] for k in ("planned", "with_acceptance", "missing", "problem_count", "rows_sha256")}
+    return {k: rec[k] for k in ("planned", "accepted", "conflicted", "missing", "problem_count", "rows_sha256")}
 
 
 # ---------------------------------------------------------------------------------------------- verify
@@ -391,9 +411,12 @@ def _header_matches(naive_et: datetime, api_utc: datetime) -> bool:
 
 
 def stage_verify(out: Path, fetch: Fetch, *, sample: int, seed: int = 20261126) -> dict:
-    p = out / "acceptance_8k.jsonl"
-    if not p.exists():
-        raise BackfillError("no acceptance_8k.jsonl: run the extract stage first")
+    p, rp = out / "acceptance_8k.jsonl", out / "reconciliation.json"
+    if not (p.exists() and rp.exists()):
+        raise BackfillError("no acceptance_8k.jsonl / reconciliation.json: run the extract stage first")
+    actual = sha256_bytes(p.read_bytes())
+    if actual != json.loads(rp.read_text())["rows_sha256"]:
+        raise BackfillError("acceptance_8k.jsonl does not match the hash in reconciliation.json: re-run extract")
     rows = [json.loads(ln) for ln in p.read_text().splitlines() if ln]
     pick = random.Random(seed).sample(rows, min(sample, len(rows)))
     results, bad = [], 0
@@ -407,7 +430,9 @@ def stage_verify(out: Path, fetch: Fetch, *, sample: int, seed: int = 20261126) 
             ok, res = False, {"accession": r["accession"], "match": False, "error": str(e)}
         bad += not ok
         results.append(res)
-    rec = {"schema": SCHEMA, "seed": seed, "sampled": len(results), "mismatches": bad, "results": results,
+    rec = {"schema": SCHEMA, "seed": seed, "extracted_rows_sha256": actual, "population": len(rows), "requested_sample": sample,
+           "achieved_sample": len(results), "sampled": len(results), "mismatches": bad, "results": results,
+           "scope": "sampled accepted (non-conflicted) rows only; quarantined conflicts are not verified here",
            "note": "a mismatch means the submissions record is not trusted for that accession; zero mismatches is evidence, not proof"}
     _atomic_write(out / "verify.json", (json.dumps(rec, indent=1, sort_keys=True) + "\n").encode())
     return {"sampled": len(results), "mismatches": bad}

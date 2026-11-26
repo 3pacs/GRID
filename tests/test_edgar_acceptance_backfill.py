@@ -196,6 +196,11 @@ def full(tmp_path):
     return site, out
 
 
+def lines_of(out, name):
+    p = out / name
+    return [json.loads(ln) for ln in p.read_text().splitlines() if ln]
+
+
 def rows_of(out):
     return [json.loads(ln) for ln in (out / "acceptance_8k.jsonl").read_text().splitlines()]
 
@@ -226,7 +231,8 @@ def test_a_planned_accession_without_acceptance_is_listed_not_dropped(tmp_path):
     fetch_all(site, out)
     B.stage_extract(out)
     rec = json.loads((out / "reconciliation.json").read_text())
-    assert rec["missing_accessions"] == [A2]  # A3 still found via CIK 2
+    assert lines_of(out, "missing.jsonl") == [{"accession": A2}] and rec["missing"] == 1  # A3 still found via CIK 2
+    assert rec["planned"] == rec["accepted"] + rec["conflicted"] + rec["missing"]
     assert [r["items"] for r in rows_of(out) if r["accession"] == A1] == [[]]
 
 
@@ -241,17 +247,51 @@ def test_bad_records_become_problems_and_the_accession_stays_missing(tmp_path, e
     run_plan(site, out)
     fetch_all(site, out)
     B.stage_extract(out)
-    rec = json.loads((out / "reconciliation.json").read_text())
-    assert any(needle in p["problem"] for p in rec["problems"]) and A1 in rec["missing_accessions"]
+    probs = lines_of(out, "problems.jsonl")
+    assert any(needle in p["problem"] for p in probs) and {"accession": A1} in lines_of(out, "missing.jsonl")
 
 
-def test_co_registrant_files_that_disagree_are_a_problem(tmp_path):
+def test_co_registrant_sources_that_disagree_are_quarantined_not_accepted(tmp_path):
     site, out = world(tmp_path)
     site.pages["https://data.sec.gov/submissions/CIK0000000002.json"] = sub("2", [(A3, "2024-04-02", "8-K", "2024-04-02T20:06:00.000Z", "5.02")])
     run_plan(site, out)
     fetch_all(site, out)
+    res = B.stage_extract(out)
+    assert res["conflicted"] == 1 and res["accepted"] == 2 and res["missing"] == 0
+    assert A3 not in {r["accession"] for r in rows_of(out)}  # never emitted as accepted coverage
+    (c,) = lines_of(out, "conflicts.jsonl")
+    assert c["accession"] == A3 and sorted(x["acceptance_utc"] for x in c["sources"]) == ["2024-04-02T20:05:00Z", "2024-04-02T20:06:00Z"]
+    assert sorted(x["source_file"] for x in c["sources"]) == ["CIK0000000001.json", "CIK0000000002.json"]  # both retained
+    rec = json.loads((out / "reconciliation.json").read_text())
+    assert rec["planned"] == rec["accepted"] + rec["conflicted"] + rec["missing"]
+    assert rec["detail_files"]["conflicts.jsonl"]["lines"] == 1
+
+
+def test_co_registrants_that_differ_only_in_items_are_also_a_conflict(tmp_path):
+    site, out = world(tmp_path)
+    site.pages["https://data.sec.gov/submissions/CIK0000000002.json"] = sub("2", [(A3, "2024-04-02", "8-K", "2024-04-02T20:05:00.000Z", "5.02,9.01")])
+    run_plan(site, out)
+    fetch_all(site, out)
+    assert B.stage_extract(out)["conflicted"] == 1
+
+
+def test_agreeing_co_registrants_are_accepted_with_their_source_count(tmp_path):
+    site, out = full(tmp_path)
     B.stage_extract(out)
-    assert "co-registrant source files disagree" in json.loads((out / "reconciliation.json").read_text())["problems"][0]["problem"]
+    assert {r["accession"]: r["n_sources"] for r in rows_of(out)}[A3] == 2 and lines_of(out, "conflicts.jsonl") == []
+
+
+def test_conflict_and_coverage_counts_are_separate_and_nothing_is_truncated(tmp_path):
+    out = tmp_path / "out"
+    (out / "raw").mkdir(parents=True)
+    n = 1100
+    plan = [{"accession": f"0000000009-24-{i:06d}", "ciks": ["0000000009"], "form": "8-K", "filed": "2024-01-02"} for i in range(n)]
+    (out / "plan.jsonl").write_text("\n".join(json.dumps(p) for p in plan) + "\n")
+    res = B.stage_extract(out)
+    assert res["missing"] == n and len(lines_of(out, "missing.jsonl")) == n  # past the old 1,000 cut
+    rec = json.loads((out / "reconciliation.json").read_text())
+    assert rec["detail_files"]["missing.jsonl"]["lines"] == n
+    assert "nothing is truncated" in rec["counts_note"]
 
 
 def test_a_record_from_a_cik_the_index_does_not_list_is_refused(tmp_path):
@@ -260,7 +300,7 @@ def test_a_record_from_a_cik_the_index_does_not_list_is_refused(tmp_path):
     run_plan(site, out)
     fetch_all(site, out)
     B.stage_extract(out)
-    assert any("not among" in p["problem"] for p in json.loads((out / "reconciliation.json").read_text())["problems"])
+    assert any("not among" in p["problem"] for p in lines_of(out, "problems.jsonl"))
 
 
 def test_extract_refuses_stored_bytes_that_do_not_match_the_manifest(tmp_path):
@@ -317,6 +357,37 @@ def test_verify_counts_a_mismatch_a_missing_header_and_a_garbled_one(tmp_path):
     assert res == {"sampled": 3, "mismatches": 3}
     errs = json.loads((out / "verify.json").read_text())["results"]
     assert sum(1 for e in errs if e.get("error")) == 2
+
+
+def test_verify_receipt_is_bound_to_the_extract_hash_and_the_achieved_sample(tmp_path):
+    site, out = full(tmp_path)
+    B.stage_extract(out)
+    for r in rows_of(out):
+        site.pages[hdr_url(r)] = header({"2024-01-05T21:30:05Z": "20240105163005", "2024-01-09T14:00:00Z": "20240109090000",
+                                         "2024-04-02T20:05:00Z": "20240402160500"}[r["acceptance_utc"]])
+    B.stage_verify(out, site, sample=50)
+    v = json.loads((out / "verify.json").read_text())
+    assert v["extracted_rows_sha256"] == B.sha256_bytes((out / "acceptance_8k.jsonl").read_bytes())
+    assert (v["requested_sample"], v["achieved_sample"], v["population"]) == (50, 3, 3)
+    assert "quarantined" in v["scope"]
+
+
+def test_verify_refuses_an_extract_that_changed_after_reconciliation(tmp_path):
+    site, out = full(tmp_path)
+    B.stage_extract(out)
+    (out / "acceptance_8k.jsonl").write_bytes((out / "acceptance_8k.jsonl").read_bytes() + b"\n")
+    with pytest.raises(B.BackfillError, match="re-run extract"):
+        B.stage_verify(out, site, sample=3)
+
+
+def test_verify_never_samples_a_quarantined_conflict(tmp_path):
+    site, out = world(tmp_path)
+    site.pages["https://data.sec.gov/submissions/CIK0000000002.json"] = sub("2", [(A3, "2024-04-02", "8-K", "2024-04-02T20:06:00.000Z", "5.02")])
+    run_plan(site, out)
+    fetch_all(site, out)
+    B.stage_extract(out)
+    B.stage_verify(out, site, sample=10)
+    assert A3 not in {x["accession"] for x in json.loads((out / "verify.json").read_text())["results"]}
 
 
 def test_verify_sample_is_seeded_and_bounded(tmp_path):
