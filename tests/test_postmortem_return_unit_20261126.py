@@ -137,6 +137,8 @@ def test_batch_selection_skips_predictions_with_no_recorded_return(monkeypatch):
     pm_mod.batch_postmortem(_Engine(), days=30, limit=5)
     pred_sql = [q for q in seen_sql if "oracle_predictions" in q and "verdict = 'miss'" in q]
     assert pred_sql and all("pnl_pct IS NOT NULL" in q for q in pred_sql)
+    # NULL is not the only return the writer refuses: NaN and +/-Infinity must not fill the LIMIT either.
+    assert all("pnl_pct::float8 NOT IN ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)" in q for q in pred_sql)
 
 
 def _pm(ret: float) -> PostMortem:

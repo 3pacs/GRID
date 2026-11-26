@@ -57,6 +57,7 @@ def test_candidate_query_excludes_predictions_with_no_recorded_return(monkeypatc
     _, seen_sql = _run_worker(monkeypatch, [], {}, max_rows=5)
     pred_sql = [q for q in seen_sql if "FROM" in q and "oracle_predictions" in q and "verdict = 'miss'" in q]
     assert pred_sql and all("pnl_pct IS NOT NULL" in q for q in pred_sql)
+    assert all("pnl_pct::float8 NOT IN ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)" in q for q in pred_sql)
 
 
 def test_a_skipped_prediction_does_not_spend_the_row_budget(monkeypatch):

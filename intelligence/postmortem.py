@@ -452,6 +452,18 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
 
 # ── 2. Generate Post-Mortem for an Oracle Prediction ──────────────────────
 
+# SQL twins of `_finite_or_none`, for the batch selectors. `IS NOT NULL` alone still admits NaN and
+# +/-Infinity (oracle_predictions.pnl_pct is DOUBLE PRECISION; options_recommendations.actual_return
+# is NUMERIC, which also holds NaN), and a row the writer then refuses stays selectable, so enough
+# newer ones fill every batch's LIMIT and older valid rows never advance (Codex hold on #1486).
+# In PostgreSQL NaN compares equal to itself, so NOT IN excludes it. A measured 0 stays selected.
+_NON_FINITE_FLOAT8_SQL = "'NaN'::float8, 'Infinity'::float8, '-Infinity'::float8"
+FINITE_PNL_PCT_SQL = "pnl_pct IS NOT NULL AND pnl_pct::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
+FINITE_ACTUAL_RETURN_SQL = (
+    "actual_return IS NOT NULL AND actual_return::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
+)
+
+
 def _finite_or_none(value: Any) -> float | None:
     """``float(value)`` when it is a finite number, else None (missing, blank or NaN/inf)."""
     if value is None or isinstance(value, bool):
@@ -693,7 +705,7 @@ def batch_postmortem(
         SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE verdict = 'miss'
           AND scored_at >= :cutoff
-          AND pnl_pct IS NOT NULL
+          AND """ + FINITE_PNL_PCT_SQL + """
           AND id NOT LIKE 'astrogrid:%'
           AND id NOT IN (
               SELECT prediction_id FROM trade_postmortems
