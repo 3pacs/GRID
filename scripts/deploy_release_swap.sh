@@ -255,6 +255,13 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
       exit 5
     fi
   done
+  # Tracked-file check reads `git status`, not `git diff`: `git diff` refreshes
+  # and rewrites a checkout's .git/index when a tracked file has stale stat
+  # info and ignores --no-optional-locks (builtin/diff.c refresh_index_quietly),
+  # so it could write into the running scheduler's or the rollback release's
+  # checkout. `status` honours the flag. Empty porcelain output = clean; a
+  # failed status prints a marker so it refuses. Stricter than before: a staged
+  # change whose worktree file was put back now refuses (fails closed).
   verify_preserved_checkout() {
     local name="$1" dir="$2" expected_sha="$3" expected_tree="$4"
     if [[ ! "$expected_sha" =~ ^[0-9a-f]{40}$ ]] ||
@@ -262,7 +269,7 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
        [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)" != "$dir" ] ||
        [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" != "$expected_sha" ] ||
        [ "$(git -C "$dir" rev-parse 'HEAD^{tree}' 2>/dev/null || true)" != "$expected_tree" ] ||
-       ! git -C "$dir" diff --quiet HEAD --; then
+       [ -n "$(git --no-optional-locks -C "$dir" -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=no --ignore-submodules=none 2>/dev/null || echo STATUS_FAILED)" ]; then
       echo "$name preservation Git HEAD/tree or tracked files do not match approved identity" >&2
       exit 5
     fi
