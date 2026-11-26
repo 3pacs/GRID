@@ -3,6 +3,7 @@ import { render, screen, waitFor, fireEvent, within, act } from '@testing-librar
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Dashboard from '../views/Dashboard.jsx';
 import { api } from '../api.js';
+import { useWebSocket } from '../hooks/useWebSocket.js';
 
 const storeState = {
     currentRegime: null,
@@ -72,6 +73,7 @@ describe('Dashboard watchlist loading', () => {
         api.listFlowBriefings.mockReset();
         api.loadFlowBriefingAudio.mockClear();
 
+        useWebSocket.mockReturnValue({ connected: false, prices: {} });
         api.getCurrent.mockResolvedValue({ state: 'NEUTRAL', confidence: 0.5 });
         api.getStatus.mockResolvedValue({ database: { connected: true } });
         api.getThesis.mockResolvedValue({});
@@ -131,6 +133,158 @@ describe('Dashboard watchlist loading', () => {
         render(<Dashboard onNavigate={vi.fn()} />);
         await waitFor(() => expect(screen.getAllByTitle('source not reported · time not reported').length).toBeGreaterThan(0));
         expect(screen.queryByTitle(/yfinance/i)).not.toBeInTheDocument();
+    });
+
+    it('says why the PULSE strip is empty when the quote cache is empty (#959)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false, source: 'yfinance' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        const note = await screen.findByTestId('pulse-empty-note');
+        expect(note).toHaveTextContent(/No cached quotes yet/i);
+        expect(note).toHaveTextContent(/not a live feed/i);
+        expect(note).not.toHaveTextContent(/failed/i);
+    });
+
+    it('does not claim an empty cache when the quote read failed (#959)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({ error: true, status: 503, message: 'down' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        const note = await screen.findByTestId('pulse-empty-note');
+        expect(note).toHaveTextContent(/Quotes unavailable: the request failed/i);
+        expect(note).not.toHaveTextContent(/No cached quotes/i);
+    });
+
+    it('shows no empty-strip note while the first quote read is pending or when a quote exists (#959)', async () => {
+        let resolvePrices;
+        api.getWatchlistPrices.mockReturnValue(new Promise(r => { resolvePrices = r; }));
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(api.getWatchlistPrices).toHaveBeenCalled());
+        expect(screen.queryByTestId('pulse-empty-note')).not.toBeInTheDocument();
+
+        await act(async () => { resolvePrices({ prices: { SPY: { price: 500, pct_1d: 0.01 } }, fresh: true, cached: true }); });
+        await waitFor(() => expect(screen.getAllByText('500.00').length).toBeGreaterThan(0));
+        expect(screen.queryByTestId('pulse-empty-note')).not.toBeInTheDocument();
+    });
+
+    // Codex hold on #1464: overlapping quote reads (mount read and reconnect snapshot).
+    // Each call to getWatchlistPrices starts right after its generation is taken, so the
+    // call order is the start order; the later-started read is the newest.
+    async function twoOverlappingReads() {
+        const calls = [];
+        api.getWatchlistPrices.mockImplementation(() => new Promise(resolve => { calls.push(resolve); }));
+        useWebSocket.mockReturnValue({ connected: true, prices: {} });
+        render(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(calls.length).toBe(2));
+        return calls;
+    }
+
+    it('ignores an older empty-cache quote read that finishes after a newer failed one (#959)', async () => {
+        const [older, newer] = await twoOverlappingReads();
+        await act(async () => { newer({ error: true, status: 503, message: 'down' }); });
+        expect(await screen.findByTestId('pulse-empty-note')).toHaveTextContent(/Quotes unavailable: the request failed/i);
+        await act(async () => { older({ prices: {}, fresh: false, cached: false }); });
+        expect(screen.getByTestId('pulse-empty-note')).toHaveTextContent(/Quotes unavailable: the request failed/i);
+        expect(screen.getByTestId('pulse-empty-note')).not.toHaveTextContent(/No cached quotes/i);
+    });
+
+    it('ignores an older failed quote read that finishes after a newer empty-cache one (#959)', async () => {
+        const [older, newer] = await twoOverlappingReads();
+        await act(async () => { newer({ prices: {}, fresh: false, cached: false }); });
+        expect(await screen.findByTestId('pulse-empty-note')).toHaveTextContent(/No cached quotes yet/i);
+        await act(async () => { older({ error: true, status: 503, message: 'down' }); });
+        expect(screen.getByTestId('pulse-empty-note')).toHaveTextContent(/No cached quotes yet/i);
+        expect(screen.getByTestId('pulse-empty-note')).not.toHaveTextContent(/failed/i);
+    });
+
+    it('re-enables Refresh quotes when a newer read overtook the pending refresh (#959)', async () => {
+        useWebSocket.mockReturnValue({ connected: false, prices: {} });
+        api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false });
+        let finishRefresh;
+        api.refreshWatchlistPrices.mockReturnValue(new Promise(r => { finishRefresh = r; }));
+        const { rerender } = render(<Dashboard onNavigate={vi.fn()} />);
+
+        fireEvent.click(await screen.findByTestId('pulse-refresh'));
+        await waitFor(() => expect(screen.getByTestId('pulse-refresh')).toBeDisabled());
+
+        // A newer background read starts and finishes while the POST is still pending.
+        useWebSocket.mockReturnValue({ connected: true, prices: {} });
+        rerender(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(api.getWatchlistPrices).toHaveBeenCalledTimes(2));
+
+        await act(async () => { finishRefresh({ prices: {} }); });
+        // The POST has settled; the button must not stay stuck disabled.
+        await waitFor(() => expect(screen.getByTestId('pulse-refresh')).not.toBeDisabled());
+        expect(screen.getByTestId('pulse-refresh')).toHaveTextContent('Refresh quotes');
+    });
+
+    // Codex hold on #1464 at 4a151ab4: a reconnect GET that starts while the manual POST is
+    // pending can return the OLD cache; start order is not cache freshness.
+    async function refreshOverlappedByReconnectRead() {
+        useWebSocket.mockReturnValue({ connected: false, prices: {} });
+        const gets = [];
+        api.getWatchlistPrices.mockImplementation(() => new Promise(resolve => { gets.push(resolve); }));
+        let finishRefresh;
+        api.refreshWatchlistPrices.mockReturnValue(new Promise(r => { finishRefresh = r; }));
+        const view = render(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(gets.length).toBe(1));
+        await act(async () => { gets[0]({ prices: {}, fresh: false, cached: false }); });
+
+        fireEvent.click(await screen.findByTestId('pulse-refresh'));
+        await waitFor(() => expect(screen.getByTestId('pulse-refresh')).toBeDisabled());
+
+        useWebSocket.mockReturnValue({ connected: true, prices: {} });
+        view.rerender(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(gets.length).toBe(2));
+        return { reconnectGet: gets[1], finishRefresh };
+    }
+
+    it('keeps the refreshed price when a reconnect read that returned the old cache lands first (#959)', async () => {
+        const { reconnectGet, finishRefresh } = await refreshOverlappedByReconnectRead();
+        await act(async () => { reconnectGet({ prices: { SPY: { price: 500, pct_1d: 0.01 } }, fresh: true, cached: true }); });
+        await act(async () => { finishRefresh({ prices: { SPY: { price: 501, pct_1d: 0.02 } } }); });
+        await waitFor(() => expect(screen.getAllByText('501.00').length).toBeGreaterThan(0));
+        expect(screen.queryByText('500.00')).not.toBeInTheDocument();
+    });
+
+    it('keeps the refreshed price when the refresh lands first and the old-cache read lands after (#959)', async () => {
+        const { reconnectGet, finishRefresh } = await refreshOverlappedByReconnectRead();
+        await act(async () => { finishRefresh({ prices: { SPY: { price: 501, pct_1d: 0.02 } } }); });
+        await waitFor(() => expect(screen.getAllByText('501.00').length).toBeGreaterThan(0));
+        await act(async () => { reconnectGet({ prices: { SPY: { price: 500, pct_1d: 0.01 } }, fresh: true, cached: true }); });
+        expect(screen.getAllByText('501.00').length).toBeGreaterThan(0);
+        expect(screen.queryByText('500.00')).not.toBeInTheDocument();
+    });
+
+    it('drops the refresh-failed message once a later quote read succeeds (#959)', async () => {
+        useWebSocket.mockReturnValue({ connected: false, prices: {} });
+        api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false });
+        api.refreshWatchlistPrices.mockResolvedValueOnce({ error: true, status: 502, message: 'upstream' });
+        const { rerender } = render(<Dashboard onNavigate={vi.fn()} />);
+
+        fireEvent.click(await screen.findByTestId('pulse-refresh'));
+        expect(await screen.findByText(/Quote refresh failed, so there are still no quotes/i)).toBeInTheDocument();
+
+        // The socket connects; the reconnect snapshot reads the (still empty) cache successfully.
+        useWebSocket.mockReturnValue({ connected: true, prices: {} });
+        rerender(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(screen.getByTestId('pulse-empty-note')).toHaveTextContent(/No cached quotes yet/i));
+        expect(screen.getByTestId('pulse-empty-note')).not.toHaveTextContent(/refresh failed/i);
+    });
+
+    it('fills the strip only when the user presses Refresh quotes, and says so if that fails (#959)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false });
+        api.refreshWatchlistPrices.mockResolvedValueOnce({ error: true, status: 502, message: 'upstream' });
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        const button = await screen.findByTestId('pulse-refresh');
+        expect(api.refreshWatchlistPrices).not.toHaveBeenCalled();
+        fireEvent.click(button);
+        expect(await screen.findByText(/Quote refresh failed, so there are still no quotes/i)).toBeInTheDocument();
+
+        api.refreshWatchlistPrices.mockResolvedValueOnce({ prices: { SPY: { price: 501, pct_1d: 0.02 } } });
+        fireEvent.click(screen.getByTestId('pulse-refresh'));
+        await waitFor(() => expect(screen.queryByTestId('pulse-empty-note')).not.toBeInTheDocument());
+        expect(screen.getAllByText('501.00').length).toBeGreaterThan(0);
     });
 
     it('shows "time not reported" for a change-feed event with no time, never the brief time (#959)', async () => {

@@ -110,6 +110,39 @@ describe('LessonsWidget', () => {
         expect(await screen.findByText(/No post-mortem lessons in the last 14 days/i)).toBeInTheDocument();
     });
 
+    it('shows the summary the endpoint really returns: lessons as {text, count, label} (#959)', async () => {
+        // Measured on the served build 2026-11-26: label "LLM summary of 5 postmortems"
+        // sat above "No post-mortem lessons" because the object shape normalized to [].
+        api.getPostmortemLessons.mockResolvedValue({
+            lessons: {
+                text: '- Cover the puts before earnings.\n- Avoid Friday OPEX bull runs.',
+                count: 5,
+                label: 'LLM summary of 5 postmortems dated 2026-11-26',
+            },
+            generated_at: new Date().toISOString(),
+            label: 'LLM summary of 5 postmortems dated 2026-11-26',
+            cached: false,
+        });
+
+        render(<LessonsWidget />);
+
+        expect(await screen.findByText('Cover the puts before earnings.')).toBeInTheDocument();
+        expect(screen.getByText('Avoid Friday OPEX bull runs.')).toBeInTheDocument();
+        expect(screen.queryByText(/No post-mortem lessons/i)).not.toBeInTheDocument();
+    });
+
+    it('still reads an empty window as empty when the object says count 0 (#959)', async () => {
+        api.getPostmortemLessons.mockResolvedValue({
+            lessons: { lessons: [], text: 'No post-mortems found in the last 30 days.', count: 0 },
+            generated_at: null, label: null, note: 'no postmortems in the last 30 days',
+        });
+
+        render(<LessonsWidget />);
+
+        expect(await screen.findByText(/No post-mortem lessons in the last 30 days/i)).toBeInTheDocument();
+        expect(screen.queryByText(/No post-mortems found/i)).not.toBeInTheDocument();
+    });
+
     it('shows the honesty label ("LLM summary of N postmortems dated X-Y")', async () => {
         // Wave 3 #6 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md): the backend
         // now returns a `label` describing exactly what was summarized —
