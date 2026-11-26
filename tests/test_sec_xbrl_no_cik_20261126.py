@@ -204,33 +204,65 @@ def test_a_foreign_tagged_issuer_with_a_valid_cik_is_still_pulled_and_written(mo
 
 # ── a degraded heads read cannot starve later issuers in bounded runs ────────
 
-def test_unresolved_symbols_do_not_starve_a_valid_issuer_behind_them_and_recover_later(monkeypatch):
-    """Codex 6080007104: the scheduler runs with a limit; unresolved symbols consume it. With the
-    heads unreadable and a window of unresolved symbols ahead of a valid issuer, consecutive capped
-    runs must still reach the valid issuer, and the unknowns must be settled once the read recovers."""
+def test_unresolved_symbols_do_not_starve_a_valid_issuer_behind_them_but_the_run_is_never_green(monkeypatch):
+    """Codex 6080007104 + 6080285694: with the heads unreadable and a window of unresolved symbols
+    ahead of a valid issuer, consecutive capped runs reach the valid issuer, the second run is PARTIAL
+    (the outstanding coverage is one explicit incomplete item), and recovery settles everything."""
     state: dict = {}
     universe = ["U1", "U2", "U3", "V1"]
     cik = {"V1": "0000000005"}
 
     run1 = _puller(monkeypatch, universe, cik, covered=None, state=state).pull_all(limit=3)
     assert [r["status"] for r in run1 if r.get("ticker")] == ["FAILED"] * 3
+    assert run1[-1]["coverage_check_unavailable"] == 3 and run1[-1]["coverage_deferred_outstanding"] == 0
     assert state["deferred"] == ["U1", "U2", "U3"] and state["attempted"] == []
 
     p2 = _puller(monkeypatch, universe, cik, covered=None, state=state)
     run2 = p2.pull_all(limit=3)
     assert [(r["ticker"], r["status"]) for r in run2 if r.get("ticker")] == [("V1", "SUCCESS")]    # forward progress
+    outstanding = [r for r in run2 if "coverage incomplete" in str(r.get("error", ""))]
+    assert len(outstanding) == 1 and "3 symbol(s) deferred" in outstanding[0]["error"]
+    assert run2[-1]["coverage_check_unavailable"] == 0 and run2[-1]["coverage_deferred_outstanding"] == 3
+    outcome, rows, note = _classify_outcome(run2)
+    assert outcome == OUTCOME_PARTIAL and rows == 1 and "coverage incomplete" in note       # never SUCCESS
     assert state["completed"] == ["V1"] and state["attempted"] == ["V1"]
 
-    # the heads read recovers: only the deferred symbols remain, so they are retried and settled
-    run3 = _puller(monkeypatch, universe, cik, covered=frozenset(), state=state).pull_all(limit=3)
-    assert [(r["ticker"], r["status"], r["reason"]) for r in run3 if r.get("ticker")] == [
-        ("U1", "NO_DATA", "NO_CIK"), ("U2", "NO_DATA", "NO_CIK"), ("U3", "NO_DATA", "NO_CIK")]
-    assert sorted(state["attempted"]) == ["U1", "U2", "U3", "V1"] and state["deferred"] == []
-    assert _classify_outcome(run3)[0] == OUTCOME_NO_NEW_DATA
+    # the heads read recovers (U2 is a covered issuer that lost its CIK): the deferred symbols are retried
+    run3 = _puller(monkeypatch, universe, cik, covered={"u2"}, state=state).pull_all(limit=3)
+    by = {r["ticker"]: r for r in run3 if r.get("ticker")}
+    assert by["U1"]["status"] == "NO_DATA" and by["U3"]["status"] == "NO_DATA"
+    assert by["U2"]["status"] == "FAILED" and by["U2"]["error"].startswith("CIK lost")
+    assert run3[-1]["coverage_deferred_outstanding"] == 0 and state["deferred"] == []
+    assert sorted(state["attempted"]) == ["U1", "U2", "U3", "V1"]
+    assert _classify_outcome(run3)[0] == OUTCOME_PARTIAL                                     # the known lost CIK
 
     # the sweep is complete: the next run starts a new one
     run4 = _puller(monkeypatch, universe, cik, covered=frozenset(), state=state).pull_all(limit=1)
     assert [r["ticker"] for r in run4 if r.get("ticker")] == ["U1"]
+
+
+def test_the_real_limit_200_fixture_second_run_is_partial_not_green(monkeypatch):
+    """Codex's fixture: run 1 has 200 unavailable heads; run 2 writes the next valid issuer while the
+    same 200 are still deferred, and must report them."""
+    state: dict = {}
+    universe = [f"U{i}" for i in range(200)] + ["V1"]
+    cik = {"V1": "0000000005"}
+    run1 = _puller(monkeypatch, universe, cik, covered=None, state=state).pull_all(limit=200)
+    assert _classify_outcome(run1)[0] == OUTCOME_FAILED
+    run2 = _puller(monkeypatch, universe, cik, covered=None, state=state).pull_all(limit=200)
+    assert [(r["ticker"], r["status"]) for r in run2 if r.get("ticker")] == [("V1", "SUCCESS")]
+    assert run2[-1]["coverage_deferred_outstanding"] == 200 and run2[-1]["coverage_check_unavailable"] == 0
+    outcome, rows, note = _classify_outcome(run2)
+    assert outcome == OUTCOME_PARTIAL and rows == 1 and "200 symbol(s) deferred" in note
+
+
+def test_a_readable_heads_table_retries_deferred_symbols_immediately_in_order(monkeypatch):
+    """The reason for the deferral is gone, so they are not held behind the rest of the sweep."""
+    state = {"normalizer_version": NORMALIZER_VERSION, "completed": [], "attempted": [],
+             "deferred": ["U1", "U2"]}
+    run = _puller(monkeypatch, ["U1", "U2", "V1"], {"V1": "0000000005"}, covered=frozenset(), state=state).pull_all(limit=2)
+    assert [(r["ticker"], r["status"]) for r in run if r.get("ticker")] == [("U1", "NO_DATA"), ("U2", "NO_DATA")]
+    assert run[-1]["coverage_deferred_outstanding"] == 0 and state["deferred"] == []
 
 
 def test_still_degraded_the_deferred_symbols_are_retried_when_nothing_else_is_left(monkeypatch):

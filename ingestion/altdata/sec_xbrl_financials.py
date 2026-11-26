@@ -1110,14 +1110,22 @@ class SECXBRLFinancialsPuller:
             # after every issuer succeeded. Failure never means completion.
             checkpoint, already_done, already_attempted = {}, set(), set()
         total_rows_before: int = int(checkpoint.get("total_rows") or 0)
+        # Issuers that already have a stored snapshot: one of them missing from
+        # the SEC ticker file is a lost CIK (rename, delisting, a truncated
+        # file), not a symbol that never filed. None = the heads could not be
+        # read, so no CIK-less symbol can be classified this run.
+        covered_actors = _stored_snapshot_actors(self.engine)
         # Symbols a run could not classify (heads unreadable): neither attempted
         # nor retried ahead of the rest of the sweep, so a degraded heads read
         # cannot make bounded runs revisit the same window forever. They are
         # retried once every other symbol of the sweep has been attempted.
         deferred: set[str] = set(checkpoint.get("deferred") or [])
         pending = [t for t in universe if t not in already_attempted]
-        if pending and deferred and all(t in deferred for t in pending):
+        if covered_actors is not None or (pending and deferred and all(t in deferred for t in pending)):
+            # The heads are readable again (the reason for the deferral is gone), or
+            # only deferred symbols remain: retry them now.
             deferred = set()
+        carried = frozenset(deferred)        # still deferred from earlier runs; skipped this run
 
         # Pre-load FX rates once so every ticker's facts can convert
         # non-USD amounts to USD without a DB hit per row.
@@ -1132,11 +1140,6 @@ class SECXBRLFinancialsPuller:
         if not cik_map:
             log.error("SEC_XBRL: CIK map empty — aborting")
             return [{"status": "FAILED", "error": "cik map empty"}]
-        # Issuers that already have a stored snapshot: one of them missing from
-        # the SEC ticker file is a lost CIK (rename, delisting, a truncated
-        # file), not a symbol that never filed. None = the heads could not be
-        # read, so no CIK-less symbol can be classified this run.
-        covered_actors = _stored_snapshot_actors(self.engine)
 
         # Small courtesy delay after the first SEC call.
         time.sleep(_RATE_LIMIT_DELAY_SECS)
@@ -1248,6 +1251,18 @@ class SECXBRLFinancialsPuller:
             tolerated_total += snapshot.tolerated_legacy_entries
             record_attempt(ticker, success=True)
 
+        if carried:
+            # Deferred coverage from earlier runs is still unresolved and was skipped
+            # this run so later symbols could make progress. It must not read as a
+            # clean run: one explicit incomplete item carries the count (the
+            # scheduler classifies per item and ignores SUMMARY counts).
+            log.warning("SEC_XBRL: {n} symbol(s) deferred by earlier runs are still unresolved", n=len(carried))
+            results.append({
+                "status": "FAILED", "rows": 0,
+                "error": (f"coverage incomplete: {len(carried)} symbol(s) deferred because the stored snapshot "
+                          "heads were unreadable are still unresolved"),
+            })
+
         elapsed = time.monotonic() - start_ts
         log.info(
             "SEC_XBRL complete — {p} tickers, {r} rows, {t} unusable legacy entries tolerated, "
@@ -1262,7 +1277,8 @@ class SECXBRLFinancialsPuller:
             "no_cik": len(no_cik_tickers),
             "no_cik_tickers": no_cik_tickers[:50],
             "cik_lost": cik_lost,
-            "coverage_check_unavailable": coverage_unavailable,
+            "coverage_check_unavailable": coverage_unavailable,      # new this run
+            "coverage_deferred_outstanding": len(carried),           # carried from earlier runs
             "elapsed_seconds": round(elapsed, 1),
         })
         return results
