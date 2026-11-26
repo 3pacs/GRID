@@ -372,29 +372,40 @@ export default function Dashboard({ onNavigate }) {
         }
     }, []);
 
-    const applyPulseRead = useCallback((r) => {
-        if (!r || r.error) { setPulseRead('failed'); return; }
+    // Quote reads can overlap (mount read, reconnect snapshot, manual refresh). Only the
+    // newest one may change the strip's state, and any accepted read supersedes an
+    // earlier refresh failure, same as the regime reads above.
+    const pulseGenRef = useRef(0);
+    const startPulseRead = useCallback(() => ++pulseGenRef.current, []);
+    const applyPulseRead = useCallback((gen, r) => {
+        if (gen !== pulseGenRef.current) return false;
+        setPulseRefreshFailed(false);
+        if (!r || r.error) { setPulseRead('failed'); return true; }
         if (r.prices) setPulsePrices(r.prices);
         setPulseRead('ok');
+        return true;
     }, []);
 
     const refreshPulseQuotes = useCallback(async () => {
+        const gen = startPulseRead();
         setPulseRefreshing(true);
         setPulseRefreshFailed(false);
         try {
             const r = await api.refreshWatchlistPrices();
+            if (gen !== pulseGenRef.current) return;
             if (!r || r.error) { setPulseRefreshFailed(true); return; }
-            applyPulseRead(r);
+            applyPulseRead(gen, r);
         } catch {
-            setPulseRefreshFailed(true);
+            if (gen === pulseGenRef.current) setPulseRefreshFailed(true);
         } finally {
-            setPulseRefreshing(false);
+            if (gen === pulseGenRef.current) setPulseRefreshing(false);
         }
-    }, [applyPulseRead]);
+    }, [applyPulseRead, startPulseRead]);
 
     const refreshLiveSnapshot = useCallback(async () => {
         try {
             const regimeRead = startRegimeRead();
+            const pulseGen = startPulseRead();
             const [regime, status, watchlistPriceResponse] = await Promise.all([
                 api.getCurrent({ force: true }).catch(() => null),
                 api.getStatus().catch(() => null),
@@ -402,7 +413,7 @@ export default function Dashboard({ onNavigate }) {
             ]);
             applyRegimeRead(regimeRead, regime);
             if (status) setSystemStatus(status);
-            applyPulseRead(watchlistPriceResponse);
+            applyPulseRead(pulseGen, watchlistPriceResponse);
         } catch {
             // Best-effort catch-up after socket reconnect/visibility restore.
         }
@@ -430,7 +441,8 @@ export default function Dashboard({ onNavigate }) {
                 setIntelData(d);
             }).catch(() => { setChangeFeedState('failed'); });
             api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
-            api.getWatchlistPrices().then(applyPulseRead).catch(() => setPulseRead('failed'));
+            const pulseGen = startPulseRead();
+            api.getWatchlistPrices().then(r => applyPulseRead(pulseGen, r)).catch(() => applyPulseRead(pulseGen, null));
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
         } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
     }, []);
