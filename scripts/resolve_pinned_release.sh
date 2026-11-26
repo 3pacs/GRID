@@ -50,7 +50,16 @@ if [ "$("${G[@]}" rev-parse 'HEAD^{tree}' 2>/dev/null)" != "$EXPECTED_TREE" ]; t
   echo "REFUSED: $RELEASE HEAD tree does not match $EXPECTED_SHA" >&2
   exit 8
 fi
-if ! "${G[@]}" diff --quiet HEAD --; then
+# `git status`, not `git diff`: `git diff` refreshes and rewrites the index
+# when a tracked file has stale stat info, and ignores --no-optional-locks
+# (builtin/diff.c refresh_index_quietly). `git status` honours it, so this
+# stays read-only. Empty porcelain output = no staged or unstaged tracked
+# change, which also catches a staged change whose worktree file was restored.
+if ! STATUS="$("${G[@]}" -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=no --ignore-submodules=none 2>/dev/null)"; then
+  echo "REFUSED: cannot read git status of $RELEASE" >&2
+  exit 9
+fi
+if [ -n "$STATUS" ]; then
   echo "REFUSED: $RELEASE has tracked files that differ from $EXPECTED_SHA" >&2
   exit 9
 fi
