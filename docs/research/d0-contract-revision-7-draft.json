@@ -1,0 +1,215 @@
+{
+ "schema": "d0-contract-revision-7-draft/1",
+ "status": "DRAFT_NOT_EFFECTIVE",
+ "drafted": "2026-11-26",
+ "authority": "operator, 2026-11-26: 'Yes, drop D2-H1 and draft it' (drafting only; signing and pinning need the reviewer's ACCEPT and the operator's separate go)",
+ "base_revision": 6,
+ "base_body_sha256": "7643c1e096d8c75567598d16ebf077a246e862c0c922a8f674e82574e2681285",
+ "note": "Not effective. The signed revision 6 body stays pinned and unedited. Each change gives an anchor that must occur exactly once in that body, and replacement text; applying them mechanically yields the revision 7 body that would be signed.",
+ "changes": [
+  {
+   "section": "Header Version row",
+   "anchor": "**revision 6** (revision 2 answered",
+   "replacement": "**revision 7** (revision 7: D2-H1 struck, §10.6; revision 2 answered",
+   "why": "version label"
+  },
+  {
+   "section": "Header signature row",
+   "anchor": "**Signed 2026-11-14** on the operator's \"Yes, sign and pin\", after the reviewer accepted revision 6 at `5e7c34aa`.",
+   "replacement": "**Revision 6 was signed 2026-11-14** (inherited, historical) on the operator's \"Yes, sign and pin\", after the reviewer accepted revision 6 at `5e7c34aa`. **Revision 7 is not signed**: it takes effect only when the owner signs it again, after the reviewer's ACCEPT and on the operator's separate go, and it then pins its own body hash.",
+   "why": "do not let a revision 7 header claim the old signature"
+  },
+  {
+   "section": "Header status paragraph",
+   "anchor": "The research owner signed this body\non 2026-11-14 and its hash is pinned",
+   "replacement": "The research owner signed revision 6 of this body on 2026-11-14\n(revision 7 is not yet signed or pinned) and revision 6's hash is pinned",
+   "why": "same, in the status paragraph"
+  },
+  {
+   "section": "§4 ledger",
+   "anchor": "| #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |",
+   "replacement": "| #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |\n| GEX edge6 follow-up: SPX (fb0c73b, 3fbba8d, 059876a) | the 15:00 short iron fly on SPXW; 14:00 and 14:30 entries reported only | sample A 2016-11-15 .. 2022-11-11 and sample B 2022-11-14 .. 2026-11-09 | FAIL on both samples | revision 7, G5 reconciliation |\n| GEX edge9 | analog library of SPY intraday moments (price paths, no option premium) | burn-in 2018-05-01 .. 2018-12-31; holdout trades 2019-01-02 .. 2022-11-11; development 2022-11-14 .. 2024-11-08 | look result exists | revision 7, G5 reconciliation |\n| GEX eod-flows and playbook evidence cuts | SPY and QQQ late-day follow; decision-minute to close SPY moves (exploratory) | 2018-05-01 .. 2026-11-10 | exploratory, no verdict | revision 7, G5 reconciliation |\n| GEX edge10, edge11, edge12 | equity cross-section families (daily; no SPY option data) | edge10 holdout 2018-06-01 .. 2022-12-30; edge11 2018-08 .. 2026-11; edge12 dev 2010-01-04 .. 2022-12-29, holdout 2022-12-30 .. 2026-11-12 | see their records | revision 7, G5 reconciliation |",
+   "why": "section 4 omitted these lane records (full list, windows and the one unconfirmed item: docs/research/d2-h1-ledger-reconciliation-v0.json)"
+  },
+  {
+   "section": "§4 consequence",
+   "anchor": "Untouched options history exists before 2022-11-14 (OPRA from 2013), where SPY had Monday/Wednesday/Friday",
+   "replacement": "Revision 7: that window is spent for the 0DTE short iron fly family (2016-11-15 .. 2022-11-11 was judged on SPXW, rows above). No other family is presumed untouched: each needs a family-specific reconciliation against this ledger before any fetch, without opening a protected reservation (edge3's daily-SPY holdout, the insider reservations). Options history exists before 2022-11-14 (OPRA from 2013), where SPY had Monday/Wednesday/Friday",
+   "why": "no blanket untouched claim"
+  },
+  {
+   "section": "§6.2 heading",
+   "anchor": "### 6.2 Hypotheses: D2-H1 has two cells; D2-H2 and D2-H3 are adopted unchanged",
+   "replacement": "### 6.2 Hypotheses: D2-H1 is struck (revision 7); D2-H2 and D2-H3 are adopted unchanged",
+   "why": "strike"
+  },
+  {
+   "section": "§6.2 D2-H1 row",
+   "anchor": "| D2-H1a / D2-H1b | edge6 replication at",
+   "replacement": "| D2-H1a / D2-H1b (**STRUCK in revision 7: never fetched, never looked at, kept as history**) | edge6 replication at",
+   "why": "strike, history retained"
+  },
+  {
+   "section": "§6.2 estimands (1)",
+   "anchor": "- **D2-H1** is graded on the synthetic payoff proxy and is historical.",
+   "replacement": "- **D2-H1** (struck in revision 7; history) was to be graded on the synthetic payoff proxy, historically.",
+   "why": "no live verb"
+  },
+  {
+   "section": "§6.2 estimands (2)",
+   "anchor": "A D2-H1 pass does not show that the 15:55 exit earns the same, and a D2-H2 pass does not replicate the\nproxy result. The only comparison D0 makes is the GO rule in §6.5, frozen here before either look.",
+   "replacement": "A D2-H2 pass does not replicate the proxy result that the struck D2-H1 would have measured, and no replication exists in revision 7. D0 makes no cross-hypothesis comparison: GO is not reachable (§6.5).",
+   "why": "no live H1 pass"
+  },
+  {
+   "section": "§6.2 pre-2022 window",
+   "anchor": "**Pre-2022 window, before fetching (G5):**",
+   "replacement": "**Pre-2022 window (G5), outcome in revision 7.** The ledger reconciliation (`d2-h1-ledger-reconciliation-v0`, scoped-accepted by the reviewer at `bf47da50`) found that the 15:00 short iron fly was already judged on SPXW over 2016-11-15 .. 2022-11-11, with the 14:00 and 14:30 entries reported. The reviewer's position (review 6068505242) and the owner's are the same: that is the same selection family, a different underlying is a different estimand and not an independent selection, and reported-only inspection is still inspection. Both cells are therefore struck, and neither goes on a fetch manifest. The pre-fetch conditions below are history, not rules:\n<!-- D2-H1-HISTORY-BEGIN -->",
+   "why": "outcome, then the old conditions as history"
+  },
+  {
+   "section": "§6.2 excluded entry times",
+   "anchor": "**Excluded entry times:** 09:35 (edge6 FAIL) and 12:00 (edge6 PASS, but not chosen) are not tested, and are\ncounted in the selection disclosure in §6.4.",
+   "replacement": "**Excluded entry times:** 09:35 (edge6 FAIL) and 12:00 (edge6 PASS, but not chosen) are not tested, and are\ncounted in the selection disclosure in §6.4.\n<!-- D2-H1-HISTORY-END -->",
+   "why": "close the history block"
+  },
+  {
+   "section": "§6.3 D2-H1 fills",
+   "anchor": "- **D2-H1 (replication):** fills at mark T, exactly as edge6.\n  - Spot and quotes share the mark, so each fill is labelled **MODELED_BBO_SAME_MARK**.\n  - A conservative sensitivity, reported and not judged, fills at the quote in force at T + 1 minute.",
+   "replacement": "<!-- D2-H1-HISTORY-BEGIN -->\n- **D2-H1 (struck in revision 7; history, no live rule):** was to fill at mark T, exactly as edge6, labelled MODELED_BBO_SAME_MARK, with a T + 1 minute sensitivity.\n<!-- D2-H1-HISTORY-END -->",
+   "why": "history block"
+  },
+  {
+   "section": "§6.3 fees",
+   "anchor": "D2-H1 uses the edge6 fee in §6.2: $0.0003 per share per leg, entry legs only. D2-H2 keeps",
+   "replacement": "(D2-H1, struck in revision 7: edge6 fee, history.) D2-H2 keeps",
+   "why": "no live fee for a struck cell"
+  },
+  {
+   "section": "§6.3 proxy",
+   "anchor": "- **D2-H1 is judged on the synthetic payoff proxy** (§6.2). No D2-H1 result is a claim about exercise, assignment or after-hours outcomes.",
+   "replacement": "- **D2-H1 (struck in revision 7; history)** was to be judged on the synthetic payoff proxy (§6.2). No D2-H1 result exists.",
+   "why": "no live verb"
+  },
+  {
+   "section": "§6.4 statistical",
+   "anchor": "**Statistical:**\n- **D2-H1a and D2-H1b** are each tested separately",
+   "replacement": "**Statistical:** *(Revision 7: the D2-H1 bullets below, the D2-H1 sample floor and the D2-H1 power sentences are void with the struck cells and stay as history. No D2-H1 test is run.)*\n<!-- D2-H1-HISTORY-BEGIN -->\n- **D2-H1a and D2-H1b** are each tested separately",
+   "why": "history block opens"
+  },
+  {
+   "section": "§6.4 statistical end",
+   "anchor": "- **If one cell passes,** that cell's own claim stands, but D2-H1 is not a PASS.",
+   "replacement": "- **If one cell passes,** that cell's own claim stands, but D2-H1 is not a PASS.\n<!-- D2-H1-HISTORY-END -->",
+   "why": "history block closes"
+  },
+  {
+   "section": "§6.4 selection disclosure",
+   "anchor": "- D2-H1 is a replication on a candidate-untouched window for that reason. Its result is reported together\n  with the full program count, and never as a standalone discovery.",
+   "replacement": "- **Revision 7 additions to the disclosure:** the 15:00 short iron fly was also judged on SPXW (2016-11-15 .. 2026-11-09, FAIL in both samples, 14:00 and 14:30 reported), and SPY intraday price paths over 2018 .. 2022-11 were read by edge9, the eod-flows read and the playbook cuts (no option premium). These are part of the program count for the fly structure and for D2-H3, and are not corrected by per-look levels.\n- D2-H1 (struck in revision 7) was a replication on a candidate-untouched window; the window is not untouched for the fly family, which is why it is struck.",
+   "why": "no live verb"
+  },
+  {
+   "section": "§6.4 sample floor",
+   "anchor": "**Sample floor:** D2-H1a and D2-H1b n ≥ 300 sessions each; D2-H2 n = 100; D2-H3 n = 50.",
+   "replacement": "**Sample floor:** D2-H2 n = 100; D2-H3 n = 50. (D2-H1's floor of 300 per cell is void with the struck cells.)",
+   "why": "floor"
+  },
+  {
+   "section": "§6.4 power heading",
+   "anchor": "**Power rationale (D2-H1/H2):**",
+   "replacement": "**Power rationale (D2-H2; the struck D2-H1's sentences at the end are history, revision 7):**",
+   "why": "heading"
+  },
+  {
+   "section": "§6.4 power tail open",
+   "anchor": "optimistic; D3 reports a block-bootstrap and a worst-decile sensitivity. At n = 300 per H1 cell",
+   "replacement": "optimistic; D3 reports a block-bootstrap and a worst-decile sensitivity.\n<!-- D2-H1-HISTORY-BEGIN -->\nAt n = 300 per H1 cell",
+   "why": "history opens"
+  },
+  {
+   "section": "§6.4 power tail close",
+   "anchor": "M/W/F-only history may differ.",
+   "replacement": "M/W/F-only history may differ.\n<!-- D2-H1-HISTORY-END -->",
+   "why": "history closes"
+  },
+  {
+   "section": "§6.5 GO",
+   "anchor": "- **GO** (frozen here, before either look): D2-H1 PASS **and** D2-H2 PASS at their own looks.",
+   "replacement": "- **GO** (revision 7): **not reachable for the fly structure under this contract version.** D2-H1 is struck, so there is no replication. A D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`), and calendar time never converts it. A GO needs a new replication that is proposed separately, authorised separately by the operator, labelled non-independent, and registered in a new contract version before anything is fetched. (Frozen before D2-H2's look: D2-H2 has 0 judged rows as of 2026-11-12.)",
+   "why": "no GO without replication"
+  },
+  {
+   "section": "§6.5 HOLD",
+   "anchor": "- **HOLD:** either is UNDERPOWERED, or operational exclusions exceed 10 %, or D2-H1 cannot be fetched\n  (spend not approved). Calendar time alone never converts HOLD to GO.",
+   "replacement": "- **HOLD** (revision 7): D2-H2 is UNDERPOWERED, or operational exclusions exceed 10 %, or D2-H2 has PASSed (a forward pass alone is HOLD, `FORWARD_PASS_UNREPLICATED`, because D2-H1 is struck). Calendar time alone never converts HOLD to GO.",
+   "why": "HOLD names D2-H2 only"
+  },
+  {
+   "section": "§6.5 precedence",
+   "anchor": "- **Precedence (fixed before either look):** RETIRE first, then HOLD, then GO. A FAIL in any judged cell\n  (H1a, H1b or H2) is RETIRE even when another cell is UNDERPOWERED, because a FAIL is evidence against\n  the structure and an UNDERPOWERED cell is not evidence for it. Without a FAIL, any UNDERPOWERED cell or\n  other HOLD cause gives HOLD.",
+   "replacement": "- **Precedence (revision 7):** RETIRE first, then HOLD; GO is not reachable. A D2-H2 FAIL is RETIRE, because a FAIL is evidence against the structure and an UNDERPOWERED result is not evidence for it. Without a FAIL, an UNDERPOWERED D2-H2, an excluded-sessions halt or a D2-H2 PASS gives HOLD.",
+   "why": "precedence names D2-H2 only"
+  },
+  {
+   "section": "§6.5 RETIRE",
+   "anchor": "- **RETIRE:** D2-H1 FAIL **or** D2-H2 FAIL. D2-H1 FAIL means either H1 cell FAILs; an UNDERPOWERED cell gives HOLD, not FAIL.",
+   "replacement": "- **RETIRE:** D2-H2 FAIL (revision 7: D2-H1 is struck and cannot FAIL). An UNDERPOWERED cell gives HOLD, not FAIL.",
+   "why": "RETIRE rule"
+  },
+  {
+   "section": "§6.6 spend",
+   "anchor": "Spend: the D2-H1 OPRA fetch is a usage-based purchase and needs the operator's explicit approval",
+   "replacement": "Spend (revision 7): none authorised and none needed, because D2-H1 is struck. If a non-independent replication is ever proposed, its OPRA fetch is a usage-based purchase and needs the operator's explicit approval",
+   "why": "no spend"
+  },
+  {
+   "section": "§9 gap G4",
+   "anchor": "| G4 | No options cost class",
+   "replacement": "| G4 (not blocking in revision 7: D2-H2 and D2-H3 are adopted unchanged with their own costs; stays open for any later E2 scoring of options) | No options cost class",
+   "why": "G4 status"
+  },
+  {
+   "section": "§9 gap G5",
+   "anchor": "| G5 | Pre-2022-11 OPRA quotes not fetched | D2-H1a, D2-H1b | GEX research lane | First, reconcile the full inspection ledger and fix the exact contract and target scope in a fetch manifest (§6.2). Then the operator's spend approval with a cap |",
+   "replacement": "| G5 (CLOSED, revision 7) | Pre-2022-11 OPRA quotes not fetched | none: D2-H1 is struck | n/a | No fetch manifest and no spend. History: the ledger reconciliation (§6.2) found the same-family overlap |",
+   "why": "closed row carries no directive"
+  },
+  {
+   "section": "§10.6 new",
+   "anchor": "<!-- D0-CONTRACT-BODY-END -->",
+   "replacement": "### 10.6 Revision 7: D2-H1 struck (2026-11-26)\n\n| Change | Where |\n|---|---|\n| D2-H1a and D2-H1b are struck: the SPXW 15:00 fly (14:00 and 14:30 reported) was judged on the same sessions, same family; reviewer and owner agree | §6.2 |\n| The fly structure cannot reach GO in this version; D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`); D2-H2 FAIL is RETIRE | §6.5 |\n| No OPRA spend; G5 closed; G4 not blocking | §6.6, §9 |\n| Section 4 ledger adds the omitted lane records | §4 |\n| Selection disclosure adds the SPXW look and the SPY price-path reads | §6.4 |\n\nNo outcome of any D2 look had been read when this was recorded. D2-H2 and D2-H3 are unchanged.\n\n<!-- D0-CONTRACT-BODY-END -->",
+   "why": "revision log"
+  },
+  {
+   "section": "Title line",
+   "anchor": "v0 (owner-signed 2026-11-14)",
+   "replacement": "v0 (revision 6 owner-signed 2026-11-14; revision 7 unsigned draft)",
+   "why": "the title is outside the pinned body but is part of the rendered header; it must not claim the old signature for revision 7"
+  },
+  {
+   "section": "Header Version row tail",
+   "anchor": "— **signed by the research owner 2026-11-14** (§10.5).",
+   "replacement": "— **revision 6 signed by the research owner 2026-11-14** (§10.5); **revision 7 is an unsigned draft** (§10.6).",
+   "why": "signature display is revision-specific"
+  },
+  {
+   "section": "§3.1 OPRA row",
+   "anchor": "Pre-2022-11 not fetched by this lane: a **candidate** replication window, not untouched by assertion (§6.2, G5) |",
+   "replacement": "Pre-2022-11 not fetched by this lane. In revision 7 it is not a candidate replication window for the 0DTE short iron fly family (spent by the SPXW look, §4); any future replication is a separate, separately authorised, non-independent registration (§6.5). Other families are not presumed untouched (§4) |",
+   "why": "align section 3.1 with the strike"
+  }
+ ],
+ "at_signing_not_in_this_draft": [
+  "docs/research/d0-research-contract-v0.md: apply every change above (body edit), and replace the 'Revision 7 is not signed' wording, the title and the Version row's 'unsigned draft' wording with the actual signature date at the moment of signing",
+  "analysis/d0_manifest.py: D0_CONTRACT_BODY_SHA256 re-pinned to the new body hash",
+  "docs/research/d0-coverage-manifest-v0.json: contract_body_sha256 and signed_at updated; hypotheses D2-H1a and D2-H1b set to a STRUCK status",
+  "analysis/d0_admission.py: D2-H1a and D2-H1b removed from the frozen hypothesis definitions, so an ADMITTED row for either is refused",
+  "tests: the pin test, the admission test that names D2-H1, and the effective-rule test below re-pointed at the signed body"
+ ],
+ "not_changed": [
+  "D2-H2 and D2-H3 (adopted unchanged)",
+  "every D1 rule",
+  "the D0 gates, the verifier flag VERIFIER_ACCEPTED, any key or signature"
+ ]
+}
