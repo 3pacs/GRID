@@ -15,7 +15,7 @@ that:
   branch or event; an ordinary other PR; pushes) routes exactly as the
   predicate without the #932 disjunct did -- the prior alternatives (push to
   main, #543, #857, #806) and the ordinary self-hosted path are untouched;
-* the four expressions (``env.ON_SELF_HOSTED`` and the three ``runs-on``)
+* the five expressions (``env.ON_SELF_HOSTED`` and the four ``runs-on``)
   carry byte-identical predicates and the trigger events are unchanged;
 * ``backend-tests-suite`` (the sharded main suite) takes no part in the
   routing: it is always hosted with its own ephemeral Postgres, because two
@@ -83,9 +83,12 @@ PR932_CONJUNCTION = (
 
 HOSTED = "ubuntu-latest"
 SELF_HOSTED = ["self-hosted", "tests"]
-JOBS = ("backend-tests", "frontend-build", "lint")
+# backend-tests-contracts (the PostgreSQL contract steps, the only routed job
+# with a database) runs at the same time as the suite shards; backend-tests is
+# the required aggregate after both.
+JOBS = ("backend-tests-contracts", "backend-tests", "frontend-build", "lint")
 # Every job in file order; the suite shards are pinned to hosted runners.
-ALL_JOBS = ("backend-tests-suite", "backend-tests", "frontend-build", "lint")
+ALL_JOBS = ("backend-tests-suite", "backend-tests-contracts", "backend-tests", "frontend-build", "lint")
 
 
 def _templates(predicate: str) -> dict[str, str]:
@@ -369,7 +372,8 @@ def _strip(expr: str) -> str:
 
 
 def _step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
-    for step in workflow["jobs"]["backend-tests"]["steps"]:
+    # The database steps live in the contracts job; the aggregate has none.
+    for step in workflow["jobs"]["backend-tests-contracts"]["steps"]:
         if step.get("name") == name:
             return step
     raise AssertionError(f"step {name!r} not found")
@@ -423,9 +427,10 @@ def test_predicate_bytes_are_the_candidate_templates(workflow: dict[str, Any]) -
     for job in JOBS:
         assert _strip(workflow["jobs"][job]["runs-on"]) == CANDIDATE["runs-on"], job
     text = WORKFLOW.read_text(encoding="utf-8")
-    assert text.count(PR932_CONJUNCTION) == 4
-    assert text.count(PRIOR_ALTERNATIVES) == 4
-    assert text.count(PR918_CONJUNCTION) == 4
+    # env.ON_SELF_HOSTED plus one runs-on per routed job
+    assert text.count(PR932_CONJUNCTION) == 1 + len(JOBS)
+    assert text.count(PRIOR_ALTERNATIVES) == 1 + len(JOBS)
+    assert text.count(PR918_CONJUNCTION) == 1 + len(JOBS)
 
 
 def test_trigger_events_and_jobs_are_unchanged(workflow: dict[str, Any]) -> None:
@@ -524,3 +529,10 @@ def test_suite_shards_are_always_hosted_with_their_own_postgres(workflow: dict[s
     assert "docker run -d --name grid-test-pg" in start["run"]
     # and nothing else in the job is conditioned on the self-hosted switch
     assert "ON_SELF_HOSTED" not in yaml.safe_dump(job)
+
+
+def test_only_the_contracts_job_touches_a_database(workflow: dict[str, Any]) -> None:
+    """The required aggregate starts and resets no Postgres; the contracts job is the one routed job that does."""
+    for job in ("backend-tests", "frontend-build", "lint"):
+        names = [step.get("name") or "" for step in workflow["jobs"][job]["steps"]]
+        assert not [n for n in names if "Postgres" in n], job
