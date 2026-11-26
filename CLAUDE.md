@@ -1,5 +1,9 @@
 # GRID — Claude Code Guidelines
 
+Read `AGENTS.md` first for shared agent instructions. Historical session entries
+are preserved in `docs/agent-history/AGENTS-legacy-20261125.md`; current task
+coordination stays in `.coordination.md`.
+
 This file is the **always-on core**: identity, standing rules, non-negotiable guardrails,
 and a load-on-demand index. Heavy reference material lives in `docs/reference/` and is
 loaded only when a task needs it (see the Reference Index at the bottom). Keep this file
@@ -195,8 +199,8 @@ request IDs) so similar-but-not-identical errors bucket together. Run it before 
 
 ## Workflow Best Practices
 
-- Start complex tasks in **plan mode** before execution
-- Use subagents for independent subtasks (parallel investigation, code review)
+- Explain a concrete plan for complex work, then execute within the user's authorized scope; honor explicit plan-mode requests
+- Use subagents only when the current user request or applicable instructions call for delegation
 - Perform `/compact` at ~50% context usage on long sessions
 - Break work into phases — verify each phase works before moving to the next
 - After fixing a bug, confirm the fix with a test — don't just eyeball it
