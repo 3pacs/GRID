@@ -55,10 +55,10 @@ NeedDaemonReload. Then, read-only:
   host that runs the GRID units, as the user they run as (``/proc/<pid>/cwd`` of another user's process is
   unreadable, and git refuses a checkout owned by someone else);
 * every tree (this script's, each ``--code-root`` and each unit's) needs an exact code identity: ``git
-  rev-parse --show-toplevel HEAD HEAD^{tree}`` and ``git diff --quiet HEAD --`` (fixed argv, ``--no-optional-locks``
-  so nothing is written). The tree must be its checkout's top, HEAD a full commit id, tracked files must match
-  HEAD, and a ``<live_path>.releases/<name>`` directory must be named for its HEAD. It must also carry both
-  literals.
+  rev-parse --show-toplevel HEAD HEAD^{tree}`` and ``git status --porcelain --untracked-files=no`` (fixed argv,
+  ``--no-optional-locks`` and no fsmonitor, so nothing is written; ``git diff`` would write a refreshed index). The
+  tree must be its checkout's top, HEAD a full commit id, the index and tracked files must match HEAD, and a
+  ``<live_path>.releases/<name>`` directory must be named for its HEAD. It must also carry both literals.
 
 * **code identity (#1383).** The cwd is not proof of the code, so the command line is bound too: the running
   process's ``/proc/<pid>/cmdline`` and the unit's ExecStart must be equal, and each must name an entry file inside
@@ -392,7 +392,13 @@ def proc_clock(ticks: str) -> datetime:
 
 
 def git_identity(tree: Path) -> dict[str, Any]:
-    """HEAD, its tree and whether tracked files match it, read without writing (no index refresh, no locks)."""
+    """HEAD, its tree and whether the index and the tracked files match it, read without writing.
+
+    Cleanliness comes from ``git status``, not ``git diff``: with optional locks off, status refreshes stale stat
+    info in memory only. ``git diff`` writes the refreshed index back even with ``--no-optional-locks`` (its
+    ``refresh_index_quietly`` takes the index lock without checking optional locks), so it rewrote the index of
+    any tree with a touched file. Status is also stricter: a staged change whose file was put back reads dirty.
+    """
     exe = shutil.which("git")
     if exe is None:
         raise RuntimeError("git is not installed on this host")
@@ -403,12 +409,13 @@ def git_identity(tree: Path) -> dict[str, Any]:
     lines = parsed.stdout.splitlines()
     if parsed.returncode != 0 or len(lines) != 3:
         raise RuntimeError(f"git rev-parse in {tree} exited {parsed.returncode}: {parsed.stderr.strip()}")
-    diff = subprocess.run(  # nosec B603 - fixed argv, no shell
-        [exe, "-C", str(tree), "--no-optional-locks", "diff", "--quiet", "HEAD", "--"],
+    status = subprocess.run(  # nosec B603 - fixed argv, no shell
+        [exe, "-C", str(tree), "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1",
+         "-z", "--untracked-files=no", "--ignore-submodules=none"],
         capture_output=True, text=True, timeout=120, check=False, env=env)
-    if diff.returncode not in (0, 1):
-        raise RuntimeError(f"git diff in {tree} exited {diff.returncode}: {diff.stderr.strip()}")
-    return {"toplevel": lines[0], "head": lines[1], "head_tree": lines[2], "clean": diff.returncode == 0}
+    if status.returncode != 0:
+        raise RuntimeError(f"git status in {tree} exited {status.returncode}: {status.stderr.strip()}")
+    return {"toplevel": lines[0], "head": lines[1], "head_tree": lines[2], "clean": status.stdout == ""}
 
 
 def _git_exe() -> str:

@@ -374,19 +374,37 @@ def _git(*args, cwd):
 
 @pytest.mark.skipif(not shutil.which("git"), reason="needs git")
 def test_the_real_git_probe_reads_the_identity_and_writes_nothing(tmp_path):
+    """A file with stale stat info and HEAD's content reads clean, and the index is left as it was.
+
+    The file's mtime is set 2 s after the index's. Inside git's racy window ``git diff`` compares content and
+    writes nothing, so a plain ``touch`` passed most runs. Outside it, ``git diff``'s auto-refresh writes the
+    refreshed index back even with ``--no-optional-locks`` (its ``refresh_index_quietly`` does not check
+    optional locks). Hosted CI caught the old probe doing that (run 45762412714)."""
+    import os
+
     repo = write_tree(tmp_path / "repo")
     _git("init", "-q", cwd=repo)
     _git("add", "-A", cwd=repo)
     _git("commit", "-q", "-m", "x", cwd=repo)
     head = _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
-    (repo / HYSTERESIS.path).touch()                          # stale stat info, same content: still clean
     index = repo / ".git" / "index"
+    tracked = repo / HYSTERESIS.path
+    later = index.stat().st_mtime_ns + 2_000_000_000
+    os.utime(tracked, ns=(later, later))                      # stale stat info, same content: still clean
     stamp = (index.stat().st_mtime_ns, index.read_bytes())
     identity = elig.git_identity(repo)
     assert identity == {"toplevel": str(repo.resolve()), "head": head,
                         "head_tree": _git("rev-parse", "HEAD^{tree}", cwd=repo).stdout.strip(), "clean": True}
     assert (index.stat().st_mtime_ns, index.read_bytes()) == stamp and not (repo / ".git" / "index.lock").exists()
-    (repo / HYSTERESIS.path).write_text("changed\n")
+    original = tracked.read_bytes()
+    tracked.write_text("changed\n")
+    assert elig.git_identity(repo)["clean"] is False
+    _git("add", HYSTERESIS.path, cwd=repo)                    # staged, then the file put back: the index differs
+    tracked.write_bytes(original)
+    assert elig.git_identity(repo)["clean"] is False
+    _git("reset", "-q", cwd=repo)
+    assert elig.git_identity(repo)["clean"] is True
+    tracked.unlink()
     assert elig.git_identity(repo)["clean"] is False
     with pytest.raises(RuntimeError, match="git rev-parse"):
         elig.git_identity(tmp_path / "not-a-repo")
