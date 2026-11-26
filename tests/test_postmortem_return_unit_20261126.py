@@ -304,12 +304,23 @@ def _llm_capturing(monkeypatch, prompts: list) -> None:
     monkeypatch.setitem(sys.modules, "llm.router", fake)
 
 
-def test_lessons_prompt_omits_the_old_return_text_of_legacy_prediction_rows(monkeypatch):
+PARAPHRASES = [
+    "Direction was wrong. Actual return: -5024.00%.",
+    "Loss of 5024.00% followed an incorrect signal.",
+    "The position fell 5024.00% after entry.",
+    "Down fifty-one hundred percent; 5024 pct drawdown.",
+]
+
+
+@pytest.mark.parametrize("legacy_text", PARAPHRASES)
+def test_lessons_prompt_carries_no_free_text_of_legacy_prediction_rows(monkeypatch, legacy_text):
     prompts: list = []
     _llm_capturing(monkeypatch, prompts)
     legacy = LEGACY_PRED()
-    legacy["full_analysis"]["root_cause"] = "Direction was wrong. Actual return: -5024.00%."
-    legacy["full_analysis"]["what_actually_happened"] = "INSM PUT ... Outcome: miss. Return: -5024.00%."
+    legacy["full_analysis"]["root_cause"] = legacy_text
+    legacy["full_analysis"]["what_actually_happened"] = legacy_text
+    legacy["full_analysis"]["what_we_missed"] = legacy_text
+    legacy["full_analysis"]["recommended_fix"] = legacy_text
     new = NEW_PRED()
     new["full_analysis"]["root_cause"] = "Fresh row. Actual return: -50.24%."
     trade = TRADE()
@@ -321,20 +332,22 @@ def test_lessons_prompt_omits_the_old_return_text_of_legacy_prediction_rows(monk
     assert len(prompts) == 1
     prompt = prompts[0]
     assert "Average return: -66.83%" in prompt
-    assert "-5024" not in prompt
-    assert pm_mod.RETURN_TEXT_OMITTED in prompt                   # the legacy phrase
-    assert "Fresh row. Actual return: -50.24%." in prompt         # marked row: its prose is right
-    assert "Trade row. Actual return: -100.00%." in prompt        # trade rows were always fractions
+    assert "5024" not in prompt and "fifty-one hundred" not in prompt
+    assert f"wrong_signal {pm_mod.PROSE_OMITTED}" in prompt          # structured stand-in for the legacy row
+    assert "Fresh row. Actual return: -50.24%." in prompt            # marked row: its prose is right
+    assert "Trade row. Actual return: -100.00%." in prompt           # trade rows were always fractions
     assert out["count"] == 3
-    # raw stored prose is untouched
-    assert "-5024.00%" in legacy["full_analysis"]["root_cause"]
+    assert legacy["full_analysis"]["root_cause"] == legacy_text      # raw stored prose untouched
 
 
-def test_prose_without_a_stated_return_is_kept_for_legacy_rows():
-    rec = LEGACY_PRED()
-    rec["full_analysis"]["root_cause"] = "Price moved +52.7% over 21 days; the PUT was early."
-    h = postmortems_from_records([rec])
-    assert h.postmortems[0].root_cause == "Price moved +52.7% over 21 days; the PUT was early."
+def test_hydration_leaves_legacy_prose_empty_and_marks_it_untrusted():
+    legacy = LEGACY_PRED()
+    legacy["full_analysis"]["root_cause"] = "The position fell 5024.00% after entry."
+    h = postmortems_from_records([legacy, NEW_PRED(), TRADE()])
+    old, new, trade = h.postmortems
+    assert (old.prose_trusted, old.root_cause) == (False, "")
+    assert new.prose_trusted and trade.prose_trusted
+    assert new.root_cause == "r" and trade.root_cause == "r"
 
 
 def test_label_uses_the_rows_actually_included_and_exclusion_does_not_shrink_the_window(monkeypatch):

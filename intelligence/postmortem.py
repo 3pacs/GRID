@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
@@ -102,6 +101,11 @@ class PostMortem:
     # the writer: see ``stored_return_fraction``.
     actual_return_unit: str = "fraction"
 
+    # False on a hydrated pre-fix prediction row: its free-form prose may state
+    # the old x100 return in any wording, so the prose fields are left empty
+    # and no free text of it may reach a prompt (storage is untouched).
+    prose_trusted: bool = True
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -152,22 +156,7 @@ def stored_return_fraction(record: dict[str, Any]) -> float | None:
     return None
 
 
-_RETURN_TEXT = re.compile(
-    r"(?i)\b(?:actual[ _]return|return|pnl(?:_pct)?|p&l)\b[^%\n]{0,30}?[-+]?\d+(?:\.\d+)?\s*%"
-)
-RETURN_TEXT_OMITTED = "[return omitted: recorded before the return-unit fix]"
-
-
-def _without_legacy_return_text(text_value: Any) -> Any:
-    """Prose of a pre-fix prediction row with any stated return left out.
-
-    Those rows were narrated with ``{:+.2%}`` over a percent-point value
-    ("Return: -5024.00%" for -50.24%). Only a phrase that states a return is
-    replaced; the stored text itself is never rewritten.
-    """
-    if not isinstance(text_value, str):
-        return text_value
-    return _RETURN_TEXT.sub(RETURN_TEXT_OMITTED, text_value)
+PROSE_OMITTED = "[free text omitted: recorded before the return-unit fix]"
 
 
 @dataclass
@@ -190,8 +179,10 @@ def postmortems_from_records(
     history cannot reach an average. ``limit`` stops after that many included
     records, taking records in order, so an excluded row does not shrink the
     window. For a pre-fix prediction row (no unit marker, ``prediction_id``
-    set) any return stated in the prose is omitted from the object, because
-    the stored text carries the old ×100 figure.
+    set) the free-form prose fields are left empty and ``prose_trusted`` is
+    False: the stored text may state the old ×100 return in any wording, which
+    no filter can enforce. Storage is not touched; marked and trade rows keep
+    their prose.
     """
     out = HydratedPostmortems(postmortems=[], included=[], excluded=0)
     for r in records:
@@ -207,7 +198,7 @@ def postmortems_from_records(
         legacy_prediction = (
             full.get("actual_return_unit") is None and r.get("prediction_id") is not None
         )
-        prose = (lambda v: _without_legacy_return_text(v)) if legacy_prediction else (lambda v: v)
+        prose = (lambda v: "") if legacy_prediction else (lambda v: v)
         try:
             out.postmortems.append(PostMortem(
                 trade_id=full.get("trade_id", 0),
@@ -228,6 +219,7 @@ def postmortems_from_records(
                 recommended_fix=prose(full.get("recommended_fix", r.get("recommended_fix", ""))),
                 confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
                 generated_at=full.get("generated_at", ""),
+                prose_trusted=not legacy_prediction,
             ))
             out.included.append(r)
         except Exception:
@@ -2556,8 +2548,12 @@ def _get_llm_lessons_learned(
     )
 
     # Sample of individual root causes
+    # Only trusted prose is sampled; an untrusted (pre-fix prediction) row
+    # contributes its structured category instead of any free text.
     root_causes = "\n".join(
-        f"  - {pm.ticker} {pm.direction}: {pm.root_cause[:100]}"
+        f"  - {pm.ticker} {pm.direction}: "
+        + (pm.root_cause[:100] if pm.prose_trusted
+           else f"{pm.failure_category} {PROSE_OMITTED}")
         for pm in postmortems[:8]
     )
 
