@@ -6,6 +6,7 @@ All engines and provider bars are local fakes. No HTTP or production DB call.
 from __future__ import annotations
 
 import builtins
+import datetime as datetime_module
 import sys
 from datetime import date, datetime, timedelta, timezone
 from types import ModuleType
@@ -86,6 +87,23 @@ def _raise(error):
     raise error
 
 
+def _point_schedule_at(monkeypatch, fake_datetime_class):
+    """Give the `schedule` library a fake datetime class and nothing else.
+
+    `monkeypatch.setattr(schedule.datetime, "datetime", ...)` replaces the class
+    on the stdlib datetime module for the whole process. Any module first
+    imported while a test runs (ingestion.pull_context, ingestion.smart_scheduler,
+    server_log.git_sink, pydantic.types, ...) then does `from datetime import
+    datetime` and keeps the fake for the rest of the run: PullContext bound it, and
+    tests/test_log_secret_scrubbing.py::test_pull_context_scrubs_persisted_error
+    failed whenever this file was the first to import it on an xdist worker. A
+    copy of the module with the fake class changes what `schedule` sees only."""
+    shim = ModuleType("datetime")
+    shim.__dict__.update({k: v for k, v in vars(datetime_module).items() if not k.startswith("__")})
+    shim.datetime = fake_datetime_class
+    monkeypatch.setattr(schedule, "datetime", shim)
+
+
 def _fake_schedule_clock(monkeypatch, clock, host_zone):
     """Give schedule a moving UTC clock and a controlled host-local zone."""
     real_datetime = datetime
@@ -100,8 +118,18 @@ def _fake_schedule_clock(monkeypatch, clock, host_zone):
         def astimezone(self, tz=None):
             return super().astimezone(tz or local_zone)
 
-    monkeypatch.setattr(schedule.datetime, "datetime", _ClockDateTime)
+    _point_schedule_at(monkeypatch, _ClockDateTime)
     return _ClockDateTime
+
+
+def test_the_fake_schedule_clock_does_not_leak_into_other_modules(monkeypatch):
+    real = datetime_module.datetime
+    fake = _fake_schedule_clock(monkeypatch, {"now": datetime(2026, 1, 1, tzinfo=timezone.utc)}, "UTC")
+    assert schedule.datetime.datetime is fake
+    assert datetime_module.datetime is real  # what any module imported from here on would bind
+    from datetime import datetime as imported_now
+
+    assert imported_now is real
 
 
 def test_single_binance_owner_is_seven_day_utc_job(monkeypatch):
@@ -250,7 +278,7 @@ def test_daily_job_next_run_is_20_utc_on_every_weekday(monkeypatch, weekday):
                 return frozen.astimezone().replace(tzinfo=None)
             return frozen.astimezone(tz)
 
-    monkeypatch.setattr(schedule.datetime, "datetime", _FrozenDateTime)
+    _point_schedule_at(monkeypatch, _FrozenDateTime)
     job = schedule.Scheduler().every().day.at("20:00", "UTC").do(lambda: None)
     expected = frozen.replace(hour=20).astimezone().replace(tzinfo=None)
     assert job.next_run == expected
