@@ -9,13 +9,23 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 NORMALIZER_VERSION = "sec-financial-periods-v2"
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
+# A mapped flow entry with no start, or filed before its end, is unusable. The
+# normalizer drops it either way (``_normalize_entry``), so refusing the whole
+# issuer for one that ended long before the capture only discards the issuer
+# (2026-11-23/24: 47 to 60 of each 200-issuer batch, from 2014-2023 entries such
+# as a 2020 acquisition payment without a start date). The horizon is measured
+# from the capture's own receipt date, never from dates inside the response (an
+# unrelated fact filed in 2035 must not widen it). An unusable entry that ended
+# within this many days of the capture, or after it, is a current or forward
+# period that would be silently dropped, and stays fatal.
+LEGACY_ENTRY_HORIZON_DAYS = 730
 
 
 def _json(value: Any) -> str:
@@ -85,6 +95,9 @@ class FinancialSnapshot:
     source_body: bytes
     normalized_json: str
     fx_json: str
+    # Not part of the identity: how many unusable legacy entries the gate let
+    # through (for the post-run receipt; the source bytes hold the entries).
+    tolerated_legacy_entries: int = field(default=0, compare=False)
 
     @property
     def rows(self) -> list[dict[str, Any]]:
@@ -131,6 +144,7 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
         'ifrs-full': {tag for tags in _IFRS_TAG_MAP.values() for tag in tags}
                      | {_IFRS_DEBT_PROCEEDS_TAG, _IFRS_DEBT_REPAY_TAG},
     }
+    unusable_ends: list[date] = []
     for taxonomy in ('us-gaap', 'ifrs-full'):
         namespace = facts.get(taxonomy, {})
         if not isinstance(namespace, dict):
@@ -162,7 +176,10 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                     # instant non-flow concepts. Only our mapped duration flows
                     # require a start and a reporting end not after filing.
                     if tag_name in mapped_tags[taxonomy] and (start is None or filed < end):
-                        raise ValueError("Invalid mapped financial-flow duration")
+                        unusable_ends.append(end)
+    capture_day = received.date()
+    if any((capture_day - end).days <= LEGACY_ENTRY_HORIZON_DAYS for end in unusable_ends):
+        raise ValueError("Invalid mapped financial-flow duration")
     rates = _AppliedFxRates(json.loads(_json(fx_rates)))
     rows = _collect_all_flows(payload, rates)
     fx_json = _json(rates.applied)
@@ -178,6 +195,7 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
         source_sha256=source_hash, normalized_sha256=normalized_hash,
         normalizer_version=NORMALIZER_VERSION, source_body=source_body,
         normalized_json=normalized_json, fx_json=fx_json,
+        tolerated_legacy_entries=len(unusable_ends),
     )
 
 

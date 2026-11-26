@@ -1352,3 +1352,49 @@ def test_pg_normalization_never_coerces_nonstring_markers(journal_db, location, 
     before = _raw_journal_evidence(journal_db)
     assert _latest_qualified_journal(journal_db)[0] == genuine
     assert _raw_journal_evidence(journal_db) == before
+
+
+def _snapshot_with_extra_facts(extra: dict, *, second: int):
+    """The ``snapshot()`` capture plus extra Company Facts concepts, at a later request time."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+
+    base = snapshot()
+    body = json.loads(base.source_body)
+    body["facts"]["us-gaap"].update(extra)
+    started = datetime(2026, 11, 1, tzinfo=timezone.utc) + timedelta(seconds=second)
+    return prepare_snapshot(source_body=json.dumps(body).encode(), actor_id="nvda", cik="1045810",
+                            request_started_at=started, received_at=started + timedelta(seconds=1),
+                            fx_rates={"USD": 1.0})
+
+
+def test_pg_tolerated_legacy_entry_cannot_remove_an_existing_current_row(snapshot_db):
+    """Codex 6061699121: a newly tolerated legacy no-start entry changes nothing the
+    normalizer emits, so the writer replaces the projection with the same current rows;
+    a current-period no-start entry is refused before the writer and leaves them in place."""
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    first = snapshot()
+    assert write_snapshot(engine, first)["status"] == "applied"
+    before = stored(engine)
+    assert len(before) == 1
+
+    legacy = {"PaymentsToAcquireBusinessesNetOfCashAcquired": {"units": {"USD": [dict(
+        end="2020-03-18", val=1000, accn="0001045810-21-000012", filed="2021-02-22", form="10-K", fp="FY")]}}}
+    later = _snapshot_with_extra_facts(legacy, second=10)
+    assert later.tolerated_legacy_entries == 1 and later.snapshot_id != first.snapshot_id
+    assert later.rows == first.rows
+    result = write_snapshot(engine, later)
+    assert result["status"] == "applied" and result["rows_written"] == len(first.rows)
+    assert result["rows_removed"] == len(first.rows)             # the same owned rows replaced by the same rows
+    assert stored(engine) == before                              # no current row lost or changed
+
+    current_period = {"PaymentsOfDividends": {"units": {"USD": [dict(
+        end="2026-07-26", val=5, accn="0001045810-26-000075", filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    with pytest.raises(ValueError, match="duration"):
+        _snapshot_with_extra_facts(current_period, second=20)
+    assert stored(engine) == before                              # refused before the writer: projection retained
