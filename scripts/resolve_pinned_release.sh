@@ -30,10 +30,29 @@ if [ ! -d "$RELEASES_ROOT" ] || [ "$(dirname -- "$RELEASE")" != "$RELEASES_ROOT"
   echo "REFUSED: $RELEASE is not directly under $RELEASES_ROOT" >&2
   exit 5
 fi
-HEAD_SHA="$(git -C "$RELEASE" rev-parse HEAD 2>/dev/null)" || { echo "REFUSED: $RELEASE is not a git checkout" >&2; exit 6; }
+# Same identity rule as verify_preserved_checkout in deploy_release_swap.sh:
+# the directory is the checkout's own root, HEAD is the reviewed commit, and
+# no tracked file differs from that commit. A matching HEAD alone is not
+# enough: a tracked file edited under the same HEAD would still resolve.
+G=(git --no-optional-locks -C "$RELEASE")
+TOPLEVEL="$("${G[@]}" rev-parse --show-toplevel 2>/dev/null)" || { echo "REFUSED: $RELEASE is not a git checkout" >&2; exit 6; }
+if [ "$(readlink -f -- "$TOPLEVEL")" != "$RELEASE" ]; then
+  echo "REFUSED: $RELEASE is not the root of its checkout ($TOPLEVEL)" >&2
+  exit 6
+fi
+HEAD_SHA="$("${G[@]}" rev-parse HEAD 2>/dev/null)" || { echo "REFUSED: $RELEASE has no HEAD" >&2; exit 6; }
 if [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
   echo "REFUSED: $RELEASE is at $HEAD_SHA, expected $EXPECTED_SHA" >&2
   exit 7
+fi
+EXPECTED_TREE="$("${G[@]}" rev-parse "${EXPECTED_SHA}^{tree}" 2>/dev/null)" || { echo "REFUSED: cannot read the tree of $EXPECTED_SHA" >&2; exit 8; }
+if [ "$("${G[@]}" rev-parse 'HEAD^{tree}' 2>/dev/null)" != "$EXPECTED_TREE" ]; then
+  echo "REFUSED: $RELEASE HEAD tree does not match $EXPECTED_SHA" >&2
+  exit 8
+fi
+if ! "${G[@]}" diff --quiet HEAD --; then
+  echo "REFUSED: $RELEASE has tracked files that differ from $EXPECTED_SHA" >&2
+  exit 9
 fi
 
 printf '%s\n' "$RELEASE"

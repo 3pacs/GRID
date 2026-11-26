@@ -104,6 +104,69 @@ def test_refuses_target_outside_the_releases_root(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_refuses_a_modified_tracked_file_under_the_same_head(tmp_path: Path) -> None:
+    rel, sha = _release(tmp_path, "a")
+    (rel / "f.txt").write_text("edited after checkout", encoding="utf-8")
+    link = tmp_path / "grid_release"
+    link.symlink_to(rel)
+
+    result = _run(str(link), sha)
+
+    assert result.returncode == 9
+    assert result.stdout == ""
+    assert "tracked files" in result.stderr
+
+
+@pytest.mark.unit
+def test_refuses_a_staged_change_under_the_same_head(tmp_path: Path) -> None:
+    rel, sha = _release(tmp_path, "a")
+    (rel / "f.txt").write_text("staged edit", encoding="utf-8")
+    _git(rel, "add", "f.txt")
+    link = tmp_path / "grid_release"
+    link.symlink_to(rel)
+
+    result = _run(str(link), sha)
+
+    assert result.returncode == 9
+    assert result.stdout == ""
+
+
+@pytest.mark.unit
+def test_untracked_files_do_not_block_a_clean_checkout(tmp_path: Path) -> None:
+    # Release trees carry untracked build output (pwa_dist and the like).
+    rel, sha = _release(tmp_path, "a")
+    (rel / "build-output.js").write_text("generated", encoding="utf-8")
+    link = tmp_path / "grid_release"
+    link.symlink_to(rel)
+
+    result = _run(str(link), sha)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(rel.resolve())
+
+
+@pytest.mark.unit
+def test_refuses_a_directory_that_is_not_its_checkout_root(tmp_path: Path) -> None:
+    # The releases root itself is the checkout; "a" is only a subdirectory of it.
+    root = tmp_path / "grid_release.releases"
+    sub = root / "a"
+    sub.mkdir(parents=True)
+    _git(root, "init", "-q")
+    (sub / "f.txt").write_text("a", encoding="utf-8")
+    _git(root, "add", "a/f.txt")
+    _git(root, "commit", "-q", "-m", "a")
+    sha = _git(root, "rev-parse", "HEAD")
+    link = tmp_path / "grid_release"
+    link.symlink_to(sub)
+
+    result = _run(str(link), sha)
+
+    assert result.returncode == 6
+    assert result.stdout == ""
+    assert "root of its checkout" in result.stderr
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("bad", ["", "abc", "A" * 40, "g" * 40, "0" * 39])
 def test_refuses_anything_but_a_full_lowercase_sha(tmp_path: Path, bad: str) -> None:
     rel, _ = _release(tmp_path, "a")
