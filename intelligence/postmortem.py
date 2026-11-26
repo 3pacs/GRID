@@ -452,6 +452,29 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
 
 # ── 2. Generate Post-Mortem for an Oracle Prediction ──────────────────────
 
+# SQL twins of `_finite_or_none`, for the batch selectors. `IS NOT NULL` alone still admits NaN and
+# +/-Infinity (oracle_predictions.pnl_pct is DOUBLE PRECISION; options_recommendations.actual_return
+# is NUMERIC, which also holds NaN), and a row the writer then refuses stays selectable, so enough
+# newer ones fill every batch's LIMIT and older valid rows never advance (Codex hold on #1486).
+# In PostgreSQL NaN compares equal to itself, so NOT IN excludes it. A measured 0 stays selected.
+_NON_FINITE_FLOAT8_SQL = "'NaN'::float8, 'Infinity'::float8, '-Infinity'::float8"
+FINITE_PNL_PCT_SQL = "pnl_pct IS NOT NULL AND pnl_pct::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
+FINITE_ACTUAL_RETURN_SQL = (
+    "actual_return IS NOT NULL AND actual_return::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
+)
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """``float(value)`` when it is a finite number, else None (missing, blank or NaN/inf)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMortem | None:
     """Generate a full post-mortem for a failed oracle prediction.
 
@@ -514,7 +537,20 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     # {:+.2%} formatters and PostmortemCompleted.realized_pnl expect one, so
     # convert here. Without it a -3.81% miss read "-381.00%" and the lessons
     # report averaged two units together.
-    actual_ret = float(pnl_pct) / 100.0 if pnl_pct else 0.0
+    # A prediction scored a miss with no recorded return has no measured return. Storing
+    # `0.0` there stored a measured 0% (narrated as "Return: +0.00%", averaged into the
+    # lessons report and emitted as realized_pnl), and #1471's reader cannot tell that zero
+    # from a real one afterwards. Without a return there is nothing true to analyse here, so
+    # no post-mortem is written; batch_postmortem does not select such rows either.
+    pnl_f = _finite_or_none(pnl_pct)
+    if pnl_f is None:
+        log.warning(
+            "Post-mortem: prediction {id} is a miss with no recorded return (pnl_pct={p!r}); "
+            "not generating, a missing return is not a 0% return",
+            id=prediction_id, p=pnl_pct,
+        )
+        return None
+    actual_ret = pnl_f / 100.0
     conf = float(confidence) if confidence is not None else None
 
     signals = _parse_json(signals_json)
@@ -669,6 +705,7 @@ def batch_postmortem(
         SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
         WHERE verdict = 'miss'
           AND scored_at >= :cutoff
+          AND """ + FINITE_PNL_PCT_SQL + """
           AND id NOT LIKE 'astrogrid:%'
           AND id NOT IN (
               SELECT prediction_id FROM trade_postmortems

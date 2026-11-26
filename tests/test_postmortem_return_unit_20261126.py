@@ -91,11 +91,54 @@ def test_prediction_path_stores_a_fraction_and_narrates_the_true_percent(monkeyp
     assert float(captured[0].realized_pnl) == pytest.approx(-0.5024)
 
 
-def test_prediction_path_without_a_pnl_is_zero_not_a_scaled_value(monkeypatch):
+@pytest.mark.parametrize("missing", [None, float("nan"), float("inf"), "", "n/a"])
+def test_prediction_miss_without_a_return_writes_no_postmortem_and_no_zero(monkeypatch, missing):
+    # Codex hold on #959: `float(pnl_pct) / 100.0 if pnl_pct else 0.0` stored a missing
+    # return as a measured 0%. No return means no post-mortem, never a 0.0 one.
+    captured, seen = _setup(monkeypatch)
+    stored: list = []
+    monkeypatch.setattr(pm_mod, "_store_postmortem", lambda *a, **k: stored.append(a))
+    assert generate_prediction_postmortem(_prediction_engine(missing), prediction_id="pred-1") is None
+    assert stored == []          # nothing persisted
+    assert captured == []        # no realized_pnl event
+    assert seen == {}            # the LLM was never asked to narrate "Return: +0.00%"
+
+
+def test_prediction_miss_with_a_measured_zero_return_is_still_written(monkeypatch):
+    # A stated 0.0 pnl is a measurement, not a missing value.
     _setup(monkeypatch)
-    pm = generate_prediction_postmortem(_prediction_engine(None), prediction_id="pred-1")
+    pm = generate_prediction_postmortem(_prediction_engine(0.0), prediction_id="pred-1")
     assert pm is not None
     assert pm.actual_return == 0.0
+
+
+def test_batch_selection_skips_predictions_with_no_recorded_return(monkeypatch):
+    # Unwritable rows must not be re-selected every batch and crowd out newer ones under LIMIT.
+    seen_sql: list[str] = []
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt, params=None):
+            seen_sql.append(" ".join(str(stmt).split()))
+            res = MagicMock()
+            res.fetchall.return_value = []
+            return res
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+    monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
+    pm_mod.batch_postmortem(_Engine(), days=30, limit=5)
+    pred_sql = [q for q in seen_sql if "oracle_predictions" in q and "verdict = 'miss'" in q]
+    assert pred_sql and all("pnl_pct IS NOT NULL" in q for q in pred_sql)
+    # NULL is not the only return the writer refuses: NaN and +/-Infinity must not fill the LIMIT either.
+    assert all("pnl_pct::float8 NOT IN ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)" in q for q in pred_sql)
 
 
 def _pm(ret: float) -> PostMortem:

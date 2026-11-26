@@ -262,6 +262,17 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
 
+      # The postmortem batch selectors must skip rows the writers refuse (NaN, +/-Infinity, NULL
+      # return) before the LIMIT, or enough newer ones starve older valid misses (#959).
+      - name: Postmortem batch selection PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_POSTMORTEM_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_postmortem_batch_selection_pg.py -q -rA
+
       # scripts/hermes_health.py::check_db_health's stale_sources feeds the
       # db.stale_sources alert and Hermes's stale-refresh. It reads through a
       # PostgreSQL-only LATERAL join and savepoints, so these tests skip in
