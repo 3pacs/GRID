@@ -132,6 +132,57 @@ def test_refuses_a_staged_change_under_the_same_head(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_resolving_never_rewrites_the_release_index(tmp_path: Path) -> None:
+    # `git diff` refreshes and rewrites .git/index when a tracked file's stat
+    # info is stale, even with --no-optional-locks. Put the file's mtime 2 s
+    # past the index (outside git's racy window, so this is deterministic)
+    # with unchanged content: the resolver must accept and leave the index
+    # byte-for-byte and mtime-for-mtime untouched.
+    rel, sha = _release(tmp_path, "a")
+    index = rel / ".git" / "index"
+    tracked = rel / "f.txt"
+    future = index.stat().st_mtime_ns + 2_000_000_000
+    os.utime(tracked, ns=(future, future))
+    stamp = (index.stat().st_mtime_ns, index.read_bytes())
+    link = tmp_path / "grid_release"
+    link.symlink_to(rel)
+
+    result = _run(str(link), sha)
+
+    assert result.returncode == 0, result.stderr
+    assert (index.stat().st_mtime_ns, index.read_bytes()) == stamp
+    assert not (rel / ".git" / "index.lock").exists()
+
+
+@pytest.mark.unit
+def test_refuses_a_staged_change_whose_file_was_restored(tmp_path: Path) -> None:
+    rel, sha = _release(tmp_path, "a")
+    (rel / "f.txt").write_text("staged edit", encoding="utf-8")
+    _git(rel, "add", "f.txt")
+    (rel / "f.txt").write_text("a", encoding="utf-8")  # worktree back to HEAD
+    link = tmp_path / "grid_release"
+    link.symlink_to(rel)
+
+    result = _run(str(link), sha)
+
+    assert result.returncode == 9
+    assert result.stdout == ""
+
+
+@pytest.mark.unit
+def test_refuses_a_deleted_tracked_file(tmp_path: Path) -> None:
+    rel, sha = _release(tmp_path, "a")
+    (rel / "f.txt").unlink()
+    link = tmp_path / "grid_release"
+    link.symlink_to(rel)
+
+    result = _run(str(link), sha)
+
+    assert result.returncode == 9
+    assert result.stdout == ""
+
+
+@pytest.mark.unit
 def test_untracked_files_do_not_block_a_clean_checkout(tmp_path: Path) -> None:
     # Release trees carry untracked build output (pwa_dist and the like).
     rel, sha = _release(tmp_path, "a")
