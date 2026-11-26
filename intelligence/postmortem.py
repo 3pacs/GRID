@@ -325,7 +325,19 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     entry_f = float(entry_price) if entry_price is not None else None
     strike_f = float(strike) if strike else 0.0
     target_f = float(target_price) if target_price else 0.0
-    actual_ret = float(actual_return) if actual_return else 0.0
+    # A LOSS/EXPIRED row with no recorded return has no measured return. `0.0` here was
+    # stored as a measured 0%, narrated as "Return: +0.00%", averaged into the lessons
+    # report and emitted as realized_pnl (#959). Write nothing instead, as the prediction
+    # path does; batch_postmortem does not select such rows either.
+    ret_f = _finite_or_none(actual_return)
+    if ret_f is None:
+        log.warning(
+            "Post-mortem: trade {id} is a {o} with no recorded return (actual_return={r!r}); "
+            "not generating, a missing return is not a 0% return",
+            id=trade_id, o=outcome, r=actual_return,
+        )
+        return None
+    actual_ret = ret_f
     float(confidence) if confidence else 0.0
 
     # Parse sanity_status
@@ -683,6 +695,7 @@ def batch_postmortem(
         SELECT id FROM options_recommendations
         WHERE outcome IN ('LOSS', 'EXPIRED')
           AND closed_at >= :cutoff
+          AND actual_return IS NOT NULL
           AND id NOT IN (
               SELECT trade_id FROM trade_postmortems
               WHERE trade_id IS NOT NULL
@@ -1051,6 +1064,12 @@ def _emit_trade_postmortem(
     except Exception:
         return
 
+    # A post-mortem with no finite return carries no realized P&L; a 0 here would be invented.
+    realized = _finite_or_none(pm.actual_return)
+    if realized is None:
+        log.warning("postmortem: trade {id} has no finite return; not emitting realized_pnl", id=trade_id)
+        return
+
     signals_used = _build_signals_used_from_pm(pm)
     # ``contributing_signal_ids`` must be a list of UUIDs only — reuse
     # the signal_id from each SignalRef so the two fields agree.
@@ -1069,7 +1088,7 @@ def _emit_trade_postmortem(
                 prediction_id=prediction_uuid,
                 ticker=str(pm.ticker).upper(),
                 verdict=_verdict_from_outcome(pm.outcome),
-                realized_pnl=Decimal(str(float(pm.actual_return or 0.0))),
+                realized_pnl=Decimal(str(realized)),
                 signals_used=signals_used,
                 root_cause=str(pm.root_cause or "")[:2000],
                 contributing_signal_ids=contributing_ids,
@@ -1123,6 +1142,12 @@ def _emit_prediction_postmortem(
     except Exception:
         return
 
+    # A post-mortem with no finite return carries no realized P&L; a 0 here would be invented.
+    realized = _finite_or_none(pm.actual_return)
+    if realized is None:
+        log.warning("postmortem: prediction {id} has no finite return; not emitting realized_pnl", id=prediction_id)
+        return
+
     signals_used = _build_signals_used_from_pm(pm)
     contributing_ids = [r.signal_id for r in signals_used]
 
@@ -1146,7 +1171,7 @@ def _emit_prediction_postmortem(
                 prediction_id=prediction_uuid,
                 ticker=str(pm.ticker).upper(),
                 verdict=_verdict_from_outcome(pm.outcome),
-                realized_pnl=Decimal(str(float(pm.actual_return or 0.0))),
+                realized_pnl=Decimal(str(realized)),
                 signals_used=signals_used,
                 root_cause=str(pm.root_cause or "")[:2000],
                 contributing_signal_ids=contributing_ids,
