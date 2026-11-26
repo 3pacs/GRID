@@ -89,3 +89,35 @@ def test_newer_non_finite_predictions_do_not_fill_the_limit(selector_pg, monkeyp
 
     unlimited, _ = _run_batch(monkeypatch, selector_pg, limit=None)
     assert unlimited == ["p-zero", "p-finite", "p-older"]
+
+
+def _insert_trade(engine, tid, hours_ago, ret_sql, outcome="LOSS"):
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO options_recommendations (id, outcome, closed_at, actual_return) "
+            "VALUES (:id, :o, now() - make_interval(hours => :h), " + ret_sql + ")"
+        ), {"id": tid, "o": outcome, "h": hours_ago})
+
+
+def test_newer_non_finite_trades_do_not_fill_the_limit(selector_pg, monkeypatch):
+    # NUMERIC holds NaN (Infinity only from PostgreSQL 14, so it is not used here) and values far beyond float8.
+    _insert_trade(selector_pg, 1, 1, "'NaN'::numeric")
+    _insert_trade(selector_pg, 2, 2, "NULL")
+    _insert_trade(selector_pg, 3, 3, "'NaN'::numeric", outcome="EXPIRED")
+    _insert_trade(selector_pg, 4, 4, "NULL", outcome="EXPIRED")
+    _insert_trade(selector_pg, 5, 5, "0", outcome="EXPIRED")        # a measured 0 stays selected
+    _insert_trade(selector_pg, 6, 6, "-0.62")
+    _insert_trade(selector_pg, 7, 7, "-1.0")
+    _insert_trade(selector_pg, 8, 1, "-0.3", outcome="WIN")         # not a failure
+    # Storable in unconstrained NUMERIC but outside float8: must be skipped, not abort the selection.
+    _insert_trade(selector_pg, 9, 1, "1e400::numeric")
+    _insert_trade(selector_pg, 10, 1, "-1e400::numeric", outcome="EXPIRED")
+
+    _, trade_calls = _run_batch(monkeypatch, selector_pg, limit=2)
+    assert trade_calls == [5, 6]
+
+    _, trade_calls_again = _run_batch(monkeypatch, selector_pg, limit=2)
+    assert trade_calls_again == [5, 6]
+
+    _, unlimited = _run_batch(monkeypatch, selector_pg, limit=None)
+    assert unlimited == [5, 6, 7]

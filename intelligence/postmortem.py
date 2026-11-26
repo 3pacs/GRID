@@ -325,7 +325,19 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     entry_f = float(entry_price) if entry_price is not None else None
     strike_f = float(strike) if strike else 0.0
     target_f = float(target_price) if target_price else 0.0
-    actual_ret = float(actual_return) if actual_return else 0.0
+    # A LOSS/EXPIRED row with no recorded return has no measured return. `0.0` here was
+    # stored as a measured 0%, narrated as "Return: +0.00%", averaged into the lessons
+    # report and emitted as realized_pnl (#959). Write nothing instead, as the prediction
+    # path does; batch_postmortem does not select such rows either.
+    ret_f = _finite_or_none(actual_return)
+    if ret_f is None:
+        log.warning(
+            "Post-mortem: trade {id} is a {o} with no recorded return (actual_return={r!r}); "
+            "not generating, a missing return is not a 0% return",
+            id=trade_id, o=outcome, r=actual_return,
+        )
+        return None
+    actual_ret = ret_f
     float(confidence) if confidence else 0.0
 
     # Parse sanity_status
@@ -459,9 +471,12 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
 # In PostgreSQL NaN compares equal to itself, so NOT IN excludes it. A measured 0 stays selected.
 _NON_FINITE_FLOAT8_SQL = "'NaN'::float8, 'Infinity'::float8, '-Infinity'::float8"
 FINITE_PNL_PCT_SQL = "pnl_pct IS NOT NULL AND pnl_pct::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
-FINITE_ACTUAL_RETURN_SQL = (
-    "actual_return IS NOT NULL AND actual_return::float8 NOT IN (" + _NON_FINITE_FLOAT8_SQL + ")"
-)
+# options_recommendations.actual_return is unconstrained NUMERIC, so it is compared in NUMERIC and never
+# cast to float8: a value outside float8's range (e.g. 1e400) makes `::float8` raise and abort the whole
+# selection, starving every older valid row (Codex hold on #1488). PostgreSQL orders NaN and +/-Infinity
+# above every finite NUMERIC, so `ABS(x) < 1e300` rejects them and anything the writer's float() cannot
+# hold, and keeps every real return (a return is a small fraction) including a measured 0.
+FINITE_ACTUAL_RETURN_SQL = "actual_return IS NOT NULL AND ABS(actual_return) < 1e300"
 
 
 def _finite_or_none(value: Any) -> float | None:
@@ -695,6 +710,7 @@ def batch_postmortem(
         SELECT id FROM options_recommendations
         WHERE outcome IN ('LOSS', 'EXPIRED')
           AND closed_at >= :cutoff
+          AND """ + FINITE_ACTUAL_RETURN_SQL + """
           AND id NOT IN (
               SELECT trade_id FROM trade_postmortems
               WHERE trade_id IS NOT NULL
@@ -1063,6 +1079,12 @@ def _emit_trade_postmortem(
     except Exception:
         return
 
+    # A post-mortem with no finite return carries no realized P&L; a 0 here would be invented.
+    realized = _finite_or_none(pm.actual_return)
+    if realized is None:
+        log.warning("postmortem: trade {id} has no finite return; not emitting realized_pnl", id=trade_id)
+        return
+
     signals_used = _build_signals_used_from_pm(pm)
     # ``contributing_signal_ids`` must be a list of UUIDs only — reuse
     # the signal_id from each SignalRef so the two fields agree.
@@ -1081,7 +1103,7 @@ def _emit_trade_postmortem(
                 prediction_id=prediction_uuid,
                 ticker=str(pm.ticker).upper(),
                 verdict=_verdict_from_outcome(pm.outcome),
-                realized_pnl=Decimal(str(float(pm.actual_return or 0.0))),
+                realized_pnl=Decimal(str(realized)),
                 signals_used=signals_used,
                 root_cause=str(pm.root_cause or "")[:2000],
                 contributing_signal_ids=contributing_ids,
@@ -1135,6 +1157,12 @@ def _emit_prediction_postmortem(
     except Exception:
         return
 
+    # A post-mortem with no finite return carries no realized P&L; a 0 here would be invented.
+    realized = _finite_or_none(pm.actual_return)
+    if realized is None:
+        log.warning("postmortem: prediction {id} has no finite return; not emitting realized_pnl", id=prediction_id)
+        return
+
     signals_used = _build_signals_used_from_pm(pm)
     contributing_ids = [r.signal_id for r in signals_used]
 
@@ -1158,7 +1186,7 @@ def _emit_prediction_postmortem(
                 prediction_id=prediction_uuid,
                 ticker=str(pm.ticker).upper(),
                 verdict=_verdict_from_outcome(pm.outcome),
-                realized_pnl=Decimal(str(float(pm.actual_return or 0.0))),
+                realized_pnl=Decimal(str(realized)),
                 signals_used=signals_used,
                 root_cause=str(pm.root_cause or "")[:2000],
                 contributing_signal_ids=contributing_ids,
