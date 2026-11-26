@@ -96,8 +96,135 @@ class PostMortem:
     confidence_in_analysis: float         # 0-1
     generated_at: str
 
+    # Unit of ``actual_return``. New rows are always a fraction (-0.5 = -50%).
+    # Rows stored before 2026-11-26 carry no marker, and their unit depends on
+    # the writer: see ``stored_return_fraction``.
+    actual_return_unit: str = "fraction"
+
+    # False on a hydrated pre-fix prediction row: its free-form prose may state
+    # the old x100 return in any wording, so the prose fields are left empty
+    # and no free text of it may reach a prompt (storage is untouched).
+    prose_trusted: bool = True
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+RETURN_UNIT_FRACTION = "fraction"
+RETURN_UNIT_PERCENT_POINTS = "percent_points"
+
+
+def stored_return_fraction(record: dict[str, Any]) -> float | None:
+    """``actual_return`` of a stored ``trade_postmortems`` record, as a fraction.
+
+    Rows written from 2026-11-26 carry ``full_analysis.actual_return_unit``.
+    Older rows carry none, and the unit follows the writer, which the table
+    records exactly (every row has one of ``trade_id`` / ``prediction_id``,
+    never both: 860 / 1,108,188 rows when checked):
+
+    * ``prediction_id`` set: copied from ``oracle_predictions.pnl_pct``, in
+      percent points (-50.24 = -50.24%), so divided by 100;
+    * ``trade_id`` set: copied from ``options_recommendations.actual_return``,
+      already a fraction.
+
+    No decision uses the magnitude of the value. Returns None (the row is
+    left out of any average) for a missing or non-finite return, an unknown
+    marker, or a row whose writer cannot be told.
+    """
+    full = record.get("full_analysis") or {}
+    if not isinstance(full, dict):
+        return None
+    try:
+        value = float(full.get("actual_return"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    unit = full.get("actual_return_unit")
+    if unit == RETURN_UNIT_FRACTION:
+        return value
+    if unit == RETURN_UNIT_PERCENT_POINTS:
+        return value / 100.0
+    if unit is not None:
+        return None
+    has_prediction = record.get("prediction_id") is not None
+    has_trade = record.get("trade_id") is not None
+    if has_prediction and not has_trade:
+        return value / 100.0
+    if has_trade and not has_prediction:
+        return value
+    return None
+
+
+PROSE_OMITTED = "[free text omitted: recorded before the return-unit fix]"
+
+
+@dataclass
+class HydratedPostmortems:
+    """``postmortems_from_records`` result."""
+
+    postmortems: list["PostMortem"]
+    included: list[dict[str, Any]]    # the records behind ``postmortems``, same order
+    excluded: int                     # records left out: no known unit for the return
+
+
+def postmortems_from_records(
+    records: list[dict[str, Any]], limit: int | None = None,
+) -> HydratedPostmortems:
+    """Hydrate ``PostMortem`` objects from ``load_postmortems`` records.
+
+    ``actual_return`` is always a fraction (``stored_return_fraction``). A
+    record with no analysis blob is skipped; one with no return that can be
+    put in a known unit is left out and counted in ``excluded``, so a mixed
+    history cannot reach an average. ``limit`` stops after that many included
+    records, taking records in order, so an excluded row does not shrink the
+    window. For a pre-fix prediction row (no unit marker, ``prediction_id``
+    set) the free-form prose fields are left empty and ``prose_trusted`` is
+    False: the stored text may state the old ×100 return in any wording, which
+    no filter can enforce. Storage is not touched; marked and trade rows keep
+    their prose.
+    """
+    out = HydratedPostmortems(postmortems=[], included=[], excluded=0)
+    for r in records:
+        if limit is not None and len(out.postmortems) >= limit:
+            break
+        full = r.get("full_analysis") or {}
+        if not full:
+            continue
+        ret = stored_return_fraction(r)
+        if ret is None:
+            out.excluded += 1
+            continue
+        legacy_prediction = (
+            full.get("actual_return_unit") is None and r.get("prediction_id") is not None
+        )
+        prose = (lambda v: "") if legacy_prediction else (lambda v: v)
+        try:
+            out.postmortems.append(PostMortem(
+                trade_id=full.get("trade_id", 0),
+                ticker=full.get("ticker", r.get("ticker", "")),
+                direction=full.get("direction", ""),
+                outcome=full.get("outcome", r.get("outcome", "")),
+                actual_return=ret,
+                data_at_decision=full.get("data_at_decision", {}),
+                thesis_at_decision=full.get("thesis_at_decision", ""),
+                sanity_results_at_decision=full.get("sanity_results_at_decision", {}),
+                what_actually_happened=prose(full.get("what_actually_happened", "")),
+                price_path=full.get("price_path", []),
+                failure_category=full.get("failure_category", r.get("failure_category", "")),
+                root_cause=prose(full.get("root_cause", r.get("root_cause", ""))),
+                which_signals_were_wrong=full.get("which_signals_were_wrong", []),
+                which_signals_were_right=full.get("which_signals_were_right", []),
+                what_we_missed=prose(full.get("what_we_missed", r.get("what_we_missed", ""))),
+                recommended_fix=prose(full.get("recommended_fix", r.get("recommended_fix", ""))),
+                confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
+                generated_at=full.get("generated_at", ""),
+                prose_trusted=not legacy_prediction,
+            ))
+            out.included.append(r)
+        except Exception:
+            continue
+    return out
 
 
 # ── Table Setup ───────────────────────────────────────────────────────────
@@ -380,7 +507,14 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     # findings about the prediction rather than as missing data.
     entry_f = float(entry_price) if entry_price is not None else None
     target_f = float(target_price) if target_price else 0.0
-    actual_ret = float(pnl_pct) if pnl_pct else 0.0
+    # oracle_predictions.pnl_pct is stored in PERCENT POINTS (-50.24 means
+    # -50.24%), the same unit as actual_move_pct (2,317,610 of 2,317,610
+    # scored rows agree). PostMortem.actual_return is a FRACTION everywhere
+    # else (the trade path reads options_recommendations.actual_return) and the
+    # {:+.2%} formatters and PostmortemCompleted.realized_pnl expect one, so
+    # convert here. Without it a -3.81% miss read "-381.00%" and the lessons
+    # report averaged two units together.
+    actual_ret = float(pnl_pct) / 100.0 if pnl_pct else 0.0
     conf = float(confidence) if confidence is not None else None
 
     signals = _parse_json(signals_json)
@@ -1330,7 +1464,7 @@ def load_postmortems(
 
     results = []
     for r in rows:
-        results.append({
+        record = {
             "id": r[0],
             "trade_id": r[1],
             "prediction_id": r[2],
@@ -1345,7 +1479,12 @@ def load_postmortems(
             "full_analysis": _parse_json(r[11]),
             "confidence": float(r[12]) if r[12] is not None else None,
             "generated_at": r[13].isoformat() if r[13] else None,
-        })
+        }
+        # The return in a known unit, so no reader has to guess from
+        # ``full_analysis.actual_return`` (percent points for older prediction
+        # rows). None when it cannot be told.
+        record["actual_return_fraction"] = stored_return_fraction(record)
+        results.append(record)
 
     return results
 
@@ -2409,8 +2548,12 @@ def _get_llm_lessons_learned(
     )
 
     # Sample of individual root causes
+    # Only trusted prose is sampled; an untrusted (pre-fix prediction) row
+    # contributes its structured category instead of any free text.
     root_causes = "\n".join(
-        f"  - {pm.ticker} {pm.direction}: {pm.root_cause[:100]}"
+        f"  - {pm.ticker} {pm.direction}: "
+        + (pm.root_cause[:100] if pm.prose_trusted
+           else f"{pm.failure_category} {PROSE_OMITTED}")
         for pm in postmortems[:8]
     )
 

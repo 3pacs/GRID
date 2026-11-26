@@ -1112,7 +1112,7 @@ class TestDefect4ProducerModuleMatching:
                         "pred-42", "NVDA", "CALL", 140.0, 125.0, date(2026, 4, 17),
                         0.72, 12.0, "options_flow_mut_abc123",
                         json.dumps([{"name": "iv_skew", "direction": "bullish"}]),
-                        "[]", "{}", "miss", 118.0, -5.6, -0.056, scored_ts, "missed",
+                        "[]", "{}", "miss", 118.0, -5.6, -5.6, scored_ts, "missed",
                         created_ts,
                     )
                 else:
@@ -1199,7 +1199,7 @@ class TestDefect4ProducerModuleMatching:
                     res.fetchone.return_value = (
                         "pred-99", "NVDA", "CALL", 140.0, 125.0, date(2026, 4, 17),
                         0.72, 12.0, None, "[]", "[]", "{}", "miss", 118.0, -5.6,
-                        -0.056, scored_ts, "missed", created_ts,
+                        -5.6, scored_ts, "missed", created_ts,
                     )
                 else:
                     res.fetchone.return_value = None
