@@ -1,8 +1,12 @@
-"""Rule families the stream may register, and the queue it registers them from.
+"""Rule families the stream may register (the order it registers them in is
+:mod:`template_queue`, which no registration's hash covers).
 
 A family is code: its decision, direction rule, entry and exit are fixed here and its
 source is hashed into every registration (``code_sha256``); a look whose family code
-changed after registration is abandoned, never run on different code. A new family is
+changed after registration is abandoned, never run on different code. The hash covers
+the family's own class, the shared code in this module and the other evaluation
+modules, but not the other families' classes or the ``FAMILIES`` registry: adding or
+changing one family abandons no other family's registration. A new family is
 a reviewed PR. Proposals from other agents (``inbox/*.json``) may only parameterise an
 existing family (instruments, group, lane), and pass the same gate.
 
@@ -20,7 +24,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from . import policy as P
-from .universe import SP500_20251231
 
 Bar = tuple
 
@@ -348,9 +351,25 @@ FAMILIES: dict[str, object] = {"IM1": IntradayMomentum(), "EC1": EarningsContami
 #: open registration is then abandoned rather than judged on code it was not sealed with.
 EVALUATION_MODULES = ("families", "stats", "runner", "data", "policy")
 
+#: Top-level names of this module that sit on no family's evaluation path: the registry.
+#: They and every *other* family's class are left out of a family's hash, so a family
+#: added, or another family changed, leaves an open registration's hash as it was.
+REGISTRY_NAMES = frozenset({"FAMILIES"})
 
-def _ast_digest(source: str) -> str:
+
+def _dropped(node: ast.AST, drop: frozenset[str]) -> bool:
+    if isinstance(node, ast.ClassDef):
+        return node.name in drop
+    if isinstance(node, ast.Assign):
+        return any(isinstance(t, ast.Name) and t.id in drop for t in node.targets)
+    if isinstance(node, ast.AnnAssign):
+        return isinstance(node.target, ast.Name) and node.target.id in drop
+    return False
+
+
+def _ast_digest(source: str, drop: frozenset[str] = frozenset()) -> str:
     tree = ast.parse(source)
+    tree.body = [n for n in tree.body if not _dropped(n, drop)]
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
         if isinstance(body, list) and body and isinstance(body[0], ast.Expr) \
@@ -359,30 +378,20 @@ def _ast_digest(source: str) -> str:
     return hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
 
 
-def code_sha256(family) -> str:
+def code_sha256(family, sources: dict[str, str] | None = None) -> str:
+    """The family's evaluation-code hash. ``sources`` (module name -> source text) stands in
+    for the files on disk, for tests only."""
     import numpy
 
     here = Path(__file__).resolve().parent
+    others = frozenset(type(f).__name__ for f in FAMILIES.values()) - {type(family).__name__}
     parts = [f"family={family.id}/v{family.version}", f"numpy={'.'.join(numpy.__version__.split('.')[:2])}",
              f"policy={P.policy_sha256()}"]
-    parts += [f"{m}={_ast_digest((here / f'{m}.py').read_text())}" for m in EVALUATION_MODULES]
+    for m in EVALUATION_MODULES:
+        text = sources[m] if sources is not None and m in sources else (here / f"{m}.py").read_text()
+        parts.append(f"{m}={_ast_digest(text, others | REGISTRY_NAMES if m == 'families' else frozenset())}")
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
-
-# --- the queue ----------------------------------------------------------------------
-
-#: What the stream registers first, in order (one new registration per weekday at most).
-QUEUE: tuple[dict, ...] = (
-    {"family": "IM1", "group": "metals", "instruments": ("GLD", "SLV"), "lane": "history"},
-    {"family": "IM1", "group": "energy", "instruments": ("USO", "UNG"), "lane": "history"},
-    {"family": "IM1", "group": "intl_equity", "instruments": ("EFA", "EEM", "EWJ", "FXI", "EWZ"), "lane": "history"},
-    {"family": "IM1", "group": "crypto_etf", "instruments": ("IBIT", "ETHA"), "lane": "history"},
-    {"family": "IM1", "group": "us_single_stocks",
-     "instruments": ("AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"), "lane": "history"},
-    {"family": "IM1", "group": "fx", "instruments": ("FXE", "FXY", "UUP"), "lane": "history"},
-    {"family": "IM1", "group": "us_equity_index", "instruments": ("SPY", "QQQ", "IWM"), "lane": "forward"},
-    {"family": "EC1", "group": "sp500_events", "instruments": SP500_20251231, "lane": "history"},
-)
 
 #: Polygon's rolling window is ~728 days; a history window starts 700 days back so its
 #: 10-day warm-up and a look up to two weeks later stay inside it (data.RETENTION_DAYS).

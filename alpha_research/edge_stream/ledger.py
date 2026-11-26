@@ -14,7 +14,15 @@ genesis; no S11 allocation ever runs on it):
                        sealed under its sha256 and checked against its numbers.
 ``edge_registration``  sealed before the look's data is read; its line sha256 is the seal.
 ``edge_look``          the one look of a registration (verdicts + report sha); SPENT.
-``edge_abandoned``     a registration closed without a look; its alpha stays spent.
+``edge_read``          appended *before* the first read of an open registration's window of
+                       each kind (``progress``: a forward presence count; ``look``: a look).
+                       In the hash chain and under the anchor, so it cannot be lost or
+                       restored away: a registration sealed under policy 4 with no
+                       ``edge_read`` record was never read (:meth:`StreamState.unread_abandoned`).
+``edge_abandoned``     a registration closed without a look; its alpha stays spent. One
+                       closed at the code check (``cause: code_changed``) also records what
+                       the data dir showed (failed attempts, a staged report); any sign of a
+                       look there keeps its window and group closed, whatever else says.
 
 :func:`load_state` re-derives and re-checks every invariant from the records, so a
 ledger written by any other code path is refused rather than trusted.
@@ -36,13 +44,21 @@ REGISTRATION_KIND = "edge_registration"
 LOOK_KIND = "edge_look"
 ABANDONED_KIND = "edge_abandoned"
 AMENDMENT_KIND = "edge_policy_amendment"
-STREAM_KINDS = (POLICY_KIND, REGISTRATION_KIND, LOOK_KIND, ABANDONED_KIND, AMENDMENT_KIND)
+READ_KIND = "edge_read"
+STREAM_KINDS = (POLICY_KIND, REGISTRATION_KIND, LOOK_KIND, ABANDONED_KIND, AMENDMENT_KIND, READ_KIND)
+#: ``edge_read`` kinds: a forward registration's presence count, and a look.
+READ_KINDS = ("progress", "look")
 
 PLACEHOLDER_CATALOG = Catalog(
     families=("EDGE_LOOKS|change|fwd1",),
     features=("none|x",),
     classes=(("none|x", "edge_looks_only"),),
 )
+
+#: ``cause`` of an abandonment at the code-hash check, which runs before the cycle reads anything.
+CODE_CHANGED = "code_changed"
+#: What a code-change abandonment records of earlier cycles (``runner.read_evidence``).
+EVIDENCE_KEYS = frozenset({"ledger_reads", "failed_attempts", "report_staged"})
 
 #: EPISODE: a stage-1 discovery that did not survive its largest year left out (policy 3 on).
 VERDICTS = ("PASS", "FAIL", "UNDERPOWERED", "EPISODE")
@@ -97,6 +113,10 @@ class StreamState:
     looks: dict[str, dict] = field(default_factory=dict)  # registration sha -> look record
     abandoned: dict[str, dict] = field(default_factory=dict)  # registration sha -> record
     amendments: list[dict] = field(default_factory=list)  # edge_policy_amendment records, in order
+    #: registrations sealed under a policy with ``unread_abandonment``: every read of their window
+    #: is an ``edge_read`` record in this ledger, so the absence of one is positive evidence
+    marked: set[str] = field(default_factory=set)
+    reads: dict[str, set[str]] = field(default_factory=dict)  # registration sha -> edge_read kinds
 
     def closed(self, reg_sha: str) -> bool:
         return reg_sha in self.looks or reg_sha in self.abandoned
@@ -134,6 +154,41 @@ class StreamState:
                 out.setdefault((reg["family"], reg["group"]), reg["proposal_id"])
         return out
 
+    def reopens_unread(self) -> bool:
+        """The policy in force carries the owner decision that frees unread abandoned windows."""
+        rule = self.policy.get("unread_abandonment") or {}
+        return bool(rule.get("decision")) and rule.get("cause") == CODE_CHANGED and any(
+            d.get("id") == rule["decision"] for d in self.policy.get("owner_decisions", []))
+
+    def _code_abandonment(self, reg_sha: str, lane: str) -> dict | None:
+        """The record of a code-change abandonment on ``lane`` whose own evidence shows no sign of a
+        look (no look read in the ledger, no failed attempt, no staged report); ``None`` when it is
+        missing, partial, disputed or shows any."""
+        rec, reg = self.abandoned.get(reg_sha), self.registrations.get(reg_sha)
+        if rec is None or reg is None or reg_sha in self.looks or reg["lane"] != lane \
+                or rec.get("cause") != CODE_CHANGED or "look" in self.reads.get(reg_sha, set()):
+            return None
+        ev = rec.get("read_evidence")
+        if not isinstance(ev, dict) or set(ev) != EVIDENCE_KEYS or ev["failed_attempts"] != 0 \
+                or ev["report_staged"] is not False or sorted(ev["ledger_reads"]) != sorted(self.reads.get(reg_sha, ())):
+            return None
+        return rec
+
+    def unread_abandoned(self, reg_sha: str) -> bool:
+        """A registration no cycle read, on either lane: sealed under policy 4 (so every read of it
+        is an ``edge_read`` record in this ledger), with none at all (a forward presence count is a
+        read), abandoned at the code check with no failed attempt and no staged report. Its window is
+        freed under :meth:`reopens_unread`. Anything else, including any registration sealed before
+        policy 4, keeps its window consumed and its (family, group, lane) closed."""
+        reg = self.registrations.get(reg_sha)
+        return reg is not None and reg_sha in self.marked and not self.reads.get(reg_sha) \
+            and self._code_abandonment(reg_sha, reg["lane"]) is not None
+
+    def reregistrable(self, reg_sha: str) -> bool:
+        """Its (family, group, lane) may register again on a new window: only an unread abandonment.
+        A forward registration whose presence was counted was read, and stays closed."""
+        return self.unread_abandoned(reg_sha)
+
     def proposal_ids(self) -> set[str]:
         return {r["proposal_id"] for r in self.registrations.values()}
 
@@ -142,9 +197,14 @@ class StreamState:
 
         A history registration consumes its window from the moment it is sealed. An open
         forward registration consumes ``[from, open)``; once looked, ``[from, last session]``.
+        A registration abandoned unread for a code change consumes nothing once the policy
+        in force carries ``unread_abandonment``.
         """
         out = [dict(c, source="prior") for c in self.policy["prior_consumption"]]
+        freed = self.reopens_unread()
         for sha, reg in self.registrations.items():
+            if freed and self.unread_abandoned(sha):
+                continue
             w = reg["window"]
             end = w.get("end")
             if reg["lane"] == "forward":
@@ -185,6 +245,8 @@ def load_state(ledger: Ledger) -> StreamState:
         if kind == REGISTRATION_KIND:
             _check_registration(state, rec)
             state.registrations[sha] = rec
+            if state.policy.get("unread_abandonment"):
+                state.marked.add(sha)
         else:
             ref = rec.get("registration_sha256")
             _require(ref in state.registrations, f"record {rec['seq']}: unknown registration {ref}")
@@ -192,8 +254,17 @@ def load_state(ledger: Ledger) -> StreamState:
             if kind == LOOK_KIND:
                 _check_look(rec)
                 state.looks[ref] = rec
+            elif kind == READ_KIND:
+                _require(rec.get("read") in READ_KINDS, f"record {rec['seq']}: unknown read {rec.get('read')!r}")
+                _require(rec["read"] not in state.reads.get(ref, set()),
+                         f"record {rec['seq']}: {rec['read']} read of {ref[:12]} recorded twice")
+                state.reads.setdefault(ref, set()).add(rec["read"])
             else:
                 _require(bool(rec.get("reason")), f"record {rec['seq']}: abandonment without a reason")
+                _require(rec.get("cause", CODE_CHANGED) == CODE_CHANGED,
+                         f"record {rec['seq']}: unknown abandonment cause {rec.get('cause')!r}")
+                _require("cause" not in rec or isinstance(rec.get("read_evidence"), dict),
+                         f"record {rec['seq']}: a code-change abandonment without its read evidence")
                 state.abandoned[ref] = rec
     return state
 
@@ -344,6 +415,20 @@ def append_registration(ledger: Ledger, registration: dict) -> str:
     return sha
 
 
+def append_read(ledger: Ledger, reg_sha: str, read: str, recorded_at: str | None = None) -> str | None:
+    """Record, before it happens, the first ``read`` (``progress`` or ``look``) of an open
+    registration's window. A later read of the same kind is already on record: ``None``."""
+    state = load_state(ledger)
+    _require(reg_sha in state.registrations, f"unknown registration {reg_sha}")
+    _require(not state.closed(reg_sha), f"registration {reg_sha[:12]} already closed")
+    _require(read in READ_KINDS, f"unknown read {read!r}")
+    if read in state.reads.get(reg_sha, set()):
+        return None
+    _, sha = _append(ledger, {"kind": READ_KIND, "registration_sha256": reg_sha, "read": read,
+                              "recorded_at": recorded_at or now_iso()})
+    return sha
+
+
 def append_look(ledger: Ledger, reg_sha: str, look: dict) -> str:
     state = load_state(ledger)
     _require(reg_sha in state.registrations, f"unknown registration {reg_sha}")
@@ -355,13 +440,19 @@ def append_look(ledger: Ledger, reg_sha: str, look: dict) -> str:
     return sha
 
 
-def append_abandoned(ledger: Ledger, reg_sha: str, reason: str, recorded_at: str | None = None) -> str:
+def append_abandoned(ledger: Ledger, reg_sha: str, reason: str, recorded_at: str | None = None,
+                     cause: str | None = None, read_evidence: dict | None = None) -> str:
+    """``cause=CODE_CHANGED`` only from the code-hash check, with ``runner.read_evidence``."""
     state = load_state(ledger)
     _require(reg_sha in state.registrations, f"unknown registration {reg_sha}")
     _require(not state.closed(reg_sha), f"registration {reg_sha[:12]} already closed")
     _require(bool(reason), "an abandonment needs a reason")
+    _require(cause in (None, CODE_CHANGED), f"unknown abandonment cause {cause!r}")
+    _require((cause is None) == (read_evidence is None), "read evidence goes with a code-change cause, only")
+    _require(read_evidence is None or set(read_evidence) == EVIDENCE_KEYS, "read evidence is incomplete")
     _, sha = _append(ledger, {
         "kind": ABANDONED_KIND, "registration_sha256": reg_sha, "reason": reason,
         "alpha_spent": state.registrations[reg_sha]["alpha_look"], "recorded_at": recorded_at or now_iso(),
+        **({"cause": cause, "read_evidence": dict(read_evidence)} if cause else {}),
     })
     return sha

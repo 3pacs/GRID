@@ -1,4 +1,4 @@
-"""Frozen policy of the edge stream (``edge-stream-policy/3``).
+"""Frozen policy of the edge stream (``edge-stream-policy/4``).
 
 Everything a look is judged by lives here and is written, whole, into the
 ledger's ``edge_policy`` record at genesis (its sha256 is pinned in every
@@ -8,6 +8,13 @@ prior consumption, more groups or instruments. The one exception is a recorded
 owner decision (:data:`OWNER_DECISIONS`), which may change the few fields in
 :data:`OWNER_WAIVABLE` and nothing else. Nothing here is read from the
 environment.
+
+Version 4 (2026-11-21) adds one owner decision (:data:`UNREAD_ABANDONMENT`): a history
+registration sealed under it, abandoned because its family's code changed, whose ledger
+holds no read of its window, has that window freed, and its (family, group, lane) may
+register again on a new window. A forward registration whose presence was counted
+was read and stays closed. Its alpha stays spent and it still counts toward the yearly maximum. Every
+other abandonment, and every registration sealed before it, keeps its window consumed.
 
 Version 3 (2026-11-16) carries the owner's two-stage evidence bar (GRID issue 1213):
 
@@ -30,6 +37,8 @@ of a multi-day trade, the SPY hedge leg, and a consumption entry that keeps the 
 off the years the D0 research contract reserves for its own earnings test.
 :func:`amendment_violations` is the rule an amendment record is checked by.
 
+Version 4 decision: https://github.com/3pacs/GRID/issues/1336#issuecomment-7073862603 (posted 2026-11-22).
+
 Owner decisions behind the numbers (Anik, 2026-11-13, roast of the design):
 
 * budget: q 0.05 per calendar year shared by at most 40 stage-1 registrations
@@ -49,7 +58,7 @@ import re
 
 from .universe import SP500_20251231
 
-POLICY_VERSION = "edge-stream-policy/3"
+POLICY_VERSION = "edge-stream-policy/4"
 LEDGER_ID = "grid-edge-looks"
 
 # --- budget -----------------------------------------------------------------------
@@ -95,7 +104,37 @@ OWNER_DECISIONS: tuple[dict, ...] = (
                    "the single 0.00125 history bar is retired for new work",
         "waives": ["budget.alpha_per_look", "budget.rule", "promotion"],
     },
+    {
+        "id": "GRID#1336",
+        "url": "https://github.com/3pacs/GRID/issues/1336#issuecomment-7073862603",
+        "decided_by": "Anik (repository owner)",
+        "decided_on": "2026-11-21",
+        "text_sha256": "491fa4b3b9f645566e0b1e4fc9c683fb791aaf8986e57a13acbb4cca07f905a3",
+        "summary": "a registration abandoned because its family's code changed before its look had none of its "
+                   "window read: the window stops counting as consumed and the (family, group, lane) may register "
+                   "again on a new window; its alpha stays spent and it counts toward the yearly maximum",
+        "waives": [],
+    },
 )
+
+#: The rule the second owner decision adds (a new top-level policy section). The ledger's
+#: consumption and the runner's queue read it from the policy *in force*, so it applies only
+#: to records appended after the amendment that carries it.
+UNREAD_ABANDONMENT: dict = {
+    "decision": OWNER_DECISIONS[1]["id"],
+    "cause": "code_changed",
+    "rule": "unread status is a positive receipt in the ledger, never inferred. Before the first read of each "
+            "kind of an open registration's window (progress: a forward presence count; look: a look) the runner "
+            "appends an edge_read record to this hash-chained, anchored ledger; a dry run reads no open window. "
+            "A registration on either lane sealed under this policy or a later one, with no edge_read record at "
+            "all, abandoned at the code-hash check with no failed attempt and no staged report in the data dir, "
+            "has its window freed and its (family, group, lane) may register again on a new window. A forward "
+            "registration whose presence was counted was read: its window stays consumed and its (family, group, "
+            "lane) stays closed. Any registration sealed before this policy, and any whose evidence is missing, "
+            "partial or disputed, keeps its window and its (family, group, lane) closed. The alpha of an abandoned "
+            "registration stays spent and it counts toward max_registrations",
+    "attested": [],
+}
 
 # --- looks ------------------------------------------------------------------------
 FETCH_ATTEMPTS_BEFORE_ABANDON = 5
@@ -311,6 +350,7 @@ def policy_payload() -> dict:
                        "version on; earlier registrations keep the terms they were sealed with",
         },
         "owner_decisions": [dict(d) for d in OWNER_DECISIONS],
+        "unread_abandonment": dict(UNREAD_ABANDONMENT),
         "orders": "the stream never places, reviews or cancels an order",
     }
 
@@ -406,6 +446,7 @@ def amendment_violations(old: dict, new: dict) -> list[str]:
     for d in new.get("owner_decisions", [])[len(old.get("owner_decisions", [])):]:
         name = d.get("id") or "?"
         if not all(isinstance(d.get(k), str) and d[k] for k in ("id", "url", "decided_by", "decided_on", "summary")) \
+                or not re.fullmatch(r"https://github\.com/3pacs/GRID/issues/\d+#issuecomment-\d+", str(d.get("url"))) \
                 or not re.fullmatch(r"[0-9a-f]{64}", str(d.get("text_sha256", ""))) \
                 or not isinstance(d.get("waives"), list):
             bad.append(f"owner decision {name} is incomplete")

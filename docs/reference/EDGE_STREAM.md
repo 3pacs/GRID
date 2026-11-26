@@ -13,7 +13,7 @@ Without the three `EDGE_STREAM_*` variables it does nothing. The cycle, under `c
 1. runs the one look of every open history registration (Polygon minute bars, cached in `bars.sqlite3`); forward
    registrations only count sessions whose bars exist until `n_target_sessions` (100) or `max_sessions` (250);
 2. a stage-1 PASS registers its forward confirmation (stage 2, alpha 0.05/k);
-3. registers at most one new stage-1 proposal per weekday (queue in `families.QUEUE`, then `inbox/*.json`),
+3. registers at most one new stage-1 proposal per weekday (queue in `template_queue.QUEUE`, then `inbox/*.json`),
    each after the sanity gate (`sanity.check`, G1–G11); rejections go to `rejections.jsonl` and a refused
    queue item is checked again the next weekday;
 4. rewrites `status.json` (machine-readable, schema `edge-stream-status/1`) and `DIGEST.md` (a view of it).
@@ -33,7 +33,9 @@ Look reports: `looks/<registration sha[:16]>.json` (0444, schema `edge-look-repo
 | noise is measured per day or ISO week; a finer unit in a trade's `session` is refused | `stats.judge` |
 | no reuse of (group, horizon class, period): prior consumption table + every registration | `ledger.conflicts` |
 | forward windows start after registration; no outcome computed before the look | `runner.forward_progress` (presence only) |
-| look runs only on the registered family code (`code_sha256`), else abandoned | `runner.compute_look` |
+| look runs only on the registered family code (`code_sha256`): the live package when it reproduces the hash, else the sealed tree that does (below), else abandoned; the check runs first in every cycle, on every lane, before any data is read (a forward registration is not left to collect to its look) | `runner._evaluator`, `sealed.evaluator` |
+| the hash is per family: its own class, the shared code of `families.py` and the other evaluation modules (`stats`, `runner`, `data`, `policy`); other families' classes, the `FAMILIES` registry and the queue (`template_queue.py`) are left out, so adding or changing one family abandons no other family's registration | `families.code_sha256` |
+| unread status is a positive receipt in the ledger: before the first read of each kind of an open registration's window (`progress`, `look`) the runner appends an `edge_read` record to the hash-chained, anchored ledger, so a lost or restored data dir cannot hide one; a dry run reads no open window. Under policy 4 only a registration (either lane) sealed under policy 4+ with no `edge_read` record at all, abandoned at the code check with no failed attempt or staged report, frees its window and may register again. A forward presence count is a read: that window stays consumed and that (family, group, lane) closed. Registrations sealed before policy 4 free and reopen nothing; contrary or partial evidence keeps everything closed. Alpha stays spent | `ledger.append_read` / `StreamState.unread_abandoned` / `reregistrable`, `runner.read_evidence`, `policy.UNREAD_ABANDONMENT` |
 | bars after the decision minute never reach the rule | `families.decision_bars` / `assert_no_lookahead` |
 | a stage-1 trial of a session family must be able to pay its costs: pooled break-even hit rate (1 + round-trip cost floor / mean \|move\|) / 2 ≤ 0.60, measured on the ~13–16 sessions **before** the window (unsigned sizes only); event families (EC1) are not priced by it | `sanity` G11 (bar source set by the CLI; `sanity` is not hashed, so the gate never abandons an open registration) |
 | expectancy test: n ≥ 100, ≥ 50 a side, both sides > 0, session bootstrap LB and clustered-t LB at 1−alpha/k > 0, beats always-long, 2 of 3 thirds | `stats.judge` |
@@ -52,6 +54,14 @@ carry on the short leg; the years before 2026 are reserved for the D0 research c
 without sealing or forming a trade:
 `python -m alpha_research.edge_stream cycle --dry-run --family EC1 --data-dir <scratch>` (prints sessions,
 filings found, companies left out, and the hour of day filings were accepted).
+
+## Unread abandonments (policy 4, owner decision 2026-11-21)
+
+The policy 3 merge (#1238) changed IM1's code while `IM1-v1:us_single_stocks:history:2024-12-19` waited for its
+look: the 2026-11-20 cycle abandoned it unread, and under policy 3 its window stayed consumed and its group counted
+as done, so single stocks could never be tested. Policy 4 adds `unread_abandonment` and the owner decision behind it (Codex review 6010600452 asked that unread status be evidenced across prior cycles, not inferred from when the code check runs: review 6010864065 that the receipt be positive and independent of the data dir: hence `edge_read` ledger records. Single stocks is not freed: it was sealed before read records existed, and its evidence (cycle log, bar cache) cannot be reconciled from the source; bringing it back needs its own reviewed receipt); the ledger's consumption and the runner's queue read it from the policy in force, so it applies only to records
+after the amendment. Before merging a change to an evaluation module, check `status.json` for an open history
+registration due a look and merge after it.
 
 ## The evidence bar (policy 3, owner decision GRID#1213)
 
@@ -97,9 +107,48 @@ change), except for the fields a new entry in `policy.OWNER_DECISIONS` waives. A
 edited or removed afterwards, and never lifts the yearly budget. Anything else that loosens is refused: the cycle
 reports it under `errors` and registers nothing until the code is put right.
 
-**Deploying any change to `families`, `stats`, `runner`, `data` or `policy` abandons the registration that is open
-at that moment** (its look and its window are spent): their code is hashed into every registration. Land such a
-change when the open registration is the one you can best afford to lose, and say so in the PR.
+**Deploying any change to `families`, `stats`, `runner`, `data` or `policy` abandons the registrations open at that
+moment** (their looks and their windows are spent): their code is hashed into every registration. The policy
+payload, numpy's major.minor and Python's `ast.dump` (so the interpreter's minor version, 3.14 on grid-hermes)
+are in the hash too. **Unless the same PR adds a sealed tree:**
+
+- **What it is.** `alpha_research/edge_stream/sealed/<name>/` is a byte copy of the edge-stream package as
+  deployed (every module but `__main__` and `hermes`, never edited). Its provenance is in `sealed.TREES`: the
+  release's git tree id, the file sha256s, and the open registrations it seals. `tests/test_edge_stream_sealed.py`
+  pins the bytes and, on Python 3.14, that the tree reproduces each sealed hash.
+- **How it is used.** On every cycle a registration whose hash the live code no longer reproduces is matched to a
+  tree, failing closed at each step (`sealed.evaluator`):
+  1. every file is byte-equal to the pinned manifest, with no file missing, unreadable or extra. This covers
+     `ledger`, `sanity`, `universe` and `__init__`, which the hash leaves out but the sealed runner imports;
+  2. only then is the tree imported (an import error excludes it);
+  3. each imported module must come from the tree's own directory;
+  4. the tree's own `code_sha256`, recomputed from its files, must equal the registration's. No hash-to-tree map
+     is trusted.
+
+  Its code check, presence count, look and report then run in that tree (the runner's ledger records, read
+  receipts and report file stay the live ones). A tree failing any step judges nothing, and the registration is
+  abandoned as before.
+- **Trust boundary.** The bytes are checked on disk just before import, and re-checked on every call. The code in
+  memory is what was imported, so this assumes the deployed release root is immutable while a cycle runs: written
+  only by the deploy, owned by `grid`, never edited in place. Stale bytecode is trusted as Python trusts it.
+- **What a tree does not freeze.** A sealed look reads bars through the *live* sources and `extras`. Its failed
+  attempts are counted by the *live* `runner._attempt_failed` under live policy thresholds.
+  `tests/test_edge_stream_sealed.py` holds them to the tree:
+  - live `data.py` is AST-equal to the tree's;
+  - `_attempt_failed` and the three retry thresholds are equal;
+  - a cap is never counted;
+  - source errors abandon on the tree's day;
+  - readiness and date coverage (before the window, a gap, a holiday) match.
+
+  While a sealed registration is open, a change to any of these fails CI. It then needs a frozen adapter, or the
+  registration's loss accepted in the PR.
+- **When a tree goes.** Remove one only when no open registration in the live ledger reproduces under it.
+- **The first tree.** `tree_a1d9bd4c` (#1337, release tree `a1d9bd4c`, deployed from `ca04a2d5` on 2026-11-18)
+  keeps the two forward registrations open on 2026-11-25: the SPY/QQQ/IWM test `69a84820` and EC1's confirmation
+  `60b49abd`, both sealed under policy 3.
+
+Without a tree, land such a change when the open registrations are the ones you can best afford to lose, and say
+so in the PR.
 
 Adding a family = a reviewed PR to `families.py` (its source is hashed into registrations). An inbox proposal
 (`{"family": "IM1", "group": "...", "instruments": [...], "lane": "history"|"forward", "proposer": "codex"}`) may only
