@@ -211,10 +211,48 @@ describe('Dashboard watchlist loading', () => {
         rerender(<Dashboard onNavigate={vi.fn()} />);
         await waitFor(() => expect(api.getWatchlistPrices).toHaveBeenCalledTimes(2));
 
-        await act(async () => { finishRefresh({ prices: { SPY: { price: 999, pct_1d: 0.01 } } }); });
-        // The superseded POST result is not applied, but the button must not stay stuck.
+        await act(async () => { finishRefresh({ prices: {} }); });
+        // The POST has settled; the button must not stay stuck disabled.
         await waitFor(() => expect(screen.getByTestId('pulse-refresh')).not.toBeDisabled());
         expect(screen.getByTestId('pulse-refresh')).toHaveTextContent('Refresh quotes');
+    });
+
+    // Codex hold on #1464 at 4a151ab4: a reconnect GET that starts while the manual POST is
+    // pending can return the OLD cache; start order is not cache freshness.
+    async function refreshOverlappedByReconnectRead() {
+        useWebSocket.mockReturnValue({ connected: false, prices: {} });
+        const gets = [];
+        api.getWatchlistPrices.mockImplementation(() => new Promise(resolve => { gets.push(resolve); }));
+        let finishRefresh;
+        api.refreshWatchlistPrices.mockReturnValue(new Promise(r => { finishRefresh = r; }));
+        const view = render(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(gets.length).toBe(1));
+        await act(async () => { gets[0]({ prices: {}, fresh: false, cached: false }); });
+
+        fireEvent.click(await screen.findByTestId('pulse-refresh'));
+        await waitFor(() => expect(screen.getByTestId('pulse-refresh')).toBeDisabled());
+
+        useWebSocket.mockReturnValue({ connected: true, prices: {} });
+        view.rerender(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(gets.length).toBe(2));
+        return { reconnectGet: gets[1], finishRefresh };
+    }
+
+    it('keeps the refreshed price when a reconnect read that returned the old cache lands first (#959)', async () => {
+        const { reconnectGet, finishRefresh } = await refreshOverlappedByReconnectRead();
+        await act(async () => { reconnectGet({ prices: { SPY: { price: 500, pct_1d: 0.01 } }, fresh: true, cached: true }); });
+        await act(async () => { finishRefresh({ prices: { SPY: { price: 501, pct_1d: 0.02 } } }); });
+        await waitFor(() => expect(screen.getAllByText('501.00').length).toBeGreaterThan(0));
+        expect(screen.queryByText('500.00')).not.toBeInTheDocument();
+    });
+
+    it('keeps the refreshed price when the refresh lands first and the old-cache read lands after (#959)', async () => {
+        const { reconnectGet, finishRefresh } = await refreshOverlappedByReconnectRead();
+        await act(async () => { finishRefresh({ prices: { SPY: { price: 501, pct_1d: 0.02 } } }); });
+        await waitFor(() => expect(screen.getAllByText('501.00').length).toBeGreaterThan(0));
+        await act(async () => { reconnectGet({ prices: { SPY: { price: 500, pct_1d: 0.01 } }, fresh: true, cached: true }); });
+        expect(screen.getAllByText('501.00').length).toBeGreaterThan(0);
+        expect(screen.queryByText('500.00')).not.toBeInTheDocument();
     });
 
     it('drops the refresh-failed message once a later quote read succeeds (#959)', async () => {

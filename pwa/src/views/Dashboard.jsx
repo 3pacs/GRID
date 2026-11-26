@@ -392,9 +392,17 @@ export default function Dashboard({ onNavigate }) {
         setPulseRefreshFailed(false);
         try {
             const r = await api.refreshWatchlistPrices();
-            if (gen !== pulseGenRef.current) return;
-            if (!r || r.error) { setPulseRefreshFailed(true); return; }
-            applyPulseRead(gen, r);
+            if (!r || r.error) {
+                // A failed refresh says nothing about a newer read that already landed.
+                if (gen === pulseGenRef.current) setPulseRefreshFailed(true);
+                return;
+            }
+            // A successful refresh is what wrote the cache, so its prices are the freshest
+            // the page can hold. A cache read that started while the POST was pending may
+            // have returned the old cache, and request start order is not cache freshness:
+            // take a new generation here so such a read can neither replace these prices
+            // now nor overwrite them if it finishes later.
+            applyPulseRead(startPulseRead(), r);
         } catch {
             if (gen === pulseGenRef.current) setPulseRefreshFailed(true);
         } finally {
