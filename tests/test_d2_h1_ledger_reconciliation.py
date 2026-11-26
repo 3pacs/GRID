@@ -40,7 +40,10 @@ def test_any_option_premium_overlap_is_named_in_the_finding():
 
 def test_unread_items_are_listed_and_nothing_is_decided_here():
     assert DOC["not_read"] and all(x["reason"] for x in DOC["not_read"])
-    assert DOC["status"] == "DRAFT_FOR_REVIEW" and "does not decide" in DOC["finding"]["needs_a_decision"]
+    f = DOC["finding"]
+    assert DOC["status"] == "DRAFT_FOR_REVIEW" and "does not decide" in f["needs_a_decision"]
+    assert f["contract_revision"] == "NOT_YET_MADE" and f["owner_position"] == "AGREES_WITH_REVIEWER"
+    assert "6068505242" in f["needs_a_decision"]  # the reviewer's position is recorded by review id
 
 
 def test_the_data_file_carries_no_private_paths():

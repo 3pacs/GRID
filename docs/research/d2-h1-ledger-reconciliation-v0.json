@@ -28,9 +28,18 @@
    "gex.eod_flows",
    "gex.playbook_evidence",
    "gex.flow_sign",
-   "gex.factory_dev_data"
+   "gex.factory_dev_data",
+   "gex.exits_trail_arm",
+   "gex.overnight_shadow",
+   "gex.bounce_shadow",
+   "gex.fly_shadow",
+   "gex.desk_state_ark",
+   "gex.burnin_v2_nvda_watch_gex_trader"
   ],
-  "needs_a_decision": "Section 6.2 strikes a cell if the SPY option-premium family, entry time or contract scope was tested on 2018..2022-11. The SPXW 15:00 fly (and its reported-only 14:00 entry) was judged on the same sessions. Whether that is the same family for section 6.2 is the reviewer's and owner's call. This file records the facts and does not decide it."
+  "needs_a_decision": "Section 6.2 strikes a cell if the SPY option-premium family, entry time or contract scope was tested on 2018..2022-11. Reviewer position (Codex review 6068505242 at 0e109fad): the SPXW fly is the same selection family for 6.2; strike D2-H1b (15:00) and keep D2-H1a (14:00) off the fetch manifest too, because reported-only inspection is still inspection; record the owner decision in a versioned contract; any replication must be explicitly non-independent and separately authorized, never called untouched. Owner position (Claude): agree with the reviewer. The versioned contract revision is not yet made and the operator has been asked; this file does not decide it.",
+  "owner_position": "AGREES_WITH_REVIEWER",
+  "contract_revision": "NOT_YET_MADE",
+  "fetch_manifest_and_quote": "HELD; recommended not to be built for either cell"
  },
  "rows": [
   {
@@ -285,44 +294,78 @@
    "listed_in_contract_section_4": "YES",
    "note": "different family; no option data",
    "source": "contract section 4"
+  },
+  {
+   "id": "gex.exits_trail_arm",
+   "family": "trailing exit versus fixed target",
+   "instrument": "live entries",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "forward expectancy comparison",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "no historical window; registered 2026-11-07",
+   "source": "exits registration"
+  },
+  {
+   "id": "gex.overnight_shadow",
+   "family": "sector-aware overnight rule, forward paper record",
+   "instrument": "sector ETFs",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "forward from 2026-11-16",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "no historical window",
+   "source": "overnight-shadow registration"
+  },
+  {
+   "id": "gex.bounce_shadow",
+   "family": "late bounce on negative-gamma days, forward",
+   "instrument": "SPY shares",
+   "data_kind": "SPY_INTRADAY_PRICE_PATH",
+   "window": "forward from 2026-11-12",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "forward only; its history mirror is edge7 P3 (2022-11+)",
+   "source": "bounce-shadow registration"
+  },
+  {
+   "id": "gex.fly_shadow",
+   "family": "15:00 SPY 0DTE short iron fly, forward shadow",
+   "instrument": "SPY options, live Schwab chain",
+   "data_kind": "OPTION_PREMIUM",
+   "window": "forward from 2026-11-12",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "forward only; this is D2-H2",
+   "source": "fly-shadow registration"
+  },
+  {
+   "id": "gex.desk_state_ark",
+   "family": "ARK forced trades and flows",
+   "instrument": "equities",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "2023-01-03..2026-10-05",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "after the target window; not SPY options",
+   "source": "desk-state results"
+  },
+  {
+   "id": "gex.burnin_v2_nvda_watch_gex_trader",
+   "family": "operational servers and shadow trader",
+   "instrument": "n/a",
+   "data_kind": "NON_SPY_OTHER",
+   "window": "none stated",
+   "overlaps_target_window": false,
+   "listed_in_contract_section_4": "NO",
+   "note": "code only: no record file and no pre-2022 date constants found; read for dates, not for behaviour",
+   "source": "burnin-v2, nvda-watch, gex-trader sources"
   }
  ],
  "not_read": [
   {
    "id": "gex.gamma_vol (optflow)",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.exits (trail-arm)",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.burnin_v2",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.overnight_shadow",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.nvda_watch",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.gex_trader",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.desk_state",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.bounce_shadow",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
-  },
-  {
-   "id": "gex.fly_shadow",
-   "reason": "not read in this pass; file names show registration on or after 2026-11-06 or a forward shadow; windows unconfirmed"
+   "reason": "the directory is on branch docs/gamma-ladder-defs-20261118, not in the checkout read; the lane's data note says it holds the trailing free year only; unconfirmed"
   }
  ],
  "limits": [

@@ -12,9 +12,9 @@ was.
 
 1. **No SPY option premium before 2022-11-14 has ever been fetched.** The four OPRA fetchers in the research lane (edge2,
    edge4, edge6 XSP, edge6 SPXW) start SPY and XSP at 2022-11-14. Only SPXW starts earlier, at 2016-11-15.
-2. **Section 4 of the contract is incomplete.** It omits nine records that exist in the lane: edge6-SPX, edge9, edge10,
-   edge11, edge12, eod-flows, the playbook evidence cuts, flow-sign and the factory development data. Five of them have
-   windows or families that matter here (below). The other four are after the target window or are different families.
+2. **Section 4 of the contract is incomplete.** It omits fifteen records that exist in the lane (the JSON lists each).
+   Four bear on the target window: edge6-SPX, edge9, eod-flows and the playbook evidence cuts (below). Edge10, edge11 and
+   edge12 share dates but are different families and instruments. The rest are later than the window or forward-only.
 3. **One judged look is on the target window's sessions with the same strategy:** the edge6 follow-up that ran the 15:00
    short iron fly on SPXW over 2016-11-15 .. 2022-11-11 (verdict class FAIL; 14:00 and 14:30 entries reported only, no
    verdict). It is a different underlying, but it is the same structure on the same days, and its own record concludes the
@@ -25,23 +25,27 @@ was.
 5. **Protected reservations are untouched:** edge3's daily-SPY calendar holdout (2013 .. 2026-11-10) and the insider
    reservations are not opened by any step here.
 
-## The decision this needs (not made here)
+## The decision this needs
 
-Section 6.2: "if reconciliation finds an overlap, that cell is struck before the fetch." Whether the SPXW fly counts as the
-same family for that rule is the owner's and reviewer's call, and it changes what a fetch is worth:
+Section 6.2: "if reconciliation finds an overlap, that cell is struck before the fetch."
 
-- **If it counts,** both cells (14:00 and 15:00) are struck, D2-H1 is dropped, and no spend is needed.
-- **If it does not count,** the cells proceed as replications on a window that is untouched for SPY option premium but not
-  for the family or the SPY price path; the result is reported with these overlaps beside it.
+- **Reviewer (Codex, review 6068505242 at `0e109fad`):** the SPXW fly is the same selection family. Strike the 15:00 cell,
+  and keep the 14:00 cell off any fetch manifest too, because a reported-only look is still a look. Any replication must be
+  proposed separately, authorised separately, and labelled non-independent, never "untouched".
+- **Owner (Claude):** agrees. The reasoning is that a different ticker and settlement make a different estimand, not an
+  independent selection: the SPXW result is the stated reason the SPY-only premise exists.
+- **Not yet done:** the owner decision belongs in a versioned contract revision (the signed body is pinned, so this is a new
+  version, not an edit), and the operator has been asked. This file records the position and does not make that revision.
+- **Consequence:** if both cells are struck, D2-H1 is dropped, G5 needs no spend, the fetch manifest and the Databento quote
+  are not built, and the E2 options cost class (G4) has no hypothesis to serve in v1.
 
-My reading is that the second is defensible only with the disclosure above and a plain statement that D2-H1 is not an
-independent test. I have not decided it, and the fetch manifest and quote are held until it is decided.
+## Not read
 
-## Not read in this pass
-
-gamma-vol (optflow), exits (trail-arm), burnin-v2, overnight-shadow, nvda-watch, gex-trader, desk-state, bounce-shadow,
-fly-shadow. File names show registration on or after 2026-11-06 or forward shadows; their windows are unconfirmed. They are
-listed in the JSON, not silently omitted. The reviewer should confirm or I will read them next.
+Eight of the nine items first listed as unread are now read: the forward shadows (fly, bounce, overnight), the trailing-exit
+registration, the ARK desk-state results (2023 onward) and three operational servers (no historical window, no pre-2022 date
+constants) do not touch the target window. **Still unconfirmed: gamma-vol (optflow)**, which lives on another branch that was
+not in the checkout read; the lane's data note says it holds the trailing free year only. The reconciliation is therefore
+complete except for that one item.
 
 ## Limits
 
