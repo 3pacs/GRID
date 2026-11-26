@@ -399,12 +399,7 @@ def test_two_overlapping_writers_add_each_change_row_once(pg_engine, monkeypatch
 
     def write(name: str) -> None:
         try:
-            # The inner pass, under the per-manager lock only. Since GRID #1492
-            # the public entry points take a whole-pass run lock first, so a
-            # second writer skips before it reaches this lock
-            # (tests/test_etf_flows_single_writer_20261126.py); this keeps the
-            # inner guard proved for any overlap that gets past the run lock.
-            results[name] = inst.InstitutionalFlowsPuller(pg_engine)._pull_13f_managers()
+            results[name] = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
         except BaseException as exc:  # noqa: BLE001 -- surfaced below
             errors.append(exc)
 
@@ -546,12 +541,7 @@ def test_overlapping_writers_with_different_payloads_store_both_in_commit_order(
 
     def write(name: str) -> None:
         try:
-            # The inner pass, under the per-manager lock only. Since GRID #1492
-            # the public entry points take a whole-pass run lock first, so a
-            # second writer skips before it reaches this lock
-            # (tests/test_etf_flows_single_writer_20261126.py); this keeps the
-            # inner guard proved for any overlap that gets past the run lock.
-            results[name] = inst.InstitutionalFlowsPuller(pg_engine)._pull_13f_managers()
+            results[name] = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
         except BaseException as exc:  # noqa: BLE001 -- surfaced below
             errors.append(exc)
 

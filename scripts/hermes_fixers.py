@@ -426,15 +426,11 @@ def _recovered_after(source_name: str, last_fail: Any) -> bool:
 
 
 def _held_source_names() -> dict[str, str]:
-    """Normalized source names of registry entries Hermes must not repair -> reason.
+    """Normalized source names of held (retired) registry entries -> reason.
 
-    A held puller (``hold_reason``) never runs again, so its last failures
-    cannot be repaired and must not be retried, diagnosed or key-checked
-    (TIINGO_FUNDAMENTALS stayed on the failed list for a day after its
-    2026-11-08 retirement). An entry with ``repair_hold_reason`` still runs on
-    its schedule, and that run is its only repair: etf_flows, whose repair
-    retries re-ran the whole 13F pass as unlogged, overlapping writers
-    (GRID #1492).
+    A held puller never runs again, so its last failures cannot be repaired
+    and must not be retried, diagnosed or key-checked (TIINGO_FUNDAMENTALS
+    stayed on the failed list for a day after its 2026-11-08 retirement).
     """
     try:
         from ingestion.smart_scheduler import (
@@ -444,7 +440,7 @@ def _held_source_names() -> dict[str, str]:
         return {}
     held: dict[str, str] = {}
     for entry in PULLER_REGISTRY:
-        reason = entry.get("hold_reason") or entry.get("repair_hold_reason")
+        reason = entry.get("hold_reason")
         if not reason:
             continue
         name = entry["name"]
@@ -1471,13 +1467,6 @@ def _execute_hermes_repair_command(
         source = raw_cmd.split(":", 1)[1].strip()
         if not source:
             raise ValueError("REPULL requires a source name")
-        # Held and scheduled-run-only registry entries are never repaired;
-        # diagnose_and_fix_pulls filters them the same way (GRID #1492).
-        # Nothing runs, so no cooldown outcome either way.
-        held_reason = _held_source_names().get(_normalize_source_key(source))
-        if held_reason is not None:
-            log.info("REPULL:{s} not run: {r}", s=source, r=held_reason)
-            return {"cmd": raw_cmd, "status": "skipped", "reason": "held", "detail": held_reason}
         if state.cooldowns.can_retry(source):
             log.info("Hermes action: re-pulling {s}", s=source)
             pull_result = _retry_source(
@@ -2522,7 +2511,7 @@ def diagnose_and_fix_pulls(
     still_failed = [r for r in not_held if not _recovered_after(r[0] or "", r[2])]
     if len(still_failed) < len(failed):
         log.info(
-            "Not repairing held or scheduled-run-only sources {h} or sources a repair already "
+            "Not repairing held sources {h} or sources a repair already "
             "recovered since their last failure {r}",
             h=sorted({r[0] for r in failed} - {r[0] for r in not_held}),
             r=sorted({r[0] for r in not_held} - {r[0] for r in still_failed}),
