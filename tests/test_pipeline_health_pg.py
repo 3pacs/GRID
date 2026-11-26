@@ -128,6 +128,8 @@ def test_representative_postgres_health_is_available(pipeline_pg):
     assert by_name["Fed_Liquidity"]["field_record"]["availability"] == "unavailable"
     assert data["coverage"]["by_family"]["market"]["with_data"] == 1
     assert len(data["recent_errors"]) == 1
+    assert data["recent_errors_availability"] == "available"
+    assert data["recent_errors_stale_reason"] is None
     assert data["resolver_status"]["last_run"] == datetime.now(timezone.utc).date().isoformat()
 
     # F3: pipeline-health also carries the pre-computed daily audit
@@ -227,8 +229,13 @@ def test_optional_postgres_failure_is_visible_and_resolver_continues(pipeline_pg
     response = _response(pipeline_pg)
     assert response.status_code == 200
     data = response.json()
-    assert data["availability"] == "unavailable"
-    assert data["stale_reason"] == "consumer_query_mismatch"
+    # The recent-errors feed is its own sub-feed (#959): it says it cannot be read and why,
+    # while the rest of the response keeps its own availability and values.
+    assert data["availability"] == "available"
+    assert data["stale_reason"] is None
+    assert data["recent_errors"] == []
+    assert data["recent_errors_availability"] == "unavailable"
+    assert data["recent_errors_stale_reason"] == "consumer_query_mismatch"
     assert data["summary"]["total_sources"] == 2
     assert data["coverage"]["by_family"]["market"]["with_data"] == 1
     assert data["resolver_status"]["pending"] == 1
