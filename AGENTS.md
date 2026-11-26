@@ -66,3 +66,6 @@ current service inventory. Read matching history when recovering a scoped task.
   `.coordination.md` and the appropriate dated report. File through the available
   fleet reporter and inspect its delivery receipt. Put open work in the canonical
   task list. Keep this entry file concise; do not append session transcripts here.
+- `.coordination.md` entries append at the bottom, so PRs that each add one
+  conflict there when they merge in a batch. Rebase onto current main and keep
+  every entry when resolving; never drop another PR's entry.
