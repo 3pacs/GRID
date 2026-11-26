@@ -73,7 +73,7 @@ This enforces grep-before-create discipline and prevents the duplication documen
 
 ## Tech Stack
 
-- **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] 15 + [[TimescaleDB]]
+- **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] + [[TimescaleDB]] (production griddb is PostgreSQL 14; CI tests 14 and 15)
 - **Frontend:** React 18, Vite, [[Zustand]], served as PWA from [[FastAPI]]
 - **LLM:** Local Qwen 3.8 27B on GPU (topology from the 2026-11-05 fleet audit; routing
   changed 2026-11-06). **gridz4** llama-server `Qwen3.8-27B-Q4_K_M` on `gridz4:8080`
@@ -97,14 +97,18 @@ This enforces grep-before-create discipline and prevents the duplication documen
   `nomic-embed-text`) and return `None` when no node answers. Paid providers, including
   `gemini` (ahead of `openrouter` in every chat chain), stay gated off behind
   `GRID_ALLOW_PAID_LLM`. See `llm/router.py` for the 3-tier taxonomy (LOCAL/REASON/ORACLE).
+  **Quality over speed:** Oracle keeps thinking ON; don't trim reasoning
+  (`enable_thinking=false`) to save tokens or latency.
 - **Config:** pydantic-settings, environment variables via `.env`
 
 ## Server Deployment
 
-- Repo on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)
+- Which checkout each service runs, and how releases reach it: see `docs/SERVER-SERVICES.md`
+  and the deploy workflow. Verify a service's running directory and revision; don't infer it.
 - **Systemd services** (core, active on 2026-11-06): grid-api, grid-crucix, grid-hermes,
-  grid-scheduler, grid-coordinator, grid-worker, cloudflared. Restart core:
-  `sudo systemctl restart grid-api grid-crucix grid-hermes`. `grid-llamacpp` (and
+  grid-scheduler, grid-coordinator, grid-worker, cloudflared. Don't restart them by hand:
+  push deploys restart grid-api and grid-hermes, and scheduler/intelligence activations go
+  through the deploy workflow on Anik's word (see `AGENTS.md`). `grid-llamacpp` (and
   `grid-llamacpp-batch`, `grid-llamacpp-oracle`) still have unit files in
   `/etc/systemd/system` but are disabled and inactive; don't start or restart them.
 - **Public URL**: `https://grid.stepdad.finance` (Cloudflare Tunnel)
@@ -126,7 +130,7 @@ cd grid/pwa && npm install && npm run dev          # Dev server on :5173
 cd grid/pwa && npm run build                       # Production build
 
 # Tests
-cd grid && python -m pytest tests/ -v              # Full suite: 5,702 tests across 301 files
+cd grid && python -m pytest tests/ -v              # Full suite (current count: see the CI Backend Tests summary)
 cd grid && python -m pytest tests/test_pit.py -v   # PIT store tests
 cd grid && python -m pytest tests/test_api.py -v   # API tests
 ```
@@ -199,7 +203,7 @@ request IDs) so similar-but-not-identical errors bucket together. Run it before 
 
 ## Workflow Best Practices
 
-- Explain a concrete plan for complex work, then execute within the user's authorized scope; honor explicit plan-mode requests
+- Start complex tasks in **plan mode** before execution
 - Use subagents only when the current user request or applicable instructions call for delegation
 - Perform `/compact` at ~50% context usage on long sessions
 - Break work into phases — verify each phase works before moving to the next

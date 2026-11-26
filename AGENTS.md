@@ -28,8 +28,8 @@ current service inventory. Read matching history when recovering a scoped task.
 - Use parameterized SQL, the existing DB helpers and explicit transaction
   boundaries. Preserve decision-journal immutability and source provenance.
 - Use GPU inference through the existing router. Do not recreate retired CPU
-  inference services or enable paid providers outside task authorization and
-  `GRID_ALLOW_PAID_LLM` gates.
+  inference services. Paid providers stay off unless `GRID_ALLOW_PAID_LLM` is set
+  and the task explicitly authorizes them.
 - Keep secrets in approved local stores, never instructions, reports or commits.
   Preserve existing private-use/public-cohort filters and access boundaries.
 - Source work and synthetic tests do not authorize ingestion, provider capture,
@@ -53,6 +53,9 @@ current service inventory. Read matching history when recovering a scoped task.
 
 ## Deployment and handoff
 
+- Merges to main need Codex's accept at the exact head, green CI, the merge
+  coordinator's ACK and Anik's own typed word. Releases, shared-service
+  restarts, migrations and activations are Anik's alone.
 - Verify the running service's actual checkout, revision and working directory.
   Use `docs/SERVER-SERVICES.md` and the current deployment workflow. Historical
   `grid_repo`, `astrogrid_dedup` or other tree names are not proof of live source.
