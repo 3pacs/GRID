@@ -203,7 +203,7 @@ request IDs) so similar-but-not-identical errors bucket together. Run it before 
 
 ## Workflow Best Practices
 
-- Explain a concrete plan for complex work, then execute within the user's authorized scope; honor explicit plan-mode requests
+- Start complex tasks in **plan mode** before execution
 - Use subagents only when the current user request or applicable instructions call for delegation
 - Perform `/compact` at ~50% context usage on long sessions
 - Break work into phases — verify each phase works before moving to the next
