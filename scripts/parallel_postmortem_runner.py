@@ -70,6 +70,7 @@ def _count_candidates(engine, days: int = 30) -> tuple[int, int]:
             SELECT COUNT(*) FROM options_recommendations
             WHERE outcome IN ('LOSS', 'EXPIRED')
               AND closed_at >= CURRENT_DATE - (:d || ' days')::interval
+              AND actual_return IS NOT NULL
               AND id NOT IN (SELECT trade_id FROM trade_postmortems WHERE trade_id IS NOT NULL)
         """), {"d": int(days)}).scalar() or 0)
         n_pred = int(c.execute(text("""
@@ -152,6 +153,7 @@ def _worker_main() -> int:
             SELECT id FROM options_recommendations
             WHERE outcome IN ('LOSS', 'EXPIRED')
               AND closed_at >= CURRENT_DATE - (:d || ' days')::interval
+              AND actual_return IS NOT NULL
               AND id NOT IN (SELECT trade_id FROM trade_postmortems WHERE trade_id IS NOT NULL)
               AND MOD(ABS(id), :n) = :i
             ORDER BY closed_at DESC
@@ -176,8 +178,9 @@ def _worker_main() -> int:
         if max_rows is not None and processed >= max_rows:
             break
         try:
-            generate_postmortem(engine, tid)
-            processed += 1
+            # None means nothing was written (no recorded return, not a failure): no budget spent.
+            if generate_postmortem(engine, tid) is not None:
+                processed += 1
         except Exception as exc:  # noqa: BLE001
             log.debug("worker {i} trade {t} failed: {e}", i=idx, t=tid, e=str(exc))
     for (pid,) in pred_rows:
