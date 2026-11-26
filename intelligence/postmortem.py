@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
@@ -151,26 +152,64 @@ def stored_return_fraction(record: dict[str, Any]) -> float | None:
     return None
 
 
-def postmortems_from_records(records: list[dict[str, Any]]) -> tuple[list["PostMortem"], int]:
+_RETURN_TEXT = re.compile(
+    r"(?i)\b(?:actual[ _]return|return|pnl(?:_pct)?|p&l)\b[^%\n]{0,30}?[-+]?\d+(?:\.\d+)?\s*%"
+)
+RETURN_TEXT_OMITTED = "[return omitted: recorded before the return-unit fix]"
+
+
+def _without_legacy_return_text(text_value: Any) -> Any:
+    """Prose of a pre-fix prediction row with any stated return left out.
+
+    Those rows were narrated with ``{:+.2%}`` over a percent-point value
+    ("Return: -5024.00%" for -50.24%). Only a phrase that states a return is
+    replaced; the stored text itself is never rewritten.
+    """
+    if not isinstance(text_value, str):
+        return text_value
+    return _RETURN_TEXT.sub(RETURN_TEXT_OMITTED, text_value)
+
+
+@dataclass
+class HydratedPostmortems:
+    """``postmortems_from_records`` result."""
+
+    postmortems: list["PostMortem"]
+    included: list[dict[str, Any]]    # the records behind ``postmortems``, same order
+    excluded: int                     # records left out: no known unit for the return
+
+
+def postmortems_from_records(
+    records: list[dict[str, Any]], limit: int | None = None,
+) -> HydratedPostmortems:
     """Hydrate ``PostMortem`` objects from ``load_postmortems`` records.
 
-    ``actual_return`` is always a fraction (``stored_return_fraction``).
-    Returns ``(postmortems, excluded)``: ``excluded`` counts records left out
-    because they have no analysis blob or no return that can be put in a
-    known unit, so a mixed history cannot reach an average.
+    ``actual_return`` is always a fraction (``stored_return_fraction``). A
+    record with no analysis blob is skipped; one with no return that can be
+    put in a known unit is left out and counted in ``excluded``, so a mixed
+    history cannot reach an average. ``limit`` stops after that many included
+    records, taking records in order, so an excluded row does not shrink the
+    window. For a pre-fix prediction row (no unit marker, ``prediction_id``
+    set) any return stated in the prose is omitted from the object, because
+    the stored text carries the old ×100 figure.
     """
-    pms: list[PostMortem] = []
-    excluded = 0
+    out = HydratedPostmortems(postmortems=[], included=[], excluded=0)
     for r in records:
+        if limit is not None and len(out.postmortems) >= limit:
+            break
         full = r.get("full_analysis") or {}
         if not full:
             continue
         ret = stored_return_fraction(r)
         if ret is None:
-            excluded += 1
+            out.excluded += 1
             continue
+        legacy_prediction = (
+            full.get("actual_return_unit") is None and r.get("prediction_id") is not None
+        )
+        prose = (lambda v: _without_legacy_return_text(v)) if legacy_prediction else (lambda v: v)
         try:
-            pms.append(PostMortem(
+            out.postmortems.append(PostMortem(
                 trade_id=full.get("trade_id", 0),
                 ticker=full.get("ticker", r.get("ticker", "")),
                 direction=full.get("direction", ""),
@@ -179,20 +218,21 @@ def postmortems_from_records(records: list[dict[str, Any]]) -> tuple[list["PostM
                 data_at_decision=full.get("data_at_decision", {}),
                 thesis_at_decision=full.get("thesis_at_decision", ""),
                 sanity_results_at_decision=full.get("sanity_results_at_decision", {}),
-                what_actually_happened=full.get("what_actually_happened", ""),
+                what_actually_happened=prose(full.get("what_actually_happened", "")),
                 price_path=full.get("price_path", []),
                 failure_category=full.get("failure_category", r.get("failure_category", "")),
-                root_cause=full.get("root_cause", r.get("root_cause", "")),
+                root_cause=prose(full.get("root_cause", r.get("root_cause", ""))),
                 which_signals_were_wrong=full.get("which_signals_were_wrong", []),
                 which_signals_were_right=full.get("which_signals_were_right", []),
-                what_we_missed=full.get("what_we_missed", r.get("what_we_missed", "")),
-                recommended_fix=full.get("recommended_fix", r.get("recommended_fix", "")),
+                what_we_missed=prose(full.get("what_we_missed", r.get("what_we_missed", ""))),
+                recommended_fix=prose(full.get("recommended_fix", r.get("recommended_fix", ""))),
                 confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
                 generated_at=full.get("generated_at", ""),
             ))
+            out.included.append(r)
         except Exception:
             continue
-    return pms, excluded
+    return out
 
 
 # ── Table Setup ───────────────────────────────────────────────────────────

@@ -179,13 +179,24 @@ def _generate(engine, n: int, days: int) -> Any:
             "label": None,
         }
 
-    records = records[: int(n)] if n and n > 0 else records
-
     # Every return is put in one unit (a fraction) whichever writer stored it;
-    # a row whose unit cannot be told is left out and counted.
-    pms, excluded = postmortems_from_records(records)
+    # a row whose unit cannot be told is left out and counted. The window is
+    # the first ``n`` rows that could be hydrated, so an excluded row neither
+    # shrinks it nor lends its date to the label.
+    hydrated = postmortems_from_records(records, limit=int(n) if n and n > 0 else None)
+    pms, excluded = hydrated.postmortems, hydrated.excluded
 
     if not pms:
+        if excluded:
+            return {
+                "text": (
+                    f"{excluded} post-mortems in the last {days} days have no return in a "
+                    "known unit and were left out; nothing to synthesize."
+                ),
+                "count": 0,
+                "label": None,
+                "excluded_unknown_return": excluded,
+            }
         return {
             "text": "No hydrated post-mortems available for synthesis.",
             "count": 0,
@@ -193,7 +204,7 @@ def _generate(engine, n: int, days: int) -> Any:
         }
 
     text_out = generate_lessons_learned(engine, pms)
-    date_range = _date_range_label([r.get("generated_at") for r in records[: len(pms)]])
+    date_range = _date_range_label([r.get("generated_at") for r in hydrated.included])
     return {
         "text": text_out,
         "count": len(pms),

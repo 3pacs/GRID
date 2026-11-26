@@ -170,9 +170,10 @@ def test_stored_return_fraction(record, expected):
 
 
 def test_hydration_counts_what_it_cannot_put_in_a_unit():
-    pms, excluded = postmortems_from_records([LEGACY_PRED(), TRADE(), _rec(ret=-0.5)])
-    assert [round(p.actual_return, 4) for p in pms] == [-0.5024, -1.0]
-    assert excluded == 1
+    h = postmortems_from_records([LEGACY_PRED(), TRADE(), _rec(ret=-0.5)])
+    assert [round(p.actual_return, 4) for p in h.postmortems] == [-0.5024, -1.0]
+    assert h.excluded == 1
+    assert len(h.included) == 2
 
 
 def _patch_window(monkeypatch, records):
@@ -284,3 +285,74 @@ def test_empty_window_does_not_resurrect_a_legacy_cache(monkeypatch):
     assert out["cached"] is False and out["label"] is None
     assert "withheld" in out["note"]
     assert out["lessons"]["count"] == 0
+
+
+# ── Codex 6069248064: prompt prose and the date label ───────────────────────
+
+import types  # noqa: E402
+
+
+def _llm_capturing(monkeypatch, prompts: list) -> None:
+    class _Llm:
+        is_available = True
+
+        def generate(self, prompt, **kw):
+            prompts.append(prompt)
+            return "- lever: weight less"
+
+    fake = types.SimpleNamespace(get_llm=lambda tier: _Llm(), Tier=types.SimpleNamespace(RESEARCH="research"))
+    monkeypatch.setitem(sys.modules, "llm.router", fake)
+
+
+def test_lessons_prompt_omits_the_old_return_text_of_legacy_prediction_rows(monkeypatch):
+    prompts: list = []
+    _llm_capturing(monkeypatch, prompts)
+    legacy = LEGACY_PRED()
+    legacy["full_analysis"]["root_cause"] = "Direction was wrong. Actual return: -5024.00%."
+    legacy["full_analysis"]["what_actually_happened"] = "INSM PUT ... Outcome: miss. Return: -5024.00%."
+    new = NEW_PRED()
+    new["full_analysis"]["root_cause"] = "Fresh row. Actual return: -50.24%."
+    trade = TRADE()
+    trade["full_analysis"]["root_cause"] = "Trade row. Actual return: -100.00%."
+    monkeypatch.setattr("intelligence.postmortem.load_postmortems", lambda engine, days, **k: [legacy, new, trade])
+
+    out = pml._generate(MagicMock(), n=10, days=30)
+
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert "Average return: -66.83%" in prompt
+    assert "-5024" not in prompt
+    assert pm_mod.RETURN_TEXT_OMITTED in prompt                   # the legacy phrase
+    assert "Fresh row. Actual return: -50.24%." in prompt         # marked row: its prose is right
+    assert "Trade row. Actual return: -100.00%." in prompt        # trade rows were always fractions
+    assert out["count"] == 3
+    # raw stored prose is untouched
+    assert "-5024.00%" in legacy["full_analysis"]["root_cause"]
+
+
+def test_prose_without_a_stated_return_is_kept_for_legacy_rows():
+    rec = LEGACY_PRED()
+    rec["full_analysis"]["root_cause"] = "Price moved +52.7% over 21 days; the PUT was early."
+    h = postmortems_from_records([rec])
+    assert h.postmortems[0].root_cause == "Price moved +52.7% over 21 days; the PUT was early."
+
+
+def test_label_uses_the_rows_actually_included_and_exclusion_does_not_shrink_the_window(monkeypatch):
+    def dated(day, **kw):
+        return _rec(ret=-50.0, prediction_id=f"p{day}", gen=f"2026-11-{day:02d}T12:00:00+00:00", **kw)
+
+    unknown_newest = _rec(ret=-0.5, gen="2026-11-25T12:00:00+00:00")   # writer unknown -> excluded
+    records = [unknown_newest, dated(24), dated(23), dated(22), dated(21)]
+    _patch_window(monkeypatch, records)
+    out = pml._generate(MagicMock(), n=3, days=30)
+    assert out["count"] == 3                                          # not 2
+    assert out["label"] == "LLM summary of 3 postmortems dated 2026-11-22 to 2026-11-24"
+    assert out["excluded_unknown_return"] == 1
+
+
+def test_window_where_every_row_is_ineligible_says_so(monkeypatch):
+    _patch_window(monkeypatch, [_rec(ret=-0.5), _rec(ret=-0.7)])
+    out = pml._generate(MagicMock(), n=5, days=30)
+    assert out["count"] == 0 and out["label"] is None
+    assert out["excluded_unknown_return"] == 2
+    assert "2 post-mortems" in out["text"] and "no return in a known unit" in out["text"]

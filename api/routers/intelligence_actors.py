@@ -842,7 +842,8 @@ def get_lessons_learned(
         # Reconstruct PostMortem objects from stored records for the synthesis.
         # ``postmortems_from_records`` puts every return in one unit (a fraction)
         # whichever writer stored it, and leaves out a row whose unit it cannot tell.
-        pms, excluded = postmortems_from_records(records)
+        hydrated = postmortems_from_records(records)
+        pms, excluded = hydrated.postmortems, hydrated.excluded
 
         lessons = generate_lessons_learned(engine, pms)
         return {"lessons": lessons, "count": len(pms), "excluded_unknown_return": excluded}
