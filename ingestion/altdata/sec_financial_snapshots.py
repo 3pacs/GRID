@@ -26,6 +26,11 @@ MAX_SOURCE_BYTES = 32 * 1024 * 1024
 # within this many days of the capture, or after it, is a current or forward
 # period that would be silently dropped, and stays fatal.
 LEGACY_ENTRY_HORIZON_DAYS = 730
+# Balance-sheet instants whose latest `end` in a filing is that filing's report-period end.
+_BALANCE_SHEET_TAGS: dict[str, frozenset[str]] = {
+    'us-gaap': frozenset({'Assets', 'LiabilitiesAndStockholdersEquity'}),
+    'ifrs-full': frozenset({'Assets', 'EquityAndLiabilities'}),
+}
 
 
 def _json(value: Any) -> str:
@@ -116,7 +121,7 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
     only that the metric is absent from this qualified current projection.
     """
     from ingestion.altdata.sec_xbrl_financials import (
-        _collect_all_flows, _FLOW_MAPPINGS, _IFRS_TAG_MAP,
+        _collect_all_flows, _FLOW_MAPPINGS, _IFRS_TAG_MAP, _normalize_entry,
         _DEBT_PROCEEDS_TAG, _DEBT_REPAY_TAG, _IFRS_DEBT_PROCEEDS_TAG, _IFRS_DEBT_REPAY_TAG,
     )
 
@@ -154,8 +159,9 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
     # lack. These indexes let the gate tell such a period stand-in from an
     # event-dated stray point; see the tolerance rule below.
     unusable: list[tuple[str, str, date, str, bool]] = []            # (taxonomy, tag, end, accn, is_stray_point)
-    usable_ends_all: set[date] = set()
-    usable_ends_by_accn: dict[str, set[date]] = {}
+    qualifying_ends_all: set[date] = set()                           # ends of entries the normalizer accepts
+    qualifying_ends_by_accn: dict[str, set[date]] = {}
+    report_end_by_accn: dict[str, date] = {}                         # the filing's period end, from its balance sheet
     for taxonomy in ('us-gaap', 'ifrs-full'):
         namespace = facts.get(taxonomy, {})
         if not isinstance(namespace, dict):
@@ -190,23 +196,36 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                         if start is None or filed < end:
                             unusable_ends.append(end)
                             unusable.append((taxonomy, tag_name, end, str(entry['accn']), start is None and filed >= end))
-                        elif start < end:
-                            usable_ends_all.add(end)
-                            usable_ends_by_accn.setdefault(str(entry['accn']), set()).add(end)
+                        elif _normalize_entry(entry) is not None:
+                            # Only what the normalizer would turn into a row counts as
+                            # evidence of a reporting period: a nonqualifying form or
+                            # duration (a two-day 8-K span, a 9-month YTD) proves nothing.
+                            qualifying_ends_all.add(end)
+                            qualifying_ends_by_accn.setdefault(str(entry['accn']), set()).add(end)
+                    elif start is None and tag_name in _BALANCE_SHEET_TAGS[taxonomy] and filed >= end:
+                        accn = str(entry['accn'])
+                        report_end_by_accn[accn] = max(end, report_end_by_accn.get(accn, end))
     capture_day = received.date()
     tolerated_points: list[tuple[str, str, str]] = []
     for taxonomy, tag_name, end, accn, is_stray_point in unusable:
         if (capture_day - end).days > LEGACY_ENTRY_HORIZON_DAYS:
             continue                                   # legacy: cannot affect a current row
-        # A recent unusable entry refuses the issuer, EXCEPT an event-dated stray point:
-        # a start-less entry (it can never be a flow row: the normalizer needs a
-        # duration) (1) whose accession has reporting periods known from its own usable
-        # entries, so it is not the filing's only evidence, and (2) whose end is none
-        # of the issuer's reporting-period ends, so it cannot stand in for a period the
-        # projection would then lack. Real shapes: a one-day debt issuance, share
-        # issuance or buyback in a notes disclosure, tagged with a flow concept but no
-        # start (2026-11-26: INTC, EOG, ON, WLK, DHI, RPD, NXE, each refused for one).
-        if is_stray_point and usable_ends_by_accn.get(accn) and end not in usable_ends_all:
+        # A recent unusable entry refuses the issuer, EXCEPT an event-dated stray point: a
+        # start-less entry (it can never be a flow row: the normalizer needs a duration)
+        # for which the filing's OWN report-period end is established and the point is
+        # shown not to be that period or any other:
+        #  (1) the accession's period end R comes from its balance sheet (Assets /
+        #      LiabilitiesAndStockholdersEquity instants: the latest end the filing
+        #      reports), not from the entries under test;
+        #  (2) the accession has a qualifying (normalizer-accepted) flow ending at R, so
+        #      the current period is represented and not hiding behind comparatives;
+        #  (3) the point's end is not R and not the end of any qualifying flow.
+        # Real shapes: a one-day debt issuance, share issuance or buyback in a notes
+        # disclosure (2026-11-26: INTC, EOG, ON, WLK, DHI, RPD, NXE, each refused for one).
+        report_end = report_end_by_accn.get(accn)
+        if (is_stray_point and report_end is not None
+                and report_end in qualifying_ends_by_accn.get(accn, ())
+                and end != report_end and end not in qualifying_ends_all):
             tolerated_points.append((tag_name, end.isoformat(), accn))
             continue
         raise ValueError("Invalid mapped financial-flow duration")

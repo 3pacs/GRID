@@ -1400,10 +1400,19 @@ def test_pg_tolerated_legacy_entry_cannot_remove_an_existing_current_row(snapsho
     assert stored(engine) == before                              # refused before the writer: projection retained
 
 
+_OWN = "0001045810-26-000075"
+_BALANCE = {"Assets": {"units": {"USD": [dict(end="2026-07-26", val=1000, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+
+
+def _stray_fact(tag="PaymentsOfDividends", end="2026-06-15"):
+    return {tag: {"units": {"USD": [dict(end=end, val=1000, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+
+
 def test_pg_tolerated_stray_point_cannot_remove_an_existing_current_row(snapshot_db):
-    """An event-dated start-less point (not a reporting-period end, in an accession whose
-    periods are known) changes nothing the normalizer emits: the writer replaces the owned
-    projection with the same rows. At the filing's period end it is refused before the writer."""
+    """An event-dated start-less point (the filing's period end known from its balance sheet and
+    represented by a qualifying flow; the point is not a period end) changes nothing the normalizer
+    emits: the writer replaces the owned projection with the same rows. At the filing's period end
+    it is refused before the writer."""
     import pytest
     from store.sec_financial_snapshots import write_snapshot
 
@@ -1413,18 +1422,97 @@ def test_pg_tolerated_stray_point_cannot_remove_an_existing_current_row(snapshot
     before = stored(engine)
     assert len(before) == 1
 
-    stray = {"PaymentsOfDividends": {"units": {"USD": [dict(
-        end="2026-06-15", val=1000, accn="0001045810-26-000075", filed="2026-08-26", form="10-Q", fp="Q2")]}}}
-    later = _snapshot_with_extra_facts(stray, second=30)
-    assert later.tolerated_stray_points == (("PaymentsOfDividends", "2026-06-15", "0001045810-26-000075"),)
+    later = _snapshot_with_extra_facts({**_BALANCE, **_stray_fact()}, second=30)
+    assert later.tolerated_stray_points == (("PaymentsOfDividends", "2026-06-15", _OWN),)
     assert later.rows == first.rows and later.snapshot_id != first.snapshot_id
     result = write_snapshot(engine, later)
     assert result["status"] == "applied" and result["rows_written"] == len(first.rows)
     assert result["rows_removed"] == len(first.rows)             # the same owned rows replaced by the same rows
     assert stored(engine) == before                              # no current row lost or changed
 
-    at_period_end = {"PaymentsOfDividends": {"units": {"USD": [dict(
-        end="2026-07-26", val=5, accn="0001045810-26-000075", filed="2026-08-26", form="10-Q", fp="Q2")]}}}
     with pytest.raises(ValueError, match="duration"):
-        _snapshot_with_extra_facts(at_period_end, second=40)
+        _snapshot_with_extra_facts({**_BALANCE, **_stray_fact(end="2026-07-26")}, second=40)
     assert stored(engine) == before                              # refused before the writer: projection retained
+
+
+def _comparative_only_body(*, second):
+    """Codex 6081201501 control 1: a valid 2025 comparative flow and a start-less Revenue at the
+    2026 current quarter end (balance sheet at 2026-07-26)."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+
+    tag = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    facts = {tag: {"units": {"USD": [
+        dict(start="2025-04-28", end="2025-07-27", val=1, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2"),
+        dict(end="2026-07-26", val=100, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}, **_BALANCE}
+    started = datetime(2026, 11, 1, tzinfo=timezone.utc) + timedelta(seconds=second)
+    return prepare_snapshot(
+        source_body=json.dumps({"cik": 1045810, "entityName": "Synthetic Test Issuer", "facts": {"us-gaap": facts}}).encode(),
+        actor_id="nvda", cik="1045810", request_started_at=started, received_at=started + timedelta(seconds=1),
+        fx_rates={"USD": 1.0})
+
+
+def test_pg_comparative_only_evidence_cannot_hide_the_current_period_or_clear_owned_rows(snapshot_db):
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    assert write_snapshot(engine, snapshot())["status"] == "applied"
+    before = stored(engine)
+    with pytest.raises(ValueError, match="duration"):
+        _comparative_only_body(second=50)
+    assert stored(engine) == before                              # the 2026 owned row is still there
+
+
+def test_pg_a_nonqualifying_duration_cannot_lead_to_an_empty_projection(snapshot_db):
+    """Codex 6081201501 control 2: only a two-day 8-K span supports the accession; the normalizer
+    rejects it, so a tolerated point would otherwise yield an empty projection and clear owned rows."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    import pytest
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    assert write_snapshot(engine, snapshot())["status"] == "applied"
+    before = stored(engine)
+    tag = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    facts = {tag: {"units": {"USD": [dict(start="2026-07-24", end="2026-07-26", val=1, accn=_OWN,
+                                          filed="2026-08-26", form="8-K", fp="Q2")]}},
+             **_BALANCE, **_stray_fact()}
+    started = datetime(2026, 11, 1, tzinfo=timezone.utc) + timedelta(seconds=60)
+    with pytest.raises(ValueError, match="duration"):
+        prepare_snapshot(
+            source_body=json.dumps({"cik": 1045810, "entityName": "Synthetic Test Issuer", "facts": {"us-gaap": facts}}).encode(),
+            actor_id="nvda", cik="1045810", request_started_at=started, received_at=started + timedelta(seconds=1),
+            fx_rates={"USD": 1.0})
+    assert stored(engine) == before
+
+
+def test_pg_a_tolerating_capture_never_erases_a_stored_period_but_a_clean_one_may(snapshot_db):
+    """The writer's own guard (no inference involved): a capture that tolerated start-less points
+    and lacks a previously owned key is rejected with the projection retained; the same removal in
+    a capture with no tolerated point is the ordinary replacement and still applies."""
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    dividends = {"PaymentsOfDividends": {"units": {"USD": [dict(
+        start="2026-04-27", end="2026-07-26", val=40, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    first = _snapshot_with_extra_facts(dividends, second=70)
+    assert len(first.rows) == 2 and write_snapshot(engine, first)["status"] == "applied"
+    before = stored(engine)
+    assert len(before) == 2
+
+    tolerating = _snapshot_with_extra_facts({**_BALANCE, **_stray_fact("PaymentsForRepurchaseOfCommonStock")}, second=80)
+    assert tolerating.tolerated_stray_points and len(tolerating.rows) == 1       # the dividends row is gone from the source
+    result = write_snapshot(engine, tolerating)
+    assert result["status"] == "rejected_stray_would_remove_rows" and result["rows_written"] == 0
+    assert stored(engine) == before                                             # nothing erased
+
+    clean = _snapshot_with_extra_facts({}, second=90)                           # same removal, nothing tolerated
+    assert not clean.tolerated_stray_points
+    assert write_snapshot(engine, clean)["status"] == "applied"
+    assert len(stored(engine)) == 1

@@ -141,6 +141,8 @@ def test_summary_counts_tolerated_stray_points_and_the_issuer_is_still_written(r
     puller,fetch,write,checkpoints=runner
     raw,now,_=response()
     data=json.loads(raw)
+    data['facts']['us-gaap']['Assets']={'units':{'USD':[dict(
+        end='2026-07-26',val=1,form='10-Q',fp='Q2',accn='0001045810-26-000075',filed='2026-08-26')]}}
     data['facts']['us-gaap']['PaymentsOfDividends']={'units':{'USD':[dict(
         end='2026-06-15',val=1,form='10-Q',fp='Q2',accn='0001045810-26-000075',filed='2026-08-26')]}}
     fetch.return_value=(json.dumps(data).encode(),now,now)

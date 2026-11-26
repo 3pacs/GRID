@@ -1232,6 +1232,8 @@ class SECXBRLFinancialsPuller:
                 outcome = write_snapshot(self.engine, snapshot)
                 if outcome["status"] == "rejected_revision_regression":
                     raise ValueError("New capture regressed an existing filed revision; projection retained")
+                if outcome["status"] == "rejected_stray_would_remove_rows":
+                    raise ValueError("A tolerated start-less point would remove stored periods; projection retained")
             except Exception as exc:
                 # The transactional writer already rolled back any SQL failure.
                 # Never checkpoint failed admission as a completed ticker.

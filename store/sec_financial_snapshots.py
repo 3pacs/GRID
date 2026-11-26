@@ -45,6 +45,11 @@ def _revision_regressed(previous: list[dict[str, Any]], incoming: list[dict[str,
                for r in incoming)
 
 
+def _removes_owned_keys(previous: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> bool:
+    key = lambda r: (r['fiscal_period'], r['period_type'], r['flow_type'])  # noqa: E731
+    return bool({key(r) for r in previous} - {key(r) for r in incoming})
+
+
 def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
     """Archive source, then atomically replace only this producer's projection.
 
@@ -80,6 +85,10 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
             old = json.loads(old) if isinstance(old, str) else old
             if _revision_regressed(old, rows):
                 return dict(status='rejected_revision_regression', rows_written=0, snapshot_id=snapshot.snapshot_id)
+            if snapshot.tolerated_stray_points and _removes_owned_keys(old, rows):
+                # A capture that tolerated start-less points must never erase a stored
+                # period: that needs an explicit, supported reconciliation, not this path.
+                return dict(status='rejected_stray_would_remove_rows', rows_written=0, snapshot_id=snapshot.snapshot_id)
         if current and snapshot.snapshot_id == current['snapshot_id']:
             conn.execute(_HEAD, params)
             return dict(status='unchanged', rows_written=0, snapshot_id=snapshot.snapshot_id)
