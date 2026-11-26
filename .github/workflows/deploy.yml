@@ -1108,10 +1108,19 @@ jobs:
           # tests/test_dropin_backup_and_write.py) backs up whatever is
           # already there before overwriting, rather than the backup/rollback
           # logic existing only as inline bash no test ever ran.
-          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" \
+          #
+          # Pin the exact release directory, not $DEPLOY_PATH. $DEPLOY_PATH is
+          # the mutable grid_release symlink that every push deploy moves, so
+          # with Restart=always a crash restart would put grid-intelligence on
+          # whatever main is at that moment, without anyone deciding to.
+          # Measured 2026-11-26: the drop-in held the symlink while the
+          # process ran release 62112241. Same rule as the grid-scheduler step.
+          INTELLIGENCE_RELEASE="$(bash "$DEPLOY_PATH/scripts/resolve_pinned_release.sh" "$DEPLOY_PATH" "${{ github.sha }}")"
+          printf '%s\n' '[Service]' "WorkingDirectory=$INTELLIGENCE_RELEASE" \
             | sudo bash "$DEPLOY_PATH/scripts/dropin_backup_and_write.sh" "$DROPIN" grid-intelligence \
             | tee -a "$GITHUB_STEP_SUMMARY"
           sudo systemctl daemon-reload
+          test "$(systemctl show -p WorkingDirectory --value grid-intelligence)" = "$INTELLIGENCE_RELEASE"
           sudo systemctl restart grid-intelligence
 
       # Same proof-of-tree pattern as grid-hermes/grid-scheduler above -- a
