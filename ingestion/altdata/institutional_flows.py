@@ -674,11 +674,21 @@ def _from_resume_point(managers: list[tuple[str, str]], resume_cik: str | None) 
     return managers
 
 
-# What counts as "read in full" for a withheld comparison (Codex review
-# 6080519392). A side is read in full when it is complete, or when its status
-# is one of these: each is a finding that rests on documents that were fetched
-# and parsed. Everything else (a failed or refused fetch, a document that did
-# not parse, a status not listed here) is not a finding about the filing.
+# What counts as "read in full" for a withheld comparison (Codex reviews
+# 6080519392 and 6080669374). A side is read in full when it is complete, or
+# when its status is one of these: each is a finding that rests on that
+# filing's own documents, fetched and parsed. Everything else (a failed or
+# refused fetch, a document that did not parse, a status not listed here) is
+# not a finding about the filing.
+#
+# Deliberately not listed, though both are stable from run to run:
+# - ``additive_supplement_not_merged``: the run stops at the supplement's
+#   NEW HOLDINGS cover and never loads the original filing's table. That
+#   says why the pair is withheld, not that the pair was read.
+# - an amendment whose own index answers 404/410 (``missing_filing_index``):
+#   neither its index nor its cover was obtained.
+# If stable omissions should one day count as complete for the scheduler,
+# that is a separate, named policy, not "read in full".
 READ_IN_FULL_NOT_COMPARABLE: frozenset[str] = frozenset({
     "entry_count_mismatch",                 # cover and table parsed; their entry counts disagree
     "unreadable_entries",                   # table parsed; some of its entries are not holdings
@@ -690,12 +700,10 @@ READ_IN_FULL_NOT_COMPARABLE: frozenset[str] = frozenset({
     "amendment_not_verified_restatement",   # cover parsed; not a restatement
     "amendment_flag_mismatch",              # cover parsed; it says amendment, the index does not
     "missing_table_entry_total",            # cover parsed; it states no entry count
-    "additive_supplement_not_merged",       # a later amendment's cover was parsed as NEW HOLDINGS
 })
 # An amendment's own cover, when that is what the side's status rests on.
 AMENDMENT_COVER_READ: frozenset[str] = frozenset({
-    "missing_filing_index",                 # 404/410 on the amendment's index
-    "missing_cover_page",
+    "missing_cover_page",                   # the amendment's index was read and lists no cover page
     "cover_not_an_amendment",
     "report_date_mismatch",
     "unknown_amendment_type",

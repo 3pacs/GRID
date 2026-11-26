@@ -306,6 +306,7 @@ def test_read_in_full_is_a_named_list_of_statuses(status):
     "fetch_failed:timeout", "fetch_failed:http_503", "fetch_failed:http_403",   # failed or refused fetch
     "unparseable_cover_page", "unparseable_infotable",                         # a document that did not parse
     "unknown_filing_date_or_accession",                                        # nothing was fetched
+    "additive_supplement_not_merged",                                          # the original's table is never loaded
     "a_status_added_later",                                                    # not listed: not read in full
 ])
 def test_everything_else_is_not_read_in_full_and_says_why(status):
@@ -317,7 +318,10 @@ def test_an_amendment_side_is_read_in_full_only_when_its_cover_was_read():
         assert inst._not_read_in_full(_snap("unclassified_amendment", classification_reason=reason)) is None
         assert inst._not_read_in_full(_snap(
             "unresolved_undated_amendment", unresolved_amendments=[{"accession": "B", "reason": reason}])) is None
-    for reason in ("fetch_failed:http_503", "unparseable_cover_page"):
+    # missing_filing_index: a 404/410 on the amendment's own index, so neither
+    # its index nor its cover was obtained.
+    assert "missing_filing_index" not in inst.AMENDMENT_COVER_READ
+    for reason in ("fetch_failed:http_503", "unparseable_cover_page", "missing_filing_index"):
         assert inst._not_read_in_full(_snap("unclassified_amendment", classification_reason=reason)) == reason
         assert inst._not_read_in_full(_snap("unresolved_undated_amendment", unresolved_amendments=[
             {"accession": "B", "reason": "missing_cover_page"}, {"accession": "C", "reason": reason},
@@ -722,3 +726,75 @@ def test_the_change_row_lock_wait_is_cut_to_the_time_left_and_only_tried_after_t
     conn = _PgConn()
     puller._lock_change_rows(conn, "1067983", date(2026, 11, 14))
     assert ["pg_try_advisory_xact_lock" in sql for sql, _p in conn.sent] == [True]   # tried, never waited for
+
+
+# ── Incomplete reads that are stable are still not a finished check ────────
+#
+# Codex review 6080669374: two withheld paths never read the pair, although
+# they give the same answer every run. They keep their withheld receipt and
+# write no position row, and the manager is FAILED, not NO_DATA, so a run
+# with one of them beside a compared manager is PARTIAL.
+
+
+def _with_a_new_holdings_supplement(edgar: s.FakeEdgar) -> None:
+    curr = edgar.filings[s.CIK_ALPHA][1]
+    edgar.add(s.CIK_ALPHA, s.Filing(
+        "9000000001-26-000009", curr.filing_date + timedelta(days=2), curr.report_date,
+        {s.PEER_B_CUSIP: ("PEER B INC", 5_000, 50)}, form="13F-HR/A", amendment_type="NEW HOLDINGS"))
+
+
+def _with_an_amendment_whose_index_is_gone(edgar: s.FakeEdgar, dated: bool) -> None:
+    curr = edgar.filings[s.CIK_ALPHA][1]
+    edgar.add(s.CIK_ALPHA, s.Filing(
+        "9000000001-26-000008", curr.filing_date + timedelta(days=3), curr.report_date,
+        dict(curr.holdings), form="13F-HR/A", fail="404", fail_on="index", index_report_date=dated))
+
+
+@pytest.mark.parametrize("arrange,snapshot_status,reason", [
+    (_with_a_new_holdings_supplement, "additive_supplement_not_merged", "additive_supplement_not_merged"),
+    (lambda e: _with_an_amendment_whose_index_is_gone(e, dated=True), "unclassified_amendment",
+     "missing_filing_index"),
+    (lambda e: _with_an_amendment_whose_index_is_gone(e, dated=False), "unresolved_undated_amendment",
+     "missing_filing_index"),
+], ids=["new_holdings_supplement", "amendment_index_gone", "undated_amendment_index_gone"])
+def test_a_stable_but_incomplete_read_beside_a_compared_manager_is_partial_with_its_own_coverage(
+    engine, monkeypatch, arrange, snapshot_status, reason
+):
+    from intelligence import dollar_flows
+    from intelligence import holdings_observations_13f as h13f
+
+    monkeypatch.setattr(dollar_flows, "_get_cusip_ticker_map", lambda: None)
+    edgar = s.two_quarter_scenario()
+    arrange(edgar)
+
+    results = _run(engine, monkeypatch, edgar.get)
+
+    (alpha,) = [r for r in results if r["feature"] == f"13F:{s.CIK_ALPHA}"]
+    (beta,) = [r for r in results if r["feature"] == f"13F:{s.CIK_BETA}"]
+    # Withheld, on record, no position row: and not a checked leaf.
+    assert alpha["status"] == "FAILED" and alpha["comparison_status"] == "withheld_incomplete"
+    assert alpha["curr_snapshot"] == snapshot_status and reason in alpha["error"]
+    assert alpha["receipts_inserted"] == 1 and alpha["rows_inserted"] == 0
+    assert _count(engine, f"13F:{s.CIK_ALPHA}:%") == 0
+    assert _classify_outcome([alpha])[0] == "FAILED"
+    # The compared manager beside it is unaffected, and the run is PARTIAL.
+    assert beta["status"] == "SUCCESS" and beta["rows_inserted"] > 0
+    outcome, _rows, note = _classify_outcome(results)
+    assert outcome == "PARTIAL" and reason in note
+    # Distinct withheld coverage downstream: Alpha unverified and unserved, Beta served.
+    h13f.clear_snapshot_cache()
+    snapshot = h13f.read_13f_holdings_snapshot(engine)
+    h13f.clear_snapshot_cache()
+    assert snapshot.counts.get("managers_latest_filing_unverified") == 1
+    served = {h.manager_cik for h in snapshot.holdings}
+    assert s.CIK_ALPHA not in served and s.CIK_BETA in served
+
+
+def test_control_a_structurally_read_mismatch_beside_a_compared_manager_stays_a_finished_check(engine, monkeypatch):
+    edgar = s.two_quarter_scenario()
+    edgar.filings[s.CIK_ALPHA][1].cover_entry_total = 99
+
+    results = _run(engine, monkeypatch, edgar.get)
+
+    assert [r["status"] for r in results] == ["NO_DATA", "SUCCESS"]
+    assert _classify_outcome(results)[0] == "SUCCESS"
