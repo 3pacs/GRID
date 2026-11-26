@@ -38,7 +38,7 @@ def _auth_header() -> dict[str, str]:
 
 
 def _make_engine(source_rows=None, cov_rows=None, err_rows=None, resolver_rows=None, family_rows=None, stale_rows=None,
-                 run_rows=None, run_error=None):
+                 run_rows=None, run_error=None, err_error=None):
     """A fake engine whose ``conn.execute`` dispatches on the query text.
 
     Each ``*_rows`` argument is the ``fetchall``/``fetchone`` payload for the
@@ -63,6 +63,8 @@ def _make_engine(source_rows=None, cov_rows=None, err_rows=None, resolver_rows=N
         elif "sc.last_pull_at < NOW()" in sql:
             result.fetchall.return_value = stale_rows or []
         elif "FROM server_log" in sql:
+            if err_error is not None:
+                raise err_error
             result.fetchall.return_value = err_rows or []
         elif "WITH recent_raw AS" in sql:
             result.fetchone.return_value = (resolver_rows or {}).get("pending", (0,))
@@ -261,6 +263,45 @@ class TestPipelineHealthRunStates:
         # Without runs, only raw_series is left to go on.
         assert statuses["acme_options"] == "inactive"
         assert statuses["acme_stopped"] == "stopped"
+
+
+class TestPipelineHealthRecentErrorsSubFeed:
+    """The recent-errors read is its own sub-feed (griddb has no ``server_log`` table,
+    confirmed 2026-11-26: ``to_regclass('server_log')`` is NULL). Its failure must say
+    so without blanking the rest of the response (#959)."""
+
+    _SOURCES = [("yfinance", datetime.now(timezone.utc), 5, 1, True)]
+
+    def _get(self, **kw):
+        engine = _make_engine(source_rows=self._SOURCES, **kw)
+        with patch("api.routers.system.get_db_engine", return_value=engine):
+            return client.get("/api/v1/system/pipeline-health", headers=_auth_header())
+
+    def test_missing_server_log_table_does_not_blank_the_response(self):
+        resp = self._get(err_error=RuntimeError('relation "server_log" does not exist'))
+        assert resp.status_code == 200
+        data = resp.json()
+        # The sources still count, and the response as a whole is still available.
+        assert data["availability"] == "available"
+        assert data["stale_reason"] is None
+        assert data["summary"]["total_sources"] == 1
+        assert [s["name"] for s in data["sources"]] == ["yfinance"]
+        # The recent-errors sub-feed says it cannot be read, and why.
+        assert data["recent_errors"] == []
+        assert data["recent_errors_availability"] == "unavailable"
+        assert data["recent_errors_stale_reason"] == "consumer_query_mismatch"
+
+    def test_readable_empty_error_feed_is_available_not_unavailable(self):
+        data = self._get(err_rows=[]).json()
+        assert data["recent_errors"] == []
+        assert data["recent_errors_availability"] == "available"
+        assert data["recent_errors_stale_reason"] is None
+
+    def test_readable_error_feed_returns_its_rows(self):
+        ts = datetime.now(timezone.utc)
+        data = self._get(err_rows=[(ts, "api", "boom")]).json()
+        assert data["recent_errors_availability"] == "available"
+        assert [e["message"] for e in data["recent_errors"]] == ["boom"]
 
 
 class TestPipelineHealthFailurePath:
