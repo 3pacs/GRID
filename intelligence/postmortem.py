@@ -380,7 +380,14 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     # findings about the prediction rather than as missing data.
     entry_f = float(entry_price) if entry_price is not None else None
     target_f = float(target_price) if target_price else 0.0
-    actual_ret = float(pnl_pct) if pnl_pct else 0.0
+    # oracle_predictions.pnl_pct is stored in PERCENT POINTS (-50.24 means
+    # -50.24%), the same unit as actual_move_pct (2,317,610 of 2,317,610
+    # scored rows agree). PostMortem.actual_return is a FRACTION everywhere
+    # else (the trade path reads options_recommendations.actual_return) and the
+    # {:+.2%} formatters and PostmortemCompleted.realized_pnl expect one, so
+    # convert here. Without it a -3.81% miss read "-381.00%" and the lessons
+    # report averaged two units together.
+    actual_ret = float(pnl_pct) / 100.0 if pnl_pct else 0.0
     conf = float(confidence) if confidence is not None else None
 
     signals = _parse_json(signals_json)
