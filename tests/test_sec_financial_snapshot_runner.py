@@ -27,7 +27,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(sec,'_load_checkpoint',lambda:{})
     monkeypatch.setattr(sec.time,'sleep',lambda _:None)
     checkpoints=[]
-    monkeypatch.setattr(sec,'_save_checkpoint',lambda *args:checkpoints.append(args))
+    monkeypatch.setattr(sec,'_save_checkpoint',lambda *args,**kw:checkpoints.append(args))
     fetch=MagicMock(return_value=response())
     write=MagicMock(return_value=dict(status='applied',rows_written=1,snapshot_id='synthetic',rows_removed=0))
     monkeypatch.setattr(sec,'_fetch_company_facts_response',fetch)
@@ -112,7 +112,7 @@ def test_persistent_failure_does_not_starve_other_issuers_or_next_sweep(runner,m
     fetch.side_effect=lambda cik: None if cik=='0000320193' else response()
     checkpoint={}
     monkeypatch.setattr(sec,'_load_checkpoint',lambda:checkpoint.copy())
-    def save(completed,last_ticker,total_rows,attempted):
+    def save(completed,last_ticker,total_rows,attempted,deferred=None):
         checkpoint.update(normalizer_version=NORMALIZER_VERSION,completed=completed,
                           attempted=attempted,total_rows=total_rows)
     monkeypatch.setattr(sec,'_save_checkpoint',save)

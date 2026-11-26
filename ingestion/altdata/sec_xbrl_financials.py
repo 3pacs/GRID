@@ -348,20 +348,8 @@ def _sector_map_tickers() -> list[str]:
                 if ticker in seen:
                     continue
                 seen.add(ticker)
-                if _is_structural_non_filer(ticker):
-                    continue
                 ordered.append(ticker)
     return ordered
-
-
-def _is_structural_non_filer(ticker: str) -> bool:
-    """A symbol that can never have an SEC CIK: futures, FX, crypto, indices
-    and dotted exchange-suffix listings (``=F``, ``=X``, ``-USD``, ``^``,
-    ``ATD.TO``). The rule is the one Tiingo's price list already uses; a
-    one-letter share class (``MOG.A``) is not dropped."""
-    from tiingo_symbol_contract import is_tiingo_equity
-
-    return "=" in ticker or not is_tiingo_equity(ticker)
 
 
 # ── CIK lookup ──────────────────────────────────────────────────────────
@@ -1029,6 +1017,7 @@ def _load_checkpoint() -> dict[str, Any]:
 
 def _save_checkpoint(
     completed: list[str], last_ticker: str, total_rows: int, attempted: list[str],
+    deferred: list[str] | None = None,
 ) -> None:
     """Atomically write checkpoint to /tmp."""
     from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION
@@ -1038,6 +1027,7 @@ def _save_checkpoint(
         "last_ticker": last_ticker,
         "completed": completed,
         "attempted": attempted,
+        "deferred": deferred or [],
         "total_rows": total_rows,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1120,6 +1110,14 @@ class SECXBRLFinancialsPuller:
             # after every issuer succeeded. Failure never means completion.
             checkpoint, already_done, already_attempted = {}, set(), set()
         total_rows_before: int = int(checkpoint.get("total_rows") or 0)
+        # Symbols a run could not classify (heads unreadable): neither attempted
+        # nor retried ahead of the rest of the sweep, so a degraded heads read
+        # cannot make bounded runs revisit the same window forever. They are
+        # retried once every other symbol of the sweep has been attempted.
+        deferred: set[str] = set(checkpoint.get("deferred") or [])
+        pending = [t for t in universe if t not in already_attempted]
+        if pending and deferred and all(t in deferred for t in pending):
+            deferred = set()
 
         # Pre-load FX rates once so every ticker's facts can convert
         # non-USD amounts to USD without a DB hit per row.
@@ -1158,7 +1156,7 @@ class SECXBRLFinancialsPuller:
             if success:
                 completed_list.append(ticker)
             _save_checkpoint(completed_list.copy(), ticker, total_rows_before + rows_this_run,
-                             attempted_list.copy())
+                             attempted_list.copy(), deferred=sorted(deferred))
 
         for ticker in universe:
             if limit is not None and processed >= limit:
@@ -1168,7 +1166,7 @@ class SECXBRLFinancialsPuller:
                 log.warning("SEC_XBRL: runtime cap reached — stopping")
                 break
 
-            if ticker in already_attempted:
+            if ticker in already_attempted or ticker in deferred:
                 continue
 
             actor_id = ticker.lower()
@@ -1176,13 +1174,17 @@ class SECXBRLFinancialsPuller:
             if not cik_padded:
                 processed += 1
                 if covered_actors is None:
-                    # Unknown, not "never filed": a visible failed item, and NOT
-                    # recorded as attempted so the next run looks at it again.
-                    log.warning("SEC_XBRL: {t} has no CIK and the stored snapshot heads are unreadable — retry", t=ticker)
+                    # Unknown, not "never filed": a visible failed item, NOT
+                    # recorded as attempted, and deferred behind the rest of the
+                    # sweep so it is retried without starving later issuers.
+                    log.warning("SEC_XBRL: {t} has no CIK and the stored snapshot heads are unreadable — deferred", t=ticker)
                     coverage_unavailable += 1
+                    deferred.add(ticker)
+                    _save_checkpoint(completed_list.copy(), ticker, total_rows_before + rows_this_run,
+                                     attempted_list.copy(), deferred=sorted(deferred))
                     results.append({
                         "ticker": ticker, "status": "FAILED", "rows": 0,
-                        "error": "coverage check unavailable: stored snapshot heads could not be read; retried next run",
+                        "error": "coverage check unavailable: stored snapshot heads could not be read; retried later in the sweep",
                     })
                     continue
                 if actor_id in covered_actors:

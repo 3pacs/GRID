@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 import json
 from unittest.mock import MagicMock
 
-import pytest
 
 from ingestion.altdata import sec_xbrl_financials as sec
 from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION
@@ -35,17 +34,18 @@ def _response(cik=1, value=100):
     return json.dumps(data).encode(), now, now
 
 
-def _puller(monkeypatch, universe, cik_map, *, covered=frozenset(), state=None, write_rows=1):
+def _puller(monkeypatch, universe, cik_map, *, covered=frozenset(), state=None, write_rows=1, real_universe=False):
     """``covered=None`` scripts an unreadable heads table (unknown, not empty)."""
     state = {} if state is None else state
-    monkeypatch.setattr(sec, "_sector_map_tickers", lambda: list(universe))
+    if not real_universe:
+        monkeypatch.setattr(sec, "_sector_map_tickers", lambda: list(universe))
     monkeypatch.setattr(sec, "_load_fx_rates", lambda _: {"USD": 1})
     monkeypatch.setattr(sec, "_fetch_ticker_to_cik_map", lambda: dict(cik_map))
     monkeypatch.setattr(sec, "_load_checkpoint", lambda: dict(state))
 
-    def save(completed, last_ticker, total_rows, attempted):
+    def save(completed, last_ticker, total_rows, attempted, deferred=None):
         state.update(normalizer_version=NORMALIZER_VERSION, completed=completed,
-                     attempted=attempted, total_rows=total_rows)
+                     attempted=attempted, deferred=deferred or [], total_rows=total_rows)
 
     monkeypatch.setattr(sec, "_save_checkpoint", save)
     monkeypatch.setattr(sec.time, "sleep", lambda _: None)
@@ -137,6 +137,7 @@ def test_an_unreadable_heads_table_is_unknown_not_a_checked_leaf(monkeypatch):
     assert outcome == OUTCOME_PARTIAL and rows == 2 and "coverage check unavailable" in note
     # valid-CIK neighbours were written and completed; the unresolved symbol was not attempted
     assert state["completed"] == ["AAA", "BBB"] and state["attempted"] == ["AAA", "BBB"]
+    assert state["deferred"] == ["AVB"]                                  # held back, not attempted
     assert puller.write.call_count == 2
 
     # the DB recovers: the next run sees it again, and AVB (covered) is now a known loss
@@ -161,35 +162,34 @@ def test_the_heads_reader_returns_the_actor_ids():
     assert sec._stored_snapshot_actors(engine) == frozenset({"avb", "nvda"})
 
 
-# ── the universe ─────────────────────────────────────────────────────────────
+# ── the universe is the sector map, whatever a price provider thinks of a symbol ──
 
-@pytest.mark.parametrize("ticker", ["BTC-USD", "ETH-USD", "CL=F", "ZC=F", "BRL=X", "EURUSD=X",
-                                    "ATD.TO", "DX-Y.NYB", "^GSPC", "DXY"])
-def test_structural_non_filers_are_recognised(ticker):
-    assert sec._is_structural_non_filer(ticker)
-
-
-@pytest.mark.parametrize("ticker", ["AAPL", "BRK-B", "MOG.A", "KELY.A", "IBB", "ADRNY"])
-def test_listed_symbols_are_not_dropped_by_the_symbol_rule(ticker):
-    assert not sec._is_structural_non_filer(ticker)
-
-
-def test_universe_drops_symbols_that_can_never_have_a_cik_and_keeps_sidecar_marked_ones(monkeypatch):
-    """Codex 6079823206: a sidecar foreign_listing / acquired / delisted ticker can still
-    hold a valid SEC CIK and retained snapshots; only positive evidence may retire it,
-    so none of them is filtered here."""
+def _sector_map(monkeypatch, tickers, status=None):
     import analysis.sector_map as sm
 
-    status = {
-        "ACQ": {"status": "acquired"}, "DEL": {"status": "delisted"},
-        "FOR": {"status": "foreign_listing"}, "OLD": {"status": "renamed", "successor": "NEW"},
-    }
-    sector_map = {"s": {"subsectors": {"u": {"actors": [
-        {"ticker": t} for t in ("AAPL", "ACQ", "DEL", "FOR", "OLD", "BTC-USD", "CL=F", "MOG.A", "AAPL", "")
-    ]}}}}
-    monkeypatch.setattr(sm, "SECTOR_MAP", sector_map)
-    monkeypatch.setattr(sm, "TICKER_STATUS", status)
-    assert sec._sector_map_tickers() == ["AAPL", "ACQ", "DEL", "FOR", "OLD", "MOG.A"]
+    monkeypatch.setattr(sm, "SECTOR_MAP", {"s": {"subsectors": {"u": {"actors": [{"ticker": t} for t in tickers]}}}})
+    monkeypatch.setattr(sm, "TICKER_STATUS", status or {})
+
+
+def test_the_universe_is_not_filtered_before_the_authoritative_lookups(monkeypatch):
+    """Codex 6080007104: a price-provider symbol heuristic (Tiingo hardcodes bare BTC, ETH, SOL,
+    DXY) must not override a valid CIK or a stored head, and sidecar-marked tickers stay too."""
+    _sector_map(monkeypatch, ["AAPL", "ACQ", "FOR", "SOL", "BTC-USD", "CL=F", "MOG.A", "AAPL", ""],
+                {"ACQ": {"status": "acquired"}, "FOR": {"status": "foreign_listing"}})
+    assert sec._sector_map_tickers() == ["AAPL", "ACQ", "FOR", "SOL", "BTC-USD", "CL=F", "MOG.A"]
+
+
+def test_a_sol_style_collision_with_a_valid_cik_and_a_stored_head_is_pulled_on_the_scheduled_path(monkeypatch):
+    """An issuer whose ticker collides with a crypto symbol is visited by the full sweep (no
+    ``tickers`` argument); symbols with no CIK and no head are the checked NO_DATA leaf."""
+    _sector_map(monkeypatch, ["AAA", "SOL", "BTC-USD", "CL=F", "IBB"])
+    puller = _puller(monkeypatch, [], {"AAA": "0000000001", "SOL": "0000000009"},
+                     covered={"aaa", "sol"}, real_universe=True)
+    out = puller.pull_all()
+    by = {r["ticker"]: r["status"] for r in out if r.get("ticker")}
+    assert by == {"AAA": "SUCCESS", "SOL": "SUCCESS", "BTC-USD": "NO_DATA", "CL=F": "NO_DATA", "IBB": "NO_DATA"}
+    assert _classify_outcome(out)[0] == OUTCOME_SUCCESS
+    assert sorted(c.args[1].actor_id for c in puller.write.call_args_list) == ["aaa", "sol"]
 
 
 def test_a_foreign_tagged_issuer_with_a_valid_cik_is_still_pulled_and_written(monkeypatch):
@@ -200,3 +200,43 @@ def test_a_foreign_tagged_issuer_with_a_valid_cik_is_still_pulled_and_written(mo
     assert [(r["ticker"], r["status"]) for r in out if r.get("ticker")] == [("FOR", "SUCCESS")]
     assert puller.write.call_count == 1 and puller.write.call_args.args[1].actor_id == "for"
     assert puller.state["completed"] == ["FOR"]
+
+
+# ── a degraded heads read cannot starve later issuers in bounded runs ────────
+
+def test_unresolved_symbols_do_not_starve_a_valid_issuer_behind_them_and_recover_later(monkeypatch):
+    """Codex 6080007104: the scheduler runs with a limit; unresolved symbols consume it. With the
+    heads unreadable and a window of unresolved symbols ahead of a valid issuer, consecutive capped
+    runs must still reach the valid issuer, and the unknowns must be settled once the read recovers."""
+    state: dict = {}
+    universe = ["U1", "U2", "U3", "V1"]
+    cik = {"V1": "0000000005"}
+
+    run1 = _puller(monkeypatch, universe, cik, covered=None, state=state).pull_all(limit=3)
+    assert [r["status"] for r in run1 if r.get("ticker")] == ["FAILED"] * 3
+    assert state["deferred"] == ["U1", "U2", "U3"] and state["attempted"] == []
+
+    p2 = _puller(monkeypatch, universe, cik, covered=None, state=state)
+    run2 = p2.pull_all(limit=3)
+    assert [(r["ticker"], r["status"]) for r in run2 if r.get("ticker")] == [("V1", "SUCCESS")]    # forward progress
+    assert state["completed"] == ["V1"] and state["attempted"] == ["V1"]
+
+    # the heads read recovers: only the deferred symbols remain, so they are retried and settled
+    run3 = _puller(monkeypatch, universe, cik, covered=frozenset(), state=state).pull_all(limit=3)
+    assert [(r["ticker"], r["status"], r["reason"]) for r in run3 if r.get("ticker")] == [
+        ("U1", "NO_DATA", "NO_CIK"), ("U2", "NO_DATA", "NO_CIK"), ("U3", "NO_DATA", "NO_CIK")]
+    assert sorted(state["attempted"]) == ["U1", "U2", "U3", "V1"] and state["deferred"] == []
+    assert _classify_outcome(run3)[0] == OUTCOME_NO_NEW_DATA
+
+    # the sweep is complete: the next run starts a new one
+    run4 = _puller(monkeypatch, universe, cik, covered=frozenset(), state=state).pull_all(limit=1)
+    assert [r["ticker"] for r in run4 if r.get("ticker")] == ["U1"]
+
+
+def test_still_degraded_the_deferred_symbols_are_retried_when_nothing_else_is_left(monkeypatch):
+    state = {"normalizer_version": NORMALIZER_VERSION, "completed": ["V1"], "attempted": ["V1"],
+             "deferred": ["U1", "U2"]}
+    run = _puller(monkeypatch, ["U1", "U2", "V1"], {"V1": "0000000005"}, covered=None, state=state).pull_all(limit=1)
+    assert [(r["ticker"], r["status"]) for r in run if r.get("ticker")] == [("U1", "FAILED")]
+    assert state["deferred"] == ["U1"]            # U2 was not visited yet, so it is simply pending
+    assert "U1" not in state["attempted"]
