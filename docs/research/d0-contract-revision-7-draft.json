@@ -1,0 +1,113 @@
+{
+ "schema": "d0-contract-revision-7-draft/1",
+ "status": "DRAFT_NOT_EFFECTIVE",
+ "drafted": "2026-11-26",
+ "authority": "operator, 2026-11-26: 'Yes, drop D2-H1 and draft it' (drafting only; signing and pinning need the reviewer's ACCEPT and the operator's separate go)",
+ "base_revision": 6,
+ "base_body_sha256": "7643c1e096d8c75567598d16ebf077a246e862c0c922a8f674e82574e2681285",
+ "note": "Not effective. The signed revision 6 body stays pinned and unedited. Each change gives an anchor that must occur exactly once in that body, and replacement text; applying them mechanically yields the revision 7 body that would be signed.",
+ "changes": [
+  {
+   "section": "Header Version row",
+   "anchor": "**revision 6** (revision 2 answered",
+   "replacement": "**revision 7** (revision 7 strikes D2-H1, §10.5; revision 2 answered",
+   "why": "version label"
+  },
+  {
+   "section": "§4 ledger",
+   "anchor": "| #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |",
+   "replacement": "| #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |\n| GEX edge6 follow-up: SPX (fb0c73b, 3fbba8d, 059876a) | the 15:00 short iron fly on SPXW; 14:00 and 14:30 entries reported only | sample A 2016-11-15 .. 2022-11-11 and sample B 2022-11-14 .. 2026-11-09 | FAIL on both samples | revision 7, G5 reconciliation |\n| GEX edge9 | analog library of SPY intraday moments (price paths, no option premium) | burn-in 2018-05-01 .. 2018-12-31; holdout trades 2019-01-02 .. 2022-11-11; development 2022-11-14 .. 2024-11-08 | look result exists | revision 7, G5 reconciliation |\n| GEX eod-flows and playbook evidence cuts | SPY and QQQ late-day follow; decision-minute to close SPY moves (exploratory) | 2018-05-01 .. 2026-11-10 | exploratory, no verdict | revision 7, G5 reconciliation |\n| GEX edge10, edge11, edge12 | equity cross-section families (daily; no SPY option data) | edge10 holdout 2018-06-01 .. 2022-12-30; edge11 2018-08 .. 2026-11; edge12 dev 2010-01-04 .. 2022-12-29, holdout 2022-12-30 .. 2026-11-12 | see their records | revision 7, G5 reconciliation |",
+   "why": "section 4 omitted these lane records (full list, windows and the one unconfirmed item: docs/research/d2-h1-ledger-reconciliation-v0.json)"
+  },
+  {
+   "section": "§4 consequence",
+   "anchor": "Untouched options history exists before 2022-11-14 (OPRA from 2013), where SPY had Monday/Wednesday/Friday",
+   "replacement": "Revision 7: that window is spent for the 0DTE short iron fly family (2016-11-15 .. 2022-11-11 was judged on SPXW, rows above). For any other family, untouched options history exists before 2022-11-14 (OPRA from 2013), where SPY had Monday/Wednesday/Friday",
+   "why": "same-family finding"
+  },
+  {
+   "section": "§6.2 heading",
+   "anchor": "### 6.2 Hypotheses: D2-H1 has two cells; D2-H2 and D2-H3 are adopted unchanged",
+   "replacement": "### 6.2 Hypotheses: D2-H1 is struck (revision 7); D2-H2 and D2-H3 are adopted unchanged",
+   "why": "strike"
+  },
+  {
+   "section": "§6.2 D2-H1 row",
+   "anchor": "| D2-H1a / D2-H1b | edge6 replication at",
+   "replacement": "| D2-H1a / D2-H1b (**STRUCK in revision 7: never fetched, never looked at, kept as history**) | edge6 replication at",
+   "why": "strike, history retained"
+  },
+  {
+   "section": "§6.2 pre-2022 window",
+   "anchor": "**Pre-2022 window, before fetching (G5):**",
+   "replacement": "**Pre-2022 window (G5), outcome in revision 7.** The ledger reconciliation (`d2-h1-ledger-reconciliation-v0`, scoped-accepted by the reviewer at `bf47da50`) found that the 15:00 short iron fly was already judged on SPXW over 2016-11-15 .. 2022-11-11, with the 14:00 and 14:30 entries reported. The reviewer's position (review 6068505242) and the owner's are the same: that is the same selection family, a different underlying is a different estimand and not an independent selection, and reported-only inspection is still inspection. Both cells are therefore struck, and neither goes on a fetch manifest. The steps below were the pre-fetch conditions and are kept as history:",
+   "why": "records the section 6.2 rule applied"
+  },
+  {
+   "section": "§6.4 statistical",
+   "anchor": "**Statistical:**\n- **D2-H1a and D2-H1b** are each tested separately",
+   "replacement": "**Statistical:** *(Revision 7: the D2-H1 bullets below, the D2-H1 sample floor and the D2-H1 power paragraph are void with the struck cells and stay as history. No D2-H1 test is run.)*\n- **D2-H1a and D2-H1b** are each tested separately",
+   "why": "void, history retained"
+  },
+  {
+   "section": "§6.4 selection disclosure",
+   "anchor": "- D2-H1 is a replication on a candidate-untouched window for that reason.",
+   "replacement": "- **Revision 7 additions to the disclosure:** the 15:00 short iron fly was also judged on SPXW (2016-11-15 .. 2026-11-09, FAIL in both samples, 14:00 and 14:30 reported), and SPY intraday price paths over 2018 .. 2022-11 were read by edge9, the eod-flows read and the playbook cuts (no option premium). These are part of the program count for the fly structure and for D2-H3, and are not corrected by per-look levels.\n- D2-H1 was a replication on a candidate-untouched window for that reason; revision 7 strikes it.",
+   "why": "selection disclosure"
+  },
+  {
+   "section": "§6.5 GO",
+   "anchor": "- **GO** (frozen here, before either look): D2-H1 PASS **and** D2-H2 PASS at their own looks.",
+   "replacement": "- **GO** (revision 7): **not reachable for the fly structure under this contract version.** D2-H1 is struck, so there is no replication. A D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`), and calendar time never converts it. A GO needs a new replication that is proposed separately, authorised separately by the operator, labelled non-independent, and registered in a new contract version before anything is fetched. (Frozen before D2-H2's look: D2-H2 has 0 judged rows as of 2026-11-12.)",
+   "why": "no GO without replication"
+  },
+  {
+   "section": "§6.5 HOLD",
+   "anchor": "or D2-H1 cannot be fetched\n  (spend not approved)",
+   "replacement": "or D2-H1 is struck (revision 7), which makes a D2-H2 PASS a HOLD",
+   "why": "HOLD cause"
+  },
+  {
+   "section": "§6.5 RETIRE",
+   "anchor": "- **RETIRE:** D2-H1 FAIL **or** D2-H2 FAIL. D2-H1 FAIL means either H1 cell FAILs; an UNDERPOWERED cell gives HOLD, not FAIL.",
+   "replacement": "- **RETIRE:** D2-H2 FAIL (revision 7: D2-H1 is struck and cannot FAIL). An UNDERPOWERED cell gives HOLD, not FAIL.",
+   "why": "RETIRE rule"
+  },
+  {
+   "section": "§6.6 spend",
+   "anchor": "Spend: the D2-H1 OPRA fetch is a usage-based purchase and needs the operator's explicit approval",
+   "replacement": "Spend (revision 7): none authorised and none needed, because D2-H1 is struck. If a non-independent replication is ever proposed, its OPRA fetch is a usage-based purchase and needs the operator's explicit approval",
+   "why": "no spend"
+  },
+  {
+   "section": "§9 gap G4",
+   "anchor": "| G4 | No options cost class",
+   "replacement": "| G4 (not blocking in revision 7: D2-H2 and D2-H3 are adopted unchanged with their own costs; stays open for any later E2 scoring of options) | No options cost class",
+   "why": "G4 status"
+  },
+  {
+   "section": "§9 gap G5",
+   "anchor": "| G5 | Pre-2022-11 OPRA quotes not fetched",
+   "replacement": "| G5 (CLOSED in revision 7: D2-H1 struck, no pre-2022-11 OPRA fetch) | Pre-2022-11 OPRA quotes not fetched",
+   "why": "G5 status"
+  },
+  {
+   "section": "§10.5 new",
+   "anchor": "<!-- D0-CONTRACT-BODY-END -->",
+   "replacement": "### 10.5 Revision 7: D2-H1 struck (2026-11-26)\n\n| Change | Where |\n|---|---|\n| D2-H1a and D2-H1b are struck: the SPXW 15:00 fly (14:00 and 14:30 reported) was judged on the same sessions, same family; reviewer and owner agree | §6.2 |\n| The fly structure cannot reach GO in this version; D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`); D2-H2 FAIL is RETIRE | §6.5 |\n| No OPRA spend; G5 closed; G4 not blocking | §6.6, §9 |\n| Section 4 ledger adds the omitted lane records | §4 |\n| Selection disclosure adds the SPXW look and the SPY price-path reads | §6.4 |\n\nNo outcome of any D2 look had been read when this was recorded. D2-H2 and D2-H3 are unchanged.\n\n<!-- D0-CONTRACT-BODY-END -->",
+   "why": "revision log"
+  }
+ ],
+ "at_signing_not_in_this_draft": [
+  "docs/research/d0-research-contract-v0.md: apply every change above (body edit)",
+  "analysis/d0_manifest.py: D0_CONTRACT_BODY_SHA256 re-pinned to the new body hash",
+  "docs/research/d0-coverage-manifest-v0.json: contract_body_sha256 and signed_at updated; hypotheses D2-H1a and D2-H1b set to a STRUCK status; the D0 manifest checker updated if it needs a status value",
+  "analysis/d0_admission.py: D2-H1a and D2-H1b removed from the frozen hypothesis definitions, so an ADMITTED row for either is refused",
+  "tests: pin test, the admission test that names D2-H1, and a new test that no live rule still requires D2-H1"
+ ],
+ "not_changed": [
+  "D2-H2 and D2-H3 (adopted unchanged)",
+  "every D1 rule",
+  "the D0 gates, the verifier flag VERIFIER_ACCEPTED, any key or signature"
+ ]
+}
