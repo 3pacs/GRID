@@ -184,6 +184,55 @@ describe('FreshnessIndicator consumers', () => {
         nowSpy.mockRestore();
     });
 
+    // Codex hold on #959: the readings-table envelope was turned into confidence "confirmed"
+    // (shown OBSERVED) for every envelope that was not explicitly unavailable.
+    async function renderJunctionWith(provenance, minutesAhead) {
+        const { default: JunctionDashboard } = await import('../components/flows/JunctionDashboard.jsx');
+        api.getJunctionPoints.mockResolvedValue({
+            junction_points: [], layer_summaries: [], total_junction_points: 0,
+            ...(provenance ? { provenance } : {}),
+        });
+        // useJunctionPoints keeps a 5-minute module cache; step past it.
+        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + minutesAhead * 60 * 1000);
+        render(<JunctionDashboard />);
+        const prov = await screen.findByTestId('readings-provenance');
+        nowSpy.mockRestore();
+        return prov;
+    }
+
+    it('a table within threshold is shown as materialization state, never OBSERVED (#959)', async () => {
+        const prov = await renderJunctionWith({
+            junction_point_readings: {
+                table: 'junction_point_readings', max_obs_date: '2026-11-25', age_days: 1,
+                stale_after_days: 3, unavailable: false, reason: null,
+            },
+        }, 20);
+        expect(prov).toHaveTextContent('WITHIN THRESHOLD · as of 2026-11-25');
+        expect(prov).toHaveTextContent('newest obs 2026-11-25 (1d old, threshold 3d)');
+        expect(prov).not.toHaveTextContent('OBSERVED');
+        expect(prov.querySelector('[data-freshness="observed"]')).toBeNull();
+        expect(screen.getByTestId('readings-within-threshold').title).toMatch(/does not say the values are confirmed/i);
+    });
+
+    it('an envelope with no unavailable flag is UNKNOWN, not a pass (#959)', async () => {
+        const prov = await renderJunctionWith({
+            junction_point_readings: { table: 'junction_point_readings', max_obs_date: '2026-11-25', age_days: 1, stale_after_days: 3 },
+        }, 30);
+        expect(prov).toHaveTextContent('UNKNOWN');
+        expect(prov).not.toHaveTextContent('OBSERVED');
+        expect(prov).not.toHaveTextContent('WITHIN THRESHOLD');
+        expect(screen.queryByTestId('readings-within-threshold')).toBeNull();
+    });
+
+    it('unavailable and stale tables keep their own badges (#959)', async () => {
+        const prov = await renderJunctionWith({
+            junction_point_readings: { table: 'junction_point_readings', max_obs_date: null, unavailable: true, reason: 'empty' },
+        }, 40);
+        expect(prov).toHaveTextContent('UNAVAILABLE');
+        expect(prov).not.toHaveTextContent('OBSERVED');
+        expect(prov).not.toHaveTextContent('WITHIN THRESHOLD');
+    });
+
     it('FlowWaterfall lists per-step confidence', async () => {
         if (typeof globalThis.ResizeObserver !== 'function') {
             globalThis.ResizeObserver = class { observe() {} disconnect() {} };
