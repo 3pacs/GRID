@@ -333,6 +333,7 @@ def _sector_map_tickers() -> list[str]:
         log.error("Could not import SECTOR_MAP: {e}", e=str(exc))
         return []
 
+    excluded = _non_filer_tickers()
     seen: set[str] = set()
     ordered: list[str] = []
     for _sector_name, sector in SECTOR_MAP.items():
@@ -348,8 +349,39 @@ def _sector_map_tickers() -> list[str]:
                 if ticker in seen:
                     continue
                 seen.add(ticker)
+                if ticker in excluded or _is_structural_non_filer(ticker):
+                    continue
                 ordered.append(ticker)
     return ordered
+
+
+def _is_structural_non_filer(ticker: str) -> bool:
+    """A symbol that can never have an SEC CIK: futures, FX, crypto, indices
+    and dotted exchange-suffix listings (``=F``, ``=X``, ``-USD``, ``^``,
+    ``ATD.TO``). The rule is the one Tiingo's price list already uses; a
+    one-letter share class (``MOG.A``) is not dropped."""
+    from tiingo_symbol_contract import is_tiingo_equity
+
+    return "=" in ticker or not is_tiingo_equity(ticker)
+
+
+def _non_filer_tickers() -> frozenset[str]:
+    """Tickers the lifecycle sidecar marks acquired, delisted or foreign-listed.
+
+    Such a symbol stops filing under its own CIK (or never had one). A
+    ``renamed`` symbol is kept: the issuer still files, under a new symbol, and
+    its old symbol is reported as NO_CIK like any other symbol the SEC ticker
+    file does not list.
+    """
+    try:
+        from analysis.sector_map import TICKER_STATUS
+    except Exception as exc:  # noqa: BLE001 -- no sidecar: only the symbol rule applies
+        log.warning("SEC_XBRL: ticker status sidecar unavailable: {e}", e=str(exc))
+        return frozenset()
+    return frozenset(
+        str(t).upper() for t, entry in TICKER_STATUS.items()
+        if isinstance(entry, dict) and entry.get("status") in {"acquired", "delisted", "foreign_listing"}
+    )
 
 
 # ── CIK lookup ──────────────────────────────────────────────────────────
@@ -406,6 +438,21 @@ _COMPANY_FACTS_NOT_FOUND: set[str] = set()
 def company_facts_not_found(cik_padded: str) -> bool:
     """Whether the latest fetch returned HTTP 404 (no XBRL facts)."""
     return cik_padded in _COMPANY_FACTS_NOT_FOUND
+
+
+def _stored_snapshot_actors(engine: Any) -> frozenset[str]:
+    """``actor_id`` of every issuer that has a stored SEC financial snapshot.
+
+    Empty on a read failure, which only turns a lost-CIK failure into a
+    NO_CIK skip for this run; it never blocks the pull.
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT actor_id FROM sec_financial_snapshot_heads")).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("SEC_XBRL: stored snapshot actors unreadable ({e}); lost-CIK check off", e=type(exc).__name__)
+        return frozenset()
+    return frozenset(str(r[0]) for r in rows if r and r[0])
 
 
 def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
@@ -1105,6 +1152,10 @@ class SECXBRLFinancialsPuller:
         if not cik_map:
             log.error("SEC_XBRL: CIK map empty — aborting")
             return [{"status": "FAILED", "error": "cik map empty"}]
+        # Issuers that already have a stored snapshot: one of them missing from
+        # the SEC ticker file is a lost CIK (rename, delisting, a truncated
+        # file), not a symbol that never filed.
+        covered_actors = _stored_snapshot_actors(self.engine)
 
         # Small courtesy delay after the first SEC call.
         time.sleep(_RATE_LIMIT_DELAY_SECS)
@@ -1113,6 +1164,8 @@ class SECXBRLFinancialsPuller:
         processed = 0
         rows_this_run = 0
         tolerated_total = 0
+        no_cik_tickers: list[str] = []
+        cik_lost = 0
         completed_list: list[str] = sorted(already_done)
         attempted_list: list[str] = sorted(already_attempted)
 
@@ -1137,11 +1190,27 @@ class SECXBRLFinancialsPuller:
             actor_id = ticker.lower()
             cik_padded = cik_map.get(ticker)
             if not cik_padded:
-                log.info("SEC_XBRL: {t} has no CIK — skip", t=ticker)
-                results.append({
-                    "ticker": ticker, "status": "NO_CIK", "rows": 0,
-                })
                 processed += 1
+                if actor_id in covered_actors:
+                    # A covered issuer must not look like a symbol that never
+                    # filed: it is reported as a failed item with its reason.
+                    log.warning("SEC_XBRL: {t} has a stored snapshot but no CIK in the SEC ticker file", t=ticker)
+                    cik_lost += 1
+                    results.append({
+                        "ticker": ticker, "status": "FAILED", "rows": 0,
+                        "error": "CIK lost: a stored snapshot exists but the ticker is not in the SEC ticker file",
+                    })
+                else:
+                    log.info("SEC_XBRL: {t} has no CIK — skip", t=ticker)
+                    no_cik_tickers.append(ticker)
+                    # NO_DATA is the pullers' "checked, nothing to fetch" leaf
+                    # that the outcome classifier already counts as a checked
+                    # item (ingestion/smart_scheduler.py); ``reason`` keeps the
+                    # specific cause. It used to be a status of its own,
+                    # NO_CIK, which the classifier logged as an item failure.
+                    results.append({
+                        "ticker": ticker, "status": "NO_DATA", "reason": "NO_CIK", "rows": 0,
+                    })
                 record_attempt(ticker)
                 continue
 
@@ -1185,14 +1254,18 @@ class SECXBRLFinancialsPuller:
 
         elapsed = time.monotonic() - start_ts
         log.info(
-            "SEC_XBRL complete — {p} tickers, {r} rows, {t} unusable legacy entries tolerated, {e:.1f}s",
-            p=processed, r=rows_this_run, t=tolerated_total, e=elapsed,
+            "SEC_XBRL complete — {p} tickers, {r} rows, {t} unusable legacy entries tolerated, "
+            "{n} without a CIK, {c} covered issuers with a lost CIK, {e:.1f}s",
+            p=processed, r=rows_this_run, t=tolerated_total, n=len(no_cik_tickers), c=cik_lost, e=elapsed,
         )
         results.append({
             "status": "SUMMARY",
             "tickers_processed": processed,
             "rows_written": rows_this_run,
             "tolerated_legacy_entries": tolerated_total,
+            "no_cik": len(no_cik_tickers),
+            "no_cik_tickers": no_cik_tickers[:50],
+            "cik_lost": cik_lost,
             "elapsed_seconds": round(elapsed, 1),
         })
         return results

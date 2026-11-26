@@ -130,7 +130,8 @@ def test_persistent_failure_does_not_starve_other_issuers_or_next_sweep(runner,m
 def test_no_cik_is_attempted_not_successful(runner,monkeypatch):
     puller,fetch,write,checkpoints=runner
     monkeypatch.setattr(sec,'_fetch_ticker_to_cik_map',lambda:{'AAPL':'0000320193'})
-    assert puller.pull_all()[0]['status']=='NO_CIK'
+    first=puller.pull_all()[0]
+    assert (first['status'],first['reason'])==('NO_DATA','NO_CIK')
     assert checkpoints[0][0]==[] and checkpoints[0][3]==['NVDA']
     fetch.assert_not_called()
     write.assert_not_called()
