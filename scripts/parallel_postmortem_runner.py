@@ -51,6 +51,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from db import get_engine
+from intelligence.postmortem import FINITE_PNL_PCT_SQL
 from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS
 
 
@@ -77,7 +78,7 @@ def _count_candidates(engine, days: int = 30) -> tuple[int, int]:
             SELECT COUNT(*) FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict = 'miss'
               AND scored_at >= CURRENT_DATE - (:d || ' days')::interval
-              AND pnl_pct IS NOT NULL
+              AND """ + FINITE_PNL_PCT_SQL + """
               AND id NOT IN (SELECT prediction_id FROM trade_postmortems WHERE prediction_id IS NOT NULL)
         """), {"d": int(days)}).scalar() or 0)
     return n_trade, n_pred
@@ -162,7 +163,7 @@ def _worker_main() -> int:
             SELECT id FROM """ + VISIBLE_ORACLE_PREDICTIONS + """ oracle_predictions
             WHERE verdict = 'miss'
               AND scored_at >= CURRENT_DATE - (:d || ' days')::interval
-              AND pnl_pct IS NOT NULL
+              AND """ + FINITE_PNL_PCT_SQL + """
               AND id NOT IN (SELECT prediction_id FROM trade_postmortems WHERE prediction_id IS NOT NULL)
               AND MOD(ABS(HASHTEXT(id::text)), :n) = :i
             ORDER BY scored_at DESC
