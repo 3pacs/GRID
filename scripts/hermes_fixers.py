@@ -2191,6 +2191,14 @@ def _retry_source(
 
         outcome, outcome_rows, outcome_note = _classify_outcome(raw_result)
         result = dict(raw_result) if isinstance(raw_result, dict) else {"status": outcome}
+        if isinstance(raw_result, list) and any(
+            isinstance(item, dict) and item.get("stopped_by_budget") for item in raw_result
+        ):
+            # A per-item list (InstitutionalFlowsPuller) reports its own
+            # cooperative stop on an item. Without this it reads as an
+            # abandoned worker below: no cooldown is recorded and the same
+            # repair starts again on the next cycle.
+            result["stopped_by_budget"] = True
         # Keep failures, unknown counts and no-new-data under the unchanged
         # classifier. A positive result from a rebound writer is not recovery.
         identity_changed = (

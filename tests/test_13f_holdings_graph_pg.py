@@ -203,7 +203,8 @@ def test_pg_no_delta_restatement_and_unreadable_filing_are_negative_controls(pg_
                      dict(y_unchanged), infotable="missing")
     edgar.add(s.CIK_ALPHA, later)
     results = s.run_writer(pg_engine, monkeypatch, edgar, filers)
-    assert results[0]["status"] == "QUARANTINED" and results[0]["curr_snapshot"] == "missing_infotable"
+    assert results[0]["status"] == "NO_DATA" and results[0]["comparison_status"] == "withheld_incomplete"
+    assert results[0]["curr_snapshot"] == "missing_infotable"
     assert not [sid for sid, _p in s.series_rows(pg_engine, "13F:%") if sid.endswith(":CLOSED")]
     final = _layer9_live(monkeypatch, pg_engine)
     assert final["actors"] == []

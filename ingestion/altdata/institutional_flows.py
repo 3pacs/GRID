@@ -38,6 +38,7 @@ import logging
 import math
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -538,6 +539,93 @@ def _aggregate_holdings_by_cusip(
 
 # Request timeout
 _REQUEST_TIMEOUT: int = 30
+# A request started just before the run's deadline still gets this long.
+_MIN_REQUEST_TIMEOUT: float = 1.0
+
+
+class _RunBudget:
+    """The caller's time budget for one run.
+
+    SmartScheduler passes ``should_continue`` and ``deadline_at`` (a
+    ``time.monotonic()`` instant a little inside its own hard timeout) to a
+    puller method that accepts them; the Hermes repair passes
+    ``should_continue``. With neither, the budget never runs out.
+
+    A run that outlives its caller's timeout is not stopped: its thread is
+    abandoned, keeps reading and writing, and the run is logged as a bare
+    TIMEOUT. Checking this budget between items lets the run stop itself and
+    say how far it got.
+    """
+
+    def __init__(
+        self,
+        should_continue: Callable[[], bool] | None = None,
+        deadline_at: float | None = None,
+    ) -> None:
+        self._should_continue = should_continue
+        self._deadline_at = deadline_at
+
+    def spent(self) -> bool:
+        if self._deadline_at is not None and time.monotonic() >= self._deadline_at:
+            return True
+        return self._should_continue is not None and not self._should_continue()
+
+    def request_timeout(self) -> float:
+        """``_REQUEST_TIMEOUT``, cut to what is left before the deadline."""
+        if self._deadline_at is None:
+            return float(_REQUEST_TIMEOUT)
+        left = self._deadline_at - time.monotonic()
+        return max(_MIN_REQUEST_TIMEOUT, min(float(_REQUEST_TIMEOUT), left))
+
+
+def _budget_stop(feature: str, what: str, read: int, total: int, **extra: Any) -> dict[str, Any]:
+    """The result item for a run that stopped itself at its caller's deadline.
+
+    PARTIAL, never SUCCESS: the items after the stop were not read.
+    """
+    return {
+        "feature": feature,
+        "status": "PARTIAL",
+        "stopped_by_budget": True,
+        "rows_inserted": 0,
+        "items_total": total,
+        "items_read": read,
+        "items_not_attempted": total - read,
+        "error": (
+            f"{what} stopped at the run deadline: {read} of {total} read, "
+            f"{total - read} not attempted"
+        ),
+        **extra,
+    }
+
+
+def _from_resume_point(managers: list[tuple[str, str]], resume_cik: str | None) -> list[tuple[str, str]]:
+    """``managers`` starting at ``resume_cik`` and wrapping round to the rest.
+
+    A run that stopped at its deadline leaves the first manager it did not
+    finish as the resume point, so the managers at the end of the list are not
+    starved by a run that is cut short every time.
+    """
+    for i, (cik, _name) in enumerate(managers):
+        if cik == resume_cik:
+            return managers[i:] + managers[:i]
+    return managers
+
+
+def _snapshot_fetch_failure(snap: FilingSnapshot) -> str | None:
+    """``fetch_failed:<kind>`` when a failed fetch is why ``snap`` is incomplete.
+
+    A filing that was read and is incomplete in itself (entry-count mismatch,
+    no cover page, an additive supplement) returns None: reading it again
+    gives the same answer. A failed fetch is this run's failure and the next
+    run may succeed.
+    """
+    reasons = [
+        snap.status,
+        str(snap.evidence.get("classification_reason") or ""),
+        *(str(u.get("reason") or "") for u in snap.evidence.get("unresolved_amendments") or []),
+    ]
+    return next((r for r in reasons if r.startswith("fetch_failed:")), None)
 
 # ── Re-runs write nothing new ────────────────────────────────────────────
 # The change rows used BasePuller._row_exists, whose window is one hour: every
@@ -663,6 +751,15 @@ class InstitutionalFlowsPuller(BasePuller):
         "priority_rank": 15,
     }
 
+    # First manager the last deadline-stopped 13F run did not finish; None
+    # after a run that reached the end of the list. Process-wide, so it is
+    # lost on a restart, which only means the next run starts at the top.
+    _resume_13f_at_cik: str | None = None
+
+    # No budget until a run is given one (each 13F run sets its own on the
+    # instance), so the fetchers work on an instance used outside a run.
+    _budget: _RunBudget = _RunBudget()
+
     def __init__(self, db_engine: Engine) -> None:
         """Initialise the institutional flows puller.
 
@@ -681,6 +778,7 @@ class InstitutionalFlowsPuller(BasePuller):
         self,
         start_date: date,
         end_date: date,
+        budget: _RunBudget | None = None,
     ) -> list[dict[str, Any]]:
         """Compute ETF flow proxies from yfinance daily data.
 
@@ -706,7 +804,16 @@ class InstitutionalFlowsPuller(BasePuller):
         # Need extra history for rolling windows
         fetch_start = start_date - timedelta(days=_FLOW_WINDOW_20D + 10)
 
-        for ticker in ETF_FLOW_TICKERS:
+        for position, ticker in enumerate(ETF_FLOW_TICKERS):
+            if budget is not None and budget.spent():
+                results.append(_budget_stop(
+                    "ETF_FLOW:run_budget", "ETF flows", position, len(ETF_FLOW_TICKERS),
+                ))
+                log.warning(
+                    "ETF flows stopped at the run deadline: {r} of {t} tickers read",
+                    r=position, t=len(ETF_FLOW_TICKERS),
+                )
+                break
             try:
                 log.info("Fetching ETF flow data for {t}", t=ticker)
                 data = yf.download(
@@ -852,7 +959,7 @@ class InstitutionalFlowsPuller(BasePuller):
         url = (
             f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
         )
-        resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
         # Permanent client errors (bad/retired CIK, forbidden) will never
         # recover from a retry — short-circuit and blacklist the CIK for
         # the remainder of this process so we don't re-hit it every cycle.
@@ -981,7 +1088,7 @@ class InstitutionalFlowsPuller(BasePuller):
         """
         base_url = f"{_EDGAR_13F_XML_BASE}/{cik}/{accession.replace('-', '')}"
         try:
-            resp = requests.get(f"{base_url}/index.json", headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+            resp = requests.get(f"{base_url}/index.json", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
             if resp.status_code in (404, 410):
                 return None, "missing_filing_index", None
             resp.raise_for_status()
@@ -990,7 +1097,7 @@ class InstitutionalFlowsPuller(BasePuller):
                 return None, "missing_cover_page", None
             time.sleep(_EDGAR_RATE_DELAY)
             resp = requests.get(f"{base_url}/{_13F_COVER_DOCUMENT}", headers=_EDGAR_HEADERS,
-                                timeout=_REQUEST_TIMEOUT)
+                                timeout=self._budget.request_timeout())
             if resp.status_code in (404, 410):
                 return None, "missing_cover_page", None
             resp.raise_for_status()
@@ -1043,7 +1150,7 @@ class InstitutionalFlowsPuller(BasePuller):
         # First, get the filing index to find the infotable document
         index_url = f"{base_url}/index.json"
         resp = requests.get(
-            index_url, headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT
+            index_url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout()
         )
         resp.raise_for_status()
         index_data = resp.json()
@@ -1067,7 +1174,7 @@ class InstitutionalFlowsPuller(BasePuller):
         # Fetch and parse the infotable XML
         xml_url = f"{base_url}/{infotable_name}"
         resp = requests.get(
-            xml_url, headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT
+            xml_url, headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout()
         )
         resp.raise_for_status()
 
@@ -1112,7 +1219,7 @@ class InstitutionalFlowsPuller(BasePuller):
             return snap("unknown_filing_date_or_accession")
 
         base_url = f"{_EDGAR_13F_XML_BASE}/{cik}/{accession.replace('-', '')}"
-        resp = requests.get(f"{base_url}/index.json", headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+        resp = requests.get(f"{base_url}/index.json", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
         resp.raise_for_status()
         names = [
             str(item.get("name") or "")
@@ -1124,7 +1231,7 @@ class InstitutionalFlowsPuller(BasePuller):
         if cover_name is None:
             return snap("missing_cover_page")
         time.sleep(_EDGAR_RATE_DELAY)
-        resp = requests.get(f"{base_url}/{cover_name}", headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+        resp = requests.get(f"{base_url}/{cover_name}", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
         if resp.status_code in (404, 410):
             return snap("missing_cover_page")
         resp.raise_for_status()
@@ -1171,7 +1278,7 @@ class InstitutionalFlowsPuller(BasePuller):
         value_total: float | None = None
         for name in candidates:
             time.sleep(_EDGAR_RATE_DELAY)
-            resp = requests.get(f"{base_url}/{name}", headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+            resp = requests.get(f"{base_url}/{name}", headers=_EDGAR_HEADERS, timeout=self._budget.request_timeout())
             if resp.status_code in (404, 410):
                 continue
             resp.raise_for_status()
@@ -1498,7 +1605,11 @@ class InstitutionalFlowsPuller(BasePuller):
         )
         return 1
 
-    def _pull_13f_filings(self) -> list[dict[str, Any]]:
+    def _pull_13f_filings(
+        self,
+        should_continue: Callable[[], bool] | None = None,
+        deadline_at: float | None = None,
+    ) -> list[dict[str, Any]]:
         """Pull and process 13F filings for all tracked institutional managers.
 
         For each manager:
@@ -1513,13 +1624,32 @@ class InstitutionalFlowsPuller(BasePuller):
 
         Nothing goes to signal_sources (13F is non-directional).
 
+        The run checks its caller's budget before each manager, after the
+        index read and after both filings are read. Once the budget is spent
+        it stops before writing anything for the manager in hand, appends one
+        ``stopped_by_budget`` PARTIAL item saying how many managers were read,
+        and leaves that manager as the next run's starting point.
+
+        Parameters:
+            should_continue: Returns False once the caller's budget is spent.
+            deadline_at: ``time.monotonic()`` instant of the same budget; it
+                also caps each request's timeout.
+
         Returns:
             List of result dicts per manager.
         """
         results: list[dict[str, Any]] = []
         self._change_row_lock_wait_s = 0.0      # lock-wait budget of this run
+        budget = self._budget = _RunBudget(should_continue, deadline_at)
+        managers = _from_resume_point(
+            list(TOP_13F_FILERS.items()), InstitutionalFlowsPuller._resume_13f_at_cik
+        )
+        stopped_at: int | None = None
 
-        for cik, manager_name in TOP_13F_FILERS.items():
+        for position, (cik, manager_name) in enumerate(managers):
+            if budget.spent():
+                stopped_at = position
+                break
             try:
                 log.info(
                     "Processing 13F for {m} (CIK={c})",
@@ -1533,6 +1663,9 @@ class InstitutionalFlowsPuller(BasePuller):
                     count=2,
                 )
                 time.sleep(_EDGAR_RATE_DELAY)
+                if budget.spent():
+                    stopped_at = position
+                    break
 
                 if len(filings) < 2:
                     log.debug(
@@ -1596,6 +1729,12 @@ class InstitutionalFlowsPuller(BasePuller):
                 time.sleep(_EDGAR_RATE_DELAY)
                 prev_snap = self._read_filing_snapshot(cik, prev_filing)
                 time.sleep(_EDGAR_RATE_DELAY)
+                if budget.spent():
+                    # A read cut short by the deadline is not a finding about
+                    # the filing: no receipt and no change row for this
+                    # manager. The next run starts with it.
+                    stopped_at = position
+                    break
                 # The cover page is authoritative for a period the index omits.
                 curr_report_date = curr_report_date or curr_snap.evidence.get("cover_report_date")
                 prev_report_date = prev_report_date or prev_snap.evidence.get("cover_report_date")
@@ -1637,16 +1776,31 @@ class InstitutionalFlowsPuller(BasePuller):
                     with self.engine.begin() as conn:
                         receipts_inserted = self._insert_receipt(conn, receipt_series, obs_date, receipt,
                                                                  curr_snap)
-                    results.append({
+                    # Both filings read and the withheld receipt stored is a
+                    # finished check with nothing to compare (NO_DATA): the
+                    # same read gives the same answer until the manager files
+                    # again. A side that could not be fetched is a failure of
+                    # this run and says which kind.
+                    fetch_failure = (
+                        _snapshot_fetch_failure(curr_snap) or _snapshot_fetch_failure(prev_snap)
+                    )
+                    withheld = {
                         "feature": f"13F:{cik}",
                         "manager": manager_name,
-                        "status": "QUARANTINED",
+                        "status": "FAILED" if fetch_failure else "NO_DATA",
+                        "comparison_status": "withheld_incomplete",
                         "reason": "incomplete_filing_snapshot",
                         "curr_snapshot": curr_snap.status,
                         "prev_snapshot": prev_snap.status,
                         "rows_inserted": 0,
                         "receipts_inserted": receipts_inserted,
-                    })
+                    }
+                    if fetch_failure:
+                        withheld["error"] = (
+                            f"13F {manager_name} (CIK={cik}): filing not read "
+                            f"({fetch_failure}); comparison withheld"
+                        )
+                    results.append(withheld)
                     continue
                 curr_holdings_list = curr_snap.holdings
                 prev_holdings_list = prev_snap.holdings
@@ -1791,6 +1945,9 @@ class InstitutionalFlowsPuller(BasePuller):
                     "rows_inserted": 0,
                 })
             except requests.HTTPError as http_exc:
+                if budget.spent():
+                    stopped_at = position
+                    break
                 # Permanent HTTP failures (404 / 403) — log once at WARNING,
                 # not ERROR.  Retries are already disabled at the fetcher.
                 log.warning(
@@ -1804,6 +1961,11 @@ class InstitutionalFlowsPuller(BasePuller):
                     "error": str(http_exc),
                 })
             except Exception as exc:
+                if budget.spent():
+                    # A request cut to the time left failed at the deadline:
+                    # not attempted, not a failed manager.
+                    stopped_at = position
+                    break
                 log.opt(exception=True).error(
                     "13F {m} (CIK={c}) failed: {e}",
                     m=manager_name,
@@ -1817,6 +1979,17 @@ class InstitutionalFlowsPuller(BasePuller):
                     "error": str(exc),
                 })
 
+        if stopped_at is None:
+            InstitutionalFlowsPuller._resume_13f_at_cik = None
+        else:
+            next_cik = managers[stopped_at][0]
+            InstitutionalFlowsPuller._resume_13f_at_cik = next_cik
+            stop = _budget_stop(
+                "13F:run_budget", "13F managers", stopped_at, len(managers), next_manager_cik=next_cik,
+            )
+            results.append(stop)
+            log.warning("{e}; the next run starts at CIK={c}", e=stop["error"], c=next_cik)
+
         return results
 
     # ── Main pull orchestrator ─────────────────────────────────────────────
@@ -1825,16 +1998,23 @@ class InstitutionalFlowsPuller(BasePuller):
         self,
         start_date: str | date = "2020-01-01",
         days_back: int = 60,
+        should_continue: Callable[[], bool] | None = None,
+        deadline_at: float | None = None,
     ) -> list[dict[str, Any]]:
         """Pull all institutional flow data (ETF flows + 13F filings).
 
         Parameters:
             start_date: Earliest date for ETF flow computation.
             days_back: Number of days back for incremental ETF flow pulls.
+            should_continue: Returns False once the caller's budget is spent.
+            deadline_at: ``time.monotonic()`` instant of the same budget.
 
         Returns:
-            Combined list of result dicts.
+            Combined list of result dicts. A run that stopped at its budget
+            puts its ``stopped_by_budget`` items first, so the stop is what
+            the run's status names.
         """
+        budget = _RunBudget(should_continue, deadline_at)
         start = (
             date.fromisoformat(start_date)
             if isinstance(start_date, str)
@@ -1861,7 +2041,7 @@ class InstitutionalFlowsPuller(BasePuller):
         # 1. ETF flow proxies (daily)
         log.info("Pulling ETF flow proxies from {s} to {e}", s=start, e=end)
         try:
-            etf_results = self._pull_etf_flows(start, end)
+            etf_results = self._pull_etf_flows(start, end, budget)
             results.extend(etf_results)
         except Exception as exc:
             log.error("ETF flow pull failed: {e}", e=str(exc))
@@ -1874,7 +2054,9 @@ class InstitutionalFlowsPuller(BasePuller):
         # 2. SEC 13F filings (quarterly — always check for new filings)
         log.info("Processing SEC 13F filings for top managers")
         try:
-            filing_results = self._pull_13f_filings()
+            filing_results = self._pull_13f_filings(
+                should_continue=should_continue, deadline_at=deadline_at
+            )
             results.extend(filing_results)
         except Exception as exc:
             log.error("13F filing pull failed: {e}", e=str(exc))
@@ -1884,13 +2066,21 @@ class InstitutionalFlowsPuller(BasePuller):
                 "error": str(exc),
             })
 
+        # Stable: the budget stops move to the front, everything else keeps
+        # its order.
+        results.sort(key=lambda r: not r.get("stopped_by_budget"))
+
         total_inserted = sum(r.get("rows_inserted", 0) for r in results)
         ok = sum(1 for r in results if r.get("status") == "SUCCESS")
+        withheld = sum(1 for r in results if r.get("comparison_status") == "withheld_incomplete")
+        stopped = any(r.get("stopped_by_budget") for r in results)
         log.info(
-            "InstitutionalFlows complete — {ok}/{total} succeeded, "
-            "{ins} total rows inserted",
+            "InstitutionalFlows {state} — {ok}/{total} succeeded, "
+            "{w} comparisons withheld, {ins} total rows inserted",
+            state="stopped at the run deadline" if stopped else "complete",
             ok=ok,
             total=len(results),
+            w=withheld,
             ins=total_inserted,
         )
         return results
@@ -1914,13 +2104,21 @@ class InstitutionalFlowsPuller(BasePuller):
         )
         return self._pull_etf_flows(start, date.today())
 
-    def pull_13f_only(self) -> list[dict[str, Any]]:
+    def pull_13f_only(
+        self,
+        should_continue: Callable[[], bool] | None = None,
+        deadline_at: float | None = None,
+    ) -> list[dict[str, Any]]:
         """Pull only SEC 13F filing data.
+
+        Parameters:
+            should_continue: Returns False once the caller's budget is spent.
+            deadline_at: ``time.monotonic()`` instant of the same budget.
 
         Returns:
             List of result dicts for 13F filings.
         """
-        return self._pull_13f_filings()
+        return self._pull_13f_filings(should_continue=should_continue, deadline_at=deadline_at)
 
 
 if __name__ == "__main__":
