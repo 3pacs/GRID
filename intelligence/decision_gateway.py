@@ -40,11 +40,22 @@ Inputs:
 
 Rule:
   - If provenance.verdict == 'no_trade' → 'no_trade'
-  - Missing/invalid red-team or stress checks → 'no_trade'.
+  - No eligible directional evidence → provenance.verdict is LOW, and the
+    ticket stage refuses as well (the evidence floor, Codex review
+    6032024752, adopted by Anik on 2026-11-24). Eligible evidence needs a
+    signed input from the same decision that agrees with the call, and the
+    ticket stage needs a live report with an explicit, timezone-aware
+    decision instant (Codex HOLD 6032982233); its refusal reason is
+    recorded in stage_errors["trade_ticket"].
+  - Missing/invalid counterfactual stress checks → 'no_trade'.
   - Invalid supplied pattern confidence → 'no_trade'; an explicitly absent
     pattern estimate is optional and never described as agreement.
-  - Any failed orchestration check blocks ticket generation.
-  - If red_team_risk >= 0.8 → 'no_trade' (LLM vetoed)
+  - Any failed quantitative orchestration check blocks ticket generation.
+  - LLM red team is advisory only: its report and epistemic_risk_score remain
+    attached to DecisionResponse, with NO numeric conviction multiplier and
+    NO veto (including when the LLM is offline). An LLM-derived layer may
+    affect conviction only after it passes the same out-of-sample gate as
+    quantitative layers.
   - If stress.robustness_label == 'fragile' AND stress.robustness_score < 0.5
       → downgrade one level (high→medium, medium→low, low→no_trade)
   - If pattern.confidence_signal > 0.0 AND pattern.confidence_signal < 0.3
@@ -88,12 +99,14 @@ def combine_verdict(
     pattern_confidence: float | None,
     stress_label: str | None,
     stress_score: float | None,
-    red_team_risk: float | None,
+    red_team_risk: float | None = None,
 ) -> tuple[str, list[str]]:
     """Apply the unified verdict rule. Returns (final_verdict, reasons)
     where reasons documents every downgrade applied.
 
     Pure function — easy to unit-test and reason about.
+    ``red_team_risk`` is accepted for API compatibility and advisory display
+    only; it never vetoes or scales the verdict.
     """
     reasons: list[str] = []
     verdict = provenance_verdict if provenance_verdict in _VERDICT_ORDER else "no_trade"
@@ -102,23 +115,20 @@ def combine_verdict(
         reasons.append("provenance verdict is no_trade")
         return "no_trade", reasons
 
-    # Missing, malformed and nonfinite checks never count as agreement.
+    # Missing, malformed and nonfinite quantitative checks never count as agreement.
     def valid_probability(value: Any) -> bool:
         return (isinstance(value, (int, float)) and not isinstance(value, bool)
                 and 0.0 <= value <= 1.0 and math.isfinite(value))
 
-    if not valid_probability(red_team_risk):
-        return "no_trade", ["red-team risk missing or invalid"]
+    # LLM red team is advisory only — no numeric multiplier and no veto.
+    # An LLM-derived layer may affect conviction only after it passes the
+    # same out-of-sample gate as quantitative layers.
+    _ = red_team_risk
+
     if stress_label not in ("robust", "moderate", "fragile") or not valid_probability(stress_score):
         return "no_trade", ["counterfactual stress missing or invalid"]
     if pattern_confidence is not None and not valid_probability(pattern_confidence):
         return "no_trade", ["pattern confidence invalid"]
-
-    if red_team_risk >= 0.8:
-        reasons.append(
-            f"LLM red-team vetoed (epistemic_risk={red_team_risk:.2f} >= 0.8)"
-        )
-        return "no_trade", reasons
 
     if (
         stress_label == "fragile"
@@ -265,8 +275,7 @@ def _run_provenance(
 ) -> tuple[Any | None, str | None]:
     if prediction is None:
         return None, "skipped — no prediction"
-    if red_team_risk is None:
-        return None, "skipped — red-team risk unavailable"
+    # Red team is advisory only, so provenance still runs when red_team_risk is None.
     try:
         from intelligence.signal_provenance import build_provenance_report
         return build_provenance_report(
@@ -336,6 +345,15 @@ def _run_trade_ticket(
     if current_price is None or current_price <= 0:
         return None, "current_price missing or non-positive"
     try:
+        # The evidence floor (Codex review 6032024752; Anik, 2026-11-24), the
+        # mandatory decision instant (Codex HOLD 6032982233) and issuance
+        # freshness (Codex HOLD 6033471347): no ticket from a research
+        # report, a bad, future or expired clock, or without eligible
+        # directional evidence (a signed per-family receipt), in any band.
+        from intelligence.signal_provenance import actionable_refusal_reason
+        refusal = actionable_refusal_reason(provenance_report)
+        if refusal is not None:
+            return None, f"{refusal}; no ticket"
         from trading.trade_ticket_generator import generate_ticket
         ticket = generate_ticket(
             provenance_report,
@@ -403,9 +421,14 @@ def should_i_trade(
         red_team_risk,
     )
 
-    if stage_errors:
+    # LLM red team is advisory only — an LLM outage is still recorded in
+    # stage_errors for visibility, but never vetoes a quantitative verdict.
+    # An LLM-derived layer may affect conviction only after it passes the
+    # same out-of-sample gate as quantitative layers.
+    required_errors = {k: v for k, v in stage_errors.items() if k != "red_team"}
+    if required_errors:
         unified_verdict = "no_trade"
-        reasons.append("required check failed: " + ", ".join(sorted(stage_errors)))
+        reasons.append("required check failed: " + ", ".join(sorted(required_errors)))
 
     ticket, err = _run_trade_ticket(
         provenance_report,

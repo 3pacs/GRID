@@ -8,9 +8,15 @@ top contributing signals), this module spins up a lightweight LLM "red team"
 that produces exactly 3 strongest counter-arguments against the prediction,
 grades each counter on severity + plausibility in [0, 1], and returns an
 aggregate ``epistemic_risk_score`` equal to the mean of the top-2 counter
-grades. A high epistemic_risk_score is a signal to the Oracle that it should
-dampen confidence on that prediction (wiring happens in a follow-up commit
-on ``oracle/engine.py``; this module must not import or patch the engine).
+grades.
+
+Advisory only
+-------------
+The prompt receives only prediction metadata (ticker, direction, horizon,
+score, and model weights) — no market data. Its output stays on reports as
+advisory text/fields, with NO numeric conviction multiplier and NO verdict
+veto. An LLM-derived layer may affect conviction only after it passes the
+same out-of-sample gate as quantitative layers.
 
 Rules
 -----
@@ -87,6 +93,10 @@ TOP_K_FOR_RISK: int = 2
 # composite grade. 0.5/0.5 is the neutral default — both axes matter equally.
 SEVERITY_WEIGHT: float = 0.5
 PLAUSIBILITY_WEIGHT: float = 0.5
+
+# Advisory only: an LLM-derived layer may affect conviction only after it
+# passes the same out-of-sample gate as quantitative layers.
+ADVISORY_ONLY: bool = True
 
 
 # ── Data classes ────────────────────────────────────────────────────────────

@@ -632,16 +632,23 @@ def null_hypothesis_penalty(
     engine: Engine,
     *,
     horizon_days: int = 7,
-) -> float:
+) -> float | None:
     """Bare-multiplier shortcut for the live aggregate conviction path.
 
-    ``compute_aggregate_conviction`` can call this without branching —
-    returns ``1.0`` (neutral) on any error so the multiplicative fold
-    stays side-effect-free. All error paths log at ``debug`` only.
+    Returns ``None`` on insufficient history, missing baselines, or any error
+    so provenance reports the layer as unavailable rather than neutral 1.0.
+    All error paths log at ``debug`` only.
     """
     try:
         report = evaluate_null_hypothesis(engine, horizon_days=horizon_days)
+        if report.n_oracle_predictions < MIN_ORACLE_SAMPLES or not report.baselines:
+            log.debug(
+                "null_hypothesis_penalty: unavailable (n={n} < {m})",
+                n=report.n_oracle_predictions,
+                m=MIN_ORACLE_SAMPLES,
+            )
+            return None
         return float(report.penalty_multiplier)
     except Exception as exc:  # noqa: BLE001
         log.debug("null_hypothesis_penalty: unexpected failure: {e}", e=str(exc))
-        return NEUTRAL_PENALTY
+        return None

@@ -12,8 +12,10 @@ from intelligence.freshness_guard import check_freshness
 @pytest.mark.parametrize(
     "risk", [None, float("nan"), float("inf"), -0.1, 1.1, True, "0.1", 10**1000]
 )
-def test_invalid_risk_fails_closed(risk):
-    assert combine_verdict("high", 0.8, "robust", 0.9, risk)[0] == "no_trade"
+def test_advisory_red_team_risk_does_not_veto(risk):
+    # LLM red team is advisory only: missing/unusable risk never vetoes a
+    # quantitative verdict (stress and pattern checks still fail closed).
+    assert combine_verdict("high", 0.8, "robust", 0.9, risk)[0] == "high"
 
 
 @pytest.mark.parametrize(

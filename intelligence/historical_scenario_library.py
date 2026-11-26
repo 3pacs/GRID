@@ -1020,10 +1020,10 @@ def scenario_conviction_multiplier(
     as_of: date,
     horizon_days: int,
     direction: str | None = None,
-) -> float:
-    """Live-path convenience returning just the multiplier.
-
-    Returns 1.0 on any failure — never raises.
+) -> float | None:
+    """Live-path convenience returning just the multiplier, or ``None`` when
+    fewer than ``MIN_MATCHES_FOR_SIGNAL`` analogs match or lookup fails.
+    Never raises.
     """
     try:
         report = find_analogs(
@@ -1032,13 +1032,20 @@ def scenario_conviction_multiplier(
             horizon_days=horizon_days,
             direction=direction,
         )
+        if report.n_matches < MIN_MATCHES_FOR_SIGNAL:
+            log.debug(
+                "historical_scenario_library: insufficient analogs ({n} < {m}); layer unavailable",
+                n=report.n_matches,
+                m=MIN_MATCHES_FOR_SIGNAL,
+            )
+            return None
         return float(report.conviction_multiplier)
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "historical_scenario_library: conviction multiplier failed: {e}",
             e=str(exc),
         )
-        return MULT_NEUTRAL
+        return None
 
 
 def _format_ts(value: Any) -> str:

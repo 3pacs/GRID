@@ -486,7 +486,7 @@ class TestLivePathMultiplier:
         assert isinstance(result, float)
         assert result == ALIGNED_STRONG
 
-    def test_engine_exception_returns_neutral(self):
+    def test_engine_exception_returns_none(self):
         engine = MagicMock()
         with patch(
             "intelligence.money_flow_adapter.build_flow_map",
@@ -495,11 +495,11 @@ class TestLivePathMultiplier:
             result = money_flow_conviction_multiplier(
                 engine, as_of=date(2026, 4, 14), trade_direction="bullish",
             )
-        assert result == NEUTRAL_MULTIPLIER
+        assert result is None
 
-    def test_compute_raises_still_returns_neutral(self):
+    def test_compute_raises_returns_none(self):
         """If compute_money_flow_conviction itself raises (belt-and-braces),
-        the live-path wrapper still returns neutral 1.0."""
+        the live-path wrapper returns None (unavailable)."""
         engine = MagicMock()
         with patch(
             "intelligence.money_flow_adapter.compute_money_flow_conviction",
@@ -508,7 +508,7 @@ class TestLivePathMultiplier:
             result = money_flow_conviction_multiplier(
                 engine, as_of=date(2026, 4, 14), trade_direction="bullish",
             )
-        assert result == NEUTRAL_MULTIPLIER
+        assert result is None
 
     def test_neutral_direction_input(self):
         engine = MagicMock()

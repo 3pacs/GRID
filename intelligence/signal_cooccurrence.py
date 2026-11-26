@@ -580,8 +580,9 @@ def get_stats_for_signal(
 
 def get_lift_multiplier(
     engine: Engine, signal_contributions: dict[str, float]
-) -> float:
-    """Return the aggregated lift multiplier for the firing signals.
+) -> float | None:
+    """Return the aggregated lift multiplier for the firing signals, or
+    ``None`` when the layer has no usable data or fails.
 
     This is the function the decision gateway and
     ``compute_aggregate_conviction`` path should call. It:
@@ -589,22 +590,29 @@ def get_lift_multiplier(
     1. Filters ``signal_contributions`` to the firing set via
        :func:`get_firing_signals`.
     2. Looks up every pair's calibrated stats from the DB, ignoring pairs
-       not updated within ``COOCCURRENCE_MAX_STALE_DAYS``.
-    3. Averages lift across calibrated pairs using
+       not updated within ``COOCCURRENCE_MAX_STALE_DAYS`` or below
+       ``MIN_COOCCURRENCE_SAMPLES``.
+    3. Averages lift across fresh calibrated pairs using
        :func:`compute_pair_lift_multiplier`.
 
-    Returns ``1.0`` on any failure so the caller's conviction math is
-    left untouched when calibration data is missing.
+    Returns ``None`` on any failure, fewer than two firing signals, or when no
+    fresh calibrated pair stats exist, so provenance counts the layer as
+    unavailable instead of silently faking a neutral 1.0.
     """
 
     try:
         firing = get_firing_signals(signal_contributions)
         if len(firing) < 2:
-            return 1.0
+            log.debug(
+                "get_lift_multiplier: fewer than 2 firing signals ({n}); layer unavailable",
+                n=len(firing),
+            )
+            return None
 
         now = datetime.now(timezone.utc)
         stats_lookup: dict[SignalPair, CooccurrenceStats] = {}
         stale = 0
+        uncalibrated = 0
         for a, b in combinations(sorted(firing), 2):
             if a == b:
                 continue
@@ -614,17 +622,22 @@ def get_lift_multiplier(
             if not _is_fresh(stats, now):
                 stale += 1
                 continue
+            if not stats.is_calibrated:
+                uncalibrated += 1
+                continue
             stats_lookup[stats.pair] = stats
-        if stale and not stats_lookup:
+        if not stats_lookup:
             log.debug(
-                "get_lift_multiplier: {n} pair(s) older than {d}d ignored; neutral 1.0",
-                n=stale, d=COOCCURRENCE_MAX_STALE_DAYS,
+                "get_lift_multiplier: no fresh calibrated pair stats "
+                "(stale={s}, uncalibrated={u}, max_age={d}d); layer unavailable",
+                s=stale, u=uncalibrated, d=COOCCURRENCE_MAX_STALE_DAYS,
             )
+            return None
 
         return compute_pair_lift_multiplier(firing, stats_lookup)
     except Exception as exc:
         log.warning("get_lift_multiplier failed: {e}", e=exc)
-        return 1.0
+        return None
 
 
 # ── Bootstrap replay ───────────────────────────────────────────────────────

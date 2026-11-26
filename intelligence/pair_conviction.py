@@ -631,6 +631,31 @@ def _build_pair_leg(
     )
 
 
+def _pair_leg_refusal(long_raw: dict[str, Any], short_raw: dict[str, Any]) -> str | None:
+    """Why the pair must be refused, or None when both legs are actionable.
+
+    Applies ``signal_provenance.actionable_refusal_reason`` to each leg's
+    provenance report, so a pair can never ticket where its legs could not.
+    Fails closed: a missing report, or a gate that cannot be evaluated,
+    refuses the pair.
+    """
+    try:
+        from intelligence.signal_provenance import actionable_refusal_reason  # noqa: WPS433
+    except Exception as exc:  # noqa: BLE001
+        return f"actionable gate unavailable: {exc}"
+    for label, raw in (("long", long_raw), ("short", short_raw)):
+        report = getattr(raw.get("response"), "provenance_report", None)
+        if report is None:
+            return f"{label} leg has no provenance report"
+        try:
+            reason = actionable_refusal_reason(report)
+        except Exception as exc:  # noqa: BLE001
+            return f"{label} leg gate failed: {exc}"
+        if reason is not None:
+            return f"{label} leg refused: {reason}"
+    return None
+
+
 def generate_pair_ticket(
     engine: Any,
     long_ticker: str,
@@ -643,6 +668,9 @@ def generate_pair_ticket(
     Returns ``None`` whenever any disqualifying condition fires:
 
     * either leg's ``_run_leg`` returned an error
+    * either leg's provenance report fails ``actionable_refusal_reason``
+      (no report, research/clockless, expired or future decision, or no
+      eligible signed directional evidence) -- see ``_pair_leg_refusal``
     * either leg's aggregate conviction < ``MIN_LEG_CONVICTION``
     * either leg's stress robustness_label == 'fragile' with score < 0.5
     * the two legs produce a correlated-risk trap (same sector, same dir)
@@ -660,6 +688,18 @@ def generate_pair_ticket(
             return None
         if short_raw.get("error"):
             log.debug("pair_conviction: short leg error: {e}", e=short_raw["error"])
+            return None
+
+        # Actionable gate (#1352 Option B release witness, criterion e): a
+        # pair ticket is an actionable entry point, so each leg's provenance
+        # report must pass the same ``actionable_refusal_reason`` gate the
+        # gateway's own ticket stage applies. A leg with no report, a
+        # research/clockless report, an expired or future decision, or no
+        # eligible signed directional evidence refuses the whole pair --
+        # there is no fallback onto the legs' raw conviction.
+        refusal = _pair_leg_refusal(long_raw, short_raw)
+        if refusal is not None:
+            log.debug("pair_conviction: pair refused: {r}", r=refusal)
             return None
 
         long_conv = float(long_raw.get("conviction", 0.0))

@@ -626,27 +626,27 @@ def test_get_weight_multiplier_is_clamped():
 # ── get_aggregate_weight_multiplier ───────────────────────────────────────
 
 
-def test_aggregate_weight_multiplier_empty_contributions_returns_1():
+def test_aggregate_weight_multiplier_empty_contributions_returns_none():
     engine = FakeEngine()
     ct = ConditionTuple("MID", "NEUTRAL", "NEUTRAL", "NORMAL")
     assert (
         get_aggregate_weight_multiplier(
             engine, signal_contributions={}, condition=ct
         )
-        == 1.0
+        is None
     )
 
 
-def test_aggregate_weight_multiplier_no_calibrated_cells_returns_1():
+def test_aggregate_weight_multiplier_no_calibrated_cells_returns_none():
     engine = FakeEngine()
     ct = ConditionTuple("MID", "NEUTRAL", "NEUTRAL", "NORMAL")
-    # None of these signals have any history, so aggregate should be 1.0
+    # None of these signals have any history, so aggregate is unavailable (None).
     mult = get_aggregate_weight_multiplier(
         engine,
         signal_contributions={"alpha": 0.5, "beta": 0.5},
         condition=ct,
     )
-    assert mult == 1.0
+    assert mult is None
 
 
 def test_aggregate_weight_multiplier_harmonic_mean_two_signals():
@@ -716,7 +716,7 @@ def test_aggregate_weight_multiplier_clamped_to_bounds():
     assert MIN_EDGE_MULTIPLIER <= mult <= MAX_EDGE_MULTIPLIER
 
 
-def test_aggregate_weight_multiplier_db_failure_returns_1():
+def test_aggregate_weight_multiplier_db_failure_returns_none():
     engine = FakeEngine(fail_reads=True)
     ct = ConditionTuple("MID", "NEUTRAL", "NEUTRAL", "NORMAL")
     mult = get_aggregate_weight_multiplier(
@@ -724,7 +724,7 @@ def test_aggregate_weight_multiplier_db_failure_returns_1():
         signal_contributions={"alpha": 0.5, "beta": 0.5},
         condition=ct,
     )
-    assert mult == 1.0
+    assert mult is None
 
 
 # ── rank_signals_by_edge ──────────────────────────────────────────────────

@@ -594,13 +594,22 @@ def memory_lesson_conviction_multiplier(
     fingerprint: dict[str, Any],
     top_k: int = 20,
     require_direction_match: bool = True,
-) -> float:
-    """Conviction multiplier in [0.85, 1.15]; ``memory_lesson_evidence``
-    has the rules and the reason."""
-    return memory_lesson_evidence(
-        engine, fingerprint=fingerprint, top_k=top_k,
-        require_direction_match=require_direction_match,
-    ).multiplier
+) -> float | None:
+    """Conviction multiplier in [0.85, 1.15], or ``None`` when no two-sided
+    lesson record exists or lookup fails; ``memory_lesson_evidence`` has the
+    rules and the reason."""
+    try:
+        ev = memory_lesson_evidence(
+            engine, fingerprint=fingerprint, top_k=top_k,
+            require_direction_match=require_direction_match,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("reasoning_bank: multiplier lookup failed: {e}", e=str(exc))
+        return None
+    if ev.wins < MIN_LESSONS_EACH_SIDE or ev.losses < MIN_LESSONS_EACH_SIDE:
+        log.debug("reasoning_bank: memory_lesson unavailable ({r})", r=ev.reason)
+        return None
+    return float(ev.multiplier)
 
 
 __all__ = [

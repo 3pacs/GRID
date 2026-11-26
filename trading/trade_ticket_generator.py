@@ -48,6 +48,7 @@ from loguru import logger as log
 from intelligence.signal_provenance import (
     SignalEvidence,
     TradeProvenanceReport,
+    actionable_refusal_reason,
 )
 
 
@@ -423,6 +424,11 @@ def generate_ticket(
       - ``aggregate_conviction`` < ``MIN_CONVICTION_FOR_TICKET``
       - ``current_price`` ≤ 0 (no anchor for stops/targets)
       - direction is neither bullish nor bearish
+      - a research report, a decision clock that is not an explicit,
+        timezone-aware instant at or before now, a decision older than
+        ``ISSUANCE_MAX_AGE``, or no eligible directional evidence, which
+        needs a signed per-family receipt that nothing builds yet
+        (``signal_provenance.actionable_refusal_reason``, logged)
       - account_size_usd < 0
 
     Otherwise, returns a ``TradeTicket`` with every SOP field populated.
@@ -451,6 +457,12 @@ def generate_ticket(
 
     direction = (report.direction or "").strip().lower()
     if direction not in (_BULLISH, _BEARISH):
+        return None
+    # The evidence floor (Codex review 6032024752; Anik, 2026-11-24) and the
+    # mandatory decision instant (Codex HOLD 6032982233), whatever the verdict.
+    refusal = actionable_refusal_reason(report)
+    if refusal is not None:
+        log.info("trade_ticket_generator: no ticket for {t}: {r}", t=report.ticker, r=refusal)
         return None
 
     # ── Sizing (computed before risk gate so exposure reflects actual ticket size) ──

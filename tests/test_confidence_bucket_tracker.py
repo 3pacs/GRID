@@ -446,14 +446,14 @@ class TestConvictionMultiplier:
             "last_updated": datetime.now(timezone.utc),
         }
 
-    def test_no_history_returns_neutral(self):
+    def test_no_history_returns_none(self):
         engine = FakeEngine()
         mult = conviction_multiplier_for_bucket(
             engine, confidence=0.80, horizon_days=7,
         )
-        assert mult == MULT_NEUTRAL
+        assert mult is None
 
-    def test_cold_start_below_min_samples_returns_neutral(self):
+    def test_cold_start_below_min_samples_returns_none(self):
         engine = FakeEngine()
         self._populate_bucket(
             engine,
@@ -465,7 +465,7 @@ class TestConvictionMultiplier:
         mult = conviction_multiplier_for_bucket(
             engine, confidence=0.80, horizon_days=7,
         )
-        assert mult == MULT_NEUTRAL
+        assert mult is None
 
     def test_severe_overconfidence_returns_060(self):
         engine = FakeEngine()
@@ -557,12 +557,12 @@ class TestConvictionMultiplier:
         )
         assert mult == MULT_STRONG_UNDERCONF
 
-    def test_db_failure_returns_neutral(self):
+    def test_db_failure_returns_none(self):
         engine = FakeEngine(raise_on_execute=True)
         mult = conviction_multiplier_for_bucket(
             engine, confidence=0.80, horizon_days=7,
         )
-        assert mult == MULT_NEUTRAL
+        assert mult is None
 
 
 # ── rank_buckets_by_calibration ───────────────────────────────────────────

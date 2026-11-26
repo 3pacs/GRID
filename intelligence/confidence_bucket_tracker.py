@@ -490,18 +490,21 @@ def conviction_multiplier_for_bucket(
     *,
     confidence: float,
     horizon_days: int,
-) -> float:
-    """Return the conviction multiplier for ``confidence`` at ``horizon_days``.
+) -> float | None:
+    """Return the conviction multiplier for ``confidence`` at ``horizon_days``,
+    or ``None`` when no calibrated bucket data is available or lookup fails.
 
     Pipeline:
-      1. Resolve the containing bucket. No bucket → 1.0.
-      2. Load its calibration row. No row → 1.0.
-      3. Require is_calibrated (>= MIN_CALIBRATED_SAMPLES). Below it → 1.0.
+      1. Resolve the containing bucket. No bucket → ``None``.
+      2. Load its calibration row. No row / DB error → ``None``.
+      3. Require is_calibrated (>= MIN_CALIBRATED_SAMPLES). Below it → ``None``.
       4. Compute gap = confidence - empirical_hit_rate.
-      5. Map to multiplier via ``_multiplier_from_gap``.
+      5. Map to multiplier via ``_multiplier_from_gap`` (still returns ``1.0``
+         when a calibrated bucket is genuinely within the neutral |gap| <= 0.05
+         band).
 
-    Never raises. Every failure mode returns the neutral 1.0 so callers
-    can multiply without guarding.
+    Never raises. Returns ``None`` on missing/cold-start data or DB failure so
+    provenance reports the layer as unavailable instead of faking coverage.
     """
     try:
         cal = get_bucket_calibration(
@@ -512,10 +515,20 @@ def conviction_multiplier_for_bucket(
             "conviction_multiplier_for_bucket: lookup failed: {e}",
             e=str(exc),
         )
-        return MULT_NEUTRAL
+        return None
 
-    if cal is None or not cal.is_calibrated:
-        return MULT_NEUTRAL
+    if cal is None:
+        log.debug(
+            "conviction_multiplier_for_bucket: no bucket history for conf={c} h={h}; layer unavailable",
+            c=confidence, h=horizon_days,
+        )
+        return None
+    if not cal.is_calibrated:
+        log.debug(
+            "conviction_multiplier_for_bucket: bucket cold-start (n={n} < {m}); layer unavailable",
+            n=cal.n_predictions, m=MIN_CALIBRATED_SAMPLES,
+        )
+        return None
 
     gap = _compute_gap(float(confidence), cal.empirical_hit_rate)
     return _multiplier_from_gap(gap)

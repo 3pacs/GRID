@@ -67,6 +67,7 @@ from features.per_signal_brier import (
 )
 from intelligence.counterfactual_stress import run_stress_test
 from intelligence.signal_provenance import (
+    REPORT_BASIS_RESEARCH,
     CausationChain,
     SignalEvidence,
     TradeProvenanceReport,
@@ -521,7 +522,9 @@ def build_time_frozen_provenance(
     A fully-populated ``TradeProvenanceReport`` whose ``aggregate_conviction``
     and ``verdict`` were computed via the same
     ``compute_aggregate_conviction`` / ``_verdict_from_aggregate`` that the
-    live gateway uses.
+    live gateway uses. It is a research report with no decision clock
+    (``actionable=False``, ``basis="research_no_clock"``): it never tickets,
+    and its stress test is not live parity.
     """
     horizon = _coerce_horizon_days(prediction_row)
     confidence = _coerce_confidence(prediction_row.get("confidence")) or 0.0
@@ -547,14 +550,11 @@ def build_time_frozen_provenance(
             )
         )
 
-    # No fudge-alert lookup in backtest — that's a live DB call. We treat
-    # the historical window as clean (zero alerts) since we can't replay
-    # them with the right freshness cheaply.
-    fudge_alert_count = 0
-
-    # Surface the prediction's stored metadata with safe defaults. The
-    # replayed row's ``signals`` JSONB may carry fragility/disagreement;
-    # default neutral values otherwise.
+    # Surface the prediction's stored metadata for display/advisory fields on
+    # TradeProvenanceReport. Disagreement and fragility are already incorporated
+    # into oracle confidence (not re-penalized in conviction), red team is
+    # advisory only (None when not recorded), and historical fudge alerts are
+    # not replayed.
     signals = prediction_row.get("signals") or {}
     if isinstance(signals, str):
         try:
@@ -566,7 +566,15 @@ def build_time_frozen_provenance(
 
     fragility_multiplier = float(signals.get("fragility_multiplier", 1.0) or 1.0)
     disagreement_score = float(signals.get("disagreement_score", 0.0) or 0.0)
-    red_team_risk = float(signals.get("red_team_epistemic_risk", 0.0) or 0.0)
+    _rt_raw = signals.get("red_team_epistemic_risk")
+    red_team_risk: float | None = None
+    if _rt_raw is not None and not isinstance(_rt_raw, bool):
+        try:
+            _rt_val = float(_rt_raw)
+            if math.isfinite(_rt_val):
+                red_team_risk = _rt_val
+        except (TypeError, ValueError):
+            red_team_risk = None
 
     # EDGE-table multiplier — no-op (returns 1.0) when
     # ``GRID_EDGE_SIGNALS_ENABLED`` is off (or no engine passed), so
@@ -601,10 +609,6 @@ def build_time_frozen_provenance(
 
     aggregate = compute_aggregate_conviction(
         signal_evidence,
-        fragility_multiplier=fragility_multiplier,
-        disagreement_score=disagreement_score,
-        red_team_epistemic_risk=red_team_risk,
-        fudge_alert_count=fudge_alert_count,
         edge_signal_multiplier=edge_signal_multiplier,
     )
     verdict = _verdict_from_aggregate(aggregate, confidence)
@@ -670,6 +674,8 @@ def build_time_frozen_provenance(
         memory_lesson_multiplier=1.0,
         aggregate_conviction=aggregate,
         verdict=verdict,
+        actionable=False,
+        basis=REPORT_BASIS_RESEARCH,
     )
 
 
@@ -1293,7 +1299,8 @@ def walk_forward(
             # Ticket generation happens against the provenance report —
             # we don't care whether it succeeds (we only need verdict +
             # robustness for the aggregation). But we still call it to
-            # ensure the whole stack runs end-to-end.
+            # ensure the whole stack runs end-to-end. The report is
+            # research (no decision clock), so the generator refuses it.
             try:
                 generate_ticket(
                     provenance,

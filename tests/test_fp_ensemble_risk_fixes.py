@@ -27,15 +27,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from features.per_signal_brier import SignalScorecard
+from intelligence import signal_provenance as sp
 from intelligence.liquidity_regime import STATE_CRISIS, LiquidityRegimeResult
 from intelligence.market_implied_prob import (
     MarketImpliedProb,
     options_implied_probability_from_iv,
 )
 from intelligence.signal_provenance import (
+    REPORT_BASIS_LIVE,
     CausationChain,
     SignalEvidence,
+    SignedFamilyReceipt,
     TradeProvenanceReport,
+    actionable_refusal_reason,
 )
 from oracle.risk import (
     CircuitBreaker,
@@ -59,6 +64,9 @@ def _admit_models_and_reset_breaker(monkeypatch):
         "oracle.contrast_distillation.compute_divergence",
         lambda rollouts: 0.0,
     )
+    # Tickets issue one minute after the fixture report's decision, inside
+    # sp.ISSUANCE_MAX_AGE (Codex HOLD 6033471347).
+    monkeypatch.setattr(sp, "_utc_now", lambda: _REPORT_CLOCK + timedelta(minutes=1))
     reset_global_circuit_breaker()
     yield
     reset_global_circuit_breaker()
@@ -145,6 +153,10 @@ def _neutral_context_patches(fci_score: float = 0.0):
     )
 
 
+# A live report's decision instant, after the card's stamp and before now.
+_REPORT_CLOCK = datetime(2026, 11, 21, tzinfo=timezone.utc)
+
+
 def _make_report(
     *,
     direction: str = "bullish",
@@ -167,8 +179,32 @@ def _make_report(
             SignalEvidence(
                 signal_source="sig_0",
                 shapley_weight=0.5,
-                scorecard=None,
+                # Calibrated and stamped, so the evidence floor passes and
+                # the risk-gate refusals below are the risk gate's.
+                scorecard=SignalScorecard(
+                    signal_source="sig_0",
+                    horizon_days=7,
+                    scored_count=50,
+                    running_brier=0.08,
+                    running_ece=0.06,
+                    hit_rate=0.65,
+                    last_updated=datetime(2026, 11, 20, tzinfo=timezone.utc),
+                    is_calibrated=True,
+                    conviction_weight=1.3,
+                ),
                 classification="strong",
+                # Contract: a complete signed per-family receipt from the
+                # report's own decision, in the call's direction (Codex HOLD
+                # 6033471347; nothing in production builds one yet).
+                receipt=SignedFamilyReceipt(
+                    signal_source="sig_0",
+                    direction=direction,
+                    ticker="AAPL",
+                    decision_clock=_REPORT_CLOCK,
+                    consumed_signals=("sig_0:obs-1",),
+                    head_directions=(("head", direction),),
+                    complete_contributing_set=True,
+                ),
             )
         ],
         top_shapley_contributor="sig_0",
@@ -195,6 +231,9 @@ def _make_report(
         money_flow_multiplier=1.0,
         aggregate_conviction=1.30,
         verdict="high",
+        decision_clock=_REPORT_CLOCK.isoformat(),
+        actionable=True,
+        basis=REPORT_BASIS_LIVE,
     )
 
 
@@ -510,6 +549,13 @@ class TestDefect6RiskGatePriceAndFailClosed:
         )
         assert res.passed is False
         assert "exposure" in res.reason.lower()
+
+    def test_fixture_report_clears_the_floor_so_refusals_here_are_the_gates(self):
+        # Round 7: the fixture's contract receipt and its issuance inside
+        # ISSUANCE_MAX_AGE pass the floor, so the refusals below are the
+        # risk gate's own.
+        for direction in ("bullish", "bearish"):
+            assert actionable_refusal_reason(_make_report(direction=direction)) is None
 
     def test_generate_ticket_blocks_when_notional_exceeds_exposure_limit(self):
         # Default max_total_exposure = $50,000. 5% of $1.2M = $60,000 > $50,000.

@@ -136,6 +136,32 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      # #1352 Option B release witness (tests/test_1352_option_b_release_witness.py),
+      # run on its own so this step's log keeps the full per-test report: the
+      # main suite above keeps only its last 300 lines, so it cannot prove each
+      # witness node ID. The release check (check-1352-release.sh pre) reads the
+      # block between the BEGIN/END markers and requires every pinned node ID to
+      # be PASSED at the exact head. Offline: no database, network or LLM.
+      # Fails on any failed or errored test and on any skip/xfail/deselect.
+      - name: Option B release witness (#1352)
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+          WITNESS_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          WITNESS_TESTED_SHA: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          echo "GRID-1352-WITNESS-BEGIN head=${WITNESS_HEAD_SHA} tested=${WITNESS_TESTED_SHA}"
+          python -m pytest tests/test_1352_option_b_release_witness.py \
+            -p no:xdist -p no:cacheprovider -rA -v --tb=short 2>&1 | tee /tmp/grid-1352-witness.txt
+          summary=$(tail -1 /tmp/grid-1352-witness.txt)
+          echo "GRID-1352-WITNESS-END summary=${summary}"
+          if grep -qE '[0-9]+ (skipped|xfailed|xpassed|deselected)' <<<"$summary"; then
+            echo "witness: skipped, xfailed, xpassed or deselected tests are not allowed: $summary"
+            exit 1
+          fi
+
       # 13F holdings observations (intelligence/holdings_observations_13f.py):
       # the real 13F writer -> reader -> deep_graph layer 9 -> served route on
       # PostgreSQL types (JSONB payloads, TIMESTAMPTZ receipts, the window-

@@ -767,7 +767,7 @@ def test_to_dict_roundtrip(patched_pit, feature_id_map):
             assert key in first
 
 
-def test_scenario_conviction_multiplier_returns_one_on_pit_failure(
+def test_scenario_conviction_multiplier_returns_none_on_pit_failure(
     patched_pit, feature_id_map, monkeypatch,
 ):
     query_date = date(2026, 4, 10)
@@ -786,10 +786,10 @@ def test_scenario_conviction_multiplier_returns_one_on_pit_failure(
         as_of=query_date,
         horizon_days=7,
     )
-    assert mult == MULT_NEUTRAL  # 1.0
+    assert mult is None
 
 
-def test_scenario_conviction_multiplier_returns_one_on_engine_failure(
+def test_scenario_conviction_multiplier_returns_none_on_engine_failure(
     patched_pit, feature_id_map,
 ):
     query_date = date(2026, 4, 10)
@@ -804,7 +804,7 @@ def test_scenario_conviction_multiplier_returns_one_on_engine_failure(
         as_of=query_date,
         horizon_days=7,
     )
-    assert mult == MULT_NEUTRAL
+    assert mult is None
 
 
 def test_fallback_feature_resolution(monkeypatch, feature_id_map):

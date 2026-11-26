@@ -541,7 +541,7 @@ class TestSqueezeConvictionLivePath:
         )
         assert mult == 1.00
 
-    def test_returns_one_on_pit_exception(self, monkeypatch):
+    def test_returns_none_on_pit_exception(self, monkeypatch):
         class _ExplodingPIT:
             def __init__(self, engine):
                 pass
@@ -562,7 +562,7 @@ class TestSqueezeConvictionLivePath:
             as_of=date(2026, 4, 1),
             trade_direction="bullish",
         )
-        assert mult == 1.0
+        assert mult is None
 
     def test_live_path_never_raises(self, monkeypatch):
         def _broken_compute(*args, **kwargs):
@@ -575,7 +575,7 @@ class TestSqueezeConvictionLivePath:
             as_of=date(2026, 4, 1),
             trade_direction="bullish",
         )
-        assert mult == 1.0
+        assert mult is None
 
 
 # ---------------------------------------------------------------------------

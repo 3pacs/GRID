@@ -15,14 +15,16 @@ where everything was checked and neutral. These tests pin that:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from features.per_signal_brier import SignalScorecard
 from intelligence import signal_provenance as sp
+from intelligence.signal_convergence_scanner import ConvergenceReport
 from intelligence.signal_provenance import (
     CONVICTION_LAYERS,
+    LAYER_NOT_APPLICABLE,
     MIN_EVIDENCE_COVERAGE_FOR_HIGH,
     MIN_LAYER_COVERAGE_FOR_HIGH,
     SignalEvidence,
@@ -32,6 +34,7 @@ from intelligence.signal_provenance import (
     compute_aggregate_conviction,
     compute_evidence_coverage,
 )
+from tests.test_provenance_stack_defects import _every_family_receipted
 
 
 def _card(source: str, weight: float, calibrated: bool = True) -> SignalScorecard:
@@ -42,7 +45,7 @@ def _card(source: str, weight: float, calibrated: bool = True) -> SignalScorecar
         running_brier=0.1,
         running_ece=0.1,
         hit_rate=0.6,
-        last_updated=datetime.now(timezone.utc),
+        last_updated=datetime.now(timezone.utc) - timedelta(days=1),
         is_calibrated=calibrated,
         conviction_weight=weight,
     )
@@ -64,12 +67,12 @@ class TestLayerCoverage:
     def test_present_layers_are_counted_and_applied(self):
         agg = aggregate_conviction_with_coverage(
             [_strong()],
-            fragility_multiplier=0.5,
-            disagreement_score=0.0,
+            null_hypothesis_penalty_value=0.5,
+            cooccurrence_lift=1.0,
             money_flow_multiplier=1.0,
         )
-        assert agg.layer_coverage["fragility"] is True
-        assert agg.layer_coverage["disagreement"] is True
+        assert agg.layer_coverage["null_hypothesis"] is True
+        assert agg.layer_coverage["cooccurrence"] is True
         assert agg.layer_coverage["money_flow"] is True
         assert agg.layer_coverage["scenario"] is False
         assert agg.layers_present == 3
@@ -87,6 +90,19 @@ class TestLayerCoverage:
         assert compute_aggregate_conviction([_strong()], **kwargs) == (
             aggregate_conviction_with_coverage([_strong()], **kwargs).value
         )
+
+    def test_not_applicable_layers_excluded_from_denominator(self):
+        agg = aggregate_conviction_with_coverage(
+            [_strong()],
+            cooccurrence_lift=1.0,
+            not_applicable=("fudge_alerts", "edge_signal"),
+        )
+        assert agg.layer_coverage["fudge_alerts"] == LAYER_NOT_APPLICABLE
+        assert agg.layer_coverage["edge_signal"] == LAYER_NOT_APPLICABLE
+        assert agg.layer_coverage["cooccurrence"] is True
+        assert agg.layers_present == 1
+        assert agg.layers_total == len(CONVICTION_LAYERS) - 2
+        assert abs(agg.layer_coverage_ratio - (1 / (len(CONVICTION_LAYERS) - 2))) < 1e-9
 
 
 class TestEvidenceCoverage:
@@ -144,16 +160,30 @@ class TestBuildProvenanceReportCoverage:
             horizon=7,
             regime="NEUTRAL",
             fci_regime="EASY",
-            model_votes=[{"model_name": "flow_momentum", "weight": 1.0}],
+            # A signed head vote. Since Codex HOLD 6033471347 it never counts:
+            # _patch_all_layers adds contract receipts so the floor passes.
+            model_votes=[{"model_name": "flow_momentum", "weight": 1.0, "direction": "bullish"}],
             shapley_top_contributor="flow_momentum",
             shapley_top_share=1.0,
             fragility_multiplier=1.0,
             disagreement_score=0.0,
             signals={},
+            as_of=datetime.now(timezone.utc),
         )
 
     def _patch_all_layers(self, stack, *, raise_layers: bool, scorecard):
-        """Make every DB-backed layer either succeed neutrally or raise."""
+        """Make every DB-backed layer either succeed neutrally or raise.
+
+        Every layer is treated as fenced to the decision clock: these tests
+        pin coverage mechanics, and in production only the fenced layers
+        (``CLOCK_FENCED_LAYERS``) count as present.
+        """
+        stack.enter_context(
+            patch.object(sp, "CLOCK_FENCED_LAYERS", frozenset(CONVICTION_LAYERS))
+        )
+        # Contract (round 7): a complete receipt on every row, so the evidence
+        # floor passes and these tests reach the coverage gate.
+        stack.enter_context(_every_family_receipted())
         def _fail(*_a, **_k):
             raise RuntimeError("layer unavailable")
 
@@ -168,12 +198,36 @@ class TestBuildProvenanceReportCoverage:
             "contra_conviction_multiplier",
             "squeeze_conviction_multiplier",
             "arbitrage_conviction_multiplier",
-            "convergence_conviction_multiplier",
             "money_flow_conviction_multiplier",
             "memory_lesson_conviction_multiplier",
         ):
             stack.enter_context(patch.object(sp, name, fn))
-        stack.enter_context(patch.object(sp, "get_scorecard_with_regime_fallback", lambda *_a, **_k: scorecard))
+        if raise_layers:
+            stack.enter_context(
+                patch("intelligence.signal_convergence_scanner.scan_convergence", side_effect=_fail)
+            )
+        else:
+            stack.enter_context(
+                patch(
+                    "intelligence.signal_convergence_scanner.scan_convergence",
+                    return_value=ConvergenceReport(
+                        ticker="NVDA",
+                        as_of="2026-11-21",
+                        window_days=7,
+                        target_direction="bullish",
+                        stream_signals=(),
+                        n_active_streams=2,
+                        n_aligned=2,
+                        n_opposed=0,
+                        convergence_score=0.5,
+                        conviction_multiplier=1.0,
+                        evidence_chain=(),
+                        advisory="neutral",
+                        missing_stream_count=6,
+                    ),
+                )
+            )
+        stack.enter_context(patch.object(sp, "get_scorecard_with_regime_source", lambda *_a, **_k: (scorecard, "regime")))
         stack.enter_context(patch.object(sp, "_recent_fudge_alerts", lambda *_a, **_k: []))
         stack.enter_context(patch.object(sp, "build_condition_tuple", lambda **_k: ("t",)))
 
@@ -184,17 +238,21 @@ class TestBuildProvenanceReportCoverage:
             self._patch_all_layers(stack, raise_layers=True, scorecard=_card("flow_momentum", 1.3))
             report = build_provenance_report(MagicMock(), prediction=self._prediction())
 
-        # Only the prediction-level layers (fragility, disagreement, red_team,
-        # fudge_alerts) could compute; 11 of 15 DB-backed layers failed.
-        assert report.layers_total == len(CONVICTION_LAYERS)
+        # All 11 applicable DB-backed layers failed; NVDA is not shipping-exposed
+        # (fudge_alerts not_applicable) and edge_signal is unwired (not_applicable)
+        # -> 0/11 applicable layers present.
+        assert report.layers_total == len(CONVICTION_LAYERS) - 2
         assert report.layer_coverage["scenario"] is False
-        assert report.layer_coverage["fragility"] is True
+        assert report.layer_coverage["fudge_alerts"] == LAYER_NOT_APPLICABLE
+        assert report.layer_coverage["edge_signal"] == LAYER_NOT_APPLICABLE
+        assert report.layers_present == 0
         assert report.layers_present < report.layers_total * MIN_LAYER_COVERAGE_FOR_HIGH
         assert report.verdict == "low"
         assert "adjuster layers computed" in report.verdict_reason
         # The API-facing multipliers stay numeric; absence is carried by coverage.
         assert report.scenario_multiplier == 1.0
         assert report.to_dict()["layer_coverage"]["scenario"] is False
+        assert report.to_dict()["layer_coverage"]["fudge_alerts"] == LAYER_NOT_APPLICABLE
 
     def test_layers_computed_but_no_scorecards_is_not_high(self):
         from contextlib import ExitStack
@@ -203,9 +261,11 @@ class TestBuildProvenanceReportCoverage:
             self._patch_all_layers(stack, raise_layers=False, scorecard=None)
             report = build_provenance_report(MagicMock(), prediction=self._prediction())
 
-        assert report.layers_present == report.layers_total - 1  # edge_signal is never passed here
+        # NVDA is not shipping-exposed (fudge_alerts not_applicable) and edge_signal
+        # is unwired (not_applicable) -> 11 of 11 applicable layers present.
+        assert report.layers_total == len(CONVICTION_LAYERS) - 2
+        assert report.layers_present == report.layers_total
         assert report.evidence_coverage == 0.0
-        assert report.aggregate_conviction == 1.0  # the "dead dimension" value the 2026-05-17 probe found
         assert report.verdict == "low"
         assert "calibrated" in report.verdict_reason
 

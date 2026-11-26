@@ -6,15 +6,25 @@ no LLM, no DB.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 
+from features.per_signal_brier import SignalScorecard
 from intelligence.decision_gateway import (
     DecisionResponse,
     _downgrade_verdict,
     combine_verdict,
     should_i_trade,
+)
+from intelligence import signal_provenance as sp
+from intelligence.signal_provenance import (
+    REPORT_BASIS_LIVE,
+    SignalEvidence,
+    SignedFamilyReceipt,
+    SignedInput,
 )
 
 
@@ -27,10 +37,10 @@ class TestCombineVerdict:
         assert v == "no_trade"
         assert any("no_trade" in r for r in reasons)
 
-    def test_red_team_veto(self):
-        v, reasons = combine_verdict("high", 0.7, "robust", 0.95, red_team_risk=0.85)
-        assert v == "no_trade"
-        assert any("red-team" in r.lower() for r in reasons)
+    def test_red_team_advisory_only_does_not_veto(self):
+        # LLM red team is advisory only: high risk does not veto the verdict.
+        v, _reasons = combine_verdict("high", 0.7, "robust", 0.95, red_team_risk=0.85)
+        assert v == "high"
 
     def test_fragile_stress_downgrades_one_level(self):
         v, reasons = combine_verdict(
@@ -135,6 +145,17 @@ def _mock_prediction() -> SimpleNamespace:
     )
 
 
+# The mocked live report's decision instant, after its card's stamp.
+_PROVENANCE_CLOCK = datetime(2026, 11, 21, 15, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _issue_just_after_the_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The ticket stage refuses a decision older than sp.ISSUANCE_MAX_AGE
+    # (Codex HOLD 6033471347); these tests issue one minute after it.
+    monkeypatch.setattr(sp, "_utc_now", lambda: _PROVENANCE_CLOCK + timedelta(minutes=1))
+
+
 def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
     obj = SimpleNamespace(
         ticker="NVDA",
@@ -155,7 +176,50 @@ def _mock_provenance(verdict: str = "high") -> SimpleNamespace:
         market_implied_prob=0.78,
         red_team_epistemic_risk=0.0,
         shipping_fudge_alerts=[],
-        signal_evidence=[],
+        # A live report with one calibrated, stamped card and (contract) a
+        # complete signed per-family receipt in the call's direction from
+        # the same decision: the evidence floor passes, so these tests
+        # exercise the stages after it. The head vote alone would not count
+        # (Codex HOLD 6033471347).
+        actionable=True,
+        basis=REPORT_BASIS_LIVE,
+        decision_clock=_PROVENANCE_CLOCK.isoformat(),
+        signal_evidence=[
+            SignalEvidence(
+                signal_source="regime_contrarian",
+                shapley_weight=1.0,
+                scorecard=SignalScorecard(
+                    signal_source="regime_contrarian",
+                    horizon_days=7,
+                    scored_count=50,
+                    running_brier=0.08,
+                    running_ece=0.06,
+                    hit_rate=0.65,
+                    last_updated=datetime(2026, 11, 20, tzinfo=timezone.utc),
+                    is_calibrated=True,
+                    conviction_weight=1.3,
+                ),
+                classification="strong",
+                signed_input=SignedInput(
+                    signal_source="regime_contrarian",
+                    direction="bullish",
+                    ticker="NVDA",
+                    decision_clock=_PROVENANCE_CLOCK,
+                    bullish_weight=1.0,
+                    bearish_weight=0.0,
+                    models=("regime_contrarian",),
+                ),
+                receipt=SignedFamilyReceipt(
+                    signal_source="regime_contrarian",
+                    direction="bullish",
+                    ticker="NVDA",
+                    decision_clock=_PROVENANCE_CLOCK,
+                    consumed_signals=("regime_contrarian:obs-1",),
+                    head_directions=(("regime_contrarian", "bullish"),),
+                    complete_contributing_set=True,
+                ),
+            )
+        ],
         causation=SimpleNamespace(
             lever="earnings",
             flow_direction="open",
@@ -214,12 +278,13 @@ class TestShouldITrade:
         assert response.trade_ticket is ticket
         assert response.stage_errors == {}
 
-    def test_red_team_veto_zeros_verdict(self):
+    def test_red_team_high_risk_advisory_only_keeps_verdict(self):
         engine = MagicMock()
         pred = _mock_prediction()
         prov = _mock_provenance("high")
         pattern = SimpleNamespace(confidence_signal=0.75)
         stress = SimpleNamespace(robustness_label="robust", robustness_score=0.95)
+        ticket = SimpleNamespace(ticker="NVDA", verdict="high")
 
         with patch(
             "oracle.engine.EnsemblePredictor"
@@ -235,6 +300,9 @@ class TestShouldITrade:
         ), patch(
             "intelligence.counterfactual_stress.run_stress_test",
             return_value=stress,
+        ), patch(
+            "trading.trade_ticket_generator.generate_ticket",
+            return_value=ticket,
         ):
             MockPredictor.return_value.predict.return_value = pred
             response = should_i_trade(
@@ -245,9 +313,9 @@ class TestShouldITrade:
                 vol_30d=0.35,
             )
 
-        assert response.unified_verdict == "no_trade"
-        assert response.trade_ticket is None
-        assert any("red-team" in r.lower() for r in response.verdict_reasons)
+        assert response.unified_verdict == "high"
+        assert response.trade_ticket is ticket
+        assert response.red_team_report.epistemic_risk_score == 0.9
 
     def test_prediction_failure_partial_response(self):
         engine = MagicMock()
@@ -485,3 +553,24 @@ class TestShouldITrade:
                 account_size_usd=100000,
             )
         assert response.ticker == "NVDA"
+
+
+class TestMockProvenanceClearsTheFloor:
+    def test_mock_report_clears_the_floor_so_refusals_here_are_the_stages(self) -> None:
+        # Round 7 (Codex HOLD 6033471347): the mocked report's contract
+        # receipt makes its row eligible and it issues inside
+        # ISSUANCE_MAX_AGE; without the receipt, or later, it is refused.
+        report = _mock_provenance()
+        assert sp.actionable_refusal_reason(report) is None
+        (row,) = report.signal_evidence
+        report.signal_evidence = [
+            SignalEvidence(row.signal_source, row.shapley_weight, row.scorecard,
+                           row.classification, signed_input=row.signed_input)
+        ]
+        assert sp.actionable_refusal_reason(report).startswith(
+            sp.NO_ELIGIBLE_DIRECTIONAL_EVIDENCE
+        )
+        late = _PROVENANCE_CLOCK + sp.ISSUANCE_MAX_AGE + timedelta(seconds=1)
+        assert sp.actionable_refusal_reason(_mock_provenance(), now=late).startswith(
+            sp.DECISION_EXPIRED
+        )

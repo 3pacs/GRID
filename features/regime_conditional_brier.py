@@ -90,7 +90,7 @@ from __future__ import annotations
 import math
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -136,6 +136,15 @@ CANONICAL_REGIMES: tuple[str, ...] = (
 # the smallest size where binomial hit-rate variance drops below ~0.16 —
 # the "minimum stratified-calibration sample" rule of thumb.
 MIN_REGIME_SAMPLES: int = 10
+
+# Which table answered a ``get_scorecard_with_regime_source`` lookup.
+# "regime": the regime-conditional row, warm enough to trust.
+# "flat_fallback": a regime was given, but its row was missing or thin, so
+#     the flat per-signal scorecard answered.
+# "flat": no regime was given, so only the flat scorecard was read.
+CALIBRATION_SOURCE_REGIME: str = "regime"
+CALIBRATION_SOURCE_FLAT_FALLBACK: str = "flat_fallback"
+CALIBRATION_SOURCE_FLAT: str = "flat"
 
 
 # ── Table DDL ─────────────────────────────────────────────────────────────
@@ -428,18 +437,54 @@ def get_scorecard_with_regime_fallback(
     Returns ``None`` only when both the regime-specific AND the
     non-regime scorecards are missing — i.e. a genuinely unknown signal.
 
-    This is the function the signal_provenance consumer should call.
-    It does not need to care about the two-table layout.
+    Callers that must tell a regime-specific hit from a flat fallback
+    (signal_provenance counts only regime hits) call
+    ``get_scorecard_with_regime_source`` instead.
     """
-    if regime is None:
-        return get_signal_scorecard(engine, signal_source, horizon_days)
-
-    regime_card = get_regime_conditional_scorecard(
+    return get_scorecard_with_regime_source(
         engine, signal_source, horizon_days, regime
+    )[0]
+
+
+def get_scorecard_with_regime_source(
+    engine: Engine,
+    signal_source: str,
+    horizon_days: int,
+    regime: str | None,
+    *,
+    aliases: Sequence[str] = (),
+) -> tuple[SignalScorecard | None, str | None]:
+    """``get_scorecard_with_regime_fallback`` plus which table answered.
+
+    Same resolution order. Returns ``(card, source)``, where ``source`` is
+    ``CALIBRATION_SOURCE_REGIME`` for a warm regime-conditional row,
+    ``CALIBRATION_SOURCE_FLAT_FALLBACK`` when a regime was given but its row
+    was missing or thin, ``CALIBRATION_SOURCE_FLAT`` when no regime was
+    given, and ``None`` when no scorecard exists (``card`` is then ``None``).
+
+    Key policy. ``aliases`` are other spellings of the same signal (the
+    bootstrap paths write both ``<family>`` and ``feature:<family>``).
+    ``signal_source`` is tried first, then each alias in order, and the
+    regime tier is searched across every key before the flat tier is read
+    at all. So a flat card on an earlier key never hides a warm regime card
+    on a later one, and within a tier the earliest key wins.
+    """
+    keys = list(dict.fromkeys([signal_source, *aliases]))
+    if regime is not None:
+        for key in keys:
+            regime_card = get_regime_conditional_scorecard(
+                engine, key, horizon_days, regime
+            )
+            if regime_card is not None:
+                return regime_card, CALIBRATION_SOURCE_REGIME
+    flat_source = (
+        CALIBRATION_SOURCE_FLAT if regime is None else CALIBRATION_SOURCE_FLAT_FALLBACK
     )
-    if regime_card is not None:
-        return regime_card
-    return get_signal_scorecard(engine, signal_source, horizon_days)
+    for key in keys:
+        card = get_signal_scorecard(engine, key, horizon_days)
+        if card is not None:
+            return card, flat_source
+    return None, None
 
 
 def rank_signals_by_regime(

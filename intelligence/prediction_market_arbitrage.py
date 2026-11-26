@@ -484,11 +484,9 @@ def arbitrage_conviction_multiplier(
     direction: str,
     horizon_days: int,
     oracle_confidence: float,
-) -> float:
-    """Return the conviction multiplier only. Never raises.
-
-    This is the live-path entry point the trading stack calls. On any
-    exception it returns 1.0 and logs the failure.
+) -> float | None:
+    """Return the conviction multiplier only, or ``None`` when no prediction
+    market coverage exists or lookup fails. Never raises.
 
     Parameters:
         engine: SQLAlchemy engine.
@@ -499,8 +497,7 @@ def arbitrage_conviction_multiplier(
         oracle_confidence: Oracle's probability (0..1).
 
     Returns:
-        Float multiplier, typically in [0.95, 1.10]. Always returns 1.0
-        on any unexpected failure.
+        Float multiplier in [0.95, 1.10], or ``None`` when unavailable.
     """
     try:
         report = build_arbitrage_report(
@@ -511,13 +508,19 @@ def arbitrage_conviction_multiplier(
             horizon_days=horizon_days,
             oracle_confidence=oracle_confidence,
         )
+        if report.market_implied_prob is None:
+            log.debug(
+                "arbitrage_conviction_multiplier: no market coverage for {t}; layer unavailable",
+                t=ticker,
+            )
+            return None
         return float(report.conviction_multiplier)
     except Exception as exc:  # pragma: no cover — ultimate safety net
         log.warning(
             "arbitrage_conviction_multiplier neutralised by exception: {e}",
             e=str(exc),
         )
-        return 1.0
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -35,7 +35,7 @@ ALPHA-9 (Shapley fragility multiplier), ALPHA-15 (per-signal Brier).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -45,10 +45,14 @@ from features.per_signal_brier import (
     compute_conviction_weight,
 )
 from intelligence.signal_provenance import (
+    REPORT_BASIS_LIVE,
+    REPORT_BASIS_RESEARCH,
     SignalEvidence,
     TradeProvenanceReport,
     _verdict_from_aggregate,
     compute_aggregate_conviction,
+    decide_verdict,
+    live_decision_clock,
 )
 
 
@@ -140,10 +144,18 @@ class StressTestReport:
     break_count: int
     generated_at: str
     advisory: str
+    # ``live_parity`` is True only when every perturbation of a live report
+    # was re-decided with the live verdict policy (``decide_verdict``). A
+    # research report's stress test uses the pre-floor verdict and is not
+    # live parity.
+    basis: str = REPORT_BASIS_RESEARCH
+    live_parity: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ticker": self.ticker,
+            "basis": self.basis,
+            "live_parity": self.live_parity,
             "original_verdict": self.original_verdict,
             "original_conviction": round(self.original_conviction, 4),
             "perturbations": [p.to_dict() for p in self.perturbations],
@@ -213,6 +225,9 @@ def _stress_verdict_from_aggregate(
     conviction: float,
     confidence: float,
     original_verdict: str,
+    *,
+    report: TradeProvenanceReport | None = None,
+    signal_evidence: list[SignalEvidence] | None = None,
 ) -> str:
     """Return the verdict used for counterfactual break detection.
 
@@ -221,8 +236,30 @@ def _stress_verdict_from_aggregate(
     support after the perturbation? The 1.15 floor is the documented high
     conviction support boundary that provenance plans to restore once the
     calibration substrate is populated again.
+
+    A live report from ``build_provenance_report`` (``actionable``, with an
+    explicit decision instant) was decided by
+    ``signal_provenance.decide_verdict``, so each perturbed
+    ``signal_evidence`` is re-decided by it: same layer coverage, same
+    evidence floor. A research report (walk-forward, call_a_trade) keeps the
+    pre-floor path, labelled as not live parity; it never tickets.
     """
-    verdict = _verdict_from_aggregate(conviction, confidence)
+    clock = live_decision_clock(report) if report is not None else None
+    if clock is not None and signal_evidence is not None:
+        verdict, _ = decide_verdict(
+            conviction,
+            confidence,
+            signal_evidence,
+            direction=report.direction,
+            ticker=report.ticker,
+            decision_clock=clock,
+            layer_coverage_ratio=(
+                report.layers_present / report.layers_total if report.layers_total else 0.0
+            ),
+            layers_advisory=report.layers_advisory,
+        )
+    else:
+        verdict = _verdict_from_aggregate(conviction, confidence)
     if (
         str(original_verdict).lower() == "high"
         and verdict == "high"
@@ -367,7 +404,9 @@ def _swap_signal_evidence(
     scorecard conviction_weight overridden to ``new_weight``.
 
     We rebuild the SignalEvidence (and its inner SignalScorecard) since
-    both are frozen dataclasses. Pure — never mutates the input.
+    both are frozen dataclasses, keeping every other field, the receipt and
+    head vote included: stress perturbs the card's skill, not what the
+    signal said at the decision. Pure — never mutates the input.
     """
     new_list: list[SignalEvidence] = []
     for i, ev in enumerate(evidence_list):
@@ -402,14 +441,7 @@ def _swap_signal_evidence(
                 is_calibrated=old_card.is_calibrated,
                 conviction_weight=new_weight,
             )
-        new_list.append(
-            SignalEvidence(
-                signal_source=ev.signal_source,
-                shapley_weight=ev.shapley_weight,
-                scorecard=new_card,
-                classification=ev.classification,
-            )
-        )
+        new_list.append(replace(ev, scorecard=new_card))
     return new_list
 
 
@@ -423,6 +455,11 @@ def run_stress_test(report: TradeProvenanceReport) -> StressTestReport:
     records the resulting verdict.
     """
     perturbations: list[SignalPerturbation] = []
+    live = live_decision_clock(report) is not None
+    labels = {
+        "basis": REPORT_BASIS_LIVE if live else REPORT_BASIS_RESEARCH,
+        "live_parity": live,
+    }
 
     if not report.signal_evidence:
         # Empty evidence → no perturbations, trivially robust.
@@ -440,18 +477,7 @@ def run_stress_test(report: TradeProvenanceReport) -> StressTestReport:
             advisory="",
         )
         advisory = build_advisory(empty_report, report)
-        return StressTestReport(
-            ticker=empty_report.ticker,
-            original_verdict=empty_report.original_verdict,
-            original_conviction=empty_report.original_conviction,
-            perturbations=empty_report.perturbations,
-            fragility_flags=empty_report.fragility_flags,
-            robustness_score=empty_report.robustness_score,
-            robustness_label=empty_report.robustness_label,
-            break_count=empty_report.break_count,
-            generated_at=empty_report.generated_at,
-            advisory=advisory,
-        )
+        return replace(empty_report, advisory=advisory, **labels)
 
     for idx, ev in enumerate(report.signal_evidence):
         base_brier, base_count = _scorecard_brier_and_count(ev.scorecard)
@@ -472,6 +498,8 @@ def run_stress_test(report: TradeProvenanceReport) -> StressTestReport:
                 new_aggregate,
                 report.confidence,
                 report.verdict,
+                report=report,
+                signal_evidence=swapped,
             )
             perturbations.append(
                 SignalPerturbation(
@@ -504,15 +532,4 @@ def run_stress_test(report: TradeProvenanceReport) -> StressTestReport:
         advisory="",
     )
     advisory = build_advisory(bare, report)
-    return StressTestReport(
-        ticker=bare.ticker,
-        original_verdict=bare.original_verdict,
-        original_conviction=bare.original_conviction,
-        perturbations=bare.perturbations,
-        fragility_flags=bare.fragility_flags,
-        robustness_score=bare.robustness_score,
-        robustness_label=bare.robustness_label,
-        break_count=bare.break_count,
-        generated_at=bare.generated_at,
-        advisory=advisory,
-    )
+    return replace(bare, advisory=advisory, **labels)

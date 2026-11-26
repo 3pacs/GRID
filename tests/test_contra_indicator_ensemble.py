@@ -636,15 +636,15 @@ class TestBuildContraReportIntegration:
 
 class TestContraConvictionMultiplier:
 
-    def test_neutral_report_returns_one(self):
+    def test_empty_registry_returns_none(self):
         as_of = date(2026, 4, 14)
         engine = _make_engine_with_registry({})
         mult = contra_conviction_multiplier(
             engine, as_of=as_of, trade_direction="bullish"
         )
-        assert mult == MULT_NEUTRAL
+        assert mult is None
 
-    def test_engine_exception_returns_one(self, monkeypatch):
+    def test_engine_exception_returns_none(self, monkeypatch):
         as_of = date(2026, 4, 14)
 
         def _boom(*a, **k):
@@ -655,9 +655,9 @@ class TestContraConvictionMultiplier:
         mult = contra_conviction_multiplier(
             engine, as_of=as_of, trade_direction="bullish"
         )
-        assert mult == MULT_NEUTRAL
+        assert mult is None
 
-    def test_pit_exception_returns_one(self, monkeypatch):
+    def test_pit_exception_returns_none(self, monkeypatch):
         as_of = date(2026, 4, 14)
         engine = _make_engine_with_registry(
             raise_exc=RuntimeError("db down"),
@@ -665,7 +665,7 @@ class TestContraConvictionMultiplier:
         mult = contra_conviction_multiplier(
             engine, as_of=as_of, trade_direction="bullish"
         )
-        assert mult == MULT_NEUTRAL
+        assert mult is None
 
     def test_unknown_direction_returns_one(self, monkeypatch):
         as_of = date(2026, 4, 14)

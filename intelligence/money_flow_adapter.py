@@ -337,20 +337,28 @@ def money_flow_conviction_multiplier(
     *,
     as_of: date,
     trade_direction: str,
-) -> float:
-    """Live-path convenience wrapper. Returns 1.0 on any failure. Never raises.
+) -> float | None:
+    """Live-path convenience wrapper. Returns ``None`` when fewer than
+    ``MIN_LAYERS_FOR_SCORING`` layers evaluated or lookup fails. Never raises.
 
     This is the entry point imported by ``intelligence.signal_provenance.
-    build_provenance_report`` — it MUST be cheap, defensive, and silent on
-    failure so the conviction stack can never be broken by a money-flow fault.
+    build_provenance_report`` — it returns ``None`` on missing data or fault
+    so provenance reports the layer as unavailable rather than neutral 1.0.
     """
     try:
         report = compute_money_flow_conviction(
             engine, as_of=as_of, direction=trade_direction,
         )
+        if report.layers_evaluated < MIN_LAYERS_FOR_SCORING:
+            log.debug(
+                "money_flow_adapter: insufficient layers ({n} < {m}); layer unavailable",
+                n=report.layers_evaluated,
+                m=MIN_LAYERS_FOR_SCORING,
+            )
+            return None
         return float(report.conviction_multiplier)
     except Exception as exc:  # noqa: BLE001 — live path, never raise
         log.debug(
             "money_flow_adapter: conviction multiplier lookup failed: {e}", e=str(exc),
         )
-        return NEUTRAL_MULTIPLIER
+        return None
