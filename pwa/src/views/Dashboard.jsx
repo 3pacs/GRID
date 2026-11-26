@@ -398,7 +398,8 @@ export default function Dashboard({ onNavigate }) {
         } catch {
             if (gen === pulseGenRef.current) setPulseRefreshFailed(true);
         } finally {
-            if (gen === pulseGenRef.current) setPulseRefreshing(false);
+            // The POST is over whichever read is newest now; never leave the button disabled.
+            setPulseRefreshing(false);
         }
     }, [applyPulseRead, startPulseRead]);
 

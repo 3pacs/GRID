@@ -196,6 +196,27 @@ describe('Dashboard watchlist loading', () => {
         expect(screen.getByTestId('pulse-empty-note')).not.toHaveTextContent(/failed/i);
     });
 
+    it('re-enables Refresh quotes when a newer read overtook the pending refresh (#959)', async () => {
+        useWebSocket.mockReturnValue({ connected: false, prices: {} });
+        api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false });
+        let finishRefresh;
+        api.refreshWatchlistPrices.mockReturnValue(new Promise(r => { finishRefresh = r; }));
+        const { rerender } = render(<Dashboard onNavigate={vi.fn()} />);
+
+        fireEvent.click(await screen.findByTestId('pulse-refresh'));
+        await waitFor(() => expect(screen.getByTestId('pulse-refresh')).toBeDisabled());
+
+        // A newer background read starts and finishes while the POST is still pending.
+        useWebSocket.mockReturnValue({ connected: true, prices: {} });
+        rerender(<Dashboard onNavigate={vi.fn()} />);
+        await waitFor(() => expect(api.getWatchlistPrices).toHaveBeenCalledTimes(2));
+
+        await act(async () => { finishRefresh({ prices: { SPY: { price: 999, pct_1d: 0.01 } } }); });
+        // The superseded POST result is not applied, but the button must not stay stuck.
+        await waitFor(() => expect(screen.getByTestId('pulse-refresh')).not.toBeDisabled());
+        expect(screen.getByTestId('pulse-refresh')).toHaveTextContent('Refresh quotes');
+    });
+
     it('drops the refresh-failed message once a later quote read succeeds (#959)', async () => {
         useWebSocket.mockReturnValue({ connected: false, prices: {} });
         api.getWatchlistPrices.mockResolvedValue({ prices: {}, fresh: false, cached: false });
