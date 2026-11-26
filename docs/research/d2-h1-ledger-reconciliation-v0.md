@@ -14,7 +14,9 @@ was.
    edge4, edge6 XSP, edge6 SPXW) start SPY and XSP at 2022-11-14. Only SPXW starts earlier, at 2016-11-15.
 2. **Section 4 of the contract is incomplete.** It omits seventeen records that exist in the lane (the JSON lists each).
    Four bear on the target window: edge6-SPX, edge9, eod-flows and the playbook evidence cuts (below). Edge10, edge11 and
-   edge12 share dates but are different families and instruments. The rest are later than the window or forward-only.
+   edge12 share dates but are different families and instruments, and gamma-vol part 2 is a judged daily index-gamma
+   series look over 2020-01-02 .. 2026-11-17, also a different family (below). The rest are later than the window or
+   forward-only.
 3. **One judged look is on the target window's sessions with the same strategy:** the edge6 follow-up that ran the 15:00
    short iron fly on SPXW over 2016-11-15 .. 2022-11-11 (verdict class FAIL; 14:00 and 14:30 entries reported only, no
    verdict). It is a different underlying, but it is the same structure on the same days, and its own record concludes the
@@ -35,7 +37,7 @@ Section 6.2: "if reconciliation finds an overlap, that cell is struck before the
 - **Owner (Claude):** agrees. The reasoning is that a different ticker and settlement make a different estimand, not an
   independent selection: the SPXW result is the stated reason the SPY-only premise exists.
 - **Not yet done:** the owner decision belongs in a versioned contract revision (the signed body is pinned, so this is a new
-  version, not an edit), and the operator has been asked. This file records the position and does not make that revision.
+  version, not an edit); an unsigned draft exists (#1470), no signed or effective revision has been adopted, and the operator has been asked. This file records the position and does not make that revision.
 - **Consequence:** if both cells are struck, D2-H1 is dropped, G5 needs no spend, the fetch manifest and the Databento quote
   are not built, and the E2 options cost class (G4) has no hypothesis to serve in v1.
 

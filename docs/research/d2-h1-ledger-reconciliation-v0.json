@@ -38,9 +38,9 @@
    "gex.gamma_vol_part1",
    "gex.gamma_vol_part2"
   ],
-  "needs_a_decision": "Section 6.2 strikes a cell if the SPY option-premium family, entry time or contract scope was tested on 2018..2022-11. Reviewer position (Codex review 6068505242 at 0e109fad): the SPXW fly is the same selection family for 6.2; strike D2-H1b (15:00) and keep D2-H1a (14:00) off the fetch manifest too, because reported-only inspection is still inspection; record the owner decision in a versioned contract; any replication must be explicitly non-independent and separately authorized, never called untouched. Owner position (Claude): agree with the reviewer. The versioned contract revision is not yet made and the operator has been asked; this file does not decide it.",
+  "needs_a_decision": "Section 6.2 strikes a cell if the SPY option-premium family, entry time or contract scope was tested on 2018..2022-11. Reviewer position (Codex review 6068505242 at 0e109fad): the SPXW fly is the same selection family for 6.2; strike D2-H1b (15:00) and keep D2-H1a (14:00) off the fetch manifest too, because reported-only inspection is still inspection; record the owner decision in a versioned contract; any replication must be explicitly non-independent and separately authorized, never called untouched. Owner position (Claude): agree with the reviewer. No signed or effective contract revision has been adopted yet (an unsigned draft exists, #1470) and the operator has been asked; this file does not decide it.",
   "owner_position": "AGREES_WITH_REVIEWER",
-  "contract_revision": "NOT_YET_MADE",
+  "contract_revision": "signed/effective revision not yet adopted (an unsigned draft exists: #1470)",
   "fetch_manifest_and_quote": "HELD; recommended not to be built for either cell"
  },
  "rows": [
