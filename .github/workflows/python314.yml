@@ -3,7 +3,8 @@ name: Python 3.14
 # The 2026-11 runtime upgrade (Anik, 2026-11-04: "lets get it to 3.14"). Production grid-api / grid-hermes still run
 # /usr/bin/python3.10 until the cutover; this job proves the whole backend suite on CPython 3.14 with the requirements
 # as they resolve there (numpy/scipy/matplotlib move to their first 3.14-wheeled releases), against the same ephemeral
-# PostgreSQL 15 and with the same commands as GRID Tests' Backend Tests job. It does not replace that job.
+# PostgreSQL 15 and with the same pytest command as GRID Tests' Backend Tests suite shards. It does not replace them.
+# It runs the whole suite in one job (no GRID_TEST_SHARD), under the same xdist units (tests/ci_scheduling.py).
 
 on:
   push:
