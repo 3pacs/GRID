@@ -4,7 +4,7 @@ The property that matters most: the shards partition the suite. Every
 collected test runs in exactly one shard, so splitting the run can never drop
 or repeat a test. The rest pins the xdist units (database tests serialised,
 spread files split, everything else by file), the dispatch order and the
-GRID Tests workflow wiring that relies on them.
+GRID Tests and Python 3.14 workflow wiring that relies on them.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from tests import conftest
 
 REPO = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
+PY314_WORKFLOW = REPO / ".github" / "workflows" / "python314.yml"
 
 
 @pytest.fixture(autouse=True)
@@ -517,8 +518,11 @@ def workflow() -> dict[str, Any]:
     return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
 
 
-def test_suite_matrix_covers_every_shard_once(workflow: dict[str, Any]) -> None:
-    job = workflow["jobs"]["backend-tests-suite"]
+def _assert_sharded_suite(workflow: dict[str, Any], suite: str, gate_job: str, artifact: str) -> None:
+    """The suite job's matrix, its GRID_TEST_SHARD and the gate job's `verify --shards` agree,
+    every shard uploads its manifest and the gate verifies all of them, and each shard runs
+    the whole tests/ tree under GRID's xdist units, unfiltered."""
+    job = workflow["jobs"][suite]
     shards = job["strategy"]["matrix"]["shard"]
     assert shards == list(range(1, len(shards) + 1)) and len(shards) >= 2
     assert job["strategy"]["fail-fast"] is False
@@ -529,17 +533,17 @@ def test_suite_matrix_covers_every_shard_once(workflow: dict[str, Any]) -> None:
     assert upload["uses"].startswith("actions/upload-artifact@")
     assert upload["if"] == "always()"
     assert upload["with"] == {
-        "name": "backend-suite-manifest-${{ matrix.shard }}", "path": manifest_dir,
+        "name": f"{artifact}-${{{{ matrix.shard }}}}", "path": manifest_dir,
         "if-no-files-found": "error", "retention-days": 7,
     }
-    gate = workflow["jobs"]["backend-tests"]["steps"]
+    gate = workflow["jobs"][gate_job]["steps"]
     download = next(step for step in gate if step.get("name") == "Download suite shard manifests")
     assert download["uses"].startswith("actions/download-artifact@")
-    assert download["with"]["pattern"] == "backend-suite-manifest-*"
+    assert download["with"]["pattern"] == f"{artifact}-*"
     verify = next(step for step in gate if step.get("name") == "Suite shards ran every collected test exactly once")
     assert verify["run"] == (
         f"python -m tests.ci_scheduling verify --shards {len(shards)} "
-        f"{download['with']['path']}/backend-suite-manifest-*"
+        f"{download['with']['path']}/{artifact}-*"
     )
     names = [step.get("name") or step.get("uses") for step in gate]
     assert names.index("Download suite shard manifests") < names.index("Suite shards ran every collected test exactly once")
@@ -549,6 +553,10 @@ def test_suite_matrix_covers_every_shard_once(workflow: dict[str, Any]) -> None:
     options = run["run"].replace("python -m pytest", "python_m_pytest")
     narrowing = re.findall(r"\s(-k|-m|--deselect|--ignore(?:-glob)?|--lf|--last-failed|--sw|--stepwise)\b", options)
     assert not narrowing, narrowing
+
+
+def test_suite_matrix_covers_every_shard_once(workflow: dict[str, Any]) -> None:
+    _assert_sharded_suite(workflow, "backend-tests-suite", "backend-tests", "backend-suite-manifest")
 
 
 def test_backend_tests_fails_unless_every_suite_shard_passed(workflow: dict[str, Any]) -> None:
@@ -565,3 +573,62 @@ def test_backend_tests_fails_unless_every_suite_shard_passed(workflow: dict[str,
     names = [step.get("name") for step in job["steps"]]
     assert "Run tests" not in names
     assert "Option B release witness (#1352)" in names
+
+
+# --------------------------------------------------------------------------
+# Python 3.14 workflow wiring
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def py314_workflow() -> dict[str, Any]:
+    return yaml.safe_load(PY314_WORKFLOW.read_text(encoding="utf-8"))
+
+
+def test_py314_suite_matrix_covers_every_shard_once(py314_workflow: dict[str, Any]) -> None:
+    _assert_sharded_suite(py314_workflow, "backend-tests-py314-suite", "backend-tests-py314", "py314-suite-manifest")
+    job = py314_workflow["jobs"]["backend-tests-py314-suite"]
+    # always hosted: each shard needs its own VM and its own ephemeral Postgres
+    assert job["runs-on"] == "ubuntu-latest"
+    setup = next(step for step in job["steps"] if step.get("name") == "Set up Python")
+    assert setup["with"]["python-version"] == "3.14"
+    # the same suite command as GRID Tests' shards: a drift between the two would make one of them prove less
+    def pytest_command(steps: list[dict[str, Any]]) -> str:
+        script = next(step for step in steps if step.get("name") == "Run tests")["run"]
+        lines = script.splitlines()
+        first = next(i for i, line in enumerate(lines) if "python -m pytest tests/ -v --tb=short --maxfail" in line)
+        command = []
+        for line in lines[first:]:
+            command.append(line.strip().rstrip("\\").strip())
+            if not line.rstrip().endswith("\\"):
+                break
+        return " ".join(part for part in command if not part.startswith(">"))
+
+    grid_tests = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["backend-tests-suite"]["steps"]
+    assert pytest_command(job["steps"]) == pytest_command(grid_tests)
+
+
+def test_backend_tests_py314_fails_unless_every_suite_shard_passed(py314_workflow: dict[str, Any]) -> None:
+    jobs = py314_workflow["jobs"]
+    job = jobs["backend-tests-py314"]
+    # the #1352 release check pins this exact check name to python314.yml / backend-tests-py314
+    assert job["name"] == "Backend Tests (Python 3.14)"
+    assert "strategy" not in job   # one check run under that name, not a matrix of them
+    assert job["needs"] == "backend-tests-py314-suite"
+    # runs (and fails) when a shard failed, but not when the run was cancelled
+    assert job["if"] == "${{ !cancelled() }}"
+    assert job["runs-on"] == "ubuntu-latest"
+    steps = job["steps"]
+    # the tested checkout first (that check's workflow guard binds the job to it), then the gate
+    assert steps[0]["uses"].startswith("actions/checkout@") and "with" not in steps[0] and "if" not in steps[0]
+    gate = steps[1]
+    assert gate["name"] == "Python 3.14 suite shards passed"
+    assert "if" not in gate
+    assert gate["env"]["SUITE_RESULT"] == "${{ needs.backend-tests-py314-suite.result }}"
+    assert '[ "$SUITE_RESULT" != "success" ]' in gate["run"] and "exit 1" in gate["run"]
+    # the manifests land in a fresh directory of this job, never a fixed path a runner could keep
+    download = next(step for step in steps if step.get("name") == "Download suite shard manifests")
+    assert download["with"]["path"].startswith("${{ runner.temp }}/")
+    # the suite no longer runs here, and nothing else in the workflow runs it unsharded
+    assert "Run tests" not in [step.get("name") for step in steps]
+    assert set(jobs) == {"backend-tests-py314-suite", "backend-tests-py314"}

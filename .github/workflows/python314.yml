@@ -1,10 +1,10 @@
 name: Python 3.14
 
 # The 2026-11 runtime upgrade (Anik, 2026-11-04: "lets get it to 3.14"). Production grid-api / grid-hermes still run
-# /usr/bin/python3.10 until the cutover; this job proves the whole backend suite on CPython 3.14 with the requirements
-# as they resolve there (numpy/scipy/matplotlib move to their first 3.14-wheeled releases), against the same ephemeral
-# PostgreSQL 15 and with the same pytest command as GRID Tests' Backend Tests suite shards. It does not replace them.
-# It runs the whole suite in one job (no GRID_TEST_SHARD), under the same xdist units (tests/ci_scheduling.py).
+# /usr/bin/python3.10 until the cutover; this workflow proves the whole backend suite on CPython 3.14 with the
+# requirements as they resolve there (numpy/scipy/matplotlib move to their first 3.14-wheeled releases), against the
+# same ephemeral PostgreSQL 15 and with the same pytest command as GRID Tests' Backend Tests suite shards. It does not
+# replace them.
 
 on:
   push:
@@ -17,10 +17,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  backend-tests-py314:
-    name: Backend Tests (Python 3.14)
+  # The suite, split into whole-file shards that run at the same time, each on its own hosted runner with its own
+  # ephemeral Postgres, exactly as GRID Tests splits its Backend Tests suite (test.yml, backend-tests-suite). Run in one
+  # 4-vCPU ubuntu-latest job it took 15-25.6 min (median ~20) against a 30-minute timeout on 2026-11-24..26.
+  # tests/ci_scheduling.py assigns each test file to one shard from the checked-out tree and orders the xdist units
+  # inside each shard; every shard uploads a manifest of the node ids it collected and ran, and the "Backend Tests
+  # (Python 3.14)" job below fails unless together they ran every collected test exactly once. To add a shard, change
+  # the matrix, the /2 in GRID_TEST_SHARD and `verify --shards 2` together (tests/test_ci_scheduling.py checks they
+  # agree). Always hosted: each shard needs its own VM and its own Postgres.
+  backend-tests-py314-suite:
+    name: Backend Tests (Python 3.14) suite (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      # every shard reports its own failures; one failing must not cancel the other
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+
     steps:
       - uses: actions/checkout@v7
 
@@ -58,7 +72,12 @@ jobs:
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
+          # This job's share of the suite (tests/ci_scheduling.py): whole files, every collected file in exactly one shard.
+          GRID_TEST_SHARD: ${{ matrix.shard }}/2
+          # shard.txt, collected.txt (before the shard filter), executed.txt
+          GRID_TEST_MANIFEST_DIR: ${{ runner.temp }}/py314-suite-manifest
         run: |
+          echo "shard ${GRID_TEST_SHARD} on $(nproc) vCPU: $(lscpu | sed -n 's/^Model name: *//p')"
           set +e
           python -m pytest tests/ --co -q > /tmp/grid-pytest-collection.txt 2>/tmp/grid-pytest-collection.err
           collection_status=$?
@@ -74,10 +93,80 @@ jobs:
           set +e
           python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 \
             -n auto --dist loadgroup --durations=25 \
+            --junitxml=/tmp/grid-junit.xml -o junit_family=xunit1 \
             > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
           echo "::group::pytest output (tail -300)"
           tail -300 /tmp/grid-pytest-output.txt
           echo "::endgroup::"
+
+          # Where this shard's time went, per file (setup + call + teardown, summed over workers). Diagnostic only: it
+          # can never fail the step. Feeds HEAVY_SECONDS in tests/ci_scheduling.py.
+          echo "::group::test time by file (Python 3.14 shard ${GRID_TEST_SHARD}, top 40)"
+          python - /tmp/grid-junit.xml <<'PY' || echo "no junit summary"
+          import collections, sys, xml.etree.ElementTree as ET
+          seconds, tests = collections.Counter(), collections.Counter()
+          for case in ET.parse(sys.argv[1]).iter("testcase"):
+              seconds[case.get("file") or "?"] += float(case.get("time") or 0)
+              tests[case.get("file") or "?"] += 1
+          print(f"{sum(tests.values())} tests, {sum(seconds.values()):.0f} s of test time in {len(tests)} files")
+          for name, s in seconds.most_common(40):
+              print(f"{s:8.1f} s {tests[name]:6d} tests  {name}")
+          PY
+          echo "::endgroup::"
           exit "$pytest_status"
+
+      - name: Upload shard manifest
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: py314-suite-manifest-${{ matrix.shard }}
+          path: ${{ runner.temp }}/py314-suite-manifest
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Stop ephemeral Postgres
+        if: always()
+        run: docker rm -f grid-test-pg 2>/dev/null || true
+
+  # Keeps the "Backend Tests (Python 3.14)" check name and this job id, which the #1352 release check
+  # (check-1352-release.sh in the vault) pins as a required check and maps to python314.yml/backend-tests-py314. It runs
+  # after every shard and fails unless all of them passed and their manifests show each collected test ran exactly once.
+  # The checkout stays the first step (that check's workflow guard binds each required job to its tested checkout).
+  backend-tests-py314:
+    name: Backend Tests (Python 3.14)
+    needs: backend-tests-py314-suite
+    # a failed shard still runs this job (so the check fails, not skips); a cancelled run does not
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Python 3.14 suite shards passed
+        env:
+          SUITE_RESULT: ${{ needs.backend-tests-py314-suite.result }}
+        run: |
+          if [ "$SUITE_RESULT" != "success" ]; then
+            echo "::error::Backend Tests (Python 3.14) suite shards did not all pass (result: $SUITE_RESULT)"
+            exit 1
+          fi
+          echo "every Backend Tests (Python 3.14) suite shard passed"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      # Proof, not assumption, that the shards partitioned the suite: every shard ran, all collected the same node ids,
+      # none ran twice, none was missed (tests/ci_scheduling.py, verify_manifests). Standard library only. A fresh
+      # directory under this job's runner.temp, so nothing left on the runner can join the manifests.
+      - name: Download suite shard manifests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: py314-suite-manifest-*
+          path: ${{ runner.temp }}/py314-suite-manifests
+
+      - name: Suite shards ran every collected test exactly once
+        run: python -m tests.ci_scheduling verify --shards 2 ${{ runner.temp }}/py314-suite-manifests/py314-suite-manifest-*
