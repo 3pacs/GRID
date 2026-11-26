@@ -203,7 +203,8 @@ def test_pg_no_delta_restatement_and_unreadable_filing_are_negative_controls(pg_
                      dict(y_unchanged), infotable="missing")
     edgar.add(s.CIK_ALPHA, later)
     results = s.run_writer(pg_engine, monkeypatch, edgar, filers)
-    assert results[0]["status"] == "QUARANTINED" and results[0]["curr_snapshot"] == "missing_infotable"
+    assert results[0]["status"] == "NO_DATA" and results[0]["comparison_status"] == "withheld_incomplete"
+    assert results[0]["curr_snapshot"] == "missing_infotable"
     assert not [sid for sid, _p in s.series_rows(pg_engine, "13F:%") if sid.endswith(":CLOSED")]
     final = _layer9_live(monkeypatch, pg_engine)
     assert final["actors"] == []
@@ -399,7 +400,12 @@ def test_two_overlapping_writers_add_each_change_row_once(pg_engine, monkeypatch
 
     def write(name: str) -> None:
         try:
-            results[name] = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
+            # The inner pass, under the per-manager lock only. Since GRID #1492
+            # the public entry points take a whole-pass run lock first, so a
+            # second writer skips before it reaches this lock
+            # (tests/test_etf_flows_single_writer_20261126.py); this keeps the
+            # inner guard proved for any overlap that gets past the run lock.
+            results[name] = inst.InstitutionalFlowsPuller(pg_engine)._pull_13f_managers()
         except BaseException as exc:  # noqa: BLE001 -- surfaced below
             errors.append(exc)
 
@@ -541,7 +547,12 @@ def test_overlapping_writers_with_different_payloads_store_both_in_commit_order(
 
     def write(name: str) -> None:
         try:
-            results[name] = inst.InstitutionalFlowsPuller(pg_engine).pull_13f_only()
+            # The inner pass, under the per-manager lock only. Since GRID #1492
+            # the public entry points take a whole-pass run lock first, so a
+            # second writer skips before it reaches this lock
+            # (tests/test_etf_flows_single_writer_20261126.py); this keeps the
+            # inner guard proved for any overlap that gets past the run lock.
+            results[name] = inst.InstitutionalFlowsPuller(pg_engine)._pull_13f_managers()
         except BaseException as exc:  # noqa: BLE001 -- surfaced below
             errors.append(exc)
 

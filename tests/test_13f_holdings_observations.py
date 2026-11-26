@@ -591,6 +591,12 @@ _DEFECT_STATUS = {
 }
 
 
+def _withheld_run_status(defect: str) -> str:
+    """The run status of a withheld pair: NO_DATA when both sides were read in
+    full, FAILED when a document could not be fetched or did not parse."""
+    return "FAILED" if "malformed" in defect or "503" in defect else "NO_DATA"
+
+
 def _defective(filing: s.Filing, defect: str) -> s.Filing:
     if defect.startswith("cover_"):
         filing.cover = defect.split("_", 1)[1]
@@ -622,7 +628,11 @@ def test_an_unreadable_current_filing_closes_nothing_and_claims_nothing(engine, 
     results = s.run_writer(engine, monkeypatch, edgar, filers)
     assert not [sid for sid, _p in s.series_rows(engine, "13F:%") if sid.endswith(":CLOSED")]  # no false CLOSED
     assert _change_rows(engine, dates[0][1]) == []
-    assert results[0]["status"] == "QUARANTINED" and results[0]["curr_snapshot"] == _DEFECT_STATUS[defect]
+    # Read in full, not comparable: a finished check. A document that did
+    # not parse is not a finding about the filing: a failed manager.
+    assert results[0]["status"] == _withheld_run_status(defect)
+    assert results[0]["comparison_status"] == "withheld_incomplete"
+    assert results[0]["curr_snapshot"] == _DEFECT_STATUS[defect]
     receipt = _receipt(engine, "A-0")
     assert receipt["comparison_status"] == "withheld_incomplete"
     assert receipt["curr_snapshot"]["status"] == _DEFECT_STATUS[defect]
@@ -650,7 +660,9 @@ def test_an_unreadable_prior_filing_opens_nothing_and_claims_nothing(engine, mon
 
     results = s.run_writer(engine, monkeypatch, edgar, {s.CIK_ALPHA: s.ALPHA})
     assert s.series_rows(engine, "13F:%") == []  # no false NEW (or anything else)
-    assert results[0]["status"] == "QUARANTINED" and results[0]["prev_snapshot"] == _DEFECT_STATUS[defect]
+    assert results[0]["status"] == _withheld_run_status(defect)
+    assert results[0]["comparison_status"] == "withheld_incomplete"
+    assert results[0]["prev_snapshot"] == _DEFECT_STATUS[defect]
     receipt = _receipt(engine, "A-0")
     assert receipt["comparison_status"] == "withheld_incomplete"
     assert receipt["prev_snapshot"]["status"] == _DEFECT_STATUS[defect]
@@ -790,7 +802,11 @@ def test_an_unclassifiable_newer_amendment_reads_as_unknown_not_as_the_original(
     results = s.run_writer(engine, monkeypatch, edgar, filers)
 
     assert _served_layer9(served)["actors"] == []  # not silently the original
-    assert results[0]["status"] == "QUARANTINED" and results[0]["curr_snapshot"] == "unclassified_amendment"
+    # A cover that could not be fetched or did not parse is this run's
+    # failure; one that was read and does not classify the amendment is a
+    # finished check.
+    assert results[0]["status"] == _withheld_run_status(defect)
+    assert results[0]["curr_snapshot"] == "unclassified_amendment"
     receipt = _receipt(engine, "A-0A")
     assert receipt["comparison_status"] == "withheld_incomplete"
     assert receipt["curr_snapshot"]["classification_reason"]
@@ -833,7 +849,7 @@ def test_a_failed_read_of_a_known_newer_filing_is_recorded_until_recovery(
     s.set_receipt(engine, dates[0][1], failed_at)
 
     expected = "timeout" if failure == "timeout" else f"http_{failure}"
-    assert results[0]["status"] == "QUARANTINED"
+    assert results[0]["status"] == "FAILED" and f"fetch_failed:{expected}" in results[0]["error"]
     assert results[0]["curr_snapshot" if side == "current" else "prev_snapshot"] == f"fetch_failed:{expected}"
     assert _change_rows(engine, dates[0][1]) == []
     receipt = _receipt(engine, "A-0")
@@ -929,7 +945,7 @@ def test_an_undated_amendment_with_no_recoverable_quarter_withholds_the_current_
     edgar.today = date.today()
     results = s.run_writer(engine, monkeypatch, edgar, filers)
     assert _served_layer9(served)["actors"] == []
-    assert results[0]["status"] == "QUARANTINED"
+    assert results[0]["status"] == _withheld_run_status(defect)
     assert results[0]["curr_snapshot"] == "unresolved_undated_amendment"
     receipt = _receipt(engine, "A-0")
     assert receipt["comparison_status"] == "withheld_incomplete"

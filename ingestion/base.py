@@ -260,6 +260,7 @@ def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     backoff: float = DEFAULT_RETRY_BACKOFF,
     retryable_exceptions: tuple = (ConnectionError, TimeoutError, OSError),
+    before_sleep: Any = None,
 ):
     """Decorator for retrying API calls with exponential backoff and jitter.
 
@@ -275,6 +276,12 @@ def retry_on_failure(
         max_attempts: Maximum number of attempts.
         backoff: Base backoff in seconds (multiplied by attempt number).
         retryable_exceptions: Tuple of exception types to retry on.
+        before_sleep: Optional ``(instance, delay_seconds)`` callable, called
+            before each wait between attempts with the first positional
+            argument of the decorated call (``self`` for a method). It may
+            raise to refuse the wait, for example because it would pass the
+            caller's deadline; that exception ends the retries. None (the
+            default) changes nothing.
     """
     import functools
     import random
@@ -314,6 +321,8 @@ def retry_on_failure(
                         else:
                             # Exponential backoff with jitter to avoid thundering herd
                             delay = backoff * attempt + random.uniform(0, backoff * 0.5)
+                        if before_sleep is not None:
+                            before_sleep(args[0] if args else None, delay)
                         log.warning(
                             "{f} attempt {a}/{m} failed: {e} — retrying in {d:.1f}s",
                             f=func.__name__,
