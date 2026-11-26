@@ -46,7 +46,7 @@ BODY_END = "<!-- D0-CONTRACT-BODY-END -->"
 
 #: sha256 of the owner-signed contract body (revision 6, signed 2026-11-14). Any edit to the
 #: body is a new contract version and needs a new pin; it is never edited to match a changed body.
-D0_CONTRACT_BODY_SHA256 = "7643c1e096d8c75567598d16ebf077a246e862c0c922a8f674e82574e2681285"
+D0_CONTRACT_BODY_SHA256 = "9bcb00213bc2bfef0f0dcfecc3e0bcc3ef698a1f84ef8a6ab203bde2ff899665"
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")

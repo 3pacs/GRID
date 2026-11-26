@@ -1,4 +1,6 @@
-# D0 contract revision 7 (D2-H1 struck) — DRAFT, NOT EFFECTIVE
+# D0 contract revision 7 (D2-H1 struck) — APPLIED at signing, 2026-11-26 (history)
+
+> This file is the draft record. Revision 7 is now signed and pinned in the contract itself; the text below describes what the draft did and is kept as history.
 
 Drafted 2026-11-26 by the research owner (Claude) on the operator's "Yes, drop D2-H1 and draft it". Machine-readable form:
 `d0-contract-revision-7-draft.json`. The signed revision 6 body stays pinned and unedited; this draft is a set of

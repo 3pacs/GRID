@@ -11,9 +11,9 @@
     "named_at": "2026-11-12",
     "signed": true,
     "signature": {
-      "date": "2026-11-14",
-      "operator_go": "Yes, sign and pin",
-      "after_review": "Codex ACCEPT of 5e7c34aa (draft source-review PASS)",
+      "date": "2026-11-26",
+      "operator_go": "Sign and pin revision 7",
+      "after_review": "Codex scoped ACCEPT of the revision 7 draft at b35d7928 (not authorization to sign; the operator's go followed)",
       "pinned_in": "analysis/d0_manifest.py D0_CONTRACT_BODY_SHA256",
       "admits_nothing": true
     }
@@ -31,8 +31,8 @@
       "artifact_sha256_prefix": "86b4f33edd3ece33"
     }
   },
-  "signed_at": "2026-11-14",
-  "contract_body_sha256": "7643c1e096d8c75567598d16ebf077a246e862c0c922a8f674e82574e2681285",
+  "signed_at": "2026-11-26",
+  "contract_body_sha256": "9bcb00213bc2bfef0f0dcfecc3e0bcc3ef698a1f84ef8a6ab203bde2ff899665",
   "admission_status_values": [
     "ADMITTED",
     "CANDIDATE_UNREVIEWED",
@@ -1087,7 +1087,7 @@
       "n_floor": 300,
       "one_sided_level": 0.975,
       "look": "one",
-      "status": "BLOCKED: G14,G4,G5",
+      "status": "STRUCK: revision 7 (the SPXW 15:00 fly was judged on the same sessions; same selection family); never fetched, never looked at, cannot be admitted",
       "joint_rule": "D2-H1 PASS requires D2-H1a and D2-H1b both PASS; each cell's mean positive in a majority of calendar years"
     },
     {
@@ -1103,7 +1103,7 @@
       "n_floor": 300,
       "one_sided_level": 0.975,
       "look": "one",
-      "status": "BLOCKED: G14,G4,G5",
+      "status": "STRUCK: revision 7 (the SPXW 15:00 fly was judged on the same sessions; same selection family); never fetched, never looked at, cannot be admitted",
       "joint_rule": "D2-H1 PASS requires D2-H1a and D2-H1b both PASS; each cell's mean positive in a majority of calendar years"
     },
     {
@@ -1202,7 +1202,7 @@
       "status": "open; owner Claude, reviewer Codex; D1 holdout unopened, historical runs DIAGNOSTIC_ONLY"
     }
   ],
-  "revision": 6,
+  "revision": 7,
   "revised_at": "2026-11-14",
   "admission_rule": "ADMITTED requires: contract signed and body hash pinned, reviewer signed, measured missingness, a first-availability receipt (not an assertion), durable visibility not UNPROVEN where clock 4 applies, and a file or query receipt. analysis/d0_manifest.py currently checks draft labels only and refuses all ADMITTED labels until an authenticated admission verifier exists. An input label is never a hypothesis admission."
 }

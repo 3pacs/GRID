@@ -103,9 +103,11 @@ VERIFIER_ACCEPTED = False
 #: required inputs, floors, level, window, coverage scope and blocking gaps from here, never
 #: from the manifest. ``tests/test_d0_admission.py`` checks each number against the body text.
 #: Input ids not yet in the manifest (``sec.edgar.8k_acceptance``, ``tiingo.eod_incl_delisted``,
-#: the D2-H1 holdout fetches, ``ledger.fly_shadow_1.fly_days``) are refused as unknown
+#: ``ledger.fly_shadow_1.fly_days``) are refused as unknown
 #: dependencies until they are registered with receipts. Any edit here is a reviewed code
 #: change and needs a new :data:`FROZEN_SPEC_SHA256`.
+#: Revision 7 (2026-11-26) struck D2-H1a and D2-H1b: they are no longer supported hypotheses, so an
+#: ADMITTED row for either is refused (contract §6.2, §10.6).
 FROZEN_SPEC: dict[str, Any] = {
     "schema": "d0-frozen-admission-spec/1",
     "hypotheses": {
@@ -138,34 +140,6 @@ FROZEN_SPEC: dict[str, Any] = {
                                 "universe.liquid_us_equity_pit"],
             "blocking_gaps": ["G15", "G2", "G3"],
             "judged_historical_d1": True,
-        },
-        "D2-H1a": {
-            "basis": "contract §6.2 (OPRA cbbo-1m plus SPY 1-minute bars, 2018-01-02 .. 2022-11-11), §6.4, §9 G4 G5",
-            "track": "D2",
-            "window": {"holdout": ["2018-01-02", "2022-11-11"]},
-            "scope": "holdout",
-            "one_sided_level": 0.975,
-            "n_floor": 300,
-            "coverage_unit": "sessions",
-            "cells": [],
-            "cell_floors": {},
-            "required_inputs": ["research.opra.cbbo_1m.SPY_0dte_d2h1_holdout", "research.spy_1min.d2h1_holdout"],
-            "blocking_gaps": ["G4", "G5"],
-            "judged_historical_d1": False,
-        },
-        "D2-H1b": {
-            "basis": "contract §6.2 (OPRA cbbo-1m plus SPY 1-minute bars, 2018-01-02 .. 2022-11-11), §6.4, §9 G4 G5",
-            "track": "D2",
-            "window": {"holdout": ["2018-01-02", "2022-11-11"]},
-            "scope": "holdout",
-            "one_sided_level": 0.975,
-            "n_floor": 300,
-            "coverage_unit": "sessions",
-            "cells": [],
-            "cell_floors": {},
-            "required_inputs": ["research.opra.cbbo_1m.SPY_0dte_d2h1_holdout", "research.spy_1min.d2h1_holdout"],
-            "blocking_gaps": ["G4", "G5"],
-            "judged_historical_d1": False,
         },
         "D2-H2": {
             "basis": "contract §6.2 (live Schwab chain, ledger fly_days, forward from 2026-11-12), §6.4",
@@ -211,7 +185,7 @@ FROZEN_SPEC: dict[str, Any] = {
 }
 
 #: sha256 of :func:`canonical` (:data:`FROZEN_SPEC`). Refused at runtime if it does not match.
-FROZEN_SPEC_SHA256 = "dc09f57d01c886f60ff16fc1609ec56bd71558b4630c5d0f05f715b61ec857d0"
+FROZEN_SPEC_SHA256 = "36b533e953f948be420759b5082dd0243da43ab56fffd8a2bef32cc21e1b4c30"
 
 COVERAGE_RECEIPT_SCHEMA = "d0-coverage-receipt/1"
 GAP_CLOSURE_SCHEMA = "d0-gap-closure/1"

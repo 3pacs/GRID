@@ -1,20 +1,20 @@
-# D0 research contract — event scanner (D1) and SPY volatility lab (D2), v0 (owner-signed 2026-11-14)
+# D0 research contract — event scanner (D1) and SPY volatility lab (D2), v0 (revision 7 owner-signed 2026-11-26)
 
 <!-- D0-CONTRACT-BODY-BEGIN -->
 
 | Field | Value |
 |---|---|
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
-| Version | `d0-contract-v0`, **revision 6** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2; revision 5 answers the reviewer's re-checks of 88768412 and 217d9c91, §10.3; revision 6 makes historical D1 results diagnostic-only, §10.4) — **signed by the research owner 2026-11-14** (§10.5). The reviewer has not signed the admission manifest, and nothing is admitted |
+| Version | `d0-contract-v0`, **revision 7** (revision 7: D2-H1 struck, §10.6; revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2; revision 5 answers the reviewer's re-checks of 88768412 and 217d9c91, §10.3; revision 6 makes historical D1 results diagnostic-only, §10.4) — **revision 7 signed by the research owner 2026-11-26** (§10.6); revision 6 was signed 2026-11-14 (§10.5) and is superseded. The reviewer has not signed the admission manifest, and nothing is admitted |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
-| Research owner (signs) | **Claude** (named by the operator 2026-11-12). **Signed 2026-11-14** on the operator's "Yes, sign and pin", after the reviewer accepted revision 6 at `5e7c34aa`. The body hash is pinned as `D0_CONTRACT_BODY_SHA256` in `analysis/d0_manifest.py`, checked by a test |
+| Research owner (signs) | **Claude** (named by the operator 2026-11-12). **Revision 6 was signed 2026-11-14** (superseded) on the operator's "Yes, sign and pin", after the reviewer accepted revision 6 at `5e7c34aa`. **Revision 7 signed 2026-11-26** on the operator's "Sign and pin revision 7", after the reviewer's scoped ACCEPT of the draft at `b35d7928`. The body hash is pinned as `D0_CONTRACT_BODY_SHA256` in `analysis/d0_manifest.py`, checked by a test |
 | Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1); revision 4 adds one D2 rule (§10.2). Re-checks of `88768412` (2026-11-13) and `217d9c91` (2026-11-14): **REQUEST_CHANGES**; revision 5 answers both (§10.3). Re-check of `222e9083` (2026-11-14): **REQUEST_CHANGES** on historical availability only; revision 6 answers it (§10.4). Re-check of `5e7c34aa` (2026-11-14): **ACCEPT**, draft source-review PASS. That is not a signature, admission, holdout access, merge or release |
 | Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
 
-**Status of every number in this file: frozen for `d0-contract-v0`.** The research owner signed this body
-on 2026-11-14 and its hash is pinned, so any edit to the body fails the pin test. A change is a new
+**Status of every number in this file: frozen for `d0-contract-v0`.** The research owner signed revision 7 of this body on 2026-11-26
+(revision 6 was signed 2026-11-14 and is superseded) and revision 7's hash is pinned, so any edit to the body fails the pin test. A change is a new
 contract version with a new pin, recorded before any outcome is read; after an outcome is read it also
 needs fresh evidence, never a free retry. Signing freezes the rules. It admits nothing: admission still
 needs the reviewer's signature, the G14 verifier and §8 for each hypothesis.
@@ -132,7 +132,7 @@ An input enters a decision only if all six are known; otherwise it is `EXCLUDED_
 | Polygon `/v3/snapshot/options` | — | 403, puller SKIPPED | — | unavailable |
 | SPY 1-min bars, Polygon | offline research copy (GEX repo scratch) | rolling ~2 yr (2024-11 ..) | bar end | inspected (§4); not GRID custody |
 | SPY 1-min bars, XNAS.ITCH | offline research copy | 2022-11 .. 2026-11 | bar end | inspected (§4) |
-| OPRA cbbo-1m, near-spot 0DTE strikes | offline research copy | 2022-11-14 .. 2026-11-09 fetched; vendor history from 2013 | quote in force at minute end | inspected 2022-11-14 .. 2026-11-09. Pre-2022-11 not fetched by this lane: a **candidate** replication window, not untouched by assertion (§6.2, G5) |
+| OPRA cbbo-1m, near-spot 0DTE strikes | offline research copy | 2022-11-14 .. 2026-11-09 fetched; vendor history from 2013 | quote in force at minute end | inspected 2022-11-14 .. 2026-11-09. Pre-2022-11 not fetched by this lane. In revision 7 it is not a candidate replication window for the 0DTE short iron fly family (spent by the SPXW look, §4); any future replication is a separate, separately authorised, non-independent registration (§6.5). Other families are not presumed untouched (§4) |
 | OPRA open interest (statistics, stat_type 9) | offline research copy | 2022-11-14 .. 2026-03-25 rebuilt books | published ~06:30 ET from the prior close (PIT-safe) | inspected |
 | SPY trades with aggressor side (XNAS.ITCH) | offline research copy | 2022-11 .. 2026-11 | trade time | dev 2024-11 .. 2026-11 inspected for edge8; 2022-11 .. 2024-11 unread for edge8 only |
 | Tiingo SPY adjusted daily | GRID key; offline copy for edge3 | 1993 .. | daily | inspected for calendar rules 1993 .. 2026-11-10 |
@@ -178,9 +178,15 @@ A family may not be tested again on a window listed here; a revisit is a new reg
 | GEX edge8 (dev only, 73ffc1d) | trade-flow turn markers | dev 2024-11 .. 2026-11 | not yet registered | #1133 |
 | #1065 v1–v6 | ETF rotation / trend / vol-managed / mean reversion / inverse-vol / regime top-3 | weekly 2017-01 .. 2026-10 (v6 also Kenneth French 1926 .. 2026) | FAIL ×6; 492 trials | #1065 |
 | #647 gex-levels-v1 | SPY GEX levels | forward from its registration | interim only | #647 |
+| GEX edge6 follow-up: SPX (fb0c73b, 3fbba8d, 059876a) | the 15:00 short iron fly on SPXW; 14:00 and 14:30 entries reported only | sample A 2016-11-15 .. 2022-11-11 and sample B 2022-11-14 .. 2026-11-09 | FAIL on both samples | revision 7, G5 reconciliation |
+| GEX edge9 | analog library of SPY intraday moments (price paths, no option premium) | burn-in 2018-05-01 .. 2018-12-31; holdout trades 2019-01-02 .. 2022-11-11; development 2022-11-14 .. 2024-11-08 | look result exists | revision 7, G5 reconciliation |
+| GEX eod-flows and playbook evidence cuts | SPY and QQQ late-day follow; decision-minute to close SPY moves (exploratory) | 2018-05-01 .. 2026-11-10 | exploratory, no verdict | revision 7, G5 reconciliation |
+| GEX edge10, edge11, edge12 | equity cross-section families (daily; no SPY option data) | edge10 holdout 2018-06-01 .. 2022-12-30; edge11 2018-08 .. 2026-11; edge12 dev 2010-01-04 .. 2022-12-29, holdout 2022-12-30 .. 2026-11-12 | see their records | revision 7, G5 reconciliation |
+| GEX gamma-vol, part 1 | dealer gamma against next-session volatility (exploratory regression and ladder look); outside the target window, no SPY option premium before 2022-11-14 | option data: the trailing free year only (first fetched session 2025-11-19, through 2026-11-09); regression sessions 2022-11-14 .. 2026-11-09 | exploratory, no verdict | revision 7, G5 reconciliation |
+| GEX gamma-vol, part 2 | a long daily index-gamma series against volatility over the next 1, 5 and 21 sessions (judged). It overlaps the target window by date only: a daily-series family, not option premium | fit through 2019-12-31; check 2020-01-02 .. 2026-11-17 | see its record | revision 7, G5 reconciliation |
 
 Consequence for D2: **no untouched historical intraday SPY 0DTE window exists from 2022-11-14 onward.**
-Untouched options history exists before 2022-11-14 (OPRA from 2013), where SPY had Monday/Wednesday/Friday
+Revision 7: that window is spent for the 0DTE short iron fly family (2016-11-15 .. 2022-11-11 was judged on SPXW, rows above). No other family is presumed untouched: each needs a family-specific reconciliation against this ledger before any fetch, without opening a protected reservation (edge3's daily-SPY holdout, the insider reservations). Options history exists before 2022-11-14 (OPRA from 2013), where SPY had Monday/Wednesday/Friday
 expiries rather than daily ones.
 
 Equity and event looks already run or reserved:
@@ -418,22 +424,22 @@ under an append-only table with accession as key. Compute small.
 - **Separate questions, scored separately:** (a) forecast quality of a volatility measure (diagnostic);
   (b) after-cost tradability of a fixed structure (economic). A pass on (a) never implies (b).
 
-### 6.2 Hypotheses: D2-H1 has two cells; D2-H2 and D2-H3 are adopted unchanged
+### 6.2 Hypotheses: D2-H1 is struck (revision 7); D2-H2 and D2-H3 are adopted unchanged
 
 | ID | Hypothesis and exact estimand | Data | Window | Look |
 |---|---|---|---|---|
-| D2-H1a / D2-H1b | edge6 replication at **14:00** (H1a) and **15:00** (H1b) ET, two separate cells. Short ATM iron butterfly exactly as edge6 (registered cb7b213), with K = the strike nearest spot that has both a call and a put quote. **Entry:** sell the K call and K put at their bids and buy the K+5 call and K−5 put at their asks, at the quote mark T (§6.3); spot = the close of the 1-minute bar ending at T. **Exit: a synthetic intrinsic-payoff proxy, not settlement.** Each leg is valued at its intrinsic value at S, the close of SPY's 15:59 1-minute bar (the edge6 formula, `vrp_edge6.py` at 35fa182); no early exit. SPY options are American-style and physically settled, so this proxy makes no claim about exercise, assignment, after-hours moves or the official expiry value. **Fees, bound to edge6:** $0.0003 per share per leg, which is $0.03 per contract at the 100-share multiplier, charged on the four entry legs only and never at the proxy exit (edge6 protocol cb7b213: "Fees 0.0003 per share per leg"; code `FEE = 0.0003`, net = credit − payoff − 4 × FEE). Net in dollars per share; risk per trade = 5 − credit, per share. | OPRA cbbo-1m plus SPY 1-minute bars, not yet fetched | Monday/Wednesday/Friday SPY expiry days 2018-01-02 .. 2022-11-11. The exact start, contract list and strike/target scope are fixed in a fetch manifest **before** the fetch | one look per cell after the fetch manifest is hashed |
+| D2-H1a / D2-H1b (**STRUCK in revision 7: never fetched, never looked at, kept as history**) | edge6 replication at **14:00** (H1a) and **15:00** (H1b) ET, two separate cells. Short ATM iron butterfly exactly as edge6 (registered cb7b213), with K = the strike nearest spot that has both a call and a put quote. **Entry:** sell the K call and K put at their bids and buy the K+5 call and K−5 put at their asks, at the quote mark T (§6.3); spot = the close of the 1-minute bar ending at T. **Exit: a synthetic intrinsic-payoff proxy, not settlement.** Each leg is valued at its intrinsic value at S, the close of SPY's 15:59 1-minute bar (the edge6 formula, `vrp_edge6.py` at 35fa182); no early exit. SPY options are American-style and physically settled, so this proxy makes no claim about exercise, assignment, after-hours moves or the official expiry value. **Fees, bound to edge6:** $0.0003 per share per leg, which is $0.03 per contract at the 100-share multiplier, charged on the four entry legs only and never at the proxy exit (edge6 protocol cb7b213: "Fees 0.0003 per share per leg"; code `FEE = 0.0003`, net = credit − payoff − 4 × FEE). Net in dollars per share; risk per trade = 5 − credit, per share. | OPRA cbbo-1m plus SPY 1-minute bars, not yet fetched | Monday/Wednesday/Friday SPY expiry days 2018-01-02 .. 2022-11-11. The exact start, contract list and strike/target scope are fixed in a fetch manifest **before** the fetch | one look per cell after the fetch manifest is hashed |
 | D2-H2 | fly-shadow/1 forward: the 15:00 fly **exited at 15:55** (shorts bought back at the ask, wings sold at the bid) | live Schwab chain, ledger `fly_days` | forward from 2026-11-12 | one look at 100 traded sessions. Registered fe8318a; adopted **unchanged**, including its own test and level |
 | D2-H3 | bounce-shadow/1 forward: long SPY 15:29 → 15:59 after a negative-gamma late-day bounce | live dte0 regime plus bars | forward from 2026-11-12 | one look at 50 qualifying sessions. Registered f8b3874; adopted unchanged. **Not independent of history:** chosen after edge7 P3 (short the same bounce, −0.391, n 83) was read |
 
 **The estimands differ:**
-- **D2-H1** is graded on the synthetic payoff proxy and is historical.
+- **D2-H1** (struck in revision 7; history) was to be graded on the synthetic payoff proxy, historically.
 - **D2-H2** exits at 15:55 and runs forward.
 
-A D2-H1 pass does not show that the 15:55 exit earns the same, and a D2-H2 pass does not replicate the
-proxy result. The only comparison D0 makes is the GO rule in §6.5, frozen here before either look.
+A D2-H2 pass does not replicate the proxy result that the struck D2-H1 would have measured, and no replication exists in revision 7. D0 makes no cross-hypothesis comparison: GO is not reachable (§6.5).
 
-**Pre-2022 window, before fetching (G5):**
+**Pre-2022 window (G5), outcome in revision 7.** The ledger reconciliation (`d2-h1-ledger-reconciliation-v0`, scoped-accepted by the reviewer at `bf47da50`) found that the 15:00 short iron fly was already judged on SPXW over 2016-11-15 .. 2022-11-11, with the 14:00 and 14:30 entries reported. The reviewer's position (review 6068505242) and the owner's are the same: that is the same selection family, a different underlying is a different estimand and not an independent selection, and reported-only inspection is still inspection. Both cells are therefore struck, and neither goes on a fetch manifest. The pre-fetch conditions below are history, not rules:
+<!-- D2-H1-HISTORY-BEGIN -->
 - **Reconcile the full inspection ledger.** This covers GEX edge1–edge8, #647, VS1, #1065 and the daily-SPY
   calendar looks in §4. The aim is to confirm that no SPY option-premium family, entry time or contract scope
   has been tested on 2018 .. 2022-11.
@@ -444,6 +450,7 @@ proxy result. The only comparison D0 makes is the GO rule in §6.5, frozen here 
 
 **Excluded entry times:** 09:35 (edge6 FAIL) and 12:00 (edge6 PASS, but not chosen) are not tested, and are
 counted in the selection disclosure in §6.4.
+<!-- D2-H1-HISTORY-END -->
 
 Diagnostic only (no pass/fail, cannot promote): realised-vs-implied variance by time of day on GRID's own
 `options_capture_batches` once it reaches 120 sessions.
@@ -461,11 +468,11 @@ intraday rule on 2022-11 .. 2026-11.
   Otherwise the session is `EXCLUDED_INPUT` for that cell.
 - **Size:** one contract per leg, full fill at the quoted price. Displayed size and partial fills are not
   modelled.
-- **D2-H1 (replication):** fills at mark T, exactly as edge6.
-  - Spot and quotes share the mark, so each fill is labelled **MODELED_BBO_SAME_MARK**.
-  - A conservative sensitivity, reported and not judged, fills at the quote in force at T + 1 minute.
+<!-- D2-H1-HISTORY-BEGIN -->
+- **D2-H1 (struck in revision 7; history, no live rule):** was to fill at mark T, exactly as edge6, labelled MODELED_BBO_SAME_MARK, with a T + 1 minute sensitivity.
+<!-- D2-H1-HISTORY-END -->
 - **D2-H2:** keeps fe8318a's registered fills.
-- **Fees:** D2-H1 uses the edge6 fee in §6.2: $0.0003 per share per leg, entry legs only. D2-H2 keeps fe8318a's registered fees and units. No mid fills in any judged result.
+- **Fees:** (D2-H1, struck in revision 7: edge6 fee, history.) D2-H2 keeps fe8318a's registered fees and units. No mid fills in any judged result.
 - **Labels.** Every option result is labelled **MODELED_BBO**, not observed execution; D2-H2's
   Schwab-quote-graded fills are modelled too. A quote snapshot within two minutes with positive bids is
   **not** proof that the trade could be executed.
@@ -475,39 +482,44 @@ intraday rule on 2022-11 .. 2026-11.
 - Shares: $0.04 per share round trip (D2-H3), plus a 6 bp round-trip sensitivity (`evals/e2` `e2-costs-v1`).
 - **Gap:** no options cost class exists in `evals/e2/cost_model.json`. D2 must add `us_equity_option_0dte`
   to the cost model (versioned) before D3 can score through E2.
-- **D2-H1 is judged on the synthetic payoff proxy** (§6.2). No D2-H1 result is a claim about exercise, assignment or after-hours outcomes.
+- **D2-H1 (struck in revision 7; history)** was to be judged on the synthetic payoff proxy (§6.2). No D2-H1 result exists.
 - **For the live-exit hypothesis (D2-H2),** the proxy-graded result is reported but never judged.
 - **Pin risk** is reported for every fly cell, as the share of entries whose proxy mark S is within $0.25 of a short
   strike.
 
 ### 6.4 Success thresholds (fixed before any outcome)
 
-**Statistical:**
+**Statistical:** *(Revision 7: the D2-H1 bullets below, the D2-H1 sample floor and the D2-H1 power sentences are void with the struck cells and stay as history. No D2-H1 test is run.)*
+<!-- D2-H1-HISTORY-BEGIN -->
 - **D2-H1a and D2-H1b** are each tested separately: mean net per trade > 0, with a seeded
   percentile-bootstrap lower bound (B = 10 000, seed 20261107) above 0 at one-sided **1 − 0.05/2 = 0.975**
   (Bonferroni over the two H1 cells).
 - **D2-H1 PASS** requires **both** cells to pass (an intersection–union rule), and each cell's mean must be
   positive in a majority of the calendar years covered.
 - **If one cell passes,** that cell's own claim stands, but D2-H1 is not a PASS.
+<!-- D2-H1-HISTORY-END -->
 - **D2-H2 and D2-H3** keep their registered tests and levels (0.95) unchanged. D0 does not regrade them.
 
 **Program-level selection, disclosed and not corrected by these per-look levels:**
 - edge6 was chosen as the one PASS among the SPY option and intraday looks of 2026-11-06 .. 11-12 (#1133: 10
   looks, about 40 rules and cells, all others FAIL or UNDERPOWERED).
 - edge6's own four entry times included 09:35 FAIL and 12:00 PASS.
-- D2-H1 is a replication on a candidate-untouched window for that reason. Its result is reported together
-  with the full program count, and never as a standalone discovery.
+- **Revision 7 additions to the disclosure:** the 15:00 short iron fly was also judged on SPXW (2016-11-15 .. 2026-11-09, FAIL in both samples, 14:00 and 14:30 reported), and SPY intraday price paths over 2018 .. 2022-11 were read by edge9, the eod-flows read and the playbook cuts (no option premium). These are part of the program count for the fly structure and for D2-H3, and are not corrected by per-look levels.
+- D2-H1 (struck in revision 7) was a replication on a candidate-untouched window; the window is not untouched for the fly family, which is why it is struck.
 
-**Sample floor:** D2-H1a and D2-H1b n ≥ 300 sessions each; D2-H2 n = 100; D2-H3 n = 50. Fewer eligible
+**Sample floor:** D2-H2 n = 100; D2-H3 n = 50. (D2-H1's floor of 300 per cell is void with the struck cells.) Fewer eligible
 sessions than the floor = UNDERPOWERED = HOLD, never PASS.
 
-**Power rationale (D2-H1/H2):** edge6 at 15:00 gives mean +0.195, bootstrap LB(0.9875) +0.131 at n = 986,
+**Power rationale (D2-H2; the struck D2-H1's sentences at the end are history, revision 7):** edge6 at 15:00 gives mean +0.195, bootstrap LB(0.9875) +0.131 at n = 986,
 so SD ≈ 0.90 per trade. At n = 100 (D2-H2), the one-sided 95 % bound clears 0 when the sample mean
 exceeds ≈ 0.148: power ≈ 0.70 if the true mean is 0.195, ≈ 0.50 if a 15:55 exit cuts it to 0.15. The
 distribution is left-skewed (many small wins, rare losses near −4), so the bootstrap at n = 100 is likely
-optimistic; D3 reports a block-bootstrap and a worst-decile sensitivity. At n = 300 per H1 cell (level 0.975, bound clears 0 above ≈ 0.102), power ≈ 0.96
+optimistic; D3 reports a block-bootstrap and a worst-decile sensitivity.
+<!-- D2-H1-HISTORY-BEGIN -->
+At n = 300 per H1 cell (level 0.975, bound clears 0 above ≈ 0.102), power ≈ 0.96
 for a true mean of 0.195 and ≈ 0.82 for 0.15. Because both cells must pass, joint power is about their product
 if they are independent. The 14:00 and 15:00 cells share sessions, so joint power is higher than that product. These use the 2022–2026 SD; M/W/F-only history may differ.
+<!-- D2-H1-HISTORY-END -->
 
 **Economic:** mean net ≥ 2 % of capital at risk (5 − credit) per trade; max drawdown reported in units of
 mean monthly net; positive in a majority of calendar years covered.
@@ -522,26 +534,22 @@ Otherwise the session is `EXCLUDED_INPUT` and counted. D2-H2 keeps fe8318a's own
 
 ### 6.5 GO / HOLD / RETIRE
 
-- **GO** (frozen here, before either look): D2-H1 PASS **and** D2-H2 PASS at their own looks.
+- **GO** (revision 7): **not reachable for the fly structure under this contract version.** D2-H1 is struck, so there is no replication. A D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`), and calendar time never converts it. A GO needs a new replication that is proposed separately, authorised separately by the operator, labelled non-independent, and registered in a new contract version before anything is fetched. (Frozen before D2-H2's look: D2-H2 has 0 judged rows as of 2026-11-12.)
   - This cross-program rule is D0's. It reads D2-H2's verdict as registered and does not change it.
   - **D4 does not run another fly pilot.** D2-H2 is already the prospective paper test, so its immutable
     evidence maps directly onto D4's acceptance rule.
   - A D4 step is added only for a genuinely new validation question, such as executable fills. It is then
     registered separately, without touching fe8318a.
-- **HOLD:** either is UNDERPOWERED, or operational exclusions exceed 10 %, or D2-H1 cannot be fetched
-  (spend not approved). Calendar time alone never converts HOLD to GO.
-- **Precedence (fixed before either look):** RETIRE first, then HOLD, then GO. A FAIL in any judged cell
-  (H1a, H1b or H2) is RETIRE even when another cell is UNDERPOWERED, because a FAIL is evidence against
-  the structure and an UNDERPOWERED cell is not evidence for it. Without a FAIL, any UNDERPOWERED cell or
-  other HOLD cause gives HOLD.
-- **RETIRE:** D2-H1 FAIL **or** D2-H2 FAIL. D2-H1 FAIL means either H1 cell FAILs; an UNDERPOWERED cell gives HOLD, not FAIL. A retired structure returns only
+- **HOLD** (revision 7): D2-H2 is UNDERPOWERED, or operational exclusions exceed 10 %, or D2-H2 has PASSed (a forward pass alone is HOLD, `FORWARD_PASS_UNREPLICATED`, because D2-H1 is struck). Calendar time alone never converts HOLD to GO.
+- **Precedence (revision 7):** RETIRE first, then HOLD; GO is not reachable. A D2-H2 FAIL is RETIRE, because a FAIL is evidence against the structure and an UNDERPOWERED result is not evidence for it. Without a FAIL, an UNDERPOWERED D2-H2, an excluded-sessions halt or a D2-H2 PASS gives HOLD.
+- **RETIRE:** D2-H2 FAIL (revision 7: D2-H1 is struck and cannot FAIL). An UNDERPOWERED cell gives HOLD, not FAIL. A retired structure returns only
   as a new registration on new data.
 - D2-H3 decides only its own GO/RETIRE; it cannot rescue or sink the fly.
 
 ### 6.6 Budget
 
 Compute: single host, < 2 h per look. Storage: research copies stay outside griddb until #1108 defines
-snapshots. Spend: the D2-H1 OPRA fetch is a usage-based purchase and needs the operator's explicit approval
+snapshots. Spend (revision 7): none authorised and none needed, because D2-H1 is struck. If a non-independent replication is ever proposed, its OPRA fetch is a usage-based purchase and needs the operator's explicit approval
 with a quoted cap before it starts; no subscription.
 
 ### 6.7 Examples required before admission
@@ -642,8 +650,8 @@ Gaps block only the hypotheses named in the gap list below.
 | G1 | ~~Research owner and independent reviewer not named~~ resolved 2026-11-12: owner Claude, reviewer Codex | signing | — | Codex pickup + first pass |
 | G2 | No EDGAR acceptance-datetime history; `earnings_events` starts 2026-02-19 | D1-F1, D1-F2 history | existing SEC lane (#1050 author) | approval of a free backfill job |
 | G3 | No point-in-time liquid-equity universe | all D1 history | — | Tiingo EOD incl. delisted + `security_master` validity |
-| G4 | No options cost class in `evals/e2/cost_model.json` | D2 scoring through E2 | E2 owner | versioned cost-model bump |
-| G5 | Pre-2022-11 OPRA quotes not fetched | D2-H1a, D2-H1b | GEX research lane | First, reconcile the full inspection ledger and fix the exact contract and target scope in a fetch manifest (§6.2). Then the operator's spend approval with a cap |
+| G4 (not blocking in revision 7: D2-H2 and D2-H3 are adopted unchanged with their own costs; stays open for any later E2 scoring of options) | No options cost class in `evals/e2/cost_model.json` | D2 scoring through E2 | E2 owner | versioned cost-model bump |
+| G5 (CLOSED, revision 7) | Pre-2022-11 OPRA quotes not fetched | none: D2-H1 is struck | n/a | No fetch manifest and no spend. History: the ledger reconciliation (§6.2) found the same-family overlap |
 | G6 | `event_sequence.py` dropped all `signal_sources` events (`r[8]`) and stamped filings at `period_end` | any D1 card that uses event_sequence | Claude (owner integration) | #1145 merged and deployed 2026-11-12. Codex's stricter guards (8befc05e) are integrated with #1145 as `25467893` (rebased onto `6e0b78b7`) in #1167, **merged and deployed 2026-11-13 as `99dbd52a`** (CI green on all 11 checks). Event-sequence timing is now held at the reader; lead times stay on HOLD for D1 until release/version receipts exist |
 | G7 | `earnings_calendar` compat stubs (`earnings_date = period_end`; 2,131 by date equality, the author's count) read as releases | D1 (excluded by rule meanwhile); earnings causal-link timing on HOLD | readers: done in #1167 (`99dbd52a`, deployed 2026-11-13); producer: #1051 author | The reader-side hold covers the three direct `causal_links` readers, not `causation_graph` or persisted `causal_chains`. Stored rows are never mass-rewritten on the date-equality count. Any repair is separately authorised |
 | G8 | S11/E3 windows cannot express contract identity, intraday horizon or "inspected, not tested" | native D2 window checks | S11/E3 owner | version bump |
@@ -728,5 +736,19 @@ owner-signed and admits nothing. No threshold, window, horizon, level, floor or 
 outcome was read. The pinned hash covers the text between the body markers. It is recorded in
 `analysis/d0_manifest.py` (`D0_CONTRACT_BODY_SHA256`) and in the manifest's `contract_body_sha256`, never
 inside the body itself.
+
+### 10.6 Revision 7: D2-H1 struck (2026-11-26)
+
+| Change | Where |
+|---|---|
+| D2-H1a and D2-H1b are struck: the SPXW 15:00 fly (14:00 and 14:30 reported) was judged on the same sessions, same family; reviewer and owner agree | §6.2 |
+| The fly structure cannot reach GO in this version; D2-H2 PASS alone is HOLD (`FORWARD_PASS_UNREPLICATED`); D2-H2 FAIL is RETIRE | §6.5 |
+| No OPRA spend; G5 closed; G4 not blocking | §6.6, §9 |
+| Section 4 ledger adds the omitted lane records | §4 |
+| Selection disclosure adds the SPXW look and the SPY price-path reads | §6.4 |
+
+No outcome of any D2 look had been read when this was recorded. D2-H2 and D2-H3 are unchanged.
+
+**Owner signature (2026-11-26).** The research owner signed revision 7 on the operator's "Sign and pin revision 7", after the reviewer's scoped ACCEPT of the draft at `b35d7928`. At signing only status wording changed beyond the draft's anchors. The body hash is pinned in `analysis/d0_manifest.py` (`D0_CONTRACT_BODY_SHA256`) and in the manifest's `contract_body_sha256`, never inside the body itself. The frozen admission spec in `analysis/d0_admission.py` no longer contains D2-H1a or D2-H1b, so an ADMITTED row for either is refused as unsupported.
 
 <!-- D0-CONTRACT-BODY-END -->

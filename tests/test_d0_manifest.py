@@ -16,7 +16,7 @@ def test_committed_manifest_is_owner_signed_pinned_and_admits_nothing():
     m = _real()
     assert M.validate(m) == []
     assert M.contract_pin_errors(m) == []
-    assert m["research_owner"]["signed"] is True and m["signed_at"] == "2026-11-14"
+    assert m["research_owner"]["signed"] is True and m["signed_at"] == "2026-11-26"
     assert m["contract_body_sha256"] == M.D0_CONTRACT_BODY_SHA256
     assert m["reviewer"]["signed"] is False
     assert not any(i["admission_status"] == "ADMITTED" for i in m["inputs"])
