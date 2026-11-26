@@ -1,9 +1,10 @@
-"""scripts/propose_ticker_status.py: evidence for a sidecar entry, never a status change.
+"""scripts/propose_ticker_status.py: evidence for a person to read, never an entry or a status change.
 
 2026-11-26: smart:tiingo went PARTIAL on FNGR, the sixth lapsed ticker in 16 days
 (KPTI, ROKU, BKH, GWHT, UTZ, FNGR). Codex HOLD 6031219314: no vendor listing may
-clear the PARTIAL on its own. The tool only prepares the person's decision, and
-says "status not established" when the filings do not settle it.
+clear the PARTIAL on its own. Codex HOLD 6080189252: filing metadata is a lead,
+not an issuer or security outcome, so the tool prints candidate evidence as
+comments and no sidecar entry; a malformed EDGAR answer is unavailable, not "none".
 
 Offline: scripted HTTP, SEC ticker file and stored closes; nothing is read or written.
 """
@@ -18,12 +19,11 @@ from unittest.mock import MagicMock
 import pytest
 
 import analysis.sector_map as sm
-from analysis.sector_map import _load_ticker_status
 from ingestion.tiingo_pull import TiingoPuller
 from scripts import propose_ticker_status as pts
 
 D = date.fromisoformat
-CLOSES = {"TIINGO": (D("2026-11-24"), 0.022), "yfinance": (D("2026-05-13"), 0.31)}
+CLOSES = {"TIINGO": (D("2026-11-19"), 0.022), "yfinance": (D("2026-05-13"), 0.31)}
 
 
 def _ev(ticker="XYZ", *, filings=(), cik="0000000042", tickers=("XYZ",), found=True, end=None,
@@ -36,84 +36,116 @@ def _ev(ticker="XYZ", *, filings=(), cik="0000000042", tickers=("XYZ",), found=T
     )
 
 
-def _valid_in_the_sidecar(block: str, tmp_path: Path) -> dict:
-    path = tmp_path / "status.yaml"
-    path.write_text("TICKER_STATUS:\n" + block + "\n", encoding="utf-8")
-    return _load_ticker_status(path)       # the real loader and its rules
+def _text(ticker, ev):
+    return pts.render(pts.triage(ev), ev)
 
 
-# ── what the filings settle ──────────────────────────────────────────────────
+# ── leads, not findings ──────────────────────────────────────────────────────
 
-def test_utz_shape_is_proposed_as_acquired_with_accessions_and_a_review_placeholder(tmp_path):
-    ev = _ev("UTZ", end=D("2026-11-19"), name="Utz Brands", filings=[
-        ("25-NSE", D("2026-11-20"), "0000000000-26-000025", ()),
-        ("8-K", D("2026-11-19"), "0001193125-26-470261", ("2.01", "3.01", "5.01")),
-    ])
-    proposal = pts.classify(ev)
-    assert proposal.status == "acquired" and proposal.last_session == D("2026-11-19")
-    text = pts.render(proposal, ev)
-    assert "0001193125-26-470261" in text and "0000000000-26-000025" in text
-    assert "REVIEW: name the acquirer from 8-K 0001193125-26-470261" in text     # cannot be committed unread
-    entry = _valid_in_the_sidecar(text, tmp_path)["UTZ"]
-    assert entry["status"] == "acquired" and str(entry["last_session"]) == "2026-11-19"
-
-
-@pytest.mark.parametrize("form", ["25", "25-NSE", "15-12B", "15-12G", "15"])
-def test_a_delisting_form_without_an_acquisition_is_delisted(form, tmp_path):
-    ev = _ev("DEL", filings=[(form, D("2026-11-18"), "0000000001-26-000001", ())])
-    proposal = pts.classify(ev)
-    assert proposal.status == "delisted"
-    assert _valid_in_the_sidecar(pts.render(proposal, ev), tmp_path)["DEL"]["status"] == "delisted"
+def test_utz_shape_is_a_lead_with_accessions_and_never_an_entry():
+    ev = _ev("UTZ", end=D("2026-11-19"), name="Utz Brands", closes={"TIINGO": (D("2026-11-19"), 17.3), "yfinance": None},
+             filings=[("25-NSE", D("2026-11-20"), "0000876661-26-000942", ()),
+                      ("8-K", D("2026-11-20"), "0001193125-26-470261", ("2.01", "3.01", "5.01"))])
+    t = pts.triage(ev)
+    assert t.lead and len(t.filings) == 2
+    text = pts.render(t, ev)
+    assert "UTZ: LEAD (triage, not a finding; no entry proposed)" in text
+    assert "0000876661-26-000942" in text and "0001193125-26-470261" in text
+    assert "not established by this tool: that the filing(s) concern this issuer's listed security" in text
+    assert "write the sidecar entry yourself" in text
+    # comments only: no line could be pasted into the sidecar as it stands
+    assert all(line.startswith("#") for line in text.splitlines())
+    assert "status:" not in text and "acquirer:" not in text and "successor:" not in text and "last_session" not in text
+    assert "endDate 2026-11-19 (a vendor claim)" in text                 # never presented as the last session
 
 
-def test_a_symbol_the_issuer_no_longer_uses_is_proposed_as_renamed(tmp_path):
-    ev = _ev("ATUS", tickers=("OPTU",), name="Optimum Communications", cik_source="--cik")
-    proposal = pts.classify(ev)
-    assert (proposal.status, proposal.successor) == ("renamed", "OPTU")
-    entry = _valid_in_the_sidecar(pts.render(proposal, ev), tmp_path)["ATUS"]
-    assert entry["successor"] == "OPTU"
+@pytest.mark.parametrize("name, filing", [
+    ("an Item 2.01 alone (also covers the filer's own acquisitions and dispositions)",
+     ("8-K", D("2026-11-18"), "0000000005-26-000005", ("2.01",))),
+    ("a Form 15 alone (does not show the listing stopped trading)",
+     ("15-12B", D("2026-11-18"), "0000000006-26-000006", ())),
+    ("a delisting notice", ("8-K", D("2026-11-18"), "0000000003-26-000003", ("3.01",))),
+    ("a bankruptcy", ("8-K", D("2026-11-18"), "0000000004-26-000004", ("1.03",))),
+])
+def test_a_single_filing_is_only_ever_a_candidate_and_says_what_is_missing(name, filing):
+    ev = _ev("XYZ", filings=[filing])
+    text = _text("XYZ", ev)
+    assert "LEAD (triage" in text and "candidate:" in text and filing[2] in text, name
+    assert "acquired" not in text.split("candidate:")[0] and "STATUS NOT ESTABLISHED" not in text
+
+
+@pytest.mark.parametrize("name, anchor, filed", [
+    ("a stale vendor date: 2020 anchor, Nov 2026 filings", D("2020-03-02"), D("2026-11-20")),
+    ("filed long before the last close", D("2026-11-19"), D("2026-09-01")),
+    ("filed more than 30 days after the last close", D("2026-11-19"), D("2026-12-20")),
+    ("the same Form 25 two years earlier", D("2026-11-19"), D("2024-11-20")),
+])
+def test_the_filing_window_is_bounded_on_both_sides_of_the_last_stored_close(name, anchor, filed):
+    ev = _ev("XYZ", closes={"TIINGO": (anchor, 1.0), "yfinance": None},
+             filings=[("25", filed, "0000000007-26-000007", ())])
+    t = pts.triage(ev)
+    assert not t.lead and t.window == (anchor - pts.timedelta(days=14), anchor + pts.timedelta(days=30)), name
+
+
+def test_the_edges_of_the_window_are_inside_it():
+    anchor = D("2026-11-19")
+    inside = [("25", anchor - pts.timedelta(days=14), "0000000008-26-000008", ()),
+              ("25", anchor + pts.timedelta(days=30), "0000000009-26-000009", ())]
+    assert len(pts.triage(_ev("XYZ", filings=inside)).filings) == 2
+
+
+def test_current_symbols_are_a_lead_not_a_successor_and_no_entry_is_emitted():
+    """Codex 6080189252 item 2: a CIK's current tickers do not establish old-to-new continuity."""
+    ev = _ev("ATUS", tickers=("OPTU", "OPTUW"), name="Optimum Communications", cik_source="--cik")
+    t = pts.triage(ev)
+    assert t.lead and not t.filings
+    text = pts.render(t, ev)
+    assert "EDGAR now lists OPTU, OPTUW for CIK 0000000042, not ATUS: a current-symbols list, not an old-to-new listing record" in text
+    assert "successor" not in text.replace("a successor symbol", "") and all(line.startswith("#") for line in text.splitlines())
 
 
 # ── what they do not settle: "status not established" ────────────────────────
 
 def test_the_fngr_case_no_cik_is_not_established_and_says_what_would_settle_it():
-    ev = _ev("FNGR", cik=None, tickers=(), filings=[], end=None, closes={"TIINGO": (D("2026-11-24"), 0.022), "yfinance": None})
-    proposal = pts.classify(ev)
-    text = pts.render(proposal, ev)
-    assert proposal.status is None
+    ev = _ev("FNGR", cik=None, tickers=(), found=True, end=None,
+             closes={"TIINGO": (D("2026-11-24"), 0.022), "yfinance": None})
+    text = _text("FNGR", ev)
     assert "STATUS NOT ESTABLISHED (no entry proposed)" in text
     assert "no CIK for this symbol in the SEC ticker file" in text and "--cik TICKER=CIK" in text
     assert "TIINGO 2026-11-24 at 0.022" in text and "yfinance none" in text
-    assert "status:" not in text.replace("STATUS NOT", "")             # no entry is printed
 
 
 def test_a_live_issuer_with_only_a_tiingo_gap_is_not_established():
     ev = _ev("XYZ", filings=[("10-Q", D("2026-11-05"), "0000000002-26-000002", ())])
-    proposal = pts.classify(ev)
-    assert proposal.status is None
-    assert "still lists XYZ for this issuer: consistent with a Tiingo-only gap" in pts.render(proposal, ev)
+    assert not pts.triage(ev).lead
+    assert "still lists XYZ for this issuer: consistent with a Tiingo-only gap" in _text("XYZ", ev)
 
 
-@pytest.mark.parametrize("name, filings", [
-    ("delisting notice only", [("8-K", D("2026-11-18"), "0000000003-26-000003", ("3.01",))]),
-    ("bankruptcy only", [("8-K", D("2026-11-18"), "0000000004-26-000004", ("1.03",))]),
-    ("acquisition item without a delisting form", [("8-K", D("2026-11-18"), "0000000005-26-000005", ("2.01",))]),
-    ("a Form 25 two years earlier", [("25", D("2024-11-18"), "0000000006-24-000006", ())]),
-])
-def test_partial_or_old_evidence_does_not_establish_a_status(name, filings):
-    assert pts.classify(_ev("XYZ", filings=filings)).status is None, name
+def test_without_a_stored_close_there_is_no_window_and_no_lead():
+    ev = _ev("XYZ", closes={"TIINGO": None, "yfinance": None},
+             filings=[("25", D("2026-11-20"), "0000000010-26-000010", ())])
+    t = pts.triage(ev)
+    assert not t.lead and t.window is None
+    assert "no stored TIINGO close to anchor a filing window" in pts.render(t, ev)
 
 
 def test_prices_and_a_missing_yfinance_row_never_establish_anything():
-    for closes in ({"TIINGO": (D("2026-11-24"), 0.001), "yfinance": None},
-                   {"TIINGO": None, "yfinance": None}):
-        assert pts.classify(_ev("XYZ", closes=closes)).status is None
+    for closes in ({"TIINGO": (D("2026-11-24"), 0.001), "yfinance": None}, {"TIINGO": None, "yfinance": None}):
+        assert not pts.triage(_ev("XYZ", closes=closes)).lead
 
 
-# ── it fails loudly instead of printing an entry with missing evidence ───────
+# ── EDGAR answers: only a well-formed answer counts, empty or not ────────────
 
-def _deps(*, tiingo=(200, {"name": "Xyz", "endDate": None}), submissions=(200, None), closes=None):
+def _doc(rows=(), *, cik=42, name="Xyz", tickers=("XYZ",), files=()):
+    keys = ("form", "filingDate", "accessionNumber", "items")
+    recent = {k: [r[i] for r in rows] for i, k in enumerate(keys)}
+    return {"cik": cik, "name": name, "tickers": list(tickers),
+            "filings": {"recent": recent, "files": list(files)}}
+
+
+def _deps(*, tiingo=(200, {"name": "Xyz", "endDate": None}), submissions=None, closes=None):
     calls = []
+    submissions = (200, _doc()) if submissions is None else submissions
 
     def get(url, headers):
         calls.append(url)
@@ -123,15 +155,46 @@ def _deps(*, tiingo=(200, {"name": "Xyz", "endDate": None}), submissions=(200, N
             return tiingo
         if isinstance(submissions, Exception):
             raise submissions
-        return submissions[0], submissions[1] or {"name": "Xyz", "tickers": ["XYZ"],
-                                                  "filings": {"recent": {"form": [], "filingDate": [],
-                                                                         "accessionNumber": [], "items": []}}}
+        return submissions
 
     return dict(get=get, tiingo_headers={}, sec_headers={}, cik_map={"XYZ": "42", "BAD": "43"},
                 cik_overrides={}, last_closes=closes or (lambda t: dict(CLOSES))), calls
 
 
-def test_every_unavailable_source_gives_no_entry_a_message_and_exit_2():
+@pytest.mark.parametrize("name, doc", [
+    ("200 with name and tickers but no filings", {"cik": 42, "name": "Xyz", "tickers": ["ABC"]}),
+    ("filings without recent", {"cik": 42, "name": "Xyz", "tickers": ["XYZ"], "filings": {}}),
+    ("a missing items array", {"cik": 42, "name": "Xyz", "tickers": ["XYZ"], "filings": {"recent": {
+        "form": ["25"], "filingDate": ["2026-11-20"], "accessionNumber": ["a"]}}}),
+    ("arrays of different length", {"cik": 42, "name": "Xyz", "tickers": ["XYZ"], "filings": {"recent": {
+        "form": ["25", "8-K"], "filingDate": ["2026-11-20"], "accessionNumber": ["a"], "items": [""]}}}),
+    ("a bad filing date", _doc([("25", "not-a-date", "a", "")])),
+    ("a non-string form", _doc([(25, "2026-11-20", "a", "")])),
+    ("the answer is for another CIK", _doc(cik=99)),
+    ("no tickers list", {"cik": 42, "name": "Xyz", "filings": _doc()["filings"]}),
+    ("older pages exist and recent starts after the window", _doc(
+        [("10-Q", "2026-11-10", "a", "")], files=[{"name": "CIK0000000042-submissions-001.json"}])),
+])
+def test_an_unexpected_edgar_shape_is_unavailable_never_an_empty_answer(name, doc):
+    out, err = [], []
+    code = pts.run(["XYZ"], out=out.append, err=err.append, **_deps(submissions=(200, doc))[0])
+    assert code == 2, name
+    assert any("EVIDENCE UNAVAILABLE, nothing reported" in e for e in err), name
+    assert not any("XYZ:" in line for line in out), name
+
+
+def test_a_valid_empty_answer_is_the_only_empty_that_counts():
+    out: list[str] = []
+    code = pts.run(["XYZ"], out=out.append, err=lambda s: None, **_deps(submissions=(200, _doc()))[0])
+    assert code == 0 and any("XYZ: STATUS NOT ESTABLISHED" in line for line in out)
+    # older pages exist but the recent array already reaches back past the window: still well-formed
+    doc = _doc([("10-Q", "2026-10-01", "a", "")], files=[{"name": "older.json"}])
+    assert pts.run(["XYZ"], out=out.append, err=lambda s: None, **_deps(submissions=(200, doc))[0]) == 0
+
+
+# ── it fails loudly instead of printing a block with missing evidence ────────
+
+def test_every_unavailable_source_gives_no_block_a_message_and_exit_2():
     out, err = [], []
     for kind, deps in {
         "tiingo down": _deps(tiingo=pts.EvidenceUnavailable("Tiingo listing for XYZ: ConnectionError"))[0],
@@ -144,8 +207,8 @@ def test_every_unavailable_source_gives_no_entry_a_message_and_exit_2():
         err.clear()
         code = pts.run(["XYZ"], out=out.append, err=err.append, **deps)
         assert code == 2, kind
-        assert any("EVIDENCE UNAVAILABLE, no entry proposed" in e for e in err), kind
-        assert not any(line.lstrip().startswith("XYZ:") or "NOT ESTABLISHED" in line for line in out), kind
+        assert any("EVIDENCE UNAVAILABLE, nothing reported" in e for e in err), kind
+        assert not any("XYZ:" in line for line in out), kind
         assert out[-1].endswith("1 unavailable"), kind
 
 
@@ -190,7 +253,7 @@ def test_pull_log_names_are_parsed_and_an_empty_log_is_unavailable():
 
 # ── it prepares a decision and cannot make one ───────────────────────────────
 
-def test_the_tool_writes_nothing(monkeypatch):
+def test_the_tool_writes_nothing_and_has_no_way_to_(monkeypatch):
     sidecar = Path(sm.__file__).parent / "sector_map_ticker_status.yaml"
     before = hashlib.sha256(sidecar.read_bytes()).hexdigest()
     status_before = dict(sm.TICKER_STATUS)
@@ -201,11 +264,12 @@ def test_the_tool_writes_nothing(monkeypatch):
         return real_open(file, mode, *a, **k)
 
     monkeypatch.setattr(builtins, "open", guarded)
-    deps, _ = _deps()
-    pts.run(["XYZ"], out=lambda s: None, err=lambda s: None, **deps)
+    out: list[str] = []
+    pts.run(["XYZ"], out=out.append, err=lambda s: None, **_deps()[0])
     assert hashlib.sha256(sidecar.read_bytes()).hexdigest() == before
     assert dict(sm.TICKER_STATUS) == status_before
-    assert not [n for n in dir(pts) if n in {"write_sidecar", "apply", "save"}]
+    assert all(line.startswith("#") for line in out)            # not one line is a sidecar entry
+    assert not [n for n in dir(pts) if n in {"write_sidecar", "apply", "save", "render_entry"}]
 
 
 _NOW = datetime(2026, 11, 21, 1, 0, tzinfo=timezone.utc)
@@ -238,7 +302,7 @@ class _Puller(TiingoPuller):
 
 
 def test_a_tiingo_only_lapse_on_a_live_ticker_stays_partial_before_and_after_the_tool():
-    """The tool proposes nothing for a live issuer and has no channel to clear a status."""
+    """The tool reports no lead for a live issuer and has no channel to clear a status."""
     latest = {"SPY": D("2026-11-19"), "XYZ": D("2026-11-13")}
 
     def pull():
@@ -248,9 +312,8 @@ def test_a_tiingo_only_lapse_on_a_live_ticker_stays_partial_before_and_after_the
     before = pull()
     assert before["status"] == "PARTIAL" and before["lapsed_tickers"] == ["XYZ"]
 
-    deps, _ = _deps()                 # EDGAR: XYZ still listed, only a 10-Q; Tiingo: no endDate
     out: list[str] = []
-    assert pts.run(["XYZ"], out=out.append, err=lambda s: None, **deps) == 0
+    assert pts.run(["XYZ"], out=out.append, err=lambda s: None, **_deps()[0]) == 0     # EDGAR: still listed, no filings
     assert any("STATUS NOT ESTABLISHED" in line for line in out)
     assert "XYZ" not in sm.TICKER_STATUS
 

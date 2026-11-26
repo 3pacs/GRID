@@ -1,41 +1,43 @@
 #!/usr/bin/env python3
-"""Propose sector-map lifecycle entries for lapsed tickers, with evidence (read-only).
+"""Collect evidence on lapsed tickers for a person to read (read-only; proposes no entry).
 
 ``smart:tiingo`` goes PARTIAL every few days when a ticker stops trading
 (KPTI, ROKU, BKH, GWHT, UTZ, FNGR in 2026-11) and stays PARTIAL until someone
 marks the ticker in ``analysis/sector_map_ticker_status.yaml``. Codex HOLD
-6031219314 settled that no vendor listing may clear the status on its own, so
-the mark stays a person's decision. This script makes that decision quick and
-checkable instead of automatic: for each lapsed ticker it reads three
-independent kinds of evidence and prints a ready-to-review sidecar entry with
-the accession numbers behind it, or says the status is **not established**.
+6031219314: no vendor listing may clear it on its own. Codex HOLD 6080189252:
+filing metadata is a lead, not a finding about this issuer's security, so this
+tool prints **candidate evidence as comments, never a sidecar entry**. The
+person reads the accession(s), establishes the security, class, venue, last
+session and acquirer, and writes the entry.
 
-Evidence, per ticker:
+Per ticker it reads three independent sources:
 
-* Tiingo's own listing (``/tiingo/daily/{ticker}``: found / endDate / name);
-* the closes GRID stored (last TIINGO and yfinance close date and value);
-* EDGAR (``data.sec.gov/submissions``): Form 25 / 25-NSE (exchange delisting),
-  Form 15 (deregistration) and 8-K Items 2.01 (completed acquisition), 3.01
-  (delisting notice), 1.03 (bankruptcy), plus the entity's current tickers.
+* Tiingo's own listing (found / endDate / name): reported as a vendor claim,
+  never as the last session;
+* the closes GRID stored (newest TIINGO and yfinance close, date and value);
+* EDGAR submissions (``data.sec.gov``): Form 25 / 25-NSE, Form 15 family and
+  8-K Items 2.01 / 3.01 / 1.03, with accession numbers, and the issuer's
+  current tickers.
 
-What it concludes (``classify``; no magnitude or price rule):
+It prints one of:
 
-* **acquired**: a Form 25 or Form 15 and an 8-K Item 2.01 in the window;
-* **delisted**: a Form 25 or Form 15 and no Item 2.01;
-* **renamed**: EDGAR's current tickers for the issuer no longer include the
-  symbol and name a successor (needs the CIK, from the SEC ticker file or
-  ``--cik``);
-* otherwise **status not established**, naming what was checked and what is
-  missing. A Tiingo gap alone, a falling price, a missing yfinance row or no
-  CIK never establishes anything.
+* ``LEAD``: filings of those kinds fall in a window bounded on **both** sides
+  of the last stored TIINGO close (``LEAD_BEFORE_DAYS`` before to
+  ``LEAD_AFTER_DAYS`` after). That is triage. It says what the tool did not
+  establish: that the filing concerns this issuer's listed security (an 8-K
+  Item 2.01 also covers the filer's own acquisitions and asset dispositions; a
+  Form 15 alone does not show the listing stopped trading), the class, the
+  venue, the last session and the acquirer. A current-symbols list that omits
+  the ticker is reported the same way: it is not an old-to-new change record.
+* ``STATUS NOT ESTABLISHED``: no such filing in the window, or no CIK, or no
+  stored close to anchor the window. It names what was checked.
 
 It never writes: no sidecar edit, no database write, no status change. It
 fails loudly: if Tiingo, EDGAR, the SEC ticker file or the database cannot be
-read for a ticker, that ticker gets no entry (an entry with missing evidence
-would look like a finding), the reason goes to stderr and the exit code is 2.
-An acquirer's name is not extracted from the filing: the entry carries a
-``REVIEW:`` placeholder naming the accession to read, so it cannot be
-committed unreviewed by accident.
+read, or EDGAR answers with an envelope that is not the expected shape (or
+whose recent filings do not reach back to the window), that ticker gets no
+block, the reason goes to stderr and the exit code is 2. Only a well-formed
+EDGAR answer with no such filings counts as "none".
 
     python scripts/propose_ticker_status.py --tickers FNGR UTZ
     python scripts/propose_ticker_status.py --from-pull-log            # names in the latest PARTIAL
@@ -43,8 +45,8 @@ committed unreviewed by accident.
 
 Related: ``scripts/classify_tiingo_dead_tickers.py`` lists sector-map tickers
 whose Tiingo ``endDate`` is stale (Tiingo meta only; it guesses ``delisted``
-from that alone and swallows errors). This script is the evidence-based
-review step for the tickers a pull actually names.
+from that alone and swallows errors). This tool is the evidence-reading step
+for the tickers a pull actually names.
 """
 
 from __future__ import annotations
@@ -62,15 +64,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 TIINGO_META_URL = "https://api.tiingo.com/tiingo/daily/{}"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{}.json"
-WINDOW_DAYS = 60              # filings from this many days before the last session count
+LEAD_BEFORE_DAYS = 14         # a lead filing is filed at most this long before the last stored close
+LEAD_AFTER_DAYS = 30          # ... and at most this long after it
 PULL_NAMES = ("smart:tiingo", "Tiingo_Prices")
 _NAMED = re.compile(r"(?:^|, )([A-Z0-9][A-Z0-9.\-=^]*)(?: \([^)]*\))?")
-
-NOT_ESTABLISHED = "not established"
+_RECENT_KEYS = ("form", "filingDate", "accessionNumber", "items")
 
 
 class EvidenceUnavailable(RuntimeError):
-    """A source could not be read, so no entry is printed for the ticker."""
+    """A source could not be read (or answered in an unexpected shape): no block for the ticker."""
 
 
 @dataclass(frozen=True)
@@ -97,14 +99,14 @@ class Evidence:
 
 
 @dataclass
-class Proposal:
+class Triage:
     ticker: str
-    status: str | None                 # acquired | delisted | renamed | None (= not established)
-    last_session: date | None
-    successor: str | None = None
-    cited: list[str] = field(default_factory=list)       # what supports it, with accessions
-    checked: list[str] = field(default_factory=list)     # what was read, for a "not established"
-    missing: list[str] = field(default_factory=list)     # what would settle it
+    lead: bool
+    window: tuple[date, date] | None
+    filings: list[Filing] = field(default_factory=list)      # the lead filings, in the window
+    symbol_lead: str = ""                                     # current-symbols observation, not a change record
+    checked: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
 
 
 # ── evidence ─────────────────────────────────────────────────────────────────
@@ -145,25 +147,40 @@ def read_tiingo(ticker: str, get: HttpGet, headers: dict[str, str]) -> tuple[boo
     return True, str(meta.get("name") or "").strip(), _date(meta.get("endDate"))
 
 
-def read_submissions(cik: str, get: HttpGet, headers: dict[str, str]) -> tuple[str, tuple[str, ...], list[Filing]]:
+def read_submissions(
+    cik: str, get: HttpGet, headers: dict[str, str], since: date | None = None,
+) -> tuple[str, tuple[str, ...], list[Filing]]:
+    """The issuer's name, current tickers and recent filings from EDGAR submissions.
+
+    Only the expected envelope counts as evidence: a ``filings.recent`` object with
+    the four aligned arrays, a ``tickers`` list and the requested CIK. Anything else
+    (a 200 with a different shape, misaligned arrays, a bad row, recent filings that
+    do not reach back to ``since`` while older pages exist) is unavailable, never
+    "no filings".
+    """
+    where = f"EDGAR submissions for CIK {cik}"
     status, doc = get(SUBMISSIONS_URL.format(cik), headers)
     if status != 200 or not isinstance(doc, dict):
-        raise EvidenceUnavailable(f"EDGAR submissions for CIK {cik}: HTTP {status}")
-    recent = ((doc.get("filings") or {}).get("recent")) or {}
-    forms, filed = recent.get("form") or [], recent.get("filingDate") or []
-    accessions, items = recent.get("accessionNumber") or [], recent.get("items") or []
-    if not (len(forms) == len(filed) == len(accessions)):
-        raise EvidenceUnavailable(f"EDGAR submissions for CIK {cik}: recent filings arrays disagree")
+        raise EvidenceUnavailable(f"{where}: HTTP {status}")
+    if str(doc.get("cik") or "").zfill(10) != cik:
+        raise EvidenceUnavailable(f"{where}: the answer is for CIK {doc.get('cik')!r}")
+    filings = doc.get("filings")
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if not isinstance(recent, dict) or not all(isinstance(recent.get(k), list) for k in _RECENT_KEYS):
+        raise EvidenceUnavailable(f"{where}: no filings.recent with {', '.join(_RECENT_KEYS)} arrays")
+    if len({len(recent[k]) for k in _RECENT_KEYS}) != 1:
+        raise EvidenceUnavailable(f"{where}: recent filings arrays disagree in length")
+    if not isinstance(doc.get("tickers"), list) or not isinstance(doc.get("name"), str):
+        raise EvidenceUnavailable(f"{where}: no name / tickers")
     out: list[Filing] = []
-    for i, form in enumerate(forms):
-        when = _date(filed[i])
-        if when is None:
-            continue
-        raw_items = items[i] if i < len(items) else ""
-        out.append(Filing(str(form), when, str(accessions[i]),
-                          tuple(x.strip() for x in str(raw_items).split(",") if x.strip())))
-    tickers = tuple(str(t).upper() for t in (doc.get("tickers") or []))
-    return str(doc.get("name") or ""), tickers, out
+    for form, filed, accession, items in zip(*(recent[k] for k in _RECENT_KEYS)):
+        when = _date(filed)
+        if when is None or not isinstance(form, str) or not isinstance(accession, str) or not isinstance(items, str):
+            raise EvidenceUnavailable(f"{where}: a filing row is malformed ({form!r}, {filed!r}, {accession!r})")
+        out.append(Filing(form, when, accession, tuple(x.strip() for x in items.split(",") if x.strip())))
+    if since is not None and (filings.get("files") or []) and (not out or min(f.filed for f in out) > since):
+        raise EvidenceUnavailable(f"{where}: recent filings start after {since.isoformat()} and older pages exist (not read)")
+    return doc["name"], tuple(str(t).upper() for t in doc["tickers"]), out
 
 
 def gather(
@@ -184,91 +201,90 @@ def gather(
     cik = cik_override or cik_map.get(ticker)
     if cik:
         ev.cik, ev.cik_source = cik.zfill(10), ("--cik" if cik_override else "SEC ticker file")
-        ev.edgar_name, ev.edgar_tickers, ev.filings = read_submissions(ev.cik, get, sec_headers)
+        anchor = ev.last_tiingo_close[0] if ev.last_tiingo_close else None
+        since = anchor - timedelta(days=LEAD_BEFORE_DAYS) if anchor else None
+        ev.edgar_name, ev.edgar_tickers, ev.filings = read_submissions(ev.cik, get, sec_headers, since)
     return ev
 
 
-# ── conclusion ───────────────────────────────────────────────────────────────
+# ── triage ───────────────────────────────────────────────────────────────────
 
-def _is_delisting(f: Filing) -> bool:
-    return f.form.startswith("25") or f.form == "15" or f.form.startswith("15-")
+def _kind(f: Filing) -> str | None:
+    if f.form.startswith("25"):
+        return "delisting form (Form 25)"
+    if f.form == "15" or f.form.startswith("15-"):
+        return "deregistration form (Form 15)"
+    if f.form == "8-K" and "2.01" in f.items:
+        return "8-K Item 2.01 (completion of an acquisition or a disposition of assets)"
+    if f.form == "8-K" and "3.01" in f.items:
+        return "8-K Item 3.01 (notice of delisting or failure to satisfy a listing rule)"
+    if f.form == "8-K" and "1.03" in f.items:
+        return "8-K Item 1.03 (bankruptcy or receivership)"
+    return None
 
 
-def classify(ev: Evidence) -> Proposal:
-    last = ev.tiingo_end or (ev.last_tiingo_close[0] if ev.last_tiingo_close else None)
-    start = (last or date.today()) - timedelta(days=WINDOW_DAYS)      # noqa: DTZ011 -- calendar bound
-    window = [f for f in ev.filings if f.filed >= start]
-    delisting = [f for f in window if _is_delisting(f)]
-    acquisition = [f for f in window if f.form == "8-K" and "2.01" in f.items]
-    notice = [f for f in window if f.form == "8-K" and "3.01" in f.items]
-    bankrupt = [f for f in window if f.form == "8-K" and "1.03" in f.items]
-
-    def cite(fs: list[Filing], label: str) -> list[str]:
-        return [f"{label} {f.accession} filed {f.filed.isoformat()}" for f in fs]
-
-    cited = [f"Form {f.form} {f.accession} filed {f.filed.isoformat()}" for f in delisting]
-    cited += cite(acquisition, "8-K Item 2.01")
-    cited += cite(notice, "8-K Item 3.01")
-    cited += cite(bankrupt, "8-K Item 1.03")
-
-    if delisting and acquisition:
-        return Proposal(ev.ticker, "acquired", last, cited=cited)
-    if delisting:
-        return Proposal(ev.ticker, "delisted", last, cited=cited)
-    if ev.cik and ev.edgar_tickers and ev.ticker not in ev.edgar_tickers:
-        return Proposal(ev.ticker, "renamed", last, successor=ev.edgar_tickers[0],
-                        cited=[f"EDGAR CIK {ev.cik} ({ev.edgar_name}) now lists {', '.join(ev.edgar_tickers)}, "
-                               f"not {ev.ticker}"])
-
+def triage(ev: Evidence) -> Triage:
+    """Leads only. Nothing here is an issuer/security outcome (see the module docstring)."""
+    anchor = ev.last_tiingo_close[0] if ev.last_tiingo_close else None
+    end_text = f", endDate {ev.tiingo_end.isoformat()} (a vendor claim)" if ev.tiingo_end else ", no endDate"
     checked = [
-        "Tiingo listing: " + (
-            "not found" if not ev.tiingo_found
-            else f"found{', endDate ' + ev.tiingo_end.isoformat() if ev.tiingo_end else ', no endDate'}"),
+        "Tiingo listing: " + ("not found" if not ev.tiingo_found else "found" + end_text),
         "stored closes: TIINGO " + (f"{ev.last_tiingo_close[0]} at {ev.last_tiingo_close[1]:g}"
                                     if ev.last_tiingo_close else "none")
         + ", yfinance " + (f"{ev.last_yfinance_close[0]} at {ev.last_yfinance_close[1]:g}"
                            if ev.last_yfinance_close else "none"),
     ]
     missing: list[str] = []
-    if ev.cik:
-        checked.append(f"EDGAR CIK {ev.cik} ({ev.cik_source}, {ev.edgar_name or 'unnamed'}), tickers "
-                       f"{', '.join(ev.edgar_tickers) or 'none'}: no Form 25/25-NSE/15 and no 8-K Item 2.01 "
-                       f"since {start.isoformat()}")
-        if notice or bankrupt:
-            checked.append("; ".join(cited) + " (a notice or a bankruptcy, not a delisting)")
-        if ev.ticker in ev.edgar_tickers:
-            checked.append(f"EDGAR still lists {ev.ticker} for this issuer: consistent with a Tiingo-only gap")
-        missing.append("a Form 25/25-NSE/15 or an 8-K Item 2.01 for this issuer")
+    window = None
+    leads: list[Filing] = []
+    symbol_lead = ""
+    if anchor is None:
+        checked.append("no stored TIINGO close to anchor a filing window")
+        missing.append("a last stored close, to bound the filings that could relate to it")
     else:
-        checked.append("EDGAR: no CIK for this symbol in the SEC ticker file")
-        missing.append("the issuer's CIK (pass --cik TICKER=CIK once the issuer is identified) and its filings")
-    return Proposal(ev.ticker, None, last, checked=checked, missing=missing)
+        window = (anchor - timedelta(days=LEAD_BEFORE_DAYS), anchor + timedelta(days=LEAD_AFTER_DAYS))
+        if not ev.cik:
+            checked.append("EDGAR: no CIK for this symbol in the SEC ticker file")
+            missing.append("the issuer's CIK (pass --cik TICKER=CIK once the issuer is identified) and its filings")
+        else:
+            leads = [f for f in ev.filings if _kind(f) and window[0] <= f.filed <= window[1]]
+            span = f"{window[0].isoformat()} and {window[1].isoformat()}"
+            checked.append(
+                f"EDGAR CIK {ev.cik} ({ev.cik_source}, {ev.edgar_name or 'unnamed'}), current tickers "
+                f"{', '.join(ev.edgar_tickers) or 'none'}: "
+                + (f"{len(leads)} candidate filing(s) between {span}" if leads else
+                   f"no Form 25 / Form 15 / 8-K Item 2.01, 3.01 or 1.03 filed between {span}"))
+            if ev.edgar_tickers and ev.ticker not in ev.edgar_tickers:
+                symbol_lead = (f"EDGAR now lists {', '.join(ev.edgar_tickers)} for CIK {ev.cik}, not {ev.ticker}: "
+                               "a current-symbols list, not an old-to-new listing record")
+            elif ev.ticker in ev.edgar_tickers and not leads:
+                checked.append(f"EDGAR still lists {ev.ticker} for this issuer: consistent with a Tiingo-only gap")
+            if not leads and not symbol_lead:
+                missing.append("a Form 25 / 15 or an 8-K Item 2.01 / 3.01 / 1.03 for this issuer near the last close")
+    return Triage(ev.ticker, bool(leads or symbol_lead), window, leads, symbol_lead, checked, missing)
 
 
-# ── output ───────────────────────────────────────────────────────────────────
+# ── output (comments only) ───────────────────────────────────────────────────
 
-def _q(text: str) -> str:
-    return '"' + text.replace("\\", "\\\\").replace('"', "'") + '"'
+UNESTABLISHED = ("not established by this tool: that the filing(s) concern this issuer's listed security "
+                 "(class, venue), the last trading session, the acquirer or a successor symbol. Read the "
+                 "accession(s), then write the sidecar entry yourself.")
 
 
-def render(p: Proposal, ev: Evidence) -> str:
-    if p.status is None:
-        lines = [f"# {p.ticker}: STATUS NOT ESTABLISHED (no entry proposed)"]
-        lines += [f"#   checked: {c}" for c in p.checked]
-        lines += [f"#   would settle it: {m}" for m in p.missing]
+def render(t: Triage, ev: Evidence) -> str:
+    if not t.lead:
+        lines = [f"# {t.ticker}: STATUS NOT ESTABLISHED (no entry proposed)"]
+        lines += [f"#   checked: {c}" for c in t.checked]
+        lines += [f"#   would settle it: {m}" for m in t.missing]
         return "\n".join(lines)
-    note = (f"{p.status}: " + "; ".join(p.cited)
-            + (f". Tiingo: {ev.tiingo_name}" if ev.tiingo_name else "")
-            + ". Proposed by scripts/propose_ticker_status.py; reviewer to confirm before merging.")
-    lines = [f"  {p.ticker}:", f"    status: {p.status}"]
-    if p.status == "renamed":
-        lines.append(f"    successor: {p.successor}")
-    if p.status == "acquired":
-        accessions = ", ".join(c.split()[-3] for c in p.cited if "Item 2.01" in c) or "the 8-K"
-        lines.append(f"    acquirer: {_q('REVIEW: name the acquirer from 8-K ' + accessions)}")
-    if p.last_session:
-        lines.append(f"    last_session: {p.last_session.isoformat()}")
-    lines.append(f"    note: {_q(note)}")
+    lines = [f"# {t.ticker}: LEAD (triage, not a finding; no entry proposed)"]
+    lines += [f"#   checked: {c}" for c in t.checked]
+    for f in t.filings:
+        items = f" (Items: {', '.join(f.items)})" if f.items else ""
+        lines.append(f"#   candidate: {_kind(f)}: Form {f.form} {f.accession} filed {f.filed.isoformat()}{items}")
+    if t.symbol_lead:
+        lines.append(f"#   candidate: {t.symbol_lead}")
+    lines.append(f"#   {UNESTABLISHED}")
     return "\n".join(lines)
 
 
@@ -348,23 +364,22 @@ def run(
     err: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
 ) -> int:
     """Print one block per ticker; exit code 2 if any ticker's evidence could not be read."""
-    unavailable = 0
-    established = 0
+    unavailable = leads = 0
     for ticker in tickers:
         try:
             ev = gather(ticker, get=get, tiingo_headers=tiingo_headers, sec_headers=sec_headers,
                         cik_map=cik_map, cik_override=cik_overrides.get(ticker), last_closes=last_closes)
         except EvidenceUnavailable as exc:
             unavailable += 1
-            err(f"# {ticker}: EVIDENCE UNAVAILABLE, no entry proposed: {exc}")
+            err(f"# {ticker}: EVIDENCE UNAVAILABLE, nothing reported: {exc}")
             continue
-        proposal = classify(ev)
-        established += proposal.status is not None
-        out(render(proposal, ev))
-    out(f"# propose_ticker_status: {len(tickers)} tickers, {established} proposed, "
-        f"{len(tickers) - established - unavailable} not established, {unavailable} unavailable")
+        result = triage(ev)
+        leads += result.lead
+        out(render(result, ev))
+    out(f"# propose_ticker_status: {len(tickers)} tickers, {leads} with a lead, "
+        f"{len(tickers) - leads - unavailable} not established, {unavailable} unavailable")
     if unavailable:
-        err(f"propose_ticker_status: {unavailable} ticker(s) have no entry because a source could not be read")
+        err(f"propose_ticker_status: {unavailable} ticker(s) have no block because a source could not be read")
         return 2
     return 0
 
