@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, beforeAll, beforeEach } from 'vitest';
-import SectorDive, { IntelligenceFeed, ticketKellyText, ticketConfidenceTier, finiteNumberOrNull } from '../views/SectorDive.jsx';
+import SectorDive, { IntelligenceFeed, ticketKellyText, ticketConfidenceTier, finiteNumberOrNull, featureSnapshotNotice } from '../views/SectorDive.jsx';
 import { api } from '../api.js';
 
 vi.mock('../api.js', () => ({
@@ -265,5 +265,41 @@ describe('SectorDive intelligence feed defaults (#959, Codex hold)', () => {
         );
         const titles = [...container.querySelectorAll('[title]')].map(e => e.title);
         expect(titles).toEqual(expect.arrayContaining(['confirmed', 'estimated']));
+    });
+});
+
+
+describe('Sector Dive says when the server-side z-scores are stale or still warming (#959, Codex hold on #1499)', () => {
+    it('featureSnapshotNotice: fresh or absent says nothing; unavailable and stale say what they are', () => {
+        expect(featureSnapshotNotice(undefined)).toBeNull();
+        expect(featureSnapshotNotice(null)).toBeNull();
+        expect(featureSnapshotNotice({ state: 'fresh', age_seconds: 12 })).toBeNull();
+        expect(featureSnapshotNotice({ state: 'unavailable', age_seconds: null })).toMatch(/still warming up.*"--".*not zero/);
+        expect(featureSnapshotNotice({ state: 'stale', age_seconds: 780 })).toMatch(/13 min old/);
+        expect(featureSnapshotNotice({ state: 'stale', age_seconds: 5 })).toMatch(/1 min old/);
+        expect(featureSnapshotNotice({ state: 'stale', age_seconds: 'x' })).toMatch(/older than usual/);
+        expect(featureSnapshotNotice({ state: 'stale' })).toMatch(/older than usual/);
+    });
+
+    async function renderWith(snapshot) {
+        api.getSectorDetail.mockResolvedValue({ ...DETAIL_NO_SIGNALS, ...(snapshot ? { feature_snapshot: snapshot } : {}) });
+        api.getSectorHealth.mockResolvedValue(HEALTH_UNAVAILABLE);
+        render(<SectorDive sector="Technology" onBack={() => {}} />);
+        await waitFor(() => expect(screen.getByText('Technology')).toBeInTheDocument());
+    }
+
+    it('shows a notice on the page while the feature maps are unavailable', async () => {
+        await renderWith({ state: 'unavailable', age_seconds: null });
+        expect(screen.getByTestId('feature-snapshot-notice')).toHaveTextContent(/still warming up on the server/);
+    });
+
+    it('shows a notice with the age when they are stale, and none when fresh or absent', async () => {
+        await renderWith({ state: 'stale', age_seconds: 1200 });
+        expect(screen.getByTestId('feature-snapshot-notice')).toHaveTextContent('20 min old');
+    });
+
+    it('shows nothing for a fresh snapshot', async () => {
+        await renderWith({ state: 'fresh', age_seconds: 3 });
+        expect(screen.queryByTestId('feature-snapshot-notice')).toBeNull();
     });
 });
