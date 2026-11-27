@@ -30,6 +30,7 @@ import os
 import threading
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from enum import Enum
 from typing import Any
 
@@ -49,16 +50,80 @@ from store.options_provenance import (
     visible_sql,
 )
 
-# The one options-signal row the Oracle reads per ticker, values and lineage
-# in one statement (``OracleEngine._read_options_signal``).
+# The market session an Oracle decision belongs to is a New York day.
+_NY_SESSION_TZ = ZoneInfo("America/New_York")
+
+# ── The options-signal row at the decision clock (live only) ─────────────
+#
+# ``options_daily_signals`` keeps one mutable row per (ticker, signal_date):
+# every capture of the day overwrites it in place, and ``created_at`` is the
+# time of its last write (``ingestion/options.py``; a lower bound, the writing
+# transaction's start). There is no revision history and no commit-time
+# availability clock. So, as ``analysis/thesis_scorer.py`` already does for
+# this table:
+#
+# * only a live read is sound. A live read sees committed rows, and its
+#   decision clock is the instant just before the read;
+# * what the row said at a past decision clock cannot be reproduced. A replay
+#   is refused, never answered from the row as it stands now, and no earlier
+#   session is substituted;
+# * a row with no provable timing (no market day, no write time) is not used.
+#
+# The policy name is stored with every prediction's basis. A different rule
+# gets a new name, never a rewrite of this one.
+OPTIONS_SIGNAL_POLICY = "oracle_options_signal_live_v1"
+OPTIONS_USED = "used"
+OPTIONS_NO_ROW = "no_row"
+OPTIONS_UNREAD = "unread"
+OPTIONS_OTHER_SESSION = "unavailable_other_market_session"
+OPTIONS_TIMING_UNVERIFIABLE = "unavailable_timing_unverifiable"
+# Same strings as analysis/thesis_scorer.py for the same two findings.
+OPTIONS_REPLAY_UNAVAILABLE = "historical_replay_unavailable"
+OPTIONS_WRITTEN_AFTER_CLOCK = "unavailable_written_after_decision_clock"
+# A pass reads its inputs within minutes of its batch clock (the forward pass
+# has a 300 s budget). A batch clock further than this from the read is a
+# decision that is not being made now: a replay.
+OPTIONS_LIVE_WINDOW = timedelta(minutes=15)
+
+# The one options-signal row the Oracle reads per ticker: values, lineage,
+# market day and last-write time in one statement
+# (``OracleEngine._read_options_signal``).
 _OPTIONS_SIGNAL_SQL = (
     "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,"
     " total_oi, term_structure_slope, oi_concentration, "
-    + SIGNAL_ROW_IS_SCHWAB + " AS schwab_private"
+    + SIGNAL_ROW_IS_SCHWAB + " AS schwab_private, signal_date, created_at"
     " FROM " + VISIBLE_DAILY_SIGNALS
     + " ods WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)"
     " ORDER BY signal_date DESC LIMIT 1"
 )
+
+
+def _is_aware_clock(value: Any) -> bool:
+    """True for a timezone-aware datetime (judged by behaviour, not by class)."""
+    return (hasattr(value, "astimezone") and hasattr(value, "utcoffset")
+            and getattr(value, "tzinfo", None) is not None and value.utcoffset() is not None)
+
+
+def _as_market_day(value: Any) -> date | None:
+    """A DATE column as a date, whatever the driver returned. None when it is not one."""
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    if hasattr(value, "utcoffset") and hasattr(value, "date"):      # a datetime
+        return value.date()
+    return value if hasattr(value, "isoformat") and hasattr(value, "toordinal") else None
+
+
+def _as_utc_clock(value: Any) -> datetime | None:
+    """A TIMESTAMPTZ column as an aware UTC datetime. None when it is missing or unzoned."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return value.astimezone(timezone.utc) if _is_aware_clock(value) else None
 
 
 @dataclass(frozen=True)
@@ -72,6 +137,13 @@ class OptionsSignalRead:
 
     values: tuple[Any, ...] | None
     schwab_private: bool
+    #: The market day the row describes, its last-write time, and the instant
+    #: just before it was read (the live decision clock). All three are set by
+    #: the engine's own read; a read built by a caller has none, and
+    #: ``decision_time_options_read`` does not use it.
+    signal_date: date | None = None
+    written_at: datetime | None = None
+    read_at: datetime | None = None
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
@@ -1037,12 +1109,72 @@ class OracleEngine:
         Schwab-captured day counts once the operator has turned it on. A NULL
         lineage reads as Schwab (fail closed).
         """
+        # The live decision clock: the instant just before the read. A row
+        # committed after it may be visible to the read; its write time then
+        # exceeds this clock and decision_time_options_read refuses it.
+        read_at = datetime.now(timezone.utc)
         with self.engine.connect() as conn:
             row = conn.execute(visible_sql(_OPTIONS_SIGNAL_SQL, oracle_reads_schwab()),
                                {"t": ticker}).fetchone()
         if row is None:
-            return OptionsSignalRead(None, False)
-        return OptionsSignalRead(tuple(row[:8]), row[8] is None or bool(row[8]))
+            return OptionsSignalRead(None, False, read_at=read_at)
+        signal_date = _as_market_day(row[9]) if len(row) > 9 else None
+        written_at = _as_utc_clock(row[10]) if len(row) > 10 else None
+        return OptionsSignalRead(tuple(row[:8]), row[8] is None or bool(row[8]),
+                                 signal_date, written_at, read_at)
+
+    @staticmethod
+    def decision_time_options_read(
+        options_read: OptionsSignalRead | None, batch_clock: datetime,
+    ) -> tuple[OptionsSignalRead | None, dict[str, Any]]:
+        """The options row a decision may use, and the receipt of that judgement.
+
+        Used only when all of this holds (``OPTIONS_SIGNAL_POLICY``):
+
+        * the decision is being made now: the pass's batch clock is within
+          ``OPTIONS_LIVE_WINDOW`` of the read. Otherwise it is a replay, and
+          what the mutable row said then cannot be reproduced;
+        * the read carries its market day, its last-write time and its read
+          clock. A read built by a caller, with no provable timing, is not used;
+        * the row describes the read clock's own New York session;
+        * the row was last written at or before the read clock.
+
+        A row that fails is not handed to the models (``values`` becomes
+        ``None``) and no other session is substituted. The returned basis says
+        which rule decided, with the three clocks, and is stored on every
+        prediction of the ticker (``flow_context.options_signal_basis``): a
+        later in-place correction of the row changes neither the predictions
+        already stored nor their basis. The read keeps its ``schwab_private``
+        lineage either way: the private-use tag is judged on the read as made.
+        """
+        basis: dict[str, Any] = {
+            "policy": OPTIONS_SIGNAL_POLICY, "status": OPTIONS_UNREAD,
+            "session_date": None, "signal_date": None, "written_at": None, "read_at": None,
+        }
+        if options_read is None:
+            return None, basis
+        if options_read.values is None:
+            return options_read, basis | {"status": OPTIONS_NO_ROW}
+
+        def refuse(status: str) -> tuple[OptionsSignalRead, dict[str, Any]]:
+            return replace(options_read, values=None), basis | {"status": status}
+
+        read_at, written_at = options_read.read_at, options_read.written_at
+        clocks_ok = all(_is_aware_clock(c) for c in (read_at, written_at, batch_clock))
+        if options_read.signal_date is not None:
+            basis["signal_date"] = options_read.signal_date.isoformat()
+        if not clocks_ok or options_read.signal_date is None:
+            return refuse(OPTIONS_TIMING_UNVERIFIABLE)
+        basis["written_at"] = written_at.astimezone(timezone.utc).isoformat()
+        basis["read_at"] = read_at.astimezone(timezone.utc).isoformat()
+        basis["session_date"] = read_at.astimezone(_NY_SESSION_TZ).date().isoformat()
+        if abs(read_at - batch_clock) > OPTIONS_LIVE_WINDOW:
+            return refuse(OPTIONS_REPLAY_UNAVAILABLE)
+        if options_read.signal_date.isoformat() != basis["session_date"]:
+            return refuse(OPTIONS_OTHER_SESSION)
+        if written_at > read_at:
+            return refuse(OPTIONS_WRITTEN_AFTER_CLOCK)
+        return options_read, basis | {"status": OPTIONS_USED}
 
     def _gather_signals(
         self, ticker: str, families: list[str], options_read: OptionsSignalRead | None = None,
@@ -1663,6 +1795,16 @@ class OracleEngine:
         # price) inherits this tag, which keeps it out of non-admin readers.
         if self._schwab_private_inputs(ticker, reference, options_read):
             flow_ctx[ORACLE_PRIVATE_USE_KEY] = ORACLE_PRIVATE_USE_SCHWAB
+        # After the tag (judged on the read as made): the models get the row
+        # only under OPTIONS_SIGNAL_POLICY, and the receipt goes on every row.
+        options_read, options_basis = self.decision_time_options_read(options_read, now)
+        flow_ctx["options_signal_basis"] = options_basis
+        if options_basis["status"] not in (OPTIONS_USED, OPTIONS_NO_ROW, OPTIONS_UNREAD):
+            log.warning(
+                "Oracle {t}: options-signal row not used ({s}; row dated {d}, written {w})",
+                t=ticker, s=options_basis["status"], d=options_basis["signal_date"],
+                w=options_basis["written_at"],
+            )
         if not spot:
             log.warning(
                 "Oracle: no spot price for {t} - storing no_data placeholder per model",
