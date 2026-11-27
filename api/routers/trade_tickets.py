@@ -39,8 +39,11 @@ def _finite_in_range(value: Any, low: float, high: float) -> float | None:
     """``value`` as a float when it is a finite number inside [low, high], else None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
-    return number if math.isfinite(number) and low <= number <= high else None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    # Compare before converting: float(10**400) raises OverflowError, but an int compares exactly with
+    # the float bounds, so an oversized integer is simply out of range.
+    return float(value) if low <= value <= high else None
 
 
 def _validated_ticket(ticket: dict[str, Any]) -> dict[str, Any]:

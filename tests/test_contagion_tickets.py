@@ -421,20 +421,13 @@ class TestTicketFieldHonesty:
         assert t["confidence_basis"] == ctt.CONFIDENCE_BASIS_BACKTEST
         assert t["kelly_size"] == 0.0   # a real accuracy of 0 sizes to 0
 
-    def test_journal_still_records_the_sizing_default_for_a_no_history_ticket(self):
-        # The immutable journal needs a number; a ticket without a measured confidence is journaled at
-        # the sizing default it was sized with, as before.
-        import inspect
-        src = inspect.getsource(ctt.write_ticket_to_journal)
-        assert "DEFAULT_CONFIDENCE_NO_HISTORY" in src
-        assert 'ticket.get("confidence") or 0.5' not in src
 
 
 class TestTradeTicketRouteValidation:
     @pytest.mark.parametrize("value,expected", [
         (0.0, 0.0), (0.6, 0.6), (1.0, 1.0),
         (None, None), (float("nan"), None), (float("inf"), None), (-0.01, None), (1.01, None),
-        ("0.6", None), (True, None), ([0.6], None),
+        ("0.6", None), (True, None), ([0.6], None), (10**400, None), (-(10**400), None), (1, 1.0), (0, 0.0),
     ])
     def test_confidence_is_a_finite_fraction_or_absent(self, value, expected):
         from api.routers.trade_tickets import _validated_ticket
@@ -442,7 +435,7 @@ class TestTradeTicketRouteValidation:
 
     @pytest.mark.parametrize("value,expected", [
         (0.0, 0.0), (0.05, 0.05), (None, None), (float("nan"), None), (float("inf"), None),
-        (-0.01, None), (0.0501, None), (1e308, None), ("0.05", None), (False, None),
+        (-0.01, None), (0.0501, None), (1e308, None), ("0.05", None), (False, None), (10**400, None),
     ])
     def test_kelly_is_finite_and_inside_the_cap_or_absent(self, value, expected):
         from api.routers.trade_tickets import _validated_ticket
@@ -462,3 +455,72 @@ class TestTradeTicketRouteValidation:
         # allow_nan=False is what a strict JSON encoder enforces: this raised before the validation.
         json.dumps(result, allow_nan=False)
         assert result["tickets"][0]["confidence"] is None and result["tickets"][0]["kelly_size"] is None
+
+
+class TestJournalContract:
+    """The decision journal keeps its numeric column; the basis is recorded beside it (#959, Codex hold)."""
+
+    def _journal(self, ticket):
+        import sys
+        import types
+        captured: dict = {}
+
+        class _FakeJournal:
+            def __init__(self, db_engine=None):
+                pass
+
+            def log_decision(self, **kw):
+                captured.update(kw)
+                return 7
+
+        fake_mod = types.ModuleType("journal.log")
+        fake_mod.DecisionJournal = _FakeJournal
+        with patch.dict(sys.modules, {"journal.log": fake_mod}):
+            assert ctt.write_ticket_to_journal(MagicMock(), ticket, model_version_id=1) == 7
+        return captured
+
+    @staticmethod
+    def _ticket(**over):
+        base = {"direction": "short", "instrument": "put", "ticker": "aapl", "strike": 175.0,
+                "expiry": "2026-12-18", "kelly_size": 0.05, "thesis": "t", "shock_type": "x",
+                "prediction_id": 1, "shock_node": "n", "margin_impact_pct": -0.1,
+                "dealer_gamma_context": {}}
+        base.update(over)
+        return base
+
+    def test_measured_and_default_55_are_the_same_number_but_different_bases(self):
+        measured = self._journal(self._ticket(confidence=0.55, confidence_basis="backtest_accuracy", kelly_basis="backtest_accuracy"))
+        default = self._journal(self._ticket(confidence=None, confidence_basis="default_no_history", kelly_basis="default_no_history"))
+        assert measured["state_confidence"] == default["state_confidence"] == 0.55
+        assert measured["operator_confidence"] == default["operator_confidence"] == "MEDIUM"
+        assert ctt.journal_ticket_basis(measured["contradiction_flags"]) == "backtest_accuracy"
+        assert ctt.journal_ticket_basis(default["contradiction_flags"]) == "default_no_history"
+        assert ctt.journal_ticket_basis(default["contradiction_flags"], "kelly_basis") == "default_no_history"
+
+    def test_deliberate_deltas_from_the_previous_writer(self):
+        # A measured 0 used to journal (0.5, MEDIUM) via `0 or 0.5`; now (0.0, LOW).
+        zero = self._journal(self._ticket(confidence=0.0, confidence_basis="backtest_accuracy", kelly_basis="backtest_accuracy"))
+        assert (zero["state_confidence"], zero["operator_confidence"]) == (0.0, "LOW")
+        # An invalid accuracy (1.7) used to clamp to (1.0, HIGH); the producer now emits no confidence,
+        # so the sizing default is journaled with basis default_no_history.
+        invalid = self._journal(self._ticket(confidence=None, confidence_basis="default_no_history", kelly_basis="default_no_history"))
+        assert (invalid["state_confidence"], invalid["operator_confidence"]) == (0.55, "MEDIUM")
+        # No-history stays (0.55, MEDIUM) as before.
+        assert ctt.DEFAULT_CONFIDENCE_NO_HISTORY == 0.55
+
+    def test_a_ticket_without_basis_keys_journals_unknown_and_old_rows_count_as_unknown(self):
+        legacy = self._journal(self._ticket(confidence=0.7))   # no basis keys
+        assert legacy["contradiction_flags"]["confidence_basis"] == "unknown"
+        assert legacy["contradiction_flags"]["kelly_basis"] == "unknown"
+        # Rows written before the keys existed carry neither: unknown, never measured.
+        old_row_flags = {"flow_thesis": ctt.FLOW_THESIS_TAG, "prediction_id": 1}
+        assert ctt.journal_ticket_basis(old_row_flags) == "unknown"
+        assert ctt.journal_ticket_basis(None) == "unknown"
+        assert ctt.journal_ticket_basis("not json") == "unknown"
+        assert ctt.journal_ticket_basis('{"confidence_basis": "backtest_accuracy"}') == "backtest_accuracy"
+        assert ctt.journal_ticket_basis({"confidence_basis": "something_else"}) == "unknown"
+
+    def test_the_journal_column_is_still_a_valid_number(self):
+        for conf in (None, 0.0, 0.3, 1.0):
+            j = self._journal(self._ticket(confidence=conf, confidence_basis="x"))
+            assert isinstance(j["state_confidence"], float) and 0.0 <= j["state_confidence"] <= 1.0

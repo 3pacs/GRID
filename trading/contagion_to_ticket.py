@@ -64,6 +64,24 @@ DEFAULT_CONFIDENCE_NO_HISTORY: float = 0.55
 # confidence; the no-history default is a sizing policy, never a measurement.
 CONFIDENCE_BASIS_BACKTEST = "backtest_accuracy"
 CONFIDENCE_BASIS_DEFAULT = "default_no_history"
+JOURNAL_BASIS_UNKNOWN = "unknown"
+
+
+def journal_ticket_basis(contradiction_flags: Any, key: str = "confidence_basis") -> str:
+    """The basis of a journaled ticket's confidence (or kelly, with ``key="kelly_basis"``).
+
+    Journal rows written before the basis keys existed have none: they count as ``"unknown"``, never as
+    measured. Anything that is not a recognised basis string also reads as ``"unknown"``.
+    """
+    if isinstance(contradiction_flags, str):
+        try:
+            contradiction_flags = json.loads(contradiction_flags)
+        except ValueError:
+            return JOURNAL_BASIS_UNKNOWN
+    if not isinstance(contradiction_flags, dict):
+        return JOURNAL_BASIS_UNKNOWN
+    basis = contradiction_flags.get(key)
+    return basis if basis in (CONFIDENCE_BASIS_BACKTEST, CONFIDENCE_BASIS_DEFAULT) else JOURNAL_BASIS_UNKNOWN
 INVALIDATION_SHORT_UP_PCT: float = 0.02
 INVALIDATION_LONG_DOWN_PCT: float = 0.02
 FLOW_THESIS_TAG: str = "contagion_derived"
@@ -493,7 +511,24 @@ def write_ticket_to_journal(
     ticket: dict[str, Any],
     model_version_id: int | None = None,
 ) -> int | None:
-    """Append a ticket to ``decision_journal``."""
+    """Append a ticket to ``decision_journal``.
+
+    The journal column ``state_confidence`` must be a number in [0, 1], so it keeps one; what it means is
+    recorded next to it in ``contradiction_flags`` (the row's existing metadata): ``confidence_basis`` and
+    ``kelly_basis`` are ``"backtest_accuracy"`` (a measured accuracy) or ``"default_no_history"`` (the
+    sizing default, not a measurement). Rows written before these keys existed have neither: a reader
+    must count a row with no basis as ``"unknown"`` (``journal_ticket_basis``), never as measured.
+
+    Deliberate differences from the previous writer (``float(confidence or 0.5)`` clamped to [0, 1]),
+    for the same ticket inputs:
+
+    * a measured accuracy of exactly 0 journals ``(0.0, LOW)``; it used to journal ``(0.5, MEDIUM)``,
+      because ``0 or 0.5`` replaced a measurement with a default;
+    * an out-of-range accuracy such as 1.7 is not a measurement: it journals the sizing default
+      ``(0.55, MEDIUM)`` with basis ``default_no_history``; it used to clamp to ``(1.0, HIGH)``;
+    * a no-history ticket journals ``(0.55, MEDIUM)`` as before, now with basis ``default_no_history``,
+      so it can be told apart from a measured 0.55.
+    """
     try:
         from journal.log import DecisionJournal
     except Exception as exc:  # pragma: no cover — import guard
@@ -505,11 +540,13 @@ def write_ticket_to_journal(
         log.debug("journal skip: no model_version_id available")
         return None
 
-    # The immutable journal needs a number: a ticket with no measured confidence is journaled at the
-    # sizing default it was sized with (exactly what it recorded before confidence became absent).
+    # The journal column needs a number: a ticket with no measured confidence is journaled at the
+    # sizing default it was sized with, and its basis says so (see the docstring).
     stated = ticket.get("confidence")
     confidence = float(stated) if stated is not None else DEFAULT_CONFIDENCE_NO_HISTORY
     confidence = max(0.0, min(1.0, confidence))
+    confidence_basis = ticket.get("confidence_basis") or JOURNAL_BASIS_UNKNOWN
+    kelly_basis = ticket.get("kelly_basis") or JOURNAL_BASIS_UNKNOWN
     state_label = f"CONTAGION_{str(ticket.get('shock_type','')).upper()}"
     action = (
         f"{ticket['direction'].upper()} {ticket['instrument'].upper()} "
@@ -523,6 +560,8 @@ def write_ticket_to_journal(
         "shock_type": ticket.get("shock_type"),
         "margin_impact_pct": ticket.get("margin_impact_pct"),
         "dealer_gamma_context": ticket.get("dealer_gamma_context"),
+        "confidence_basis": confidence_basis,
+        "kelly_basis": kelly_basis,
     }
 
     try:
