@@ -21,6 +21,7 @@ from oracle.entry_price_policy import (
     load_quote_reference,
     tracking_reference_return,
 )
+from oracle.forward_health import forward_health
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
 from store.options_provenance import VISIBLE_ORACLE_PREDICTIONS, include_schwab_rows, visible_sql
@@ -381,6 +382,32 @@ def get_latest(
         "recent_scored": recent_scored,
         "streak": streak,
     }
+
+
+_forward_health_cache: TTLCache = TTLCache(ttl=60, max_size=2)
+
+
+@router.get("/forward-health")
+def get_forward_health(
+    _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
+) -> dict:
+    """Whether the forward pass produced a usable forecast this session, and if not, why.
+
+    Read from the durable record (attempts and stored rows). An admin request
+    reads every prediction and gets the operator notes; everyone else reads the
+    public cohort (``oracle.forward_health``).
+    """
+    # One read a minute per cohort: the page asks on every visit.
+    cohort = "all" if include_schwab_rows(include_schwab) else "public"
+    cached = _forward_health_cache.get(cohort)
+    if cached is not None:
+        return cached
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        health = forward_health(conn, now=datetime.now(timezone.utc), include_schwab=include_schwab)
+    _forward_health_cache.set(cohort, health)
+    return health
 
 
 @router.get("/predict-live/{ticker}")

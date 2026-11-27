@@ -319,6 +319,50 @@ def _metadata_provider(clock_metadata: Any) -> str:
     return ""
 
 
+def withheld_capture_note(conn: Any, ticker: str, *, as_of: Any) -> str | None:
+    """For an admin request: a private-use capture of ``ticker`` was the newest one registered by ``as_of``.
+
+    What this establishes, and what it does not. It reads one row: the newest
+    capture batch registered by ``as_of``, its provider class and completion
+    time. A non-``None`` return means that batch is one the public cohort may
+    not read (``VISIBLE_CAPTURE_BATCHES`` would hide it). It does **not**
+    establish that the Oracle's private-use switch was off at that time, nor
+    that this is why a prediction abstained: the switch is process
+    environment, not recorded on any row. So the sentence is conditional. It
+    names something to check.
+
+    Why it is worth saying at all: with the switch off and a private-use
+    capture as the newest one, the Oracle freezes an older public quote, the
+    entry-price policy refuses it as stale, and the stored reason ("quote
+    belongs to a different market session") is true and points away from the
+    cause (2026-11-23 to 11-25).
+
+    It returns no price and no row. It does say that a private-use capture
+    exists and when it completed, which a batch listing hides from non-admin
+    readers, so callers give it to admin requests only and keep it out of
+    stored rows and out of e-mail.
+    """
+    from sqlalchemy import text
+
+    statement = text(
+        "SELECT schwab_pb.capture_completed_at, CASE WHEN " + _SCHWAB_BATCH + " THEN 1 ELSE 0 END"
+        " FROM options_capture_batches schwab_pb WHERE schwab_pb.ticker = :ticker"
+        " AND schwab_pb.capture_completed_at <= :as_of AND schwab_pb.registered_at <= :as_of"
+        " ORDER BY schwab_pb.capture_ordinal DESC LIMIT 1"
+    ).bindparams(schwab_from=SCHWAB_POSSIBLE_FROM.isoformat())
+    row = conn.execute(statement, {"ticker": ticker, "as_of": as_of}).fetchone()
+    if row is None or not row[1]:
+        return None
+    completed = row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])
+    return (
+        f"a private-use capture of {ticker} was the newest one registered by that time (completed"
+        f" {completed}). If the Oracle's private-use switch ({ORACLE_SCHWAB_ENV}={ORACLE_SCHWAB_ON})"
+        " was off for the process that made the decision, that capture was not readable and an older"
+        " public quote would have been frozen instead. Check the switch before anything else"
+        " (deploy/systemd/README.md). This shows what was in the table, not why the pass abstained."
+    )
+
+
 def provider_is_schwab(spot_provider: Any, clock_metadata: Any = None) -> bool:
     """True when either provider field of a capture names Schwab (the writer's check)."""
     return (str(spot_provider or "").strip().lower() == SCHWAB_PROVIDER
