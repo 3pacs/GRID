@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
@@ -677,6 +678,7 @@ def batch_postmortem(
     engine: Engine,
     days: int = 30,
     limit: int | None = None,
+    deadline: float | None = None,
 ) -> list[PostMortem]:
     """Generate post-mortems for all failed trades and predictions in the last N days.
 
@@ -697,6 +699,11 @@ def batch_postmortem(
             minutes on the live corpus (2026-05-16 audit observed 256
             new rows in 30 min on the LLM-narrative path). Cron-friendly
             pattern: schedule every 15 min with ``limit=20``.
+
+    deadline: ``time.monotonic()`` value after which no NEW row is started (a row already running
+        finishes). The caller picks it so the batch ends inside its own time budget: rows left over are
+        simply picked up by the next run (the ``NOT IN trade_postmortems`` selection), and the batch
+        completes and reports on time instead of being abandoned by its wrapper and finishing late.
 
     Returns:
         list of PostMortem objects.
@@ -740,8 +747,16 @@ def batch_postmortem(
         trade_rows = conn.execute(text(trade_sql), params).fetchall()
         pred_rows = conn.execute(text(pred_sql), params).fetchall()
 
+    stopped_at_deadline = False
+
+    def _past_deadline() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
     # Generate trade post-mortems
     for (trade_id,) in trade_rows:
+        if _past_deadline():
+            stopped_at_deadline = True
+            break
         try:
             pm = generate_postmortem(engine, trade_id)
             if pm:
@@ -751,6 +766,9 @@ def batch_postmortem(
 
     # Generate prediction post-mortems
     for (pred_id,) in pred_rows:
+        if _past_deadline():
+            stopped_at_deadline = True
+            break
         try:
             pm = generate_prediction_postmortem(engine, pred_id)
             if pm:
@@ -764,9 +782,13 @@ def batch_postmortem(
 
     log.info(
         "Batch post-mortem complete: {n} failures analysed over {d} days"
-        "{lim_note}",
+        "{lim_note}{dl_note}",
         n=len(postmortems), d=days,
         lim_note=f" (limit={limit} per source)" if limit else "",
+        dl_note=(
+            " (stopped at its deadline; the remaining rows are picked up by the next run)"
+            if stopped_at_deadline else ""
+        ),
     )
     return postmortems
 

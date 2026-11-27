@@ -288,7 +288,15 @@ DAILY_INTEL_CYCLE_BUDGET_SECONDS = 480        # cumulative wall-time budget for 
 DAILY_INTEL_LLM_TASK_BUDGET_S = 180           # documented default per-task budget for LLM-backed daily-intel tasks (source_audit, backtest_scan, options_improvement, hypothesis_review, hypothesis_discovery, rag_index, actor_research, edgar_transcripts) — sized like the other single-to-few-call LLM steps above (e.g. TIMESFM_TIMEOUT_SECONDS, KNOWLEDGE_MAP_TIMEOUT_SECONDS), not the many-ticker ORACLE_CYCLE_TIMEOUT_SECONDS.
 DAILY_INTEL_SQL_TASK_BUDGET_S = 60            # documented default per-task budget for SQL/CPU-only daily-intel tasks (flow_materialize, icij_linking, attention_anomaly, corporate_actions, capital_flow_rollups, fundamental_divergence, holder_deal_overlap) — matches SMART_INGESTION/RESOLUTION-class steps, generous headroom over the sub-10s runtimes those steps observe.
 DAILY_INTEL_CLEANUP_TASK_BUDGET_S = 30        # documented default per-task budget for the three daily-intel file/log cleanup tasks (insight_cleanup, briefing_cleanup, errors_jsonl_cleanup) — cheap filesystem work, not DB or LLM bound.
-DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = DAILY_INTEL_LLM_TASK_BUDGET_S  # postmortem_batch is LLM-backed but bounded on the WORK axis by POSTMORTEM_BATCH_LIMIT (20 rows/cycle, see above) rather than its own time constant; the time budget still uses the LLM default.
+# postmortem_batch: each row is an LLM-narrated post-mortem, ~20-30 s (journal 2026-11-26/27: 20 rows took 542.8 s and
+# 412.2 s). With the 180 s LLM default it timed out EVERY night, was blacklisted for 24 h and finished late, the period
+# marked done_late with its results never published (hermes_operator done_late path). The budget is now sized to the
+# work and the batch is handed a DEADLINE (budget minus a margin that covers one worst-case row) after which it stops
+# STARTING rows, so it completes and publishes inside the budget; unfinished rows are picked up by the next run.
+# Throughput is therefore ~(budget - margin) / ~25 s rows per run, below POSTMORTEM_BATCH_LIMIT, instead of 20 rows
+# that were flagged late. 300 s is a deliberate middle: a longer budget would hold the daemon cycle for minutes.
+DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = 300
+DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S = 60  # >= one worst-case LLM post-mortem row plus its store
 DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_maintenance_subagent only QUEUES a subagent dispatch command (_execute_hermes_repair_command) — no LLM call in this step itself — so it gets the SQL-class default, not the LLM one.
 
 # capital_flow_rollups / fundamental_divergence per-task budgets
@@ -2008,9 +2016,14 @@ def _daily_intel_postmortem_batch(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
     from intelligence.postmortem import batch_postmortem
+    # Stop STARTING rows early enough that the batch ends inside its own budget (see the constants), so it
+    # reports on time instead of timing out, being blacklisted and finishing late with nothing published.
+    deadline = time.monotonic() + max(
+        0.0, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S - DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S,
+    )
     results["postmortem_batch"] = _run_intel_task(
         "postmortem_batch", batch_postmortem, state, engine,
-        limit=POSTMORTEM_BATCH_LIMIT,
+        limit=POSTMORTEM_BATCH_LIMIT, deadline=deadline,
     )
     _daily_intel_raise_if_task_status_failed(state, "postmortem_batch")
 

@@ -763,10 +763,19 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # task has a final outcome. Each weekly call is unchanged. No SEC,
         # FINRA or dispatch-prefix change. Needs reviewer acceptance like the
         # prior pins.
+        # OPER re-pinned 754dfee2 -> 7aaf8d96 (2026-11-27,
+        # claude/m1-postmortem-budget-20261127): the only operator edits are the
+        # daily-intel postmortem budget (DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S 180
+        # -> 300, with its comment, and the new DAILY_INTEL_POSTMORTEM_DEADLINE_
+        # MARGIN_S) and _daily_intel_postmortem_batch, which now passes
+        # deadline=<monotonic now + budget - margin> to batch_postmortem so the
+        # batch stops starting rows and ends inside its budget instead of timing
+        # out, being blacklisted and finishing late. No SEC, FINRA or dispatch
+        # change. Needs reviewer acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','7aaf8d967766d196118b42dedb66b611c1f9d4a1c5fbd2a941c1fefa0ee9155b'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
