@@ -55,11 +55,11 @@ def test_contracts_run_beside_the_suite_not_after_it(jobs: dict[str, Any]) -> No
     assert names.index("Start ephemeral Postgres (hosted runner)") < names.index(contract_steps[0])
 
 
-def test_backend_tests_is_the_gate_for_both(jobs: dict[str, Any]) -> None:
+def test_backend_tests_is_the_gate_for_all(jobs: dict[str, Any]) -> None:
     job = jobs["backend-tests"]
     assert job["name"] == "Backend Tests"
     assert "strategy" not in job
-    assert job["needs"] == ["backend-tests-suite", "backend-tests-contracts"]
+    assert job["needs"] == ["backend-tests-suite", "backend-tests-contracts", "backend-tests-pit-postgres"]
     assert job["if"] == "${{ !cancelled() }}"
     steps = job["steps"]
     # the tested checkout first, plain
@@ -68,11 +68,12 @@ def test_backend_tests_is_the_gate_for_both(jobs: dict[str, Any]) -> None:
     assert gate["env"] == {
         "SUITE_RESULT": "${{ needs.backend-tests-suite.result }}",
         "CONTRACTS_RESULT": "${{ needs.backend-tests-contracts.result }}",
+        "PIT_POSTGRES_RESULT": "${{ needs.backend-tests-pit-postgres.result }}",
     }
-    for var in ("SUITE_RESULT", "CONTRACTS_RESULT"):
+    for var in ("SUITE_RESULT", "CONTRACTS_RESULT", "PIT_POSTGRES_RESULT"):
         assert f'[ "${var}" != "success" ]' in gate["run"]
-    assert gate["run"].count("exit 1") == 2
-    # no database here, and nothing that belongs to the other two jobs
+    assert gate["run"].count("exit 1") == 3
+    # no database here, and nothing that belongs to the other jobs
     names = _names(job)
     assert not [n for n in names if "Postgres" in n or "PostgreSQL contract" in n]
     assert "Run tests" not in names
@@ -92,3 +93,15 @@ def test_manifests_land_in_a_fresh_per_job_directory(jobs: dict[str, Any]) -> No
 def test_no_step_is_in_both_jobs(jobs: dict[str, Any]) -> None:
     shared = (set(_names(jobs["backend-tests"])) & set(_names(jobs["backend-tests-contracts"]))) - SHARED_SETUP
     assert {n for n in shared if not n.startswith("actions/checkout@")} == set()
+
+
+def test_pit_postgres_uses_a_fresh_hosted_service_without_enabling_the_shards(jobs: dict[str, Any]) -> None:
+    pit = jobs["backend-tests-pit-postgres"]
+    assert pit["runs-on"] == "ubuntu-latest"
+    assert "needs" not in pit and "if" not in pit
+    pg = pit["services"]["postgres"]
+    assert pg["image"] == "postgres:15"
+    assert pg["env"]["POSTGRES_DB"] == "grid_pit_test"
+    assert pg["ports"] == ["5432/tcp"]
+    suite = jobs["backend-tests-suite"]
+    assert all("GRID_TEST_DB_URL" not in s.get("env", {}) for s in suite["steps"])

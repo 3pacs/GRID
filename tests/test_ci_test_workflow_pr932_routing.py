@@ -88,7 +88,7 @@ SELF_HOSTED = ["self-hosted", "tests"]
 # the required aggregate after both.
 JOBS = ("backend-tests-contracts", "backend-tests", "frontend-build", "lint")
 # Every job in file order; the suite shards are pinned to hosted runners.
-ALL_JOBS = ("backend-tests-suite", "backend-tests-contracts", "backend-tests", "frontend-build", "lint")
+ALL_JOBS = ("backend-tests-suite", "backend-tests-contracts", "backend-tests-pit-postgres", "backend-tests", "frontend-build", "lint")
 
 
 def _templates(predicate: str) -> dict[str, str]:
