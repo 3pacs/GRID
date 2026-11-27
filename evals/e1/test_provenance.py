@@ -38,8 +38,10 @@ conftest, no pytest configuration file, no auto-loaded plugins), and fails
 unless each is collected and passes (none skipped): the parity claim is
 executed on every E1 run, not just named. The pin is a tripwire against the
 evidence being weakened or bypassed, not a proof that the evidence is
-sufficient: the code under test is deliberately not pinned, and whether these
-tests are enough is the reviewer's and the owner's judgement at sign-off. It is not an exemption: an undeclared writer, an implicit
+sufficient: the code under test is deliberately not pinned (so, for one, the
+missing-session test and the repair share ingestion.market_calendar and
+cannot see a change to it), and whether these tests are enough is the
+reviewer's and the owner's judgement at sign-off. It is not an exemption: an undeclared writer, an implicit
 flag, a stored basis that differs, a changed parity file or support module,
 or a missing, skipped or failing parity test fails the gate.
 
@@ -456,7 +458,7 @@ def parity_run_problems(refs: list[str], cwd: Path) -> list[str]:
 
     # Isolated from what is not pinned: no conftest, no pytest config file, no
     # auto-loaded plugins; the repository on the path for its own imports.
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     env.update({"TZ": os.environ.get("TZ", "UTC"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
                 "PYTHONPATH": str(cwd)})
     proc = subprocess.run(
@@ -496,12 +498,12 @@ def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path):
     # A plugin named in the environment is not loaded into the isolated run.
     (tmp_path / "evil_plugin.py").write_text(
         "def pytest_pyfunc_call(pyfuncitem):\n    return True\n")
-    os.environ["PYTEST_PLUGINS"] = "evil_plugin"
-    os.environ["PYTEST_ADDOPTS"] = "-p evil_plugin"
-    try:
-        assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path))
-    finally:
-        del os.environ["PYTEST_PLUGINS"], os.environ["PYTEST_ADDOPTS"]
+    for key, value in (("PYTEST_PLUGINS", "evil_plugin"), ("PYTEST_ADDOPTS", "-p evil_plugin")):
+        os.environ[key] = value
+        try:
+            assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path)), key
+        finally:
+            del os.environ[key]
     assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path))
     assert any("skipped" in p for p in parity_run_problems(["tests/test_p.py::test_skip"], tmp_path))
     assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_absent"], tmp_path))

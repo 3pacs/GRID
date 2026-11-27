@@ -837,7 +837,8 @@ def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False, a
       the tolerance is incomplete unless ``accept_superseded``. An ``undone``
       item is incomplete unless ``accept_undone``: after an undo the partial
       value is current again, so "ok" never means both "repaired" and
-      "undone" (verify an undo with ``--accept-undone``).
+      "undone" (verify an undo with ``--accept-undone``, which passes only
+      once no item is still ``applied``: the undo is finished).
     * ``ok`` is both. The command exits 0 only then: 1 on an integrity
       problem, 4 when the plan is intact but not (fully) applied.
     """
@@ -934,7 +935,7 @@ def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False, a
     over = sum(1 for x in supersessions if x > TOLERANCE)
     complete = (states["not_applied"] == 0 and states["repair_quarantined"] == 0
                 and (accept_plan_gaps or not has_gaps)
-                and (accept_undone or states["undone"] == 0)
+                and (states["undone"] == 0 or (accept_undone and states["applied"] == 0))
                 and (accept_superseded or over == 0))
     return {"run_id": run_id, "digest": plan["digest"], "planned": len(plan["items"]),
             "states": {k: states[k] for k in ("applied", "undone", "applied_then_superseded",

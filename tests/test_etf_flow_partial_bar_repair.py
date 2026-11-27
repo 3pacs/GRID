@@ -534,6 +534,30 @@ def test_undoing_a_repair_of_an_earlier_repair_keeps_that_earlier_runs_lineage()
     assert mod.verify_plan(engine, first)["integrity_ok"]                # no second row of the first run
 
 
+def test_accept_undone_passes_only_a_finished_undo(world, monkeypatch):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(inst, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(mod, "_monotonic", lambda: clock["t"])
+    real = mod._write_series
+
+    def _slow(*a, **kw):
+        out = real(*a, **kw)
+        clock["t"] += 10.0
+        return out
+
+    monkeypatch.setattr(mod, "_write_series", _slow)
+    half = mod.run_writes(engine, plan, mode="undo", deadline_at=15.0, session_day=SESSION_DAY,
+                          expect_digest=plan["digest"])
+    assert half["status"] == "STOPPED_AT_DEADLINE"
+    partly = mod.verify_plan(engine, plan, accept_undone=True)
+    assert partly["states"]["undone"] > 0 and partly["repair_in_force"] > 0 and not partly["ok"]
+    mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY, expect_digest=plan["digest"])
+    assert mod.verify_plan(engine, plan, accept_undone=True)["ok"]
+
+
 def test_undo_writes_only_for_the_exact_approved_digest(world, tmp_path):
     engine, market, _ = world
     plan = _plan(engine, market)
