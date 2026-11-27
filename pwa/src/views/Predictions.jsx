@@ -4,6 +4,7 @@ import { shared, colors, tokens } from '../styles/shared.js';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import OracleForwardHealth from '../components/OracleForwardHealth.jsx';
 import { humanizeOr } from '../utils/text.js';
 
 // ── Styles ────────────────────────────────────────────────────────────────
@@ -734,6 +735,8 @@ export default function Predictions() {
                 <span>Oracle Predictions</span>
                 <span style={s.headerAccent}>TRACK RECORD</span>
             </div>
+
+            <OracleForwardHealth />
 
             {loading && !scoreboard ? (
                 <LoadingSkeleton variant="card" count={3} />

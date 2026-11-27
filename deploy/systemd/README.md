@@ -661,3 +661,70 @@ P&L, weights and timestamps that the scorer and weight evolution update from
 every scored row, private ones included. Only an admin request reads them
 (`/oracle/scorecard` admin branch, scoreboard weights); everyone else gets
 public-cohort counts (`tests/test_oracle_model_state_private.py`).
+
+### When the forward pass has no usable forecast
+
+With the switch off and Schwab as the options provider, the Oracle cannot read
+its own forward capture: it freezes an older public quote, the entry-price
+policy refuses it, and every model abstains (2026-11-23 to 11-25: 1,830
+`no_data` rows, each pass reported `completed`). That is now loud:
+
+- the pass reports `all_abstained` (some ticker abstained) or `no_result` (no
+  ticker even had a candidate) instead of `completed`, and logs an ERROR.
+  `completed` and `partial` now mean that at least one captured ticker holds a
+  forecast;
+- one `[GRID CRITICAL] Oracle forward pass needs attention (<session date>)`
+  e-mail per session: at once when every candidate abstained, after two or more attempts
+  that stored nothing over at least an hour, and from the daily sweep for a
+  session in which no pass ran or which ended with a cohort ticker lacking a
+  forecast (a ticker on which no model produces a candidate writes no row).
+  "Already sent" is one marker row per session in `oracle_iterations`
+  (`oracle/forward_alert.py`), shared by Hermes and the sweep, so a Hermes
+  restart or the sweep judging Friday again over a weekend sends nothing new.
+  The e-mail is generic on purpose: the session date and where an
+  authenticated admin can read the rest. Counts, tickers, reasons and the
+  status stay on the host (the log, the sweep's alert file, the check script).
+  An ended session with a single attempt and nothing stored is reported by the
+  sweep too; the two-attempt, one-hour grace applies only while it is open;
+- `GET /api/v1/oracle/forward-health` and the status line on the Oracle page
+  say whether the session has a forecast for every cohort ticker. An admin
+  request also gets the attempt count, whether the alert was sent, and, when a
+  private-use capture was the newest one at the decision, a note saying so and
+  what to check. Everyone else gets an answer built from public rows and the
+  clock alone. No read looks past the instant it is asked about;
+- `scripts/oracle_forward_health_check.py --ended` exits 1 for a session that
+  ended with none (`--notes` adds the possible cause, for an operator at the
+  terminal). The daily freshness sweep runs it with `--alert --write-alert`.
+  The sweep's installed copy is root-owned, so after a release that changes
+  it, reinstall it:
+
+```bash
+sudo install -m 0755 -o root -g root \
+  /data/grid_v4/grid_release/server_setup/grid-data-freshness-check.sh \
+  /usr/local/bin/grid-data-freshness-check.sh
+```
+
+A pass that leaves the session waiting is followed sooner than an hour later
+(`oracle.forward_health.retry_plan`): about every 10 minutes, with a fresh
+capture each time, until the wait ends, 13 attempts have been made in the
+session, or 30 minutes before the close. "Waiting" is judged per ticker, on
+what it ended the newest finished pass with: it waits after `no_quote` (it
+abstained for want of a qualified quote, `flow_context.abstention_kind` =
+`no_qualified_quote`) and after `no_capture`. It does not wait after `no_vote`
+(the quote qualified and no model produced a candidate), so a ticker that
+abstained for its quote at 14:31 and got a qualified quote and no vote at 14:41
+is done, although its earlier abstention rows are still there. A session whose
+newest capture is a private-use one does not wait either (if the Oracle cannot
+read that one it cannot read the next; the pass stays hourly and the alert is
+sent at once). Each pass writes its own account as one row in
+`oracle_iterations`
+(`oracle_forward_v2:SPY_QQQ:1d:outcome:<status>|attempt=<attempt clock>|SPY=...|QQQ=...`);
+only the newest attempt's account is read, matched by that clock.
+
+The pass that succeeds makes the forecast, with its own decision time and its
+own frozen quote. An earlier abstention keeps its row and its clock. The
+20-minute and same-session quote rules are unchanged. While a retry is minutes
+away the alert waits for the second attempt.
+
+An abstention is the honest record of a pass with no qualified quote. Nothing
+here repairs or regenerates one; the fix for the cause is the switch above.

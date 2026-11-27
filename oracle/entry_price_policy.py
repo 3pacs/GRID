@@ -112,6 +112,12 @@ def is_divisible_entry_price(entry_price: Any) -> bool:
 # A delayed, observed benchmark is not an executable fill. Legacy prices are
 # never admitted by inferring a quote clock from their date or capture rows.
 QUOTE_REFERENCE_POLICY = "oracle_observed_reference_v1"
+# Why a prediction abstained, on the row itself (``flow_context``). The Oracle
+# writes this kind when it had no qualified entry quote at the decision: the
+# one case a fresh capture a few minutes later can change. Any other reason to
+# abstain uses a different kind, or none, and is not retried for.
+ABSTENTION_KIND_KEY = "abstention_kind"
+ABSTENTION_NO_QUALIFIED_QUOTE = "no_qualified_quote"
 QUOTE_MAX_AGE_SECONDS = 20 * 60
 # Providers whose capture spot is a qualified observed reference. Schwab joined
 # on 2026-11-23: its batches carry the same exact provider/capture clocks. Who

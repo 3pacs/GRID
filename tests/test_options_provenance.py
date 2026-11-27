@@ -716,29 +716,32 @@ def _tagged(predictions: list[Any]) -> list[bool]:
 
 
 NOW = datetime(2026, 11, 23, 16, tzinfo=timezone.utc)
+# These passes are decisions being made now: only an acting pass reads the options-signal row
+# (oracle.engine.DECISION_MODE_ACTING), and the tag is judged on that read.
+ACTING = "acting"
 
 
 def test_no_data_placeholders_carry_the_tag(db) -> None:
     oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "spy-schwab", "price": 595.0,
                                       "reason": "quote is older than the 20-minute reference limit"})
-    placeholders = oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)
+    placeholders = oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1, decision_mode=ACTING)
     assert _tagged(placeholders) == [True, True]
 
 
 def test_public_placeholders_are_not_tagged(db, oracle_on) -> None:
     oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "nuox-yahoo"})
-    assert _tagged(oracle._oracle_one_ticker(1, "NUOX", 1, NOW, {}, horizon_days=1)) == [False, False]
+    assert _tagged(oracle._oracle_one_ticker(1, "NUOX", 1, NOW, {}, horizon_days=1, decision_mode=ACTING)) == [False, False]
 
 
 def test_a_consumed_schwab_options_row_tags_with_a_public_receipt(db, oracle_on) -> None:
     oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "spy-cboe"})
-    assert _tagged(oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)) == [True, True]
+    assert _tagged(oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1, decision_mode=ACTING)) == [True, True]
 
 
 def test_switch_off_spy_pass_is_public(db, monkeypatch) -> None:
     monkeypatch.delenv(op.ORACLE_SCHWAB_ENV, raising=False)
     oracle = _placeholder_oracle(db, {"status": "unavailable", "capture_batch_id": "spy-cboe"})
-    assert _tagged(oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)) == [False, False]
+    assert _tagged(oracle._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1, decision_mode=ACTING)) == [False, False]
 
 
 def test_a_failed_options_read_tags_the_pass(db, oracle_on) -> None:
@@ -748,7 +751,7 @@ def test_a_failed_options_read_tags_the_pass(db, oracle_on) -> None:
         raise RuntimeError("database blip")
 
     oracle._read_options_signal = broken
-    assert _tagged(oracle._oracle_one_ticker(1, "NUOX", 1, NOW, {}, horizon_days=1)) == [True, True]
+    assert _tagged(oracle._oracle_one_ticker(1, "NUOX", 1, NOW, {}, horizon_days=1, decision_mode=ACTING)) == [True, True]
 
 
 def test_scanner_and_digest_never_read_a_schwab_day(db, monkeypatch) -> None:

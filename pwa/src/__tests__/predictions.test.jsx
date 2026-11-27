@@ -10,6 +10,7 @@ vi.mock('../api.js', () => ({
         getOracleEvidence: vi.fn(),
         getOracleLatest: vi.fn(),
         getOraclePredictions: vi.fn(),
+        getOracleForwardHealth: vi.fn(),
     },
 }));
 
@@ -41,6 +42,21 @@ describe('Predictions view async data', () => {
         api.getOracleEvidence.mockResolvedValue(EVIDENCE);
         api.getOracleLatest.mockResolvedValue({ streak: {}, recent_scored: [] });
         api.getOraclePredictions.mockResolvedValue({ predictions: [], total: 0 });
+    });
+
+    it('shows the forward-pass status above the scoreboard', async () => {
+        api.getOracleScoreboard.mockResolvedValue({ overall: {}, models: [], by_ticker: [], calibration: {} });
+        api.getOracleForwardHealth.mockResolvedValue({
+            status: 'all_abstained', level: 'failing', tickers: {},
+            message: 'No usable Oracle forecast in the 2026-11-25 session: all 610 candidates abstained over 6 attempt(s).',
+        });
+
+        render(<Predictions />);
+
+        const banner = await screen.findByTestId('forward-health');
+        expect(banner).toHaveAttribute('data-level', 'failing');
+        expect(banner).toHaveTextContent('all 610 candidates abstained');
+        api.getOracleForwardHealth.mockReset();
     });
 
     it('shows a loading skeleton while fetching, then renders the scoreboard', async () => {
