@@ -6,8 +6,12 @@ The nightly batch (``intelligence.postmortem.batch_postmortem``) records every f
 this explicit run. It is never scheduled; running ``--apply`` against production is an owner decision.
 
     python -m scripts.postmortem_backfill                      # dry run: counts, writes nothing
-    python -m scripts.postmortem_backfill --apply              # record all of them, newest first
-    python -m scripts.postmortem_backfill --apply --limit 1000 --scored-before 2026-06-01
+    python -m scripts.postmortem_backfill --apply --limit 1000 --max-seconds 600   # a budgeted slice
+    python -m scripts.postmortem_backfill --apply --limit 1000 --max-seconds 600 --scored-before 2026-06-01
+
+Every ``--apply`` run states a budget: ``--limit`` rows and ``--max-seconds`` (no new row is
+started after it). A bulk run is staged: a timed first slice, the readers measured, then the
+next slice (the PR's run sheet), never one unbounded pass.
 
 A written row is the rule-based classifier's record: failure_category, root_cause, signals wrong and
 right, the classifier's "what we missed", ``full_analysis.analysis_method = 'rules'`` and a NULL
@@ -127,17 +131,27 @@ def run_backfill(
     scored_before: date | None = None,
     max_errors: int = 100,
     page_size: int = PAGE_SIZE,
+    max_seconds: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, int]:
-    """Record every selected failure (``narrate=False``). Returns written / skipped / error counts."""
+    """Record every selected failure (``narrate=False``) within ``limit`` rows and ``max_seconds``.
+
+    Returns selected / written / skipped / error counts and ``stopped`` (1 when the time budget
+    ended the run; the rest stays unrecorded and a later run resumes from it).
+    """
     writers: dict[str, Callable[..., Any]] = {
         "predictions": pm.generate_prediction_postmortem,
         "trades": pm.generate_postmortem,
     }
-    stats = {"selected": 0, "written": 0, "skipped": 0, "errors": 0}
-    started = time.monotonic()
+    stats = {"selected": 0, "written": 0, "skipped": 0, "errors": 0, "stopped": 0}
+    started = clock()
     for source in ("predictions", "trades"):
         for ident in iter_unrecorded(engine, source, scored_after, scored_before, page_size):
             if limit is not None and stats["selected"] >= limit:
+                return stats
+            if max_seconds is not None and clock() - started >= max_seconds:
+                stats["stopped"] = 1
+                log.info("postmortem_backfill: time budget of {s}s spent; stopping", s=max_seconds)
                 return stats
             stats["selected"] += 1
             try:
@@ -155,7 +169,7 @@ def run_backfill(
                 log.info(
                     "postmortem_backfill: {sel} selected, {w} written, {sk} skipped, {er} errors, {t:.0f}s",
                     sel=stats["selected"], w=stats["written"], sk=stats["skipped"], er=stats["errors"],
-                    t=time.monotonic() - started,
+                    t=clock() - started,
                 )
     return stats
 
@@ -171,6 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--scored-after", type=_parse_date, default=None, help="Only failures on/after YYYY-MM-DD.")
     ap.add_argument("--scored-before", type=_parse_date, default=None, help="Only failures before YYYY-MM-DD.")
     ap.add_argument("--max-errors", type=int, default=100, help="Stop after this many failed rows.")
+    ap.add_argument("--max-seconds", type=float, default=None,
+                    help="Start no new row after this many seconds (required with --apply).")
     args = ap.parse_args(argv)
 
     from db import get_engine
@@ -182,15 +198,20 @@ def main(argv: list[str] | None = None) -> int:
         for month, n in info["by_month"].items():
             print(f"  {month}: {n:,}")
     if not args.apply:
-        print("\nDry run: nothing written. Add --apply to record them (rule-based, no LLM).")
+        print("\nDry run: nothing written. Add --apply --limit N --max-seconds S to record them "
+              "(rule-based, no LLM).")
         return 0
+    if args.limit is None or args.max_seconds is None:
+        print("\n--apply needs an explicit budget: --limit N and --max-seconds S.")
+        return 2
 
     stats = run_backfill(
         engine, limit=args.limit, scored_after=args.scored_after,
-        scored_before=args.scored_before, max_errors=args.max_errors,
+        scored_before=args.scored_before, max_errors=args.max_errors, max_seconds=args.max_seconds,
     )
     print(f"\nselected {stats['selected']:,}, written {stats['written']:,}, "
-          f"skipped {stats['skipped']:,}, errors {stats['errors']:,}")
+          f"skipped {stats['skipped']:,}, errors {stats['errors']:,}"
+          + (" (stopped at the time budget)" if stats["stopped"] else ""))
     after = count_unrecorded(engine, args.scored_after, args.scored_before)
     for name, info in after.items():
         print(f"{name}: {info['total']:,} still unrecorded")

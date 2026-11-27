@@ -150,12 +150,17 @@ def _cached_label(lessons: Any) -> str | None:
     return None
 
 
-def _lessons_label(count: int, date_range: str | None) -> str:
+def _lessons_label(count: int, date_range: str | None, methods: list[str | None] | None = None) -> str:
     """The honest, non-committal label the report asked for: "LLM summary of
-    N postmortems dated X-Y" (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #6)."""
+    N postmortems dated X-Y" (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #6),
+    plus how many of them are LLM-narrated and how many rule-based."""
+    label = f"LLM summary of {count} postmortems"
     if date_range:
-        return f"LLM summary of {count} postmortems dated {date_range}"
-    return f"LLM summary of {count} postmortems"
+        label += f" dated {date_range}"
+    if methods is not None:
+        rules = sum(1 for m in methods if m == "rules")
+        label += f" ({count - rules} narrated, {rules} rule-based: classified by rule, not a proven cause)"
+    return label
 
 
 def _coverage(engine, days: int) -> dict[str, Any]:
@@ -220,7 +225,7 @@ def _generate(engine, n: int, days: int) -> Any:
     return {
         "text": text_out,
         "count": len(pms),
-        "label": _lessons_label(len(pms), date_range),
+        "label": _lessons_label(len(pms), date_range, [getattr(pm, "analysis_method", None) for pm in pms]),
         # Marks the text as computed with returns in one unit. A cached summary
         # without it was written before the unit fix and is never served.
         "return_units": RETURN_UNITS,

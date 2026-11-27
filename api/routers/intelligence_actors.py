@@ -797,7 +797,8 @@ def trigger_batch_postmortem(
     post-mortem (rule-based), then narrates a few of the newest, under the same
     bounds as the nightly batch: at most ``API_POSTMORTEM_NARRATE_LIMIT`` LLM
     narrations and an ``API_POSTMORTEM_DEADLINE_S`` deadline. The window is
-    capped at ``POSTMORTEM_EVENT_WINDOW_DAYS``: recording older misses is the
+    capped at ``POSTMORTEM_EVENT_WINDOW_DAYS``; the lessons summary is the deterministic one
+    (no LLM call after the batch's budget). Recording older misses is the
     backfill (``scripts/postmortem_backfill.py``), an owner decision, never a
     request. ``days_applied`` says which window ran.
     """
@@ -823,7 +824,9 @@ def trigger_batch_postmortem(
                 limit=API_POSTMORTEM_NARRATE_LIMIT,
                 deadline=time.monotonic() + API_POSTMORTEM_DEADLINE_S,
             )
-            lessons = generate_lessons_learned(engine, postmortems) if postmortems else ""
+            # Deterministic summary: the batch's deadline and narration slots are the whole LLM budget
+            # of this request, so no further model call is made after it (Codex HOLD 6093994627).
+            lessons = generate_lessons_learned(engine, postmortems, use_llm=False) if postmortems else ""
 
             return {
                 "generated": len(postmortems),

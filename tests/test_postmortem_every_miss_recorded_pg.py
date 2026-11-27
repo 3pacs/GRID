@@ -8,6 +8,7 @@ phases, and the backfill CLI's keyset selection.
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import uuid
@@ -43,11 +44,12 @@ def pg():
         with engine.begin() as conn:
             conn.execute(text(
                 "CREATE TABLE oracle_predictions (id text PRIMARY KEY, verdict text, "
-                "scored_at timestamptz, pnl_pct double precision, flow_context jsonb DEFAULT '{}'::jsonb)"
+                "scored_at timestamptz, pnl_pct double precision, flow_context jsonb DEFAULT '{}'::jsonb, "
+                "ticker text, direction text, expiry date, model_name text)"
             ))
             conn.execute(text(
                 "CREATE TABLE options_recommendations (id integer PRIMARY KEY, outcome text, "
-                "closed_at timestamptz, actual_return numeric)"
+                "closed_at timestamptz, actual_return numeric, signals jsonb, opposing_signals jsonb)"
             ))
         pm_mod._ensure_tables(engine)   # the real trade_postmortems DDL
         yield engine
@@ -58,11 +60,12 @@ def pg():
         admin.dispose()
 
 
-def _miss(engine, pid, scored_at, pnl=-4.0):
+def _miss(engine, pid, scored_at, pnl=-4.0, ticker="SPY", direction="CALL", expiry="2026-11-20", model="m"):
     with engine.begin() as conn:
         conn.execute(text(
-            "INSERT INTO oracle_predictions (id, verdict, scored_at, pnl_pct) VALUES (:i, 'miss', :s, :p)"
-        ), {"i": pid, "s": scored_at, "p": pnl})
+            "INSERT INTO oracle_predictions (id, verdict, scored_at, pnl_pct, ticker, direction, expiry, model_name)"
+            " VALUES (:i, 'miss', :s, :p, :t, :d, :e, :m)"
+        ), {"i": pid, "s": scored_at, "p": pnl, "t": ticker, "d": direction, "e": expiry, "m": model})
 
 
 def _trade(engine, tid, closed_at, ret=-0.4, outcome="LOSS"):
@@ -136,21 +139,60 @@ def test_concurrent_writers_for_one_miss_leave_exactly_one_record(pg):
 # ── narration in place ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_narration_rewrites_only_rule_based_rows(pg):
+def _full(engine, row_id):
+    with engine.connect() as conn:
+        return conn.execute(text(
+            "SELECT failure_category, root_cause, signals_wrong, generated_at, what_we_missed, confidence,"
+            " full_analysis FROM trade_postmortems WHERE id = :i"), {"i": row_id}).fetchone()
+
+
+def test_narration_keeps_the_rule_baseline_and_the_replaced_narrative(pg, monkeypatch):
+    # Codex HOLD 6093994627: one stable classification per miss, the narration kept separately.
+    _miss(pg, "rules", RECENT)
+    pm_mod._store_postmortem(pg, _pm(ANALYSIS_RULES), trade_id=None, prediction_id="rules")
+    row_id = _rows(pg)[0][0]
+    before = _full(pg, row_id)
+    calls: list = []
+    monkeypatch.setattr(pm_mod, "_get_llm_postmortem",
+                        lambda **k: calls.append(k) or {"what_we_missed": "FOMC", "recommended_fix": "wait", "confidence": 0.7})
+    monkeypatch.setattr(pm_mod, "_utcnow", lambda: datetime(2026, 11, 27, 15, 0, tzinfo=timezone.utc))
+    narrated = pm_mod.narrate_postmortem(pg, row_id)
+    assert narrated is not None and calls[0]["category"] == "wrong_signal"
+    after = _full(pg, row_id)
+    assert after[:4] == before[:4]                     # category, root cause, signals, generated_at: untouched
+    assert (after[4], float(after[5])) == ("FOMC", 0.7)
+    full = after[6]
+    assert full["analysis_method"] == ANALYSIS_LLM and full["classification_method"] == ANALYSIS_RULES
+    assert full["failure_category"] == "wrong_signal" and full["root_cause"] == "rc"   # baseline keys kept
+    # the narrative keys agree with the columns (hydration reads the keys first; partner review)
+    assert (full["what_we_missed"], full["recommended_fix"], float(full["confidence_in_analysis"])) == ("FOMC", "wait", 0.7)
+    assert full["rule_narrative"] == {"what_we_missed": "rule text", "recommended_fix": "rc", "confidence": None}
+    assert full["narration"]["narrated_at"] == "2026-11-27T15:00:00+00:00"
+    # Read back the way the Lessons synthesis reads it: the narration, labelled as such.
+    loaded = [r for r in pm_mod.load_postmortems(pg, days=30) if r["prediction_id"] == "rules"]
+    assert loaded[0]["analysis_method"] == ANALYSIS_LLM and loaded[0]["what_we_missed"] == "FOMC"
+    hydrated = pm_mod.postmortems_from_records(loaded).postmortems[0]
+    assert (hydrated.what_we_missed, hydrated.recommended_fix, hydrated.confidence_in_analysis,
+            hydrated.analysis_method, hydrated.failure_category) == ("FOMC", "wait", 0.7, ANALYSIS_LLM, "wrong_signal")
+    assert pm_mod.narrate_postmortem(pg, row_id) is None          # once only
+    assert len(calls) == 1
+
+
+def test_narration_update_touches_only_rule_based_and_placeholder_rows(pg):
     pm_mod._store_postmortem(pg, _pm(ANALYSIS_RULES), trade_id=None, prediction_id="rules")
     pm_mod._store_postmortem(pg, _pm(ANALYSIS_LLM, what="already narrated"), trade_id=None, prediction_id="llm")
-    # a pre-2026-11-27 row: no marker, the old placeholder text
     pm_mod._store_postmortem(pg, _pm(None, what=LEGACY_LLM_FALLBACK_TEXT), trade_id=None, prediction_id="legacy")
     ids = {r[1]: r[0] for r in _rows(pg)}
-    narrated = _pm(ANALYSIS_LLM, what="FOMC")
-    assert pm_mod._update_postmortem_narration(pg, ids["rules"], narrated) is True
-    assert pm_mod._update_postmortem_narration(pg, ids["legacy"], narrated) is True
-    assert pm_mod._update_postmortem_narration(pg, ids["llm"], narrated) is False
-    assert pm_mod._update_postmortem_narration(pg, ids["rules"], narrated) is False   # once only
+    narration = {"what_we_missed": "FOMC", "recommended_fix": "wait", "confidence": 0.7,
+                 "narrated_at": NOW.isoformat(), "method": ANALYSIS_LLM}
+    assert pm_mod._update_postmortem_narration(pg, ids["rules"], narration) is True
+    assert pm_mod._update_postmortem_narration(pg, ids["legacy"], narration) is True
+    assert pm_mod._update_postmortem_narration(pg, ids["llm"], narration) is False
+    assert pm_mod._update_postmortem_narration(pg, ids["rules"], narration) is False   # once only
     by_pid = {r[1]: r for r in _rows(pg)}
-    assert by_pid["rules"][3] == "FOMC" and by_pid["rules"][5] == ANALYSIS_LLM and float(by_pid["rules"][4]) == 0.7
-    assert by_pid["legacy"][3] == "FOMC"
+    assert by_pid["rules"][3] == "FOMC" and by_pid["legacy"][3] == "FOMC"
     assert by_pid["llm"][3] == "already narrated"
+    assert _full(pg, ids["legacy"])[6]["rule_narrative"]["what_we_missed"] == LEGACY_LLM_FALLBACK_TEXT
 
 
 # ── readers window on the miss's own date ───────────────────────────────────────────────────────────
@@ -187,6 +229,46 @@ def test_trace_evolver_loads_only_recent_misses(mixed_window):
     assert sorted(str(r["prediction_id"]) for r in loaded) == ["None", "recent"]
 
 
+def test_auto_improve_counts_each_logical_miss_once(pg, monkeypatch):
+    # Codex HOLD 6093994627: 115 models making one call, or one prediction with 34 rows, are one miss.
+    import scripts.auto_improve_from_postmortems as ai
+
+    for i in range(4):   # four models, one call (SPY CALL 2026-11-20); one model saw it as a shock
+        _miss(pg, f"clone{i}", RECENT, model=f"m{i}")
+        pm_mod._store_postmortem(pg, _pm(category="external_shock" if i == 3 else "wrong_signal"),
+                                 trade_id=None, prediction_id=f"clone{i}")
+    _miss(pg, "other", RECENT, ticker="QQQ")
+    _legacy_row(pg, "other", "x")
+    _legacy_row(pg, "other", "x")      # a duplicate row of the same prediction
+    with pg.connect() as conn:
+        # each call weighs 1, split across its models: SPY 0.75 + 0.25, QQQ 1 (its duplicate row dropped)
+        assert ai._failure_categories(conn) == {"wrong_signal": 1.75, "external_shock": 0.25}
+        assert ai._anti_signal_override_clusters(conn)["total_all_time"] == 0
+        assert ai._wrong_direction_tickers(conn) == []          # 1 miss per ticker, minimum 10
+        monkeypatch.setattr(ai, "_MIN_OCCURRENCES_FOR_SIGNAL", 1)
+        monkeypatch.setattr(ai, "_POSTMORTEM_CORPUS_CUTOFF", (RECENT - timedelta(days=1)).date().isoformat())
+        ratios = {r["signal"]: r for r in ai._signal_ratios(conn)}
+    assert ratios["iv_skew"]["wrong_count"] == 1.0     # the SPY call once (4 x 0.25), not four times
+
+
+def test_a_ticker_of_trade_losses_only_is_not_listed_first(pg):
+    # Partner review: SUM ... FILTER is NULL (not 0) for a ticker with no 'miss' rows, and DESC put it first.
+    import dataclasses
+
+    import scripts.auto_improve_from_postmortems as ai
+
+    for i in range(10):
+        _miss(pg, f"real{i}", RECENT, ticker="REAL", expiry=f"2026-11-{10 + i:02d}")   # ten distinct calls
+        pm_mod._store_postmortem(pg, dataclasses.replace(_pm(), ticker="REAL"), trade_id=None, prediction_id=f"real{i}")
+        _trade(pg, 100 + i, RECENT)
+        pm_mod._store_postmortem(pg, dataclasses.replace(_pm(), ticker="LOSSONLY", outcome="LOSS"),
+                                 trade_id=100 + i, prediction_id=None)
+    with pg.connect() as conn:
+        clusters = ai._wrong_direction_tickers(conn)
+    assert [c["ticker"] for c in clusters] == ["REAL", "LOSSONLY"]
+    assert (clusters[0]["fail_rate"], clusters[1]["wrong_n"], clusters[1]["fail_rate"]) == (1.0, 0, 0.0)
+
+
 def test_auto_improve_queries_run_on_postgresql_and_count_only_recent_misses(mixed_window, monkeypatch):
     import scripts.auto_improve_from_postmortems as ai
 
@@ -216,22 +298,30 @@ def test_coverage_counts_recorded_narrated_and_not_analysed_in_the_window(pg):
     assert (cov["eligible"], cov["recorded"], cov["narrated"], cov["not_analysed"]) == (5, 3, 2, 2)
 
 
-def _legacy_row(engine, pid, what, generated_at=None):
-    """A row as the pre-2026-11-27 writer stored it: no analysis_method key; bypasses the store guard."""
+def _legacy_row(engine, pid, what, generated_at=None, unit=None):
+    """A row as the pre-2026-11-27 writer stored it: no analysis_method key; bypasses the store guard.
+    ``unit``: the return-unit marker rows carry from 2026-11-26 (None: an older row)."""
+    full = {"root_cause": "rc", "ticker": "SPY", "direction": "CALL", "outcome": "miss",
+            "actual_return": -4.0 if unit is None else -0.04, "failure_category": "wrong_signal",
+            "what_we_missed": what, "recommended_fix": "rc"}
+    if unit is not None:
+        full["actual_return_unit"] = unit
     with engine.begin() as conn:
         conn.execute(text(
             "INSERT INTO trade_postmortems (prediction_id, ticker, outcome, failure_category, root_cause,"
             " what_we_missed, recommended_fix, full_analysis, confidence, generated_at)"
-            " VALUES (:p, 'SPY', 'miss', 'wrong_signal', 'rc', :w, 'rc', '{\"root_cause\": \"rc\"}'::jsonb, 0.5,"
+            " VALUES (:p, 'SPY', 'miss', 'wrong_signal', 'rc', :w, 'rc', CAST(:f AS jsonb), 0.5,"
             " COALESCE(:g, now()))"
-        ), {"p": pid, "w": what, "g": generated_at})
+        ), {"p": pid, "w": what, "g": generated_at, "f": json.dumps(full)})
 
 
 def test_narration_takes_only_the_newest_copy_of_a_duplicated_miss(pg, monkeypatch):
     narrated = _patch_writers(monkeypatch)
     _miss(pg, "dup", RECENT)
-    for _ in range(3):   # the spring run's duplicates: three placeholder copies of one miss
-        _legacy_row(pg, "dup", LEGACY_LLM_FALLBACK_TEXT)
+    for _ in range(3):   # duplicates: three placeholder copies of one miss, written with the unit marker
+        _legacy_row(pg, "dup", LEGACY_LLM_FALLBACK_TEXT, unit="fraction")
+    _miss(pg, "old-unit", RECENT)
+    _legacy_row(pg, "old-unit", LEGACY_LLM_FALLBACK_TEXT)   # no marker: prose withheld, never narrated
     newest = max(r[0] for r in _rows(pg, "prediction_id = 'dup'"))
     pm_mod.batch_postmortem(pg, days=30, limit=10)
     assert narrated == [newest]
@@ -291,7 +381,7 @@ def test_the_backfill_records_every_old_miss_once_across_pages(pg, monkeypatch):
     assert counts["trades"]["total"] == 1
     assert list(bf.iter_unrecorded(pg, "predictions", page_size=2)) == ["old0", "old1", "old2", "old3", "old4"]
     stats = bf.run_backfill(pg, page_size=2)
-    assert stats == {"selected": 6, "written": 6, "skipped": 0, "errors": 0}
+    assert stats == {"selected": 6, "written": 6, "skipped": 0, "errors": 0, "stopped": 0}
     assert bf.run_backfill(pg, page_size=2)["selected"] == 0
     assert bf.count_unrecorded(pg)["predictions"]["by_month"] == {"no date": 1}   # reported, never selected
     limited = bf.count_unrecorded(pg, scored_before=OLD.date())

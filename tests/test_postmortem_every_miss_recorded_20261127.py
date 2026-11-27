@@ -173,14 +173,29 @@ def test_the_llm_helper_counts_a_reply_as_narration_only_with_a_missed_or_fix_li
     assert out["narrated"] is narrated
 
 
-# ── events: only a new record of a recent miss ──────────────────────────────────────────────────────
+# ── events: only a new record of a known recent miss (fail closed) ────────────────────────────────
 
 
-@pytest.mark.parametrize("scored_at,emits", [(RECENT, 1), (EDGE_IN, 1), (EDGE_OUT, 0), (OLD, 0), (None, 1)])
-def test_only_a_recent_or_undated_miss_emits_postmortem_completed(harness, scored_at, emits):
+@pytest.mark.parametrize("scored_at,emits", [
+    (RECENT, 1),
+    (EDGE_IN, 1),                                  # exactly now - 30 d: inside
+    (EDGE_OUT, 0),                                 # one second older: outside
+    (FIXED_NOW, 1),                                # exactly now: inside
+    (FIXED_NOW + timedelta(seconds=1), 0),         # the future: never
+    (OLD, 0),
+    (None, 0),                                     # unknown: never (Codex HOLD 6093994627)
+])
+def test_only_a_known_recent_miss_emits_postmortem_completed(harness, scored_at, emits):
     pm = generate_prediction_postmortem(_prediction_engine(scored_at), "pred-1", narrate=False)
     assert pm is not None
     assert len(harness.emitted) == emits
+
+
+def test_the_store_refuses_a_record_written_before_its_own_miss(monkeypatch):
+    engine = MagicMock()
+    pm = SimpleNamespace(miss_at=(FIXED_NOW + timedelta(hours=1)).isoformat(), generated_at=FIXED_NOW.isoformat())
+    assert pm_mod._store_postmortem(engine, pm, trade_id=None, prediction_id="p") is False
+    engine.begin.assert_not_called()
 
 
 def test_an_existing_record_is_not_written_again_and_emits_nothing(harness, monkeypatch):
@@ -189,58 +204,100 @@ def test_an_existing_record_is_not_written_again_and_emits_nothing(harness, monk
     assert harness.emitted == []
 
 
-# ── narration in place ──────────────────────────────────────────────────────────────────────────────
+# ── narration keeps the rule baseline ───────────────────────────────────────────────────────────────
 
 
-def test_narration_updates_the_rule_based_row_in_place_and_emits_nothing(harness, monkeypatch):
+def _stored_row_engine(row, statements, trade_signals=None):
+    """A fake engine serving one stored trade_postmortems row (and a trade's decision signals)."""
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt, params=None):
+            sql = _norm(stmt)
+            statements.append((sql, dict(params or {})))
+            res = MagicMock()
+            res.rowcount = 1
+            if sql.startswith("SELECT tp.id, tp.trade_id"):
+                res.fetchone.return_value = row
+            elif sql.startswith("SELECT signals, opposing_signals"):
+                res.fetchone.return_value = trade_signals
+            else:
+                res.fetchone.return_value = None
+            return res
+
+    return SimpleNamespace(connect=lambda: _Conn(), begin=lambda: _Conn())
+
+
+def _stored_rule_row(*, prediction_id="pred-1", trade_id=None, unit="fraction"):
+    full = {
+        "ticker": "SPY", "direction": "CALL", "outcome": "miss", "actual_return": -0.04,
+        "data_at_decision": {"model_name": "m"}, "thesis_at_decision": "t",
+        "sanity_results_at_decision": {}, "what_actually_happened": "it fell", "price_path": [],
+        "failure_category": "wrong_signal", "root_cause": "rule cause",
+        "which_signals_were_wrong": ["iv_skew"], "which_signals_were_right": [],
+        "what_we_missed": "rule text", "recommended_fix": "rule cause", "confidence_in_analysis": None,
+        "generated_at": RECENT.isoformat(), "analysis_method": ANALYSIS_RULES,
+    }
+    if unit:
+        full["actual_return_unit"] = unit
+    return (7, trade_id, prediction_id, "SPY", "miss", "wrong_signal", "rule cause", "rule text",
+            "rule cause", json.dumps(full))
+
+
+def test_narration_writes_only_the_narrative_and_keeps_the_rule_baseline(harness):
     harness.llm_reply = {"recommended_fix": "cut size", "what_we_missed": "FOMC", "confidence": 0.7}
     statements: list = []
-    engine = _prediction_engine(RECENT, statements)
-    pm = generate_prediction_postmortem(engine, "pred-1", narrate=True, update_row_id=42)
+    pm = pm_mod.narrate_postmortem(_stored_row_engine(_stored_rule_row(), statements), 7)
     assert pm is not None and pm.analysis_method == ANALYSIS_LLM
+    assert pm.failure_category == "wrong_signal" and pm.root_cause == "rule cause"   # the baseline, not re-run
+    assert harness.llm_calls[0]["category"] == "wrong_signal" and harness.llm_calls[0]["actual_return"] == -0.04
     updates = [(s, p) for s, p in statements if s.startswith("UPDATE trade_postmortems")]
     assert len(updates) == 1
     sql, params = updates[0]
-    assert params["id"] == 42 and "FOMC" == params["what_we_missed"] and params["confidence"] == 0.7
-    assert _norm(UNNARRATED_SQL) in sql                    # only a row that is still rule-based
-    assert json.loads(params["full_analysis"])["analysis_method"] == ANALYSIS_LLM
-    assert "generated_at" not in sql                        # the first-written time is kept
-    assert harness.stored == [] and harness.emitted == []   # no insert, no second event
+    set_clause = sql.split(" WHERE ")[0]
+    for baseline in ("failure_category", "root_cause", "signals_wrong", "signals_right", "generated_at"):
+        assert baseline not in set_clause                                     # never rewritten
+    assert "'rule_narrative', jsonb_build_object('what_we_missed', tp.what_we_missed" in sql
+    assert _norm(UNNARRATED_SQL) in sql
+    narration = json.loads(params["narration"])
+    assert narration == {"what_we_missed": "FOMC", "recommended_fix": "cut size", "confidence": 0.7,
+                         "narrated_at": FIXED_NOW.isoformat(), "method": ANALYSIS_LLM}
+    assert params["what_we_missed"] == "FOMC" and params["confidence"] == 0.7
+    assert harness.emitted == [] and harness.stored == []
 
 
 def test_narration_without_an_llm_narrative_changes_nothing(harness):
     harness.llm_reply = {"narrated": False}
     statements: list = []
-    assert generate_prediction_postmortem(
-        _prediction_engine(RECENT, statements), "pred-1", narrate=True, update_row_id=42) is None
+    assert pm_mod.narrate_postmortem(_stored_row_engine(_stored_rule_row(), statements), 7) is None
     assert not any(s.startswith("UPDATE") for s, _ in statements)
 
 
-def test_narrate_postmortem_only_takes_a_rule_based_row(monkeypatch):
-    calls: list = []
-    monkeypatch.setattr(pm_mod, "generate_prediction_postmortem", lambda e, pid, **k: calls.append((pid, k)) or "pm")
-    seen: list = []
+def test_a_row_whose_prose_is_withheld_is_not_narrated(harness):
+    # A pre-2026-11-26 prediction row (no unit marker) is hydrated with its prose withheld.
+    statements: list = []
+    assert pm_mod.narrate_postmortem(_stored_row_engine(_stored_rule_row(unit=None), statements), 7) is None
+    assert harness.llm_calls == []
 
-    def _engine(row):
-        class _Conn:
-            def __enter__(self):
-                return self
 
-            def __exit__(self, *a):
-                return False
+def test_a_trade_is_narrated_with_its_decision_time_signals(harness):
+    harness.llm_reply = {"recommended_fix": "f", "what_we_missed": "w", "confidence": 0.6}
+    statements: list = []
+    engine = _stored_row_engine(_stored_rule_row(prediction_id=None, trade_id=3, unit="fraction"), statements,
+                                trade_signals=(json.dumps([{"name": "gex"}]), "[]"))
+    assert pm_mod.narrate_postmortem(engine, 7) is not None
+    assert harness.llm_calls[0]["decision_signals"] == [{"name": "gex"}]
 
-            def execute(self, stmt, params=None):
-                seen.append(_norm(stmt))
-                res = MagicMock()
-                res.fetchone.return_value = row
-                return res
 
-        return SimpleNamespace(connect=lambda: _Conn())
-
-    assert pm_mod.narrate_postmortem(_engine((None, "pred-9")), 7) == "pm"
-    assert calls == [("pred-9", {"narrate": True, "update_row_id": 7})]
-    assert _norm(UNNARRATED_SQL) in seen[0]
-    assert pm_mod.narrate_postmortem(_engine(None), 8) is None   # already narrated (or gone): nothing
+def test_narrate_postmortem_selects_only_a_narratable_rule_based_row(harness):
+    statements: list = []
+    assert pm_mod.narrate_postmortem(_stored_row_engine(None, statements), 8) is None
+    select = statements[0][0]
+    assert _norm(UNNARRATED_SQL) in select and _norm(pm_mod.NARRATABLE_SQL) in select
 
 
 # ── the nightly batch: record all, then narrate the newest ───────────────────────────────────────────
@@ -400,7 +457,7 @@ def test_the_backfill_records_without_the_llm_and_honours_its_limit(monkeypatch)
     stats = bf.run_backfill(object())
     assert calls == [("p1", {"narrate": False}), ("p2", {"narrate": False}),
                      ("p3", {"narrate": False}), (7, {"narrate": False})]
-    assert stats == {"selected": 4, "written": 3, "skipped": 1, "errors": 0}
+    assert stats == {"selected": 4, "written": 3, "skipped": 1, "errors": 0, "stopped": 0}
     calls.clear()
     assert bf.run_backfill(object(), limit=2)["selected"] == 2 and len(calls) == 2
 
@@ -414,7 +471,35 @@ def test_the_backfill_counts_errors_and_stops_at_its_error_budget(monkeypatch):
         raise RuntimeError("db blip")
 
     monkeypatch.setattr(pm_mod, "generate_prediction_postmortem", _boom)
-    assert bf.run_backfill(object(), max_errors=2) == {"selected": 2, "written": 0, "skipped": 0, "errors": 2}
+    assert bf.run_backfill(object(), max_errors=2) == {
+        "selected": 2, "written": 0, "skipped": 0, "errors": 2, "stopped": 0}
+
+
+def test_the_backfill_starts_no_row_after_its_time_budget(monkeypatch):
+    import scripts.postmortem_backfill as bf
+
+    monkeypatch.setattr(bf, "iter_unrecorded", lambda _e, source, *a, **k: iter(["a", "b", "c", "d"] if source == "predictions" else []))
+    clock = _Clock()
+
+    def _write(_e, _i, **_k):
+        clock.now += 4.0
+        return "pm"
+
+    monkeypatch.setattr(pm_mod, "generate_prediction_postmortem", _write)
+    stats = bf.run_backfill(object(), max_seconds=10.0, clock=clock.monotonic)
+    assert stats == {"selected": 3, "written": 3, "skipped": 0, "errors": 0, "stopped": 1}   # starts at 0, 4, 8
+
+
+def test_the_backfill_apply_requires_an_explicit_budget(monkeypatch, capsys):
+    import db
+    import scripts.postmortem_backfill as bf
+
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(bf, "count_unrecorded", lambda *a, **k: {"predictions": {"by_month": {}, "total": 0}})
+    monkeypatch.setattr(bf, "run_backfill", lambda *a, **k: pytest.fail("no budget, no run"))
+    assert bf.main(["--apply"]) == 2
+    assert bf.main(["--apply", "--limit", "10"]) == 2
+    assert "explicit budget" in capsys.readouterr().out
 
 
 def test_the_hermes_step_still_narrates_at_most_its_batch_limit():
@@ -443,3 +528,23 @@ def test_the_api_trigger_is_bounded_like_the_nightly_and_never_reaches_past_the_
     assert seen["days"] == pm_mod.POSTMORTEM_EVENT_WINDOW_DAYS and out["days_applied"] == 30
     assert seen["limit"] == pm_mod.API_POSTMORTEM_NARRATE_LIMIT
     assert seen["deadline"] is not None
+
+
+@pytest.mark.parametrize("spent_slots", [0, 5])
+def test_the_api_trigger_makes_no_llm_call_after_the_batch(monkeypatch, spent_slots):
+    # Codex HOLD 6093994627: an exhausted batch, and one that spends all five narration slots, are
+    # followed by the deterministic summary, never a further research-LLM call.
+    import api.routers.intelligence_actors as ia
+
+    pms = [SimpleNamespace(
+        ticker="SPY", direction="CALL", failure_category="wrong_signal", actual_return=-0.04,
+        which_signals_were_wrong=["iv_skew"], which_signals_were_right=[], analysis_method=ANALYSIS_LLM,
+        to_dict=lambda: {}) for _ in range(spent_slots)]
+    monkeypatch.setattr(pm_mod, "batch_postmortem", lambda engine, **kw: pms)
+    monkeypatch.setattr(pm_mod, "_get_llm_lessons_learned", lambda *a, **k: pytest.fail("LLM after the budget"))
+    monkeypatch.setattr(ia, "get_db_engine", lambda: object())
+    fn = getattr(ia.trigger_batch_postmortem, "__wrapped__", ia.trigger_batch_postmortem)
+    out = fn(days=30, token="t")
+    assert out["generated"] == spent_slots
+    if spent_slots:
+        assert "Basis: 5 LLM-narrated, 0 rule-based records" in out["lessons_learned"]

@@ -68,6 +68,9 @@ NEWEST_COPY_SQL = (
     "(tp.prediction_id IS NOT NULL AND tp_newer.prediction_id = tp.prediction_id)"
     " OR (tp.trade_id IS NOT NULL AND tp_newer.trade_id = tp.trade_id)))"
 )
+# Rows narration can build from: a trade, or a prediction row whose return unit is recorded
+# (written from 2026-11-26). Older prediction rows have their prose withheld on hydration.
+NARRATABLE_SQL = "(tp.prediction_id IS NULL OR (tp.full_analysis->>'actual_return_unit') IS NOT NULL)"
 # The API trigger (POST /intelligence/postmortems/generate) narrates at most this many per call,
 # and stops starting rows after this many seconds.
 API_POSTMORTEM_NARRATE_LIMIT = 5
@@ -101,6 +104,67 @@ def miss_on_or_after_sql(bound: str, alias: str = "tp") -> str:
     )
 
 
+def analysis_method_of(record: dict[str, Any]) -> str:
+    """How a stored record's narrative was produced: ANALYSIS_LLM or ANALYSIS_RULES.
+
+    Rows from 2026-11-27 say so in ``full_analysis.analysis_method``. An older row holding the
+    unreachable-LLM placeholder is rule-based; any other older row was LLM-narrated.
+    """
+    full = record.get("full_analysis") or {}
+    method = full.get("analysis_method") if isinstance(full, dict) else None
+    if method in (ANALYSIS_LLM, ANALYSIS_RULES):
+        return method
+    if record.get("what_we_missed") == LEGACY_LLM_FALLBACK_TEXT:
+        return ANALYSIS_RULES
+    return ANALYSIS_LLM
+
+
+def analysis_basis_line(methods: list[str | None]) -> str:
+    """One line saying what a summary rests on, shown wherever postmortems are summarised."""
+    rules = sum(1 for m in methods if m == ANALYSIS_RULES)
+    return (
+        f"Basis: {len(methods) - rules} LLM-narrated, {rules} rule-based records "
+        "(rule-based: classified by rule, not a proven cause)"
+    )
+
+
+def logical_miss_postmortems_sql(where_sql: str) -> str:
+    """A derived table (use it as ``FROM <this> tp``): the rows matching ``where_sql`` (alias ``tp``),
+    one per prediction or trade, each carrying ``miss_weight`` so that every logical miss weighs 1.
+
+    A prediction's logical miss is its call, ``(ticker, direction, expiry)``: one market outcome,
+    however many models made it. The May 2026 cohort is 318,763 predictions from about 115 models
+    but only 433 calls, and 76,710 predictions have 2 to 34 rows. So: the newest row of each
+    prediction or trade is kept (duplicate copies dropped), and each kept row weighs
+    ``1 / (predictions in its call)``. Sum ``miss_weight`` instead of counting rows: every call
+    weighs 1 in total, and the different models' signals within it are all kept, each at its
+    share (Codex HOLD 6093994627; partner review). A trade is its own logical miss; a prediction
+    hidden from the public cohort keeps its own id as its call.
+    """
+    return (
+        "(SELECT w.*, 1.0 / COUNT(*) OVER (PARTITION BY w.miss_key) AS miss_weight FROM ("
+        "SELECT DISTINCT ON (lm.copy_key) tp.*, lm.miss_key FROM trade_postmortems tp"
+        " CROSS JOIN LATERAL (SELECT COALESCE("
+        "(SELECT 'call:' || op_k.ticker || '|' || COALESCE(op_k.direction, '') || '|'"
+        " || COALESCE(op_k.expiry::text, '') FROM " + VISIBLE_ORACLE_PREDICTIONS + " op_k"
+        " WHERE op_k.id = tp.prediction_id),"
+        " 'prediction:' || tp.prediction_id, 'trade:' || tp.trade_id::text, 'row:' || tp.id::text"
+        ") AS miss_key, COALESCE('prediction:' || tp.prediction_id, 'trade:' || tp.trade_id::text,"
+        " 'row:' || tp.id::text) AS copy_key) lm"
+        " WHERE " + where_sql + " ORDER BY lm.copy_key, tp.id DESC) w)"
+    )
+
+
+def _parse_iso(value: Any) -> Any:
+    """An ISO-8601 string as a datetime; anything else unchanged (None stays None)."""
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return value
+
+
 def _as_utc(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -115,11 +179,14 @@ def _utcnow() -> datetime:
 
 
 def _miss_is_recent(miss_at: Any) -> bool:
-    """True when a miss is inside the event window, or its date is unknown (the old behaviour)."""
+    """True only for a known miss inside the event window: from ``now - POSTMORTEM_EVENT_WINDOW_DAYS``
+    to ``now``, both inclusive. Fails closed: an unknown date or a date in the future emits nothing
+    (Codex HOLD 6093994627)."""
     when = _as_utc(miss_at)
     if when is None:
-        return True
-    return when >= _utcnow() - timedelta(days=POSTMORTEM_EVENT_WINDOW_DAYS)
+        return False
+    now = _utcnow()
+    return now - timedelta(days=POSTMORTEM_EVENT_WINDOW_DAYS) <= when <= now
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────
@@ -184,8 +251,11 @@ class PostMortem:
     # and no free text of it may reach a prompt (storage is untouched).
     prose_trusted: bool = True
 
-    # ANALYSIS_RULES or ANALYSIS_LLM for rows written from 2026-11-27; None on older rows.
+    # How the narrative fields were produced: ANALYSIS_RULES or ANALYSIS_LLM for rows written from
+    # 2026-11-27; None on older rows. The classification (category, root cause, signals) is always
+    # the rule-based classifier's: classification_method.
     analysis_method: str | None = None
+    classification_method: str = ANALYSIS_RULES
     # When the miss was scored (prediction) or the trade closed, ISO-8601; None when unknown.
     miss_at: str | None = None
 
@@ -303,6 +373,7 @@ def postmortems_from_records(
                 confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
                 generated_at=full.get("generated_at", ""),
                 prose_trusted=not legacy_prediction,
+                analysis_method=analysis_method_of(r),
             ))
             out.included.append(r)
         except Exception:
@@ -364,7 +435,6 @@ def generate_postmortem(
     trade_id: int,
     *,
     narrate: bool = True,
-    update_row_id: int | None = None,
 ) -> PostMortem | None:
     """Generate a full post-mortem for a failed options trade.
 
@@ -377,13 +447,10 @@ def generate_postmortem(
         engine: SQLAlchemy engine.
         trade_id: options_recommendations.id
         narrate: Ask the LLM for the narrative fields.
-        update_row_id: Narrate this existing trade_postmortems row in place
-            instead of inserting (see ``narrate_postmortem``).
 
     Returns:
         PostMortem, or None if the trade is not found, not a failure, or
-        nothing was written (a record already exists; a narration produced
-        no LLM narrative).
+        nothing was written (a record already exists, or the write was refused).
     """
     _ensure_tables(engine)
 
@@ -543,15 +610,15 @@ def generate_postmortem(
     )
 
     # Persist
-    if not _persist_postmortem(engine, pm, trade_id=trade_id, prediction_id=None, update_row_id=update_row_id):
+    if _store_postmortem(engine, pm, trade_id=trade_id, prediction_id=None) is False:
         return None
 
     # SYNTH-C / SYNTH-41 — non-fatal PostmortemCompleted fanout for the
     # TRADE path. The contagion-feedback postmortem already emits its
     # own contract (see ``apply_contagion_feedback`` below) — this hook
     # is strictly for the trade post-mortem pipeline. Only a new record of
-    # a recent miss emits (POSTMORTEM_EVENT_WINDOW_DAYS); a narration does not.
-    if update_row_id is None and _miss_is_recent(closed_at):
+    # a known recent miss emits (POSTMORTEM_EVENT_WINDOW_DAYS).
+    if _miss_is_recent(closed_at):
         _emit_trade_postmortem(pm=pm, trade_id=trade_id)
 
     log.info(
@@ -594,13 +661,11 @@ def generate_prediction_postmortem(
     prediction_id: str,
     *,
     narrate: bool = True,
-    update_row_id: int | None = None,
 ) -> PostMortem | None:
     """Generate a full post-mortem for a failed oracle prediction.
 
     Same analysis pipeline as trade post-mortems but queries the
-    oracle_predictions table instead. ``narrate`` and ``update_row_id``
-    as in ``generate_postmortem``.
+    oracle_predictions table instead. ``narrate`` as in ``generate_postmortem``.
 
     Args:
         engine: SQLAlchemy engine.
@@ -764,13 +829,11 @@ def generate_prediction_postmortem(
         generated_at=now.isoformat(),
     )
 
-    if not _persist_postmortem(
-        engine, pm, trade_id=None, prediction_id=prediction_id, update_row_id=update_row_id,
-    ):
+    if _store_postmortem(engine, pm, trade_id=None, prediction_id=prediction_id) is False:
         return None
 
-    # Only a new record of a recent miss emits (POSTMORTEM_EVENT_WINDOW_DAYS); a narration does not.
-    if update_row_id is None and _miss_is_recent(scored_at):
+    # Only a new record of a known recent miss emits (POSTMORTEM_EVENT_WINDOW_DAYS).
+    if _miss_is_recent(scored_at):
         _emit_prediction_postmortem(
             pm=pm,
             prediction_id=prediction_id,
@@ -779,38 +842,93 @@ def generate_prediction_postmortem(
 
     log.info(
         "Post-mortem {how} for prediction {id} ({t} {d}): {cat}",
-        how="narrated" if update_row_id is not None else f"recorded ({analysis_method})",
+        how=f"recorded ({analysis_method})",
         id=prediction_id, t=ticker, d=direction, cat=category,
     )
     return pm
 
 
 def narrate_postmortem(engine: Engine, row_id: int) -> PostMortem | None:
-    """LLM-narrate one stored rule-based postmortem in place.
+    """LLM-narrate one stored rule-based postmortem, keeping its baseline.
 
-    The miss is re-read from its source and re-classified (the same deterministic
-    classifier), then the LLM writes the narrative; the row's classification, narrative
-    fields and ``full_analysis`` are rewritten together, so they describe one analysis
-    (the category can differ from the first record only if the source data changed
-    since; ``full_analysis.narrated_at`` says when). ``generated_at`` (first written)
-    is kept and no PostmortemCompleted is emitted (the record already emitted, or was
-    too old to).
-    Returns None and changes nothing when the row is not a rule-based record or the
-    LLM produced no narrative.
+    The narrative is built from the stored record, not by re-running the classifier
+    (Codex HOLD 6093994627): ``failure_category``, ``root_cause``, the signal lists and
+    ``generated_at`` are the rule baseline and never change, so automatic learning reads
+    one stable classification per miss. The narration is written to the narrative
+    columns and to ``full_analysis.narration`` with its own ``narrated_at``; the values it
+    replaced are kept in ``full_analysis.rule_narrative``, so a reader asking what was
+    known before ``narrated_at`` can tell. No PostmortemCompleted is emitted.
+
+    Only a record whose return unit is known and whose prose is trusted is narrated
+    (``NARRATABLE_SQL``; a pre-2026-11-26 prediction row has its prose withheld). Returns
+    None and changes nothing when the row is not such a rule-based record or the LLM
+    produced no narrative.
     """
     with engine.connect() as conn:
         row = conn.execute(text(
-            "SELECT tp.trade_id, tp.prediction_id FROM trade_postmortems tp "
-            "WHERE tp.id = :id AND " + UNNARRATED_SQL
+            "SELECT tp.id, tp.trade_id, tp.prediction_id, tp.ticker, tp.outcome, tp.failure_category,"
+            " tp.root_cause, tp.what_we_missed, tp.recommended_fix, tp.full_analysis"
+            " FROM trade_postmortems tp WHERE tp.id = :id AND " + UNNARRATED_SQL + " AND " + NARRATABLE_SQL
         ), {"id": int(row_id)}).fetchone()
-    if not row:
+        if not row:
+            return None
+        record = {
+            "id": row[0], "trade_id": row[1], "prediction_id": row[2], "ticker": row[3],
+            "outcome": row[4], "failure_category": row[5], "root_cause": row[6],
+            "what_we_missed": row[7], "recommended_fix": row[8], "full_analysis": _parse_json(row[9]),
+        }
+        decision_signals = decision_opposing = None
+        if record["trade_id"] is not None:
+            # Decision-time inputs of the trade (never rewritten after the decision).
+            sig = conn.execute(text(
+                "SELECT signals, opposing_signals FROM options_recommendations WHERE id = :id"
+            ), {"id": int(record["trade_id"])}).fetchone()
+            if sig:
+                decision_signals = _parse_json(sig[0]) or []
+                decision_opposing = _parse_json(sig[1]) or []
+    hydrated = postmortems_from_records([record])
+    if not hydrated.postmortems or not hydrated.postmortems[0].prose_trusted:
         return None
-    trade_id, prediction_id = row
-    if prediction_id is not None:
-        return generate_prediction_postmortem(engine, prediction_id, narrate=True, update_row_id=int(row_id))
-    if trade_id is not None:
-        return generate_postmortem(engine, int(trade_id), narrate=True, update_row_id=int(row_id))
-    return None
+    base = hydrated.postmortems[0]
+    data = base.data_at_decision if isinstance(base.data_at_decision, dict) else {}
+    if record["trade_id"] is not None:
+        data = {**data, "sanity_status": _active_sanity(base.sanity_results_at_decision)}
+    narrative = _get_llm_postmortem(
+        ticker=base.ticker,
+        direction=base.direction,
+        thesis=base.thesis_at_decision,
+        outcome=base.outcome,
+        actual_return=base.actual_return,
+        category=base.failure_category,
+        root_cause=base.root_cause,
+        what_happened=base.what_actually_happened,
+        data_at_decision=data,
+        price_path=base.price_path,
+        signals_wrong=base.which_signals_were_wrong,
+        signals_right=base.which_signals_were_right,
+        decision_signals=decision_signals,
+        decision_opposing=decision_opposing,
+    )
+    if not narrative.get("narrated", True):
+        return None
+    narration = {
+        "what_we_missed": narrative.get("what_we_missed", base.what_we_missed),
+        "recommended_fix": narrative.get("recommended_fix", base.root_cause),
+        "confidence": narrative.get("confidence", 0.5),
+        "narrated_at": _utcnow().isoformat(),
+        "method": ANALYSIS_LLM,
+    }
+    if not _update_postmortem_narration(engine, int(row_id), narration):
+        return None
+    base.what_we_missed = narration["what_we_missed"]
+    base.recommended_fix = narration["recommended_fix"]
+    base.confidence_in_analysis = narration["confidence"]
+    base.analysis_method = ANALYSIS_LLM
+    log.info(
+        "Post-mortem narrated for row {id} ({t}); rule baseline {cat} kept",
+        id=row_id, t=base.ticker, cat=base.failure_category,
+    )
+    return base
 
 
 # ── 3. Batch Post-Mortem ──────────────────────────────────────────────────
@@ -981,12 +1099,12 @@ def batch_postmortem(
             "SELECT tp.id, op.scored_at AS miss_at FROM trade_postmortems tp"
             " JOIN " + VISIBLE_ORACLE_PREDICTIONS + " op ON op.id = tp.prediction_id"
             " WHERE tp.generated_at >= :cutoff AND op.scored_at >= :cutoff AND " + UNNARRATED_SQL +
-            " AND " + NEWEST_COPY_SQL +
+            " AND " + NEWEST_COPY_SQL + " AND " + NARRATABLE_SQL +
             " UNION ALL"
             " SELECT tp.id, orr.closed_at AS miss_at FROM trade_postmortems tp"
             " JOIN options_recommendations orr ON orr.id = tp.trade_id"
             " WHERE tp.generated_at >= :cutoff AND orr.closed_at >= :cutoff AND " + UNNARRATED_SQL +
-            " AND " + NEWEST_COPY_SQL +
+            " AND " + NEWEST_COPY_SQL + " AND " + NARRATABLE_SQL +
             " ORDER BY miss_at DESC, id DESC"
         )
         narrate_params: dict[str, Any] = {"cutoff": cutoff}
@@ -1033,7 +1151,7 @@ def batch_postmortem(
 
 # ── 4. Lessons Learned Synthesis ──────────────────────────────────────────
 
-def generate_lessons_learned(engine: Engine, postmortems: list[PostMortem]) -> str:
+def generate_lessons_learned(engine: Engine, postmortems: list[PostMortem], *, use_llm: bool = True) -> str:
     """Synthesise actionable lessons from a batch of post-mortems.
 
     Uses LLM to identify systemic patterns and produce specific
@@ -1066,10 +1184,13 @@ def generate_lessons_learned(engine: Engine, postmortems: list[PostMortem]) -> s
 
     avg_return = sum(pm.actual_return for pm in postmortems) / total
 
-    # Try LLM synthesis
-    llm_report = _get_llm_lessons_learned(postmortems, categories, tickers, wrong_counts, right_counts)
-    if llm_report:
-        return llm_report
+    basis = analysis_basis_line([getattr(pm, "analysis_method", None) for pm in postmortems])
+
+    # Try LLM synthesis (not when the caller's budget is spent: the API trigger passes use_llm=False)
+    if use_llm:
+        llm_report = _get_llm_lessons_learned(postmortems, categories, tickers, wrong_counts, right_counts)
+        if llm_report:
+            return basis + "\n" + llm_report
 
     # Rule-based fallback
     lines = [
@@ -1078,6 +1199,7 @@ def generate_lessons_learned(engine: Engine, postmortems: list[PostMortem]) -> s
         "=" * 60,
         "",
         f"Failures analysed: {total}",
+        basis,
         f"Average return:    {avg_return:+.2%}",
         "",
         "-- Failure Category Breakdown --",
@@ -1471,6 +1593,16 @@ def _store_postmortem(
     batch's ``NOT IN`` check before either inserted. A transaction-scoped advisory lock on the key makes
     the existence check and the insert atomic between writers on PostgreSQL.
     """
+    # Write chronology: a record is written after its miss. Readers prefilter on generated_at
+    # (miss_on_or_after_sql), so a record dated before its own miss would be invisible to them.
+    miss_when = _as_utc(_parse_iso(getattr(pm, "miss_at", None)))
+    written_when = _as_utc(_parse_iso(getattr(pm, "generated_at", None)))
+    if miss_when is not None and written_when is not None and written_when < miss_when:
+        log.warning(
+            "Post-mortem: refusing a record written {w} before its miss {m} ({p}/{t})",
+            w=written_when.isoformat(), m=miss_when.isoformat(), p=prediction_id, t=trade_id,
+        )
+        return False
     if prediction_id is not None:
         key, where, ident = f"trade_postmortems:prediction:{prediction_id}", "prediction_id = :ident", str(prediction_id)
     elif trade_id is not None:
@@ -1530,45 +1662,39 @@ def _store_postmortem(
     return True
 
 
-def _update_postmortem_narration(engine: Engine, row_id: int, pm: PostMortem) -> bool:
-    """Rewrite one rule-based row with its LLM narration. False when the row is no longer rule-based."""
+def _update_postmortem_narration(engine: Engine, row_id: int, narration: dict[str, Any]) -> bool:
+    """Write a narration onto a rule-based row. False when the row is no longer rule-based.
+
+    Only the narrative changes: the columns ``what_we_missed``, ``recommended_fix`` and
+    ``confidence`` and the same three keys in ``full_analysis`` (hydration reads the keys first,
+    so they must agree with the columns). ``failure_category``, ``root_cause``, ``signals_*`` and
+    ``generated_at`` (the rule baseline) are not in the statement. ``full_analysis`` gains
+    ``narration`` (with ``narrated_at``) and ``rule_narrative`` (the replaced values, read from the
+    row itself in the same statement).
+    """
     with engine.begin() as conn:
         result = conn.execute(text(
-            "UPDATE trade_postmortems tp SET failure_category = :failure_category, root_cause = :root_cause,"
-            " signals_wrong = :signals_wrong, signals_right = :signals_right,"
-            " what_we_missed = :what_we_missed, recommended_fix = :recommended_fix,"
-            " full_analysis = :full_analysis, confidence = :confidence"
+            "UPDATE trade_postmortems tp SET what_we_missed = :what_we_missed,"
+            " recommended_fix = :recommended_fix, confidence = :confidence,"
+            " full_analysis = COALESCE(tp.full_analysis, '{}'::jsonb) || jsonb_build_object("
+            "'analysis_method', CAST(:method AS text),"
+            " 'what_we_missed', CAST(:what_we_missed AS text),"
+            " 'recommended_fix', CAST(:recommended_fix AS text),"
+            " 'confidence_in_analysis', CAST(:confidence AS numeric),"
+            " 'narration', CAST(:narration AS jsonb),"
+            " 'rule_narrative', jsonb_build_object('what_we_missed', tp.what_we_missed,"
+            " 'recommended_fix', tp.recommended_fix, 'confidence', tp.confidence))"
             " WHERE tp.id = :id AND " + UNNARRATED_SQL
         ), {
             "id": int(row_id),
-            "failure_category": pm.failure_category,
-            "root_cause": pm.root_cause,
-            "signals_wrong": json.dumps(pm.which_signals_were_wrong),
-            "signals_right": json.dumps(pm.which_signals_were_right),
-            "what_we_missed": pm.what_we_missed,
-            "recommended_fix": pm.recommended_fix,
-            "full_analysis": json.dumps({**pm.to_dict(), "narrated_at": pm.generated_at}, default=str),
-            "confidence": pm.confidence_in_analysis,
+            "what_we_missed": narration["what_we_missed"],
+            "recommended_fix": narration["recommended_fix"],
+            "confidence": narration["confidence"],
+            "method": ANALYSIS_LLM,
+            "narration": json.dumps(narration, default=str),
         })
     rowcount = getattr(result, "rowcount", None)
     return not isinstance(rowcount, int) or rowcount > 0
-
-
-def _persist_postmortem(
-    engine: Engine,
-    pm: PostMortem,
-    *,
-    trade_id: int | None,
-    prediction_id: str | None,
-    update_row_id: int | None,
-) -> bool:
-    """Insert a new record, or narrate an existing row in place. True when something was written."""
-    if update_row_id is not None:
-        if pm.analysis_method != ANALYSIS_LLM:
-            return False  # the LLM gave no narrative: the rule-based row stands as it is
-        return _update_postmortem_narration(engine, update_row_id, pm)
-    # ``is not False``: a None from a stubbed store still reads as written.
-    return _store_postmortem(engine, pm, trade_id=trade_id, prediction_id=prediction_id) is not False
 
 
 def _narrative_fields(
@@ -1782,7 +1908,7 @@ def load_postmortems_top_n(
         SELECT id, trade_id, prediction_id, ticker, outcome,
                failure_category, root_cause, signals_wrong, signals_right,
                what_we_missed, recommended_fix,
-               confidence, generated_at
+               confidence, generated_at, full_analysis->>'analysis_method'
         FROM trade_postmortems tp
         WHERE """ + miss_on_or_after_sql(":cutoff") + """
         ORDER BY generated_at DESC
@@ -1812,6 +1938,9 @@ def load_postmortems_top_n(
             "full_analysis": {},
             "confidence": float(r[11]) if r[11] is not None else None,
             "generated_at": r[12].isoformat() if r[12] else None,
+            "analysis_method": analysis_method_of(
+                {"full_analysis": {"analysis_method": r[13]}, "what_we_missed": r[9]}),
+            "classification_method": ANALYSIS_RULES,
         })
 
     return results
@@ -1941,6 +2070,8 @@ def load_postmortems(
         # ``full_analysis.actual_return`` (percent points for older prediction
         # rows). None when it cannot be told.
         record["actual_return_fraction"] = stored_return_fraction(record)
+        record["analysis_method"] = analysis_method_of(record)
+        record["classification_method"] = ANALYSIS_RULES
         results.append(record)
 
     return results

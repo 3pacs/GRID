@@ -405,7 +405,8 @@ def test_label_uses_the_rows_actually_included_and_exclusion_does_not_shrink_the
     _patch_window(monkeypatch, records)
     out = pml._generate(MagicMock(), n=3, days=30)
     assert out["count"] == 3                                          # not 2
-    assert out["label"] == "LLM summary of 3 postmortems dated 2026-11-22 to 2026-11-24"
+    assert out["label"] == ("LLM summary of 3 postmortems dated 2026-11-22 to 2026-11-24"
+                            " (3 narrated, 0 rule-based: classified by rule, not a proven cause)")
     assert out["excluded_unknown_return"] == 1
 
 
