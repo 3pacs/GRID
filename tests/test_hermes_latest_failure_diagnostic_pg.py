@@ -182,7 +182,11 @@ def _diagnose(conn):
     namespace = {"log": log, "json": json, "re": re, "datetime": datetime, "timezone": timezone,
                  "_REPAIR_SCHEDULE_LOCK": threading.Lock(), "_REPAIR_RECOVERED_AT": {},
                  "_UNROUTED_FAILURES_REPORTED": {},
-                 "_guest_pull_log_names": lambda: GUEST_PULL_LOG_NAMES}
+                 "_guest_pull_log_names": lambda: GUEST_PULL_LOG_NAMES,
+                 # No fixture source is a scheduler registry entry, so none is too
+                 # slow for a repair and the pass still runs one query
+                 # (tests/test_hermes_repair_slow_source_20261127.py covers the real helper).
+                 "_slow_repair_reason": lambda source, engine: None}
     exec(compile(module, str(SOURCE), "exec"), namespace)
     engine = _OneConnection(conn)
     # BOTH flags are necessary: production dry_run is checked after optional LLM diagnosis.

@@ -208,6 +208,10 @@ def _diagnostics_abandoned(token: int, deadline: float) -> tuple[bool, str]:
 #     with the sources the previous pass did not reach;
 #   - deterministic failures get a DETERMINISTIC_FAILURE_COOLDOWN_SECONDS
 #     skip, recorded once with one warning.
+#   - an overrun of the per-source cap counts toward the repeated-failure
+#     long skip (REPAIR_OVERRAN_REASON), and a source whose own scheduled
+#     runs measurably do not fit in the cap and cannot be stopped is not
+#     started at all (_slow_repair_reason, 2026-11-27).
 # The pass therefore returns by REPAIR_BUDGET_SECONDS (plus bookkeeping),
 # well inside DIAGNOSE_PULLS_TIMEOUT_SECONDS, so _run_with_timeout no longer
 # blacklists the step.
@@ -225,6 +229,18 @@ REPAIR_WARNING_INTERVAL_SECONDS = 3600.0
 REPEATED_FAILURE_THRESHOLD = 3
 REPEATED_FAILURE_COOLDOWN_SECONDS = 24 * 3600.0
 REPEATED_FAILURE_MAX_COOLDOWN_SECONDS = 7 * 24 * 3600.0
+# What an overrun of the per-source cap is counted as by note_repair_failure.
+# No digits and no source name, so every overrun of one source is "the same
+# failure" to the repeated-failure rule.
+REPAIR_OVERRAN_REASON = "repair exceeded the per-source cap"
+# A source most of whose own scheduled runs take longer than
+# PER_SOURCE_REPAIR_SECONDS is not repaired by diagnose_and_fix_pulls (see
+# _slow_repair_reason). The runs counted are its completed (SUCCESS or
+# PARTIAL) scheduled runs in pull_log in this window; fewer than the minimum
+# is not evidence. pull_log is read at most once per refresh interval.
+SLOW_RUN_LOOKBACK_DAYS = 30
+SLOW_RUN_MIN_RUNS = 3
+SLOW_RUN_REFRESH_SECONDS = 3600.0
 
 _REPAIR_SCHEDULE_LOCK = threading.Lock()
 # source_key -> monotonic time the last repair attempt for it started.
@@ -253,6 +269,12 @@ _REPAIR_RECOVERED_AT: dict[str, datetime] = {}
 # OPERATOR_ISSUE_DEDUPE_HOURS). Not persisted: the cost of a restart is one
 # log line per failing guest, and there is one guest today.
 _UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
+# "read_at": monotonic time pull_log was last read for run times (None: not
+# yet); "runs": registry name -> (runs longer than the repair cap, completed
+# runs). Process memory, but only a cache of pull_log: the first pass after a
+# restart reads it again, so a restart does not forget which sources are too
+# slow.
+_SCHEDULED_RUNS: dict[str, Any] = {"read_at": None, "runs": {}}
 
 # Exception classes that mean "this retry will fail the same way next time"
 # (a code or wiring defect, not a transient provider condition). TypeError
@@ -453,6 +475,165 @@ def _held_source_names() -> dict[str, str]:
     return held
 
 
+def _read_scheduled_runs(engine: Any) -> dict[str, tuple[int, int]]:
+    """Registry name -> (runs longer than the repair cap, completed runs).
+
+    Only SmartScheduler runs (``smart:<name>`` in pull_log) that did their
+    work (SUCCESS or PARTIAL) in the last SLOW_RUN_LOOKBACK_DAYS, and only
+    names with at least SLOW_RUN_MIN_RUNS of them. A FAILED run is left out:
+    it may have stopped at once or at its timeout, and neither says how long
+    the pull takes.
+    """
+    from sqlalchemy import text
+
+    from ingestion.smart_scheduler import PULLER_REGISTRY, SMART_PULL_LOG_PREFIX
+
+    names = [SMART_PULL_LOG_PREFIX + entry["name"] for entry in PULLER_REGISTRY]
+    with engine.connect() as conn:
+        if not _relation_exists(conn, "pull_log"):
+            return {}
+        rows = conn.execute(
+            text(
+                "SELECT puller_name, "
+                "       COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM completed_at - started_at) "
+                "                              > :cap_seconds) AS over_cap, "
+                "       COUNT(*) AS completed "
+                "FROM pull_log "
+                "WHERE puller_name = ANY(:names) "
+                "  AND status IN ('SUCCESS', 'PARTIAL') "
+                "  AND completed_at > NOW() - make_interval(days => :days) "
+                "GROUP BY puller_name "
+                "HAVING COUNT(*) >= :min_runs"
+            ),
+            {"names": names, "cap_seconds": float(PER_SOURCE_REPAIR_SECONDS),
+             "days": SLOW_RUN_LOOKBACK_DAYS, "min_runs": SLOW_RUN_MIN_RUNS},
+        ).fetchall()
+    return {
+        str(row[0])[len(SMART_PULL_LOG_PREFIX):]: (int(row[1]), int(row[2]))
+        for row in rows
+    }
+
+
+def _scheduled_runs(engine: Any) -> dict[str, tuple[int, int]]:
+    """_read_scheduled_runs, read at most once per SLOW_RUN_REFRESH_SECONDS.
+
+    A failed read keeps the last good one (empty before the first) and is
+    tried again on the next pass: without run times no source is held as too
+    slow, which is the behaviour before this rule existed.
+    """
+    now = time.monotonic()
+    with _REPAIR_SCHEDULE_LOCK:
+        read_at = _SCHEDULED_RUNS["read_at"]
+        cached = _SCHEDULED_RUNS["runs"]
+    if read_at is not None and now - read_at < SLOW_RUN_REFRESH_SECONDS:
+        return cached
+    try:
+        runs = _read_scheduled_runs(engine)
+    except Exception as exc:
+        _warn_throttled(
+            "scheduled_runs",
+            "Scheduled run times unavailable ({kind}); no source is held as too slow "
+            "for a repair beyond the last read",
+            kind=type(exc).__name__,
+        )
+        return cached
+    with _REPAIR_SCHEDULE_LOCK:
+        _SCHEDULED_RUNS["read_at"] = now
+        _SCHEDULED_RUNS["runs"] = runs
+    return runs
+
+
+def _repeats_scheduled_run(source_name: str) -> tuple[str, dict[str, Any]] | None:
+    """(registry name, handler entry) when a repair would repeat the scheduled run.
+
+    That is: the source resolves to a runnable class-based handler that is a
+    scheduler registry entry (directly or by an alias), and the repair calls
+    the same method with the same kwargs as the schedule does. A handler with
+    its own repair method or kwargs (edgar, insider_filings: a three-day
+    window) runs a different, shorter pull, so the scheduled run's time says
+    nothing about it. None for those and for a source with no handler.
+    """
+    try:
+        from ingestion.smart_scheduler import PULLER_REGISTRY
+        from scripts.hermes_operator import _SOURCE_REGISTRY
+    except Exception:
+        return None
+    entry = _retry_registry_entry(source_name)
+    if entry is None or entry.get("skip_runtime") or "cls" not in entry:
+        return None
+    for scheduled in PULLER_REGISTRY:
+        if _SOURCE_REGISTRY.get(scheduled["name"]) is not entry:
+            continue
+        same_call = (
+            entry.get("pull_method", "pull_all") == scheduled.get("method", "pull_all")
+            and (entry.get("pull_kwargs") or {}) == (scheduled.get("kwargs") or {})
+        )
+        return (scheduled["name"], entry) if same_call else None
+    return None
+
+
+def _repair_cannot_be_bounded(entry: dict[str, Any]) -> bool:
+    """True when a repair of this handler can neither be stopped nor narrowed.
+
+    _retry_source hands ``should_continue`` to a pull method that accepts it
+    (the pull then stops at the per-source deadline and keeps its backlog)
+    and bounds ``start_date`` to the repair window for one that accepts that.
+    A method with neither runs exactly as on its schedule, to the end. An
+    import or signature failure is unknown, not evidence: False.
+    """
+    try:
+        import importlib
+
+        cls = getattr(importlib.import_module(entry["mod"]), entry["cls"])
+        params = inspect.signature(getattr(cls, entry.get("pull_method", "pull_all"))).parameters
+    except Exception:
+        return False
+    return "should_continue" not in params and "start_date" not in params
+
+
+def _slow_repair_reason(source_name: str, engine: Any) -> str | None:
+    """Why diagnose_and_fix_pulls must not start a repair of this source, or None.
+
+    A repair gets PER_SOURCE_REPAIR_SECONDS. A pull that takes longer and
+    cannot be stopped overruns it: the pass moves on, the worker cannot be
+    killed, and the pull runs to its end as an unlogged copy of the scheduled
+    run. SEC_XBRL_Financials (a weekly pull; 7 of its 11 completed runs took
+    over three minutes) was started this way 19 times on 2026-11-27 and
+    overran 62 times in eight days without one recovery. Such a source's
+    scheduled run is its only repair.
+
+    The rule: more than half of the source's completed scheduled runs in the
+    last SLOW_RUN_LOOKBACK_DAYS took longer than the cap, and a repair would
+    make the same call with no way to stop or narrow it.
+
+    Decided from the runs, not from the registry's ``timeout_s``: that is a
+    ceiling, and 53 of the 85 pulls that cannot be stopped have one above the
+    cap while most of them finish in seconds (GoogleTrends: 180 s allowed,
+    about 19 s taken, recovered by a repair eight times in the same eight
+    days). The runs are the scheduler's own rows in pull_log, so the hold
+    needs no stored state of its own and a restart cannot forget it. A source
+    with too few runs, a cooperative or date-bounded pull, or a repair that
+    is not the scheduled call is left to the overrun count in
+    diagnose_and_fix_pulls (REPAIR_OVERRAN_REASON).
+    """
+    resolved = _repeats_scheduled_run(source_name)
+    if resolved is None:
+        return None
+    registry_name, entry = resolved
+    measured = _scheduled_runs(engine).get(registry_name)
+    if measured is None:
+        return None
+    over_cap, completed = measured
+    if 2 * over_cap <= completed or not _repair_cannot_be_bounded(entry):
+        return None
+    return (
+        f"{over_cap} of its {completed} completed scheduled runs in the last "
+        f"{SLOW_RUN_LOOKBACK_DAYS} days took longer than the {PER_SOURCE_REPAIR_SECONDS:.0f}s "
+        "a repair may run, and a repair would start the same pull with no way to stop it; "
+        "its scheduled run is its only repair"
+    )
+
+
 def _guest_pull_log_names() -> frozenset[str]:
     """pull_log names of runs that write under another registry entry's catalog row.
 
@@ -492,7 +673,11 @@ UNROUTED_GUEST_REASON = (
 def _report_unrouted_failures(
     engine: Any, unrouted: list[dict[str, Any]], state: Any, dry_run: bool,
 ) -> None:
-    """Report failures no repair can be routed to, once per new failure per process.
+    """Report failures no repair will be started for, once per new failure per process.
+
+    Two kinds: a guest run no repair can be routed to (UNROUTED_GUEST_REASON)
+    and a source too slow for a repair, whose entry carries its own
+    ``not_repaired_reason``.
 
     They are not diagnosed, retried or escalated, so they take no LLM slot,
     no repair budget and no CRITICAL issue. A new failure (a later
@@ -512,17 +697,28 @@ def _report_unrouted_failures(
         if seen:
             continue
         error = (info.get("last_error") or "").strip().replace("\n", " ")[:160] or "no error message"
-        log.warning(
-            "Not repairing {s} — no retry handler: {r} (latest failure {t}: {e})",
-            s=source, r=UNROUTED_GUEST_REASON, t=stamp or "?", e=error,
-        )
+        # A source held as too slow for a repair carries its own reason
+        # (_slow_repair_reason); a guest run has no handler at all.
+        own_reason = info.get("not_repaired_reason")
+        if own_reason:
+            log.warning(
+                "Not repairing {s} — {r} (latest failure {t}: {e})",
+                s=source, r=own_reason, t=stamp or "?", e=error,
+            )
+        else:
+            log.warning(
+                "Not repairing {s} — no retry handler: {r} (latest failure {t}: {e})",
+                s=source, r=UNROUTED_GUEST_REASON, t=stamp or "?", e=error,
+            )
         if dry_run:
             continue
         log_issue(
             engine, category="ingestion", severity="WARNING",
             source=source,
-            title=f"No Hermes pull handler — {source}",
-            detail=f"Latest failure {stamp or '?'}: {error}. Not retried: {UNROUTED_GUEST_REASON}.",
+            title=(f"Scheduled run failed, no Hermes repair — {source}" if own_reason
+                   else f"No Hermes pull handler — {source}"),
+            detail=(f"Latest failure {stamp or '?'}: {error}. "
+                    f"Not retried: {own_reason or UNROUTED_GUEST_REASON}."),
             fix_result="SKIPPED",
             cycle_number=getattr(state, "cycle_count", None),
         )
@@ -1871,6 +2067,25 @@ def _construct_retry_puller(entry: dict[str, Any], cls: Any, engine: Any) -> Any
     return cls(db_engine=engine)
 
 
+def _retry_registry_entry(source_name: str) -> dict[str, Any] | None:
+    """The handler entry a repair of ``source_name`` resolves to, or None.
+
+    Direct precedence and explicit aliases only. A map entry only selects a
+    candidate: _resolve_puller still checks that its class declares this
+    exact catalog. Fuzzy prefix guesses provide no target-specific routing
+    authority.
+    """
+    from scripts.hermes_operator import _SOURCE_REGISTRY
+
+    source_lower = source_name.lower().replace(" ", "_").replace("-", "_")
+    entry = _SOURCE_REGISTRY.get(source_lower)
+    if entry is None:
+        mapped = _CATALOG_TO_REGISTRY.get(source_name) or _CATALOG_TO_REGISTRY.get(source_lower)
+        if mapped:
+            entry = _SOURCE_REGISTRY.get(mapped)
+    return entry
+
+
 def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, Any]]:
     """Resolve a source name to a puller instance using the registry.
 
@@ -1882,18 +2097,7 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
     """
     import importlib
 
-    source_lower = source_name.lower().replace(" ", "_").replace("-", "_")
-
-    from scripts.hermes_operator import _SOURCE_REGISTRY
-
-    # Preserve direct precedence and explicit aliases. A map entry only
-    # selects a candidate: its class must declare this exact catalog below.
-    # Fuzzy prefix guesses provide no target-specific routing authority.
-    entry = _SOURCE_REGISTRY.get(source_lower)
-    if entry is None:
-        mapped = _CATALOG_TO_REGISTRY.get(source_name) or _CATALOG_TO_REGISTRY.get(source_lower)
-        if mapped:
-            entry = _SOURCE_REGISTRY.get(mapped)
+    entry = _retry_registry_entry(source_name)
     if entry is None:
         raise NoRetryHandler("No explicit dataset handler registered for requested source")
 
@@ -2519,6 +2723,23 @@ def diagnose_and_fix_pulls(
 
     held = _held_source_names()
     not_held = [r for r in failed if _normalize_source_key(r[0] or "") not in held]
+    # A source whose own scheduled run does not fit in a repair is not
+    # repaired either (_slow_repair_reason). Unlike a held source it still
+    # runs and can still fail, so each new failure is reported once.
+    too_slow = {
+        r[0]: reason for r in not_held
+        if r[0] and (reason := _slow_repair_reason(r[0], engine)) is not None
+    }
+    if too_slow:
+        result["skipped_too_slow"] = len(too_slow)
+        _report_unrouted_failures(
+            engine,
+            [{"source": r[0], "last_fail": r[2].isoformat() if r[2] else None,
+              "last_error": (r[3] or "")[:200], "not_repaired_reason": too_slow[r[0]]}
+             for r in not_held if r[0] in too_slow],
+            state, dry_run,
+        )
+        not_held = [r for r in not_held if r[0] not in too_slow]
     still_failed = [r for r in not_held if not _recovered_after(r[0] or "", r[2])]
     if len(still_failed) < len(failed):
         log.info(
@@ -2852,6 +3073,16 @@ def diagnose_and_fix_pulls(
                     "Repair for {s} exceeded the {t:.0f}s per-source cap — moving on",
                     s=source_name, t=source_budget,
                 )
+                # An overrun is a failed repair like any other: the third in
+                # a row puts the source on the long skip. Before this an
+                # overrun was never counted, so a source too slow for the cap
+                # was started again after every ordinary cooldown while each
+                # abandoned pull ran to its end (EIA: 40 repairs, 23
+                # overruns, 1 recovery in eight days). Only when the source
+                # had the whole cap: a budget cut short by the pass deadline
+                # says nothing about the source.
+                if source_budget >= PER_SOURCE_REPAIR_SECONDS:
+                    note_repair_failure(source_name, REPAIR_OVERRAN_REASON)
                 continue
             if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
                 log.info("Skipping {s} — repair already in flight", s=source_name)
