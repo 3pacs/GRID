@@ -487,7 +487,7 @@ def test_derived_basis_writers_parity_tests_run_and_pass(rel):
     assert not problems, "\n".join(problems)
 
 
-def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path):
+def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path, monkeypatch):
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_p.py").write_text(
         "import pytest\n"
@@ -499,11 +499,9 @@ def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path):
     (tmp_path / "evil_plugin.py").write_text(
         "def pytest_pyfunc_call(pyfuncitem):\n    return True\n")
     for key, value in (("PYTEST_PLUGINS", "evil_plugin"), ("PYTEST_ADDOPTS", "-p evil_plugin")):
-        os.environ[key] = value
-        try:
+        with monkeypatch.context() as env:
+            env.setenv(key, value)
             assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path)), key
-        finally:
-            del os.environ[key]
     assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path))
     assert any("skipped" in p for p in parity_run_problems(["tests/test_p.py::test_skip"], tmp_path))
     assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_absent"], tmp_path))
