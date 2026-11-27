@@ -24,6 +24,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(sec,'_sector_map_tickers',lambda:['NVDA'])
     monkeypatch.setattr(sec,'_load_fx_rates',lambda _: {'USD':1})
     monkeypatch.setattr(sec,'_fetch_ticker_to_cik_map',lambda:{'NVDA':'0001045810'})
+    monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik:None)   # no network: refusals stay refusals
     monkeypatch.setattr(sec,'_load_checkpoint',lambda:{})
     monkeypatch.setattr(sec.time,'sleep',lambda _:None)
     checkpoints=[]
@@ -137,15 +138,72 @@ def test_no_cik_is_attempted_not_successful(runner,monkeypatch):
     write.assert_not_called()
 
 
-def test_summary_counts_tolerated_stray_points_and_the_issuer_is_still_written(runner):
-    puller,fetch,write,checkpoints=runner
+def _stray_response():
     raw,now,_=response()
     data=json.loads(raw)
-    data['facts']['us-gaap']['Assets']={'units':{'USD':[dict(
-        end='2026-07-26',val=1,form='10-Q',fp='Q2',accn='0001045810-26-000075',filed='2026-08-26')]}}
     data['facts']['us-gaap']['PaymentsOfDividends']={'units':{'USD':[dict(
         end='2026-06-15',val=1,form='10-Q',fp='Q2',accn='0001045810-26-000075',filed='2026-08-26')]}}
-    fetch.return_value=(json.dumps(data).encode(),now,now)
+    return json.dumps(data).encode(),now,now
+
+
+def test_a_start_less_point_is_retried_once_with_edgar_report_dates_and_the_issuer_is_written(runner,monkeypatch):
+    from datetime import date
+    puller,fetch,write,checkpoints=runner
+    fetch.return_value=_stray_response()
+    asked=[]
+    monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik:asked.append(cik) or {'0001045810-26-000075':date(2026,7,26)})
     result=puller.pull_all()
     assert result[0]['status']=='SUCCESS' and result[-1]['tolerated_stray_points']==1
-    assert write.call_count==1 and write.call_args.args[1].tolerated_stray_points[0][1]=='2026-06-15'
+    assert asked==['0001045810']                                       # one extra EDGAR call, only after the refusal
+    assert write.call_count==1 and write.call_args.args[1].report_dates==(('0001045810-26-000075','2026-07-26'),)
+
+
+def test_without_report_date_evidence_the_refusal_stands_and_nothing_is_written(runner,monkeypatch):
+    puller,fetch,write,checkpoints=runner
+    fetch.return_value=_stray_response()
+    for unavailable in (None,{}):
+        monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik,u=unavailable:u)
+        result=puller.pull_all(resume=False)
+        assert result[0]['status']=='FAILED' and 'duration' in result[0]['error']
+    write.assert_not_called()
+
+
+def test_clean_issuers_make_no_submissions_request(runner,monkeypatch):
+    puller,fetch,write,checkpoints=runner
+    monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik:pytest.fail('asked for report dates'))
+    assert puller.pull_all()[0]['status']=='SUCCESS'
+
+
+def _submissions(**changes):
+    doc={'cik':1045810,'filings':{'recent':{'accessionNumber':['0001045810-26-000075','0001045810-26-000070','0001045810-26-000001'],
+                                            'reportDate':['2026-07-26','','not-a-date']}}}
+    doc.update(changes)
+    return doc
+
+
+def _http(monkeypatch,status=200,body=None,exc=None):
+    def get(url,**kw):
+        if exc:
+            raise exc
+        return MagicMock(status_code=status,json=lambda:body)
+    monkeypatch.setattr(sec.requests,'get',get)
+
+
+def test_report_dates_come_only_from_well_formed_rows(monkeypatch):
+    from datetime import date
+    _http(monkeypatch,body=_submissions())
+    assert sec._fetch_report_dates('0001045810')=={'0001045810-26-000075':date(2026,7,26)}   # blank/garbled rows give no evidence
+
+
+@pytest.mark.parametrize('name, kwargs',[
+    ('http error',dict(status=500,body=None)),
+    ('network down',dict(exc=sec.requests.ConnectionError('x'))),
+    ('another cik',dict(body=_submissions(cik=99))),
+    ('no filings',dict(body={'cik':1045810})),
+    ('no recent arrays',dict(body={'cik':1045810,'filings':{'recent':{'accessionNumber':[]}}})),
+    ('arrays of different length',dict(body={'cik':1045810,'filings':{'recent':{'accessionNumber':['a','b'],'reportDate':['2026-07-26']}}})),
+    ('not an object',dict(body=[1])),
+])
+def test_report_dates_are_unavailable_unless_the_answer_is_well_formed(monkeypatch,name,kwargs):
+    _http(monkeypatch,**kwargs)
+    assert sec._fetch_report_dates('0001045810') is None,name

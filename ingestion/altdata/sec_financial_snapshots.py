@@ -26,15 +26,9 @@ MAX_SOURCE_BYTES = 32 * 1024 * 1024
 # within this many days of the capture, or after it, is a current or forward
 # period that would be silently dropped, and stays fatal.
 LEGACY_ENTRY_HORIZON_DAYS = 730
-# A filing's report-period end must be recent relative to the filing itself (10-Q/10-K/20-F/40-F
-# deadlines, with room for extensions); an older "latest" balance-sheet date means the current
-# period's balance sheet is absent and the date is a prior-year comparative.
+# Independent sanity bound on the EDGAR reportDate evidence: the report period ends at most this many
+# days before the filing was filed (10-Q/10-K/20-F/40-F deadlines, with room for extensions).
 REPORT_END_MAX_AGE_DAYS = 150
-# Balance-sheet instants whose latest `end` in a filing is that filing's report-period end.
-_BALANCE_SHEET_TAGS: dict[str, frozenset[str]] = {
-    'us-gaap': frozenset({'Assets', 'LiabilitiesAndStockholdersEquity'}),
-    'ifrs-full': frozenset({'Assets', 'EquityAndLiabilities'}),
-}
 
 
 def _json(value: Any) -> str:
@@ -106,6 +100,9 @@ class FinancialSnapshot:
     fx_json: str
     # Not part of the identity: how many unusable legacy entries the gate let
     # through (for the post-run receipt; the source bytes hold the entries).
+    # EDGAR reportDate evidence (accession, ISO date) that a tolerance decision depended on; part of the
+    # identity, and replayed by validate_snapshot.
+    report_dates: tuple[tuple[str, str], ...] = ()
     tolerated_legacy_entries: int = field(default=0, compare=False)
     # (tag, end, accession) of each recent start-less mapped-flow point that was tolerated
     # (event-dated, not a reporting-period end): counted and traceable, never part of the identity.
@@ -118,7 +115,8 @@ class FinancialSnapshot:
 
 def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                      request_started_at: datetime, received_at: datetime,
-                     fx_rates: dict[str, float]) -> FinancialSnapshot:
+                     fx_rates: dict[str, float],
+                     report_dates: dict[str, date] | None = None) -> FinancialSnapshot:
     """Admit a complete successful Company Facts response, not a row subset.
 
     This does not infer an issuer withdrawal from an omitted row. It records
@@ -131,6 +129,12 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
 
     if not isinstance(source_body, bytes) or not 0 < len(source_body) <= MAX_SOURCE_BYTES:
         raise ValueError("Company Facts body must be nonempty bytes within the size bound")
+    report_dates_in: dict[str, date] = {}
+    for accession, reported in (report_dates or {}).items():
+        if (not re.fullmatch(r'[0-9]{10}-[0-9]{2}-[0-9]{6}', str(accession))
+                or not isinstance(reported, date) or isinstance(reported, datetime)):
+            raise ValueError("Invalid report-date evidence")
+        report_dates_in[str(accession)] = reported
     actor_id = actor_id.strip().lower()
     if not actor_id or len(actor_id) > 32 or not all(c.isalnum() or c in '.-' for c in actor_id):
         raise ValueError("Invalid actor identifier")
@@ -162,10 +166,9 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
     # only matter if it stands in for a reporting period the projection would then
     # lack. These indexes let the gate tell such a period stand-in from an
     # event-dated stray point; see the tolerance rule below.
-    unusable: list[tuple[str, str, date, str, bool]] = []            # (taxonomy, tag, end, accn, is_stray_point)
+    unusable: list[tuple[str, str, date, str, bool, date]] = []      # (taxonomy, tag, end, accn, is_stray_point, filed)
     qualifying_ends_all: set[date] = set()                           # ends of entries the normalizer accepts
     qualifying_ends_by_accn: dict[str, set[date]] = {}
-    report_end_by_accn: dict[str, tuple[date, date]] = {}            # accn -> (period end, filed) from its balance sheet
     for taxonomy in ('us-gaap', 'ifrs-full'):
         namespace = facts.get(taxonomy, {})
         if not isinstance(namespace, dict):
@@ -199,43 +202,41 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                     if tag_name in mapped_tags[taxonomy]:
                         if start is None or filed < end:
                             unusable_ends.append(end)
-                            unusable.append((taxonomy, tag_name, end, str(entry['accn']), start is None and filed >= end))
+                            unusable.append((taxonomy, tag_name, end, str(entry['accn']), start is None and filed >= end, filed))
                         elif _normalize_entry(entry) is not None:
                             # Only what the normalizer would turn into a row counts as
                             # evidence of a reporting period: a nonqualifying form or
                             # duration (a two-day 8-K span, a 9-month YTD) proves nothing.
                             qualifying_ends_all.add(end)
                             qualifying_ends_by_accn.setdefault(str(entry['accn']), set()).add(end)
-                    elif start is None and tag_name in _BALANCE_SHEET_TAGS[taxonomy] and filed >= end:
-                        accn = str(entry['accn'])
-                        if accn not in report_end_by_accn or end > report_end_by_accn[accn][0]:
-                            report_end_by_accn[accn] = (end, filed)
     capture_day = received.date()
     tolerated_points: list[tuple[str, str, str]] = []
-    for taxonomy, tag_name, end, accn, is_stray_point in unusable:
+    used_report_dates: dict[str, date] = {}
+    for taxonomy, tag_name, end, accn, is_stray_point, filed_at in unusable:
         if (capture_day - end).days > LEGACY_ENTRY_HORIZON_DAYS:
             continue                                   # legacy: cannot affect a current row
         # A recent unusable entry refuses the issuer, EXCEPT an event-dated stray point: a
-        # start-less entry (it can never be a flow row: the normalizer needs a duration)
-        # for which the filing's OWN report-period end is established and the point is
+        # start-less entry (it can never be a flow row: the normalizer needs a duration) for
+        # which the filing's report-period end is independently established and the point is
         # shown not to be that period or any other:
-        #  (1) the accession's period end R comes from its balance sheet (Assets /
-        #      LiabilitiesAndStockholdersEquity instants: the latest end the filing
-        #      reports), not from the entries under test;
-        #  (2) the accession has a qualifying (normalizer-accepted) flow ending at R, so
-        #      the current period is represented and not hiding behind comparatives;
-        #  (3) the point's end is not R and not the end of any qualifying flow.
+        #  (1) report_dates carries the accession's reportDate from EDGAR submissions, matched
+        #      by accession number: evidence supplied by the caller and bound into the
+        #      snapshot identity, never inferred from the entries under test; absent => the
+        #      entry refuses (fail closed);
+        #  (2) independently, that date is plausible for the filing: not after it was filed
+        #      and at most REPORT_END_MAX_AGE_DAYS before it;
+        #  (3) the accession has a QUALIFYING flow (one the normalizer accepts) ending on it,
+        #      so the current period is represented and not hiding behind comparatives;
+        #  (4) the point's end is not that date and not the end of any qualifying flow.
         # Real shapes: a one-day debt issuance, share issuance or buyback in a notes
         # disclosure (2026-11-26: INTC, EOG, ON, WLK, DHI, RPD, NXE, each refused for one).
-        report_end, filed_at = report_end_by_accn.get(accn, (None, None))
-        # (1b) the latest balance-sheet date must itself be a plausible report-period end for
-        # this filing: not after it was filed and at most REPORT_END_MAX_AGE_DAYS before it,
-        # else the current balance sheet is absent and the date is a prior-year comparative.
-        if (is_stray_point and report_end is not None
-                and 0 <= (filed_at - report_end).days <= REPORT_END_MAX_AGE_DAYS
-                and report_end in qualifying_ends_by_accn.get(accn, ())
-                and end != report_end and end not in qualifying_ends_all):
+        report_date = report_dates_in.get(accn)
+        if (is_stray_point and report_date is not None
+                and 0 <= (filed_at - report_date).days <= REPORT_END_MAX_AGE_DAYS
+                and report_date in qualifying_ends_by_accn.get(accn, ())
+                and end != report_date and end not in qualifying_ends_all):
             tolerated_points.append((tag_name, end.isoformat(), accn))
+            used_report_dates[accn] = report_date
             continue
         raise ValueError("Invalid mapped financial-flow duration")
     rates = _AppliedFxRates(json.loads(_json(fx_rates)))
@@ -243,9 +244,13 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
     fx_json = _json(rates.applied)
     normalized_json = _json(sorted(rows, key=lambda r: (r['fiscal_period'], r['period_type'], r['flow_type'])))
     source_hash, normalized_hash = _sha(source_body), _sha(normalized_json.encode('utf-8'))
-    identity = _json(dict(actor_id=actor_id, cik=cik, source_sha256=source_hash,
-                         normalized_sha256=normalized_hash, fx_inputs=json.loads(fx_json),
-                         normalizer_version=NORMALIZER_VERSION))
+    identity_fields = dict(actor_id=actor_id, cik=cik, source_sha256=source_hash,
+                           normalized_sha256=normalized_hash, fx_inputs=json.loads(fx_json),
+                           normalizer_version=NORMALIZER_VERSION)
+    used = tuple(sorted((a, d.isoformat()) for a, d in used_report_dates.items()))
+    if used:      # only when the decision depended on it: every other snapshot id is unchanged
+        identity_fields['report_dates'] = [list(pair) for pair in used]
+    identity = _json(identity_fields)
     return FinancialSnapshot(
         snapshot_id=_sha(identity.encode('utf-8')), actor_id=actor_id, cik=cik,
         request_started_at=started, received_at=received,
@@ -255,6 +260,7 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
         normalized_json=normalized_json, fx_json=fx_json,
         tolerated_legacy_entries=len(unusable_ends),
         tolerated_stray_points=tuple(tolerated_points),
+        report_dates=used,
     )
 
 
@@ -262,7 +268,8 @@ def validate_snapshot(snapshot: FinancialSnapshot) -> None:
     """Recompute admission at the write boundary, detecting mutated artifacts."""
     expected = prepare_snapshot(source_body=snapshot.source_body, actor_id=snapshot.actor_id,
                                 cik=snapshot.cik, request_started_at=snapshot.request_started_at,
-                                received_at=snapshot.received_at, fx_rates=json.loads(snapshot.fx_json))
+                                received_at=snapshot.received_at, fx_rates=json.loads(snapshot.fx_json),
+                                report_dates={a: date.fromisoformat(d) for a, d in snapshot.report_dates})
     if expected != snapshot:
         raise ValueError("Snapshot content or normalization identity mismatch")
     # These fields are outside the identity (compare=False) but drive write-boundary
