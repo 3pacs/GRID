@@ -27,6 +27,17 @@ class DollarFlowsAdapter(BaseAdapter):
         the time of the table's last rebuild of that date, so for a ``now`` in
         the past this is only what was last written inside the window, not
         what the table held then; the registry calls it with the current time.
+
+        No signal is built from a 13F row. A 13F row is a reported position
+        (``direction`` "observed", or a legacy unqualified "inflow"), stored
+        with the position's marked value, filed up to 45 days after the
+        quarter it describes: it is not a dollar flow, and its sum is a
+        portfolio total, not a flow magnitude. The directional readers of the
+        table already leave 13F out (``OBSERVED_13F_DIRECTION`` in
+        ``intelligence.dollar_flows``); this one summed it, and because the
+        groups are cut to the 200 largest, 13F totals also pushed real flows
+        out. Rows with no ticker made one "market" signal that every ticker's
+        model received.
         """
         vu = now + timedelta(hours=4)
         signals: list[RegisteredSignal] = []
@@ -37,6 +48,7 @@ class DollarFlowsAdapter(BaseAdapter):
                        0.5 as avg_conf  -- confidence is TEXT, use default
                 FROM dollar_flows
                 WHERE created_at >= :lb AND created_at <= :now
+                  AND source_type <> '13f'
                 GROUP BY ticker, source_type, direction
                 HAVING SUM(amount_usd) > 100000
                 ORDER BY SUM(amount_usd) DESC LIMIT 200

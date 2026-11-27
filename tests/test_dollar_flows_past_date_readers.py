@@ -18,10 +18,14 @@ does, and reads on the 27th:
   so a row written after ``now`` was read. The window is now closed at ``now``.
 
 Today's reads are unchanged, and each case shows that next to the past read.
+
+The adapter also built signals from 13F rows, which are reported positions and
+not flows; the last section covers that.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
@@ -261,6 +265,75 @@ def test_the_adapter_stamps_its_signals_with_the_same_now(engine):
     assert signal.direction == "neutral"
 
 
+# ── Signal adapter: a 13F row is a reported position, not a flow ───────────
+#
+# Production, 2026-11-27 08:16Z (read-only): dollar_flows held 369 rows with
+# source_type '13f'. 49 are legacy rows written 13 to 20 November: direction
+# "inflow", evidence action UNKNOWN, no ticker, confidence "confirmed",
+# 14,139,039,067,794 USD in all; the 28 written on the 20th made one
+# no-ticker MAGNITUDE signal of 7,022,705,633,749. 320 were written on the
+# 26th by the daily normalization: direction "observed", actions CLOSED and
+# NEW, 291 with a ticker and 29 without. Of the adapter's 200 groups per run,
+# 100 were 13F (two with no ticker) while 405 of 428 insider groups over the
+# threshold were cut.
+
+
+def _write_13f(engine, amount: float, written: datetime, *, direction: str, action: str,
+               ticker: str | None, confidence: str, actor: str = "Filer") -> None:
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO dollar_flows (source_type, actor_name, ticker, amount_usd, direction, "
+            "confidence, evidence, flow_date, created_at) "
+            "VALUES ('13f', :actor, :ticker, :amt, :dir, :conf, :ev, :fd, :ca)"),
+            {"actor": actor, "ticker": ticker, "amt": amount, "dir": direction, "conf": confidence,
+             "ev": json.dumps({"cusip": "000000000", "action": action, "shares": 1, "pct_change": None,
+                               "filing_accession": "0000000000-26-000001"}),
+             "fd": written.date() - timedelta(days=7), "ca": written})
+
+
+def _rows_shaped_like_production(engine) -> None:
+    for n in range(28):                                   # the legacy portfolio totals
+        _write_13f(engine, 250_000_000_000.0, _utc(20), direction="inflow", action="UNKNOWN",
+                   ticker=None, confidence="confirmed", actor=f"Legacy {n}")
+    _write_13f(engine, 2_283_782_911.0, _utc(26), direction="observed", action="NEW",
+               ticker="XOM", confidence="derived")
+    _write_13f(engine, 274_332_786.0, _utc(26), direction="observed", action="CLOSED",
+               ticker="FLS", confidence="derived")
+    _write_13f(engine, 3_847_160_143.0, _utc(26), direction="observed", action="NEW",
+               ticker=None, confidence="derived")
+
+
+def test_the_adapter_builds_no_signal_from_13f_rows(engine):
+    _rows_shaped_like_production(engine)
+
+    # Before: {None: 7003847160143.0, "XOM": 2283782911.0, "FLS": 274332786.0}
+    # (None twice: the "inflow" and the "observed" totals, one signal each).
+    assert DollarFlowsAdapter()._build_signals(engine, _utc(27, hour=8)) == []
+
+
+def test_a_real_flow_beside_13f_rows_still_makes_its_signal(engine):
+    _rows_shaped_like_production(engine)
+    _write(engine, "insider", 400_000.0, NOV24, _utc(24), ticker="XOM")
+
+    signals = DollarFlowsAdapter()._build_signals(engine, _utc(27, hour=8))
+
+    assert [(sig.ticker, sig.value, sig.metadata["source_type"]) for sig in signals] == [
+        ("XOM", 400_000.0, "insider")]
+    assert all(sig.ticker for sig in signals)             # nothing addressed to every ticker
+
+
+def test_13f_totals_no_longer_push_real_flows_out_of_the_200(engine):
+    """The groups are cut to the 200 largest. 13F position values are far
+    larger than an insider trade, so 200 of them used to take every place."""
+    for n in range(200):
+        _write_13f(engine, 5_000_000_000.0 + n, _utc(26), direction="observed", action="NEW",
+                   ticker=f"T{n:03d}", confidence="derived")
+    _write(engine, "insider", 400_000.0, NOV24, _utc(24), ticker="AAPL")
+
+    # Before: 200 13F signals and no AAPL.
+    assert _signals(engine, _utc(27, hour=8)) == {"AAPL": 400_000.0}
+
+
 # ── PostgreSQL: the same bounds on TIMESTAMPTZ and NUMERIC ─────────────────
 
 
@@ -298,6 +371,13 @@ def test_real_types_adapter_window_is_closed_at_now(pg_engine):
     assert _signals(pg_engine, _utc(19)) == {"AAPL": 400_000.0}          # written at exactly now
     assert _signals(pg_engine, _utc(19, hour=11)) == {}
     assert _signals(pg_engine, _utc(25)) == {"AAPL": 400_000.0, "MSFT": 900_000.0}
+
+
+def test_real_types_adapter_leaves_13f_rows_out(pg_engine):
+    _rows_shaped_like_production(pg_engine)
+    _write(pg_engine, "insider", 400_000.0, NOV24, _utc(24), ticker="XOM")
+
+    assert _signals(pg_engine, _utc(27, hour=8)) == {"XOM": 400_000.0}
 
 
 def test_real_types_past_and_current_reads(pg_engine, today_is):
