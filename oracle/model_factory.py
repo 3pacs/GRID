@@ -355,29 +355,43 @@ def _factor_obs_date(row: dict[str, Any]) -> str | None:
 
 
 def latest_factor_obs_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop factor rows superseded by a newer observation of the same source and ticker.
+    """One row per (source_module, ticker) for a session-bounded factor.
 
     A factor published from a ticker's own latest ranked row records that
-    row's date as ``metadata.factor_obs_date``. Until it expires, a row from
-    Friday's close is still valid beside Monday's, and a model would count two
-    different observations of one factor. Keep, per (source_module, ticker),
-    only rows carrying the newest ``factor_obs_date``. Rows without it (every
-    other source, and factor rows published before it existed) are unchanged.
+    row's date as ``metadata.factor_obs_date`` and is republished every cycle.
+    Every copy stays valid, so a model would count Friday's and Monday's
+    observations together, and n identical copies of one observation give
+    sqrt(n) times its strength. The copy count differs by ticker (SPY's D-1
+    rows accumulate from its overnight receipt; a same-day ticker's restart
+    at each session's first pull), so it would weight tickers by publication
+    count, not evidence. Keep, per (source_module, ticker), the single row
+    with the newest ``factor_obs_date`` and, among those, the newest
+    ``valid_from``. Rows without the field (every other source, and factor
+    rows published before it existed) are unchanged.
     """
-    newest: dict[tuple[Any, Any], str] = {}
-    for row in rows:
+    best: dict[tuple[Any, Any], tuple[str, Any, int]] = {}
+    for i, row in enumerate(rows):
         obs = _factor_obs_date(row)
         if obs is None:
             continue
         key = (row.get("source_module"), row.get("ticker"))
-        if obs > newest.get(key, ""):
-            newest[key] = obs
-    return [
-        row for row in rows
-        if (obs := _factor_obs_date(row)) is None
-        or obs == newest[(row.get("source_module"), row.get("ticker"))]
-    ]
+        rank = (obs, row.get("valid_from"), -i)
+        held = best.get(key)
+        if held is None or _newer(rank, held):
+            best[key] = rank
+    keep = {-rank[2] for rank in best.values()}
+    return [row for i, row in enumerate(rows) if _factor_obs_date(row) is None or i in keep]
 
+
+def _newer(a: tuple[str, Any, int], b: tuple[str, Any, int]) -> bool:
+    """Newer observation date, then newer publish time, then the earlier row (ties)."""
+    if a[0] != b[0]:
+        return a[0] > b[0]
+    if a[1] != b[1] and a[1] is not None and b[1] is not None:
+        return a[1] > b[1]
+    if a[1] is not None and b[1] is None:
+        return True
+    return False
 
 def migrate_default_models(engine: Engine) -> None:
     """Populate JSONB columns for the legacy Oracle models. Idempotent.

@@ -217,3 +217,21 @@ def test_the_registry_path_abstains_the_same_way(monkeypatch) -> None:
 
     assert len(preds) == 1
     _assert_no_direction(preds[0], 31)
+
+
+def test_a_receipt_that_fails_at_the_decision_clock_turns_no_direction_into_a_quote_abstention(
+    monkeypatch,
+) -> None:
+    """generate_predictions restamps candidates with decision_at before storing them."""
+    from dataclasses import replace
+
+    abstain = _oracle([_neutral(n) for n in "abc"])._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)
+    assert abstain[0].flow_context["abstention_kind"] == "no_direction"
+    late = [replace(p, timestamp=NOW + timedelta(minutes=16)) for p in abstain]  # quote now 21 min old
+
+    committed, inserts, counts = _store(late, [True], monkeypatch)
+
+    fc = json.loads(inserts[0]["fc"])
+    assert fc["abstention_kind"] == "no_qualified_quote"
+    assert inserts[0]["score_notes"] == "quote is older than the 20-minute reference limit"
+    assert counts["abstentions"] == 1

@@ -3197,7 +3197,13 @@ class OracleEngine:
                     abstention_context = dict(p.flow_context)
                     if receipt_error is not None:
                         # No qualified quote at the decision. An abstention for
-                        # another reason keeps the kind its writer gave it.
+                        # another reason keeps the kind its writer gave it,
+                        # except "no direction": that was judged on a receipt
+                        # which has since failed at the decision clock, so the
+                        # missing quote is the reason a fresh capture can cure.
+                        if abstention_context.get(ABSTENTION_KIND_KEY) == ABSTENTION_KIND_NO_DIRECTION:
+                            abstention_context[ABSTENTION_KIND_KEY] = ABSTENTION_NO_QUALIFIED_QUOTE
+                            p = replace(p, score_notes=str(receipt_error))
                         abstention_context.setdefault(ABSTENTION_KIND_KEY, ABSTENTION_NO_QUALIFIED_QUOTE)
                     if p.direction != "NONE":
                         abstention_context["candidate_direction"] = p.direction
