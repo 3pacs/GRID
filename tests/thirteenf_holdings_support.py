@@ -63,6 +63,7 @@ class Filing:
     fail: str | None = None
     fail_on: str = "index"
     index_report_date: bool = True  # False: the submissions index leaves reportDate blank
+    confidential_omitted: bool = False  # the cover page's isConfidentialOmitted
 
 
 class _Resp:
@@ -175,7 +176,8 @@ def _cover_xml(f: Filing) -> bytes:
         f"<summaryPage><otherIncludedManagersCount>0</otherIncludedManagersCount>"
         f"<tableEntryTotal>{total}</tableEntryTotal>"
         f"<tableValueTotal>{sum(v for _n, v, _s in f.holdings.values())}</tableValueTotal>"
-        f"<isConfidentialOmitted>false</isConfidentialOmitted></summaryPage></formData>"
+        f"<isConfidentialOmitted>{'true' if f.confidential_omitted else 'false'}</isConfidentialOmitted>"
+        f"</summaryPage></formData>"
         "</edgarSubmission>"
     ).encode()
 
