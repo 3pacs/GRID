@@ -224,9 +224,42 @@ def test_windows_by_bucket_and_the_work_query():
     _run(engine)
     statement, params = engine.statements[0]
     assert "FROM data_freshness_audit" in statement and "MAX(audited_at)" in statement
-    assert params == {"buckets": ["DEAD", "STALE_30+", "STALE_7_30"]}
+    assert params == {"stale": ["DEAD", "STALE_30+", "STALE_7_30"], "expected": date(2026, 11, 23)}
     starts = {p["sid"].split(":")[1]: p["start"] for s, p in engine.statements if "FROM raw_series" in s}
     assert starts == {"AAA": date(2025, 11, 24), "BBB": date(2026, 9, 25)}       # 365 and 60 days back
+
+
+def test_the_behind_cohort_gets_a_30_day_window_and_is_counted(capsys):
+    """2026-11-27: tickers whose last close trailed Tiingo's were skipped until the audit graded them stale."""
+    engine = _Engine([("AAA", "DEAD"), ("BEH", "BEHIND"), ("BEH2", "BEHIND")], [raw("BEH", FRI, 5.0), raw("BEH", MON, 5.5)])
+    receipt = _run(engine)
+    starts = {p["sid"].split(":")[1]: p["start"] for s, p in engine.statements if "FROM raw_series" in s}
+    assert starts == {"AAA": date(2025, 11, 24), "BEH": date(2026, 10, 25), "BEH2": date(2026, 10, 25)}   # 365 and 30 days back
+    assert receipt["tickers"] == 3 and receipt["behind_cohort"] == 2
+    assert [f["ticker"] for f in engine.fills] == ["BEH", "BEH"] and receipt["no_completed_close"] == ["AAA", "BEH2"]
+    assert "behind_cohort=2" in capsys.readouterr().out
+
+
+def test_only_bucket_behind_asks_for_no_stale_bucket_and_a_single_bucket_asks_for_no_behind_cohort():
+    engine = _Engine([("BEH", "BEHIND")])
+    _run(engine, only_bucket="BEHIND")
+    assert engine.statements[0][1] == {"stale": [], "expected": date(2026, 11, 23)}
+    engine = _Engine([("AAA", "DEAD")])
+    _run(engine, only_bucket="DEAD")
+    assert engine.statements[0][1] == {"stale": ["DEAD"], "expected": None}          # NULL selects no behind ticker
+
+
+def test_the_expected_session_follows_the_run_clock():
+    """Before 18:00 New York the day's EOD bar is not expected yet; weekends and holidays roll back."""
+    def expected(at: datetime) -> date:
+        engine = _Engine([])
+        mod.run(engine, "universe", evaluated_at=at, dry_run=True)
+        return engine.statements[0][1]["expected"]
+
+    assert expected(datetime(2026, 11, 26, 22, 3, tzinfo=timezone.utc)) == date(2026, 11, 25)    # Thanksgiving 17:03 NY
+    assert expected(datetime(2026, 11, 24, 22, 3, tzinfo=timezone.utc)) == date(2026, 11, 23)    # Tue 17:03 NY, before the bar
+    assert expected(datetime(2026, 11, 24, 23, 30, tzinfo=timezone.utc)) == date(2026, 11, 24)   # Tue 18:30 NY
+    assert expected(datetime(2026, 11, 28, 22, 3, tzinfo=timezone.utc)) == date(2026, 11, 27)    # Saturday
 
 
 def test_dry_run_measures_coverage_and_never_opens_a_write(capsys):
@@ -297,7 +330,7 @@ def test_exit_code_is_one_only_when_writes_failed_and_nothing_was_filled(monkeyp
 def test_environment_switches_reach_the_run(monkeypatch):
     engine = _Engine([("AAA", "DEAD"), ("BBB", "DEAD")], [raw("AAA", THU, 11.0)])
     assert _main(monkeypatch, engine, ["universe"], {"DRY_RUN": "1", "ONLY_BUCKET": "DEAD", "LIMIT": "1"}) == 0
-    assert engine.statements[0][1] == {"buckets": ["DEAD"]} and engine.begins == 0
+    assert engine.statements[0][1] == {"stale": ["DEAD"], "expected": None} and engine.begins == 0
     assert len({p["sid"] for s, p in engine.statements if "FROM raw_series" in s}) == 1
 
 

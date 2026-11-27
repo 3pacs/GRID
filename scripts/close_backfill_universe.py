@@ -13,8 +13,15 @@ list is not coverage.
 
 Cohorts:
 
-* ``universe``: every ticker the daily freshness audit grades DEAD, STALE_30+
-  or STALE_7_30 (``data_freshness_audit``). Window 365 / 180 / 60 days.
+* ``universe``: every ticker in the latest ``data_freshness_audit`` that is
+  either graded DEAD, STALE_30+ or STALE_7_30 (window 365 / 180 / 60 days) or
+  **behind**: its latest stored close is older than the most recent US
+  session whose Tiingo EOD bar should exist (``expected_latest_session``),
+  whatever the audit grades it (window 30 days). The behind cohort is what
+  keeps the universe current now that Twelve Data no longer does: selecting
+  only the already-stale left every ticker up to 7 days behind (2026-11-27:
+  135 tickers whose last close was Friday 11-20 had Tiingo closes through
+  11-25 and were skipped until the audit graded them STALE_7_30).
 * ``gem``: every gem-alert ticker with no close in the last 7 days. Window 60
   days.
 
@@ -51,8 +58,8 @@ compared: it is still filled and is listed under ``basis_unverified`` (unknown,
 not verified same-basis).
 
 Environment: ``DRY_RUN=1`` reads and reports but writes nothing (this is the
-coverage measurement); ``ONLY_BUCKET=DEAD`` and ``LIMIT=20`` narrow the
-universe run.
+coverage measurement); ``ONLY_BUCKET=DEAD`` (or ``BEHIND`` for the behind
+cohort alone) and ``LIMIT=20`` narrow the universe run.
 
 Exit code: 1 when a ticker's write failed and no ticker was filled; otherwise
 0, including a run where nothing had an eligible close.
@@ -83,15 +90,23 @@ from store.observations import read_completed_closes  # noqa: E402
 SOURCE_LABEL = "stored_close_backfill"
 
 STALE_BUCKETS: tuple[str, ...] = ("DEAD", "STALE_30+", "STALE_7_30")
-WINDOW_BY_BUCKET: dict[str, int] = {"DEAD": 365, "STALE_30+": 180, "STALE_7_30": 60}
+BEHIND = "BEHIND"        # not an audit bucket: a ticker whose latest stored close trails the expected session
+WINDOW_BY_BUCKET: dict[str, int] = {"DEAD": 365, "STALE_30+": 180, "STALE_7_30": 60, BEHIND: 30}
 GEM_FRESH_DAYS = 7
 GEM_WINDOW_DAYS = 60
 
+# The universe is the latest audit's tickers. A ticker is work when it is graded stale, or when its latest
+# stored close (read live, not from the audit's own snapshot) is older than ``:expected``; a NULL ``:expected``
+# (a single stale bucket was asked for) or a ticker with no stored close selects nothing extra.
 _UNIVERSE_WORK_SQL = text(
-    "SELECT ticker, bucket FROM data_freshness_audit "
-    "WHERE bucket = ANY(:buckets) "
-    "AND audited_at = (SELECT MAX(audited_at) FROM data_freshness_audit) "
-    "ORDER BY CASE bucket WHEN 'DEAD' THEN 0 WHEN 'STALE_30+' THEN 1 ELSE 2 END, ticker"
+    "SELECT a.ticker, CASE WHEN a.bucket = ANY(:stale) THEN a.bucket ELSE 'BEHIND' END AS cohort "
+    "FROM data_freshness_audit a "
+    "LEFT JOIN LATERAL (SELECT MAX(m.obs_date) AS last_close FROM ticker_metrics_daily m "
+    "                   WHERE m.ticker = a.ticker AND m.close_price IS NOT NULL) l ON TRUE "
+    "WHERE a.audited_at = (SELECT MAX(audited_at) FROM data_freshness_audit) "
+    "AND (a.bucket = ANY(:stale) OR l.last_close < :expected) "
+    "ORDER BY CASE WHEN a.bucket = ANY(:stale) THEN "
+    "  CASE a.bucket WHEN 'DEAD' THEN 0 WHEN 'STALE_30+' THEN 1 ELSE 2 END ELSE 3 END, a.ticker"
 )
 _GEM_WORK_SQL = text(
     "SELECT g.t FROM ("
@@ -169,9 +184,22 @@ def basis_overlap(existing: list[tuple[date, Any]], closes: list[tuple[date, flo
     return sum(1 for d, stored in existing if d in ours and stored is not None and float(stored) != 0)
 
 
-def _universe_work(conn: Any, only_bucket: str | None, limit: int) -> list[tuple[str, int]]:
-    buckets = [only_bucket] if only_bucket else list(STALE_BUCKETS)
-    rows = conn.execute(_UNIVERSE_WORK_SQL, {"buckets": buckets}).fetchall()
+def _universe_work(conn: Any, only_bucket: str | None, limit: int, evaluated_at: datetime) -> list[tuple[str, int]]:
+    """``[(ticker, window_days), ...]``: the stale buckets first, then the behind cohort."""
+    if only_bucket == BEHIND:
+        stale: list[str] = []
+    elif only_bucket:
+        stale = [only_bucket]
+    else:
+        stale = list(STALE_BUCKETS)
+    expected: date | None = None
+    if only_bucket is None or only_bucket == BEHIND:
+        # Lazy: the session rule lives with the Tiingo price pull ("the most recent US session whose
+        # EOD bar should already exist"), one definition for both.
+        from ingestion.tiingo_pull import expected_latest_session
+
+        expected = expected_latest_session(evaluated_at)
+    rows = conn.execute(_UNIVERSE_WORK_SQL, {"stale": stale, "expected": expected}).fetchall()
     work = [(str(t), WINDOW_BY_BUCKET.get(str(b), 60)) for t, b in rows]
     return work[:limit] if limit else work
 
@@ -191,12 +219,15 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
         raise ValueError("evaluated_at must be timezone-aware")
     today = evaluated_at.date()
     with engine.connect() as conn:
-        work = _universe_work(conn, only_bucket, limit) if mode == "universe" else _gem_work(conn, today)
+        work = (_universe_work(conn, only_bucket, limit, evaluated_at) if mode == "universe"
+                else _gem_work(conn, today))
     print(f"close backfill ({mode}): {len(work)} tickers (dry_run={dry_run})")
 
     receipt: dict[str, Any] = {
         "mode": mode, "dry_run": dry_run, "evaluated_at": evaluated_at.isoformat(),
-        "tickers": len(work), "eligible_tickers": 0, "eligible_closes": 0,
+        "tickers": len(work),
+        "behind_cohort": sum(1 for _t, d in work if mode == "universe" and d == WINDOW_BY_BUCKET[BEHIND]),
+        "eligible_tickers": 0, "eligible_closes": 0,
         "written": 0, "left_as_is": 0, "ambiguous_days_withheld": 0,
         "no_completed_close": [], "unsupported": [], "basis_conflict": [], "basis_unverified": [], "failed": [], "by_source": {},
     }
@@ -252,7 +283,7 @@ def run(engine: Any, mode: str, *, evaluated_at: datetime | None = None, dry_run
               f"({closes[0][0]}..{closes[-1][0]}), {verb} {len(closes) if dry_run else written}"
               + (f", {ambiguous} ambiguous days withheld" if ambiguous else ""))
 
-    print(f"\nDONE eligible_tickers={receipt['eligible_tickers']}/{len(work)} "
+    print(f"\nDONE eligible_tickers={receipt['eligible_tickers']}/{len(work)} behind_cohort={receipt['behind_cohort']} "
           f"eligible_closes={receipt['eligible_closes']} written={receipt['written']} "
           f"left_as_is={receipt['left_as_is']} ambiguous_days_withheld={receipt['ambiguous_days_withheld']} "
           f"no_completed_close={len(receipt['no_completed_close'])} unsupported={len(receipt['unsupported'])} "
