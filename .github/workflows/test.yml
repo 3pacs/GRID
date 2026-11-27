@@ -1400,7 +1400,11 @@ jobs:
           docker exec -i "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 \
             -U "$DB_USER" -d "$DB_NAME" -f - < schema.sql
           report="$RUNNER_TEMP/pit-postgres.xml"
+          # These two pure frame assertions already run in the generic suite.
+          # All fixture-backed cases in these files still count against the exact receipt.
           python -m pytest -q -ra --junitxml="$report" \
+            --deselect=tests/test_pit_vintage_fence_pg.py::test_assert_no_lookahead_rejects_a_vintage_after_as_of \
+            --deselect=tests/test_pit_vintage_fence_pg.py::test_assert_no_lookahead_accepts_known_rows_and_release_only_frames \
             tests/test_direct_readers_vintage_fence_pg.py \
             tests/test_pit_vintage_fence_pg.py \
             tests/test_store_observations_pg.py \
