@@ -562,7 +562,7 @@ def test_suite_matrix_covers_every_shard_once(workflow: dict[str, Any]) -> None:
 def test_backend_tests_fails_unless_every_suite_shard_passed(workflow: dict[str, Any]) -> None:
     job = workflow["jobs"]["backend-tests"]
     assert job["name"] == "Backend Tests"
-    assert job["needs"] == ["backend-tests-suite", "backend-tests-contracts"]
+    assert job["needs"] == ["backend-tests-suite", "backend-tests-contracts", "backend-tests-pit-postgres"]
     # runs (and fails) when a shard or the contracts failed, but not when the run was cancelled
     assert job["if"] == "${{ !cancelled() }}"
     gate = job["steps"][1]

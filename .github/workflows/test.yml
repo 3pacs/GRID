@@ -1344,14 +1344,135 @@ jobs:
         if: always() && env.ON_SELF_HOSTED != 'true'
         run: docker rm -f grid-test-pg 2>/dev/null || true
 
+  # A clean PostgreSQL 15 instance for the first audited PIT/provenance batch.
+  # Never activate GRID_TEST_DB_URL in either generic suite shard or touch a
+  # persistent self-hosted database. The required aggregate gates this job too.
+  backend-tests-pit-postgres:
+    name: Backend Tests PIT PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: grid_pit_test
+          POSTGRES_USER: grid
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C
+          TZ: UTC
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U grid -d grid_pit_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-xdist
+
+      - name: PIT and provenance PostgreSQL contracts (28, no skips)
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          DB_HOST: 127.0.0.1
+          DB_PORT: ${{ job.services.postgres.ports[5432] }}
+          DB_NAME: grid_pit_test
+          DB_USER: grid
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+          TZ: UTC
+        run: |
+          set -euo pipefail
+          export GRID_TEST_DB_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+          docker exec -i "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 \
+            -U "$DB_USER" -d "$DB_NAME" -f - < schema.sql
+          report="$RUNNER_TEMP/pit-postgres.xml"
+          python -m pytest -q -ra --junitxml="$report" \
+            tests/test_direct_readers_vintage_fence_pg.py \
+            tests/test_pit_vintage_fence_pg.py \
+            tests/test_store_observations_pg.py \
+            tests/test_signal_provenance_clock_pg.py
+          python - "$report" <<'PY'
+          from collections import Counter
+          import sys
+          import xml.etree.ElementTree as ET
+
+          expected = Counter("""
+          tests.test_direct_readers_vintage_fence_pg::test_astrogrid_price_reads_with_a_release_cutoff
+          tests.test_direct_readers_vintage_fence_pg::test_conviction_scorer_latest_and_price
+          tests.test_direct_readers_vintage_fence_pg::test_conviction_scorer_universe_excludes_rows_not_yet_held
+          tests.test_direct_readers_vintage_fence_pg::test_credit_cycle_feature_series
+          tests.test_direct_readers_vintage_fence_pg::test_prediction_context_latest_feature_value
+          tests.test_direct_readers_vintage_fence_pg::test_volume_panel
+          tests.test_pit_vintage_fence_pg::test_backdated_release_row_is_served_from_its_vintage_on[sql]
+          tests.test_pit_vintage_fence_pg::test_backdated_release_row_is_served_from_its_vintage_on[window]
+          tests.test_pit_vintage_fence_pg::test_first_release_never_serves_a_vintage_written_after_as_of[sql]
+          tests.test_pit_vintage_fence_pg::test_first_release_never_serves_a_vintage_written_after_as_of[window]
+          tests.test_pit_vintage_fence_pg::test_get_feature_matrix_inherits_the_fence
+          tests.test_pit_vintage_fence_pg::test_latest_as_of_never_serves_a_vintage_written_after_as_of[sql]
+          tests.test_pit_vintage_fence_pg::test_latest_as_of_never_serves_a_vintage_written_after_as_of[window]
+          tests.test_pit_vintage_fence_pg::test_window_snapshot_matches_sql_on_backdated_release_rows
+          tests.test_signal_provenance_clock_pg::test_fudge_alerts_stop_at_the_decision_clock
+          tests.test_signal_provenance_clock_pg::test_fudge_alerts_window_is_measured_back_from_the_clock
+          tests.test_store_observations_pg::test_latest_as_of_date_returns_that_dates_success_vintage
+          tests.test_store_observations_pg::test_latest_as_of_ts_before_the_second_vintage_returns_the_first
+          tests.test_store_observations_pg::test_latest_is_the_newest_success_not_the_newer_failed_row
+          tests.test_store_observations_pg::test_latest_n_returns_the_two_most_recent_accepted_dates
+          tests.test_store_observations_pg::test_mixed_source_explicit_source_disambiguates
+          tests.test_store_observations_pg::test_mixed_source_fails_closed_against_real_source_catalog_fks
+          tests.test_store_observations_pg::test_single_source_observation_carries_its_source
+          tests.test_store_observations_pg::test_unknown_series_latest_is_none_not_zero
+          tests.test_store_observations_pg::test_unknown_series_window_is_empty_not_zeros
+          tests.test_store_observations_pg::test_window_keeps_a_measured_zero_but_never_a_failed_zero
+          tests.test_store_observations_pg::test_window_returns_success_rows_one_per_date_latest_vintage_oldest_first
+          tests.test_store_observations_pg::test_window_start_bound
+          """.split())
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = list(root.iter("testcase"))
+          actual = Counter(f"{c.attrib['classname']}::{c.attrib['name']}" for c in cases)
+          nonpassing = [
+              f"{c.attrib['classname']}::{c.attrib['name']}"
+              for c in cases
+              if any(child.tag in {"skipped", "failure", "error"} for child in c)
+          ]
+          if actual != expected or nonpassing:
+              sys.exit(
+                  f"PostgreSQL contract mismatch: missing={list((expected - actual).elements())}, "
+                  f"unexpected={list((actual - expected).elements())}, nonpassing={nonpassing}"
+              )
+          print(f"{len(cases)} exact PIT/provenance PostgreSQL cases passed, no skips")
+          PY
+
+      - name: Upload PIT PostgreSQL JUnit receipt
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-pit-postgres-junit
+          path: ${{ runner.temp }}/pit-postgres.xml
+          if-no-files-found: warn
+          retention-days: 7
+
   # The required check. evals/e3/gates.py (MANDATORY_CI) and the #1352 release
   # check read it by this name. It runs after the suite shards and the
-  # contracts job (which run at the same time) and fails unless both passed.
+  # PostgreSQL contracts jobs (which run in parallel) and fails unless all passed.
   # Then it checks the shards' manifests and runs the #1352 witness. No
   # database: the witness is offline.
   backend-tests:
     name: Backend Tests
-    needs: [backend-tests-suite, backend-tests-contracts]
+    needs: [backend-tests-suite, backend-tests-contracts, backend-tests-pit-postgres]
     # a failed shard or contracts job still runs this job (so the check fails,
     # not skips); a cancelled run does not
     if: ${{ !cancelled() }}
@@ -1363,13 +1484,14 @@ jobs:
       # this job to it.
       - uses: actions/checkout@v7
 
-      # Fails unless every suite shard and the contracts job passed, so this
+      # Fails unless every suite shard and both contracts jobs passed, so this
       # check (the name evals/e3/gates.py MANDATORY_CI and the #1352 release
       # check read) covers all of them.
       - name: Suite shards and contracts passed
         env:
           SUITE_RESULT: ${{ needs.backend-tests-suite.result }}
           CONTRACTS_RESULT: ${{ needs.backend-tests-contracts.result }}
+          PIT_POSTGRES_RESULT: ${{ needs.backend-tests-pit-postgres.result }}
         run: |
           if [ "$SUITE_RESULT" != "success" ]; then
             echo "::error::Backend Tests suite shards did not all pass (result: $SUITE_RESULT)"
@@ -1379,7 +1501,11 @@ jobs:
             echo "::error::Backend Tests contracts did not pass (result: $CONTRACTS_RESULT)"
             exit 1
           fi
-          echo "every Backend Tests suite shard and the contracts job passed"
+          if [ "$PIT_POSTGRES_RESULT" != "success" ]; then
+            echo "::error::Backend Tests PIT PostgreSQL did not pass (result: $PIT_POSTGRES_RESULT)"
+            exit 1
+          fi
+          echo "every Backend Tests suite shard and both contracts jobs passed"
 
       - name: Set up Python
         uses: actions/setup-python@v7
