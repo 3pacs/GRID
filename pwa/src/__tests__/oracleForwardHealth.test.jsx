@@ -52,6 +52,20 @@ describe('Oracle forward-pass status on the predictions page', () => {
         expect(banner).toHaveTextContent('no forecast for SPY');
     });
 
+    it('says it is waiting for a quote, not failing, while the next pass is minutes away', async () => {
+        api.getOracleForwardHealth.mockResolvedValue({
+            ...INCIDENT, level: 'retrying',
+            message: 'No usable Oracle forecast in the 2026-11-25 session: all 610 candidates abstained over 1 attempt(s). '
+                + 'Trying again about every 10 minutes with a fresh capture until a quote qualifies.',
+        });
+        render(<OracleForwardHealth />);
+        const banner = await screen.findByRole('status');
+        expect(banner).toHaveAttribute('data-level', 'retrying');
+        expect(banner).toHaveTextContent('WAITING FOR A QUALIFIED QUOTE');
+        expect(banner).toHaveTextContent('Trying again about every 10 minutes');
+        expect(screen.queryByRole('alert')).toBeNull();
+    });
+
     it('is a quiet line, not an alert, when the session has its forecasts', async () => {
         api.getOracleForwardHealth.mockResolvedValue({
             status: 'ok', level: 'ok', session_date: '2026-11-25',

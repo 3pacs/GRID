@@ -196,7 +196,9 @@ def test_forward_pass_captures_before_inputs_and_durable_hourly_gate_survives_re
     assert second["reason"] == "hourly_attempt_already_recorded"
     assert calls == []
     with forward_engine.connect() as conn:
-        assert conn.execute(text("SELECT COUNT(*) FROM oracle_iterations")).scalar_one() == 1
+        # One attempt, and one row saying how that pass ended (the retry plan reads it).
+        assert conn.execute(text("SELECT notes FROM oracle_iterations ORDER BY iteration_at")).scalars().all() == [
+            ho.ORACLE_FORWARD_ATTEMPT_NOTE, "oracle_forward_v2:SPY_QQQ:1d:outcome:completed"]
 
 
 def test_forward_capture_failure_never_generates_and_attempt_remains_durable(forward_engine, monkeypatch):

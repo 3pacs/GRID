@@ -152,7 +152,9 @@ class OptionsSignalRead:
     written_at: datetime | None = None
     read_at: datetime | None = None
 
-from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
+from oracle.entry_price_policy import (
+    ABSTENTION_KIND_KEY, ABSTENTION_NO_QUALIFIED_QUOTE, NULL_WRITE_POLICY, entry_price_score_note,
+)
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
 from oracle.model_factory import signal_registry_enabled as _signal_registry_enabled
@@ -1869,7 +1871,7 @@ class OracleEngine:
                     model_version=model.version,
                     verdict=Verdict.NO_DATA,
                     score_notes=reference.get("reason") or "No qualified entry reference at decision time",
-                    flow_context=flow_ctx,
+                    flow_context={**flow_ctx, ABSTENTION_KIND_KEY: ABSTENTION_NO_QUALIFIED_QUOTE},
                     horizon_days=self._horizon_days_for(now, placeholder_expiry, horizon_days),
                 )
                 ticker_predictions.append(placeholder)
@@ -3119,6 +3121,10 @@ class OracleEngine:
                     receipt_error = "entry_price_does_not_match_frozen_receipt"
                 if p.verdict == Verdict.NO_DATA or receipt_error is not None:
                     abstention_context = dict(p.flow_context)
+                    if receipt_error is not None:
+                        # No qualified quote at the decision. An abstention for
+                        # another reason keeps the kind its writer gave it.
+                        abstention_context.setdefault(ABSTENTION_KIND_KEY, ABSTENTION_NO_QUALIFIED_QUOTE)
                     if p.direction != "NONE":
                         abstention_context["candidate_direction"] = p.direction
                     p = replace(p, direction="NONE", verdict=Verdict.NO_DATA,

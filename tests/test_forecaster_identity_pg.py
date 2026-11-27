@@ -272,6 +272,11 @@ def test_store_detail_says_what_each_ticker_ended_with_and_why(writer):
         "abstention_reasons": {reason: 1},
     }
     assert writer._last_store_counts["qualified"] == 0 and writer._last_store_counts["duplicates"] == 2
+    # The abstention says why, on its own row: no qualified quote. A forecast has no such key.
+    with writer.engine.connect() as conn:
+        kinds = dict(conn.execute(text(
+            "SELECT direction, flow_context ->> 'abstention_kind' FROM oracle_predictions")).fetchall())
+    assert kinds == {"NONE": "no_qualified_quote", "CALL": None}
 
 
 def test_retired_unknown_and_unobserved_entries_are_rejected(writer):
