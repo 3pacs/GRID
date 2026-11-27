@@ -151,19 +151,20 @@ def test_a_start_less_point_is_retried_once_with_edgar_report_dates_and_the_issu
     puller,fetch,write,checkpoints=runner
     fetch.return_value=_stray_response()
     asked=[]
-    ref=sec.ReportDateEvidence({'0001045810-26-000075':date(2026,7,26)},'https://data.sec.gov/submissions/CIK0001045810.json','a'*64,'2026-11-27T00:00:00+00:00')
+    ref=sec.ReportDateEvidence({'0001045810-26-000075':date(2026,7,26)},'https://data.sec.gov/submissions/CIK0001045810.json','a'*64,'2026-11-27T00:00:00+00:00',b'raw response')
     monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik:asked.append(cik) or ref)
     result=puller.pull_all()
     assert result[0]['status']=='SUCCESS' and result[-1]['tolerated_stray_points']==1
     assert asked==['0001045810']                                       # one extra EDGAR call, only after the refusal
     assert write.call_count==1 and write.call_args.args[1].report_dates==(('0001045810-26-000075','2026-07-26'),)
     assert write.call_args.args[1].report_date_source==(ref.url,'a'*64,'2026-11-27T00:00:00+00:00')   # archived with the dates
+    assert write.call_args.args[1].report_date_source_body==b'raw response'
 
 
 def test_without_report_date_evidence_the_refusal_stands_and_nothing_is_written(runner,monkeypatch):
     puller,fetch,write,checkpoints=runner
     fetch.return_value=_stray_response()
-    empty=sec.ReportDateEvidence({},'u','a'*64,'t')
+    empty=sec.ReportDateEvidence({},'u','a'*64,'t',b'x')
     for unavailable in (None,empty):
         monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik,u=unavailable:u)
         result=puller.pull_all(resume=False)
@@ -198,7 +199,7 @@ def test_report_dates_come_only_from_well_formed_rows_with_a_reference_to_the_re
     _http(monkeypatch,body=_submissions(),content=b'raw submissions bytes')
     got=sec._fetch_report_dates('0001045810')
     assert got.dates=={'0001045810-26-000075':date(2026,7,26)}          # blank/garbled rows give no evidence
-    assert got.url=='https://data.sec.gov/submissions/CIK0001045810.json'
+    assert got.url=='https://data.sec.gov/submissions/CIK0001045810.json' and got.body==b'raw submissions bytes'
     assert got.sha256==hashlib.sha256(b'raw submissions bytes').hexdigest() and got.received_at.endswith('+00:00')
 
 

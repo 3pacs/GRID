@@ -1414,6 +1414,25 @@ def _rd():
     return {_OWN: date(2026, 7, 26)}                              # EDGAR submissions reportDate for the accession
 
 
+def _submissions_body(dates=None, cik=1045810):
+    """A raw EDGAR submissions response whose recent filings carry the given accession -> reportDate pairs."""
+    import json
+    dates = dates or {_OWN: "2026-07-26"}
+    return json.dumps({"cik": cik, "name": "Synthetic Test Issuer", "filings": {"recent": {
+        "accessionNumber": list(dates), "reportDate": list(dates.values())}}}).encode()
+
+
+def _with_provenance(snapshot_, *, url="https://data.sec.gov/submissions/CIK0001045810.json",
+                     received="2026-11-27T00:00:00+00:00", body=None, digest=None):
+    """Attach the complete evidence provenance a puller would: matched url, lowercase sha256, aware receipt, response."""
+    import dataclasses
+    import hashlib
+
+    body = _submissions_body() if body is None else body
+    return dataclasses.replace(snapshot_, report_date_source=(url, digest or hashlib.sha256(body).hexdigest(), received),
+                               report_date_source_body=body)
+
+
 def _stray_fact(tag="PaymentsOfDividends", end="2026-06-15"):
     return {tag: {"units": {"USD": [dict(end=end, val=1000, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
 
@@ -1450,7 +1469,7 @@ def test_pg_tolerated_stray_point_with_edgar_evidence_cannot_remove_an_existing_
 
     with pytest.raises(ValueError, match="duration"):
         _snapshot_with_extra_facts(_stray_fact(), second=25)                      # no evidence: fail closed
-    later = _snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd())
+    later = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()))
     assert later.tolerated_stray_points == (("PaymentsOfDividends", "2026-06-15", _OWN),)
     assert later.report_dates == ((_OWN, "2026-07-26"),)
     assert later.rows == first.rows and later.snapshot_id != first.snapshot_id
@@ -1524,7 +1543,7 @@ def test_pg_a_tolerating_capture_never_erases_a_stored_period_but_a_clean_one_ma
     before = stored(engine)
     assert len(before) == 2
 
-    tolerating = _snapshot_with_extra_facts(_stray_fact("PaymentsForRepurchaseOfCommonStock"), second=80, report_dates=_rd())
+    tolerating = _with_provenance(_snapshot_with_extra_facts(_stray_fact("PaymentsForRepurchaseOfCommonStock"), second=80, report_dates=_rd()))
     assert tolerating.tolerated_stray_points and len(tolerating.rows) == 1       # the dividends row is gone from the source
     result = write_snapshot(engine, tolerating)
     assert result["status"] == "rejected_stray_would_remove_rows" and result["rows_written"] == 0
@@ -1551,7 +1570,7 @@ def test_pg_dropping_tolerance_metadata_or_evidence_cannot_bypass_the_writer_gua
     before = stored(engine)
     assert len(before) == 2
 
-    tolerating = _snapshot_with_extra_facts(_stray_fact("PaymentsForRepurchaseOfCommonStock"), second=120, report_dates=_rd())
+    tolerating = _with_provenance(_snapshot_with_extra_facts(_stray_fact("PaymentsForRepurchaseOfCommonStock"), second=120, report_dates=_rd()))
     assert tolerating.tolerated_stray_points and len(tolerating.rows) == 1
     for drifted in (replace(tolerating, tolerated_stray_points=()), replace(tolerating, report_dates=())):
         with pytest.raises(ValueError):
@@ -1564,14 +1583,15 @@ def test_pg_dropping_tolerance_metadata_or_evidence_cannot_bypass_the_writer_gua
 def _archive_row(engine, snapshot_id):
     with engine.connect() as conn:
         return dict(conn.execute(text(
-            "SELECT report_date_evidence FROM sec_financial_snapshots WHERE snapshot_id = :i"), {"i": snapshot_id}).mappings().one())
+            "SELECT report_date_evidence, report_date_source_gzip FROM sec_financial_snapshots WHERE snapshot_id = :i"),
+            {"i": snapshot_id}).mappings().one())
 
 
-def test_pg_the_archive_row_alone_reproduces_a_snapshot_that_used_report_date_evidence(snapshot_db):
-    """Codex 6081926340: the report-date pairs are needed to reproduce the identity, so they are archived
-    (canonical used mapping + the EDGAR submissions reference) and a replay from the immutable row alone
-    gives the same snapshot_id. An ordinary snapshot stores NULL evidence and still replays."""
-    import dataclasses
+def test_pg_the_archive_row_alone_reproduces_a_snapshot_and_its_complete_provenance(snapshot_db):
+    """Codex 6081926340 / 6082027007: the used mapping, the matched source reference AND the raw
+    submissions response are archived; a replay from the immutable row alone restores all of it and gives
+    the same identity. An ordinary snapshot stores NULLs and still replays."""
+    import gzip
 
     import pytest
     from store.sec_financial_snapshots import replay_archived_snapshot, write_snapshot
@@ -1579,27 +1599,111 @@ def test_pg_the_archive_row_alone_reproduces_a_snapshot_that_used_report_date_ev
     engine = snapshot_db
     ordinary = snapshot()
     assert write_snapshot(engine, ordinary)["status"] == "applied"
-    assert _archive_row(engine, ordinary.snapshot_id)["report_date_evidence"] is None
+    row = _archive_row(engine, ordinary.snapshot_id)
+    assert row["report_date_evidence"] is None and row["report_date_source_gzip"] is None
     assert replay_archived_snapshot(engine, ordinary.snapshot_id) == ordinary
 
-    tolerating = dataclasses.replace(
-        _snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()),
-        report_date_source=("https://data.sec.gov/submissions/CIK0001045810.json", "b" * 64, "2026-11-27T00:00:00+00:00"))
-    assert tolerating.report_dates == ((_OWN, "2026-07-26"),)
+    body = _submissions_body()
+    tolerating = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()), body=body)
     assert write_snapshot(engine, tolerating)["status"] == "applied"
-    evidence = _archive_row(engine, tolerating.snapshot_id)["report_date_evidence"]
-    assert evidence == {"report_dates": {_OWN: "2026-07-26"},
-                        "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json",
-                                   "sha256": "b" * 64, "received_at": "2026-11-27T00:00:00+00:00"}}
+    row = _archive_row(engine, tolerating.snapshot_id)
+    assert row["report_date_evidence"] == {
+        "report_dates": {_OWN: "2026-07-26"},
+        "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json",
+                   "sha256": tolerating.report_date_source[1], "received_at": "2026-11-27T00:00:00+00:00"}}
+    assert gzip.decompress(bytes(row["report_date_source_gzip"])) == body
     replayed = replay_archived_snapshot(engine, tolerating.snapshot_id)
     assert replayed == tolerating and replayed.snapshot_id == tolerating.snapshot_id
+    assert replayed.report_date_source == tolerating.report_date_source                 # the complete triple
+    assert replayed.report_date_source_body == body
     assert replayed.tolerated_stray_points == tolerating.tolerated_stray_points and replayed.rows == tolerating.rows
 
-    # the evidence is what makes the identity reproducible: without it the replay cannot
+    # without the archived evidence the identity cannot be reproduced; without the response it cannot be verified
     with engine.begin() as conn:
-        conn.execute(text("UPDATE sec_financial_snapshots SET report_date_evidence = NULL WHERE snapshot_id = :i"),
-                     {"i": tolerating.snapshot_id})
+        conn.execute(text("UPDATE sec_financial_snapshots SET report_date_source_gzip = NULL, report_date_evidence = NULL "
+                          "WHERE snapshot_id = :i"), {"i": tolerating.snapshot_id})
     with pytest.raises(ValueError):
         replay_archived_snapshot(engine, tolerating.snapshot_id)
     with pytest.raises(ValueError, match="No archived snapshot"):
         replay_archived_snapshot(engine, "0" * 64)
+
+
+def test_pg_the_write_boundary_requires_complete_matched_provenance_whenever_evidence_was_used(snapshot_db):
+    """Codex 6082027007: evidence-dependent snapshots no longer apply with source=None, a malformed
+    url / hash / receipt clock, a url for another CIK, a response that does not hash to the reference or
+    does not yield the used pairs; provenance without evidence is refused too. Nothing is stored."""
+    import dataclasses
+
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    good = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()))
+    url = "https://data.sec.gov/submissions/CIK0001045810.json"
+    other = _submissions_body({_OWN: "2026-04-26"})                   # a response that yields different pairs
+    cases = {
+        "no source": dataclasses.replace(good, report_date_source=None),
+        "no response": dataclasses.replace(good, report_date_source_body=None),
+        "empty response": dataclasses.replace(good, report_date_source_body=b""),
+        "url for another cik": _with_provenance(good, url="https://data.sec.gov/submissions/CIK0000000099.json"),
+        "malformed url": _with_provenance(good, url="http://example.com/x"),
+        "uppercase hash": dataclasses.replace(good, report_date_source=(url, good.report_date_source[1].upper(), "2026-11-27T00:00:00+00:00")),
+        "short hash": dataclasses.replace(good, report_date_source=(url, "abc", "2026-11-27T00:00:00+00:00")),
+        "hash not of the response": dataclasses.replace(good, report_date_source=(url, "0" * 64, "2026-11-27T00:00:00+00:00")),
+        "naive receipt": _with_provenance(good, received="2026-11-27T00:00:00"),
+        "garbled receipt": _with_provenance(good, received="yesterday"),
+        "response yields other pairs": _with_provenance(good, body=other),
+        "response not json": _with_provenance(good, body=b"not json"),
+        "response for another cik": _with_provenance(good, body=_submissions_body(cik=99)),
+    }
+    for name, bad in cases.items():
+        with pytest.raises(ValueError):
+            write_snapshot(engine, bad)
+        assert stored(engine) == [], name
+    ordinary = snapshot()
+    with pytest.raises(ValueError, match="without report-date evidence"):
+        write_snapshot(engine, _with_provenance(ordinary))
+    assert write_snapshot(engine, good)["status"] == "applied"
+
+
+def test_pg_the_archive_checks_reject_invalid_evidence_rows_and_unpaired_columns(snapshot_db):
+    """The CHECKs are an evidence validation, not only an object test."""
+    import json
+
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+
+    engine = snapshot_db
+    good = {"report_dates": {_OWN: "2026-07-26"},
+            "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json", "sha256": "a" * 64,
+                       "received_at": "2026-11-27T00:00:00+00:00"}}
+
+    def insert(evidence, gz, key):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO sec_financial_snapshots (snapshot_id, actor_id, cik, source_url, source_sha256, normalized_sha256, "
+                "normalizer_version, source_gzip, normalized_rows, fx_inputs, first_request_started_at, first_received_at, "
+                "report_date_evidence, report_date_source_gzip) VALUES (:k, 'x', '1', 'u', :h, :h, 'v', :g, "
+                "CAST('[]' AS JSONB), CAST('{}' AS JSONB), NOW(), NOW(), CAST(:e AS JSONB), :z)"),
+                {"k": key.ljust(64, "0"), "h": "b" * 64, "g": b"x",
+                 "e": None if evidence is None else json.dumps(evidence), "z": gz})
+
+    insert(good, b"z", "ok")                                          # a valid pair inserts
+    insert(None, None, "ordinary")                                    # NULL, NULL inserts
+    bads = {
+        "empty mapping": {**good, "report_dates": {}},
+        "no source": {"report_dates": good["report_dates"]},
+        "uppercase hash": {**good, "source": {**good["source"], "sha256": "A" * 64}},
+        "short hash": {**good, "source": {**good["source"], "sha256": "a" * 63}},
+        "url for a non-sec host": {**good, "source": {**good["source"], "url": "https://example.com/submissions/CIK0001045810.json"}},
+        "short cik in url": {**good, "source": {**good["source"], "url": "https://data.sec.gov/submissions/CIK1045810.json"}},
+        "naive receipt": {**good, "source": {**good["source"], "received_at": "2026-11-27T00:00:00"}},
+        "not an object": [1],
+    }
+    for i, (name, evidence) in enumerate(bads.items()):
+        with pytest.raises(IntegrityError):
+            insert(evidence, b"z", f"bad{i}")
+    with pytest.raises(IntegrityError):
+        insert(good, None, "nobody")                                  # evidence without the response
+    with pytest.raises(IntegrityError):
+        insert(None, b"z", "nometa")                                  # response without the evidence

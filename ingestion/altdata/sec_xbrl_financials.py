@@ -431,35 +431,23 @@ _SUBMISSIONS_URL: str = "https://data.sec.gov/submissions/CIK{cik}.json"
 
 
 class ReportDateEvidence(NamedTuple):
-    """EDGAR submissions reportDate by accession, with a reference to the response it came from."""
+    """EDGAR submissions reportDate by accession, with the response it came from."""
     dates: dict[str, date]
     url: str
     sha256: str
     received_at: str
+    body: bytes = b""
 
 
-def _fetch_report_dates(cik_padded: str) -> ReportDateEvidence | None:
-    """``accession -> reportDate`` from EDGAR submissions (``filings.recent``), or None.
+def report_dates_from_submissions(doc: Any, cik_padded: str) -> dict[str, date] | None:
+    """``accession -> reportDate`` from a parsed EDGAR submissions document, or None.
 
-    Independent evidence of each filing's report period, matched by accession number, with the
-    response's url, sha256 and receipt time so it can be archived. None when the answer is
-    unavailable or not the expected shape (the caller then keeps the refusal: fail closed). Only
-    complete, well-formed rows are returned; an accession that appears more than once with
-    different valid dates is conflicting evidence and is left out, whatever the row order.
+    Only the expected envelope counts (the requested CIK, ``filings.recent`` with aligned
+    ``accessionNumber`` / ``reportDate`` arrays). Only complete, well-formed rows are returned; an
+    accession that appears more than once with different valid dates is conflicting evidence and is
+    left out, whatever the row order. Pure: also used to re-derive archived evidence.
     """
-    url = _SUBMISSIONS_URL.format(cik=cik_padded)
-    try:
-        resp = requests.get(url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS)
-        received = datetime.now(timezone.utc)
-        if resp.status_code != 200:
-            log.warning("SEC submissions CIK={c} HTTP {s}", c=cik_padded, s=resp.status_code)
-            return None
-        doc = resp.json()
-        body = resp.content
-    except (requests.RequestException, ValueError) as exc:
-        log.warning("SEC submissions CIK={c} unavailable: {e}", c=cik_padded, e=type(exc).__name__)
-        return None
-    if not isinstance(body, bytes) or not isinstance(doc, dict) or str(doc.get("cik") or "").zfill(10) != cik_padded:
+    if not isinstance(doc, dict) or str(doc.get("cik") or "").zfill(10) != cik_padded:
         return None
     filings = doc.get("filings")
     recent = filings.get("recent") if isinstance(filings, dict) else None
@@ -484,7 +472,34 @@ def _fetch_report_dates(cik_padded: str) -> ReportDateEvidence | None:
             del out[accession]
             continue
         out[accession] = when
-    return ReportDateEvidence(out, url, hashlib.sha256(body).hexdigest(), received.isoformat())
+    return out
+
+
+def _fetch_report_dates(cik_padded: str) -> ReportDateEvidence | None:
+    """EDGAR submissions reportDate evidence for ``cik_padded`` with the raw response, or None.
+
+    None when the answer is unavailable or not the expected shape (the caller then keeps the
+    refusal: fail closed). The response's url, sha256, receipt time and bytes are returned so they can
+    be archived next to the dates they produced.
+    """
+    url = _SUBMISSIONS_URL.format(cik=cik_padded)
+    try:
+        resp = requests.get(url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS)
+        received = datetime.now(timezone.utc)
+        if resp.status_code != 200:
+            log.warning("SEC submissions CIK={c} HTTP {s}", c=cik_padded, s=resp.status_code)
+            return None
+        doc = resp.json()
+        body = resp.content
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("SEC submissions CIK={c} unavailable: {e}", c=cik_padded, e=type(exc).__name__)
+        return None
+    if not isinstance(body, bytes) or not body:
+        return None
+    dates = report_dates_from_submissions(doc, cik_padded)
+    if dates is None:
+        return None
+    return ReportDateEvidence(dates, url, hashlib.sha256(body).hexdigest(), received.isoformat(), body)
 
 
 def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
@@ -1306,7 +1321,8 @@ class SECXBRLFinancialsPuller:
                     snapshot = prepare_snapshot(**prepare_args, report_dates=evidence.dates)
                     if snapshot.report_dates:
                         snapshot = dataclasses.replace(
-                            snapshot, report_date_source=(evidence.url, evidence.sha256, evidence.received_at))
+                            snapshot, report_date_source=(evidence.url, evidence.sha256, evidence.received_at),
+                            report_date_source_body=evidence.body)
                 outcome = write_snapshot(self.engine, snapshot)
                 if outcome["status"] == "rejected_revision_regression":
                     raise ValueError("New capture regressed an existing filed revision; projection retained")

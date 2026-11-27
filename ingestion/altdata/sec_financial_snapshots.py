@@ -106,6 +106,9 @@ class FinancialSnapshot:
     # Provenance of that evidence (EDGAR submissions url, response sha256, receipt time as ISO),
     # archived next to the dates; not decision-bearing, so outside the identity.
     report_date_source: tuple[str, str, str] | None = field(default=None, compare=False)
+    # The EDGAR submissions response itself (raw bytes), archived with the evidence so the
+    # report dates can be re-derived independently of the puller.
+    report_date_source_body: bytes | None = field(default=None, compare=False, repr=False)
     tolerated_legacy_entries: int = field(default=0, compare=False)
     # (tag, end, accession) of each recent start-less mapped-flow point that was tolerated
     # (event-dated, not a reporting-period end): counted and traceable, never part of the identity.
