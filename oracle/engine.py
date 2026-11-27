@@ -199,7 +199,6 @@ MAX_ACTOR_RECEIPT_BYTES = 16_384
 # quote abstention ("no_qualified_quote"), which a fresh capture can cure.
 # Written only for a model that applies to the ticker (>= 3 signals) and finds
 # bull == bear; a model with fewer signals does not apply and records nothing.
-ABSTENTION_KIND_KEY_NO_DIRECTION = "abstention_kind"
 ABSTENTION_KIND_NO_DIRECTION = "no_direction"
 NO_DIRECTION_SCORE_NOTE = "No directional evidence at decision time"
 
@@ -1827,7 +1826,7 @@ class OracleEngine:
             receipt_error = "entry_price_does_not_match_frozen_receipt"
         context = {**flow_ctx}
         if receipt_error is None:
-            context[ABSTENTION_KIND_KEY_NO_DIRECTION] = ABSTENTION_KIND_NO_DIRECTION
+            context[ABSTENTION_KIND_KEY] = ABSTENTION_KIND_NO_DIRECTION
         pred_id = hashlib.md5(
             f"{ticker}:{model.name}:no_direction:{now.isoformat()}".encode()
         ).hexdigest()[:16]
