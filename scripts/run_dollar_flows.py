@@ -18,6 +18,15 @@ staleness bound added per PR #712 review):
 All three are counted in the printed summary (``skipped_no_vwap`` /
 ``skipped_stale_vwap`` / ``skipped_future_date``), never silently absorbed.
 
+Stored-row contract (``intelligence.dollar_flows.STORED_ROW_CONTRACTS``):
+a run rebuilds only the dates inside ``--days``, so rows an older rule wrote
+at earlier dates are never rewritten. After persisting, the run counts every
+stored row, at any date, that breaks its source's contract, and every flow
+it refused for breaking it. Either one makes the exit status 3 (the systemd
+unit fails), after this run's window has been written. Stored rows are
+removed only by the reviewed repair
+``scripts/repair_dollar_flows_stored_contract.py``.
+
 Usage:
     python3 scripts/run_dollar_flows.py                    # last 90 days, persist
     python3 scripts/run_dollar_flows.py --days 7            # last 7 days, persist
@@ -36,6 +45,10 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+
+# Exit status when the stored-row contract is broken (see module docstring).
+EXIT_CONTRACT_BROKEN = 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,6 +91,16 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             f"by_source={out['by_source']}"
             + (" [dry-run]" if out["dry_run"] else "")
         )
+    if not summary.contract_ok:
+        print(
+            "dollar-flows stored-row contract broken: "
+            f"rejected_by_contract={out['rejected_by_contract']}, "
+            f"stored_contract_violations={out['stored_contract_violations']}; "
+            "rows are removed only by the reviewed repair "
+            "scripts/repair_dollar_flows_stored_contract.py",
+            file=sys.stderr,
+        )
+        return EXIT_CONTRACT_BROKEN
     return 0
 
 

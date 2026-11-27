@@ -269,6 +269,20 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_dollar_flows_past_date_readers.py -q -rA -k real_types
 
+      # dollar_flows stored-row contract: alembic revision
+      # df_13f_observed_20261127 (NOT VALID over superseded rows, validated
+      # once clean), the writer raising when PostgreSQL rejects a row, and the
+      # reviewed repair (export, apply, refusals, lock, restore). The test
+      # fails instead of skipping when REQUIRE_DOLLAR_FLOWS_CONTRACT_PG=1.
+      - name: dollar_flows stored-row contract PostgreSQL proof
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_DOLLAR_FLOWS_CONTRACT_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dollar_flows_stored_contract_pg.py -q -rA
+
       # Stored-close backfill (scripts/close_backfill_universe.py): the work
       # queries, the completed-close reader and the fill-only write on
       # PostgreSQL. The test fails instead of skipping when
