@@ -1423,7 +1423,7 @@ def _submissions_body(dates=None, cik=1045810):
 
 
 def _with_provenance(snapshot_, *, url="https://data.sec.gov/submissions/CIK0001045810.json",
-                     received="2026-11-27T00:00:00+00:00", body=None, digest=None):
+                     received="2026-11-02T00:00:00+00:00", body=None, digest=None):
     """Attach the complete evidence provenance a puller would: matched url, lowercase sha256, aware receipt, response."""
     import dataclasses
     import hashlib
@@ -1610,7 +1610,7 @@ def test_pg_the_archive_row_alone_reproduces_a_snapshot_and_its_complete_provena
     assert row["report_date_evidence"] == {
         "report_dates": {_OWN: "2026-07-26"},
         "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json",
-                   "sha256": tolerating.report_date_source[1], "received_at": "2026-11-27T00:00:00+00:00"}}
+                   "sha256": tolerating.report_date_source[1], "received_at": "2026-11-02T00:00:00+00:00"}}
     assert gzip.decompress(bytes(row["report_date_source_gzip"])) == body
     replayed = replay_archived_snapshot(engine, tolerating.snapshot_id)
     assert replayed == tolerating and replayed.snapshot_id == tolerating.snapshot_id
@@ -1647,9 +1647,9 @@ def test_pg_the_write_boundary_requires_complete_matched_provenance_whenever_evi
         "empty response": dataclasses.replace(good, report_date_source_body=b""),
         "url for another cik": _with_provenance(good, url="https://data.sec.gov/submissions/CIK0000000099.json"),
         "malformed url": _with_provenance(good, url="http://example.com/x"),
-        "uppercase hash": dataclasses.replace(good, report_date_source=(url, good.report_date_source[1].upper(), "2026-11-27T00:00:00+00:00")),
-        "short hash": dataclasses.replace(good, report_date_source=(url, "abc", "2026-11-27T00:00:00+00:00")),
-        "hash not of the response": dataclasses.replace(good, report_date_source=(url, "0" * 64, "2026-11-27T00:00:00+00:00")),
+        "uppercase hash": dataclasses.replace(good, report_date_source=(url, good.report_date_source[1].upper(), "2026-11-02T00:00:00+00:00")),
+        "short hash": dataclasses.replace(good, report_date_source=(url, "abc", "2026-11-02T00:00:00+00:00")),
+        "hash not of the response": dataclasses.replace(good, report_date_source=(url, "0" * 64, "2026-11-02T00:00:00+00:00")),
         "naive receipt": _with_provenance(good, received="2026-11-27T00:00:00"),
         "garbled receipt": _with_provenance(good, received="yesterday"),
         "response yields other pairs": _with_provenance(good, body=other),
@@ -1676,7 +1676,7 @@ def test_pg_the_archive_checks_reject_invalid_evidence_rows_and_unpaired_columns
     engine = snapshot_db
     good = {"report_dates": {_OWN: "2026-07-26"},
             "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json", "sha256": "a" * 64,
-                       "received_at": "2026-11-27T00:00:00+00:00"}}
+                       "received_at": "2026-11-02T00:00:00+00:00"}}
 
     def insert(evidence, gz, key):
         with engine.begin() as conn:
@@ -1707,3 +1707,60 @@ def test_pg_the_archive_checks_reject_invalid_evidence_rows_and_unpaired_columns
         insert(good, None, "nobody")                                  # evidence without the response
     with pytest.raises(IntegrityError):
         insert(None, b"z", "nometa")                                  # response without the evidence
+
+
+def _head(engine):
+    with engine.connect() as conn:
+        return dict(conn.execute(text(
+            "SELECT h.request_started_at, h.received_at, s.first_received_at "
+            "FROM sec_financial_snapshot_heads h JOIN sec_financial_snapshots s ON s.snapshot_id = h.snapshot_id "
+            "WHERE h.actor_id = 'nvda'")).mappings().one())
+
+
+def test_pg_evidence_receipt_is_bounded_by_the_write_clock_and_keeps_the_facts_receipt_separate(snapshot_db):
+    """Codex 6082240621: a future evidence receipt is refused (nothing applied, no head); a normal receipt
+    later than the Company Facts receipt is accepted and replays; the facts receipt stays in the archive
+    while the head's availability time is the later of the two receipts."""
+    from datetime import datetime, timezone
+
+    import pytest
+    from store.sec_financial_snapshots import available_at, replay_archived_snapshot, write_snapshot
+
+    engine = snapshot_db
+    base = _snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd())     # facts received 2026-11-01 00:00:31
+    for future in ("2099-01-01T00:00:00+00:00", "2099-01-01T00:00:00Z"):
+        with pytest.raises(ValueError, match="future"):
+            write_snapshot(engine, _with_provenance(base, received=future))
+    with engine.connect() as conn:
+        assert stored(engine) == [] and conn.execute(text("SELECT count(*) FROM sec_financial_snapshot_heads")).scalar() == 0
+
+    later = _with_provenance(base, received="2026-11-02T00:00:00+00:00")                # evidence arrived a day after the facts
+    assert available_at(later) == datetime(2026, 11, 2, tzinfo=timezone.utc) > later.received_at
+    assert write_snapshot(engine, later)["status"] == "applied"
+    head = _head(engine)
+    assert head["first_received_at"] == later.received_at                              # the facts receipt, retained
+    assert head["received_at"] == datetime(2026, 11, 2, tzinfo=timezone.utc)           # usable only after BOTH receipts
+    assert head["request_started_at"] == later.request_started_at
+    assert replay_archived_snapshot(engine, later.snapshot_id) == later
+
+
+def test_pg_an_evidence_receipt_before_the_facts_receipt_leaves_availability_at_the_facts_receipt(snapshot_db):
+    from store.sec_financial_snapshots import available_at, write_snapshot
+
+    engine = snapshot_db
+    earlier = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()),
+                               received="2026-10-30T00:00:00+00:00")
+    assert available_at(earlier) == earlier.received_at
+    assert write_snapshot(engine, earlier)["status"] == "applied"
+    assert _head(engine)["received_at"] == earlier.received_at
+
+
+def test_pg_ordinary_snapshots_keep_the_facts_receipt_as_their_availability(snapshot_db):
+    from store.sec_financial_snapshots import available_at, write_snapshot
+
+    engine = snapshot_db
+    ordinary = snapshot()
+    assert available_at(ordinary) == ordinary.received_at
+    assert write_snapshot(engine, ordinary)["status"] == "applied"
+    head = _head(engine)
+    assert head["received_at"] == ordinary.received_at == head["first_received_at"]

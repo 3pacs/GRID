@@ -47,7 +47,7 @@ _DELETE_OWNED = text('''DELETE FROM capital_flows WHERE actor_id = :actor_id
     AND split_part(source_filing, ' ', 2) = '[SEC-XBRL-PERIOD-V1]' ''')
 _HEAD = text('''INSERT INTO sec_financial_snapshot_heads
     (actor_id, snapshot_id, request_started_at, received_at)
-    VALUES (:actor_id, :snapshot_id, :request_started_at, :received_at)
+    VALUES (:actor_id, :snapshot_id, :request_started_at, :head_received_at)
     ON CONFLICT (actor_id) DO UPDATE SET snapshot_id=EXCLUDED.snapshot_id,
         request_started_at=EXCLUDED.request_started_at, received_at=EXCLUDED.received_at,
         updated_at=NOW()''')
@@ -59,7 +59,27 @@ def _revision_regressed(previous: list[dict[str, Any]], incoming: list[dict[str,
                for r in incoming)
 
 
-def validate_report_date_provenance(snapshot: FinancialSnapshot) -> None:
+def report_date_receipt(snapshot: FinancialSnapshot):
+    """The timezone-aware receipt time of the report-date evidence, or None without evidence."""
+    from datetime import datetime as _dt
+
+    if not snapshot.report_dates or snapshot.report_date_source is None:
+        return None
+    return _dt.fromisoformat(str(snapshot.report_date_source[2]))
+
+
+def available_at(snapshot: FinancialSnapshot):
+    """When an as-of consumer may first use the snapshot: after every receipt it depends on.
+
+    The Company Facts receipt, and for an evidence-dependent snapshot also the later EDGAR
+    submissions receipt. The Company Facts receipt itself stays separate (the archive's
+    first_received_at); this is the head's availability time.
+    """
+    evidence = report_date_receipt(snapshot)
+    return snapshot.received_at if evidence is None else max(snapshot.received_at, evidence)
+
+
+def validate_report_date_provenance(snapshot: FinancialSnapshot, now=None) -> None:
     """Whenever EDGAR reportDate evidence was used, its provenance must be complete and matched.
 
     The source reference must be the submissions url of this snapshot's CIK, a lowercase SHA-256 of the
@@ -88,6 +108,8 @@ def validate_report_date_provenance(snapshot: FinancialSnapshot) -> None:
         raise ValueError('Report-date source receipt time is not an ISO timestamp') from exc
     if when.tzinfo is None or when.utcoffset() is None:
         raise ValueError('Report-date source receipt time must be timezone-aware')
+    if when > (now or _dt.now(timezone.utc)):
+        raise ValueError('Report-date source receipt time is in the future')
     try:
         derived = report_dates_from_submissions(json.loads(body), snapshot.cik)
     except ValueError as exc:
@@ -113,8 +135,8 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
     from ingestion.altdata.sec_xbrl_financials import _INSERT_SQL
 
     validate_snapshot(snapshot)
-    validate_report_date_provenance(snapshot)
     now = datetime.now(timezone.utc)
+    validate_report_date_provenance(snapshot, now)
     if snapshot.received_at > now or snapshot.request_started_at > now:
         raise ValueError('Future source receipt cannot advance current projection')
     params = dict(snapshot_id=snapshot.snapshot_id, actor_id=snapshot.actor_id, cik=snapshot.cik,
@@ -122,7 +144,8 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
                   normalized_sha256=snapshot.normalized_sha256, normalizer_version=snapshot.normalizer_version,
                   source_gzip=gzip.compress(snapshot.source_body, mtime=0),
                   normalized_rows=snapshot.normalized_json, fx_inputs=snapshot.fx_json,
-                  request_started_at=snapshot.request_started_at, received_at=snapshot.received_at)
+                  request_started_at=snapshot.request_started_at, received_at=snapshot.received_at,
+                  head_received_at=available_at(snapshot))
     rows = snapshot.rows
     with engine.begin() as conn:
         conn.execute(_LOCK, params)
