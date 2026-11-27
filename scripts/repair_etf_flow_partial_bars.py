@@ -85,10 +85,13 @@ refuses the plan. A holiday is not a gap.
 
 ``verify --expect-digest D`` reads only and reports integrity, completion
 and supersession apart (see ``verify_plan``): it exits 0 only for a plan that
-is intact and fully applied (or legitimately superseded or undone), 1 on an
+is intact and fully applied (or superseded within the tolerance), 1 on an
 integrity problem, 4 for an intact plan not yet fully applied, with a repair
 row quarantined since, or with plan gaps (an ETF not planned in full, rows it
-could not price) unless ``--accept-plan-gaps``.
+could not price) unless ``--accept-plan-gaps``, with items undone unless
+``--accept-undone``, or with later vintages further than the tolerance from
+the plan unless ``--accept-superseded``. ``apply`` refuses to write again a
+repair row someone quarantined unless ``--reapply-quarantined``.
 ``undo --expect-digest D`` appends, for every planned date whose newest
 vintage is still this plan's own repair row (marker naming digest ``D`` and
 the revised vintage), a vintage restoring that original row: its value and
@@ -523,6 +526,7 @@ def build_plan(
                     # put back: near 0 when only its own bar was wrong; larger
                     # when other bars of its window were unsettled too.
                     "stored_bar_residual": explained,
+                    "scale_5d": scale,
                     "rel_change": rel,
                     "revises_id": vint["id"],
                     "revises_value": vint["value"],
@@ -670,6 +674,7 @@ def _write_series(
     mode: str,
     budget: Any,
     session_day: date,
+    reapply_quarantined: bool = False,
 ) -> Counter:
     """One series, one transaction, under the ETF flow write lock.
 
@@ -685,6 +690,10 @@ def _write_series(
     with engine.begin() as conn:
         received_at = puller._serialize_etf_write(conn, budget)
         newest = newest_vintages(conn, puller.source_id, [series_id], min(dates), max(dates))
+        quarantined = {_as_date(r[0]) for r in conn.execute(text(
+            "SELECT obs_date FROM raw_series WHERE source_id = :src AND series_id = :sid "
+            "AND pull_status = 'QUARANTINED' AND CAST(raw_payload AS TEXT) LIKE :pat"),
+            {"src": puller.source_id, "sid": series_id, "pat": f"%{run_id}%"})}
         for item, obs_date in zip(items, dates):
             current = newest.get((series_id, obs_date))
             if obs_date >= floor:
@@ -698,6 +707,11 @@ def _write_series(
                     continue
                 if current is None or current["id"] != item["revises_id"]:
                     counts["superseded"] += 1
+                    continue
+                if obs_date in quarantined and not reapply_quarantined:
+                    # Someone quarantined this plan's row: a retraction. Writing
+                    # it again would silently re-impose a value judged bad.
+                    counts["refused_repair_was_quarantined"] += 1
                     continue
                 payload = {
                     "ticker": item["ticker"], "close": item["close"], "volume": item["volume"],
@@ -744,6 +758,7 @@ def run_writes(
     progress_path: Path | None = None,
     session_day: date | None = None,
     expect_digest: str | None = None,
+    reapply_quarantined: bool = False,
 ) -> dict[str, Any]:
     """Write the plan (``apply``) or its undo, series by series; resumable.
 
@@ -769,7 +784,8 @@ def run_writes(
         started = _monotonic()
         try:
             counts = _write_series(engine, puller, plan, series_id, items, mode=mode,
-                                   budget=budget, session_day=session_day)
+                                   budget=budget, session_day=session_day,
+                                   reapply_quarantined=reapply_quarantined)
         except inst._EtfWriteLockBusy as exc:
             counts = Counter({"lock_busy": len(items)})
             status = "STOPPED_LOCK_BUSY" if status == "DONE" else status
@@ -798,7 +814,8 @@ def plan_gaps(plan: dict) -> dict[str, Any]:
     return {"tickers_not_ok": tickers, "rows_left_unrepaired": left}
 
 
-def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False) -> dict[str, Any]:
+def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False, accept_undone: bool = False,
+                accept_superseded: bool = False) -> dict[str, Any]:
     """Read-only receipt of a plan against what is stored.
 
     Three answers, reported apart:
@@ -816,7 +833,11 @@ def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False) -
       left alone for a reason other than being within tolerance), unless
       ``accept_plan_gaps``: those rows were never repaired.
       ``superseded_vs_plan`` says how far the vintages that superseded the
-      plan's value are from it.
+      plan's value are from it (on the date's 5d scale); one further than
+      the tolerance is incomplete unless ``accept_superseded``. An ``undone``
+      item is incomplete unless ``accept_undone``: after an undo the partial
+      value is current again, so "ok" never means both "repaired" and
+      "undone" (verify an undo with ``--accept-undone``).
     * ``ok`` is both. The command exits 0 only then: 1 on an integrity
       problem, 4 when the plan is intact but not (fully) applied.
     """
@@ -900,7 +921,7 @@ def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False) -
             states["superseded_before_apply"] += 1
             superseded = True
         if superseded and cur is not None:
-            scale = abs(five_d.get(key[1], {}).get(item["ticker"], item["value"])) or 1.0
+            scale = abs(item.get("scale_5d") or five_d.get(key[1], {}).get(item["ticker"], item["value"])) or 1.0
             supersessions.append(abs(cur["value"] - item["value"]) / scale)
     stray = [k for k in list(repairs) + list(quarantined_repairs) + list(undos) if k not in planned_keys]
     if stray:
@@ -910,15 +931,21 @@ def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False) -
     integrity_ok = not problems
     gaps = plan_gaps(plan)
     has_gaps = bool(gaps["tickers_not_ok"] or gaps["rows_left_unrepaired"])
+    over = sum(1 for x in supersessions if x > TOLERANCE)
     complete = (states["not_applied"] == 0 and states["repair_quarantined"] == 0
-                and (accept_plan_gaps or not has_gaps))
+                and (accept_plan_gaps or not has_gaps)
+                and (accept_undone or states["undone"] == 0)
+                and (accept_superseded or over == 0))
     return {"run_id": run_id, "digest": plan["digest"], "planned": len(plan["items"]),
             "states": {k: states[k] for k in ("applied", "undone", "applied_then_superseded",
                                               "superseded_before_apply", "not_applied", "repair_quarantined")},
             "plan_gaps": gaps, "plan_gaps_accepted": bool(accept_plan_gaps and has_gaps),
+            "repair_in_force": states["applied"],
+            "accepted": {"undone": accept_undone and states["undone"] > 0,
+                         "superseded_over_tolerance": accept_superseded and over > 0},
             "superseded_vs_plan": {"count": len(supersessions),
                                    "max_rel_diff_of_5d": max(supersessions) if supersessions else None,
-                                   "over_tolerance": sum(1 for x in supersessions if x > TOLERANCE)},
+                                   "over_tolerance": over},
             "integrity_ok": integrity_ok, "complete": complete, "ok": integrity_ok and complete,
             "problems": problems}
 
@@ -955,6 +982,8 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
             w.add_argument("--expect-digest", required=True)
             w.add_argument("--allow-incomplete-plan", action="store_true",
                            help="apply a plan in which some ETF was not planned (they stay unrepaired)")
+            w.add_argument("--reapply-quarantined", action="store_true",
+                           help="write again a repair row someone quarantined (refused by default)")
         else:
             w.add_argument("--expect-digest", required=True,
                            help="the digest of the plan being undone (as printed when it was made)")
@@ -962,6 +991,10 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
     v = sub.add_parser("verify")
     v.add_argument("--plan", required=True, type=Path)
     v.add_argument("--expect-digest", required=True, help="the digest of the plan being verified")
+    v.add_argument("--accept-undone", action="store_true",
+                   help="exit 0 for items this plan's undo restored (to verify an undo)")
+    v.add_argument("--accept-superseded", action="store_true",
+                   help="exit 0 although later vintages differ from the plan by more than the tolerance")
     v.add_argument("--accept-plan-gaps", action="store_true",
                    help="exit 0 although the plan left ETFs or rows unrepaired (they are still reported)")
     args = ap.parse_args(argv)
@@ -991,15 +1024,16 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
             return _EXIT_OK
         if args.mode == "verify":
             plan = load_plan(args.plan, args.expect_digest)
-            result = verify_plan(engine, plan, accept_plan_gaps=args.accept_plan_gaps)
+            result = verify_plan(engine, plan, accept_plan_gaps=args.accept_plan_gaps,
+                                 accept_undone=args.accept_undone, accept_superseded=args.accept_superseded)
             print("VERIFY " + json.dumps(result, sort_keys=True))
             if not result["integrity_ok"]:
                 return _EXIT_FAILED
             if not result["complete"]:
                 st = result["states"]
-                print(f"NOT COMPLETE: {st['not_applied']} planned row(s) not applied, "
-                      f"{st['repair_quarantined']} repair row(s) quarantined; plan gaps "
-                      f"{json.dumps(result['plan_gaps'], sort_keys=True)}", file=sys.stderr)
+                print(f"NOT COMPLETE: {st['not_applied']} not applied, {st['repair_quarantined']} quarantined, "
+                      f"{st['undone']} undone, {result['superseded_vs_plan']['over_tolerance']} superseded "
+                      f"over tolerance; plan gaps {json.dumps(result['plan_gaps'], sort_keys=True)}", file=sys.stderr)
                 return _EXIT_INCOMPLETE
             return _EXIT_OK
         plan = load_plan(args.plan, getattr(args, "expect_digest", None),
@@ -1015,7 +1049,8 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
             return _EXIT_OK
         deadline_at = _monotonic() + args.deadline_minutes * 60
         result = run_writes(engine, plan, mode=args.mode, deadline_at=deadline_at, progress_path=progress,
-                            expect_digest=getattr(args, "expect_digest", None))
+                            expect_digest=getattr(args, "expect_digest", None),
+                            reapply_quarantined=getattr(args, "reapply_quarantined", False))
         print("RESULT " + json.dumps(result, sort_keys=True))
         if result["status"] == "DONE_WITH_REFUSED_ROWS":
             print("some rows were refused (see totals); nothing was written for them", file=sys.stderr)

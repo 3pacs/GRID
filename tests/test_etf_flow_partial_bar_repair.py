@@ -225,6 +225,8 @@ def test_apply_appends_the_planned_rows_and_keeps_every_old_one(world):
         "states": {"applied": len(plan["items"]), "undone": 0, "applied_then_superseded": 0,
                    "superseded_before_apply": 0, "not_applied": 0, "repair_quarantined": 0},
         "plan_gaps": {"tickers_not_ok": {}, "rows_left_unrepaired": {}}, "plan_gaps_accepted": False,
+        "repair_in_force": len(plan["items"]),
+        "accepted": {"undone": False, "superseded_over_tolerance": False},
         "superseded_vs_plan": {"count": 0, "max_rel_diff_of_5d": None, "over_tolerance": 0},
         "integrity_ok": True, "complete": True, "ok": True, "problems": []}
 
@@ -272,7 +274,10 @@ def test_verify_counts_a_legitimate_supersession_as_complete(world):
     m.seed_row(engine, "SPY", date.fromisoformat(second), later,      # a revision after the repair row
                repaired.replace(tzinfo=repaired.tzinfo or timezone.utc) + timedelta(minutes=1))
     result = mod.verify_plan(engine, plan)
-    assert result["ok"], result["problems"]
+    assert result["integrity_ok"] and not result["complete"]           # 6 superseders far from the plan
+    assert mod.verify_plan(engine, plan, accept_superseded=True)["ok"]
+    result = mod.verify_plan(engine, plan, accept_superseded=True)
+    assert result["accepted"]["superseded_over_tolerance"] is True
     assert result["states"]["superseded_before_apply"] == 3
     assert result["states"]["applied_then_superseded"] == 3
     assert result["states"]["applied"] == len(plan["items"]) - 6
@@ -294,8 +299,12 @@ def test_verify_does_not_count_a_quarantined_repair_row_as_done(world, tmp_path)
     path = tmp_path / "plan.json"
     path.write_text(json.dumps(plan))
     assert mod.main(["verify", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 4
-    again = mod.run_writes(engine, plan, session_day=SESSION_DAY)      # apply writes it again
-    assert again["totals"] == {"written": 1, "already_applied": len(plan["items"]) - 1}
+    again = mod.run_writes(engine, plan, session_day=SESSION_DAY)      # a quarantine is a retraction
+    assert again["status"] == "DONE_WITH_REFUSED_ROWS"
+    assert again["totals"] == {"refused_repair_was_quarantined": 1, "already_applied": len(plan["items"]) - 1}
+    assert mod.main(["apply", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 1
+    forced = mod.run_writes(engine, plan, session_day=SESSION_DAY, reapply_quarantined=True)
+    assert forced["totals"] == {"written": 1, "already_applied": len(plan["items"]) - 1}
     assert mod.verify_plan(engine, plan)["ok"]
 
 
@@ -489,7 +498,9 @@ def test_undo_appends_the_replaced_values_and_keeps_the_repair(world):
     assert {k: v for k, v in undo["payload"].items() if k not in ("repair_undo", "revises_value")} == old["payload"]
     assert "repair" not in undo["payload"]
     verified = mod.verify_plan(engine, plan)
-    assert verified["ok"] and verified["states"]["undone"] == len(plan["items"])
+    assert verified["integrity_ok"] and not verified["ok"]                # "ok" never means undone
+    assert verified["states"]["undone"] == len(plan["items"]) and verified["repair_in_force"] == 0
+    assert mod.verify_plan(engine, plan, accept_undone=True)["ok"]
     again = mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY, expect_digest=plan["digest"])
     assert again["totals"] == {"not_newest": len(plan["items"])}
     reapplied = mod.run_writes(engine, plan, session_day=SESSION_DAY)
@@ -519,7 +530,7 @@ def test_undoing_a_repair_of_an_earlier_repair_keeps_that_earlier_runs_lineage()
     assert restored["value"] == earlier["value"]
     assert restored["payload"]["restored_repair"] == earlier["payload"]["repair"]
     assert "repair" not in restored["payload"]
-    assert mod.verify_plan(engine, second)["ok"]
+    assert mod.verify_plan(engine, second, accept_undone=True)["ok"]
     assert mod.verify_plan(engine, first)["integrity_ok"]                # no second row of the first run
 
 

@@ -36,7 +36,10 @@ helper or support module fails the gate until a new E1 version is released.
 The gate runs the named tests itself, isolated from everything not pinned (no
 conftest, no pytest configuration file, no auto-loaded plugins), and fails
 unless each is collected and passes (none skipped): the parity claim is
-executed on every E1 run, not just named. It is not an exemption: an undeclared writer, an implicit
+executed on every E1 run, not just named. The pin is a tripwire against the
+evidence being weakened or bypassed, not a proof that the evidence is
+sufficient: the code under test is deliberately not pinned, and whether these
+tests are enough is the reviewer's and the owner's judgement at sign-off. It is not an exemption: an undeclared writer, an implicit
 flag, a stored basis that differs, a changed parity file or support module,
 or a missing, skipped or failing parity test fails the gate.
 
