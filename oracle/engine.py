@@ -3209,7 +3209,12 @@ class OracleEngine:
                 outcome = detail["tickers"].setdefault(p.ticker, {
                     "qualified": 0, "abstained": 0,
                     "duplicate_forecasts": 0, "duplicate_abstentions": 0,
+                    # Abstentions of this pass, new or repeated, that lacked a
+                    # qualified quote: what a fresh capture could change.
+                    "without_quote": 0,
                 })
+                if abstained and p.flow_context.get(ABSTENTION_KIND_KEY) == ABSTENTION_NO_QUALIFIED_QUOTE:
+                    outcome["without_quote"] += 1
                 outcome[("duplicate_abstentions" if abstained else "duplicate_forecasts") if row is None
                         else ("abstained" if abstained else "qualified")] += 1
                 if abstained:

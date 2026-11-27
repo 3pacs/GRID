@@ -45,10 +45,14 @@ REASON = "quote is older than the 20-minute reference limit"
 
 def _health(*, status: str = fh.STATUS_ALL_ABSTAINED, attempts: int = 1, state: str = "open",
             spy: tuple[int, int] = (0, 305), qqq: tuple[int, int] = (0, 305),
-            last_outcome: str | None = None) -> dict[str, Any]:
+            outcomes: dict[str, str] | None = None) -> dict[str, Any]:
+    """An admin answer. By default each ticker's newest outcome follows its counts:
+    a forecast, or (abstentions only) "no_quote", or nothing recorded."""
+    if outcomes is None:
+        outcomes = {name: ("forecast" if q else "no_quote")
+                    for name, (q, a) in (("SPY", spy), ("QQQ", qqq)) if q or a}
     return {
-        "abstained_without_quote": {name: n for name, n in (("SPY", spy[1]), ("QQQ", qqq[1])) if n},
-        "status": status, "attempts": attempts, "session_state": state, "last_outcome": last_outcome,
+        "status": status, "attempts": attempts, "session_state": state, "ticker_outcomes": outcomes,
         "session_closes_at": CLOSE.isoformat(),
         "tickers": {"SPY": {"qualified": spy[0], "abstained": spy[1]},
                     "QQQ": {"qualified": qqq[0], "abstained": qqq[1]}},
@@ -69,12 +73,46 @@ def test_a_session_waiting_for_a_quote_retries_in_ten_minutes() -> None:
 
 def test_a_pass_with_no_capture_retries_and_one_with_no_candidate_does_not() -> None:
     """Both store nothing. A fresh capture can fix the first and cannot fix the second."""
-    no_capture = _health(status=fh.STATUS_NO_ROWS, spy=(0, 0), qqq=(0, 0), last_outcome="no_capture")
+    both = lambda outcome: {"SPY": outcome, "QQQ": outcome}  # noqa: E731
+    no_capture = _health(status=fh.STATUS_NO_ROWS, spy=(0, 0), qqq=(0, 0), outcomes=both("no_capture"))
     plan = fh.retry_plan(no_capture, OPEN + timedelta(minutes=2))
-    assert (plan["quick"], plan["reason"], plan["waiting_tickers"]) == (True, "waiting_for_a_fresh_capture", [])
-    for outcome in ("no_result", "completed", None):       # None: the last pass never finished
-        health = _health(status=fh.STATUS_NO_ROWS, spy=(0, 0), qqq=(0, 0), last_outcome=outcome)
+    assert (plan["quick"], plan["reason"], plan["waiting_tickers"]) == (
+        True, "waiting_for_a_fresh_capture", ["SPY", "QQQ"])
+    for outcomes in (both("no_vote"), both("forecast"), both("abstained_other"), {}):   # {}: no account
+        health = _health(status=fh.STATUS_NO_ROWS, spy=(0, 0), qqq=(0, 0), outcomes=outcomes)
         assert fh.retry_plan(health, OPEN + timedelta(minutes=2))["quick"] is False
+
+
+def test_an_old_quote_abstention_does_not_keep_the_retry_going_after_a_no_vote_pass() -> None:
+    """Codex review 6089033512. SPY abstained for its quote at 14:31. At 14:41 the quote qualified
+    and no model voted. The 14:31 abstention rows are still there and SPY still has no forecast,
+    but a fresh capture cannot change a no-vote: the retry stops."""
+    after_first = _health(spy=(0, 305), qqq=(0, 305))                    # both: no_quote
+    assert fh.retry_plan(after_first, OPEN + timedelta(minutes=2))["waiting_tickers"] == ["SPY", "QQQ"]
+    after_second = _health(spy=(0, 305), qqq=(0, 305), attempts=2,       # same accumulated rows
+                           outcomes={"SPY": "no_vote", "QQQ": "no_vote"})
+    plan = fh.retry_plan(after_second, OPEN + timedelta(minutes=12))
+    assert (plan["quick"], plan["interval_seconds"], plan["reason"], plan["waiting_tickers"]) == (
+        False, 3600, "not_waiting", [])
+
+
+@pytest.mark.parametrize(("outcomes", "waiting", "reason"), [
+    ({"SPY": "no_vote", "QQQ": "no_quote"}, ["QQQ"], "waiting_for_a_qualified_quote"),
+    ({"SPY": "no_quote", "QQQ": "forecast"}, ["SPY"], "waiting_for_a_qualified_quote"),
+    ({"SPY": "no_vote", "QQQ": "no_capture"}, ["QQQ"], "waiting_for_a_fresh_capture"),
+    ({"SPY": "no_quote", "QQQ": "no_capture"}, ["SPY", "QQQ"], "waiting_for_a_qualified_quote"),
+    ({"SPY": "abstained_other", "QQQ": "no_quote"}, ["QQQ"], "waiting_for_a_qualified_quote"),
+])
+def test_mixed_tickers_wait_only_for_what_a_capture_can_change(outcomes, waiting, reason) -> None:
+    plan = fh.retry_plan(_health(spy=(0, 305), qqq=(0, 305), attempts=2, outcomes=outcomes),
+                         OPEN + timedelta(minutes=12))
+    assert (plan["quick"], plan["waiting_tickers"], plan["reason"]) == (True, waiting, reason)
+
+
+def test_a_blocked_quote_does_not_stop_a_retry_for_a_missing_capture() -> None:
+    health = _health(attempts=2, outcomes={"SPY": "no_quote", "QQQ": "no_capture"})
+    plan = fh.retry_plan(health, OPEN + timedelta(minutes=12), blocked={"SPY": "…"})
+    assert (plan["quick"], plan["reason"]) == (True, "waiting_for_a_qualified_quote")
 
 
 @pytest.mark.parametrize("health", [
@@ -224,10 +262,17 @@ def pgdb(pg_engine):
             conn.execute(DropSchema(schema, cascade=True))
 
 
+def _outcome(conn: Any, written: datetime, status: str, attempt_at: datetime, **tickers: str) -> None:
+    """The outcome row a pass writes at its end, for the attempt it made at ``attempt_at``."""
+    conn.execute(text("INSERT INTO oracle_iterations VALUES (:at, 0, 0, :note)"),
+                 {"at": _at(written), "note": fh.outcome_note(status, attempt_at, tickers)})
+
+
 def _abstained_session(conn: Any, *, withheld: bool) -> None:
     """One pass at 14:31Z in which both tickers abstained on a public quote that was too old."""
     first = OPEN + timedelta(minutes=1)
     _attempt(conn, first)
+    _outcome(conn, first + timedelta(seconds=20), "all_abstained", first, SPY="no_quote", QQQ="no_quote")
     for ticker in ("SPY", "QQQ"):
         _rows(conn, ticker, first, 305)
         _batch(conn, ticker, OPEN - timedelta(hours=18), "yahoo", 10)
@@ -276,45 +321,122 @@ def test_the_cadence_is_the_operators_and_is_not_shown_to_everyone_else(db) -> N
         public = fh.forward_health(conn, now=OPEN + timedelta(minutes=5), include_schwab=False)
     # Whether a retry would help depends on attempts, outcomes and a capture that only an
     # admin request is told about.
-    for admin_only in ("retry", "operator_notes", "attempts", "last_outcome", "alert_sent"):
+    for admin_only in ("retry", "operator_notes", "attempts", "last_outcome", "ticker_outcomes", "alert_sent"):
         assert admin_only not in public
     assert public["level"] == "failing" and "Trying again" not in public["message"]
 
 
-def _outcome(conn: Any, clock: datetime, outcome: str) -> None:
-    conn.execute(text("INSERT INTO oracle_iterations VALUES (:at, 0, 0, :note)"),
-                 {"at": _at(clock), "note": fh.FORWARD_OUTCOME_NOTE_PREFIX + outcome})
-
-
-def test_the_stored_outcome_tells_a_failed_capture_from_no_candidate(db) -> None:
+def test_the_stored_account_tells_a_failed_capture_from_no_candidate(db) -> None:
     first = OPEN + timedelta(minutes=1)
     with db.begin() as conn:
         _attempt(conn, first)
-        _outcome(conn, first + timedelta(seconds=20), "no_capture")
+        _outcome(conn, first + timedelta(seconds=20), "no_capture", first, SPY="no_capture", QQQ="no_capture")
     with db.connect() as conn:
         health = fh.forward_health(conn, now=OPEN + timedelta(minutes=5), include_schwab=True)
     assert (health["status"], health["last_outcome"], health["attempts"]) == (fh.STATUS_NO_ROWS, "no_capture", 1)
+    assert health["ticker_outcomes"] == {"SPY": "no_capture", "QQQ": "no_capture"}
     assert (health["level"], health["retry"]["reason"]) == ("retrying", "waiting_for_a_fresh_capture")
+    second = first + timedelta(minutes=10)
     with db.begin() as conn:                                  # the retry captured, and no model voted
-        _attempt(conn, first + timedelta(minutes=10))
-        _outcome(conn, first + timedelta(minutes=10, seconds=20), "no_result")
+        _attempt(conn, second)
+        _outcome(conn, second + timedelta(seconds=20), "no_result", second, SPY="no_vote", QQQ="no_vote")
     with db.connect() as conn:
         health = fh.forward_health(conn, now=OPEN + timedelta(minutes=15), include_schwab=True)
     assert (health["last_outcome"], health["attempts"]) == ("no_result", 2)        # outcomes are not attempts
     assert (health["level"], health["retry"]["quick"], health["retry"]["reason"]) == ("failing", False, "not_waiting")
 
 
-def test_an_attempt_that_never_reported_how_it_ended_has_no_outcome(db) -> None:
-    first = OPEN + timedelta(minutes=1)
+def test_no_quote_then_a_qualified_quote_with_no_vote_stops_the_retry_from_the_stored_record(db, ho, monkeypatch) -> None:
+    """The control for review 6089033512, from stored rows only, as a restarted operator reads them."""
+    first, second = OPEN + timedelta(minutes=1), OPEN + timedelta(minutes=11)
+    with db.begin() as conn:
+        _abstained_session(conn, withheld=False)              # 14:31 SPY and QQQ: no qualified quote
+    with db.connect() as conn:
+        assert fh.forward_health(conn, now=first + timedelta(minutes=1),
+                                 include_schwab=True)["retry"]["waiting_tickers"] == ["SPY", "QQQ"]
+    with db.begin() as conn:                                  # 14:41 SPY: qualified, no vote. QQQ: forecast.
+        _attempt(conn, second)
+        _rows(conn, "QQQ", second, 111, "CALL")
+        _outcome(conn, second + timedelta(seconds=20), "completed", second, SPY="no_vote", QQQ="forecast")
+    with db.connect() as conn:
+        health = fh.forward_health(conn, now=second + timedelta(minutes=1), include_schwab=True)
+    # SPY's 14:31 abstentions are still on record and it has no forecast...
+    assert health["tickers"]["SPY"]["abstained"] == 305 and health["tickers"]["SPY"]["qualified"] == 0
+    assert health["status"] == fh.STATUS_PARTIAL
+    # ...and nothing waits: the newest pass's account says no_vote, which a capture cannot change.
+    assert health["ticker_outcomes"] == {"SPY": "no_vote", "QQQ": "forecast"}
+    assert (health["retry"]["quick"], health["retry"]["interval_seconds"], health["retry"]["waiting_tickers"]) == (
+        False, 3600, [])
+    # A restarted operator has no memory: it reads the same rows and makes the same choice.
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (second + timedelta(minutes=1)).astimezone(tz)
+
+    monkeypatch.setattr(ho, "datetime", Clock)
+    assert ho._oracle_forward_retry_plan(db) == health["retry"]
+
+
+def test_a_mixed_session_keeps_retrying_only_for_the_ticker_that_lacks_a_quote(db) -> None:
+    second = OPEN + timedelta(minutes=11)
+    with db.begin() as conn:
+        _abstained_session(conn, withheld=False)
+        _attempt(conn, second)                                # 14:41 SPY: no vote. QQQ: quote refused again.
+        _outcome(conn, second + timedelta(seconds=20), "all_abstained", second, SPY="no_vote", QQQ="no_quote")
+    with db.connect() as conn:
+        health = fh.forward_health(conn, now=second + timedelta(minutes=1), include_schwab=True)
+    assert (health["retry"]["quick"], health["retry"]["waiting_tickers"]) == (True, ["QQQ"])
+
+
+def test_only_the_newest_attempts_own_account_is_used(db) -> None:
+    """An attempt that never reported how it ended has no account; an earlier pass's says nothing about it."""
+    first, second = OPEN + timedelta(minutes=1), OPEN + timedelta(minutes=11)
     with db.begin() as conn:
         _attempt(conn, first)
-        _outcome(conn, first + timedelta(seconds=20), "no_capture")
-        _attempt(conn, first + timedelta(minutes=10))         # timed out: no outcome row
+        _outcome(conn, first + timedelta(seconds=20), "no_capture", first, SPY="no_capture", QQQ="no_capture")
+        _attempt(conn, second)                                # timed out: no outcome row
     with db.connect() as conn:
         health = fh.forward_health(conn, now=OPEN + timedelta(minutes=15), include_schwab=True)
         earlier = fh.forward_health(conn, now=OPEN + timedelta(minutes=5), include_schwab=True)
-    assert health["last_outcome"] is None and health["retry"]["quick"] is False
-    assert earlier["last_outcome"] == "no_capture"            # and a replay of 14:35 still sees its own past
+    assert health["last_outcome"] is None and health["ticker_outcomes"] == {}
+    assert health["retry"]["quick"] is False
+    assert earlier["last_outcome"] == "no_capture"            # a replay of 14:35 still sees its own past
+    # An account written late, for the first attempt, after the second began: still not the second's.
+    with db.begin() as conn:
+        _outcome(conn, second + timedelta(minutes=1), "all_abstained", first, SPY="no_quote", QQQ="no_quote")
+    with db.connect() as conn:
+        late = fh.forward_health(conn, now=OPEN + timedelta(minutes=15), include_schwab=True)
+    assert late["last_outcome"] is None and late["retry"]["quick"] is False
+
+
+def test_the_note_round_trips_and_other_notes_are_not_outcomes() -> None:
+    attempt = OPEN + timedelta(minutes=1, microseconds=123456)
+    note = fh.outcome_note("partial", attempt, {"SPY": "no_capture", "QQQ": "forecast"})
+    assert note == ("oracle_forward_v2:SPY_QQQ:1d:outcome:partial|attempt=2026-11-25T14:31:00.123456+00:00"
+                    "|QQQ=forecast|SPY=no_capture")
+    assert fh.parse_outcome_note(note) == {
+        "status": "partial", "attempt": "2026-11-25T14:31:00.123456+00:00",
+        "tickers": {"QQQ": "forecast", "SPY": "no_capture"}}
+    assert fh.parse_outcome_note(fh.FORWARD_ATTEMPT_NOTE) is None
+    assert fh.parse_outcome_note(fh.alert_note("2026-11-25")) is None
+    assert fh.parse_outcome_note(None) is None
+    # A pass that could not read its attempt clock writes an untied account, which matches no attempt.
+    assert fh.parse_outcome_note(fh.outcome_note("completed", None, {}))["attempt"] is None
+
+
+@pytest.mark.parametrize(("detail", "expected"), [
+    ({"SPY": {"abstained": 305, "without_quote": 305}, "QQQ": {"qualified": 111}},
+     {"SPY": "no_quote", "QQQ": "forecast"}),
+    ({"SPY": {"duplicate_abstentions": 305, "without_quote": 305}, "QQQ": {"duplicate_forecasts": 111}},
+     {"SPY": "no_quote", "QQQ": "forecast"}),
+    ({"SPY": {"abstained": 305, "without_quote": 0}}, {"SPY": "abstained_other", "QQQ": "no_vote"}),
+    ({"SPY": {"abstained": 305, "without_quote": 100}}, {"SPY": "abstained_other", "QQQ": "no_vote"}),
+    ({}, {"SPY": "no_vote", "QQQ": "no_vote"}),
+])
+def test_a_pass_says_what_each_captured_ticker_ended_with(detail, expected) -> None:
+    outcome = fh.pass_outcome(["SPY", "QQQ"], {"tickers": detail, "abstention_reasons": {}})
+    assert outcome["ticker_outcomes"] == expected
+    assert fh.pass_outcome(["SPY", "QQQ"], None)["ticker_outcomes"] == {}      # unknown detail: no account
 
 
 @pytest.mark.parametrize("kind", ["no_direction", None])
@@ -323,11 +445,13 @@ def test_an_abstention_of_another_kind_is_not_waited_for(db, kind: str | None) -
     first = OPEN + timedelta(minutes=1)
     with db.begin() as conn:
         _attempt(conn, first)
+        _outcome(conn, first + timedelta(seconds=20), "all_abstained", first,
+                 SPY="abstained_other", QQQ="abstained_other")
         for ticker in ("SPY", "QQQ"):
             _rows(conn, ticker, first, 305, kind=kind)
     with db.connect() as conn:
         health = fh.forward_health(conn, now=OPEN + timedelta(minutes=5), include_schwab=True)
-    assert health["status"] == fh.STATUS_ALL_ABSTAINED and health["abstained_without_quote"] == {}
+    assert health["status"] == fh.STATUS_ALL_ABSTAINED
     assert health["abstention_kinds"] == {kind or "unspecified": 610}
     assert (health["level"], health["retry"]["quick"], health["retry"]["reason"]) == ("failing", False, "not_waiting")
 
@@ -336,13 +460,13 @@ def test_a_session_mixing_kinds_names_each_and_waits_only_for_the_quote(db) -> N
     first = OPEN + timedelta(minutes=1)
     with db.begin() as conn:
         _attempt(conn, first)
+        _outcome(conn, first + timedelta(seconds=20), "all_abstained", first, SPY="abstained_other", QQQ="no_quote")
         _rows(conn, "SPY", first, 305, kind="no_direction")
         _rows(conn, "QQQ", first, 305)                          # no qualified quote
     with db.connect() as conn:
         health = fh.forward_health(conn, now=OPEN + timedelta(minutes=5), include_schwab=True)
         public = fh.forward_health(conn, now=OPEN + timedelta(minutes=5), include_schwab=False)
     assert health["abstention_kinds"] == public["abstention_kinds"] == {"no_direction": 305, "no_qualified_quote": 305}
-    assert health["abstained_without_quote"] == {"QQQ": 305}
     assert (health["retry"]["quick"], health["retry"]["waiting_tickers"]) == (True, ["QQQ"])
 
 
@@ -483,12 +607,14 @@ def test_one_abstained_pass_with_a_retry_minutes_away_does_not_e_mail_yet(monkey
         _abstained_session(conn, withheld=False)
     sent = _mail(monkeypatch)
     first = OPEN + timedelta(minutes=1)
-    _at_clock(monkeypatch, ho, first + timedelta(seconds=10))
+    _at_clock(monkeypatch, ho, first + timedelta(seconds=30))       # after the pass wrote its outcome
     assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, first) is False
     assert sent == []
+    second = first + timedelta(minutes=10)
     with db.begin() as conn:                                  # the retry abstained too
-        _attempt(conn, first + timedelta(minutes=10))
-    _at_clock(monkeypatch, ho, first + timedelta(minutes=10, seconds=10))
+        _attempt(conn, second)
+        _outcome(conn, second + timedelta(seconds=20), "all_abstained", second, SPY="no_quote", QQQ="no_quote")
+    _at_clock(monkeypatch, ho, second + timedelta(seconds=30))
     # A fresh state object: the count is the stored attempts, not operator memory.
     assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, first) is True
     assert len(sent) == 1 and sent[0].startswith(GENERIC)        # nothing about the retry leaves the host
@@ -499,14 +625,15 @@ def test_a_retry_that_qualifies_means_no_e_mail_at_all(monkeypatch, ho, db) -> N
         _abstained_session(conn, withheld=False)
     sent = _mail(monkeypatch)
     first = OPEN + timedelta(minutes=1)
-    _at_clock(monkeypatch, ho, first + timedelta(seconds=10))
+    _at_clock(monkeypatch, ho, first + timedelta(seconds=30))       # after the pass wrote its outcome
     ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, first)
     second = first + timedelta(minutes=10)
     with db.begin() as conn:
         _attempt(conn, second)
         _rows(conn, "SPY", second, 40, "PUT")
         _rows(conn, "QQQ", second, 111, "CALL")
-    _at_clock(monkeypatch, ho, second + timedelta(seconds=10))
+        _outcome(conn, second + timedelta(seconds=20), "completed", second, SPY="forecast", QQQ="forecast")
+    _at_clock(monkeypatch, ho, second + timedelta(seconds=30))
     assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "completed"}, first) is False
     assert sent == []
 
@@ -517,7 +644,7 @@ def test_an_abstained_pass_with_no_retry_to_come_e_mails_at_once(monkeypatch, ho
         _abstained_session(conn, withheld=True)
     sent = _mail(monkeypatch)
     first = OPEN + timedelta(minutes=1)
-    _at_clock(monkeypatch, ho, first + timedelta(seconds=10))
+    _at_clock(monkeypatch, ho, first + timedelta(seconds=30))       # after the pass wrote its outcome
     assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, first) is True
     assert len(sent) == 1
     assert sent[0].startswith(GENERIC) and "Trying again" not in sent[0] and "private-use" not in sent[0]
@@ -529,15 +656,18 @@ def test_two_quick_attempts_without_a_capture_are_a_slow_morning_not_an_alert(mo
     first = OPEN + timedelta(minutes=1)
     with db.begin() as conn:
         for i in range(3):                                    # 14:31, 14:41, 14:51: no capture each time
-            _attempt(conn, first + timedelta(minutes=10 * i))
-            _outcome(conn, first + timedelta(minutes=10 * i, seconds=20), "no_capture")
+            at = first + timedelta(minutes=10 * i)
+            _attempt(conn, at)
+            _outcome(conn, at + timedelta(seconds=20), "no_capture", at, SPY="no_capture", QQQ="no_capture")
     no_capture = {"status": "abstained", "reason": "no_fresh_cohort_capture"}
     _at_clock(monkeypatch, ho, first + timedelta(minutes=21))
     assert ho._oracle_forward_alert(db, SimpleNamespace(), no_capture, first) is False
     assert sent == []
     with db.begin() as conn:                                  # still nothing an hour after the first attempt
-        _attempt(conn, first + timedelta(minutes=60))
-        _outcome(conn, first + timedelta(minutes=60, seconds=20), "no_capture")
+        hour_later = first + timedelta(minutes=60)
+        _attempt(conn, hour_later)
+        _outcome(conn, hour_later + timedelta(seconds=20), "no_capture", hour_later,
+                 SPY="no_capture", QQQ="no_capture")
     _at_clock(monkeypatch, ho, first + timedelta(minutes=61))
     assert ho._oracle_forward_alert(db, SimpleNamespace(), no_capture, first) is True
     assert len(sent) == 1 and sent[0].startswith(GENERIC) and "attempt(s)" not in sent[0]
@@ -546,17 +676,22 @@ def test_two_quick_attempts_without_a_capture_are_a_slow_morning_not_an_alert(mo
 # ── The durable gate inside the pass ──────────────────────────────────
 
 
+ATTEMPT_CLOCK = OPEN + timedelta(minutes=30, seconds=1)      # what the fake database stamps on an attempt
+
+
 class _Lease:
-    def __init__(self, last: datetime | None, log: list[str]) -> None:
-        self.last, self.log = last, log
+    def __init__(self, last: datetime | None, log: list[str], notes: list[str] | None = None) -> None:
+        self.last, self.log, self.notes = last, log, notes if notes is not None else []
 
     def execute(self, statement: Any, params: Any = None) -> Any:
         sql = str(statement)
         if "INSERT INTO oracle_iterations" in sql:
             note = str((params or {}).get("note", ""))
-            self.log.append("outcome:" + note[len(fh.FORWARD_OUTCOME_NOTE_PREFIX):]
-                            if note.startswith(fh.FORWARD_OUTCOME_NOTE_PREFIX) else "attempt")
-        value = True if "pg_try_advisory_lock" in sql else self.last if "MAX(iteration_at)" in sql else None
+            parsed = fh.parse_outcome_note(note)
+            self.log.append("attempt" if parsed is None else "outcome:" + parsed["status"])
+            self.notes.append(note)
+        value = (True if "pg_try_advisory_lock" in sql else self.last if "MAX(iteration_at)" in sql
+                 else ATTEMPT_CLOCK if "RETURNING iteration_at" in sql else None)
         return SimpleNamespace(scalar_one=lambda: value)
 
     def commit(self) -> None: ...
@@ -570,16 +705,18 @@ class _Lease:
 class _Engine:
     def __init__(self, last: datetime | None) -> None:
         self.log: list[str] = []
+        self.notes: list[str] = []
         self.last = last
 
     def connect(self):
-        return _Lease(self.last, self.log)
+        return _Lease(self.last, self.log, self.notes)
 
     def begin(self):
-        return _Lease(self.last, self.log)
+        return _Lease(self.last, self.log, self.notes)
 
 
-def _pass(monkeypatch, ho, *, plan: dict[str, Any], last_ago: timedelta | None, captured: bool = True):
+def _pass(monkeypatch, ho, *, plan: dict[str, Any], last_ago: timedelta | None, captured: Any = True,
+          detail: Any = None, notes: list[str] | None = None):
     from ingestion import options
     from oracle import engine as oracle_engine
 
@@ -596,8 +733,8 @@ def _pass(monkeypatch, ho, *, plan: dict[str, Any], last_ago: timedelta | None, 
     class Oracle:
         def __init__(self, db_engine: Any) -> None:
             self._last_store_counts = {"qualified": 2}
-            self._last_forward_detail = {"tickers": {"SPY": {"qualified": 1}, "QQQ": {"qualified": 1}},
-                                         "abstention_reasons": {}}
+            self._last_forward_detail = detail if detail is not None else {
+                "tickers": {"SPY": {"qualified": 1}, "QQQ": {"qualified": 1}}, "abstention_reasons": {}}
 
         def score_expired_predictions(self) -> dict:
             return {}
@@ -614,14 +751,18 @@ def _pass(monkeypatch, ho, *, plan: dict[str, Any], last_ago: timedelta | None, 
 
         def pull_all(self, tickers, *, capture_source, should_continue) -> list:
             engine.log.append("capture")
-            return [{"ticker": t, "status": "SUCCESS" if captured else "FAILED"} for t in tickers]
+            ok = set(tickers) if captured is True else set(captured or ())
+            return [{"ticker": t, "status": "SUCCESS" if t in ok else "FAILED"} for t in tickers]
 
     monkeypatch.setattr(oracle_engine, "OracleEngine", Oracle)
     monkeypatch.setattr(options, "OptionsPuller", Capture)
     monkeypatch.setattr(options, "automatic_options_capture_guard", lambda engine: None)
     monkeypatch.setattr(ho, "_oracle_forward_regular_session", lambda now: True)
     monkeypatch.setattr(ho, "_oracle_forward_retry_plan", lambda engine: plan)
-    return ho._run_oracle_forward_pass(engine, should_continue=lambda: True), engine.log
+    result = ho._run_oracle_forward_pass(engine, should_continue=lambda: True)
+    if notes is not None:
+        notes.extend(engine.notes)
+    return result, engine.log
 
 
 _QUICK = {"quick": True, "interval_seconds": 600, "reason": "waiting_for_a_qualified_quote"}
@@ -658,9 +799,33 @@ def test_the_first_pass_of_the_session_never_waits(monkeypatch, ho) -> None:
 
 
 def test_a_pass_without_a_capture_records_that_and_never_generates(monkeypatch, ho) -> None:
-    result, log = _pass(monkeypatch, ho, plan=_HOURLY, last_ago=None, captured=False)
+    notes: list[str] = []
+    result, log = _pass(monkeypatch, ho, plan=_HOURLY, last_ago=None, captured=False, notes=notes)
     assert (result["status"], result["reason"]) == ("abstained", "no_fresh_cohort_capture")
     assert log == ["attempt", "capture", "outcome:no_capture"]
+    assert fh.parse_outcome_note(notes[-1]) == {
+        "status": "no_capture", "attempt": ATTEMPT_CLOCK.isoformat(),
+        "tickers": {"SPY": "no_capture", "QQQ": "no_capture"}}
+
+
+def test_the_pass_writes_each_tickers_outcome_tied_to_its_own_attempt(monkeypatch, ho) -> None:
+    """SPY's quote qualified and no model voted; QQQ abstained for its quote."""
+    notes: list[str] = []
+    detail = {"tickers": {"QQQ": {"abstained": 305, "without_quote": 305}}, "abstention_reasons": {REASON: 305}}
+    result, _log = _pass(monkeypatch, ho, plan=_HOURLY, last_ago=None, detail=detail, notes=notes)
+    assert result["status"] == "all_abstained"
+    assert [n for n in notes if fh.parse_outcome_note(n) is None] == [ho.ORACLE_FORWARD_ATTEMPT_NOTE]
+    assert fh.parse_outcome_note(notes[-1]) == {
+        "status": "all_abstained", "attempt": ATTEMPT_CLOCK.isoformat(),
+        "tickers": {"SPY": "no_vote", "QQQ": "no_quote"}}
+
+
+def test_a_ticker_that_was_not_captured_is_recorded_as_no_capture(monkeypatch, ho) -> None:
+    notes: list[str] = []
+    detail = {"tickers": {"QQQ": {"qualified": 111}}, "abstention_reasons": {}}
+    result, _log = _pass(monkeypatch, ho, plan=_HOURLY, last_ago=None, captured=["QQQ"], detail=detail, notes=notes)
+    assert result["status"] == "partial"
+    assert fh.parse_outcome_note(notes[-1])["tickers"] == {"SPY": "no_capture", "QQQ": "forecast"}
 
 
 def test_a_cadence_check_that_fails_keeps_the_hourly_behaviour(monkeypatch, ho) -> None:
@@ -713,7 +878,8 @@ def test_the_durable_gate_on_postgresql_follows_the_stored_session(pgdb, monkeyp
             with pgdb.begin() as conn:                 # what the real engine would have stored
                 for ticker in tickers:
                     _rows(conn, ticker, clock[0], 3, "NONE" if outcome["abstain"] else "CALL")
-            detail = {t: ({"abstained": 3} if outcome["abstain"] else {"qualified": 3}) for t in tickers}
+            detail = {t: ({"abstained": 3, "without_quote": 3} if outcome["abstain"] else {"qualified": 3})
+                      for t in tickers}
             self._last_forward_detail = {"tickers": detail, "abstention_reasons": {}}
             return []
 
@@ -733,11 +899,23 @@ def test_the_durable_gate_on_postgresql_follows_the_stored_session(pgdb, monkeyp
     monkeypatch.setattr(ho, "_oracle_forward_regular_session", lambda now: True)
 
     def run() -> dict[str, Any]:
-        # The pass stamps its attempt with the database clock; pin it to the test's.
+        # The pass stamps its rows with the database clock. Move this pass's attempt to the test's
+        # clock and its outcome row with it, keeping the attempt key inside the note in step.
         result = ho._run_oracle_forward_pass(pgdb, should_continue=lambda: True)
         with pgdb.begin() as conn:
-            conn.execute(text("UPDATE oracle_iterations SET iteration_at = :at WHERE iteration_at > :future"),
-                         {"at": clock[0], "future": CLOSE})
+            fresh = conn.execute(text(
+                "SELECT iteration_at, notes FROM oracle_iterations WHERE iteration_at > :future"
+                " ORDER BY iteration_at"), {"future": CLOSE}).fetchall()
+            stamped = next((at for at, note in fresh if note == fh.FORWARD_ATTEMPT_NOTE), None)
+            for at, note in fresh:
+                parsed = fh.parse_outcome_note(note)
+                moved = (clock[0] if parsed is None
+                         else clock[0] + timedelta(seconds=20))
+                new_note = (note if parsed is None or stamped is None
+                            else fh.outcome_note(parsed["status"], clock[0], parsed["tickers"]))
+                conn.execute(text("UPDATE oracle_iterations SET iteration_at = :to, notes = :n"
+                                  " WHERE iteration_at = :at AND notes = :old"),
+                             {"to": moved, "n": new_note, "at": at, "old": note})
         return result
 
     first = run()                                             # 14:31 every candidate abstains
@@ -757,13 +935,19 @@ def test_the_durable_gate_on_postgresql_follows_the_stored_session(pgdb, monkeyp
             " WHERE ticker = 'SPY' GROUP BY direction ORDER BY 2")).fetchall()
         attempts = conn.execute(text("SELECT COUNT(*) FROM oracle_iterations WHERE notes = :n"),
                                 {"n": fh.FORWARD_ATTEMPT_NOTE}).scalar_one()
-        outcomes = [r[0][len(fh.FORWARD_OUTCOME_NOTE_PREFIX):] for r in conn.execute(text(
+        outcomes = [fh.parse_outcome_note(r[0]) for r in conn.execute(text(
             "SELECT notes FROM oracle_iterations WHERE notes LIKE :p ORDER BY iteration_at"),
             {"p": fh.FORWARD_OUTCOME_NOTE_PREFIX + "%"})]
     # Two rows of history, each with the clock of the pass that wrote it. Nothing was rewritten.
     assert [(r[0], r[1].astimezone(timezone.utc), r[2]) for r in rows] == [
         ("NONE", OPEN + timedelta(minutes=1), 3), ("CALL", OPEN + timedelta(minutes=11), 3)]
-    assert attempts == 2 and outcomes == ["all_abstained", "completed"]
+    assert attempts == 2
+    assert outcomes == [
+        {"status": "all_abstained", "attempt": (OPEN + timedelta(minutes=1)).isoformat(),
+         "tickers": {"SPY": "no_quote", "QQQ": "no_quote"}},
+        {"status": "completed", "attempt": (OPEN + timedelta(minutes=11)).isoformat(),
+         "tickers": {"SPY": "forecast", "QQQ": "forecast"}},
+    ]
 
 
 # ── The engine says on the row that it lacked a quote ─────────────────

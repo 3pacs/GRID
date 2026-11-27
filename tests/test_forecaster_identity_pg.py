@@ -260,14 +260,14 @@ def test_store_detail_says_what_each_ticker_ended_with_and_why(writer):
     stored = writer._store_predictions([forecast, abstainer])
     reason = next(p.score_notes for p in stored if p.verdict.value == "no_data")
     assert writer._last_store_detail == {
-        "tickers": {"SYNTH": {"qualified": 1, "abstained": 1,
+        "tickers": {"SYNTH": {"qualified": 1, "abstained": 1, "without_quote": 1,
                               "duplicate_forecasts": 0, "duplicate_abstentions": 0}},
         "abstention_reasons": {reason: 1},
     }
     # The next pass of the day finds both already stored: nothing new, and it says which is which.
     assert writer._store_predictions([forecast, abstainer]) == []
     assert writer._last_store_detail == {
-        "tickers": {"SYNTH": {"qualified": 0, "abstained": 0,
+        "tickers": {"SYNTH": {"qualified": 0, "abstained": 0, "without_quote": 1,
                               "duplicate_forecasts": 1, "duplicate_abstentions": 1}},
         "abstention_reasons": {reason: 1},
     }

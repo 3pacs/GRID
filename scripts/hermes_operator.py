@@ -594,11 +594,13 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
             # Commit the attempt before any provider request; retries/restarts
             # cannot turn an unsuccessful attempt into repeated hourly work.
             with engine.begin() as conn:
-                conn.execute(text("""
+                # The attempt's own clock is the key its outcome row carries.
+                attempt_at = conn.execute(text("""
                     INSERT INTO oracle_iterations
                     (iteration_at, models_updated, predictions_scored, notes)
                     VALUES (clock_timestamp(), 0, 0, :note)
-                """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE})
+                    RETURNING iteration_at
+                """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE}).scalar_one()
             check()
             scoring = oracle.score_expired_predictions()
             check()
@@ -615,7 +617,8 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
                         if any(row.get("ticker") == ticker and row.get("status") == "SUCCESS"
                                for row in capture)]
             if not captured:
-                _record_oracle_forward_outcome(engine, "no_capture")
+                _record_oracle_forward_outcome(
+                    engine, "no_capture", attempt_at, dict.fromkeys(ORACLE_FORWARD_TICKERS, "no_capture"))
                 return {"status": "abstained", "reason": "no_fresh_cohort_capture",
                         "new_predictions": 0, "scoring": scoring, **policy}
             # No run_cycle/evolve_weights/ModelEvolver/TraceEvolver or fresh
@@ -673,7 +676,10 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
                 "leaderboard": oracle._get_leaderboard(),
                 "hallucination_guard": {},
             }
-            _record_oracle_forward_outcome(engine, result["status"])
+            # A cohort ticker that was not captured has no account from the engine.
+            ticker_outcomes = {name: "no_capture" for name in ORACLE_FORWARD_TICKERS if name not in captured}
+            ticker_outcomes.update(outcome.get("ticker_outcomes") or {})
+            _record_oracle_forward_outcome(engine, result["status"], attempt_at, ticker_outcomes)
             return result
         finally:
             # Roll back any failed catalogue read before releasing the session
@@ -685,24 +691,28 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
             lease.commit()
 
 
-def _record_oracle_forward_outcome(engine: Any, outcome: str) -> None:
-    """Write how this pass ended, for the retry plan (``oracle.forward_health.retry_plan``).
+def _record_oracle_forward_outcome(
+    engine: Any, status: str, attempt_at: Any, ticker_outcomes: dict[str, str],
+) -> None:
+    """Write this pass's own account of how it ended (``oracle.forward_health.retry_plan`` reads it).
 
-    One insert-only row. The stored predictions cannot tell a failed capture
-    from qualified quotes that no model voted on; a fresh capture ten minutes
-    later may fix the first and cannot fix the second. A failure to write it
-    is logged and costs only the short interval (the plan then sees no outcome
-    for the last attempt and stays hourly unless a ticker abstained).
+    One insert-only row, carrying the pass status, the clock of the attempt
+    row this pass wrote before its provider request, and what each cohort
+    ticker ended the pass with (forecast, no quote, another abstention, no
+    vote, no capture). The retry plan follows the newest attempt's account
+    only, matched by that clock. A failure to write it is logged and costs
+    only the short interval: with no account for the newest attempt the plan
+    stays hourly.
     """
     try:
-        from oracle.forward_health import FORWARD_OUTCOME_NOTE_PREFIX
+        from oracle.forward_health import outcome_note
 
         with engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO oracle_iterations
                 (iteration_at, models_updated, predictions_scored, notes)
                 VALUES (clock_timestamp(), 0, 0, :note)
-            """), {"note": FORWARD_OUTCOME_NOTE_PREFIX + outcome})
+            """), {"note": outcome_note(status, attempt_at, ticker_outcomes)})
     except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail a pass that already ran
         log.warning("Oracle forward outcome not recorded: {e}", e=str(exc))
 

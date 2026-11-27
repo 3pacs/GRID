@@ -707,16 +707,19 @@ sudo install -m 0755 -o root -g root \
 A pass that leaves the session waiting is followed sooner than an hour later
 (`oracle.forward_health.retry_plan`): about every 10 minutes, with a fresh
 capture each time, until the wait ends, 13 attempts have been made in the
-session, or 30 minutes before the close. "Waiting" means a fresh capture could
-help: a ticker has no forecast and abstained for want of a qualified quote
-(`flow_context.abstention_kind` = `no_qualified_quote`), or the last pass got
-no capture at all. It does not include a pass whose quotes qualified and on which no
-model produced a candidate, and it does not include a session whose newest
-capture is a private-use one (if the Oracle cannot read that one it cannot
-read the next; the pass stays hourly and the alert is sent at once). Each pass
-writes how it ended as one row in `oracle_iterations`
-(`oracle_forward_v2:SPY_QQQ:1d:outcome:<status>`), which is how a failed
-capture is told from "no candidate".
+session, or 30 minutes before the close. "Waiting" is judged per ticker, on
+what it ended the newest finished pass with: it waits after `no_quote` (it
+abstained for want of a qualified quote, `flow_context.abstention_kind` =
+`no_qualified_quote`) and after `no_capture`. It does not wait after `no_vote`
+(the quote qualified and no model produced a candidate), so a ticker that
+abstained for its quote at 14:31 and got a qualified quote and no vote at 14:41
+is done, although its earlier abstention rows are still there. A session whose
+newest capture is a private-use one does not wait either (if the Oracle cannot
+read that one it cannot read the next; the pass stays hourly and the alert is
+sent at once). Each pass writes its own account as one row in
+`oracle_iterations`
+(`oracle_forward_v2:SPY_QQQ:1d:outcome:<status>|attempt=<attempt clock>|SPY=...|QQQ=...`);
+only the newest attempt's account is read, matched by that clock.
 
 The pass that succeeds makes the forecast, with its own decision time and its
 own frozen quote. An earlier abstention keeps its row and its clock. The
