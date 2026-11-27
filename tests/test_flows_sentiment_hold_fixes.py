@@ -1240,9 +1240,10 @@ def test_institutional_layer_13f_node_is_non_directional_and_reads_nothing():
 
 def test_aggregate_flows_counts_every_13f_row_as_excluded_live_and_historical():
     """get_aggregate_flows counts every 13F row in quarantined_13f and never in
-    a directional total, for a live and a historical as-of alike, including
-    rows whose evidence claims qualification and a row with no capture clock.
-    Non-13F rows are read either way."""
+    a directional total, including rows whose evidence claims qualification
+    and a row with no capture clock. Non-13F rows are read. A past as-of is not
+    answered from the table at all (it is a current view), so no 13F row can
+    reach a total there either."""
     engine = _make_engine()
     flow_day = date.today() - timedelta(days=5)
     _insert_flow(engine, "13f", "Q", "AAPL", 10_000_000.0, "inflow", flow_day,
@@ -1254,14 +1255,20 @@ def test_aggregate_flows_counts_every_13f_row_as_excluded_live_and_historical():
     _insert_flow_at(engine, 70_000_000.0, "inflow", confidence="derived", evidence=_QUALIFIED_EV,
                     created_at=None, flow_date=flow_day)
 
-    for as_of in (None, date.today() - timedelta(days=1)):
-        agg = dollar_flows.get_aggregate_flows(engine, days=30, as_of=as_of)
-        assert agg["quarantined_13f"] == 3, as_of
-        assert "13f" not in agg["by_source_type"], as_of
-        assert agg["total_inflow"] == pytest.approx(1_000_000.0), as_of
-        assert agg["total_outflow"] == 0.0, as_of
-        assert agg["by_source_type"]["insider"]["net"] == pytest.approx(1_000_000.0), as_of
-        assert agg["flow_count"] == 1, as_of
+    agg = dollar_flows.get_aggregate_flows(engine, days=30)
+    assert agg["quarantined_13f"] == 3
+    assert "13f" not in agg["by_source_type"]
+    assert agg["total_inflow"] == pytest.approx(1_000_000.0)
+    assert agg["total_outflow"] == 0.0
+    assert agg["by_source_type"]["insider"]["net"] == pytest.approx(1_000_000.0)
+    assert agg["flow_count"] == 1
+    assert agg["withheld_reason"] is None
+
+    past = dollar_flows.get_aggregate_flows(
+        engine, days=30, as_of=datetime.now(timezone.utc).date() - timedelta(days=1)
+    )
+    assert past["withheld_reason"] == dollar_flows.CURRENT_VIEW_WITHHELD_REASON
+    assert past["by_source_type"] == {} and past["total_inflow"] is None and past["flow_count"] is None
 
 
 def test_qualified_looking_13f_rows_are_excluded_by_every_served_reader():

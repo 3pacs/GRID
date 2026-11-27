@@ -20,6 +20,14 @@ class DollarFlowsAdapter(BaseAdapter):
     LOG_NAME = "dollar_flows_adapter"
 
     def _build_signals(self, engine: Engine, now: datetime) -> list[RegisteredSignal]:
+        """Magnitude signals from the rows written in the seven days up to ``now``.
+
+        The window is closed at ``now``: a signal is stamped ``valid_from=now``
+        and must not carry a row written after that instant. ``created_at`` is
+        the time of the table's last rebuild of that date, so for a ``now`` in
+        the past this is only what was last written inside the window, not
+        what the table held then; the registry calls it with the current time.
+        """
         vu = now + timedelta(hours=4)
         signals: list[RegisteredSignal] = []
         with engine.connect() as conn:
@@ -28,11 +36,11 @@ class DollarFlowsAdapter(BaseAdapter):
                        SUM(amount_usd) as total_usd, COUNT(*) as flow_count,
                        0.5 as avg_conf  -- confidence is TEXT, use default
                 FROM dollar_flows
-                WHERE created_at >= :lb
+                WHERE created_at >= :lb AND created_at <= :now
                 GROUP BY ticker, source_type, direction
                 HAVING SUM(amount_usd) > 100000
                 ORDER BY SUM(amount_usd) DESC LIMIT 200
-            """), {"lb": now - timedelta(days=7)}).fetchall()
+            """), {"lb": now - timedelta(days=7), "now": now}).fetchall()
 
         # 2026-04-28: inflow/outflow → bullish/bearish is context-blind.
         # Institutional inflow into a stock down 50% is value-buying (bullish
