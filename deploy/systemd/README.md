@@ -661,3 +661,29 @@ P&L, weights and timestamps that the scorer and weight evolution update from
 every scored row, private ones included. Only an admin request reads them
 (`/oracle/scorecard` admin branch, scoreboard weights); everyone else gets
 public-cohort counts (`tests/test_oracle_model_state_private.py`).
+
+### When the forward pass has no usable forecast
+
+With the switch off and Schwab as the options provider, the Oracle cannot read
+its own forward capture: it freezes an older public quote, the entry-price
+policy refuses it, and every model abstains (2026-11-23 to 11-25: 1,830
+`no_data` rows, each pass reported `completed`). That is now loud:
+
+- the pass reports `all_abstained`, logs an ERROR and sends one
+  `[GRID CRITICAL] Oracle forward pass: no usable forecast` e-mail per session
+  (two passes in a row without a capture or a result send the same alert);
+- `GET /api/v1/oracle/forward-health` and the status line on the Oracle page
+  say whether the session has a forecast for every cohort ticker; an admin
+  request also gets the cause when a newer private-use capture was withheld;
+- `scripts/oracle_forward_health_check.py --ended` exits 1 for a session that
+  ended with none. The daily freshness sweep runs it. The sweep's installed
+  copy is root-owned, so after a release that changes it, reinstall it:
+
+```bash
+sudo install -m 0755 -o root -g root \
+  /data/grid_v4/grid_release/server_setup/grid-data-freshness-check.sh \
+  /usr/local/bin/grid-data-freshness-check.sh
+```
+
+An abstention is the honest record of a pass with no qualified quote. Nothing
+here repairs or regenerates one; the fix for the cause is the switch above.

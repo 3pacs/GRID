@@ -2098,6 +2098,10 @@ class OracleEngine:
         )}
         self._last_store_counts = dict(totals)
         self._last_guard_verdicts = []
+        # Per-ticker outcomes and abstention reasons of this whole call
+        # (oracle.forward_health.pass_outcome reads it).
+        forward_detail: dict[str, Any] = {"abstention_reasons": {}, "tickers": {}}
+        self._last_forward_detail = forward_detail
 
         def check_budget():
             if should_continue is not None and not should_continue():
@@ -2173,6 +2177,7 @@ class OracleEngine:
             decision_at = datetime.now(timezone.utc)
             candidates = [replace(p, timestamp=decision_at) for p in candidates]
             check_budget()
+            self._last_store_detail = None
             try:
                 if should_continue is None:
                     committed = self._store_predictions(candidates)
@@ -2181,6 +2186,14 @@ class OracleEngine:
             except Exception:
                 self._last_store_counts = dict(totals)
                 raise
+            stored_detail = getattr(self, "_last_store_detail", None) or {}
+            for reason, count in (stored_detail.get("abstention_reasons") or {}).items():
+                forward_detail["abstention_reasons"][reason] = (
+                    forward_detail["abstention_reasons"].get(reason, 0) + int(count))
+            for name, outcome in (stored_detail.get("tickers") or {}).items():
+                merged = forward_detail["tickers"].setdefault(name, {})
+                for key, count in outcome.items():
+                    merged[key] = merged.get(key, 0) + int(count)
             for key in totals:
                 if key not in {"failed_tickers", "completed_batches"}:
                     totals[key] += int(self._last_store_counts.get(key, 0))
@@ -2897,6 +2910,12 @@ class OracleEngine:
                 raise ValueError("prediction decision timestamp must be timezone-aware")
         accepted: list[OraclePrediction] = []
         duplicates = rejected = abstentions = 0
+        # What each ticker ended this call with, and why candidates abstained.
+        # Beside ``_last_store_counts`` (whose shape callers sum), so a pass
+        # that abstained everywhere can be told from one that only repeated
+        # this morning's forecasts.
+        detail: dict[str, Any] = {"abstention_reasons": {}, "tickers": {}}
+        self._last_store_detail = detail
         with self.engine.begin() as conn:
             check_publication_budget()
             if should_continue is not None:
@@ -2997,6 +3016,16 @@ class OracleEngine:
                 else:
                     accepted.append(replace(p, id=row[0], recording_policy=FORWARD_RECORDING_POLICY))
                     abstentions += int(p.verdict == Verdict.NO_DATA)
+                abstained = p.verdict == Verdict.NO_DATA
+                outcome = detail["tickers"].setdefault(p.ticker, {
+                    "qualified": 0, "abstained": 0,
+                    "duplicate_forecasts": 0, "duplicate_abstentions": 0,
+                })
+                outcome[("duplicate_abstentions" if abstained else "duplicate_forecasts") if row is None
+                        else ("abstained" if abstained else "qualified")] += 1
+                if abstained:
+                    reason = p.score_notes or "entry_unavailable"
+                    detail["abstention_reasons"][reason] = detail["abstention_reasons"].get(reason, 0) + 1
             check_publication_budget()
         self._last_store_counts = {
             "upsert_statements": len(predictions) - rejected,

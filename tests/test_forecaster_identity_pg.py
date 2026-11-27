@@ -253,6 +253,27 @@ def test_two_models_same_version_same_day_preserve_separate_original_payloads(wr
     assert before[0][0]["recording_policy"] == "oracle_forward_v2"
 
 
+def test_store_detail_says_what_each_ticker_ended_with_and_why(writer):
+    """The forward pass tells "every ticker abstained" from "this morning's forecasts repeated"."""
+    forecast = _prediction(110.0)
+    abstainer = replace(_with_identity(replace(forecast, model_name="other")), flow_context={})
+    stored = writer._store_predictions([forecast, abstainer])
+    reason = next(p.score_notes for p in stored if p.verdict.value == "no_data")
+    assert writer._last_store_detail == {
+        "tickers": {"SYNTH": {"qualified": 1, "abstained": 1,
+                              "duplicate_forecasts": 0, "duplicate_abstentions": 0}},
+        "abstention_reasons": {reason: 1},
+    }
+    # The next pass of the day finds both already stored: nothing new, and it says which is which.
+    assert writer._store_predictions([forecast, abstainer]) == []
+    assert writer._last_store_detail == {
+        "tickers": {"SYNTH": {"qualified": 0, "abstained": 0,
+                              "duplicate_forecasts": 1, "duplicate_abstentions": 1}},
+        "abstention_reasons": {reason: 1},
+    }
+    assert writer._last_store_counts["qualified"] == 0 and writer._last_store_counts["duplicates"] == 2
+
+
 def test_retired_unknown_and_unobserved_entries_are_rejected(writer):
     first = _prediction(110.0)
     with writer.engine.begin() as conn:

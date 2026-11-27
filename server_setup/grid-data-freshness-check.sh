@@ -8,6 +8,9 @@
 #    one alert file per STALE / NEVER source. PARTIAL and UNKNOWN are reported
 #    in the JSON but not alerted: their data may still be landing (see the
 #    module docstring).
+# 3. Oracle forward pass: one alert file (and the operator e-mail) when the
+#    last session that closed has no usable forecast
+#    (scripts/oracle_forward_health_check.py).
 #
 # Installed copy: /usr/local/bin/grid-data-freshness-check.sh (root-owned).
 # Install from the deployed release tree:
@@ -102,6 +105,30 @@ PY
 else
   rm -f "$SRC_JSON.tmp"
   echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') source freshness check FAILED (ticker audit unaffected)"
+fi
+
+# ── Oracle forward pass ──────────────────────────────────────────────────
+# Did the last session that closed end with a usable SPY/QQQ forecast?
+# (2026-11-23..25: three sessions of abstentions, found four days later.)
+# The Hermes operator alerts in the same hour; this is the backstop for a
+# session in which Hermes ran no pass at all. Read-only. Exit 1 means failing.
+find "$ALERT_DIR" -maxdepth 1 -name 'oracle-forward-*.txt' -mtime +7 -delete 2>/dev/null || true
+ORACLE_TXT="$ALERT_DIR/oracle-forward.tmp"
+oracle_rc=0
+(
+  cd "$RELEASE_DIR" &&
+  set -a && . /home/grid/grid_v4/grid_repo/.env >/dev/null 2>&1 && set +a &&
+  timeout 120 /usr/bin/python3 scripts/oracle_forward_health_check.py --ended --alert > "$ORACLE_TXT"
+) || oracle_rc=$?
+if [ "$oracle_rc" -eq 1 ] && [ -s "$ORACLE_TXT" ]; then
+  mv "$ORACLE_TXT" "$ALERT_DIR/oracle-forward-${TODAY}.txt"
+  echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') oracle forward pass: NO USABLE FORECAST in the last session (see oracle-forward-${TODAY}.txt)"
+elif [ "$oracle_rc" -eq 0 ]; then
+  echo "oracle forward pass: $(head -n 1 "$ORACLE_TXT" 2>/dev/null)"
+  rm -f "$ORACLE_TXT"
+else
+  rm -f "$ORACLE_TXT"
+  echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') oracle forward health check FAILED to run (rc=$oracle_rc)"
 fi
 
 echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') freshness audit complete" >> "$ALERT_DIR/freshness-check.log"
