@@ -282,6 +282,20 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_dollar_flows_stored_contract_pg.py -q -rA
+      # ETF flow partial-bar repair (scripts/repair_etf_flow_partial_bars.py):
+      # with a second writer running, every vintage revises the one before
+      # it and each planned row is written once (no-lock controls show the
+      # fault); planning reads in a read-only transaction; a read for an
+      # instant before the repair sees the old value. Fails instead of
+      # skipping when REQUIRE_ETF_FLOWS_LOCK_PG=1.
+      - name: ETF flow repair PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_ETF_FLOWS_LOCK_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_etf_flow_partial_bar_repair_pg.py -q -rA
 
       # Stored-close backfill (scripts/close_backfill_universe.py): the work
       # queries, the completed-close reader and the fill-only write on
