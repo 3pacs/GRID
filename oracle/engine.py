@@ -65,13 +65,24 @@ _NY_SESSION_TZ = ZoneInfo("America/New_York")
 # * only a live read is sound. A live read sees committed rows, and its
 #   decision clock is the instant just before the read;
 # * what the row said at a past decision clock cannot be reproduced. A replay
-#   is refused, never answered from the row as it stands now, and no earlier
-#   session is substituted;
+#   never reads this source: it is refused, not answered from the row as it
+#   stands now, and no earlier session is substituted;
 # * a row with no provable timing (no market day, no write time) is not used.
+#
+# Which of the two a caller is doing is DECLARED, never inferred. A replay of
+# a 10:00 decision run at 10:08 looks, by its clocks, exactly like a decision
+# being made at 10:08, and a row overwritten at 10:07 would pass any "recent
+# enough" test. So the per-ticker pass takes a decision mode (AGENTS.md, "New
+# knowledge: act on now, grade on then": every read that feeds a decision or a
+# grade declares its mode and its cutoff), and an undeclared mode is a replay.
 #
 # The policy name is stored with every prediction's basis. A different rule
 # gets a new name, never a rewrite of this one.
-OPTIONS_SIGNAL_POLICY = "oracle_options_signal_live_v1"
+OPTIONS_SIGNAL_POLICY = "oracle_options_signal_live_v2"
+#: What do we know now? A decision being made now, on its own recorded clock.
+DECISION_MODE_ACTING = "acting"
+#: What did we know when we decided? Replays, backtests, grading.
+DECISION_MODE_REPLAY = "replay"
 OPTIONS_USED = "used"
 OPTIONS_NO_ROW = "no_row"
 OPTIONS_UNREAD = "unread"
@@ -80,10 +91,6 @@ OPTIONS_TIMING_UNVERIFIABLE = "unavailable_timing_unverifiable"
 # Same strings as analysis/thesis_scorer.py for the same two findings.
 OPTIONS_REPLAY_UNAVAILABLE = "historical_replay_unavailable"
 OPTIONS_WRITTEN_AFTER_CLOCK = "unavailable_written_after_decision_clock"
-# A pass reads its inputs within minutes of its batch clock (the forward pass
-# has a 300 s budget). A batch clock further than this from the read is a
-# decision that is not being made now: a replay.
-OPTIONS_LIVE_WINDOW = timedelta(minutes=15)
 
 # The one options-signal row the Oracle reads per ticker: values, lineage,
 # market day and last-write time in one statement
@@ -1123,34 +1130,56 @@ class OracleEngine:
         return OptionsSignalRead(tuple(row[:8]), row[8] is None or bool(row[8]),
                                  signal_date, written_at, read_at)
 
+    def _options_read_for(self, ticker: str, mode: str) -> OptionsSignalRead:
+        """The options read of a decision in ``mode``. Only an acting decision reads the table.
+
+        A replay does not query ``options_daily_signals`` at all: the row it
+        would get is the row as it stands now. It gets an empty read (no row
+        consumed, so nothing private-use consumed either).
+        """
+        if mode != DECISION_MODE_ACTING:
+            return OptionsSignalRead(None, False)
+        return self._read_options_signal(ticker)
+
     @staticmethod
     def decision_time_options_read(
-        options_read: OptionsSignalRead | None, batch_clock: datetime,
+        options_read: OptionsSignalRead | None, mode: str,
     ) -> tuple[OptionsSignalRead | None, dict[str, Any]]:
         """The options row a decision may use, and the receipt of that judgement.
 
-        Used only when all of this holds (``OPTIONS_SIGNAL_POLICY``):
+        ``mode`` is the caller's declaration (``DECISION_MODE_ACTING`` or
+        ``DECISION_MODE_REPLAY``). Anything that is not exactly the acting
+        mode is a replay.
 
-        * the decision is being made now: the pass's batch clock is within
-          ``OPTIONS_LIVE_WINDOW`` of the read. Otherwise it is a replay, and
-          what the mutable row said then cannot be reproduced;
-        * the read carries its market day, its last-write time and its read
-          clock. A read built by a caller, with no provable timing, is not used;
-        * the row describes the read clock's own New York session;
-        * the row was last written at or before the read clock.
+        * **Replay**: the row is never used, whatever the read holds and
+          whenever it was written. This store cannot reproduce what it held
+          at a past clock.
+        * **Acting**: the row is used under the read's own recorded decision
+          clock (``read_at``, the instant just before the read), only when the
+          read carries its market day, its last-write time and that clock; the
+          row describes that clock's New York session; and the row was last
+          written at or before it. A read built by a caller, with no provable
+          timing, is not used.
 
         A row that fails is not handed to the models (``values`` becomes
         ``None``) and no other session is substituted. The returned basis says
-        which rule decided, with the three clocks, and is stored on every
-        prediction of the ticker (``flow_context.options_signal_basis``): a
-        later in-place correction of the row changes neither the predictions
+        which rule decided, with the mode and the clocks, and is stored on
+        every prediction of the ticker (``flow_context.options_signal_basis``):
+        a later in-place correction of the row changes neither the predictions
         already stored nor their basis. The read keeps its ``schwab_private``
         lineage either way: the private-use tag is judged on the read as made.
         """
+        acting = mode == DECISION_MODE_ACTING
         basis: dict[str, Any] = {
-            "policy": OPTIONS_SIGNAL_POLICY, "status": OPTIONS_UNREAD,
+            "policy": OPTIONS_SIGNAL_POLICY,
+            "mode": DECISION_MODE_ACTING if acting else DECISION_MODE_REPLAY,
+            "status": OPTIONS_UNREAD,
             "session_date": None, "signal_date": None, "written_at": None, "read_at": None,
         }
+        if not acting:
+            # Declared first and decided first: nothing about the read can change it.
+            refused = None if options_read is None else replace(options_read, values=None)
+            return refused, basis | {"status": OPTIONS_REPLAY_UNAVAILABLE}
         if options_read is None:
             return None, basis
         if options_read.values is None:
@@ -1160,16 +1189,13 @@ class OracleEngine:
             return replace(options_read, values=None), basis | {"status": status}
 
         read_at, written_at = options_read.read_at, options_read.written_at
-        clocks_ok = all(_is_aware_clock(c) for c in (read_at, written_at, batch_clock))
         if options_read.signal_date is not None:
             basis["signal_date"] = options_read.signal_date.isoformat()
-        if not clocks_ok or options_read.signal_date is None:
+        if not (_is_aware_clock(read_at) and _is_aware_clock(written_at)) or options_read.signal_date is None:
             return refuse(OPTIONS_TIMING_UNVERIFIABLE)
         basis["written_at"] = written_at.astimezone(timezone.utc).isoformat()
         basis["read_at"] = read_at.astimezone(timezone.utc).isoformat()
         basis["session_date"] = read_at.astimezone(_NY_SESSION_TZ).date().isoformat()
-        if abs(read_at - batch_clock) > OPTIONS_LIVE_WINDOW:
-            return refuse(OPTIONS_REPLAY_UNAVAILABLE)
         if options_read.signal_date.isoformat() != basis["session_date"]:
             return refuse(OPTIONS_OTHER_SESSION)
         if written_at > read_at:
@@ -1765,8 +1791,16 @@ class OracleEngine:
         now: datetime,
         signal_cache: dict,
         horizon_days: int | None = None,
+        *,
+        decision_mode: str = DECISION_MODE_REPLAY,
     ) -> list["OraclePrediction"]:
         """Run the per-ticker prediction pipeline once.
+
+        ``decision_mode`` declares whether this is a decision being made now
+        (``DECISION_MODE_ACTING``) or anything else. It decides whether the
+        mutable options-signal row may be read at all. The default is a
+        replay: a caller that does not say it is acting does not get the row.
+        ``generate_predictions`` declares acting.
 
         Returns the list of predictions for this ticker. Extracted
         from generate_predictions in 2026-05-08 to enable parallel
@@ -1787,7 +1821,7 @@ class OracleEngine:
         # model's signal gathering use this same read.
         options_read: OptionsSignalRead | None
         try:
-            options_read = self._read_options_signal(ticker)
+            options_read = self._options_read_for(ticker, decision_mode)
         except Exception as exc:  # noqa: BLE001 - tagged below; gathering reads again
             log.warning("Oracle {t}: options-signal read failed: {e}", t=ticker, e=str(exc))
             options_read = None
@@ -1797,8 +1831,13 @@ class OracleEngine:
             flow_ctx[ORACLE_PRIVATE_USE_KEY] = ORACLE_PRIVATE_USE_SCHWAB
         # After the tag (judged on the read as made): the models get the row
         # only under OPTIONS_SIGNAL_POLICY, and the receipt goes on every row.
-        options_read, options_basis = self.decision_time_options_read(options_read, now)
+        options_read, options_basis = self.decision_time_options_read(options_read, decision_mode)
         flow_ctx["options_signal_basis"] = options_basis
+        if options_read is None:
+            # The read failed. Hand the models an empty read, never None:
+            # given None, signal gathering would make its own read of the
+            # table, outside this policy.
+            options_read = OptionsSignalRead(None, True)
         if options_basis["status"] not in (OPTIONS_USED, OPTIONS_NO_ROW, OPTIONS_UNREAD):
             log.warning(
                 "Oracle {t}: options-signal row not used ({s}; row dated {d}, written {w})",
@@ -2282,9 +2321,11 @@ class OracleEngine:
                 try:
                     if should_continue is not None and not should_continue():
                         raise TimeoutError("Oracle ticker dispatch deadline elapsed")
+                    # A decision being made now, stamped below with this
+                    # process's own clock: the acting mode, declared.
                     return self._oracle_one_ticker(
                         idx, ticker, total_tickers, batch_started, signal_cache,
-                        horizon_days=horizon_days,
+                        horizon_days=horizon_days, decision_mode=DECISION_MODE_ACTING,
                     ), False
                 except Exception as exc:
                     log.warning("Oracle ticker {t} failed: {e}", t=ticker, e=str(exc))
