@@ -97,6 +97,18 @@ _last_persisted_sectors_hash: str | None = None
 _sector_warm_lock = threading.Lock()
 _sector_warm_thread_started = False
 
+# The sector detail's z-scores and latest values come from one live feature snapshot plus a 504-day feature
+# matrix for EVERY model-eligible feature. They do not depend on the sector, yet every
+# /sectors/{name}/detail request rebuilt them inline, so the first view of a sector page could run past
+# Cloudflare's ~100 s limit (observed 2026-11-27: a 524, no completed detail request in the journal for
+# 72 h). Same pattern as the sector list: a background warm computes them, the request path only reads the
+# fresh tier, then the stale tier, and never computes them inline.
+_FEATURE_MAPS_TTL: float = 300.0
+_FEATURE_MAPS_STALE_TTL: float = 21600.0
+_FEATURE_MAPS_KEY = "feature_maps"
+_feature_maps_cache: TTLCache = TTLCache(ttl=_FEATURE_MAPS_TTL, max_size=1)
+_feature_maps_stale_cache: TTLCache = TTLCache(ttl=_FEATURE_MAPS_STALE_TTL, max_size=1)
+
 # Narrative LLM calls are expensive (1-5s). Cache per-sector for 1 hour so
 # sector-dive requests don't pay the ollama round-trip on every pageview.
 _SECTOR_NARRATIVE_TTL: float = 3600.0
@@ -457,6 +469,7 @@ def _sector_warm_cycle() -> float:
             "Sector flow cache warmed ({n} sectors)",
             n=len(result.get("sectors", {})),
         )
+        _warm_feature_maps()
         return max(_SECTOR_CACHE_TTL - 60.0, _SECTOR_WARM_RETRY_SECONDS)
     except Exception as exc:
         log.warning("Sector flow cache warm failed: {e}", e=str(exc))
@@ -604,6 +617,89 @@ def _read_dark_pool_signal(
     return signal, as_of, None
 
 
+def _compute_feature_maps(engine) -> tuple[dict[str, float], dict[str, Any]]:
+    """Per-feature z-score (vs the trailing 504 days) and latest value for every model-eligible feature.
+
+    Sector independent. Raises on any failure so a failure is never cached as "no features".
+    """
+    from datetime import timedelta
+
+    from api.dependencies import get_pit_store
+    from inference.live import LiveInference
+
+    today = _today()
+    lookback_504 = today - timedelta(days=504)
+    z_map: dict[str, float] = {}
+    val_map: dict[str, Any] = {}
+    pit = get_pit_store()
+    li = LiveInference(engine, pit)
+    df = li.get_feature_snapshot()
+    if not df.empty:
+        with engine.connect() as conn:
+            feat_rows = conn.execute(text(
+                "SELECT id, name FROM feature_registry WHERE model_eligible = TRUE"
+            )).fetchall()
+        name_to_id = {r[1]: r[0] for r in feat_rows}
+        records = df.to_dict("records")
+        feature_ids = [name_to_id[r["name"]] for r in records if r["name"] in name_to_id]
+        if feature_ids:
+            hist = pit.get_feature_matrix(
+                feature_ids=feature_ids,
+                start_date=lookback_504,
+                end_date=today, as_of_date=today,
+                vintage_policy="LATEST_AS_OF",
+            )
+            if hist is not None and len(hist) > 20:
+                means = hist.mean()
+                stds = hist.std().replace(0, 1)
+                last = hist.ffill().iloc[-1]
+                id_to_name = {r[0]: r[1] for r in feat_rows}
+                for col in hist.columns:
+                    name = id_to_name.get(col)
+                    if name:
+                        z = (last[col] - means[col]) / stds[col]
+                        if not math.isnan(z):
+                            z_map[name] = round(float(z), 3)
+        for r in records:
+            val_map[r["name"]] = r.get("value")
+    return z_map, val_map
+
+
+def _warm_feature_maps() -> bool:
+    """Compute the sector-independent feature maps and fill both cache tiers. Never raises."""
+    started = time.monotonic()
+    try:
+        z_map, val_map = _compute_feature_maps(get_db_engine())
+    except Exception as exc:
+        log.warning("Sector feature maps warm failed: {e}", e=str(exc))
+        return False
+    entry = {"z": z_map, "v": val_map, "at": time.time()}
+    _feature_maps_cache.set(_FEATURE_MAPS_KEY, entry)
+    _feature_maps_stale_cache.set(_FEATURE_MAPS_KEY, entry)
+    log.info(
+        "Sector feature maps warmed ({z} z-scores, {v} values) in {s:.1f}s",
+        z=len(z_map), v=len(val_map), s=time.monotonic() - started,
+    )
+    return True
+
+
+def _feature_maps_for_request() -> tuple[dict[str, float], dict[str, Any], dict[str, Any]]:
+    """(z_map, val_map, state) read from cache only; the request path never computes them.
+
+    state["state"] is "fresh", "stale" (with age_seconds) or "unavailable" (not warmed yet, or every warm
+    failed): then both maps are empty and the page shows its own "--", which is true, instead of the request
+    running for minutes.
+    """
+    _ensure_sector_warm_thread()
+    fresh = _feature_maps_cache.get(_FEATURE_MAPS_KEY)
+    if fresh is not None:
+        return fresh["z"], fresh["v"], {"state": "fresh", "age_seconds": round(time.time() - fresh["at"])}
+    stale = _feature_maps_stale_cache.get(_FEATURE_MAPS_KEY)
+    if stale is not None:
+        return stale["z"], stale["v"], {"state": "stale", "age_seconds": round(time.time() - stale["at"])}
+    return {}, {}, {"state": "unavailable", "age_seconds": None}
+
+
 @router.get("/sectors/{sector_name}/detail")
 def get_sector_detail(
     sector_name: str,
@@ -624,46 +720,11 @@ def get_sector_detail(
     lookback_30 = today - timedelta(days=30)
     lookback_504 = today - timedelta(days=504)
 
-    # ── Gather feature z-scores and values ──────────────────────
-    z_map: dict[str, float] = {}
-    val_map: dict[str, float] = {}
-    try:
-        from inference.live import LiveInference
-        from api.dependencies import get_pit_store
-
-        pit = get_pit_store()
-        li = LiveInference(engine, pit)
-        df = li.get_feature_snapshot()
-        if not df.empty:
-            with engine.connect() as conn:
-                feat_rows = conn.execute(text(
-                    "SELECT id, name FROM feature_registry WHERE model_eligible = TRUE"
-                )).fetchall()
-            name_to_id = {r[1]: r[0] for r in feat_rows}
-            records = df.to_dict("records")
-            feature_ids = [name_to_id[r["name"]] for r in records if r["name"] in name_to_id]
-            if feature_ids:
-                hist = pit.get_feature_matrix(
-                    feature_ids=feature_ids,
-                    start_date=lookback_504,
-                    end_date=today, as_of_date=today,
-                    vintage_policy="LATEST_AS_OF",
-                )
-                if hist is not None and len(hist) > 20:
-                    means = hist.mean()
-                    stds = hist.std().replace(0, 1)
-                    last = hist.ffill().iloc[-1]
-                    id_to_name = {r[0]: r[1] for r in feat_rows}
-                    for col in hist.columns:
-                        name = id_to_name.get(col)
-                        if name:
-                            z = (last[col] - means[col]) / stds[col]
-                            if not math.isnan(z):
-                                z_map[name] = round(float(z), 3)
-            for r in records:
-                val_map[r["name"]] = r.get("value")
-    except Exception as exc:
-        log.warning("Sector detail z-score computation failed: {e}", e=str(exc))
+    # ── Gather feature z-scores and values (cache only; see _feature_maps_for_request) ──
+    _phase_started = time.monotonic()
+    z_map, val_map, feature_snapshot = _feature_maps_for_request()
+    _phases = {"features": time.monotonic() - _phase_started}
+    _t0 = _phase_started
 
     # ── Options data ────────────────────────────────────────────
     opts_map: dict[str, dict] = {}
@@ -954,6 +1015,8 @@ def get_sector_detail(
     except Exception as exc:
         log.debug("Flows: convergence signals fetch failed: {e}", e=str(exc))
 
+    _phases["gather"] = time.monotonic() - _t0 - _phases["features"]
+    _narr_started = time.monotonic()
     cached_narrative = _sector_narrative_cache.get(sector_name)
     if cached_narrative is not None:
         narrative = cached_narrative
@@ -1010,6 +1073,8 @@ def get_sector_detail(
             else:
                 actor["options_signal"] = None
 
+    _phases["narrative"] = time.monotonic() - _narr_started
+    _conn_started = time.monotonic()
     # ── Build connection graph for the frontend "connect the dots" view ─
     try:
         connections = _build_sector_connections(
@@ -1018,6 +1083,14 @@ def get_sector_detail(
     except Exception as exc:
         log.warning("Sector connections build failed: {e}", e=str(exc))
         connections = {"nodes": [], "edges": [], "clusters": [], "lineage": []}
+
+    _phases["connections"] = time.monotonic() - _conn_started
+    log.info(
+        "Sector detail {s}: {t:.1f}s total ({parts}); feature maps {f}",
+        s=sector_name, t=time.monotonic() - _t0,
+        parts=", ".join(f"{k}={v:.1f}s" for k, v in _phases.items()),
+        f=feature_snapshot["state"],
+    )
 
     return {
         "sector": sector_name,
@@ -1041,6 +1114,8 @@ def get_sector_detail(
             "narrative": narrative,
         },
         "connections": connections,
+        # Where the z-scores came from: "fresh", "stale" (with age) or "unavailable" (warming).
+        "feature_snapshot": feature_snapshot,
         "provenance": _provenance(_PROV_SECTOR_DETAIL),
     }
 
