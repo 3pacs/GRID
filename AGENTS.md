@@ -35,6 +35,42 @@ current service inventory. Read matching history when recovering a scoped task.
 - Source work and synthetic tests do not authorize ingestion, provider capture,
   backfills, scheduler changes, evaluation admission, trading or deployment.
 
+## New knowledge: act on now, grade on then
+
+Two questions, never mixed.
+
+- **What do we know now?** For acting. The trader and any live decision use
+  the latest version of every fact, including corrections, late filings and
+  quotes that arrive after their scheduled minute. A late fact is tradeable
+  from the moment it arrives.
+- **What did we know when we decided?** For grading. Backtests, postmortems
+  and evidence credit only what had been received by the decision's own
+  timestamp.
+
+Three things keep both true:
+
+- Every fact carries when it was received. A correction is added as a new
+  version; it never overwrites the earlier one.
+- Every decision records what it knew and when, so a decision made on late
+  knowledge stays gradeable.
+- A late fact is an event at its real arrival time. It is never backdated, and
+  it does not mark the original moment as failed forever.
+
+What follows from this:
+
+- A current-view value is not history. Do not read one to answer the grading
+  question.
+- Receipt time is when a fact first arrived. Reading it again is not a new
+  arrival.
+- Point-in-time checks on historical evidence are not relaxed.
+- No safety gate is loosened. Everything under "Preserve the system's
+  guarantees" applies unchanged; a fact arriving is not authority to trade.
+
+For reviewers: this is the line review already draws between historical
+evidence and live use. A read for a past date goes through a receipt-aware
+reader, `store.observations.read_window_known_at`; a table that keeps only the
+newest value is a current view and serves today's read only.
+
 ## Development and verification
 
 - Use the project's `.venv` and current dependency contracts. Python 3.14 setup
