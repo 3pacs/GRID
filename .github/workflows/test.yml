@@ -296,6 +296,19 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_close_backfill_universe_pg.py -q -rA
 
+      # Hermes repair (scripts/hermes_fixers.py): which sources are too slow
+      # for a repair is read from pull_log. The run-time query on TIMESTAMPTZ
+      # and the rule end to end on stored runs. The test fails instead of
+      # skipping when REQUIRE_HERMES_SLOW_SOURCE_PG=1.
+      - name: Hermes slow-source repair hold PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_HERMES_SLOW_SOURCE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_hermes_repair_slow_source_20261127.py -q -rA -k real_types
+
       - name: Pipeline health PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test

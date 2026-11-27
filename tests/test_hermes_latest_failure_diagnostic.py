@@ -45,7 +45,10 @@ def projection(path):
  # the one guest it derives today (tests/test_hermes_fixers_guest_attribution.py
  # pins the real helper to the same set).
  log=Log();ns={'log':log,'json':json,'re':re,'datetime':dt.datetime,'timezone':dt.timezone,'_REPAIR_SCHEDULE_LOCK':threading.Lock(),'_REPAIR_RECOVERED_AT':{},
-  '_UNROUTED_FAILURES_REPORTED':{},'_guest_pull_log_names':lambda:GUEST_PULL_LOG_NAMES};exec(compile(mod,str(path),'exec'),ns)
+  '_UNROUTED_FAILURES_REPORTED':{},'_guest_pull_log_names':lambda:GUEST_PULL_LOG_NAMES,
+  # No fixture source is a scheduler registry entry, so none is too slow for a repair
+  # (tests/test_hermes_repair_slow_source_20261127.py covers the real helper).
+  '_slow_repair_reason':lambda source,engine:None};exec(compile(mod,str(path),'exec'),ns)
  return ns['diagnose_and_fix_pulls'],log
 
 GUEST_PULL_LOG_NAMES=frozenset({'smart:finra_dix'})

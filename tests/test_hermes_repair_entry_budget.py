@@ -63,6 +63,10 @@ def _load(source: str | None = None):
                  "REPEATED_FAILURE_MAX_COOLDOWN_SECONDS": 604800.0,
                  # The scheduler-derived guest list; none of these rows is a guest.
                  "_guest_pull_log_names": lambda: frozenset({"smart:finra_dix"}),
+                 # Too-slow-for-a-repair hold and overrun count (2026-11-27): no
+                 # source here is a scheduler registry entry.
+                 "_slow_repair_reason": lambda source, engine: None,
+                 "REPAIR_OVERRAN_REASON": "repair exceeded the per-source cap",
                  "_UNROUTED_FAILURES_REPORTED": {},
                  "UNROUTED_GUEST_REASON": "synthetic no-route reason"}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec",
