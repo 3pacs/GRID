@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -63,6 +63,7 @@ class Filing:
     fail: str | None = None
     fail_on: str = "index"
     index_report_date: bool = True  # False: the submissions index leaves reportDate blank
+    confidential_omitted: bool = False  # the cover page's isConfidentialOmitted
 
 
 class _Resp:
@@ -175,7 +176,8 @@ def _cover_xml(f: Filing) -> bytes:
         f"<summaryPage><otherIncludedManagersCount>0</otherIncludedManagersCount>"
         f"<tableEntryTotal>{total}</tableEntryTotal>"
         f"<tableValueTotal>{sum(v for _n, v, _s in f.holdings.values())}</tableValueTotal>"
-        f"<isConfidentialOmitted>false</isConfidentialOmitted></summaryPage></formData>"
+        f"<isConfidentialOmitted>{'true' if f.confidential_omitted else 'false'}</isConfidentialOmitted>"
+        f"</summaryPage></formData>"
         "</edgarSubmission>"
     ).encode()
 
@@ -357,3 +359,68 @@ def series_rows(engine: Engine, pattern: str) -> list[tuple[str, Any]]:
             {"p": pattern},
         ).fetchall()
     return [(r[0], r[1] if isinstance(r[1], dict) else json.loads(r[1])) for r in rows]
+
+
+# ── Declared confidential omissions (GRID #1498) ───────────────────────────
+
+def three_quarter_scenario(current_declares_omissions: bool, prior_declares_omissions: bool = False) -> FakeEdgar:
+    """Alpha: Q-2 holds PEER_A; Q-1 adds PEER_B (so PEER_B is an observed
+    holding); Q0 lists PEER_A (increased) and ROOT (new) and not PEER_B."""
+    edgar = FakeEdgar()
+    dates = {q: quarter_dates(q) for q in range(3)}
+    edgar.add(CIK_ALPHA, Filing("A-2", dates[2][1], dates[2][0], {
+        PEER_A_CUSIP: ("PEER A CORP", 50_000, 500)}))
+    edgar.add(CIK_ALPHA, Filing("A-1", dates[1][1], dates[1][0], {
+        PEER_A_CUSIP: ("PEER A CORP", 50_000, 500),
+        PEER_B_CUSIP: ("PEER B INC", 30_000, 300)}, confidential_omitted=prior_declares_omissions))
+    edgar.add(CIK_ALPHA, Filing("A-0", dates[0][1], dates[0][0], {
+        PEER_A_CUSIP: ("PEER A CORP", 120_000, 1_000),
+        ROOT_CUSIP: ("ROOT HOLDINGS INC", 260_000, 2_000)}, confidential_omitted=current_declares_omissions))
+    return edgar
+
+
+def age_13f_rows(engine: Engine, days: int = 2) -> None:
+    """Make the 13F rows written just now clearly older than the next run's
+    (SQLite's CURRENT_TIMESTAMP has one-second resolution)."""
+    base = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=days)
+    naive = base.replace(tzinfo=None)
+    with engine.begin() as conn:
+        cutoff = base if conn.dialect.name == "postgresql" else naive
+        ids = [r[0] for r in conn.execute(text(
+            "SELECT id FROM raw_series WHERE series_id LIKE '13F%' AND pull_timestamp > :b ORDER BY id"),
+            {"b": cutoff})]
+        for n, row_id in enumerate(ids):
+            conn.execute(text("UPDATE raw_series SET pull_timestamp = :ts WHERE id = :id"),
+                         {"ts": cutoff + timedelta(seconds=n), "id": row_id})
+
+
+def run_two_quarters(engine: Engine, monkeypatch: Any, edgar: FakeEdgar, filers: dict[str, str]) -> list[dict]:
+    """Q-2 -> Q-1 on Q-1's filing day, then Q-1 -> Q0 today. Returns the second run."""
+    edgar.today = quarter_dates(1)[1]
+    run_writer(engine, monkeypatch, edgar, filers)
+    age_13f_rows(engine)
+    edgar.today = date.today()
+    return run_writer(engine, monkeypatch, edgar, filers)
+
+
+def old_writer_closed_then_new_writer(engine: Engine, monkeypatch: Any, filers: dict[str, str]) -> None:
+    """The stored state production has: the writer before #1498 ignored the
+    cover page and wrote CLOSED; the current writer then reads the same
+    filings and adds NOT_SHOWN beside it."""
+    old_writer_state(engine, monkeypatch, filers)
+    age_13f_rows(engine)
+    run_writer(engine, monkeypatch, three_quarter_scenario(True), filers)
+
+
+def old_writer_state(engine: Engine, monkeypatch: Any, filers: dict[str, str]) -> None:
+    """Only the rows the writer before #1498 left for the three-quarter scenario."""
+    from ingestion.altdata import institutional_flows
+
+    real = institutional_flows.InstitutionalFlowsPuller._compare_holdings
+
+    def ignoring_the_cover(self, prev, curr, *, quarantine_counts=None, current_declares_omissions=False):
+        return real(self, prev, curr, quarantine_counts=quarantine_counts)
+
+    with monkeypatch.context() as old_writer:
+        old_writer.setattr(institutional_flows.InstitutionalFlowsPuller, "_compare_holdings", ignoring_the_cover)
+        run_two_quarters(engine, old_writer, three_quarter_scenario(True), filers)

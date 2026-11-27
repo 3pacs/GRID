@@ -156,6 +156,44 @@ def _actor_id_congress(name: str) -> str:
     return f"congress_{_normalize_name(name)}"
 
 
+# 13F filer metrics are computed over one effective row per manager, item and
+# date: the newest accepted vintage, whatever its action (Codex review
+# 6084681196). raw_series is append-only, so a corrected position has two rows:
+# a position first written CLOSED and later NOT_SHOWN (absent from a filing
+# that declares confidential omissions), or any re-read whose value changed.
+# Counting raw rows would count that position twice and add its value twice,
+# although nothing more was filed. The item is the third part of the series id:
+# a CUSIP for position rows, or a summary key for the EDGAR puller's rows.
+_13F_FILER_AGGREGATES_SQL = """
+    WITH effective AS (
+        SELECT DISTINCT ON (SPLIT_PART(series_id, ':', 2), SPLIT_PART(series_id, ':', 3), obs_date)
+               SPLIT_PART(series_id, ':', 2) AS manager_cik,
+               SPLIT_PART(series_id, ':', 3) AS item,
+               value
+        FROM raw_series
+        WHERE series_id LIKE '13F:%'
+          AND pull_status = 'SUCCESS'
+        ORDER BY SPLIT_PART(series_id, ':', 2), SPLIT_PART(series_id, ':', 3), obs_date,
+                 pull_timestamp DESC, id DESC
+    )
+    SELECT manager_cik,
+           COUNT(DISTINCT item) AS tickers_held,
+           COUNT(*)             AS filings,
+           SUM(value)           AS total_value
+    FROM effective
+    GROUP BY manager_cik
+    ORDER BY COUNT(*) DESC, manager_cik
+"""
+
+
+def _13f_filer_aggregates(conn: Any, limit: int | None = None) -> list[Any]:
+    """``(manager_cik, tickers_held, filings, total_value)`` per 13F filer,
+    most rows first, each position-day counted once (see the SQL's note)."""
+    if limit is None:
+        return conn.execute(text(_13F_FILER_AGGREGATES_SQL)).fetchall()
+    return conn.execute(text(_13F_FILER_AGGREGATES_SQL + " LIMIT :limit"), {"limit": limit}).fetchall()
+
+
 def _actor_id_13f(cik: str) -> str:
     return f"inst_13f_{cik.lstrip('0') or '0'}"
 
@@ -585,19 +623,8 @@ def _discover_13f_filers(engine: Engine) -> dict:
                 else:
                     skipped += 1
 
-            # Discover additional 13F filers from raw_series
-            rows = conn.execute(text("""
-                SELECT
-                    SPLIT_PART(series_id, ':', 2) AS manager_cik,
-                    COUNT(DISTINCT SPLIT_PART(series_id, ':', 3)) AS tickers_held,
-                    COUNT(*) AS filings
-                FROM raw_series
-                WHERE series_id LIKE '13F:%'
-                  AND pull_status = 'SUCCESS'
-                GROUP BY SPLIT_PART(series_id, ':', 2)
-                ORDER BY COUNT(*) DESC
-                LIMIT 500
-            """)).fetchall()
+            # Discover additional 13F filers from their stored 13F rows
+            rows = _13f_filer_aggregates(conn, limit=500)
 
             for r in rows:
                 cik = str(r[0]).strip()
@@ -2381,19 +2408,8 @@ def discover_all_13f_filers(engine: Engine) -> dict:
 
     try:
         with engine.begin() as conn:
-            # Pull ALL 13F filers from raw_series without the old LIMIT 500
-            rows = conn.execute(text("""
-                SELECT
-                    SPLIT_PART(series_id, ':', 2)                AS manager_cik,
-                    COUNT(DISTINCT SPLIT_PART(series_id, ':', 3)) AS tickers_held,
-                    COUNT(*)                                     AS filings,
-                    SUM(value)                                   AS total_value
-                FROM raw_series
-                WHERE series_id LIKE '13F:%'
-                  AND pull_status = 'SUCCESS'
-                GROUP BY SPLIT_PART(series_id, ':', 2)
-                ORDER BY COUNT(*) DESC
-            """)).fetchall()
+            # Every 13F filer with stored 13F rows, without the old LIMIT 500
+            rows = _13f_filer_aggregates(conn)
 
             for r in rows:
                 cik = str(r[0]).strip()

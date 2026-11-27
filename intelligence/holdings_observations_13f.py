@@ -64,7 +64,10 @@ Point in time
   replaces the original even when it changed nothing.
 * Per ``(manager, CUSIP)`` the observation with the latest report date wins.
   A CLOSED (``filing_disappearance``) ends the holding: it is never shown as
-  held.
+  held. A NOT_SHOWN (``absent_under_declared_omissions``) is not shown as
+  held either, and is counted apart (``not_shown_omissions_declared``): the
+  position was absent from a filing that declares confidential omissions,
+  so it may be sold or merely omitted.
 * A manager whose latest filing has no ``compared`` receipt (unreadable,
   unclassified amendment, additive supplement, or a fetch that failed once
   the accession was known) shows nothing
@@ -105,8 +108,10 @@ Known limits (also in the PR body)
 * Only ``LOOKBACK_DAYS`` of filings are read, so a chain cannot reach a
   position last observed before that.
 * A cover page with confidential treatment (``isConfidentialOmitted``) still
-  counts as complete for the entries it lists; an omitted position reads as
-  CLOSED, which hides it rather than inventing one.
+  counts as complete for the entries it lists. A prior position it does not
+  list is written as NOT_SHOWN, not CLOSED (rows written before 2026-11-27
+  said CLOSED; a later NOT_SHOWN of the same filing pair outranks them by
+  receipt time). Either way the position is hidden rather than invented.
 """
 
 from __future__ import annotations
@@ -153,6 +158,10 @@ _KIND_FOR_ACTION: Mapping[str, str] = MappingProxyType({
     "INCREASED": "filing_holding_change",
     "DECREASED": "filing_holding_change",
     "CLOSED": "filing_disappearance",
+    # Absent from a current filing whose cover page declares confidential
+    # omissions: neither a disappearance nor a holding (see the writer's
+    # NOT_SHOWN_ACTION).
+    "NOT_SHOWN": "absent_under_declared_omissions",
 })
 
 # What this reader serves: a holding level, not a change.
@@ -650,6 +659,11 @@ def _read(
                 rd = c["report_date"]
                 if c["action"] == "CLOSED":
                     _bump(counts, "closed")
+                    continue
+                if c["action"] == "NOT_SHOWN":
+                    # Sold or confidential: unknown. Not shown as held, and
+                    # counted apart from a filing disappearance.
+                    _bump(counts, "not_shown_omissions_declared")
                     continue
                 if rd not in chain:
                     _bump(counts, "unverified_continuity")

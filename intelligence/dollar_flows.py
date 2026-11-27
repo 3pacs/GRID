@@ -72,6 +72,12 @@ _VWAP_MAX_AGE_TRADING_DAYS: int = 5
 # 3-part portfolio summary keys from ingestion/edgar.py (TOTAL_VALUE,
 # NUM_POSITIONS, TOP5_CONCENTRATION) and unrecognized actions are never flows.
 _VALID_13F_ACTIONS: frozenset[str] = frozenset({"NEW", "INCREASED", "DECREASED", "CLOSED"})
+# Absent from a current filing whose cover page declares confidential omissions
+# (the writer's NOT_SHOWN_ACTION). It is not a flow and never becomes one, but
+# it is the newest statement about its position: it takes part in the
+# per-position resolution so that it replaces an older CLOSED of the same
+# filing pair, and is then dropped.
+_NOT_SHOWN_13F_ACTION = "NOT_SHOWN"
 
 # SEC Form 13F XML <value> cutover: whole dollars >= 2023-01-03, thousands earlier.
 _13F_DOLLAR_CUTOVER_DATE: date = date(2023, 1, 3)
@@ -1382,6 +1388,7 @@ def _normalize_13f_flows(
     skipped_non_flow = 0
     unmapped_cusip = 0
     zero_share_delta = 0
+    not_shown = 0
     local_quarantine: dict[str, int] = defaultdict(int)
     superseded_vintages = 0
 
@@ -1427,7 +1434,7 @@ def _normalize_13f_flows(
                 cik = parts[1].strip()
                 cusip = parts[2].strip().upper()
                 action = parts[3].strip().upper()
-                if action not in _VALID_13F_ACTIONS:
+                if action not in _VALID_13F_ACTIONS and action != _NOT_SHOWN_13F_ACTION:
                     skipped_non_flow += 1
                     continue
 
@@ -1466,6 +1473,10 @@ def _normalize_13f_flows(
             # Stage 2: resolve 13F-HR/A amendments & filer-quarter vintages before
             # zero-delta / quarantine filtering so restatements supersede originals.
             resolved_candidates, superseded_vintages = _resolve_13f_amendments(candidates)
+            not_shown = sum(1 for item in resolved_candidates if item["action"] == _NOT_SHOWN_13F_ACTION)
+            resolved_candidates = [
+                item for item in resolved_candidates if item["action"] != _NOT_SHOWN_13F_ACTION
+            ]
 
             # Stage 3: qualify rows and compute share-based flow estimates
             for item in resolved_candidates:
@@ -1552,6 +1563,7 @@ def _normalize_13f_flows(
             skipped_counts["zero_share_delta_13f"] = (
                 skipped_counts.get("zero_share_delta_13f", 0) + zero_share_delta
             )
+            skipped_counts["not_shown_13f"] = skipped_counts.get("not_shown_13f", 0) + not_shown
         if quarantined_total:
             log.warning(
                 "13F normalization quarantined {q} non-qualified/legacy rows from directional flows "

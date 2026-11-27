@@ -63,13 +63,18 @@ def test_reader_labels_are_the_writers_labels():
         return {"value_usd": value, "shares": shares, "value_units": "usd", "value_multiplier": 1,
                 "share_type": "SH", "name": "X"}
 
-    changes = puller._compare_holdings(
-        {"C1": holding(100, 10), "C2": holding(100, 10), "C3": holding(100, 10)},
-        {"C1": holding(300, 30), "C2": holding(10, 1), "C4": holding(100, 10)},
-    )
+    prev = {"C1": holding(100, 10), "C2": holding(100, 10), "C3": holding(100, 10)}
+    curr = {"C1": holding(300, 30), "C2": holding(10, 1), "C4": holding(100, 10)}
+    # Both ways the writer can label an absent position: a filing
+    # disappearance, and absence from a filing that declares omissions.
+    changes = puller._compare_holdings(prev, curr) + puller._compare_holdings(
+        prev, curr, current_declares_omissions=True)
     kinds = {c["action"]: c["observation_kind"] for c in changes}
     assert kinds == dict(h13f._KIND_FOR_ACTION)
     assert all(c["qualified_for_directional_flow"] is False for c in changes)
+    assert institutional_flows.NOT_SHOWN_ACTION in h13f._KIND_FOR_ACTION
+    assert h13f._KIND_FOR_ACTION[institutional_flows.NOT_SHOWN_ACTION] == institutional_flows.NOT_SHOWN_OBSERVATION_KIND
+    assert dollar_flows._NOT_SHOWN_13F_ACTION == institutional_flows.NOT_SHOWN_ACTION
 
 
 # ── Writer -> reader: filing and receipt dates kept ────────────────────────

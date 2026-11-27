@@ -164,6 +164,17 @@ CONTINUING_POSITION_UNQUALIFIED_REASON = "no_corporate_action_coverage"
 # exchange can show as one CUSIP disappearing and another appearing with no
 # trade, and GRID has no CUSIP identity/filing coverage to rule that out.
 NEW_CLOSED_UNQUALIFIED_REASON = "no_identity_coverage"
+# A current filing whose cover page says confidential positions are omitted
+# (``isConfidentialOmitted``) lists only part of what the manager holds. A
+# position of the prior quarter that it does not list may have been sold or may
+# be one of the omitted ones; the filing cannot tell which. Its absence is
+# recorded as NOT_SHOWN, never as CLOSED: no disappearance is claimed and no
+# flow is estimated. The position is not shown as held either, and it is
+# settled when the manager later discloses the omitted positions or files a
+# quarter without omissions.
+NOT_SHOWN_ACTION = "NOT_SHOWN"
+NOT_SHOWN_OBSERVATION_KIND = "absent_under_declared_omissions"
+NOT_SHOWN_UNQUALIFIED_REASON = "current_filing_declares_omissions"
 # Owner decision 2026-11-23 (Anik, "Yes, non-directional"): until identity and
 # split coverage exist, every 13F change is an observed filing change at
 # reference prices, recorded for holdings graphs and never read as direction.
@@ -1534,6 +1545,7 @@ class InstitutionalFlowsPuller(BasePuller):
         curr_holdings: dict[str, dict[str, Any]],
         *,
         quarantine_counts: dict[str, int] | None = None,
+        current_declares_omissions: bool = False,
     ) -> list[dict[str, Any]]:
         """Compare two quarterly snapshots using share-based flow estimates.
 
@@ -1552,9 +1564,14 @@ class InstitutionalFlowsPuller(BasePuller):
             curr_holdings: Current quarter holdings keyed by CUSIP.
             quarantine_counts: Optional dict updated in place with per-reason
                 quarantine counts.
+            current_declares_omissions: The current filing's cover page says
+                confidential positions are omitted. A prior position it does
+                not list is then ``NOT_SHOWN`` (see ``NOT_SHOWN_ACTION``), not
+                ``CLOSED``, and carries no flow estimate.
 
         Returns:
-            List of change dicts with action (NEW/CLOSED/INCREASED/DECREASED).
+            List of change dicts with action
+            (NEW/CLOSED/NOT_SHOWN/INCREASED/DECREASED).
         """
         def _quarantine(reason: str) -> None:
             if quarantine_counts is not None:
@@ -1624,6 +1641,34 @@ class InstitutionalFlowsPuller(BasePuller):
             prev_val, prev_shares, share_type = _qualify(h)
             if prev_val is None or prev_shares is None:
                 _quarantine(share_type)
+                continue
+            if current_declares_omissions:
+                # Sold, or one of the omitted positions: the filing does not
+                # say. The row's value is the last reported holding value;
+                # nothing about the current quarter is claimed.
+                changes.append({
+                    "cusip": cusip,
+                    "name": h.get("name", ""),
+                    "action": NOT_SHOWN_ACTION,
+                    "observation_kind": NOT_SHOWN_OBSERVATION_KIND,
+                    "measure": OBSERVATION_MEASURE,
+                    "value_usd": prev_val,
+                    "estimated_flow_usd": None,
+                    "holdings_value_delta_usd": None,
+                    "curr_value_usd": None,
+                    "prev_value_usd": prev_val,
+                    "shares": prev_shares,
+                    "curr_shares": None,
+                    "prev_shares": prev_shares,
+                    "delta_shares": None,
+                    "valuation_price_usd": None,
+                    "valuation_price_basis": None,
+                    "flow_estimation_method": None,
+                    "value_units": "usd",
+                    "share_type": share_type,
+                    "qualified_for_directional_flow": False,
+                    "unqualified_reason": NOT_SHOWN_UNQUALIFIED_REASON,
+                })
                 continue
             prev_price = prev_val / prev_shares
             est_flow = round(prev_shares * prev_price, 2)
@@ -2131,9 +2176,13 @@ class InstitutionalFlowsPuller(BasePuller):
                 )
 
                 # Detect share-based position changes
+                # What the current cover page declares, not an inference.
+                declares_omissions = curr_snap.evidence.get("confidential_omitted") is True
                 changes = self._compare_holdings(
-                    prev_by_cusip, curr_by_cusip, quarantine_counts=quarantine_counts
+                    prev_by_cusip, curr_by_cusip, quarantine_counts=quarantine_counts,
+                    current_declares_omissions=declares_omissions,
                 )
+                not_shown = sum(1 for chg in changes if chg["action"] == NOT_SHOWN_ACTION)
                 quarantined_total = sum(quarantine_counts.values())
                 if quarantined_total:
                     log.warning(
@@ -2217,6 +2266,8 @@ class InstitutionalFlowsPuller(BasePuller):
                         "comparison_status": "compared",
                         "changes_detected": len(changes),
                         "quarantined": dict(quarantine_counts),
+                        "current_declares_omissions": declares_omissions,
+                        "not_shown_under_declared_omissions": not_shown,
                     })
                     receipts_inserted = self._insert_receipt(conn, receipt_series, obs_date, receipt, curr_snap)
 
@@ -2239,6 +2290,8 @@ class InstitutionalFlowsPuller(BasePuller):
                     "rows_unchanged": rows_unchanged,
                     "receipts_inserted": receipts_inserted,
                     "quarantined": quarantined_total,
+                    "current_declares_omissions": declares_omissions,
+                    "not_shown": not_shown,
                 })
 
                 log.info(
