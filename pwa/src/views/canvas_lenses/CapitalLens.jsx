@@ -14,6 +14,7 @@ import { sankey as d3Sankey, sankeyLinkHorizontal } from 'd3-sankey';
 import { AlertTriangle } from 'lucide-react';
 import { colors, tokens } from '../../styles/shared.js';
 import { api } from '../../api.js';
+import { finiteNumberOrNull } from '../../utils/numbers.js';
 
 const MONO = colors.mono;
 const SANS = colors.sans;
@@ -202,11 +203,25 @@ function buildSankey(period, actorLabel, width, height) {
 
 // ── Component ─────────────────────────────────────────────────
 // ── Ticket card: LEVER/CONDITION/THESIS/INVALIDATION trade ticket ────
-function TicketCard({ ticket }) {
+// A ticket field that is missing or not a number is not reported; never 0, $0.00 or NaN (#959).
+export function ticketMoney(value) {
+    const n = finiteNumberOrNull(value);
+    return n === null ? 'n/a' : '$' + n.toFixed(2);
+}
+export function ticketKellyConfText(kelly, confidence, kellyBasis) {
+    const k = finiteNumberOrNull(kelly);
+    const c = finiteNumberOrNull(confidence);
+    const kellyText = k === null
+        ? 'Kelly not reported'
+        : 'Kelly ' + (k * 100).toFixed(1) + '%' + (kellyBasis === 'default_no_history' ? ' (default, no history)' : '');
+    const confText = c === null ? 'conf not reported' : 'conf ' + (c * 100).toFixed(0) + '%';
+    return kellyText + ' \u00b7 ' + confText;
+}
+
+export function TicketCard({ ticket }) {
     const parsed = parseThesis(ticket.thesis) || {};
     const dir = ticket.direction || 'short';
-    const kelly = Number(ticket.kelly_size) || 0;
-    const conf = Number(ticket.confidence) || 0;
+    const kelly = finiteNumberOrNull(ticket.kelly_size) ?? 0;   // bar width only; the label says not reported
     const instrument = (ticket.instrument || '').toUpperCase();
     return (
         <div style={S.ticketCard(dir)}>
@@ -223,19 +238,19 @@ function TicketCard({ ticket }) {
                 </div>
                 <div style={S.ticketMeta}>
                     <span style={S.ticketMetaK}>ENTRY</span>
-                    <span style={S.ticketMetaV}>${Number(ticket.entry_premium).toFixed(2)}</span>
+                    <span style={S.ticketMetaV}>{ticketMoney(ticket.entry_premium)}</span>
                 </div>
                 <div style={S.ticketMeta}>
                     <span style={S.ticketMetaK}>TGT</span>
-                    <span style={S.ticketMetaV}>${Number(ticket.target_premium).toFixed(2)}</span>
+                    <span style={S.ticketMetaV}>{ticketMoney(ticket.target_premium)}</span>
                 </div>
                 <div style={S.ticketMeta}>
                     <span style={S.ticketMetaK}>STOP</span>
-                    <span style={S.ticketMetaV}>${Number(ticket.stop_premium).toFixed(2)}</span>
+                    <span style={S.ticketMetaV}>{ticketMoney(ticket.stop_premium)}</span>
                 </div>
                 <div style={S.ticketMeta}>
                     <span style={S.ticketMetaK}>INV</span>
-                    <span style={S.ticketMetaV}>${Number(ticket.invalidation_price).toFixed(2)}</span>
+                    <span style={S.ticketMetaV}>{ticketMoney(ticket.invalidation_price)}</span>
                 </div>
             </div>
             <div style={S.lcti}>
@@ -257,7 +272,7 @@ function TicketCard({ ticket }) {
                     <div style={S.kellyFill(kelly)} />
                 </div>
                 <div style={S.kellyLabel}>
-                    Kelly {(kelly * 100).toFixed(1)}% · conf {(conf * 100).toFixed(0)}%
+                    {ticketKellyConfText(ticket.kelly_size, ticket.confidence, ticket.kelly_basis)}
                 </div>
             </div>
         </div>

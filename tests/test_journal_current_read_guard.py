@@ -88,6 +88,8 @@ def _assert_guarded(engine, queries, columns, *, count=1, limit=True,
         assert tuple(statement.selected_columns.keys()) == tuple(columns)
         params = dict(statement.compile(dialect=postgresql.dialect()).params)
         assert params.pop("journal_marker_whitespace") == PYTHON_STRIP_WHITESPACE
+        # /regime/current also excludes contagion trade tickets (store/journal_contagion_exclusion.py).
+        params.pop("contagion_marker_whitespace", None)
         if "mid" in params:
             assert params.pop("mid") is None
             assert call.args[1] == {"mid": 7}
@@ -277,6 +279,10 @@ def test_historical_regime_apis_keep_provisional_evidence(monkeypatch):
     assert transitions.transitions[-1].to_state == "PROVISIONAL_FUNDAMENTAL_DIVERGENCE"
     assert len(queries) == 2
     assert all(PG_PREDICATE not in sql for sql in queries)
+    # ...but a contagion trade ticket is never a regime state, so both exclude it by its tag.
+    from store.journal_contagion_exclusion import NOT_CONTAGION_TICKET_JOURNAL_PREDICATE as _NOT_TICKET
+    pg_not_ticket = str(text(_NOT_TICKET).compile(dialect=postgresql.dialect()))
+    assert all(pg_not_ticket in sql for sql in queries)
     engine.begin.assert_not_called()
 
 

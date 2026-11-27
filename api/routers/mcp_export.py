@@ -15,6 +15,11 @@ from sqlalchemy import text
 
 from api.auth import require_auth, viewer_is_admin
 from api.dependencies import get_db_engine
+from store.journal_contagion_exclusion import (
+    NOT_CONTAGION_TICKET_JOURNAL_PREDICATE,
+    excluding_contagion_tickets,
+)
+from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 from store.options_provenance import oracle_predictions_from
 
 router = APIRouter(prefix="/api/v1/mcp", tags=["mcp-export"])
@@ -414,23 +419,25 @@ def mcp_regime(
     """Current regime classification and recent history."""
     engine = get_db_engine()
     with engine.connect() as conn:
+        # The current regime is a "current input" read: same guard as /api/v1/regime/current (provisional
+        # signal records and contagion trade tickets are not regime states).
         row = conn.execute(
-            text(
-                "SELECT inferred_state, state_confidence, "
-                "decision_timestamp "
-                "FROM decision_journal "
-                "ORDER BY decision_timestamp DESC LIMIT 1"
-            )
+            excluding_contagion_tickets(non_provisional_journal_select(
+                "inferred_state", "state_confidence", "decision_timestamp",
+            ))
+            .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+            .limit(1)
         ).fetchone()
 
         history = conn.execute(
-            text(
+            excluding_contagion_tickets(text(
                 "SELECT DATE(decision_timestamp) AS dt, "
                 "inferred_state, state_confidence "
                 "FROM decision_journal "
                 "WHERE decision_timestamp >= NOW() - INTERVAL '30 days' "
+                "AND " + NOT_CONTAGION_TICKET_JOURNAL_PREDICATE + " "
                 "ORDER BY decision_timestamp DESC LIMIT 30"
-            )
+            ))
         ).fetchall()
 
     current = None

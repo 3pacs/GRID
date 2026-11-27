@@ -18,6 +18,7 @@ Routes
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
@@ -29,8 +30,38 @@ from trading.contagion_to_ticket import (
     generate_tickets_for_prediction,
     generate_tickets_for_recent_predictions,
 )
+from trading.options_recommender import MAX_KELLY_PER_TICKET
 
 router = APIRouter(tags=["trade-tickets"])
+
+
+def _finite_in_range(value: Any, low: float, high: float) -> float | None:
+    """``value`` as a float when it is a finite number inside [low, high], else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    # Compare before converting: float(10**400) raises OverflowError, but an int compares exactly with
+    # the float bounds, so an oversized integer is simply out of range.
+    return float(value) if low <= value <= high else None
+
+
+def _validated_ticket(ticket: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``ticket`` whose confidence and kelly size are real values or absent (#959).
+
+    The route returns plain dicts, so nothing bounded these fields: a NaN/Infinity accuracy (not valid
+    JSON, so the response would 500) or an out-of-range number reached the page as a number. A
+    confidence outside [0, 1] or a kelly size outside [0, MAX_KELLY_PER_TICKET] (or not a finite
+    number) becomes None, which the page shows as not reported. A measured 0 is kept.
+    """
+    cleaned = dict(ticket)
+    # Only fields the ticket carries are checked; an absent key stays absent (the page reads it as
+    # not reported), so the response shape does not change for tickets without them.
+    if "confidence" in cleaned:
+        cleaned["confidence"] = _finite_in_range(cleaned["confidence"], 0.0, 1.0)
+    if "kelly_size" in cleaned:
+        cleaned["kelly_size"] = _finite_in_range(cleaned["kelly_size"], 0.0, float(MAX_KELLY_PER_TICKET))
+    return cleaned
 
 
 @router.get("/api/v1/trade-tickets/recent")
@@ -58,6 +89,7 @@ def recent_tickets(
         log.warning("trade_tickets recent failed: {e}", e=str(exc))
         raise HTTPException(status_code=500, detail="trade ticket generation failed")
 
+    tickets = [_validated_ticket(t) for t in tickets]
     return {
         "tickets": tickets,
         "count": len(tickets),
@@ -86,6 +118,7 @@ def tickets_for_prediction(
         )
         raise HTTPException(status_code=500, detail="trade ticket generation failed")
 
+    tickets = [_validated_ticket(t) for t in tickets]
     return {
         "prediction_id": prediction_id,
         "tickets": tickets,

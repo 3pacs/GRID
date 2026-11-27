@@ -10,6 +10,7 @@ import * as d3 from 'd3';
 import { api } from '../api.js';
 import { buildRouteHash, parseHashRoute } from '../routing.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import { finiteNumberOrNull } from '../utils/numbers.js';
 import ActorProfileDrawer from '../components/ActorProfileDrawer.jsx';
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -1529,24 +1530,14 @@ function LineageFlows({ lineage }) {
 
 // ── Intelligence Feed (unified timeline) ─────────────────────────────
 // A trade ticket that states no kelly size is not a 0.0% bet, and one that states no
-// confidence is not "inferred" (#959): anything that is not a number reads as not reported.
-// Only a finite JSON number, or a non-blank string holding a plain decimal number, is a
-// value. `Number()` coerces blank strings, false, [] and [0] to 0, so it is never applied to
-// an unchecked shape (booleans, arrays, objects, null and undefined all abstain).
-const PLAIN_DECIMAL = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/;
-export function finiteNumberOrNull(value) {
-    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-    if (typeof value === 'string') {
-        const t = value.trim();
-        if (!PLAIN_DECIMAL.test(t)) return null;
-        const n = Number(t);
-        return Number.isFinite(n) ? n : null;
-    }
-    return null;
-}
-export function ticketKellyText(kelly) {
+// confidence is not "inferred" (#959): anything that is not a number reads as not reported
+// (finiteNumberOrNull: utils/numbers.js, never `Number()` on an unchecked shape).
+export { finiteNumberOrNull };
+export function ticketKellyText(kelly, basis) {
     const n = finiteNumberOrNull(kelly);
-    return n === null ? 'kelly not reported' : `kelly ${(n * 100).toFixed(1)}%`;
+    if (n === null) return 'kelly not reported';
+    // With no measured accuracy the size is a policy default, not a measurement.
+    return `kelly ${(n * 100).toFixed(1)}%${basis === 'default_no_history' ? ' (default, no history)' : ''}`;
 }
 export function ticketConfidenceTier(confidence) {
     const n = finiteNumberOrNull(confidence);
@@ -1565,7 +1556,7 @@ export function IntelligenceFeed({ insider, congress, convergence, levers, trade
                 source: 'ticket',
                 ticker: tk.toUpperCase(),
                 actor: String(t.shock_node || 'contagion').toUpperCase(),
-                action: `${(t.direction || '').toUpperCase()} ${(t.instrument || '').toUpperCase()} $${t.strike} exp ${t.expiry} · ${ticketKellyText(t.kelly_size)}`,
+                action: `${(t.direction || '').toUpperCase()} ${(t.instrument || '').toUpperCase()} $${t.strike} exp ${t.expiry} · ${ticketKellyText(t.kelly_size, t.kelly_basis)}`,
                 date: t.generated_at,
                 confidence: ticketConfidenceTier(t.confidence),
             });
