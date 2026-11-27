@@ -206,6 +206,28 @@ def test_raw_cutoff_keeps_an_embargo_until_the_end_of_its_release_day(engine):
         assert len(read_window_known_at(c, "UNRATE", as_of=DAY, lag=lag, source="CBOE")) == 1
 
 
+def test_a_same_day_correction_is_read_only_from_its_receipt_on(engine):
+    """AGENTS.md "act on now, grade on then": a decision at 10:00, a correction received at 10:07 the same day.
+    A replay of 10:00 reads the original, before and after the correction is stored; a read at 10:08 reads the
+    correction. One series, one observation date, two vintages."""
+    lag = PublicationLag(1, "business", "next business day")
+    decided, after = z("2026-11-20T10:00:00Z"), z("2026-11-20T10:08:00Z")
+
+    def held(ts):
+        with engine.connect() as c:
+            return read_window_known_at(c, "CBOE:VIX3M", as_of=DAY, lag=lag, source="CBOE", as_of_ts=ts)
+
+    _raw(engine, [(PREV, 21.0, "2026-11-20 05:00:00")], series="CBOE:VIX3M")      # the original, held at 10:00
+    at_decision = held(decided)
+    assert [(o.obs_date, o.value, o.known_at_basis) for o in at_decision] == [(PREV, 21.0, "pulled")]
+    _raw(engine, [(PREV, 21.4, "2026-11-20 10:07:00")], series="CBOE:VIX3M")      # the correction, received 10:07
+    replay = held(decided)
+    assert replay == at_decision and replay[0].pull_timestamp == datetime(2026, 11, 20, 5, 0)  # noqa: DTZ001
+    corrected = held(after)
+    assert [(o.obs_date, o.value, o.known_at_basis) for o in corrected] == [(PREV, 21.4, "pulled")]
+    assert corrected[0].pull_timestamp == datetime(2026, 11, 20, 10, 7)  # noqa: DTZ001
+
+
 def test_vintages_cut_at_their_fetch_time(engine):
     _delayed_inputs(engine)
     assert len(FV.load(engine, "USEPUINDXD", PREV, DAY, DAY)) == 1
