@@ -1265,7 +1265,10 @@ CREATE TABLE IF NOT EXISTS dollar_flows (
     confidence      TEXT DEFAULT 'estimated',
     evidence        JSONB,
     flow_date       DATE NOT NULL,
-    created_at      TIMESTAMPTZ DEFAULT NOW()
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    -- 13F is non-directional (owner decision 2026-11-23); existing databases
+    -- get this from alembic revision df_13f_observed_20261127.
+    CONSTRAINT dollar_flows_13f_observed_only CHECK (source_type <> '13f' OR direction = 'observed')
 );
 
 CREATE INDEX IF NOT EXISTS idx_dollar_flows_ticker

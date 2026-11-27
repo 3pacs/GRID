@@ -92,6 +92,74 @@ OBSERVED_13F_DIRECTION = "observed"
 OBSERVED_13F_MEASURE = "observed_filing_holdings_change_at_reference_prices"
 _13F_OBSERVATION_REASONS: frozenset[str] = frozenset({"no_identity_coverage"})
 
+# ── Stored-row contract ───────────────────────────────────────────────────
+# The daily writer rebuilds only the dates inside its ``--days`` window
+# (``_persist_flows`` deletes ``flow_date`` between the earliest and latest
+# date the run produced). Every older date keeps the shape of whatever rule
+# wrote it. A rule change therefore never reaches old rows: on 2026-11-27
+# production still held 49 13F portfolio summaries stored as ``inflow`` by
+# the rule before the 11-21/22 rework, outside every later window.
+#
+# A contract names, per source type, the one shape the current rule can
+# write. It is enforced three times from this single definition:
+#   - ``_persist_flows`` checks every flow before its window DELETE; one that
+#     breaks it makes the run write nothing (the last good window is kept)
+#     and ``scripts/run_dollar_flows.py`` exits 4 (unexpected: a regression);
+#   - ``count_stored_contract_violations`` reads the WHOLE table after every
+#     run, so an old row in a superseded shape is reported and the runner
+#     exits 3 after a good window committed (expected until the repair);
+#   - the CHECK constraint ``DOLLAR_FLOWS_CONTRACT_CONSTRAINT`` (alembic
+#     revision ``df_13f_observed_20261127``) rejects it for every
+#     other writer.
+# Removing rows that break it is a reviewed repair
+# (``scripts/repair_dollar_flows_stored_contract.py``), never automatic.
+DOLLAR_FLOWS_CONTRACT_CONSTRAINT = "dollar_flows_13f_observed_only"
+STORED_ROW_CONTRACTS: dict[str, dict[str, str]] = {
+    "13f": {
+        "column": "direction",
+        "value": OBSERVED_13F_DIRECTION,
+        "rule": "13F is non-directional (owner decision 2026-11-23): every stored 13f row has direction 'observed'",
+    },
+}
+
+
+def _contract_check_sql() -> str:
+    """The CHECK expression every stored row satisfies (no bound parameters)."""
+    parts = [
+        f"(source_type <> '{st}' OR {c['column']} = '{c['value']}')"
+        for st, c in sorted(STORED_ROW_CONTRACTS.items())
+    ]
+    return " AND ".join(parts)
+
+
+DOLLAR_FLOWS_CONTRACT_CHECK_SQL = _contract_check_sql()
+
+
+def flow_contract_violation(flow: dict[str, Any]) -> str | None:
+    """Return the broken contract's source type, or ``None`` if the flow conforms."""
+    stype = flow.get("source_type")
+    contract = STORED_ROW_CONTRACTS.get(stype) if isinstance(stype, str) else None
+    if contract is None:
+        return None
+    return None if flow.get(contract["column"]) == contract["value"] else stype
+
+
+def count_stored_contract_violations(conn: Any) -> dict[str, int]:
+    """Count stored rows, at any ``flow_date``, that break their source's contract."""
+    found: dict[str, int] = {}
+    for stype, contract in sorted(STORED_ROW_CONTRACTS.items()):
+        n = conn.execute(
+            text(
+                f"SELECT COUNT(*) FROM dollar_flows WHERE source_type = :st "
+                f"AND ({contract['column']} IS NULL OR {contract['column']} <> :v)"
+            ),
+            {"st": stype, "v": contract["value"]},
+        ).scalar()
+        if n:
+            found[stype] = int(n)
+    return found
+
+
 _QUALIFIED_13F_FLOW_METHODS: frozenset[str] = frozenset({
     "delta_shares_x_curr_quarter_end_price",
     "delta_shares_x_prev_quarter_end_price",
@@ -145,7 +213,8 @@ CREATE TABLE IF NOT EXISTS dollar_flows (
     confidence TEXT DEFAULT 'estimated',
     evidence JSONB,
     flow_date DATE NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT dollar_flows_13f_observed_only CHECK (source_type <> '13f' OR direction = 'observed')
 );
 CREATE INDEX IF NOT EXISTS idx_dollar_flows_ticker
     ON dollar_flows (ticker, flow_date DESC);
@@ -1740,6 +1809,8 @@ class FlowNormalizationSummary(list):
         by_source: dict[str, int] | None = None,
         persisted: int = 0,
         dry_run: bool = False,
+        rejected_by_contract: dict[str, int] | None = None,
+        stored_contract_violations: dict[str, int] | None = None,
     ) -> None:
         super().__init__(flows)
         self.skipped_no_vwap = skipped_no_vwap
@@ -1752,6 +1823,15 @@ class FlowNormalizationSummary(list):
         self.by_source = by_source or {}
         self.persisted = persisted
         self.dry_run = dry_run
+        # Flows this run refused to store because they break their source's
+        # stored-row contract (a writer regression), and stored rows at any
+        # date that break it (a superseded rule's leftovers).
+        self.rejected_by_contract = dict(rejected_by_contract or {})
+        self.stored_contract_violations = dict(stored_contract_violations or {})
+
+    @property
+    def contract_ok(self) -> bool:
+        return not self.rejected_by_contract and not self.stored_contract_violations
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1766,6 +1846,8 @@ class FlowNormalizationSummary(list):
             "zero_share_delta_13f": self.zero_share_delta_13f,
             "by_source": self.by_source,
             "dry_run": self.dry_run,
+            "rejected_by_contract": self.rejected_by_contract,
+            "stored_contract_violations": self.stored_contract_violations,
         }
 
 
@@ -1896,8 +1978,29 @@ def normalize_all_flows(
 
     # 3. Persist to dollar_flows table (skipped entirely in a dry run)
     persisted = 0
+    rejected_by_contract: dict[str, int] = {}
     if not dry_run:
-        persisted = _persist_flows(engine, all_flows)
+        persisted = _persist_flows(engine, all_flows, rejected_counts=rejected_by_contract)
+    else:
+        for f in all_flows:
+            if (bad := flow_contract_violation(f)) is not None:
+                rejected_by_contract[bad] = rejected_by_contract.get(bad, 0) + 1
+
+    # 4. Read the whole table, not only this run's window: rows outside the
+    # window are never rewritten, so a superseded rule's rows would otherwise
+    # stay forever without anyone being told (read-only, also in a dry run).
+    stored_contract_violations: dict[str, int] = {}
+    with engine.connect() as conn:
+        if _table_exists(conn, "dollar_flows"):
+            stored_contract_violations = count_stored_contract_violations(conn)
+    if rejected_by_contract or stored_contract_violations:
+        log.error(
+            "dollar_flows stored-row contract broken: rejected_by_contract={r}, "
+            "stored_contract_violations={v}. Stored rows are removed only by the reviewed "
+            "repair scripts/repair_dollar_flows_stored_contract.py",
+            r=rejected_by_contract,
+            v=stored_contract_violations,
+        )
 
     log.info(
         "Normalized {n} dollar flows across {d} days (persisted={p}, "
@@ -1927,10 +2030,17 @@ def normalize_all_flows(
         by_source=dict(by_source),
         persisted=persisted,
         dry_run=dry_run,
+        rejected_by_contract=rejected_by_contract,
+        stored_contract_violations=stored_contract_violations,
     )
 
 
-def _persist_flows(engine: Engine, flows: list[dict]) -> int:
+def _persist_flows(
+    engine: Engine,
+    flows: list[dict],
+    *,
+    rejected_counts: dict[str, int] | None = None,
+) -> int:
     """Write normalized flows to the dollar_flows table.
 
     Uses upsert-like logic: clears existing rows for the date range
@@ -1941,9 +2051,25 @@ def _persist_flows(engine: Engine, flows: list[dict]) -> int:
     directly with unfiltered flows and it must never persist a future-dated
     row either (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3 item 2).
 
+    Contract preflight: before anything is deleted, every flow is checked
+    against its source's stored-row contract (``STORED_ROW_CONTRACTS``). If
+    any breaks it, this run writes nothing at all (no DELETE, no INSERT), so
+    the last good window stays as it was; the refusals are counted per source
+    type in ``rejected_counts`` when given and the runner exits 4. A breaking
+    flow is a writer regression, never an expected state. The refusal is for
+    the whole run, so one bad 13F flow also holds back that day's options,
+    ETF and insider rows until the regression is fixed; the failed unit says
+    so. (A per-source scope would need a per-source DELETE; not done here.)
+
+    A database error on an insert is raised, never swallowed: on PostgreSQL
+    the failed statement aborts the transaction, so every later insert and
+    the window's DELETE would be lost while the run reported success.
+
     Parameters:
         engine: SQLAlchemy engine.
         flows: List of normalized flow dicts.
+        rejected_counts: Optional dict that receives per-source-type counts
+            of contract-breaking flows that made the run refuse.
 
     Returns:
         Number of rows inserted.
@@ -1952,6 +2078,22 @@ def _persist_flows(engine: Engine, flows: list[dict]) -> int:
         return 0
 
     today = date.today()
+    refused: dict[str, int] = {}
+    for f in flows:
+        if (bad := flow_contract_violation(f)) is not None:
+            refused[bad] = refused.get(bad, 0) + 1
+    if refused:
+        if rejected_counts is not None:
+            for st, n in refused.items():
+                rejected_counts[st] = rejected_counts.get(st, 0) + n
+        log.error(
+            "dollar_flows run refused before writing: {r} flow(s) break the stored-row "
+            "contract ({rules}); nothing deleted or inserted, the last good window is kept",
+            r=refused,
+            rules="; ".join(STORED_ROW_CONTRACTS[st]["rule"] for st in sorted(refused)),
+        )
+        return 0
+
     inserted = 0
     with engine.begin() as conn:
         # Determine date range (future-dated rows never count toward it,
@@ -2008,7 +2150,11 @@ def _persist_flows(engine: Engine, flows: list[dict]) -> int:
                 )
                 inserted += 1
             except Exception as exc:
-                log.debug("Failed to insert flow: {e}", e=str(exc))
+                log.error(
+                    "dollar_flows insert failed; the whole run is rolled back: {e}",
+                    e=str(exc),
+                )
+                raise
 
     log.info("Persisted {n} dollar_flows rows", n=inserted)
     return inserted
