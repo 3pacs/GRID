@@ -78,6 +78,23 @@ ETF_FLOW_TICKERS: list[str] = [
 _FLOW_WINDOW_5D: int = 5
 _FLOW_WINDOW_20D: int = 20
 
+# The three series are computed over ROWS (the bars the provider returned),
+# not calendar days: the 20-day sum of a date needs the 19 rows before it,
+# the acceleration (a 5-row sum, then its change over 5 rows) needs 9. A run
+# that starts at a recent date must therefore fetch that many rows before its
+# first date, or it silently leaves out values a run over all of history
+# writes. Calendar days cannot promise it: the 30 days this fetch used to go
+# back hold only 18 sessions before 2027-01-19 (Christmas, New Year's Day and
+# Martin Luther King Jr. Day fall inside), and a bar the provider does not
+# return shortens it further. So the fetch goes back two months, the rows it
+# brought are counted, and an ETF that still has too few is fetched again
+# from where the wide run starts, which makes its values the wide run's by
+# construction (Codex review 6086917359).
+_ETF_WARMUP_ROWS: int = max(_FLOW_WINDOW_20D, 2 * _FLOW_WINDOW_5D) - 1
+_ETF_WARMUP_CALENDAR_DAYS: int = 60
+# Where the wide run (``pull_etf_only`` and ``pull_all`` by default) starts.
+_ETF_HISTORY_START: date = date(2020, 1, 1)
+
 # Rate limit for yfinance calls
 _YF_RATE_DELAY: float = 0.5
 
@@ -133,6 +150,11 @@ def _new_york_today() -> date:
 def _bar_date(stamp: Any) -> date:
     """The calendar date of a yfinance daily bar's index value."""
     return stamp.date() if hasattr(stamp, "date") else stamp
+
+
+def _rows_before(bars: pd.DataFrame, day: date) -> int:
+    """How many of ``bars`` are dated before ``day``."""
+    return sum(1 for stamp in bars.index if _bar_date(stamp) < day)
 
 # ── SEC 13F configuration ─────────────────────────────────────────────────────
 
@@ -1003,8 +1025,11 @@ class InstitutionalFlowsPuller(BasePuller):
 
         results: list[dict[str, Any]] = []
 
-        # Need extra history for rolling windows
-        fetch_start = start_date - timedelta(days=_FLOW_WINDOW_20D + 10)
+        # Extra history for the rolling windows (see ``_ETF_WARMUP_ROWS``).
+        fetch_start = start_date - timedelta(days=_ETF_WARMUP_CALENDAR_DAYS)
+        history_fetch_start = min(
+            fetch_start, _ETF_HISTORY_START - timedelta(days=_ETF_WARMUP_CALENDAR_DAYS)
+        )
         session_day = _new_york_today()
         revise_floor = revise_from or (session_day - timedelta(days=_ETF_REVISION_DAYS))
 
@@ -1020,47 +1045,34 @@ class InstitutionalFlowsPuller(BasePuller):
                 break
             try:
                 log.info("Fetching ETF flow data for {t}", t=ticker)
-                data = yf.download(
-                    ticker,
-                    start=str(fetch_start),
-                    end=str(end_date + timedelta(days=1)),
-                    progress=False,
-                    auto_adjust=True,
+                data, session_bars_left, failure = self._fetch_etf_bars(
+                    yf, ticker, fetch_start, end_date, session_day,
                 )
-
-                if data is None or data.empty:
-                    log.warning("No yfinance data for {t}", t=ticker)
-                    # A liquid ETF with no bars over the window is a failed
-                    # fetch (yfinance returns empty on errors), not "no data".
-                    results.append({
-                        "feature": f"ETF_FLOW:{ticker}",
-                        "status": "FAILED",
-                        "rows_inserted": 0,
-                        "error": f"yfinance returned no bars for {ticker} {fetch_start}..{end_date}",
-                    })
+                warmup_widened = False
+                if (
+                    data is not None
+                    and fetch_start > history_fetch_start
+                    and _rows_before(data, start_date) < _ETF_WARMUP_ROWS
+                ):
+                    # Too few rows before the first date to compute it as a
+                    # run over all of history does. Read this ETF as that
+                    # run reads it, so nothing is left out or differs.
+                    log.warning(
+                        "ETF flow {t}: {n} bar(s) before {s} in the fetch from {f}, "
+                        "{need} needed; fetching again from {w}",
+                        t=ticker, n=_rows_before(data, start_date), s=start_date,
+                        f=fetch_start, need=_ETF_WARMUP_ROWS, w=history_fetch_start,
+                    )
+                    data, session_bars_left, failure = self._fetch_etf_bars(
+                        yf, ticker, history_fetch_start, end_date, session_day,
+                    )
+                    warmup_widened = True
+                if data is None:
+                    if failure is not None:
+                        results.append(failure)
                     continue
-
-                # Compute dollar volume
                 close_col = "Close"
                 vol_col = "Volume"
-                # Handle multi-level columns from yfinance
-                if isinstance(data.columns, pd.MultiIndex):
-                    data.columns = data.columns.get_level_values(0)
-
-                if close_col not in data.columns or vol_col not in data.columns:
-                    log.warning(
-                        "Missing columns for {t}: {c}",
-                        t=ticker,
-                        c=list(data.columns),
-                    )
-                    continue
-
-                # The session still trading (or just closed, volume still
-                # moving) is not stored. It ends no stored window, so
-                # dropping it changes no stored date's value.
-                eligible = [_bar_date(stamp) < session_day for stamp in data.index]
-                session_bars_left = len(eligible) - sum(eligible)
-                data = data[eligible].copy()
 
                 data["dollar_volume"] = data[close_col] * data[vol_col]
 
@@ -1132,6 +1144,7 @@ class InstitutionalFlowsPuller(BasePuller):
                         "rows_inserted": rows_inserted,
                         "rows_revised": rows_revised,
                         "session_bars_left": session_bars_left,
+                        "warmup_widened": warmup_widened,
                     })
 
                 log.info(
@@ -1152,6 +1165,55 @@ class InstitutionalFlowsPuller(BasePuller):
             time.sleep(_YF_RATE_DELAY)
 
         return results
+
+    @staticmethod
+    def _fetch_etf_bars(
+        yf: Any, ticker: str, fetch_start: date, end_date: date, session_day: date,
+    ) -> tuple[pd.DataFrame | None, int, dict[str, Any] | None]:
+        """One provider request for one ETF's daily bars from ``fetch_start``.
+
+        Returns ``(bars, session_bars_left, failure)``. ``bars`` holds the
+        finished sessions only; it is None when the request gave nothing
+        usable, and ``failure`` is then the result item to report (None for
+        the missing-columns case, which is logged and reports nothing, as
+        before).
+        """
+        data = yf.download(
+            ticker,
+            start=str(fetch_start),
+            end=str(end_date + timedelta(days=1)),
+            progress=False,
+            auto_adjust=True,
+        )
+
+        if data is None or data.empty:
+            log.warning("No yfinance data for {t}", t=ticker)
+            # A liquid ETF with no bars over the window is a failed
+            # fetch (yfinance returns empty on errors), not "no data".
+            return None, 0, {
+                "feature": f"ETF_FLOW:{ticker}",
+                "status": "FAILED",
+                "rows_inserted": 0,
+                "error": f"yfinance returned no bars for {ticker} {fetch_start}..{end_date}",
+            }
+
+        # Handle multi-level columns from yfinance
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
+        if "Close" not in data.columns or "Volume" not in data.columns:
+            log.warning(
+                "Missing columns for {t}: {c}",
+                t=ticker,
+                c=list(data.columns),
+            )
+            return None, 0, None
+
+        # The session still trading (or just closed, volume still
+        # moving) is not stored. It ends no stored window, so
+        # dropping it changes no stored date's value.
+        eligible = [_bar_date(stamp) < session_day for stamp in data.index]
+        return data[eligible].copy(), len(eligible) - sum(eligible), None
 
     @staticmethod
     def _serialize_etf_write(conn: Any, budget: _RunBudget | None = None) -> datetime | None:
@@ -2434,7 +2496,7 @@ class InstitutionalFlowsPuller(BasePuller):
 
     def pull_all(
         self,
-        start_date: str | date = "2020-01-01",
+        start_date: str | date = _ETF_HISTORY_START,
         days_back: int = 60,
         should_continue: Callable[[], bool] | None = None,
         deadline_at: float | None = None,
@@ -2525,7 +2587,7 @@ class InstitutionalFlowsPuller(BasePuller):
 
     def pull_etf_only(
         self,
-        start_date: str | date = "2020-01-01",
+        start_date: str | date = _ETF_HISTORY_START,
         revise_from: str | date | None = None,
     ) -> list[dict[str, Any]]:
         """Pull only ETF flow proxies (faster, no SEC API dependency).
@@ -2557,10 +2619,14 @@ class InstitutionalFlowsPuller(BasePuller):
         """Pull the ETF flow proxies for the revision window only, inside a budget.
 
         The short run: it considers the last ``_ETF_REVISION_DAYS`` days (the
-        dates a scheduled run stores or revises) and fetches about six weeks
+        dates a scheduled run stores or revises) and fetches about ten weeks
         of bars per ETF for the rolling windows, instead of every bar since
-        2020. A date older than the window that was never stored is left to
-        ``pull_etf_only``, the wide run.
+        2020. For those dates it writes what ``pull_etf_only``, the wide run,
+        writes: an ETF whose fetch brought fewer than ``_ETF_WARMUP_ROWS``
+        bars before the window is fetched again from where the wide run
+        starts (one more provider request for that ETF, inside the same
+        "no ETF is started after the deadline" bound). A date older than the
+        window that was never stored is left to the wide run.
 
         Parameters:
             should_continue: Returns False once the caller's budget is spent.

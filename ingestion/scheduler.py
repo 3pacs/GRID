@@ -773,8 +773,9 @@ EXTENDED_MONTHLY_SLOT_UTC = "06:00"
 ETF_FLOWS_MORNING_SLOT_UTC = "05:35"
 ETF_FLOWS_GROUP = "etf_flows"
 # The scheduler is one thread: a job holds every job after it. The slot runs
-# the short ETF pull (the 14-day revision window, about six weeks of bars per
-# ETF) and gives it this long. No ETF is started after the deadline; the run
+# the short ETF pull (the 14-day revision window, about ten weeks of bars per
+# ETF; an ETF whose fetch is short of rows before the window is fetched once
+# more from 2020, so the rows are the wide run's) and gives it this long. No ETF is started after the deadline; the run
 # then ends PARTIAL and says how many were read. Measured in production
 # 2026-11-24..26: the wide 20:00Z run (every bar since 2020) took 13 to 14
 # seconds. The yfinance morning slot ahead of this one has held the loop

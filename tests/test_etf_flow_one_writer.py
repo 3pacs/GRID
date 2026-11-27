@@ -80,7 +80,7 @@ def _dates(engine, series_id: str = SERIES_5D) -> list[date]:
 # ── 1. The short run ───────────────────────────────────────────────────────
 
 
-def test_the_short_run_fetches_six_weeks_and_stores_only_the_revision_window(engine, monkeypatch):
+def test_the_short_run_fetches_ten_weeks_and_stores_only_the_revision_window(engine, monkeypatch):
     asked: list[dict] = []
 
     def _download(ticker, **kwargs):
@@ -92,7 +92,8 @@ def test_the_short_run_fetches_six_weeks_and_stores_only_the_revision_window(eng
     results = inst.InstitutionalFlowsPuller(engine).pull_etf_recent()
 
     window_start = TODAY - timedelta(days=inst._ETF_REVISION_DAYS)
-    assert [a["start"] for a in asked] == [str(window_start - timedelta(days=30))]   # not 2020
+    assert [a["start"] for a in asked] == [
+        str(window_start - timedelta(days=inst._ETF_WARMUP_CALENDAR_DAYS))]              # once, and not 2020
     stored = _dates(engine)
     assert stored and min(stored) >= window_start and max(stored) == LAST
     assert len(stored) == len(set(stored)) == 10          # ten sessions in fourteen days
@@ -106,7 +107,7 @@ def test_the_wide_run_still_reaches_back(engine, monkeypatch):
 
     inst.InstitutionalFlowsPuller(engine).pull_etf_only()
 
-    assert asked == [str(date(2020, 1, 1) - timedelta(days=30))]
+    assert asked == [str(date(2020, 1, 1) - timedelta(days=inst._ETF_WARMUP_CALENDAR_DAYS))]
     assert min(_dates(engine)) < TODAY - timedelta(days=inst._ETF_REVISION_DAYS)
 
 
