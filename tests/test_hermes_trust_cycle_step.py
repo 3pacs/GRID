@@ -101,7 +101,7 @@ def test_due_daily_block_runs_even_when_trust_outlasts_its_step_cap(clock, monke
     daily_calls: list[datetime] = []
     monkeypatch.setattr(
         ho, "_run_daily_intel_block",
-        lambda engine, state, now, results: daily_calls.append(now),
+        lambda engine, state, now, results, **_kw: daily_calls.append(now),
     )
     monkeypatch.setattr(ho, "_run_sector_health_step", lambda engine, state, dry_run: {})
     slow = _SlowTrust()
@@ -124,7 +124,7 @@ def test_due_daily_block_runs_even_when_trust_outlasts_its_step_cap(clock, monke
 
 def test_daily_block_sits_ahead_of_every_periodic_task_and_trust_is_not_in_the_step():
     src = inspect.getsource(ho.run_intelligence_tasks)
-    daily = src.index("_run_daily_intel_block(engine, state, now, results)")
+    daily = src.index("_run_daily_intel_block(engine, state, now, results, step_deadline=step_deadline)")
     assert src.index("score_due_active_hypotheses") < daily
     for later in ("state.last_signal_forecasts", "state.last_options_recommendations",
                   "state.last_cross_reference_checks", "state.last_lever_pullers",

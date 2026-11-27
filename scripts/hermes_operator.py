@@ -298,9 +298,16 @@ DAILY_INTEL_CLEANUP_TASK_BUDGET_S = 30        # documented default per-task budg
 DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = 300
 DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S = 60  # >= one worst-case LLM post-mortem row plus its store
 DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S = 5      # the whole call (work AND the backlog diagnostics) must return this long before the wrapper's limit
-# Cycle admission is SOFT by design: the driver starts a task while cumulative block time is < DAILY_INTEL_CYCLE_BUDGET_SECONDS
-# and then gives it its full own budget, so the block can end up to budget+task (480+300 s) after it started.
-# postmortem_batch is the LAST task, so it only ever delays the end of the block, never another task.
+# Cycle admission is SOFT: the driver starts a task while cumulative block time is < DAILY_INTEL_CYCLE_BUDGET_SECONDS and
+# gives it its own budget, so the block can end up to budget+task (480+300 s) after it started. That alone can overrun the
+# OUTER step (INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900 s, which also holds the up-to-240 s scorer: 240 + 479 + 300 = 1019 s),
+# so postmortem_batch (flagged bounded_by_outer) is given min(its budget, what is LEFT of the outer step minus a reserve for
+# bookkeeping) and is DEFERRED to the next cycle, without counting an attempt, when less than the minimum is left.
+# What this does NOT bound: a row already running (it can overrun the deadline by up to its own duration), a DB pool checkout
+# that waits, and the diagnostics before they take their connection. Those stay inside the wrapper timeout, never an
+# absolute finish time.
+DAILY_INTEL_OUTER_STEP_RESERVE_S = 60          # kept free at the end of the outer step for result persistence/cleanup (same 60 s as the INTELLIGENCE_TASKS_TIMEOUT_SECONDS pin)
+DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S = 120   # DEADLINE_MARGIN_S (60) + room for at least ~two rows; below this the task is deferred, not started
 DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_maintenance_subagent only QUEUES a subagent dispatch command (_execute_hermes_repair_command) — no LLM call in this step itself — so it gets the SQL-class default, not the LLM one.
 
 # capital_flow_rollups / fundamental_divergence per-task budgets
@@ -2020,14 +2027,14 @@ def _daily_intel_postmortem_batch(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
     from intelligence.postmortem import batch_postmortem
-    # Stop STARTING rows early enough that the batch ends inside its own budget (see the constants), so it
-    # reports on time instead of timing out, being blacklisted and finishing late with nothing published.
-    deadline = time.monotonic() + max(
-        0.0, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S - DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S,
-    )
-    finish_by = time.monotonic() + max(
-        0.0, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S - DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S,
-    )
+    # Stop STARTING rows early enough that the batch ends inside the time the DRIVER granted this attempt (its own
+    # budget, or less when the outer step is nearly spent; see _run_daily_intel_block), so it reports on time instead of
+    # timing out, being blacklisted and finishing late with nothing published.
+    with _DAILY_INTEL_LOCK:
+        allowance = _DAILY_INTEL_TASK_ALLOWANCE_S.get("postmortem_batch", float(DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S))
+    started = time.monotonic()
+    deadline = started + max(0.0, allowance - DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S)
+    finish_by = started + max(0.0, allowance - DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S)
     results["postmortem_batch"] = _run_intel_task(
         "postmortem_batch", batch_postmortem, state, engine,
         limit=POSTMORTEM_BATCH_LIMIT, deadline=deadline, finish_by=finish_by,
@@ -2388,6 +2395,11 @@ class DailyIntelTask(NamedTuple):
     # misread as "the dispatched subagent finished" — see part C of
     # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
     reports_done_queued: bool = False
+    # True for a task whose wrapper budget is capped to what is left of the OUTER step
+    # (INTELLIGENCE_TASKS_TIMEOUT_SECONDS) and that is deferred, not started, when too little is left.
+    # Only postmortem_batch: the soft cycle admission (see DAILY_INTEL_OUTER_STEP_RESERVE_S) can otherwise
+    # admit its full budget just under the cycle budget.
+    bounded_by_outer: bool = False
 
 
 # Ordered exactly as the pre-existing inline block ran them. Do not
@@ -2430,7 +2442,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("errors_jsonl_cleanup", _daily_intel_errors_jsonl_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
-    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S),
+    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S, bounded_by_outer=True),
 )
 
 
@@ -2804,6 +2816,9 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
 # on a plain Lock.
 _DAILY_INTEL_LOCK = threading.RLock()
 _DAILY_INTEL_IN_FLIGHT: dict[str, dict[str, Any]] = {}
+# Seconds the driver granted to a bounded_by_outer task for THIS attempt (read by the task's own fn to place its
+# deadline). Set under _DAILY_INTEL_LOCK before the attempt starts; absent means the task's own budget_s.
+_DAILY_INTEL_TASK_ALLOWANCE_S: dict[str, float] = {}
 _daily_intel_token_seq = 0
 
 # SCOPE, stated precisely (release-controller rejection response,
@@ -2863,6 +2878,7 @@ def _run_daily_intel_block(
     state: OperatorState,
     now: datetime,
     results: dict[str, Any],
+    step_deadline: float | None = None,
 ) -> None:
     """Execute the ALLOW-LISTED subset of DAILY_INTEL_TASKS in order,
     resumable across cycles, with no-overlap and late-publish guards.
@@ -2898,6 +2914,12 @@ def _run_daily_intel_block(
     chance to persist — safe, because every task's own DB writes are
     idempotent upserts/inserts-with-dedupe (a property this task
     explicitly did NOT change), so a redo just repeats the same write.
+
+    Outer step bound: ``step_deadline`` is the ``time.monotonic()`` instant the enclosing
+    ``INTELLIGENCE_TASKS_TIMEOUT_SECONDS`` step ends (None = unbounded, for direct callers). A task flagged
+    ``bounded_by_outer`` is granted ``min(budget_s, step_deadline - now - DAILY_INTEL_OUTER_STEP_RESERVE_S)``
+    as its wrapper budget (the task reads it from ``_DAILY_INTEL_TASK_ALLOWANCE_S``), and is skipped for this
+    cycle, with no attempt counted, when that is below ``DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S``.
 
     Per-cycle budget: ``DAILY_INTEL_CYCLE_BUDGET_SECONDS`` is checked
     BEFORE starting each task (not mid-task) against cumulative wall time
@@ -3093,6 +3115,18 @@ def _run_daily_intel_block(
         if budget_used >= DAILY_INTEL_CYCLE_BUDGET_SECONDS:
             break
 
+        task_budget = task.budget_s
+        if task.bounded_by_outer and step_deadline is not None:
+            outer_left = step_deadline - time.monotonic() - DAILY_INTEL_OUTER_STEP_RESERVE_S
+            if outer_left < DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S:
+                log.warning(
+                    "daily_intel task '{n}' deferred to the next cycle: {left:.0f}s left of the outer step "
+                    "(minimum {m}s); no attempt counted",
+                    n=task.name, left=max(outer_left, 0.0), m=DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S,
+                )
+                continue
+            task_budget = min(task.budget_s, int(outer_left))
+
         with _DAILY_INTEL_LOCK:
             existing = _DAILY_INTEL_IN_FLIGHT.get(task.name)
             if existing is not None and _daily_intel_thread_alive(existing.get("thread")):
@@ -3112,6 +3146,8 @@ def _run_daily_intel_block(
             _DAILY_INTEL_IN_FLIGHT[task.name] = {
                 "token": token, "thread": None, "started": None,
             }
+            if task.bounded_by_outer:
+                _DAILY_INTEL_TASK_ALLOWANCE_S[task.name] = float(task_budget)
 
         t0 = time.monotonic()
         with _DAILY_INTEL_LOCK:
@@ -3223,7 +3259,7 @@ def _run_daily_intel_block(
         _, ok = _run_with_timeout(
             f"daily_intel:{task.name}",
             _run_task,
-            task.budget_s,
+            task_budget,
             state,
         )
         budget_used += time.monotonic() - t0
@@ -3808,6 +3844,9 @@ def run_intelligence_tasks(
     """
     results: dict[str, Any] = {}
     now = datetime.now(timezone.utc)
+    # When the enclosing _run_with_timeout(INTELLIGENCE_TASKS_TIMEOUT_SECONDS) gives up on this step (this runs in
+    # its worker thread, so the clock starts with it): tasks that must not run past it are capped to the remainder.
+    step_deadline = time.monotonic() + INTELLIGENCE_TASKS_TIMEOUT_SECONDS
 
     if dry_run:
         log.info("[DRY RUN] Would run intelligence tasks")
@@ -3912,7 +3951,7 @@ def run_intelligence_tasks(
             "Running daily intelligence batch (window={w} catch_up={c})",
             w=is_daily_window, c=(is_catch_up and not is_daily_window),
         )
-        _run_daily_intel_block(engine, state, now, results)
+        _run_daily_intel_block(engine, state, now, results, step_deadline=step_deadline)
 
     # ── Every 4 hours ────────────────────────────────────────────────
     # The trust cycle itself runs as its own run_cycle step since 2026-11-18

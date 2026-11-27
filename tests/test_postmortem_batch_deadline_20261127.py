@@ -279,3 +279,123 @@ def test_the_postmortem_step_passes_a_finish_by_inside_the_wrapper_budget(monkey
     ho._daily_intel_postmortem_batch(MagicMock(), MagicMock(), None, {})
     assert seen["finish_by"] == 500.0 + ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S - ho.DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S
     assert seen["deadline"] < seen["finish_by"] < 500.0 + ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
+
+
+# ── outer-step composition (Codex hold at add76357d): the task's allowance comes from the OUTER remainder ──────────
+
+import inspect  # noqa: E402
+
+from datetime import datetime, timezone  # noqa: E402
+
+from scripts.hermes_health import OperatorState  # noqa: E402
+
+_NOW = datetime(2026, 11, 27, 2, 5, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _clean_allowance_and_in_flight():
+    ho._DAILY_INTEL_TASK_ALLOWANCE_S.clear()
+    ho._DAILY_INTEL_IN_FLIGHT.clear()
+    yield
+    ho._DAILY_INTEL_TASK_ALLOWANCE_S.clear()
+    ho._DAILY_INTEL_IN_FLIGHT.clear()
+
+
+def _driver(monkeypatch, *, elapsed_in_step, work_s=0.0, outer=None):
+    """Run the real driver over the real postmortem task on a synthetic clock.
+
+    ``elapsed_in_step`` is how much of the outer step is already gone when the driver reaches the task (scorer +
+    earlier daily tasks). Returns (state, calls) where calls holds the wrapper timeout the driver passed, the kwargs
+    the batch was handed, and the clock value when the task ended.
+    """
+    clock = _Clock(10_000.0)
+    step_started = clock.now
+    monkeypatch.setattr(ho, "time", SimpleNamespace(monotonic=clock.monotonic, time=lambda: 0.0))
+    pm_task = next(t for t in ho.DAILY_INTEL_TASKS if t.name == "postmortem_batch")
+    monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", (pm_task,))
+    calls: dict = {}
+
+    def _fake_wrapper(name, fn, timeout_s, state):
+        calls["wrapper_timeout"] = timeout_s
+        calls["wrapper_started"] = clock.now
+        fn()
+        clock.now += work_s
+        calls["ended"] = clock.now
+        return None, True
+
+    monkeypatch.setattr(ho, "_run_with_timeout", _fake_wrapper)
+    monkeypatch.setattr(ho, "_run_intel_task", lambda name, fn, state, engine, **kw: calls.update(batch=kw) or [])
+    monkeypatch.setattr(ho, "_daily_intel_raise_if_task_status_failed", lambda *_a, **_k: None)
+    clock.now = step_started + elapsed_in_step
+    deadline = step_started + (ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS if outer is None else outer)
+    state = OperatorState()
+    ho._run_daily_intel_block(MagicMock(), state, _NOW, {}, step_deadline=deadline)
+    calls["outer_deadline"] = deadline
+    return state, calls
+
+
+def test_worst_case_admission_is_capped_to_the_outer_remainder(monkeypatch):
+    # 240 s scorer + 479 s block = 719 s gone; the old code granted the full 300 s (-> 1019 s)
+    state, calls = _driver(monkeypatch, elapsed_in_step=240 + 479, work_s=0.0)
+    left = ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS - (240 + 479) - ho.DAILY_INTEL_OUTER_STEP_RESERVE_S
+    assert calls["wrapper_timeout"] == left == 121
+    assert calls["wrapper_timeout"] < ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
+    started = calls["wrapper_started"]
+    assert started + calls["wrapper_timeout"] <= calls["outer_deadline"] - ho.DAILY_INTEL_OUTER_STEP_RESERVE_S
+    # the batch's own deadline and finish_by are placed from that allowance, not from the 300 s constant
+    assert calls["batch"]["deadline"] == started + 121 - ho.DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S
+    assert calls["batch"]["finish_by"] == started + 121 - ho.DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S
+    assert state.daily_intel_task_outcome["postmortem_batch"] == "done"
+
+
+def test_the_task_is_deferred_not_started_when_too_little_of_the_outer_step_is_left(monkeypatch):
+    state, calls = _driver(monkeypatch, elapsed_in_step=240 + 479 + 45)     # 116 s left after the reserve < 120 minimum
+    assert "wrapper_timeout" not in calls and "batch" not in calls
+    # a deferral is not an attempt and not an outcome: it just runs next cycle
+    assert state.daily_intel_attempts.get("postmortem_batch", 0) == 0
+    assert "postmortem_batch" not in state.daily_intel_done
+    assert "postmortem_batch" not in state.daily_intel_skipped_for_period
+    assert "postmortem_batch" not in state.daily_intel_task_outcome
+
+
+def test_every_admitted_start_leaves_the_reserve_inside_the_outer_step(monkeypatch):
+    admitted = deferred = 0
+    for elapsed in range(0, 900, 15):
+        ho._DAILY_INTEL_IN_FLIGHT.clear()
+        _state, calls = _driver(monkeypatch, elapsed_in_step=elapsed)
+        if "wrapper_timeout" in calls:
+            admitted += 1
+            assert calls["wrapper_started"] + calls["wrapper_timeout"] <= calls["outer_deadline"] - ho.DAILY_INTEL_OUTER_STEP_RESERVE_S
+            assert calls["wrapper_timeout"] >= ho.DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S
+            assert calls["wrapper_timeout"] <= ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
+        else:
+            deferred += 1
+    assert admitted and deferred                                              # both regimes are exercised
+
+
+def test_an_early_step_still_gets_the_full_budget(monkeypatch):
+    _state, calls = _driver(monkeypatch, elapsed_in_step=0)
+    assert calls["wrapper_timeout"] == ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
+
+
+def test_without_an_outer_deadline_the_driver_keeps_the_task_budget(monkeypatch):
+    clock = _Clock(0.0)
+    monkeypatch.setattr(ho, "time", SimpleNamespace(monotonic=clock.monotonic, time=lambda: 0.0))
+    pm_task = next(t for t in ho.DAILY_INTEL_TASKS if t.name == "postmortem_batch")
+    monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", (pm_task,))
+    seen: dict = {}
+    monkeypatch.setattr(ho, "_run_with_timeout", lambda name, fn, timeout_s, state: seen.update(t=timeout_s) or (None, True))
+    ho._run_daily_intel_block(MagicMock(), OperatorState(), _NOW, {})
+    assert seen["t"] == ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
+
+
+def test_only_the_postmortem_task_is_bounded_and_the_step_passes_its_deadline():
+    assert [t.name for t in ho.DAILY_INTEL_TASKS if t.bounded_by_outer] == ["postmortem_batch"]
+    src = inspect.getsource(ho.run_intelligence_tasks)
+    assert "step_deadline = time.monotonic() + INTELLIGENCE_TASKS_TIMEOUT_SECONDS" in src
+    assert "step_deadline=step_deadline" in src
+
+
+def test_the_minimum_allowance_covers_the_margin_and_fits_the_budget():
+    assert ho.DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S > ho.DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S
+    assert ho.DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S <= ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
