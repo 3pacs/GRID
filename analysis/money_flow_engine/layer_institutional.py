@@ -13,6 +13,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.observations import read_window_known_at
+
 from .types import FlowLayer, FlowNode
 
 # ── Constants ────────────────────────────────────────────────────────────
@@ -116,9 +118,15 @@ def _build_sovereign_wealth() -> FlowNode:
 
 
 def _build_etf_flow_proxy(engine: Engine, as_of: date) -> FlowNode:
-    """Sum latest 5-day ETF flow proxy values from raw_series.
+    """Sum the latest 5-day ETF flow proxy values held by the end of ``as_of``.
 
     Looks for series matching ``ETF_FLOW:<ticker>:5d`` pattern.
+
+    Point-in-time: a date's value is the newest vintage *pulled by the end of
+    the UTC day* ``as_of`` (``store.observations.read_window_known_at``, pull
+    evidence only). The writer revises a recent date whose value changed, and
+    stores a date no earlier than the day after it; neither a later revision
+    nor a date first stored after ``as_of`` can reach a read for ``as_of``.
     """
     value: float | None = None
     etf_count = 0
@@ -126,26 +134,25 @@ def _build_etf_flow_proxy(engine: Engine, as_of: date) -> FlowNode:
 
     try:
         with engine.connect() as conn:
-            rows = conn.execute(
+            series_ids = [str(row[0]) for row in conn.execute(
                 text("""
-                    SELECT series_id, value
+                    SELECT DISTINCT series_id
                     FROM raw_series
                     WHERE series_id LIKE :pattern
                       AND obs_date >= :start
                       AND obs_date <= :end
                       AND pull_status = 'SUCCESS'
-                    ORDER BY obs_date DESC, pull_timestamp DESC, id DESC
                 """),
                 {"pattern": "ETF_FLOW:%:5d", "start": lookback, "end": as_of},
-            ).fetchall()
+            ).fetchall()]
 
-            if rows:
-                # De-duplicate: keep the latest value per series_id
-                seen: dict[str, float] = {}
-                for row in rows:
-                    sid = str(row[0])
-                    if sid not in seen:
-                        seen[sid] = float(row[1])
+            # The latest date of each series that was held by the end of as_of.
+            seen: dict[str, float] = {}
+            for sid in sorted(series_ids):
+                known = read_window_known_at(conn, sid, as_of=as_of, lag=None, start=lookback)
+                if known:
+                    seen[sid] = known[-1].value
+            if seen:
                 value = sum(seen.values())
                 etf_count = len(seen)
     except Exception as exc:

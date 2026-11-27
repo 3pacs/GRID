@@ -81,18 +81,20 @@ _FLOW_WINDOW_20D: int = 20
 # Rate limit for yfinance calls
 _YF_RATE_DELAY: float = 0.5
 
-# ── Only settled bars are stored, and recent ones are revised ────────────────
+# ── The session still trading is not stored; recent dates are revised ────────
 # yfinance returns the current session's bar while it is still trading, with
 # the volume so far. The writer used to store it and then skip that date for
 # good, so the day's 5d / 20d / accel values were frozen at whatever share of
 # the volume had traded when the job happened to run. Production, 2026-11:
 # SPY stored 2.1M shares for 11-17 (written 14:33Z) against a final 71.4M, and
-# about 160 of the trading days since 2026-03-30 were written before their bar
-# had settled.
+# about 160 of the trading days since 2026-03-30 were written on their own day.
 #
-# A bar is settled once its date is before the current New York date. The
-# same data showed the day's volume still moving until about 23:30 New York
-# time (4.5 h after the close) and unchanged after midnight.
+# A bar is eligible once its date is before the current New York date. That is
+# a conservative minimum, not provider finality: in four days of SPY volume
+# vintages the figure was still moving at about 23:30 New York time and
+# unchanged after midnight, which is thin evidence. An eligible value is
+# therefore provisional, and the revision below writes a new vintage if the
+# provider changes it.
 _NEW_YORK = ZoneInfo("America/New_York")
 # A stored date this recent is compared with the value just computed and
 # written again, as a new vintage, when it differs. Bounded on purpose: the
@@ -944,11 +946,13 @@ class InstitutionalFlowsPuller(BasePuller):
         For each ticker: fetch daily OHLCV, compute $ volume (close * volume),
         then rolling 5-day and 20-day sums, and flow acceleration.
 
-        Only settled bars are stored (see the note above ``_NEW_YORK``): the
-        current New York date's bar is left for a later run. A date already
-        stored is written again, as a new vintage, when it is on or after the
-        revision floor and its value changed; before the floor it is skipped
-        as before.
+        The current New York date's bar is not stored (see the note above
+        ``_NEW_YORK``); it is left for a later run. An eligible value is still
+        provisional: a date already stored is written again, as a new vintage,
+        when it is on or after the revision floor and its value changed.
+        Before the floor it is skipped as before. Nothing is updated in
+        place, so a reader that honours ``pull_timestamp`` still sees what
+        was held at any earlier time.
 
         Parameters:
             start_date: Earliest date for flow computation.
@@ -1021,12 +1025,12 @@ class InstitutionalFlowsPuller(BasePuller):
                     )
                     continue
 
-                # The session still trading (or just closed, volume not yet
-                # final) is not a finished bar. It ends no stored window, so
+                # The session still trading (or just closed, volume still
+                # moving) is not stored. It ends no stored window, so
                 # dropping it changes no stored date's value.
-                settled = [_bar_date(stamp) < session_day for stamp in data.index]
-                unsettled_bars = len(settled) - sum(settled)
-                data = data[settled].copy()
+                eligible = [_bar_date(stamp) < session_day for stamp in data.index]
+                session_bars_left = len(eligible) - sum(eligible)
+                data = data[eligible].copy()
 
                 data["dollar_volume"] = data[close_col] * data[vol_col]
 
@@ -1095,12 +1099,12 @@ class InstitutionalFlowsPuller(BasePuller):
                         "status": "SUCCESS",
                         "rows_inserted": rows_inserted,
                         "rows_revised": rows_revised,
-                        "unsettled_bars_left": unsettled_bars,
+                        "session_bars_left": session_bars_left,
                     })
 
                 log.info(
-                    "ETF flow {t}: computed 5d/20d/accel flows ({u} unsettled bar(s) left for a later run)",
-                    t=ticker, u=unsettled_bars,
+                    "ETF flow {t}: computed 5d/20d/accel flows ({u} same-session bar(s) left for a later run)",
+                    t=ticker, u=session_bars_left,
                 )
 
             except Exception as exc:

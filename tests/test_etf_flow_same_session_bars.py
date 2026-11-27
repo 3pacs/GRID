@@ -1,17 +1,20 @@
-"""ETF flow rows are stored from settled bars only, and recent ones are revised.
+"""The session still trading is not stored as an ETF flow row; recent rows are revised.
 
 Production, read-only, 2026-11-27: yfinance returns the current session's bar
 while it is still trading, with the volume so far. ``_pull_etf_flows`` stored
 it and then skipped that date for good. SPY, stored volume against the final
 one: 11-17 2,144,207 (written 14:33Z) vs 71,408,000; 11-18 7,432,349 vs
 51,595,000; 11-19 10,713,031 vs 76,476,400; 11-20 20,344,147 vs 151,049,800.
-About 160 of the trading days since 2026-03-30 were written before their bar
-had settled, for each of the 11 ETFs and all three series.
+About 160 of the trading days since 2026-03-30 were written on their own day,
+for each of the 11 ETFs and all three series.
 
-The writer now leaves the current New York date's bar for a later run, and a
-stored date inside the revision window is written again, as a new vintage,
-when its value changed. The real writer runs here against a fake yfinance and
-a clock the test sets (network and clock replaced only).
+The writer now leaves the current New York date's bar for a later run. That is
+a conservative minimum, not provider finality, so a stored date inside the
+revision window is written again, as a new vintage, when its value changed.
+Nothing is updated in place, and a reader asked about a past date sees only
+what had been received by then (Codex review 6084304156). The real writer runs
+here against a fake yfinance and a clock the test sets (network and clock
+replaced only).
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from __future__ import annotations
 import json
 import sys
 import types
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -29,6 +32,7 @@ from analysis.money_flow_engine import layer_institutional
 from ingestion import flow_materializer
 from ingestion.altdata import institutional_flows as inst
 from ingestion.smart_scheduler import _classify_outcome
+from intelligence import dollar_flows
 from tests import thirteenf_holdings_support as s
 
 TODAY = date(2026, 11, 20)            # a Friday; the session is trading
@@ -82,14 +86,16 @@ def _rows(engine, series_id: str = SERIES_5D) -> list[tuple[date, float, dict, s
     return out
 
 
-def _store(engine, obs_date: date, value: float, volume: int, status: str = "SUCCESS") -> None:
-    """A row as an earlier run left it."""
+def _store(engine, obs_date: date, value: float, volume: int, status: str = "SUCCESS",
+           pulled: datetime | None = None, series_id: str = SERIES_5D) -> None:
+    """A row as an earlier run left it, received at ``pulled`` (default: now)."""
     with engine.begin() as conn:
         conn.execute(text(
-            "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
-            "VALUES (:sid, 7, :d, :v, :p, :st)"),
-            {"sid": SERIES_5D, "d": obs_date, "v": value,
-             "p": json.dumps({"ticker": "SPY", "close": CLOSE, "volume": volume}), "st": status})
+            "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status, "
+            "pull_timestamp) VALUES (:sid, 7, :d, :v, :p, :st, COALESCE(:ts, CURRENT_TIMESTAMP))"),
+            {"sid": series_id, "d": obs_date, "v": value, "ts": pulled,
+             "p": json.dumps({"ticker": series_id.split(":")[1], "close": CLOSE, "volume": volume}),
+             "st": status})
 
 
 def _item(results: list[dict], series_id: str = SERIES_5D) -> dict:
@@ -106,7 +112,7 @@ def test_the_session_still_trading_is_not_stored(engine, run):
     dates = [d for d, _v, _p, _s in _rows(engine)]
     assert TODAY not in dates and max(dates) == date(2026, 11, 19)
     assert all(value == FIVE_DAY for _d, value, _p, _s in _rows(engine))    # no partial volume in any sum
-    assert _item(results)["unsettled_bars_left"] == 1
+    assert _item(results)["session_bars_left"] == 1
     assert _classify_outcome(results)[0] == "SUCCESS"                     # the settled dates were new
 
 
@@ -128,7 +134,7 @@ def test_the_day_is_stored_with_its_final_volume_once_new_york_has_moved_past_it
     assert friday[1] == FIVE_DAY and friday[2]["volume"] == FINAL_VOLUME and "revises_value" not in friday[2]
     assert len(rows) == before + 1
     assert _item(results)["rows_inserted"] == 1 and _item(results)["rows_revised"] == 0
-    assert _item(results)["unsettled_bars_left"] == 0
+    assert _item(results)["session_bars_left"] == 0
 
 
 def test_a_holiday_or_weekend_run_stores_every_finished_session(engine, run):
@@ -136,7 +142,7 @@ def test_a_holiday_or_weekend_run_stores_every_finished_session(engine, run):
     assert max(d for d, _v, _p, _s in _rows(engine)) == TODAY
 
 
-def test_only_unsettled_bars_is_a_clean_run_that_writes_nothing(engine, run):
+def test_a_run_with_nothing_new_to_store_is_clean_and_writes_nothing(engine, run):
     run(TODAY + timedelta(days=1), _bars(TODAY))
     stored = len(_rows(engine))
 
@@ -242,38 +248,122 @@ def test_new_york_today_is_the_exchange_date_not_the_utc_date():
     assert isinstance(inst._new_york_today(), date)
 
 
-# ── Readers take the newest vintage of a date ──────────────────────────────
+# ── Readers: what was received by then, not merely the newest row ──────────
+#
+# Codex review 6084304156 replayed a 20 November value of 403, first seen that
+# day and revised to 490 on the 24th, and got 490 back for as_of = 20 November.
+# An as-of read must be tied to when each vintage was received.
+
+NOV19, NOV20, NOV23, NOV24 = date(2026, 11, 19), date(2026, 11, 20), date(2026, 11, 23), date(2026, 11, 24)
 
 
-def _two_vintages(engine, run) -> float:
-    partial_value = (4 * FINAL_VOLUME + 30_000) * CLOSE
-    _store(engine, TODAY, partial_value, volume=30_000)
-    run(TODAY + timedelta(days=1), _bars(TODAY))
-    return partial_value
+def _first_seen_403_then_revised_to_490(engine) -> None:
+    # The 19th as the fixed writer stores it: first received the day after.
+    _store(engine, NOV19, 380.0, volume=1, pulled=datetime(2026, 11, 20, 5, 10))
+    # The 20th as the old writer stored it, mid-session, then its revision.
+    _store(engine, NOV20, 403.0, volume=1, pulled=datetime(2026, 11, 20, 15, 0))
+    _store(engine, NOV20, 490.0, volume=1, pulled=datetime(2026, 11, 24, 5, 10))
 
 
-def test_the_materialized_etf_flows_table_gets_the_newest_vintage(engine, run, monkeypatch):
-    partial_value = _two_vintages(engine, run)
+@pytest.mark.parametrize("as_of,expected", [
+    (NOV20, 403.0),         # the revision did not exist yet
+    (NOV23, 403.0),
+    (NOV24, 490.0),         # received that day
+    (date(2026, 11, 27), 490.0),
+], ids=["old_as_of", "day_before_the_revision", "day_of_the_revision", "new_as_of"])
+def test_the_money_flow_proxy_returns_what_was_held_by_the_end_of_as_of(engine, as_of, expected):
+    _first_seen_403_then_revised_to_490(engine)
+
+    node = layer_institutional._build_etf_flow_proxy(engine, as_of)
+
+    assert node.value == expected and node.metadata["etf_count"] == 1
+
+
+def test_a_date_first_received_after_as_of_does_not_reach_the_proxy(engine):
+    """The 19th was first stored on the 20th. Asked about the 19th, the proxy
+    has nothing: an observation date at or before as_of is not enough."""
+    _first_seen_403_then_revised_to_490(engine)
+
+    node = layer_institutional._build_etf_flow_proxy(engine, NOV19)
+
+    assert node.value is None and node.metadata["etf_count"] == 0
+
+
+def test_the_proxy_takes_each_etfs_own_latest_held_date(engine):
+    _first_seen_403_then_revised_to_490(engine)
+    _store(engine, NOV19, 50.0, volume=1, pulled=datetime(2026, 11, 20, 5, 12), series_id="ETF_FLOW:QQQ:5d")
+
+    node = layer_institutional._build_etf_flow_proxy(engine, NOV20)
+
+    assert node.value == 403.0 + 50.0 and node.metadata["etf_count"] == 2      # SPY's 20th, QQQ's 19th
+
+
+@pytest.mark.parametrize("as_of,expected", [(NOV20, 403.0), (NOV23, 403.0), (NOV24, 490.0)],
+                         ids=["old_as_of", "day_before_the_revision", "new_as_of"])
+def test_the_dollar_flow_reader_already_honours_receipt_time_for_a_revised_etf_row(engine, as_of, expected):
+    """Unchanged by this PR: pinned so the existing convention covers the
+    revisions the writer now makes."""
+    _first_seen_403_then_revised_to_490(engine)
+
+    flows = dollar_flows._normalize_etf_flows(engine, days=30, as_of=as_of)
+
+    (nov20,) = [f for f in flows if f["flow_date"] == NOV20]
+    assert nov20["evidence"]["raw_value"] == expected
+
+
+def test_the_dollar_flow_reader_does_not_see_a_date_first_received_after_as_of(engine):
+    _first_seen_403_then_revised_to_490(engine)
+
+    assert dollar_flows._normalize_etf_flows(engine, days=30, as_of=NOV19) == []
+
+
+# ── The materialized table is a current view ───────────────────────────────
+
+
+def _etf_flows_table(engine, monkeypatch) -> None:
     with engine.begin() as conn:
         conn.execute(text(
             "CREATE TABLE etf_flows (ticker TEXT, flow_date DATE, flow_value REAL, source TEXT, "
             "confidence TEXT, UNIQUE (ticker, flow_date, source))"))
     monkeypatch.setattr(flow_materializer, "_ensure_tables", lambda _engine: None)
 
+
+def _materialized(engine) -> dict[str, float]:
+    with engine.connect() as conn:
+        return {str(d)[:10]: float(v) for d, v in conn.execute(text(
+            "SELECT flow_date, flow_value FROM etf_flows WHERE ticker = 'SPY'")).fetchall()}
+
+
+def test_the_materialized_table_holds_the_newest_vintage_of_each_date(engine, monkeypatch):
+    _first_seen_403_then_revised_to_490(engine)
+    _etf_flows_table(engine, monkeypatch)
+
     upserted = flow_materializer.sync_etf_flows(engine)
 
-    with engine.connect() as conn:
-        stored = conn.execute(text(
-            "SELECT flow_value FROM etf_flows WHERE ticker = 'SPY' AND flow_date = :d"), {"d": TODAY}).scalar()
-        dates = conn.execute(text("SELECT COUNT(*) FROM etf_flows")).scalar()
-    assert stored == FIVE_DAY and stored != partial_value
-    assert upserted == dates                                          # one row offered per date, not per vintage
+    assert _materialized(engine) == {"2026-11-19": 380.0, "2026-11-20": 490.0}
+    assert upserted == 2                                              # one row offered per date, not per vintage
 
 
-def test_the_money_flow_proxy_sums_the_newest_vintage(engine, run):
-    partial_value = _two_vintages(engine, run)
+def test_the_sync_limit_counts_dates_not_vintages(engine, monkeypatch):
+    """Limiting raw rows before choosing the newest vintage spent the limit on
+    the older vintage of the 20th and never reached the 19th."""
+    _first_seen_403_then_revised_to_490(engine)
+    _etf_flows_table(engine, monkeypatch)
+    monkeypatch.setattr(flow_materializer, "_ETF_FLOW_SYNC_LIMIT", 2)
 
-    node = layer_institutional._build_etf_flow_proxy(engine, TODAY)
+    flow_materializer.sync_etf_flows(engine)
 
-    assert node.value == FIVE_DAY and node.value != partial_value
-    assert node.metadata["etf_count"] == 1
+    assert _materialized(engine) == {"2026-11-19": 380.0, "2026-11-20": 490.0}
+
+
+def test_a_later_sync_replaces_the_value_so_the_table_is_not_a_history(engine, monkeypatch):
+    _store(engine, NOV20, 403.0, volume=1, pulled=datetime(2026, 11, 20, 15, 0))
+    _etf_flows_table(engine, monkeypatch)
+    flow_materializer.sync_etf_flows(engine)
+    assert _materialized(engine) == {"2026-11-20": 403.0}
+
+    _store(engine, NOV20, 490.0, volume=1, pulled=datetime(2026, 11, 24, 5, 10))
+    flow_materializer.sync_etf_flows(engine)
+
+    assert _materialized(engine) == {"2026-11-20": 490.0}             # 403 is gone from this table
+    assert "not a history" in flow_materializer.sync_etf_flows.__doc__
