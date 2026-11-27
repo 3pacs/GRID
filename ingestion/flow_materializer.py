@@ -849,12 +849,15 @@ def sync_etf_flows(engine: Engine) -> int:
     rows_upserted = 0
 
     with engine.begin() as conn:
+        # Newest vintage first within a date: a date can hold more than one
+        # row (the writer revises a recent date whose value changed), and the
+        # upsert below must be fed the current one only.
         rs_rows = conn.execute(text(
             "SELECT series_id, obs_date, value "
             "FROM raw_series WHERE series_id LIKE :prefix "
             "AND series_id LIKE :suffix "
             "AND pull_status = 'SUCCESS' "
-            "ORDER BY obs_date DESC LIMIT 20000"
+            "ORDER BY obs_date DESC, pull_timestamp DESC, id DESC LIMIT 20000"
         ), {"prefix": "ETF_FLOW:%", "suffix": "%:5d"}).fetchall()
 
         if not rs_rows:
@@ -862,7 +865,12 @@ def sync_etf_flows(engine: Engine) -> int:
             return 0
 
         batch: list[dict] = []
+        seen: set[tuple[str, Any]] = set()
         for r in rs_rows:
+            key = (str(r[0]), str(r[1]))
+            if key in seen:
+                continue                    # an older vintage of a date already taken
+            seen.add(key)
             parts = str(r[0]).split(":")
             if len(parts) < 2:
                 continue

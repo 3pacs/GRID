@@ -134,7 +134,7 @@ def _build_etf_flow_proxy(engine: Engine, as_of: date) -> FlowNode:
                       AND obs_date >= :start
                       AND obs_date <= :end
                       AND pull_status = 'SUCCESS'
-                    ORDER BY obs_date DESC
+                    ORDER BY obs_date DESC, pull_timestamp DESC, id DESC
                 """),
                 {"pattern": "ETF_FLOW:%:5d", "start": lookback, "end": as_of},
             ).fetchall()
