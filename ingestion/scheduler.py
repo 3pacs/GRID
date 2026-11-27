@@ -761,6 +761,28 @@ YFINANCE_MORNING_SLOT_UTC = "05:15"
 # The extended monthly/annual groups run for hours on the same scheduler
 # thread, so they start after the morning slot rather than ahead of it.
 EXTENDED_MONTHLY_SLOT_UTC = "06:00"
+# ETF flow proxies: the writer stores a session's bar only once its date is
+# before the current New York date (ingestion/altdata/institutional_flows.py).
+# The daily group runs ETF_Flows at 20:00Z, which is always the same New York
+# date as the session, so on its own it stores each session one weekday later
+# (a Friday on Monday evening). This slot runs the same puller after New York
+# midnight in both EDT (04:00Z) and EST (05:00Z), after the yfinance morning
+# slot and before the long monthly group, so a session is stored a few hours
+# after its close. The 20:00Z run stays: it revises recent dates and is the
+# fallback if this slot is skipped.
+ETF_FLOWS_MORNING_SLOT_UTC = "05:35"
+ETF_FLOWS_GROUP = "etf_flows"
+# The scheduler is one thread: a job holds every job after it. The slot runs
+# the short ETF pull (the 14-day revision window, about ten weeks of bars per
+# ETF; an ETF whose fetch is short of rows before the window is fetched once
+# more from 2020, so the rows are the wide run's) and gives it this long. No ETF is started after the deadline; the run
+# then ends PARTIAL and says how many were read. Measured in production
+# 2026-11-24..26: the wide 20:00Z run (every bar since 2020) took 13 to 14
+# seconds. The yfinance morning slot ahead of this one has held the loop
+# until between 05:38Z and 06:27Z, so this slot is usually released late; the
+# budget is what bounds how long it then holds the jobs behind it.
+ETF_FLOWS_MORNING_BUDGET_S = 300
+_ETF_FLOWS_DEADLINE_KEY = "ETF_FLOWS_DEADLINE_AT"
 EXTENDED_ANNUAL_SLOT_UTC = "06:30"
 # Scheduled yfinance runs request a window computed at call time: from
 # YFINANCE_WINDOW_OVERLAP_DAYS (3 calendar days, not trading days) before the
@@ -783,7 +805,7 @@ def run_pull_group(
     """Run all pullers in a named schedule group.
 
     Parameters:
-        group_name: One of 'crypto', 'daily', 'weekly', 'monthly', 'annual'.
+        group_name: One of 'crypto', 'daily', 'etf_flows', 'weekly', 'monthly', 'annual'.
         db_engine: SQLAlchemy engine for database access.
         config: Optional config dict with API keys, etc.
         skip_sources: Source names to skip (e.g. blacklisted after timeout).
@@ -1449,6 +1471,21 @@ def _get_pullers_for_group(
         # crucix_bridge hourly with its own pull_log row. This copy only re-inserted
         # deduplicated news and logged 0 rows.
 
+    elif group_name == ETF_FLOWS_GROUP:
+        # The ETF flow proxies alone, under the daily group's puller name so
+        # pull_log has one ETF_Flows history (see ETF_FLOWS_MORNING_SLOT_UTC).
+        # The short pull, with the deadline the slot computed once (a retry
+        # of the group must not start a new one).
+        try:
+            from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
+            deadline_at = (config or {}).get(_ETF_FLOWS_DEADLINE_KEY)
+            pullers.append((
+                "ETF_Flows", InstitutionalFlowsPuller(db_engine), "pull_etf_recent",
+                {} if deadline_at is None else {"deadline_at": deadline_at},
+            ))
+        except Exception as exc:
+            log.warning("ETF Flows puller init failed: {err}", err=str(exc))
+
     elif group_name == "weekly":
         try:
             from ingestion.international.oecd import OECDPuller
@@ -1989,6 +2026,59 @@ def run_yfinance_morning_slot(
     _run_yfinance_daily(
         _routine_yfinance_start(now), slot=slot,
         purpose="completed_session_capture", target_session=prior_day,
+    )
+
+
+def run_etf_flows_morning_slot(
+    db_engine: Engine,
+    slot: str = ETF_FLOWS_MORNING_SLOT_UTC,
+    now_utc: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Store the prior session's ETF flow rows once New York's date has moved on.
+
+    Registered every day at ``ETF_FLOWS_MORNING_SLOT_UTC``. It runs the
+    ``etf_flows`` group (the ``ETF_Flows`` puller alone) only when the
+    previous UTC calendar day was a US trading session, so Friday is stored on
+    Saturday and Monday on Tuesday; Sunday, Monday and the day after a holiday
+    skip. Same lateness guard as the yfinance morning slot.
+
+    The pull is the short one (``pull_etf_recent``: the revision window) and
+    gets ``ETF_FLOWS_MORNING_BUDGET_S`` from here, computed once so a retry of
+    the group cannot renew it. The lateness guard bounds when the slot may
+    start; this bounds how long it holds the scheduler's one thread.
+
+    Parameters:
+        db_engine: SQLAlchemy engine.
+        slot: The "HH:MM" UTC slot this call was registered for.
+        now_utc: Aware UTC clock override (tests).
+
+    Returns:
+        The group summary, or None when the slot was skipped.
+    """
+    from ingestion.market_calendar import is_market_open
+
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    late = _slot_lateness(slot, now)
+    if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
+        log.warning(
+            "Skipping the {s} ETF flows morning slot: released {m:.0f} min late "
+            "(limit {lim} min) by an earlier job holding the scheduler loop",
+            s=slot, m=late.total_seconds() / 60, lim=DOMESTIC_SLOT_MAX_LATE_MINUTES,
+        )
+        return None
+
+    prior_day = now.date() - timedelta(days=1)
+    if not is_market_open(prior_day):
+        log.info(
+            "ETF flows morning slot: {d} was not a US trading session — nothing to store",
+            d=prior_day,
+        )
+        return None
+
+    log.info("ETF flows morning slot: storing the ETF flow rows for {d}", d=prior_day)
+    deadline_at = time.monotonic() + ETF_FLOWS_MORNING_BUDGET_S
+    return _with_db_retry(
+        run_pull_group, ETF_FLOWS_GROUP, db_engine, {_ETF_FLOWS_DEADLINE_KEY: deadline_at},
     )
 
 
@@ -2655,6 +2745,12 @@ def start_scheduler() -> None:
             getattr(schedule.every(), day).at(TIINGO_PRICES_SLOT_UTC, "UTC").do(
                 start_tiingo_prices_worker, ext_engine
             )
+
+        # ETF flow proxies after New York midnight (see ETF_FLOWS_MORNING_SLOT_UTC).
+        # Registered every day; the function runs only after a US session.
+        schedule.every().day.at(ETF_FLOWS_MORNING_SLOT_UTC, "UTC").do(
+            run_etf_flows_morning_slot, ext_engine, slot=ETF_FLOWS_MORNING_SLOT_UTC,
+        )
 
         # Weekly on Sundays at 3:00 AM
         schedule.every().sunday.at("03:00").do(run_pull_group, "weekly", ext_engine)
