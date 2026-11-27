@@ -1248,6 +1248,28 @@ jobs:
             exit 1
           fi
 
+      # store.observations.read_window_known_at with as_of_ts on TIMESTAMPTZ
+      # receipts: the same-day correction case of AGENTS.md "act on now,
+      # grade on then" (SQLite twin in
+      # tests/test_market_state_provisional_cutoff.py). A read at 10:00 keeps
+      # the original after a 10:07 correction is stored, a read at exactly
+      # 10:07 returns the correction, with the session time zone UTC and west
+      # of UTC. The general run leaves GRID_TEST_DB_URL unset, so the file
+      # skips there. A skip must fail this step, not pass it.
+      - name: Receipt-aware reader same-day correction PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_store_observations_known_at_pg.py -q -rA | tee /tmp/grid-known-at-correction-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-known-at-correction-pg.txt; then
+            echo "::error::Receipt-aware reader same-day correction PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # E2 witness sync (scripts/e2_witness_sync.sh): commits only the E2
       # anchor folder of its dedicated vault clone, refuses anything but a
       # pure append, never the GEX mirror's clone. The general run above
