@@ -37,39 +37,48 @@ current service inventory. Read matching history when recovering a scoped task.
 
 ## New knowledge: act on now, grade on then
 
-Two questions, never mixed.
+Two questions, never mixed. Every read that feeds a decision or a grade
+declares which one it answers (its mode) and its cutoff instant.
 
 - **What do we know now?** For acting. The trader and any live decision use
   the latest version of every fact, including corrections, late filings and
-  quotes that arrive after their scheduled minute. A late fact is tradeable
-  from the moment it arrives.
-- **What did we know when we decided?** For grading. Backtests, postmortems
-  and evidence credit only what had been received by the decision's own
-  timestamp.
+  quotes that arrive after their scheduled minute. A late fact is eligible for
+  consideration after verified receipt, subject to freshness, quality,
+  readiness and authorization gates. A late quote can still be too stale to
+  use.
+- **What did we know when we decided?** For grading. Backtests, postmortems,
+  replays and evidence credit only what had been received by the decision's
+  own instant.
 
-Three things keep both true:
+The cutoff is an instant, not a date. Decision at 10:00, correction received
+at 10:07: a replay of 10:00 uses the original; a decision at 10:08 that passes
+its gates may use the correction; the 10:07 receipt does not by itself
+authorize a trade. A same-day replay never reads a later same-day correction
+from a store that keeps only the newest value.
 
-- Every fact carries when it was received. A correction is added as a new
-  version; it never overwrites the earlier one.
-- Every decision records what it knew and when, so a decision made on late
-  knowledge stays gradeable.
-- A late fact is an event at its real arrival time. It is never backdated, and
+What keeps both true:
+
+- Event time, receipt time and decision time stay distinct. Receipt is the
+  first durable availability of a version to this system: not the source's
+  own time, and not a later reread.
+- Each corrected version is added with its own receipt. It never overwrites
+  the earlier version, and a reread does not reset a receipt.
+- Every decision records its instant and exact references to the input
+  versions it used, so a decision made on late knowledge stays gradeable.
+- A late fact is an event at its real receipt time. It is never backdated, and
   it does not mark the original moment as failed forever.
+- A store that keeps only the newest value is a current view: it answers the
+  acting question only. If a store cannot reconstruct what it held at the
+  cutoff, a grading read fails closed and withholds the value.
 
-What follows from this:
-
-- A current-view value is not history. Do not read one to answer the grading
-  question.
-- Receipt time is when a fact first arrived. Reading it again is not a new
-  arrival.
-- Point-in-time checks on historical evidence are not relaxed.
-- No safety gate is loosened. Everything under "Preserve the system's
-  guarantees" applies unchanged; a fact arriving is not authority to trade.
+Not changed: point-in-time checks on historical evidence are not relaxed and
+no safety gate is loosened. Everything under "Preserve the system's
+guarantees" applies unchanged.
 
 For reviewers: this is the line review already draws between historical
-evidence and live use. A read for a past date goes through a receipt-aware
-reader, `store.observations.read_window_known_at`; a table that keeps only the
-newest value is a current view and serves today's read only.
+evidence and live use. `store.observations.read_window_known_at`, with
+`as_of_ts` for an instant, is one receipt-aware reader; another store
+qualifies when it proves an equivalent receipt contract.
 
 ## Development and verification
 
