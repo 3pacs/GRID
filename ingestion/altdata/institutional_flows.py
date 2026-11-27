@@ -105,6 +105,25 @@ _NEW_YORK = ZoneInfo("America/New_York")
 _ETF_REVISION_DAYS: int = 14
 _ETF_REVISION_REL_TOL: float = 1e-9
 
+# Two services run this writer (the Hermes operator's etf_flows tick and the
+# ingestion scheduler's ETF_Flows slots) and nothing kept them apart. For each
+# series the writer reads what is stored and then inserts what is new or
+# changed. raw_series' unique key includes pull_timestamp, so it does not stop
+# two writers storing the same date twice, and two writers that each read "100
+# is stored" could each write a revision of 100 with neither knowing of the
+# other. That read-and-insert now runs under one transaction-level advisory
+# lock (released by the commit or the rollback; there is no unlock to lose).
+# The second writer waits, then reads what the first committed. Its rows are
+# dated with the database clock read after the wait, not with its
+# transaction's start, which can be earlier than the first writer's.
+_ETF_WRITE_LOCK_KEY: int = _stable_lock_key("INSTITUTIONAL_FLOWS", "ETF-flow-write")
+_ETF_WRITE_LOCK_WAIT_S: int = 30
+_PG_LOCK_NOT_AVAILABLE = "55P03"
+
+
+class _EtfWriteLockBusy(RuntimeError):
+    """Another writer held the ETF flow write lock for the whole wait."""
+
 
 def _new_york_today() -> date:
     """Today's date on the exchange's clock. One name so a test can set it."""
@@ -1069,6 +1088,7 @@ class InstitutionalFlowsPuller(BasePuller):
                     rows_revised = 0
 
                     with self.engine.begin() as conn:
+                        received_at = self._serialize_etf_write(conn, budget)
                         existing_dates = self._get_existing_dates(series_id, conn)
                         stored_recent = self._latest_stored_etf_values(conn, series_id, revise_floor)
                         for idx, row in data.iterrows():
@@ -1102,6 +1122,7 @@ class InstitutionalFlowsPuller(BasePuller):
                                 obs_date=obs_date,
                                 value=value,
                                 raw_payload=payload,
+                                received_at=received_at,
                             )
                             rows_inserted += 1
 
@@ -1131,6 +1152,44 @@ class InstitutionalFlowsPuller(BasePuller):
             time.sleep(_YF_RATE_DELAY)
 
         return results
+
+    @staticmethod
+    def _serialize_etf_write(conn: Any, budget: _RunBudget | None = None) -> datetime | None:
+        """Take the ETF flow write lock for this transaction; return the receipt time.
+
+        Called first in the transaction that reads a series' stored values
+        and inserts (see ``_ETF_WRITE_LOCK_KEY``). It waits for another
+        writer at most ``_ETF_WRITE_LOCK_WAIT_S`` seconds, less when the
+        run's deadline is nearer, and raises ``_EtfWriteLockBusy`` when the
+        other writer still holds the lock then: nothing is written for the
+        series and the run reports it. The statements after it must see the
+        other writer's commit, which holds under READ COMMITTED (each
+        statement takes a new snapshot), the engine's default.
+
+        Returns the database clock read while the lock is held, for
+        ``_insert_raw(received_at=...)``; None on other dialects (the SQLite
+        test engines have one writer), which leaves ``pull_timestamp`` to its
+        default.
+        """
+        if conn.dialect.name != "postgresql":
+            return None
+        wait_s = _ETF_WRITE_LOCK_WAIT_S
+        left = budget.time_left() if budget is not None else None
+        if left is not None:
+            wait_s = max(1, min(wait_s, int(left)))
+        previous = conn.execute(text("SELECT current_setting('lock_timeout')")).scalar()
+        conn.execute(text("SELECT set_config('lock_timeout', :w, true)"), {"w": f"{wait_s}s"})
+        try:
+            conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _ETF_WRITE_LOCK_KEY})
+        except Exception as exc:
+            if getattr(getattr(exc, "orig", None), "pgcode", None) == _PG_LOCK_NOT_AVAILABLE:
+                raise _EtfWriteLockBusy(
+                    f"another ETF flow writer held the write lock for over {wait_s}s; "
+                    "nothing written for this series"
+                ) from exc
+            raise
+        conn.execute(text("SELECT set_config('lock_timeout', :w, true)"), {"w": previous})
+        return conn.execute(text("SELECT clock_timestamp()")).scalar()
 
     def _latest_stored_etf_values(self, conn: Any, series_id: str, floor: date) -> dict[date, float]:
         """Newest stored value per date on or after ``floor``.
@@ -2489,6 +2548,33 @@ class InstitutionalFlowsPuller(BasePuller):
         )
         floor = date.fromisoformat(revise_from) if isinstance(revise_from, str) else revise_from
         return self._pull_etf_flows(start, date.today(), revise_from=floor)
+
+    def pull_etf_recent(
+        self,
+        should_continue: Callable[[], bool] | None = None,
+        deadline_at: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pull the ETF flow proxies for the revision window only, inside a budget.
+
+        The short run: it considers the last ``_ETF_REVISION_DAYS`` days (the
+        dates a scheduled run stores or revises) and fetches about six weeks
+        of bars per ETF for the rolling windows, instead of every bar since
+        2020. A date older than the window that was never stored is left to
+        ``pull_etf_only``, the wide run.
+
+        Parameters:
+            should_continue: Returns False once the caller's budget is spent.
+            deadline_at: ``time.monotonic()`` instant of the same budget. No
+                ETF is started after it; the run then ends with one
+                ``stopped_by_budget`` PARTIAL item saying how many were read.
+
+        Returns:
+            List of result dicts for ETF flows.
+        """
+        start = _new_york_today() - timedelta(days=_ETF_REVISION_DAYS)
+        return self._pull_etf_flows(
+            start, date.today(), budget=_RunBudget(should_continue, deadline_at),
+        )
 
     def pull_13f_only(
         self,

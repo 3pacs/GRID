@@ -814,6 +814,7 @@ class BasePuller:
         pull_status: str = "SUCCESS",
         *,
         return_result: bool = False,
+        received_at: datetime | None = None,
     ) -> Any:
         """Insert a row into raw_series.
 
@@ -832,6 +833,12 @@ class BasePuller:
                 already-stored rows.
             return_result: Opt in to the exact execute result. The default
                 still returns None. A result does not acknowledge commit.
+            received_at: Opt in to an explicit ``pull_timestamp``. The default
+                leaves the column to its ``NOW()`` default, which is the
+                transaction's start. A writer that waits for a lock inside
+                its transaction passes the database clock read after the
+                wait, so its row is not dated before a row it was written
+                after.
         """
         # Legacy callers retain None; opt-in callers inspect affected rows.
         import json
@@ -839,19 +846,26 @@ class BasePuller:
         # Run sanity validation (log-only, never blocks)
         self.validate_row(series_id, obs_date, value)
 
-        result = conn.execute(
-            text(
+        params = {
+            "sid": series_id,
+            "src": self.source_id,
+            "od": obs_date,
+            "val": float(value) if value is not None else None,
+            "payload": json.dumps(raw_payload) if raw_payload else None,
+            "status": pull_status,
+        }
+        if received_at is None:
+            statement = (
                 "INSERT INTO raw_series "
                 "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
                 "VALUES (:sid, :src, :od, :val, :payload, :status)"
-            ),
-            {
-                "sid": series_id,
-                "src": self.source_id,
-                "od": obs_date,
-                "val": float(value) if value is not None else None,
-                "payload": json.dumps(raw_payload) if raw_payload else None,
-                "status": pull_status,
-            },
-        )
+            )
+        else:
+            statement = (
+                "INSERT INTO raw_series "
+                "(series_id, source_id, obs_date, value, raw_payload, pull_status, pull_timestamp) "
+                "VALUES (:sid, :src, :od, :val, :payload, :status, :received_at)"
+            )
+            params["received_at"] = received_at
+        result = conn.execute(text(statement), params)
         return result if return_result is True else None

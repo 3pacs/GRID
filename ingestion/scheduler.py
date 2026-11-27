@@ -772,6 +772,16 @@ EXTENDED_MONTHLY_SLOT_UTC = "06:00"
 # fallback if this slot is skipped.
 ETF_FLOWS_MORNING_SLOT_UTC = "05:35"
 ETF_FLOWS_GROUP = "etf_flows"
+# The scheduler is one thread: a job holds every job after it. The slot runs
+# the short ETF pull (the 14-day revision window, about six weeks of bars per
+# ETF) and gives it this long. No ETF is started after the deadline; the run
+# then ends PARTIAL and says how many were read. Measured in production
+# 2026-11-24..26: the wide 20:00Z run (every bar since 2020) took 13 to 14
+# seconds. The yfinance morning slot ahead of this one has held the loop
+# until between 05:38Z and 06:27Z, so this slot is usually released late; the
+# budget is what bounds how long it then holds the jobs behind it.
+ETF_FLOWS_MORNING_BUDGET_S = 300
+_ETF_FLOWS_DEADLINE_KEY = "ETF_FLOWS_DEADLINE_AT"
 EXTENDED_ANNUAL_SLOT_UTC = "06:30"
 # Scheduled yfinance runs request a window computed at call time: from
 # YFINANCE_WINDOW_OVERLAP_DAYS (3 calendar days, not trading days) before the
@@ -1463,9 +1473,15 @@ def _get_pullers_for_group(
     elif group_name == ETF_FLOWS_GROUP:
         # The ETF flow proxies alone, under the daily group's puller name so
         # pull_log has one ETF_Flows history (see ETF_FLOWS_MORNING_SLOT_UTC).
+        # The short pull, with the deadline the slot computed once (a retry
+        # of the group must not start a new one).
         try:
             from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
-            pullers.append(("ETF_Flows", InstitutionalFlowsPuller(db_engine), "pull_etf_only", {}))
+            deadline_at = (config or {}).get(_ETF_FLOWS_DEADLINE_KEY)
+            pullers.append((
+                "ETF_Flows", InstitutionalFlowsPuller(db_engine), "pull_etf_recent",
+                {} if deadline_at is None else {"deadline_at": deadline_at},
+            ))
         except Exception as exc:
             log.warning("ETF Flows puller init failed: {err}", err=str(exc))
 
@@ -2025,6 +2041,11 @@ def run_etf_flows_morning_slot(
     Saturday and Monday on Tuesday; Sunday, Monday and the day after a holiday
     skip. Same lateness guard as the yfinance morning slot.
 
+    The pull is the short one (``pull_etf_recent``: the revision window) and
+    gets ``ETF_FLOWS_MORNING_BUDGET_S`` from here, computed once so a retry of
+    the group cannot renew it. The lateness guard bounds when the slot may
+    start; this bounds how long it holds the scheduler's one thread.
+
     Parameters:
         db_engine: SQLAlchemy engine.
         slot: The "HH:MM" UTC slot this call was registered for.
@@ -2054,7 +2075,10 @@ def run_etf_flows_morning_slot(
         return None
 
     log.info("ETF flows morning slot: storing the ETF flow rows for {d}", d=prior_day)
-    return _with_db_retry(run_pull_group, ETF_FLOWS_GROUP, db_engine)
+    deadline_at = time.monotonic() + ETF_FLOWS_MORNING_BUDGET_S
+    return _with_db_retry(
+        run_pull_group, ETF_FLOWS_GROUP, db_engine, {_ETF_FLOWS_DEADLINE_KEY: deadline_at},
+    )
 
 
 def _completed_spy_close_window(

@@ -122,8 +122,69 @@ def test_the_group_is_the_etf_flows_puller_alone_under_its_daily_name(monkeypatc
     pullers = sched._get_pullers_for_group(sched.ETF_FLOWS_GROUP, engine, {})
 
     ((name, instance, method, kwargs),) = pullers
-    assert (name, method, kwargs) == ("ETF_Flows", "pull_etf_only", {})     # one pull_log history with the daily run
+    # One pull_log history with the daily run; the short pull, not the one from 2020.
+    assert (name, method, kwargs) == ("ETF_Flows", "pull_etf_recent", {})
     assert isinstance(instance, FakePuller) and instance.db_engine is engine
+
+    ((_, _, _, kwargs),) = sched._get_pullers_for_group(
+        sched.ETF_FLOWS_GROUP, engine, {sched._ETF_FLOWS_DEADLINE_KEY: 1234.5})
+    assert kwargs == {"deadline_at": 1234.5}
+
+
+# ── How long it may hold the scheduler's one thread ────────────────────────
+#
+# Codex review 6085724628: the slot ran pull_etf_only() with no deadline, and
+# the late-start guard bounds when it starts, not how long it runs.
+
+
+def test_the_slot_gives_the_pull_one_deadline_that_a_retry_does_not_renew(monkeypatch):
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(sched.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(sched.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+    monkeypatch.setattr(sched, "_slot_lateness", lambda *_a, **_k: timedelta(0))
+    seen: list[dict] = []
+
+    def _group_that_loses_its_connection_once(group_name, db_engine, config=None, *_a, **_k):
+        seen.append(dict(config))
+        clock["now"] += 40.0
+        if len(seen) == 1:
+            raise RuntimeError("server closed the connection unexpectedly")
+        return {"group": group_name}
+
+    monkeypatch.setattr(sched, "run_pull_group", _group_that_loses_its_connection_once)
+
+    sched.run_etf_flows_morning_slot(object(), now_utc=_slot(date(2026, 10, 17)))
+
+    deadline = 5000.0 + sched.ETF_FLOWS_MORNING_BUDGET_S
+    assert seen == [{sched._ETF_FLOWS_DEADLINE_KEY: deadline}] * 2          # the retry kept the first deadline
+    assert sched.ETF_FLOWS_MORNING_BUDGET_S == 300
+
+
+def test_the_group_hands_that_deadline_to_the_real_short_pull(monkeypatch):
+    """Through the real run_pull_group call shape: the deadline reaches
+    ``pull_etf_recent`` as ``deadline_at``, which starts no ETF after it."""
+    import inspect
+
+    from ingestion.altdata import institutional_flows as inst
+
+    accepted = inspect.signature(inst.InstitutionalFlowsPuller.pull_etf_recent).parameters
+    assert {"should_continue", "deadline_at"} <= set(accepted)
+
+    called: list[dict] = []
+
+    class RecordingPuller:
+        def __init__(self, db_engine):
+            pass
+
+        def pull_etf_recent(self, **kwargs):
+            called.append(kwargs)
+            return []
+
+    monkeypatch.setattr(inst, "InstitutionalFlowsPuller", RecordingPuller)
+    ((_, instance, method, kwargs),) = sched._get_pullers_for_group(
+        sched.ETF_FLOWS_GROUP, object(), {sched._ETF_FLOWS_DEADLINE_KEY: 77.0})
+    getattr(instance, method)(**kwargs)
+    assert called == [{"deadline_at": 77.0}]
 
 
 def test_the_daily_group_still_runs_etf_flows():
