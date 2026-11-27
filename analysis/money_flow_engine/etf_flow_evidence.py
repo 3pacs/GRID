@@ -40,6 +40,16 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def utc_today() -> date:
+    """The flow map's default ``as_of``, on the clock ``is_historical`` uses.
+
+    A builder that defaulted to ``date.today()`` would, on a host whose local
+    date is behind UTC, hand its own default to ``is_historical`` as a past
+    date and withhold today's view.
+    """
+    return _utc_today()
+
+
 def is_historical(as_of: date) -> bool:
     """True when ``as_of`` is a past date: current views must not be read."""
     return as_of < _utc_today()

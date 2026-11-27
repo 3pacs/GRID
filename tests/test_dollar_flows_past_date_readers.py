@@ -35,12 +35,16 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from analysis import money_flow_engine
-from analysis.money_flow_engine import etf_flow_evidence, layer_retail
+from analysis.money_flow_engine import etf_flow_evidence, layer_crypto, layer_market, layer_retail
 from intelligence import dollar_flows
+from intelligence.adapters.base import sid
 from intelligence.adapters.dollar_flows_adapter import DollarFlowsAdapter
+from intelligence.signal_registry import RegisteredSignal, SignalRegistry, SignalType
+from oracle.model_factory import ModelFactory, ModelSpec
+from oracle.signal_aggregator import SignalAggregator
 from tests import thirteenf_holdings_support as s
 
-NOV10, NOV19, NOV20, NOV24, NOV27 = (date(2026, 11, d) for d in (10, 19, 20, 24, 27))
+NOV10, NOV19, NOV20, NOV24, NOV26, NOV27 = (date(2026, 11, d) for d in (10, 19, 20, 24, 26, 27))
 _REQUIRE_ENV = "REQUIRE_DOLLAR_FLOWS_PG"
 
 
@@ -125,12 +129,10 @@ def test_a_rebuilt_row_whose_value_did_not_change_is_still_not_a_past_answer(eng
 
 
 @pytest.mark.parametrize("as_of", [None, NOV27], ids=["default", "today_named"])
-def test_todays_totals_are_unchanged(engine, today_is, monkeypatch, as_of):
+def test_todays_totals_are_unchanged(engine, today_is, as_of):
     _known_403_on_the_20th_then_rebuilt_as_490_on_the_24th(engine, "insider")
     _write(engine, "congressional", 90.0, NOV24, datetime(2026, 11, 24, 12, 0), direction="outflow")
     today_is(NOV27)
-    if as_of is None:
-        monkeypatch.setattr(dollar_flows, "date", type("_D", (date,), {"today": classmethod(lambda cls: NOV27)}))
 
     agg = dollar_flows.get_aggregate_flows(engine, days=30, as_of=as_of)
 
@@ -148,6 +150,80 @@ def test_a_future_as_of_is_not_a_past_date(engine, today_is):
     assert dollar_flows.is_past_as_of(NOV24) is False
     assert dollar_flows.is_past_as_of(None) is False
     assert dollar_flows.get_aggregate_flows(engine, days=30, as_of=NOV24)["total_inflow"] == 5.0
+
+
+# ── One clock: the default date and "is it past" agree on any host ─────────
+#
+# Codex review 6085725060: the default was date.today() (the host's local
+# date) while the classification used the UTC date. On a host behind UTC the
+# two differ every evening: the default named a day the same code calls past.
+
+
+@pytest.fixture()
+def host_clock_is_a_day_behind_utc(monkeypatch, today_is):
+    """UTC says 27 November; the host's local date is still the 26th."""
+    local = type("_LocalDate", (date,), {"today": classmethod(lambda cls: NOV26)})
+    for module in (dollar_flows, money_flow_engine, layer_retail, layer_market, layer_crypto):
+        monkeypatch.setattr(module, "date", local)
+    today_is(NOV27)
+
+
+def test_the_default_as_of_is_the_utc_date_the_classification_uses(engine, host_clock_is_a_day_behind_utc):
+    _write(engine, "insider", 490.0, NOV27, datetime(2026, 11, 27, 1, 0))
+
+    default = dollar_flows.get_aggregate_flows(engine, days=30)
+
+    # Before: as_of "2026-11-26" (the local date), and the 27 November row left out.
+    assert default["as_of"] == "2026-11-27" and default["withheld_reason"] is None
+    assert default["total_inflow"] == 490.0
+    # The date the default reports is one the same function answers when named.
+    assert dollar_flows.get_aggregate_flows(engine, days=30, as_of=NOV27) == default
+    assert dollar_flows.is_past_as_of(date.fromisoformat(default["as_of"])) is False
+
+
+def test_the_default_flow_map_is_todays_view_on_a_host_behind_utc(
+    engine, host_clock_is_a_day_behind_utc, other_retail_nodes
+):
+    _known_403_on_the_20th_then_rebuilt_as_490_on_the_24th(engine, "prediction_market")
+
+    def _prediction_markets(flow_map) -> dict:
+        return next(n for layer in flow_map.to_dict()["layers"] for n in layer["nodes"]
+                    if n["id"] == "prediction_markets")
+
+    # Before: the default as_of was the local 26th, classified as past, so
+    # today's own flow map withheld the node.
+    assert _prediction_markets(money_flow_engine.build_flow_map(engine))["value"] == 490.0
+    by_default = {n.id: n.value for n in layer_retail.build_retail_layer(engine).nodes}
+    assert by_default["prediction_markets"] == 490.0
+
+
+class _Reached(Exception):
+    pass
+
+
+@pytest.mark.parametrize("module, node_builder, layer_builder", [
+    (layer_market, "_build_etf_flows", "build_market_layer"),
+    (layer_crypto, "_build_btc_etf_flows_node", "build_crypto_layer"),
+], ids=["market", "crypto"])
+def test_the_other_classified_layers_default_to_the_same_clock(
+    engine, host_clock_is_a_day_behind_utc, monkeypatch, module, node_builder, layer_builder
+):
+    """The market and crypto layers withhold their ETF current views for a
+    past date (#1496). Their default date is today's, on that same clock."""
+    def _stop_at_the_etf_node(engine_, as_of):
+        raise _Reached(as_of)
+
+    for name, value in vars(module).items():              # earlier nodes read PostgreSQL-only SQL
+        if name.startswith("_build_") and callable(value) and name != node_builder:
+            monkeypatch.setattr(module, name, lambda engine_, as_of, *a, **k: None)
+    monkeypatch.setattr(module, node_builder, _stop_at_the_etf_node)
+
+    with pytest.raises(_Reached) as reached:
+        getattr(module, layer_builder)(engine)
+
+    # Before: 26 November, which is_historical calls past.
+    assert reached.value.args == (NOV27,)
+    assert etf_flow_evidence.is_historical(reached.value.args[0]) is False
 
 
 # ── Flow map: prediction markets node ──────────────────────────────────────
@@ -378,6 +454,98 @@ def test_real_types_adapter_leaves_13f_rows_out(pg_engine):
     _write(pg_engine, "insider", 400_000.0, NOV24, _utc(24), ticker="XOM")
 
     assert _signals(pg_engine, _utc(27, hour=8)) == {"XOM": 400_000.0}
+
+
+# ── Changeover: 13F signals registered before the change ───────────────────
+#
+# Codex review 6085725060: the registry appends and never invalidates, so
+# 13F signals registered by the previous adapter stay active until their
+# four-hour valid_until, whatever the corrected adapter does. The case below
+# is that changeover with synthetic evidence, through the real registry
+# writer, the real model read and the real aggregator.
+
+_MODEL_TABLES = (
+    "CREATE TABLE oracle_models (name TEXT PRIMARY KEY, active BOOLEAN DEFAULT TRUE)",
+    """CREATE TABLE signal_registry (
+        id BIGSERIAL PRIMARY KEY, signal_id TEXT NOT NULL, source_module TEXT NOT NULL,
+        signal_type TEXT NOT NULL, ticker TEXT, direction TEXT NOT NULL,
+        value DOUBLE PRECISION NOT NULL, z_score DOUBLE PRECISION,
+        confidence DOUBLE PRECISION NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        valid_from TIMESTAMPTZ NOT NULL, valid_until TIMESTAMPTZ,
+        freshness_hours DOUBLE PRECISION, metadata JSONB, provenance TEXT,
+        UNIQUE (signal_id, valid_from))""",
+)
+
+
+def _as_the_previous_adapter_registered(ticker: str | None, usd: float, at: datetime) -> RegisteredSignal:
+    return RegisteredSignal(
+        signal_id=sid("dollar_flows", "magnitude", ticker or "market", "13f", str(at.date())),
+        source_module="dollar_flows", signal_type=SignalType.MAGNITUDE, ticker=ticker,
+        direction="neutral", value=usd, z_score=None, confidence=0.5,
+        valid_from=at, valid_until=at + timedelta(hours=4), freshness_hours=0.0,
+        metadata={"source_type": "13f", "flow_count": 1, "amount_usd": usd},
+        provenance=f"dollar_flows:13f:{ticker or ''}",
+    )
+
+
+def test_real_types_13f_signals_registered_before_the_change_last_four_hours_and_no_longer(
+    pg_engine, monkeypatch
+):
+    monkeypatch.setenv("GRID_SIGNAL_REGISTRY", "1")
+    with pg_engine.begin() as conn:
+        for ddl in _MODEL_TABLES:
+            conn.execute(text(ddl))
+        conn.execute(text("INSERT INTO oracle_models (name, active) VALUES ('m', TRUE)"))
+    spec = ModelSpec(name="m", signal_sources=["dollar_flows", "feature:equity"], min_signals=3)
+    factory = ModelFactory.__new__(ModelFactory)
+    factory.engine = pg_engine
+    factory.get_model_spec = lambda name: spec
+
+    last_old_run = _utc(27, hour=8)
+    SignalRegistry.register([
+        _as_the_previous_adapter_registered(None, 7_022_705_633_749.0, last_old_run),
+        _as_the_previous_adapter_registered("AAPL", 2_283_782_911.0, last_old_run),
+        RegisteredSignal(
+            signal_id=sid("feature:equity", "AAPL"), source_module="feature:equity",
+            signal_type=SignalType.DIRECTIONAL, ticker="AAPL", direction="bullish", value=0.6,
+            z_score=0.6, confidence=0.9, valid_from=last_old_run,
+            valid_until=last_old_run + timedelta(days=1)),
+    ], pg_engine)
+
+    # The corrected adapter runs an hour later over the same stored 13F rows.
+    _rows_shaped_like_production(pg_engine)
+    first_new_run = last_old_run + timedelta(hours=1)
+    corrected = DollarFlowsAdapter()._build_signals(pg_engine, first_new_run)
+    assert corrected == [] and SignalRegistry.register(corrected, pg_engine) == 0
+
+    def _vote(as_of: datetime):
+        signals = factory.get_signals_for_model("m", as_of, ticker="AAPL")
+        return signals, SignalAggregator().aggregate(signals, spec.weight_config, as_of)
+
+    # Carryover: until the old rows' valid_until the model still receives them.
+    signals, vote = _vote(last_old_run + timedelta(hours=3, minutes=59))
+    assert sorted((sig["source_module"], sig["ticker"] or "", sig["direction"]) for sig in signals) == [
+        ("dollar_flows", "", "neutral"), ("dollar_flows", "AAPL", "neutral"),
+        ("feature:equity", "AAPL", "bullish")]
+    assert len(signals) >= spec.min_signals                       # the model votes on AAPL
+    assert (vote.signal_count, vote.neutral_count, vote.direction) == (3, 2, "bullish")
+    assert vote.strength == pytest.approx(0.2)                    # 0.6 diluted over three entries
+    assert vote.confidence == pytest.approx((0.5 + 0.5 + 0.9) / 3, abs=1e-4)
+
+    # Four hours after the last run of the previous adapter they are gone, and
+    # nothing the corrected adapter wrote replaces them.
+    signals, vote = _vote(last_old_run + timedelta(hours=4))
+    assert [sig["source_module"] for sig in signals] == ["feature:equity"]
+    assert len(signals) < spec.min_signals                        # OracleEngine.predict skips the model here
+    assert (vote.signal_count, vote.neutral_count) == (1, 0)
+    assert vote.strength == pytest.approx(0.6) and vote.confidence == pytest.approx(0.9)
+
+    with pg_engine.connect() as conn:
+        still_valid = conn.execute(text(
+            "SELECT count(*) FROM signal_registry WHERE source_module = 'dollar_flows' "
+            "AND provenance LIKE 'dollar_flows:13f:%' AND valid_until > :t"),
+            {"t": last_old_run + timedelta(hours=4)}).scalar()
+    assert still_valid == 0                                       # the changeover check, as a query
 
 
 def test_real_types_past_and_current_reads(pg_engine, today_is):

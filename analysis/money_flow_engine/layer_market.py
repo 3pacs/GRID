@@ -13,7 +13,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from .etf_flow_evidence import RAW_SOURCE, is_historical, known_5d_flows
+from .etf_flow_evidence import RAW_SOURCE, is_historical, known_5d_flows, utc_today
 from .types import FlowLayer, FlowNode
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
@@ -363,7 +363,7 @@ def build_market_layer(engine: Engine, as_of: date | None = None) -> FlowLayer:
         Immutable ``FlowLayer`` with all market-level flow nodes.
     """
     if as_of is None:
-        as_of = date.today()
+        as_of = utc_today()
 
     # Build price nodes from the ticker registry
     price_nodes = tuple(

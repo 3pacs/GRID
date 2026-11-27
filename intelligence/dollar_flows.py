@@ -2129,7 +2129,8 @@ def get_aggregate_flows(
     Parameters:
         engine: SQLAlchemy engine.
         days: Lookback window in days (default 30).
-        as_of: Optional upper bound on ``flow_date`` (defaults to today).
+        as_of: Optional upper bound on ``flow_date`` (defaults to today's
+            UTC date).
             A past date is not answered: the table is a current view (see
             ``CURRENT_VIEW_WITHHELD_REASON``), so the totals come back as
             ``None`` with ``withheld_reason`` set and no row is read.
@@ -2160,7 +2161,9 @@ def get_aggregate_flows(
         }
 
     _ensure_table(engine)
-    ref_date = as_of or date.today()
+    # The same clock is_past_as_of uses: on a host whose local date is behind
+    # UTC, date.today() would default to a day this function calls past.
+    ref_date = as_of or _utc_today()
     cutoff = ref_date - timedelta(days=days)
 
     with engine.connect() as conn:

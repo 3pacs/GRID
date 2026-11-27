@@ -13,7 +13,7 @@ from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from .etf_flow_evidence import is_historical
+from .etf_flow_evidence import is_historical, utc_today
 from .helpers import (
     _get_series_latest,
     compute_changes,
@@ -302,7 +302,7 @@ def _build_qq_wsb_sentiment(engine: Engine, as_of: date) -> FlowNode:
 def build_retail_layer(engine: Engine, as_of: date | None = None) -> FlowLayer:
     """Assemble the complete Retail layer."""
     if as_of is None:
-        as_of = date.today()
+        as_of = utc_today()
 
     logger.info("Building retail layer as_of={}", as_of)
 
