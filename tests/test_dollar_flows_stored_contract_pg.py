@@ -36,8 +36,33 @@ pytestmark = pytest.mark.xdist_group("postgres")
 
 _REQUIRE_ENV = "REQUIRE_DOLLAR_FLOWS_CONTRACT_PG"
 _MIGRATION = "migrations.versions.df_13f_observed_20261127"
-TODAY = date.today()
+_RealDate = date
+TODAY = date(2026, 11, 27)
 YESTERDAY = TODAY - timedelta(days=1)
+
+class _FrozenDateMeta(type):
+    def __instancecheck__(cls, obj):
+        return isinstance(obj, _RealDate)
+
+
+class _FrozenDate(_RealDate, metaclass=_FrozenDateMeta):
+    """``date`` for the writer module with ``today()`` pinned; real dates stay instances."""
+
+    def __new__(cls, *args, **kwargs):
+        # Dates the module builds stay real dates (drivers bind the exact type).
+        return _RealDate(*args, **kwargs)
+
+    @classmethod
+    def today(cls):
+        return TODAY
+
+
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch):
+    # No test here reads the real clock: the writer's window and future-date
+    # guard use ``date.today()``, pinned to TODAY for every case.
+    monkeypatch.setattr(dollar_flows, "date", _FrozenDate)
+
 
 # Production's table before the revision (no CHECK).
 _PRE_REVISION_DDL = """

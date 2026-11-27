@@ -29,9 +29,34 @@ from intelligence import dollar_flows
 from scripts import run_dollar_flows
 
 REPO = Path(__file__).resolve().parent.parent
-TODAY = date.today()
+_RealDate = date
+TODAY = date(2026, 11, 27)
 YESTERDAY = TODAY - timedelta(days=1)
 OLD = TODAY - timedelta(days=21)
+
+class _FrozenDateMeta(type):
+    def __instancecheck__(cls, obj):
+        return isinstance(obj, _RealDate)
+
+
+class _FrozenDate(_RealDate, metaclass=_FrozenDateMeta):
+    """``date`` for the writer module with ``today()`` pinned; real dates stay instances."""
+
+    def __new__(cls, *args, **kwargs):
+        # Dates the module builds stay real dates (drivers bind the exact type).
+        return _RealDate(*args, **kwargs)
+
+    @classmethod
+    def today(cls):
+        return TODAY
+
+
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch):
+    # No test here reads the real clock: the writer's window and future-date
+    # guard use ``date.today()``, pinned to TODAY for every case.
+    monkeypatch.setattr(dollar_flows, "date", _FrozenDate)
+
 
 # Production's table before revision df_13f_observed_20261127: no CHECK.
 _PRE_REVISION_DDL = """
