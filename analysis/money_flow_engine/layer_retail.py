@@ -13,6 +13,7 @@ from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from .etf_flow_evidence import is_historical, utc_today
 from .helpers import (
     _get_series_latest,
     compute_changes,
@@ -183,7 +184,32 @@ def _build_retail_fund_flows_node(engine: Engine, as_of: date) -> FlowNode:
 
 
 def _build_prediction_markets_node(engine: Engine, as_of: date) -> FlowNode:
-    """Prediction market flows from dollar_flows table."""
+    """Prediction market flows from dollar_flows table.
+
+    ``dollar_flows`` is rewritten on each normalization and keeps no record of
+    when a row was first known, so it cannot say what it held on a past date.
+    For a past ``as_of`` the node has no value: neither today's rows nor the
+    fixed size estimate used when today's read finds nothing.
+    """
+    if is_historical(as_of):
+        from intelligence.dollar_flows import CURRENT_VIEW_WITHHELD_REASON
+
+        return FlowNode(
+            id="prediction_markets",
+            label="Prediction Markets",
+            layer=_LAYER_ID,
+            value=None,
+            confidence="estimated",
+            unit="USD",
+            source="dollar_flows:prediction_market",
+            metadata={
+                "lookback_days": 30,
+                "evidence": "withheld",
+                "current_views_withheld": True,
+                "withheld_reason": CURRENT_VIEW_WITHHELD_REASON,
+            },
+        )
+
     total_flow: float | None = None
     confidence = "estimated"
     source = "estimate"
@@ -222,7 +248,7 @@ def _build_prediction_markets_node(engine: Engine, as_of: date) -> FlowNode:
         confidence=confidence,
         unit="USD",
         source=source,
-        metadata={"lookback_days": 30},
+        metadata={"lookback_days": 30, "evidence": "current_view" if source != "estimate" else "fixed_estimate"},
     )
 
 
@@ -276,7 +302,7 @@ def _build_qq_wsb_sentiment(engine: Engine, as_of: date) -> FlowNode:
 def build_retail_layer(engine: Engine, as_of: date | None = None) -> FlowLayer:
     """Assemble the complete Retail layer."""
     if as_of is None:
-        as_of = date.today()
+        as_of = utc_today()
 
     logger.info("Building retail layer as_of={}", as_of)
 
