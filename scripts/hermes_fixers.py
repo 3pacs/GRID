@@ -241,6 +241,14 @@ REPAIR_OVERRAN_REASON = "repair exceeded the per-source cap"
 SLOW_RUN_LOOKBACK_DAYS = 30
 SLOW_RUN_MIN_RUNS = 3
 SLOW_RUN_REFRESH_SECONDS = 3600.0
+# A failed read of the run times is tried again after this long, doubling for
+# each further failure in a row up to the refresh interval, so a failing read
+# is not repeated on every pass.
+SLOW_RUN_RETRY_SECONDS = 300.0
+# Run times older than this hold nothing: a hold must not outlive its
+# evidence. Six missed hourly refreshes; the 30-day counts move slowly, but
+# beyond that the last read is not known to be current.
+SLOW_RUN_MAX_AGE_SECONDS = 6 * 3600.0
 
 _REPAIR_SCHEDULE_LOCK = threading.Lock()
 # source_key -> monotonic time the last repair attempt for it started.
@@ -269,12 +277,16 @@ _REPAIR_RECOVERED_AT: dict[str, datetime] = {}
 # OPERATOR_ISSUE_DEDUPE_HOURS). Not persisted: the cost of a restart is one
 # log line per failing guest, and there is one guest today.
 _UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
-# "read_at": monotonic time pull_log was last read for run times (None: not
-# yet); "runs": registry name -> (runs longer than the repair cap, completed
-# runs). Process memory, but only a cache of pull_log: the first pass after a
-# restart reads it again, so a restart does not forget which sources are too
-# slow.
-_SCHEDULED_RUNS: dict[str, Any] = {"read_at": None, "runs": {}}
+# The last read of scheduled run times from pull_log. "runs": registry name
+# -> (runs longer than the repair cap, completed runs); "good_at": monotonic
+# time of the last read that succeeded (None: none yet); "attempt_at": of the
+# last read tried, good or not; "failed_reads": failed reads in a row since
+# the last good one. Process memory, but only a cache of pull_log: the first
+# pass after a restart reads it again, so a restart does not forget which
+# sources are too slow.
+_SCHEDULED_RUNS: dict[str, Any] = {
+    "runs": {}, "good_at": None, "attempt_at": None, "failed_reads": 0,
+}
 
 # Exception classes that mean "this retry will fail the same way next time"
 # (a code or wiring defect, not a transient provider condition). TypeError
@@ -514,33 +526,73 @@ def _read_scheduled_runs(engine: Any) -> dict[str, tuple[int, int]]:
     }
 
 
-def _scheduled_runs(engine: Any) -> dict[str, tuple[int, int]]:
-    """_read_scheduled_runs, read at most once per SLOW_RUN_REFRESH_SECONDS.
+def _scheduled_run_retry_seconds(failed_reads: int) -> float:
+    """How long after the ``failed_reads``-th failed read in a row the next is tried."""
+    doublings = min(max(failed_reads, 1) - 1, 16)
+    return min(SLOW_RUN_RETRY_SECONDS * (2 ** doublings), SLOW_RUN_REFRESH_SECONDS)
 
-    A failed read keeps the last good one (empty before the first) and is
-    tried again on the next pass: without run times no source is held as too
-    slow, which is the behaviour before this rule existed.
+
+def _scheduled_runs(engine: Any) -> tuple[dict[str, tuple[int, int]], str | None]:
+    """(run times to decide on, what is stale about them or None).
+
+    pull_log is read again SLOW_RUN_REFRESH_SECONDS after a good read. A
+    failed read counts as an attempt: the next one waits
+    _scheduled_run_retry_seconds, so a failing read is not repeated every
+    pass. While reads fail, the last good read is used and the second value
+    says how old it is, so a hold resting on it says so. Once it is older
+    than SLOW_RUN_MAX_AGE_SECONDS it is not used at all: the result is empty,
+    no source is held as too slow, and repairs run as they did before this
+    rule (the overrun count still applies). Before the first good read there
+    is nothing to use either.
     """
     now = time.monotonic()
     with _REPAIR_SCHEDULE_LOCK:
-        read_at = _SCHEDULED_RUNS["read_at"]
-        cached = _SCHEDULED_RUNS["runs"]
-    if read_at is not None and now - read_at < SLOW_RUN_REFRESH_SECONDS:
-        return cached
-    try:
-        runs = _read_scheduled_runs(engine)
-    except Exception as exc:
+        runs = _SCHEDULED_RUNS["runs"]
+        good_at = _SCHEDULED_RUNS["good_at"]
+        attempt_at = _SCHEDULED_RUNS["attempt_at"]
+        failed_reads = _SCHEDULED_RUNS["failed_reads"]
+    if attempt_at is None:
+        due = True
+    elif failed_reads:
+        due = now - attempt_at >= _scheduled_run_retry_seconds(failed_reads)
+    else:
+        due = now - attempt_at >= SLOW_RUN_REFRESH_SECONDS
+    if due:
+        try:
+            fresh = _read_scheduled_runs(engine)
+        except Exception as exc:
+            failed_reads += 1
+            with _REPAIR_SCHEDULE_LOCK:
+                _SCHEDULED_RUNS["attempt_at"] = now
+                _SCHEDULED_RUNS["failed_reads"] = failed_reads
+            _warn_throttled(
+                "scheduled_runs_read",
+                "Scheduled run times not read ({kind}); {n} failed read(s) in a row, "
+                "next try in {m:.0f} min",
+                kind=type(exc).__name__, n=failed_reads,
+                m=_scheduled_run_retry_seconds(failed_reads) / 60,
+            )
+        else:
+            with _REPAIR_SCHEDULE_LOCK:
+                _SCHEDULED_RUNS.update(runs=fresh, good_at=now, attempt_at=now, failed_reads=0)
+            return fresh, None
+    if good_at is None:
+        return {}, None
+    age = now - good_at
+    if age > SLOW_RUN_MAX_AGE_SECONDS:
         _warn_throttled(
-            "scheduled_runs",
-            "Scheduled run times unavailable ({kind}); no source is held as too slow "
-            "for a repair beyond the last read",
-            kind=type(exc).__name__,
+            "scheduled_runs_expired",
+            "Scheduled run times were last read {h:.1f}h ago (limit {m:.0f}h, {n} failed "
+            "read(s) since): too old to decide on, so no source is held as too slow for a "
+            "repair until a read succeeds",
+            h=age / 3600, m=SLOW_RUN_MAX_AGE_SECONDS / 3600, n=failed_reads,
         )
-        return cached
-    with _REPAIR_SCHEDULE_LOCK:
-        _SCHEDULED_RUNS["read_at"] = now
-        _SCHEDULED_RUNS["runs"] = runs
-    return runs
+        return {}, None
+    if failed_reads:
+        return runs, (
+            f"run times last read {age / 60:.0f} min ago; {failed_reads} read(s) failed since"
+        )
+    return runs, None
 
 
 def _repeats_scheduled_run(source_name: str) -> tuple[str, dict[str, Any]] | None:
@@ -604,7 +656,12 @@ def _slow_repair_reason(source_name: str, engine: Any) -> str | None:
 
     The rule: more than half of the source's completed scheduled runs in the
     last SLOW_RUN_LOOKBACK_DAYS took longer than the cap, and a repair would
-    make the same call with no way to stop or narrow it.
+    make the same call with no way to stop or narrow it. That is a screen,
+    not proof that a repair could never finish: SEC_XBRL_Financials has runs
+    of under a second beside its three-minute ones. So the hold is bounded on
+    every side: it follows the last 30 days of runs and lifts when most of
+    them fit, it is re-read hourly, and it lapses when the read is older than
+    SLOW_RUN_MAX_AGE_SECONDS (_scheduled_runs).
 
     Decided from the runs, not from the registry's ``timeout_s``: that is a
     ceiling, and 53 of the 85 pulls that cannot be stopped have one above the
@@ -620,7 +677,8 @@ def _slow_repair_reason(source_name: str, engine: Any) -> str | None:
     if resolved is None:
         return None
     registry_name, entry = resolved
-    measured = _scheduled_runs(engine).get(registry_name)
+    runs, stale = _scheduled_runs(engine)
+    measured = runs.get(registry_name)
     if measured is None:
         return None
     over_cap, completed = measured
@@ -631,6 +689,7 @@ def _slow_repair_reason(source_name: str, engine: Any) -> str | None:
         f"{SLOW_RUN_LOOKBACK_DAYS} days took longer than the {PER_SOURCE_REPAIR_SECONDS:.0f}s "
         "a repair may run, and a repair would start the same pull with no way to stop it; "
         "its scheduled run is its only repair"
+        + (f" ({stale})" if stale else "")
     )
 
 
@@ -2723,11 +2782,15 @@ def diagnose_and_fix_pulls(
 
     held = _held_source_names()
     not_held = [r for r in failed if _normalize_source_key(r[0] or "") not in held]
+    still_failed = [r for r in not_held if not _recovered_after(r[0] or "", r[2])]
     # A source whose own scheduled run does not fit in a repair is not
     # repaired either (_slow_repair_reason). Unlike a held source it still
-    # runs and can still fail, so each new failure is reported once.
+    # runs and can still fail, so each new failure is reported once. Asked
+    # only of failures that are still open: one a repair or a stale refresh
+    # has already recovered (_recovered_after; the query itself drops one
+    # followed by a successful scheduled run) is not reported as failed.
     too_slow = {
-        r[0]: reason for r in not_held
+        r[0]: reason for r in still_failed
         if r[0] and (reason := _slow_repair_reason(r[0], engine)) is not None
     }
     if too_slow:
@@ -2736,18 +2799,18 @@ def diagnose_and_fix_pulls(
             engine,
             [{"source": r[0], "last_fail": r[2].isoformat() if r[2] else None,
               "last_error": (r[3] or "")[:200], "not_repaired_reason": too_slow[r[0]]}
-             for r in not_held if r[0] in too_slow],
+             for r in still_failed if r[0] in too_slow],
             state, dry_run,
         )
-        not_held = [r for r in not_held if r[0] not in too_slow]
-    still_failed = [r for r in not_held if not _recovered_after(r[0] or "", r[2])]
-    if len(still_failed) < len(failed):
+    repairable = [r for r in still_failed if r[0] not in too_slow]
+    if len(repairable) < len(failed):
         log.info(
             "Not repairing held or scheduled-run-only sources {h} or sources a repair already "
             "recovered since their last failure {r}",
-            h=sorted({r[0] for r in failed} - {r[0] for r in not_held}),
+            h=sorted(({r[0] for r in failed} - {r[0] for r in not_held}) | set(too_slow)),
             r=sorted({r[0] for r in not_held} - {r[0] for r in still_failed}),
         )
+    still_failed = repairable
     failed = still_failed
 
     if not pull_log_available:

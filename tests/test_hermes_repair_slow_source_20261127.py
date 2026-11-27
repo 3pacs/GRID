@@ -40,6 +40,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -69,6 +70,22 @@ RUNS_20261127: dict[str, tuple[int, int]] = {
 }
 
 
+_NEVER_READ = {"runs": {}, "good_at": None, "attempt_at": None, "failed_reads": 0}
+
+
+def _forget_the_read() -> None:
+    """What a restart does to the run times: the cache is gone, pull_log is not."""
+    hf._SCHEDULED_RUNS.update(_NEVER_READ)
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    """hermes_fixers' monotonic clock, moved by hand: clock.now += seconds."""
+    fake = SimpleNamespace(now=10_000.0)
+    monkeypatch.setattr(hf, "time", SimpleNamespace(monotonic=lambda: fake.now))
+    return fake
+
+
 @pytest.fixture(autouse=True)
 def _fresh_schedule(monkeypatch):
     monkeypatch.setattr(hf, "_REPAIR_LAST_STARTED", {})
@@ -79,7 +96,7 @@ def _fresh_schedule(monkeypatch):
     monkeypatch.setattr(hf, "_REPAIR_RECOVERED_AT", {})
     monkeypatch.setattr(hf, "_REPAIRS_IN_FLIGHT", {})
     monkeypatch.setattr(hf, "_UNROUTED_FAILURES_REPORTED", {})
-    monkeypatch.setattr(hf, "_SCHEDULED_RUNS", {"read_at": None, "runs": {}})
+    monkeypatch.setattr(hf, "_SCHEDULED_RUNS", dict(_NEVER_READ))
     monkeypatch.setattr(hf, "_relation_exists", lambda *_a: True)
     monkeypatch.setattr(hf, "log_issue", MagicMock())
     monkeypatch.setattr(hf, "resolve_source_issues", MagicMock(return_value=0))
@@ -245,12 +262,26 @@ def test_exactly_half_is_not_most_and_too_few_runs_are_not_evidence(monkeypatch)
     engine = MagicMock()
     _measured(monkeypatch, {"quiverquant": (5, 10)})
     assert hf._slow_repair_reason("quiverquant", engine) is None
-    hf._SCHEDULED_RUNS["read_at"] = None
+    _forget_the_read()
     _measured(monkeypatch, {"quiverquant": (6, 10)})
     assert hf._slow_repair_reason("quiverquant", engine) is not None
-    hf._SCHEDULED_RUNS["read_at"] = None
+    _forget_the_read()
     _measured(monkeypatch, {})                    # under SLOW_RUN_MIN_RUNS: the query returns no row
     assert hf._slow_repair_reason("quiverquant", engine) is None
+
+
+@pytest.mark.parametrize("over, completed, held", [
+    (7, 11, True),      # as read on 2026-11-27: four runs of under a second, seven of three minutes
+    (6, 11, True),
+    (5, 11, False),     # one more week of quick runs and the hold lifts by itself
+    (0, 11, False),
+])
+def test_a_source_with_quick_runs_beside_slow_ones_is_held_only_while_most_are_slow(
+    monkeypatch, over, completed, held
+):
+    """The majority is a screen, not proof: SEC_XBRL_Financials is bimodal."""
+    _measured(monkeypatch, {"sec_xbrl_financials": (over, completed)})
+    assert (hf._slow_repair_reason("SEC_XBRL_Financials", MagicMock()) is not None) is held
 
 
 def test_the_sources_held_on_the_production_run_times_of_20261127(monkeypatch):
@@ -285,7 +316,7 @@ def test_the_sources_held_on_the_production_run_times_of_20261127(monkeypatch):
     }
 
 
-def test_run_times_are_read_once_an_hour_and_only_for_a_candidate(monkeypatch):
+def test_run_times_are_read_once_an_hour_and_only_for_a_candidate(monkeypatch, clock):
     reads = _measured(monkeypatch, RUNS_20261127)
     engine = MagicMock()
 
@@ -297,28 +328,115 @@ def test_run_times_are_read_once_an_hour_and_only_for_a_candidate(monkeypatch):
     assert hf._slow_repair_reason("SEC_XBRL_Financials", engine) is not None
     assert reads == [1]
 
-    hf._SCHEDULED_RUNS["read_at"] -= hf.SLOW_RUN_REFRESH_SECONDS
+    clock.now += hf.SLOW_RUN_REFRESH_SECONDS - 1
+    assert hf._slow_repair_reason("quiverquant", engine) is not None
+    assert reads == [1]
+    clock.now += 1
     assert hf._slow_repair_reason("quiverquant", engine) is not None
     assert reads == [1, 1]
     engine.connect.assert_not_called()            # _read_scheduled_runs is the only reader
 
 
-def test_a_failed_read_holds_nothing_new_and_is_tried_again(monkeypatch):
+# ── the hold does not outlive its evidence ─────────────────────────────────
+
+
+def _failing_read(monkeypatch) -> MagicMock:
+    read = MagicMock(side_effect=RuntimeError("pool exhausted"))
+    monkeypatch.setattr(hf, "_read_scheduled_runs", read)
+    return read
+
+
+def _warnings(monkeypatch) -> list[str]:
+    seen: list[str] = []
+    monkeypatch.setattr(hf.log, "warning", lambda template, **kw: seen.append(template.format(**kw)))
+    return seen
+
+
+def test_with_no_read_yet_nothing_is_held_and_a_failing_read_backs_off(monkeypatch, clock):
     engine = MagicMock()
-    warnings: list[str] = []
-    monkeypatch.setattr(hf.log, "warning", lambda template, **kw: warnings.append(template.format(**kw)))
-    monkeypatch.setattr(hf, "_read_scheduled_runs", MagicMock(side_effect=RuntimeError("pool exhausted")))
+    warnings = _warnings(monkeypatch)
+    read = _failing_read(monkeypatch)
 
-    assert hf._slow_repair_reason("quiverquant", engine) is None       # nothing known: repair as before
-    assert hf._slow_repair_reason("quiverquant", engine) is None
-    assert hf._read_scheduled_runs.call_count == 2                     # not cached as an answer
+    for _pass in range(5):                                             # five passes inside the first wait
+        assert hf._slow_repair_reason("quiverquant", engine) is None   # nothing known: repair as before
+        clock.now += 59
+    assert read.call_count == 1, "a failed read is an attempt: it is not repeated on every pass"
     assert len(warnings) == 1 and "RuntimeError" in warnings[0] and "pool exhausted" not in warnings[0]
+    assert "next try in 5 min" in warnings[0]
 
+    waits = []
+    for _ in range(6):                                                 # each failure doubles the wait
+        wait = hf._scheduled_run_retry_seconds(hf._SCHEDULED_RUNS["failed_reads"])
+        waits.append(wait)
+        clock.now = hf._SCHEDULED_RUNS["attempt_at"] + wait - 1
+        before = read.call_count
+        assert hf._slow_repair_reason("quiverquant", engine) is None
+        assert read.call_count == before, "not before the wait is over"
+        clock.now += 1
+        assert hf._slow_repair_reason("quiverquant", engine) is None
+        assert read.call_count == before + 1
+    assert waits == [300.0, 600.0, 1200.0, 2400.0, 3600.0, 3600.0], "capped at the refresh interval"
+    assert hf._scheduled_run_retry_seconds(10_000) == hf.SLOW_RUN_REFRESH_SECONDS
+
+    _measured(monkeypatch, RUNS_20261127)                              # the read works again
+    clock.now += hf.SLOW_RUN_REFRESH_SECONDS
+    reason = hf._slow_repair_reason("quiverquant", engine)
+    assert reason is not None and "failed since" not in reason
+    assert hf._SCHEDULED_RUNS["failed_reads"] == 0
+
+
+def test_a_hold_on_an_old_read_says_so_lapses_at_the_age_limit_and_returns_with_a_good_read(
+    monkeypatch, clock
+):
+    engine = MagicMock()
     _measured(monkeypatch, RUNS_20261127)
-    assert hf._slow_repair_reason("quiverquant", engine) is not None
-    monkeypatch.setattr(hf, "_read_scheduled_runs", MagicMock(side_effect=RuntimeError("down again")))
-    hf._SCHEDULED_RUNS["read_at"] -= hf.SLOW_RUN_REFRESH_SECONDS
-    assert hf._slow_repair_reason("quiverquant", engine) is not None   # the last good read is kept
+    fresh = hf._slow_repair_reason("quiverquant", engine)
+    assert fresh is not None and fresh.endswith("its scheduled run is its only repair")
+    read_at = clock.now
+
+    warnings = _warnings(monkeypatch)
+    read = _failing_read(monkeypatch)
+    clock.now = read_at + hf.SLOW_RUN_REFRESH_SECONDS                  # the hourly refresh fails
+    stale = hf._slow_repair_reason("quiverquant", engine)
+    assert stale == fresh + " (run times last read 60 min ago; 1 read(s) failed since)"
+    assert hf._slow_repair_reason("GoogleTrends", engine) is None      # still decided per source
+
+    clock.now = read_at + hf.SLOW_RUN_MAX_AGE_SECONDS                  # at the limit: still used
+    at_limit = hf._slow_repair_reason("quiverquant", engine)
+    assert at_limit is not None and "run times last read 360 min ago" in at_limit
+    assert not any("too old" in w for w in warnings)
+
+    clock.now += 1                                                     # past it: not used at all
+    attempts = read.call_count
+    assert hf._slow_repair_reason("quiverquant", engine) is None
+    assert hf._slow_repair_reason("SEC_XBRL_Financials", engine) is None
+    assert read.call_count <= attempts + 1, "and still not re-read on every call"
+    lapsed = [w for w in warnings if "too old to decide on" in w]
+    assert len(lapsed) == 1 and "last read 6.0h ago (limit 6h" in lapsed[0]
+    assert "no source is held as too slow" in lapsed[0]
+
+    _measured(monkeypatch, {**RUNS_20261127, "quiverquant": (2, 38)})  # the read returns; the source changed
+    clock.now += hf.SLOW_RUN_REFRESH_SECONDS
+    assert hf._slow_repair_reason("quiverquant", engine) is None       # decided on the new read, not the old
+    assert hf._slow_repair_reason("SEC_XBRL_Financials", engine) == (
+        "7 of its 11 completed scheduled runs in the last 30 days took longer than the 60s a repair "
+        "may run, and a repair would start the same pull with no way to stop it; "
+        "its scheduled run is its only repair")
+    assert hf._SCHEDULED_RUNS["failed_reads"] == 0
+
+
+def test_once_the_read_has_lapsed_the_pass_repairs_the_source_again(monkeypatch, clock):
+    _measured(monkeypatch, RUNS_20261127)
+    calls = _recording_retry(monkeypatch)
+    state = OperatorState()
+    held = hf.diagnose_and_fix_pulls(_failed(["quiverquant"]), False, state)
+    assert held["skipped_too_slow"] == 1 and calls == []
+
+    _failing_read(monkeypatch)
+    clock.now += hf.SLOW_RUN_MAX_AGE_SECONDS + 1
+    lapsed = hf.diagnose_and_fix_pulls(_failed(["quiverquant"]), False, state)
+
+    assert calls == ["quiverquant"] and "skipped_too_slow" not in lapsed
 
 
 def test_an_unimportable_puller_is_unknown_not_slow(monkeypatch):
@@ -373,6 +491,35 @@ def test_the_pass_repairs_the_rest_and_reports_the_slow_source_once_per_failure(
     assert later["skipped_too_slow"] == 1
     assert len([c for c in hf.log_issue.call_args_list
                 if c.kwargs.get("source") == "SEC_XBRL_Financials"]) == 2, "a new failure is reported"
+
+
+def _issues(source: str) -> list[dict]:
+    return [c.kwargs for c in hf.log_issue.call_args_list if c.kwargs.get("source") == source]
+
+
+def test_a_failure_already_recovered_is_not_reported_and_the_next_failure_is_reported_once(monkeypatch):
+    """fail -> recovered -> new failure. A stale refresh (not capped at 60 s)
+    can complete a held source; that is recorded like any repair recovery."""
+    _measured(monkeypatch, RUNS_20261127)
+    calls = _recording_retry(monkeypatch)
+    warnings = _warnings(monkeypatch)
+    state = OperatorState()
+    source = "SEC_XBRL_Financials"
+    hf._REPAIR_RECOVERED_AT[hf._normalize_source_key(source)] = FAILED_AT + timedelta(hours=1)
+
+    recovered = hf.diagnose_and_fix_pulls(_failed([source]), False, state)
+
+    assert "skipped_too_slow" not in recovered and calls == []
+    assert _issues(source) == [], "a failure that has already recovered is not an open failure"
+    assert not any(w.startswith(f"Not repairing {source}") for w in warnings)
+
+    again = FAILED_AT + timedelta(hours=2)                              # it fails again, after the recovery
+    for _pass in range(3):
+        result = hf.diagnose_and_fix_pulls(_failed([source], at=again), False, state)
+        assert result["skipped_too_slow"] == 1
+    assert len(_issues(source)) == 1, "the new failure is reported once, not once per pass"
+    assert again.isoformat() in _issues(source)[0]["detail"]
+    assert calls == []
 
 
 def test_a_dry_run_reports_without_writing_an_issue(monkeypatch):
@@ -450,15 +597,16 @@ def pg_engine(monkeypatch):
     admin.dispose()
 
 
-def _run(engine, name: str, seconds: float | None, status: str = "SUCCESS", days_ago: float = 1.0) -> None:
+def _run(engine, name: str, seconds: float | None, status: str = "SUCCESS", days_ago: float = 1.0,
+         source_id: int | None = None) -> None:
     with engine.begin() as conn:
         conn.execute(text(
-            "INSERT INTO pull_log (puller_name, started_at, completed_at, status) VALUES "
-            "(:n, NOW() - make_interval(secs => :ago), "
+            "INSERT INTO pull_log (puller_name, source_id, started_at, completed_at, status, error_message) VALUES "
+            "(:n, :sid, NOW() - make_interval(secs => :ago), "
             " CASE WHEN CAST(:s AS double precision) IS NULL THEN NULL "
             "      ELSE NOW() - make_interval(secs => :ago) + make_interval(secs => CAST(:s AS double precision)) END, "
-            " :st)"),
-            {"n": name, "ago": days_ago * 86400.0, "s": seconds, "st": status})
+            " :st, CASE WHEN :st = 'FAILED' THEN 'synthetic failure' END)"),
+            {"n": name, "sid": source_id, "ago": days_ago * 86400.0, "s": seconds, "st": status})
 
 
 def test_real_types_counts_completed_scheduler_runs_over_the_cap(pg_engine):
@@ -496,10 +644,55 @@ def test_real_types_the_rule_end_to_end_on_stored_runs(pg_engine):
     assert hf._slow_repair_reason("quiverquant", pg_engine) is None             # 1 of 4
 
     # A restart forgets the cache and nothing else: the first read restores the hold.
-    hf._SCHEDULED_RUNS.update(read_at=None, runs={})
+    _forget_the_read()
     assert hf._slow_repair_reason("SEC_XBRL_Financials", pg_engine) == reason
 
 
 def test_real_types_no_pull_log_means_no_hold(pg_engine):
     assert hf._read_scheduled_runs(pg_engine) == {}
     assert hf._slow_repair_reason("SEC_XBRL_Financials", pg_engine) is None
+
+
+_CATALOG_DDL = (
+    "CREATE TABLE source_catalog (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
+    "CREATE TABLE raw_series (id BIGSERIAL PRIMARY KEY, series_id TEXT, source_id INTEGER NOT NULL, "
+    "pull_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(), raw_payload JSONB, pull_status TEXT NOT NULL)",
+)
+
+
+def test_real_types_a_failure_followed_by_a_good_run_is_not_reported_and_the_next_one_is(pg_engine, monkeypatch):
+    """The whole pass on PostgreSQL: the real failed-pull query, the real
+    run-time query and the rule. fail -> good run -> fail again."""
+    with pg_engine.begin() as conn:
+        conn.execute(text(_PULL_LOG_DDL))
+        for ddl in _CATALOG_DDL:
+            conn.execute(text(ddl))
+        conn.execute(text("INSERT INTO source_catalog (id, name) VALUES (1, 'quiverquant')"))
+    calls = _recording_retry(monkeypatch)
+    state = OperatorState()
+    hour = 1 / 24
+
+    def run(seconds, status, hours_ago):
+        _run(pg_engine, "smart:quiverquant", seconds, status=status, days_ago=hours_ago * hour, source_id=1)
+
+    for hours_ago in (60, 48, 36):
+        run(84.5, "SUCCESS", hours_ago)                                 # its ordinary runs: every one over the cap
+    run(120.0, "FAILED", 3)
+
+    first = hf.diagnose_and_fix_pulls(pg_engine, False, state)
+    same = hf.diagnose_and_fix_pulls(pg_engine, False, state)
+    assert first["skipped_too_slow"] == same["skipped_too_slow"] == 1
+    assert len(_issues("quiverquant")) == 1
+    assert "3 of its 3 completed scheduled runs" in _issues("quiverquant")[0]["detail"]
+
+    run(88.0, "SUCCESS", 2)                                             # its scheduler's own rerun succeeds
+    recovered = hf.diagnose_and_fix_pulls(pg_engine, False, state)
+    assert "skipped_too_slow" not in recovered
+    assert len(_issues("quiverquant")) == 1, "a failure followed by a good run is not reported again"
+
+    run(120.0, "FAILED", 1)                                             # and it fails again
+    again = hf.diagnose_and_fix_pulls(pg_engine, False, state)
+    hf.diagnose_and_fix_pulls(pg_engine, False, state)
+    assert again["skipped_too_slow"] == 1
+    assert len(_issues("quiverquant")) == 2, "the new failure is reported, once"
+    assert calls == [], "no repair was started at any point"
