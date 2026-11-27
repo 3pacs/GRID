@@ -14,12 +14,11 @@ import uuid
 import pytest
 from sqlalchemy import create_engine, text
 
-from store.journal_qualification import (
-    DECISION_JOURNAL,
+from store.journal_contagion_exclusion import (
     NOT_CONTAGION_TICKET_JOURNAL_PREDICATE,
-    exclude_contagion_tickets,
-    non_provisional_journal_select,
+    excluding_contagion_tickets,
 )
+from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
 
 @pytest.fixture
@@ -64,7 +63,7 @@ def _row(engine, hours_ago, state, flags, action="HOLD"):
 def _latest_state(engine):
     with engine.connect() as conn:
         row = conn.execute(
-            non_provisional_journal_select("inferred_state", "state_confidence")
+            excluding_contagion_tickets(non_provisional_journal_select("inferred_state", "state_confidence"))
             .order_by(DECISION_JOURNAL.c.decision_timestamp.desc()).limit(1)
         ).fetchone()
     return row[0] if row else None
@@ -72,7 +71,7 @@ def _latest_state(engine):
 
 def _history_states(engine):
     with engine.connect() as conn:
-        rows = conn.execute(exclude_contagion_tickets(text(
+        rows = conn.execute(excluding_contagion_tickets(text(
             "SELECT inferred_state FROM decision_journal WHERE "
             + NOT_CONTAGION_TICKET_JOURNAL_PREDICATE + " ORDER BY decision_timestamp"
         ))).fetchall()

@@ -20,12 +20,11 @@ from api.schemas.regime import (
     RegimeTransition,
     RegimeTransitionsResponse,
 )
-from store.journal_qualification import (
-    DECISION_JOURNAL,
+from store.journal_contagion_exclusion import (
     NOT_CONTAGION_TICKET_JOURNAL_PREDICATE,
-    exclude_contagion_tickets,
-    non_provisional_journal_select,
+    excluding_contagion_tickets,
 )
+from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 from store.snapshots import strip_binding_flags
 
 router = APIRouter(prefix="/api/v1/regime", tags=["regime"])
@@ -192,11 +191,11 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
 
         if prod is not None:
             latest = conn.execute(
-                non_provisional_journal_select(
+                excluding_contagion_tickets(non_provisional_journal_select(
                     "inferred_state", "state_confidence", "transition_probability",
                     "contradiction_flags", "grid_recommendation", "baseline_recommendation",
                     "decision_timestamp",
-                )
+                ))
                 .where(DECISION_JOURNAL.c.model_version_id == bindparam("mid"))
                 .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
                 .limit(1),
@@ -208,11 +207,11 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
         # Fall back to most recent journal entry regardless of model
         if latest is None:
             latest = conn.execute(
-                non_provisional_journal_select(
+                excluding_contagion_tickets(non_provisional_journal_select(
                     "inferred_state", "state_confidence", "transition_probability",
                     "contradiction_flags", "grid_recommendation", "baseline_recommendation",
                     "decision_timestamp",
-                )
+                ))
                 .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
                 .limit(1)
             ).fetchone()
@@ -487,7 +486,7 @@ def get_history(
     with engine.connect() as conn:
         # Historical reads keep provisional evidence, but a contagion trade ticket is not a regime state.
         rows = conn.execute(
-            exclude_contagion_tickets(text(
+            excluding_contagion_tickets(text(
                 "SELECT DATE(decision_timestamp) AS dt, "
                 "inferred_state, state_confidence "
                 "FROM decision_journal "
@@ -519,7 +518,7 @@ def get_transitions(
 
     with engine.connect() as conn:
         rows = conn.execute(
-            exclude_contagion_tickets(text(
+            excluding_contagion_tickets(text(
                 "SELECT decision_timestamp, inferred_state, state_confidence "
                 "FROM decision_journal "
                 "WHERE " + NOT_CONTAGION_TICKET_JOURNAL_PREDICATE + " "
