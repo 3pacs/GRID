@@ -13,6 +13,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from .etf_flow_evidence import RAW_SOURCE, is_historical, known_5d_flows
 from .types import FlowLayer, FlowNode
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
@@ -130,10 +131,39 @@ def _build_price_node(
 
 
 def _build_etf_flows(engine: Engine, as_of: date) -> FlowNode:
-    """Sum recent ETF flow data from etf_flows or dollar_flows tables."""
+    """Sum recent ETF flow data.
+
+    For today the node reads its current views, the ``etf_flows`` table and
+    then ``dollar_flows``, as before. Both keep only the newest value of a
+    date with no record of when it was received, so for a past ``as_of``
+    neither is read: the node takes the same quantity from the raw series,
+    limited to what was held by the end of ``as_of``
+    (``etf_flow_evidence.known_5d_flows``), and has no value when nothing was.
+    """
     value: float | None = None
     source_used = ""
     lookback = as_of - timedelta(days=7)
+
+    if is_historical(as_of):
+        try:
+            with engine.connect() as conn:
+                held = known_5d_flows(conn, as_of, lookback)
+            # etf_flows carries one row per ticker and date and skips zeros.
+            values = [o.value for observations in held.values() for o in observations if o.value != 0.0]
+            if values:
+                value = sum(values)
+                source_used = RAW_SOURCE
+        except Exception as exc:
+            log.warning("etf_flows receipt-aware read failed: {}", exc)
+        return FlowNode(
+            id="etf_flows",
+            label="ETF Flows",
+            layer=LAYER_ID,
+            value=value,
+            confidence="derived",
+            source=source_used or RAW_SOURCE,
+            metadata={"lookback_days": 7, "evidence": "held_by_as_of", "current_views_withheld": True},
+        )
 
     try:
         with engine.connect() as conn:
@@ -178,7 +208,7 @@ def _build_etf_flows(engine: Engine, as_of: date) -> FlowNode:
         value=value,
         confidence="derived",
         source=source_used or "etf_flows|dollar_flows",
-        metadata={"lookback_days": 7},
+        metadata={"lookback_days": 7, "evidence": "current_view"},
     )
 
 

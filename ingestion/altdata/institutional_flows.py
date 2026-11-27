@@ -42,6 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -79,6 +80,40 @@ _FLOW_WINDOW_20D: int = 20
 
 # Rate limit for yfinance calls
 _YF_RATE_DELAY: float = 0.5
+
+# ── The session still trading is not stored; recent dates are revised ────────
+# yfinance returns the current session's bar while it is still trading, with
+# the volume so far. The writer used to store it and then skip that date for
+# good, so the day's 5d / 20d / accel values were frozen at whatever share of
+# the volume had traded when the job happened to run. Production, 2026-11:
+# SPY stored 2.1M shares for 11-17 (written 14:33Z) against a final 71.4M, and
+# about 160 of the trading days since 2026-03-30 were written on their own day.
+#
+# A bar is eligible once its date is before the current New York date. That is
+# a conservative minimum, not provider finality: in four days of SPY volume
+# vintages the figure was still moving at about 23:30 New York time and
+# unchanged after midnight, which is thin evidence. An eligible value is
+# therefore provisional, and the revision below writes a new vintage if the
+# provider changes it.
+_NEW_YORK = ZoneInfo("America/New_York")
+# A stored date this recent is compared with the value just computed and
+# written again, as a new vintage, when it differs. Bounded on purpose: the
+# series uses adjusted closes, which move for all of history on every
+# dividend, so an unbounded comparison would rewrite the whole series each
+# time. Older dates are only revised when a caller names the date to go back
+# to (``revise_from``), which is a deliberate repair, not a scheduled run.
+_ETF_REVISION_DAYS: int = 14
+_ETF_REVISION_REL_TOL: float = 1e-9
+
+
+def _new_york_today() -> date:
+    """Today's date on the exchange's clock. One name so a test can set it."""
+    return datetime.now(_NEW_YORK).date()
+
+
+def _bar_date(stamp: Any) -> date:
+    """The calendar date of a yfinance daily bar's index value."""
+    return stamp.date() if hasattr(stamp, "date") else stamp
 
 # ── SEC 13F configuration ─────────────────────────────────────────────────────
 
@@ -904,15 +939,27 @@ class InstitutionalFlowsPuller(BasePuller):
         start_date: date,
         end_date: date,
         budget: _RunBudget | None = None,
+        revise_from: date | None = None,
     ) -> list[dict[str, Any]]:
         """Compute ETF flow proxies from yfinance daily data.
 
         For each ticker: fetch daily OHLCV, compute $ volume (close * volume),
         then rolling 5-day and 20-day sums, and flow acceleration.
 
+        The current New York date's bar is not stored (see the note above
+        ``_NEW_YORK``); it is left for a later run. An eligible value is still
+        provisional: a date already stored is written again, as a new vintage,
+        when it is on or after the revision floor and its value changed.
+        Before the floor it is skipped as before. Nothing is updated in
+        place, so a reader that honours ``pull_timestamp`` still sees what
+        was held at any earlier time.
+
         Parameters:
             start_date: Earliest date for flow computation.
             end_date: Latest date.
+            budget: The caller's run budget, checked between tickers.
+            revise_from: Earliest stored date to compare and revise. Default:
+                ``_ETF_REVISION_DAYS`` before the current New York date.
 
         Returns:
             List of result dicts per ticker/window.
@@ -928,6 +975,8 @@ class InstitutionalFlowsPuller(BasePuller):
 
         # Need extra history for rolling windows
         fetch_start = start_date - timedelta(days=_FLOW_WINDOW_20D + 10)
+        session_day = _new_york_today()
+        revise_floor = revise_from or (session_day - timedelta(days=_ETF_REVISION_DAYS))
 
         for position, ticker in enumerate(ETF_FLOW_TICKERS):
             if budget is not None and budget.spent():
@@ -976,6 +1025,13 @@ class InstitutionalFlowsPuller(BasePuller):
                     )
                     continue
 
+                # The session still trading (or just closed, volume still
+                # moving) is not stored. It ends no stored window, so
+                # dropping it changes no stored date's value.
+                eligible = [_bar_date(stamp) < session_day for stamp in data.index]
+                session_bars_left = len(eligible) - sum(eligible)
+                data = data[eligible].copy()
+
                 data["dollar_volume"] = data[close_col] * data[vol_col]
 
                 # Rolling sums
@@ -999,29 +1055,42 @@ class InstitutionalFlowsPuller(BasePuller):
                 ]:
                     series_id = f"ETF_FLOW:{ticker}:{suffix}"
                     rows_inserted = 0
+                    rows_revised = 0
 
                     with self.engine.begin() as conn:
                         existing_dates = self._get_existing_dates(series_id, conn)
+                        stored_recent = self._latest_stored_etf_values(conn, series_id, revise_floor)
                         for idx, row in data.iterrows():
                             if pd.isna(row[col_name]):
                                 continue
-                            obs_date = idx.date() if hasattr(idx, "date") else idx
+                            obs_date = _bar_date(idx)
+                            value = float(row[col_name])
+                            payload = {
+                                "ticker": ticker,
+                                "close": float(row[close_col])
+                                if not pd.isna(row[close_col])
+                                else None,
+                                "volume": int(row[vol_col])
+                                if not pd.isna(row[vol_col])
+                                else None,
+                            }
                             if obs_date in existing_dates:
-                                continue
+                                stored = stored_recent.get(obs_date)
+                                if stored is None or math.isclose(
+                                    stored, value, rel_tol=_ETF_REVISION_REL_TOL, abs_tol=0.0
+                                ):
+                                    # Before the revision floor, or unchanged.
+                                    continue
+                                # A new vintage; the earlier one stays, so a
+                                # point-in-time read before now still sees it.
+                                payload["revises_value"] = stored
+                                rows_revised += 1
                             self._insert_raw(
                                 conn=conn,
                                 series_id=series_id,
                                 obs_date=obs_date,
-                                value=float(row[col_name]),
-                                raw_payload={
-                                    "ticker": ticker,
-                                    "close": float(row[close_col])
-                                    if not pd.isna(row[close_col])
-                                    else None,
-                                    "volume": int(row[vol_col])
-                                    if not pd.isna(row[vol_col])
-                                    else None,
-                                },
+                                value=value,
+                                raw_payload=payload,
                             )
                             rows_inserted += 1
 
@@ -1029,11 +1098,13 @@ class InstitutionalFlowsPuller(BasePuller):
                         "feature": series_id,
                         "status": "SUCCESS",
                         "rows_inserted": rows_inserted,
+                        "rows_revised": rows_revised,
+                        "session_bars_left": session_bars_left,
                     })
 
                 log.info(
-                    "ETF flow {t}: computed 5d/20d/accel flows",
-                    t=ticker,
+                    "ETF flow {t}: computed 5d/20d/accel flows ({u} same-session bar(s) left for a later run)",
+                    t=ticker, u=session_bars_left,
                 )
 
             except Exception as exc:
@@ -1049,6 +1120,29 @@ class InstitutionalFlowsPuller(BasePuller):
             time.sleep(_YF_RATE_DELAY)
 
         return results
+
+    def _latest_stored_etf_values(self, conn: Any, series_id: str, floor: date) -> dict[date, float]:
+        """Newest stored value per date on or after ``floor``.
+
+        A quarantined row is not a stored value: the vintage beneath it is.
+        """
+        rows = conn.execute(
+            text(
+                "SELECT obs_date, value FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src AND obs_date >= :floor "
+                "AND pull_status != 'QUARANTINED' "
+                "ORDER BY pull_timestamp ASC, id ASC"
+            ),
+            {"sid": series_id, "src": self.source_id, "floor": floor},
+        ).fetchall()
+        latest: dict[date, float] = {}
+        for obs_date, value in rows:
+            if isinstance(obs_date, str):
+                obs_date = date.fromisoformat(obs_date[:10])
+            elif isinstance(obs_date, datetime):
+                obs_date = obs_date.date()
+            latest[obs_date] = float(value)
+        return latest
 
     # ── SEC 13F Filings ────────────────────────────────────────────────────
 
@@ -2320,11 +2414,17 @@ class InstitutionalFlowsPuller(BasePuller):
     def pull_etf_only(
         self,
         start_date: str | date = "2020-01-01",
+        revise_from: str | date | None = None,
     ) -> list[dict[str, Any]]:
         """Pull only ETF flow proxies (faster, no SEC API dependency).
 
         Parameters:
             start_date: Earliest date for computation.
+            revise_from: Earliest stored date to compare with the value
+                computed now and write again when it differs. Leave unset for
+                a scheduled run (the last ``_ETF_REVISION_DAYS`` days). Naming
+                an older date rewrites history as new vintages and is a
+                separately authorized repair.
 
         Returns:
             List of result dicts for ETF flows.
@@ -2334,7 +2434,8 @@ class InstitutionalFlowsPuller(BasePuller):
             if isinstance(start_date, str)
             else start_date
         )
-        return self._pull_etf_flows(start, date.today())
+        floor = date.fromisoformat(revise_from) if isinstance(revise_from, str) else revise_from
+        return self._pull_etf_flows(start, date.today(), revise_from=floor)
 
     def pull_13f_only(
         self,

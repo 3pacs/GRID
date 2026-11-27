@@ -830,6 +830,10 @@ def sync_dark_pool_weekly(engine: Engine) -> int:
 
 # ── Sync: etf_flows ──────────────────────────────────────────────────────
 
+# Ticker-dates refreshed by one sync_etf_flows run (newest first).
+_ETF_FLOW_SYNC_LIMIT: int = 20000
+
+
 def sync_etf_flows(engine: Engine) -> int:
     """Read raw_series WHERE series_id LIKE 'ETF_FLOW:%' for volume-based
     proxy data, upsert into etf_flows with source='proxy' and
@@ -842,6 +846,15 @@ def sync_etf_flows(engine: Engine) -> int:
 
     We materialize the 5d series as the primary flow_value.
 
+    ``etf_flows`` is a current view, not a history: it holds one value per
+    ticker and date, the newest vintage, with no record of when that value
+    was received. A raw date can carry more than one vintage (the writer
+    revises a recent date whose value changed), and a sync overwrites the
+    row. It must not be used to answer what was known on a past date; read
+    ``raw_series`` through ``store.observations.read_window_known_at`` for
+    that. Each sync refreshes the newest ``_ETF_FLOW_SYNC_LIMIT``
+    ticker-dates; older ones keep what an earlier sync wrote.
+
     Returns:
         Number of rows upserted.
     """
@@ -849,13 +862,23 @@ def sync_etf_flows(engine: Engine) -> int:
     rows_upserted = 0
 
     with engine.begin() as conn:
+        # One row per series and date, the newest vintage, chosen before the
+        # LIMIT: limiting raw rows first would spend the limit on older
+        # vintages and silently cover fewer dates.
         rs_rows = conn.execute(text(
-            "SELECT series_id, obs_date, value "
-            "FROM raw_series WHERE series_id LIKE :prefix "
-            "AND series_id LIKE :suffix "
-            "AND pull_status = 'SUCCESS' "
-            "ORDER BY obs_date DESC LIMIT 20000"
-        ), {"prefix": "ETF_FLOW:%", "suffix": "%:5d"}).fetchall()
+            "SELECT r.series_id, r.obs_date, r.value "
+            "FROM raw_series r WHERE r.series_id LIKE :prefix "
+            "AND r.series_id LIKE :suffix "
+            "AND r.pull_status = 'SUCCESS' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM raw_series n "
+            "  WHERE n.series_id = r.series_id AND n.obs_date = r.obs_date "
+            "  AND n.pull_status = 'SUCCESS' "
+            "  AND (n.pull_timestamp > r.pull_timestamp "
+            "       OR (n.pull_timestamp = r.pull_timestamp AND n.id > r.id))"
+            ") "
+            "ORDER BY r.obs_date DESC, r.series_id ASC LIMIT :limit"
+        ), {"prefix": "ETF_FLOW:%", "suffix": "%:5d", "limit": _ETF_FLOW_SYNC_LIMIT}).fetchall()
 
         if not rs_rows:
             log.info("flow_materializer: no ETF flow series found")
