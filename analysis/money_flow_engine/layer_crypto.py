@@ -20,7 +20,7 @@ from .helpers import (
     compute_changes,
     dominant_confidence,
 )
-from .etf_flow_evidence import RAW_SOURCE, is_historical, known_5d_flows
+from .etf_flow_evidence import RAW_SOURCE, is_historical, known_5d_flows, utc_today
 from .types import FlowLayer, FlowNode
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ def _build_btc_etf_flows_node(engine: Engine, as_of: date) -> FlowNode:
 def build_crypto_layer(engine: Engine, as_of: date | None = None) -> FlowLayer:
     """Assemble the complete Crypto layer."""
     if as_of is None:
-        as_of = date.today()
+        as_of = utc_today()
 
     logger.info("Building crypto layer as_of={}", as_of)
 

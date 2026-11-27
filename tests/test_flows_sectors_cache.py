@@ -207,8 +207,9 @@ def test_ensure_sector_warm_thread_starts_exactly_once(monkeypatch):
     flows_router._ensure_sector_warm_thread()
     flows_router._ensure_sector_warm_thread()
 
-    assert thread_mock.call_count == 1
-    thread_mock.return_value.start.assert_called_once()
+    # Once per process: the sector-list warm and the feature-maps warm (their own thread since #959), each started once.
+    assert thread_mock.call_count == 2
+    assert thread_mock.return_value.start.call_count == 2
 
 
 def test_ensure_sector_warm_thread_loads_persisted_snapshot_once(monkeypatch):
@@ -237,8 +238,8 @@ def test_start_sector_flow_warm_thread_starts_warm_thread_once(monkeypatch):
     flows_router.start_sector_flow_warm_thread()
     flows_router.start_sector_flow_warm_thread()
 
-    assert thread_mock.call_count == 1
-    thread_mock.return_value.start.assert_called_once()
+    assert thread_mock.call_count == 2          # list warm + feature-maps warm, once each
+    assert thread_mock.return_value.start.call_count == 2
 
 
 def test_load_persisted_sectors_snapshot_seeds_stale_tier(monkeypatch):

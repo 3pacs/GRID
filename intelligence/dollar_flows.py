@@ -113,6 +113,25 @@ _SOURCE_TYPES = [
 ]
 
 
+# ``dollar_flows`` is a current view: each normalization deletes the rows of
+# the dates it covers and writes them again, so ``created_at`` is the time of
+# the last rebuild, not the time a flow was first known, and a row dropped or
+# corrected since leaves no trace. Nothing in the table can say what it held
+# on a past date. A reader asked for a past date gives no answer and this
+# reason, rather than today's rows under an old date.
+CURRENT_VIEW_WITHHELD_REASON = "dollar_flows_is_a_current_view_without_a_receipt_clock"
+
+
+def _utc_today() -> date:
+    """Today's UTC date. One name so a test can set it."""
+    return datetime.now(timezone.utc).date()
+
+
+def is_past_as_of(as_of: date | None) -> bool:
+    """True when ``as_of`` names a UTC date that has ended."""
+    return as_of is not None and as_of < _utc_today()
+
+
 # ── Table DDL ─────────────────────────────────────────────────────────────
 
 CREATE_TABLE_SQL = """
@@ -2110,14 +2129,41 @@ def get_aggregate_flows(
     Parameters:
         engine: SQLAlchemy engine.
         days: Lookback window in days (default 30).
-        as_of: Optional PIT upper bound on ``flow_date`` (defaults to today).
+        as_of: Optional upper bound on ``flow_date`` (defaults to today's
+            UTC date).
+            A past date is not answered: the table is a current view (see
+            ``CURRENT_VIEW_WITHHELD_REASON``), so the totals come back as
+            ``None`` with ``withheld_reason`` set and no row is read.
 
     Returns:
         Dict with 'by_sector', 'by_source_type', 'by_actor' aggregations
-        and 'total_inflow', 'total_outflow', 'net_flow'.
+        and 'total_inflow', 'total_outflow', 'net_flow'. 'withheld_reason'
+        is ``None`` when the totals are an answer.
     """
+    if is_past_as_of(as_of):
+        log.warning(
+            "get_aggregate_flows: as_of={d} is a past date and dollar_flows is a current view; "
+            "no totals returned",
+            d=as_of,
+        )
+        return {
+            "by_sector": {},
+            "by_source_type": {},
+            "by_actor": {},
+            "total_inflow": None,
+            "total_outflow": None,
+            "net_flow": None,
+            "days": days,
+            "flow_count": None,
+            "quarantined_13f": None,
+            "as_of": as_of.isoformat(),
+            "withheld_reason": CURRENT_VIEW_WITHHELD_REASON,
+        }
+
     _ensure_table(engine)
-    ref_date = as_of or date.today()
+    # The same clock is_past_as_of uses: on a host whose local date is behind
+    # UTC, date.today() would default to a day this function calls past.
+    ref_date = as_of or _utc_today()
     cutoff = ref_date - timedelta(days=days)
 
     with engine.connect() as conn:
@@ -2212,6 +2258,8 @@ def get_aggregate_flows(
         "days": days,
         "flow_count": counted_rows,
         "quarantined_13f": quarantined_13f,
+        "as_of": ref_date.isoformat(),
+        "withheld_reason": None,
     }
 
 

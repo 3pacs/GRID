@@ -655,8 +655,20 @@ export default function SectorDive({ sector: sectorProp, onBack }) {
     const metrics = data?.sector_metrics || {};
     const intel = data?.intelligence || {};
 
+    const featureNotice = featureSnapshotNotice(data?.feature_snapshot);
+
     return (
         <div style={{ ...shared.container, maxWidth: '1100px' }}>
+
+            {featureNotice && (
+                <div data-testid="feature-snapshot-notice" role="status" style={{
+                    border: `1px solid ${colors.yellow}55`, background: `${colors.yellow}10`, color: colors.textMuted,
+                    fontFamily: mono, fontSize: '11px', lineHeight: 1.5, padding: '8px 12px',
+                    borderRadius: tokens.radius.sm, marginBottom: tokens.space.md,
+                }}>
+                    {featureNotice}
+                </div>
+            )}
 
             {/* ═══ HEADER ═══ */}
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: tokens.space.lg, flexWrap: 'wrap' }}>
@@ -1526,6 +1538,23 @@ function LineageFlows({ lineage }) {
             })}
         </div>
     );
+}
+
+// The sector detail's z-scores come from a background-warmed snapshot (api/routers/flows.py). When it is not
+// fresh the page must say so, not leave "--" cells to look like missing data for the sector (#959).
+export function featureSnapshotNotice(snapshot) {
+    const state = snapshot && snapshot.state;
+    if (state === 'unavailable') {
+        return 'Feature z-scores are still warming up on the server, so every z-score and latest value below reads "--". '
+            + 'That is not zero and not missing data for this sector; reload in a minute.';
+    }
+    if (state === 'stale') {
+        const age = finiteNumberOrNull(snapshot.age_seconds);
+        const minutes = age === null ? null : Math.max(1, Math.round(age / 60));
+        return 'Feature z-scores are ' + (minutes === null ? 'older than usual' : minutes + ' min old')
+            + ': the background refresh is behind, so these values may not be current.';
+    }
+    return null;
 }
 
 // ── Intelligence Feed (unified timeline) ─────────────────────────────

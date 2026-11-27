@@ -463,7 +463,7 @@ def test_daily_block_runs_first_and_weekly_tasks_are_not_in_intelligence_tasks(c
     order: list[str] = []
     monkeypatch.setattr(
         ho, "_run_daily_intel_block",
-        lambda engine, state, now, results: order.append("daily"),
+        lambda engine, state, now, results, **_kw: order.append("daily"),
     )
     monkeypatch.setattr(ho, "_run_sector_health_step", lambda engine, state, dry_run: {})
     from alpha_research.edge_stream import hermes as edge_hermes
@@ -491,7 +491,7 @@ def test_hung_weekly_task_does_not_hold_the_intelligence_step(clock, monkeypatch
     daily: list[datetime] = []
     monkeypatch.setattr(
         ho, "_run_daily_intel_block",
-        lambda engine, state, now, results: daily.append(now),
+        lambda engine, state, now, results, **_kw: daily.append(now),
     )
     monkeypatch.setattr(ho, "_run_sector_health_step", lambda engine, state, dry_run: {})
     from alpha_research.edge_stream import hermes as edge_hermes
