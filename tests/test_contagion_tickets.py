@@ -372,3 +372,93 @@ class TestEndpointShape:
             "journal": False,
             "limit": 7,
         }
+
+
+class TestTicketFieldHonesty:
+    """A ticket's confidence is a measured accuracy or absent, never a default or a coerced zero (#959)."""
+
+    def _tickets(self, accuracy):
+        engine = _make_engine(
+            prediction_row=_synthetic_prediction_row(),
+            signals={"AAPL": _signal_row_for("AAPL"), "NVDA": _signal_row_for("NVDA")},
+            accuracy=accuracy,
+        )
+        with patch.object(
+            ctt, "_load_dealer_gamma_context",
+            return_value={"gamma_wall": 175.0, "put_wall": 178.0, "call_wall": 182.0,
+                          "flip_level": 176.0, "regime": "SHORT_GAMMA", "spot": 180.0},
+        ):
+            return ctt.generate_tickets_for_prediction(engine, prediction_id=12, journal=False)
+
+    def test_measured_accuracy_is_the_confidence(self):
+        t = self._tickets((0.6, 10))[0]
+        assert t["confidence"] == pytest.approx(0.6)
+        assert t["confidence_basis"] == ctt.CONFIDENCE_BASIS_BACKTEST
+        assert t["kelly_basis"] == ctt.CONFIDENCE_BASIS_BACKTEST
+
+    def test_no_history_has_no_confidence_and_a_flagged_policy_kelly(self):
+        # _load_contagion_accuracy returns (-1.0, 0) when there is no history.
+        t = self._tickets((-1.0, 0))[0]
+        assert t["confidence"] is None
+        assert t["confidence_basis"] == ctt.CONFIDENCE_BASIS_DEFAULT
+        assert t["kelly_basis"] == ctt.CONFIDENCE_BASIS_DEFAULT
+        # Sized with the conservative default, so the policy size survives, flagged as a default.
+        assert t["kelly_size"] == ctt.compute_kelly_fraction(ctt.DEFAULT_CONFIDENCE_NO_HISTORY)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 1.7, -0.2])
+    def test_non_finite_or_out_of_range_accuracy_is_not_a_confidence_or_a_zero_kelly(self, bad):
+        t = self._tickets((bad, 10))[0]
+        assert t["confidence"] is None
+        assert t["confidence_basis"] == ctt.CONFIDENCE_BASIS_DEFAULT
+        # Before: a +Infinity accuracy gave kelly 0.0 and confidence inf (invalid JSON); now the
+        # kelly is the flagged default-sized one, never a stated 0 for a non-measurement.
+        assert t["kelly_size"] == ctt.compute_kelly_fraction(ctt.DEFAULT_CONFIDENCE_NO_HISTORY)
+        assert t["kelly_size"] > 0
+
+    def test_a_measured_zero_accuracy_is_a_measurement(self):
+        t = self._tickets((0.0, 10))[0]
+        assert t["confidence"] == 0.0
+        assert t["confidence_basis"] == ctt.CONFIDENCE_BASIS_BACKTEST
+        assert t["kelly_size"] == 0.0   # a real accuracy of 0 sizes to 0
+
+    def test_journal_still_records_the_sizing_default_for_a_no_history_ticket(self):
+        # The immutable journal needs a number; a ticket without a measured confidence is journaled at
+        # the sizing default it was sized with, as before.
+        import inspect
+        src = inspect.getsource(ctt.write_ticket_to_journal)
+        assert "DEFAULT_CONFIDENCE_NO_HISTORY" in src
+        assert 'ticket.get("confidence") or 0.5' not in src
+
+
+class TestTradeTicketRouteValidation:
+    @pytest.mark.parametrize("value,expected", [
+        (0.0, 0.0), (0.6, 0.6), (1.0, 1.0),
+        (None, None), (float("nan"), None), (float("inf"), None), (-0.01, None), (1.01, None),
+        ("0.6", None), (True, None), ([0.6], None),
+    ])
+    def test_confidence_is_a_finite_fraction_or_absent(self, value, expected):
+        from api.routers.trade_tickets import _validated_ticket
+        assert _validated_ticket({"confidence": value})["confidence"] == expected
+
+    @pytest.mark.parametrize("value,expected", [
+        (0.0, 0.0), (0.05, 0.05), (None, None), (float("nan"), None), (float("inf"), None),
+        (-0.01, None), (0.0501, None), (1e308, None), ("0.05", None), (False, None),
+    ])
+    def test_kelly_is_finite_and_inside_the_cap_or_absent(self, value, expected):
+        from api.routers.trade_tickets import _validated_ticket
+        assert _validated_ticket({"kelly_size": value})["kelly_size"] == expected
+
+    def test_absent_keys_stay_absent_and_other_fields_are_untouched(self):
+        from api.routers.trade_tickets import _validated_ticket
+        t = {"ticker": "aapl", "direction": "short", "confidence_basis": "default_no_history"}
+        assert _validated_ticket(t) == t
+
+    def test_recent_route_response_is_valid_json_for_a_non_finite_ticket(self):
+        import json
+        from api.routers import trade_tickets as tt_router
+        bad = [{"ticker": "aapl", "confidence": float("inf"), "kelly_size": float("nan")}]
+        with patch.object(tt_router, "generate_tickets_for_recent_predictions", return_value=bad):
+            result = tt_router.recent_tickets(since_hours=24, limit=None, write_journal=False, _token="tok")
+        # allow_nan=False is what a strict JSON encoder enforces: this raised before the validation.
+        json.dumps(result, allow_nan=False)
+        assert result["tickets"][0]["confidence"] is None and result["tickets"][0]["kelly_size"] is None

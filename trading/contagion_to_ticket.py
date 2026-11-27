@@ -32,6 +32,7 @@ module is a thin adapter that:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -58,6 +59,11 @@ from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 MIN_ABS_MARGIN_IMPACT: float = 0.01
 DEFAULT_CONFIDENCE_NO_HISTORY: float = 0.55
+
+# Where a ticket's confidence and kelly size come from (#959). Only a measured backtest accuracy is a
+# confidence; the no-history default is a sizing policy, never a measurement.
+CONFIDENCE_BASIS_BACKTEST = "backtest_accuracy"
+CONFIDENCE_BASIS_DEFAULT = "default_no_history"
 INVALIDATION_SHORT_UP_PCT: float = 0.02
 INVALIDATION_LONG_DOWN_PCT: float = 0.02
 FLOW_THESIS_TAG: str = "contagion_derived"
@@ -393,12 +399,25 @@ def _build_single_ticket(
     else:
         invalidation_price = round(spot * (1 - INVALIDATION_LONG_DOWN_PCT), 2)
 
-    # Kelly sizing: fall back to a conservative confidence when history is empty.
-    if accuracy_n > 0 and accuracy >= 0:
-        confidence = float(accuracy)
+    # Kelly sizing: fall back to a conservative sizing default when history is empty. Only a measured
+    # backtest accuracy (a finite fraction in [0, 1] over at least one sample) is reported as the
+    # ticket's confidence. With none, or a non-finite/out-of-range average (NaN, +/-Infinity), the
+    # confidence is absent, not the sizing default and not a stated 0, and the ticket says so.
+    measured = (
+        accuracy_n > 0
+        and isinstance(accuracy, (int, float))
+        and math.isfinite(accuracy)
+        and 0.0 <= accuracy <= 1.0
+    )
+    if measured:
+        confidence: float | None = float(accuracy)
+        sizing_confidence = confidence
+        confidence_basis = CONFIDENCE_BASIS_BACKTEST
     else:
-        confidence = DEFAULT_CONFIDENCE_NO_HISTORY
-    kelly = compute_kelly_fraction(confidence)
+        confidence = None
+        sizing_confidence = DEFAULT_CONFIDENCE_NO_HISTORY
+        confidence_basis = CONFIDENCE_BASIS_DEFAULT
+    kelly = compute_kelly_fraction(sizing_confidence)
 
     thesis = _build_thesis(
         prediction, victim, ticker, direction, invalidation_price, dte
@@ -427,7 +446,11 @@ def _build_single_ticket(
             "call_wall": gamma_ctx.get("call_wall") if gamma_ctx else None,
             "regime": gamma_ctx.get("regime") if gamma_ctx else None,
         },
-        "confidence": round(confidence, 4),
+        "confidence": round(confidence, 4) if confidence is not None else None,
+        "confidence_basis": confidence_basis,
+        # kelly_size is the Kelly fraction of `confidence` when measured; otherwise the Kelly
+        # fraction of DEFAULT_CONFIDENCE_NO_HISTORY, a sizing policy flagged by the same basis.
+        "kelly_basis": confidence_basis,
         "margin_impact_pct": round(margin, 6),
         "shock_node": prediction.shock_node,
         "shock_type": prediction.shock_type,
@@ -482,7 +505,10 @@ def write_ticket_to_journal(
         log.debug("journal skip: no model_version_id available")
         return None
 
-    confidence = float(ticket.get("confidence") or 0.5)
+    # The immutable journal needs a number: a ticket with no measured confidence is journaled at the
+    # sizing default it was sized with (exactly what it recorded before confidence became absent).
+    stated = ticket.get("confidence")
+    confidence = float(stated) if stated is not None else DEFAULT_CONFIDENCE_NO_HISTORY
     confidence = max(0.0, min(1.0, confidence))
     state_label = f"CONTAGION_{str(ticket.get('shock_type','')).upper()}"
     action = (
