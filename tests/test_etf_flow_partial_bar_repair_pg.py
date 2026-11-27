@@ -59,7 +59,7 @@ def _one_etf(monkeypatch):
 @pytest.fixture()
 def market():
     return m.Market(end=date(2026, 7, 17), periods=140,
-                    dividends={date(2026, 5, 15): 1.5, date(2026, 6, 19): 1.2})
+                    dividends={date(2026, 5, 15): 1.5, date(2026, 6, 18): 1.2})
 
 
 @pytest.fixture()

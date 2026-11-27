@@ -30,6 +30,7 @@ SETTLED_NEXT_MORNING = date(2026, 6, 3)       # written before the next open, vo
 SHORT_NEXT_MORNING = date(2026, 5, 14)        # written before the next open, volume 3 % short
 BEFORE_RANGE = date(2026, 3, 25)              # partial, but before --from
 EX_DIVIDEND_OWN_DAY = date(2026, 5, 15)       # written mid-session on its ex-dividend date
+EX_DIVIDEND_AFTER_CLOSE = date(2026, 6, 18)   # written after the close on its ex-dividend date, volume final
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +44,8 @@ def _one_etf(monkeypatch):
 
 @pytest.fixture()
 def market():
-    return m.Market(dividends={date(2026, 5, 15): 1.5, date(2026, 6, 19): 1.2})
+    # 06-19 is Juneteenth (closed): the market follows the exchange calendar.
+    return m.Market(dividends={date(2026, 5, 15): 1.5, EX_DIVIDEND_AFTER_CLOSE: 1.2})
 
 
 def _seed_history(engine, market: m.Market, tickers=("SPY",)) -> dict[date, str]:
@@ -53,7 +55,10 @@ def _seed_history(engine, market: m.Market, tickers=("SPY",)) -> dict[date, str]
         for d in market.sessions:
             if d < date(2026, 3, 20):
                 continue
-            if d == SETTLED_SAME_DAY:
+            if d == EX_DIVIDEND_AFTER_CLOSE:
+                m.seed_row(engine, ticker, d, m.old_writer_values(market, d, None, seen_on=d), m.ny(d, 20))
+                kinds[d] = "settled_after_close_ex_dividend"
+            elif d == SETTLED_SAME_DAY:
                 m.seed_row(engine, ticker, d, m.old_writer_values(market, d, None, seen_on=d), m.ny(d, 20))
                 kinds[d] = "settled_same_day"
             elif d == SETTLED_NEXT_MORNING:
@@ -123,11 +128,13 @@ def test_todays_bars_priced_as_of_s_are_the_bars_the_writing_run_saw(market, d, 
     (m.ny(date(2026, 5, 12), 20), date(2026, 5, 11)),         # after the close, likewise
     (m.ny(date(2026, 5, 13), 4), date(2026, 5, 12)),          # before the next open
     (m.ny(date(2026, 5, 16), 10), date(2026, 5, 15)),         # a Saturday
-    (datetime(2026, 11, 27, 20, tzinfo=timezone.utc), date(2026, 11, 26)),  # the settled-bars writer
+    (datetime(2026, 11, 27, 20, tzinfo=timezone.utc), date(2026, 11, 25)),  # the settled-bars writer; 11-26 Thanksgiving
+    (m.ny(date(2026, 4, 6), 10), date(2026, 4, 2)),           # Monday after Good Friday
 ])
-def test_the_price_basis_is_the_last_session_before_the_new_york_date_of_the_write(pulled, expected):
-    sessions = [d.date() for d in pd.bdate_range("2026-05-01", "2026-11-30")]
-    assert mod.price_basis_session(pulled, sessions) == expected
+def test_the_price_basis_is_the_last_exchange_session_before_the_new_york_date_of_the_write(pulled, expected):
+    assert mod.price_basis_session(pulled) == expected
+    assert mod.price_basis_session(pulled, [expected]) == expected
+    assert mod.price_basis_session(pulled, [expected - timedelta(days=1)]) is None   # the provider lacks it
 
 
 # ── 2. What is planned ───────────────────────────────────────────────────
@@ -150,6 +157,47 @@ def test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars(
             assert planned[(sid, d)]["volume"] == writer_row["payload"]["volume"]
             checked += 1
     assert checked == 12
+    # The original-versus-current adjustment factor is exercised, not 1: two
+    # dividends were paid after 04-01 was written, and parity still holds.
+    first = planned[("ETF_FLOW:SPY:5d", date(2026, 4, 1))]
+    assert abs(first["basis_raw_close"] / first["basis_adj_close_now"] - 1) > 0.01
+
+
+def test_an_after_close_row_on_its_ex_dividend_date_keeps_the_day_befores_basis(world):
+    """Written after the close on its ex-date with final volume, the row is right as stored: the
+    provider had not yet applied that dividend. With S = the ex-date itself it would look wrong."""
+    engine, market, kinds = world
+    planned = _planned(_plan(engine, market))
+    d = EX_DIVIDEND_AFTER_CLOSE
+    assert kinds[d] == "settled_after_close_ex_dividend"
+    assert not any(key[1] == d for key in planned)                      # within tolerance: left alone
+    bars = _bars(market)
+    pos = {x: k for k, x in enumerate(bars.index)}
+    (stored,) = m.vintages(engine, "ETF_FLOW:SPY:5d", d)
+    basis = mod.price_basis_session(m.ny(d, 20))
+    assert basis == market.sessions[market.sessions.index(d) - 1]
+    right = mod.window_value(bars, "5d", pos[d], pos[basis])
+    wrong = mod.window_value(bars, "5d", pos[d], pos[d])
+    assert abs(right - stored["value"]) / abs(right) <= mod.TOLERANCE
+    assert abs(wrong - stored["value"]) / abs(right) > 100 * mod.TOLERANCE
+
+
+def test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not(world):
+    engine, market, _ = world
+    assert date(2026, 5, 25) not in market.sessions                     # Memorial Day: closed, not a gap
+    assert _plan(engine, market)["tickers"]["SPY"]["status"] == "OK"
+    ordinary = date(2026, 5, 20)
+    missing = mod.build_plan(engine, m.FakeYF(market, drop={ordinary}), from_date=FROM, session_day=SESSION_DAY)
+    assert missing["tickers"]["SPY"]["status"] == "REFUSED"
+    assert ordinary.isoformat() in missing["tickers"]["SPY"]["missing_sessions"]
+    assert missing["items"] == []
+    closed = mod.build_plan(engine, m.FakeYF(market, closed_day_bars={date(2026, 5, 25)}),
+                            from_date=FROM, session_day=SESSION_DAY)
+    assert closed["tickers"]["SPY"]["status"] == "REFUSED"
+    assert closed["tickers"]["SPY"]["unexpected_sessions"] == ["2026-05-25"]
+    assert closed["items"] == []
+    far = mod.build_plan(engine, m.FakeYF(market, drop={date(2026, 1, 7)}), from_date=FROM, session_day=SESSION_DAY)
+    assert far["tickers"]["SPY"]["status"] == "OK"                      # a bar no stored row needs
 
 
 def _own_bar_delta(market, d, stored_payload, basis_session):
@@ -197,7 +245,7 @@ def test_the_plan_takes_every_short_row_in_range_and_nothing_else(world):
     assert SETTLED_SAME_DAY not in planned_dates and SETTLED_NEXT_MORNING not in planned_dates
     assert BEFORE_RANGE not in planned_dates
     assert plan["summary"]["rows"] == 3 * len(expected) == len(plan["items"])
-    assert plan["summary"]["left_alone"] == {"within_tolerance": 6}
+    assert plan["summary"]["left_alone"] == {"within_tolerance": 9}
     assert plan["tickers"]["SPY"]["status"] == "OK"
     every = plan["items"][0]
     assert every["revises_value"] != every["value"] and every["revises_id"]
@@ -281,8 +329,74 @@ def test_apply_appends_the_planned_rows_and_keeps_every_old_one(world):
     basis_day = pd.Timestamp(mark["price_basis_session"])
     assert mark["basis_raw_close"] == pytest.approx(float(market.raw[basis_day]))
     assert mark["basis_adj_close_now"] == pytest.approx(float(market.view(market.sessions[-1]).adj[basis_day]))
-    assert mod.verify_plan(engine, plan) == {"run_id": plan["run_id"], "planned": len(plan["items"]),
-                                             "applied": len(plan["items"]), "problems": [], "ok": True}
+    assert mod.verify_plan(engine, plan) == {
+        "run_id": plan["run_id"], "digest": plan["digest"], "planned": len(plan["items"]),
+        "states": {"applied": len(plan["items"]), "undone": 0, "applied_then_superseded": 0,
+                   "superseded_before_apply": 0, "not_applied": 0},
+        "integrity_ok": True, "complete": True, "ok": True, "problems": []}
+
+
+def test_verify_is_not_ok_before_apply_or_after_an_interrupted_apply(world, monkeypatch, tmp_path):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    n = len(plan["items"])
+    before = mod.verify_plan(engine, plan)
+    assert before["integrity_ok"] and not before["complete"] and not before["ok"]
+    assert before["states"]["not_applied"] == n
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    assert mod.main(["verify", "--plan", str(path)], engine=engine) == 4
+    clock = {"t": 0.0}
+    monkeypatch.setattr(inst, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(mod, "_monotonic", lambda: clock["t"])
+    real = mod._write_series
+
+    def _slow(*a, **kw):
+        out = real(*a, **kw)
+        clock["t"] += 10.0
+        return out
+
+    monkeypatch.setattr(mod, "_write_series", _slow)
+    assert mod.run_writes(engine, plan, deadline_at=15.0, session_day=SESSION_DAY)["status"] == "STOPPED_AT_DEADLINE"
+    partial = mod.verify_plan(engine, plan)
+    assert partial["integrity_ok"] and not partial["complete"]
+    assert 0 < partial["states"]["applied"] < n and partial["states"]["not_applied"] == n - partial["states"]["applied"]
+    assert mod.main(["verify", "--plan", str(path)], engine=engine) == 4
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    assert mod.verify_plan(engine, plan)["ok"]
+    assert mod.main(["verify", "--plan", str(path)], engine=engine) == 0
+
+
+def test_verify_counts_a_legitimate_supersession_as_complete(world):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    first, second = sorted({i["obs_date"] for i in plan["items"]})[:2]
+    later = {"5d": 1.0, "20d": 2.0, "accel": 3.0, "close": 1.0, "volume": 1}
+    m.seed_row(engine, "SPY", date.fromisoformat(first), later, datetime(2026, 7, 20, 16, tzinfo=timezone.utc))
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)                # 'first' is left to that revision
+    repaired = m.vintages(engine, "ETF_FLOW:SPY:5d", date.fromisoformat(second))[-1]["pulled"]
+    repaired = datetime.fromisoformat(repaired) if isinstance(repaired, str) else repaired
+    m.seed_row(engine, "SPY", date.fromisoformat(second), later,      # a revision after the repair row
+               repaired.replace(tzinfo=repaired.tzinfo or timezone.utc) + timedelta(minutes=1))
+    result = mod.verify_plan(engine, plan)
+    assert result["ok"], result["problems"]
+    assert result["states"]["superseded_before_apply"] == 3
+    assert result["states"]["applied_then_superseded"] == 3
+    assert result["states"]["applied"] == len(plan["items"]) - 6
+
+
+def test_verify_flags_a_repair_row_whose_marker_is_not_this_plans(world):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    item = plan["items"][0]
+    repair = m.vintages(engine, item["series_id"], date.fromisoformat(item["obs_date"]))[-1]
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE raw_series SET raw_payload = REPLACE(raw_payload, :a, :b) WHERE id = :i"),
+                     {"a": plan["digest"], "b": "0" * 64, "i": repair["id"]})
+    result = mod.verify_plan(engine, plan)
+    assert not result["integrity_ok"] and not result["ok"]
+    assert any("marker" in p for p in result["problems"])
 
 
 def test_apply_twice_writes_each_row_once(world):
@@ -426,17 +540,62 @@ def test_undo_appends_the_replaced_values_and_keeps_the_repair(world):
     engine, market, _ = world
     plan = _plan(engine, market)
     mod.run_writes(engine, plan, session_day=SESSION_DAY)
-    result = mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY)
-    assert result["totals"] == {"written": len(plan["items"])}
+    result = mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY, expect_digest=plan["digest"])
+    assert result["status"] == "DONE" and result["totals"] == {"written": len(plan["items"])}
     item = plan["items"][0]
     old, repair, undo = m.vintages(engine, item["series_id"], date.fromisoformat(item["obs_date"]))
     assert undo["value"] == old["value"] and repair["value"] == item["value"]
     assert undo["payload"]["repair_undo"]["undoes_id"] == repair["id"]
+    assert undo["payload"]["repair_undo"]["restores_id"] == old["id"]
+    assert undo["payload"]["repair_undo"]["plan_digest"] == plan["digest"]
+    assert {k: v for k, v in undo["payload"].items() if k not in ("repair_undo", "revises_value")} == old["payload"]
     assert "repair" not in undo["payload"]
-    again = mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY)
+    verified = mod.verify_plan(engine, plan)
+    assert verified["ok"] and verified["states"]["undone"] == len(plan["items"])
+    again = mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY, expect_digest=plan["digest"])
     assert again["totals"] == {"not_newest": len(plan["items"])}
     reapplied = mod.run_writes(engine, plan, session_day=SESSION_DAY)
     assert reapplied["totals"] == {"superseded": len(plan["items"])}      # an undo is not re-applied
+
+
+def test_undo_writes_only_for_the_exact_approved_digest(world, tmp_path):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    before = m.row_count(engine)
+    for digest in (None, "0" * 64):
+        with pytest.raises(mod.Refused, match="digest"):
+            mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY, expect_digest=digest)
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    assert mod.main(["undo", "--plan", str(path), "--expect-digest", "0" * 64, "--apply"], engine=engine) == 2
+    with pytest.raises(SystemExit):                                       # --expect-digest is required
+        mod.main(["undo", "--plan", str(path), "--apply"], engine=engine)
+    assert m.row_count(engine) == before
+
+
+def test_undo_refuses_a_date_whose_original_row_is_missing_or_changed(world, tmp_path):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    gone, changed = (next(i for i in plan["items"] if i["metric"] == mt) for mt in ("5d", "20d"))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM raw_series WHERE id = :i"), {"i": gone["revises_id"]})
+        conn.execute(text("UPDATE raw_series SET value = value * 2 WHERE id = :i"), {"i": changed["revises_id"]})
+    assert not mod.verify_plan(engine, plan)["integrity_ok"]
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    assert mod.main(["undo", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 1  # dry
+    before = m.row_count(engine)
+    result = mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY, expect_digest=plan["digest"])
+    assert result["status"] == "DONE_WITH_REFUSED_ROWS"
+    assert result["totals"]["refused_original_missing"] == 1
+    assert result["totals"]["refused_original_value_changed"] == 1
+    assert result["totals"]["written"] == len(plan["items"]) - 2
+    assert m.row_count(engine) == before + len(plan["items"]) - 2
+    for item in (gone, changed):                                         # nothing written for those dates
+        newest = m.vintages(engine, item["series_id"], date.fromisoformat(item["obs_date"]))[-1]
+        assert newest["payload"]["repair"]["run_id"] == plan["run_id"]
 
 
 # ── 4. The command ───────────────────────────────────────────────────────
@@ -453,7 +612,7 @@ def test_the_command_plans_then_applies_then_verifies(world, tmp_path, capsys):
     assert mod.main(["plan", "--plan-out", str(path)], yf=fake, engine=engine) == 2        # never overwritten
     assert mod.main(["apply", "--plan", str(path), "--expect-digest", "f" * 64], engine=engine) == 2
     before = m.row_count(engine)
-    assert mod.main(["undo", "--plan", str(path)], engine=engine) == 0                    # dry: nothing yet
+    assert mod.main(["undo", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 0  # dry
     assert m.row_count(engine) == before
     assert mod.main(["apply", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 0
     assert m.row_count(engine) == before + plan["summary"]["rows"]

@@ -76,9 +76,24 @@ database clock read after the lock (``received_at``). It is resumable: run
 the same command again after a deadline stop, a busy lock or a failure, and
 it writes only what is still missing.
 
-``verify`` reads only and checks the plan against what is stored.
-``undo`` appends, for every planned date whose newest vintage is still this
-plan's row, a vintage carrying the value it replaced. Dry by default.
+``plan`` fails closed on the calendar: the basis session ``S`` comes from the
+exchange calendar (``ingestion.market_calendar``), and every exchange session
+of a row's window (5, 20 or 10 sessions ending at its date) and ``S`` must be
+a bar the provider returned, with no provider bar on a closed day inside the
+window. Otherwise the ETF is REFUSED with the sessions named, and ``apply``
+refuses the plan. A holiday is not a gap.
+
+``verify`` reads only and reports integrity, completion and supersession
+apart (see ``verify_plan``): it exits 0 only for a plan that is intact and
+fully applied (or legitimately superseded or undone), 1 on an integrity
+problem, 4 for an intact plan not yet fully applied.
+``undo --expect-digest D`` appends, for every planned date whose newest
+vintage is still this plan's own repair row (marker naming digest ``D`` and
+the revised vintage), a vintage restoring that original row: its value and
+payload are read again in the locked transaction, and the row must still be
+exactly the one the plan names (source, series, date, value, time, not
+quarantined), or that date is refused and nothing is written for it. Dry
+unless ``--apply``.
 
 What readers see afterwards
 ---------------------------
@@ -110,8 +125,9 @@ Usage (see the run sheet for the production step)::
     python scripts/repair_etf_flow_partial_bars.py verify --plan PLAN.json
     python scripts/repair_etf_flow_partial_bars.py undo --plan PLAN.json [--apply]
 
-Exit codes: 0 done; 1 a failure (provider, database); 2 refused (usage,
-digest, scope); 3 stopped early and resumable (deadline, lock busy).
+Exit codes: 0 done; 1 a failure (provider, database, a row undo refused, a
+verify integrity problem); 2 refused (usage, digest, scope); 3 stopped early
+and resumable (deadline, lock busy); 4 verify: intact but not fully applied.
 """
 from __future__ import annotations
 
@@ -136,6 +152,7 @@ import pandas as pd  # noqa: E402
 from sqlalchemy import bindparam, text  # noqa: E402
 from sqlalchemy.engine import Engine  # noqa: E402
 
+from ingestion import market_calendar as xnys  # noqa: E402
 from ingestion.altdata import institutional_flows as inst  # noqa: E402
 
 RUN_KIND = "etf_flow_partial_bar_repair"
@@ -155,7 +172,12 @@ PROVIDER_ATTEMPTS = 3
 PROVIDER_BACKOFF_S = (5.0, 15.0)
 DEFAULT_DEADLINE_MIN = 15.0
 
-_EXIT_OK, _EXIT_FAILED, _EXIT_REFUSED, _EXIT_STOPPED = 0, 1, 2, 3
+_EXIT_OK, _EXIT_FAILED, _EXIT_REFUSED, _EXIT_STOPPED, _EXIT_INCOMPLETE = 0, 1, 2, 3, 4
+
+# Sessions each metric's value is built from, ending at its own date.
+WINDOW_SESSIONS: dict[str, int] = {
+    "5d": inst._FLOW_WINDOW_5D, "20d": inst._FLOW_WINDOW_20D, "accel": 2 * inst._FLOW_WINDOW_5D,
+}
 
 _monotonic = time.monotonic
 _sleep = time.sleep
@@ -264,19 +286,40 @@ def _as_date(d: Any) -> date:
     return date.fromisoformat(str(d)[:10])
 
 
-def price_basis_session(pull_ts: Any, sessions: list[date]) -> date | None:
-    """``S``: the last session before the New York date of a write at ``pull_ts``.
+def price_basis_session(pull_ts: Any, sessions: Iterable[date] | None = None) -> date | None:
+    """``S``: the last exchange session before the New York date of a write at ``pull_ts``.
 
-    The dividend state of the provider's adjusted history at that write. None
-    if ``sessions`` (sorted) has no session that early.
+    The dividend state of the provider's adjusted history at that write. Taken
+    from the exchange calendar (``ingestion.market_calendar``), not from the
+    bars a provider happened to return, so a missing bar cannot move it. None
+    when ``sessions`` is given and does not contain it.
     """
     ny_day = _as_utc(pull_ts).astimezone(inst._NEW_YORK).date()
-    best = None
-    for s in sessions:
-        if s >= ny_day:
-            break
-        best = s
-    return best
+    basis = xnys.last_trading_day(ny_day - timedelta(days=1))
+    if sessions is not None and basis not in set(sessions):
+        return None
+    return basis
+
+
+def calendar_gaps(provider: list[date], d: date, metric: str, basis: date,
+                  calendar: list[date], calendar_pos: dict[date, int]) -> tuple[list[date], list[date]] | None:
+    """Exchange sessions the value of ``metric`` on ``d`` needs and the provider lacks, and
+    provider bars inside that window that are not exchange sessions.
+
+    The window is the ``WINDOW_SESSIONS[metric]`` exchange sessions ending at
+    ``d``, plus the basis session ``basis``. None when the calendar list does
+    not reach back that far (the caller widens it).
+    """
+    i = calendar_pos.get(d)
+    n = WINDOW_SESSIONS[metric]
+    if i is None or i - n + 1 < 0:
+        return None
+    needed = calendar[i - n + 1:i + 1]
+    have = set(provider)
+    missing = sorted({x for x in [*needed, basis] if x not in have})
+    known = set(calendar)
+    unexpected = sorted(x for x in provider if needed[0] <= x <= d and x not in known)
+    return missing, unexpected
 
 
 def _payload(raw: Any) -> dict[str, Any]:
@@ -413,19 +456,35 @@ def build_plan(
             continue
         sessions = list(bars.index)
         position_of = {d: k for k, d in enumerate(sessions)}
+        calendar = xnys.trading_days_between(fetch_start - timedelta(days=60), session_day - timedelta(days=1))
+        calendar_pos = {d: k for k, d in enumerate(calendar)}
+        missing_sessions: set[date] = set()
+        unexpected_sessions: set[date] = set()
+        ticker_items: list[dict] = []
         counts: Counter = Counter()
         for metric in METRICS:
             sid = f"ETF_FLOW:{ticker}:{metric}"
             for (s_sid, obs_date), vint in sorted(stored.items()):
                 if s_sid != sid:
                     continue
-                d_pos = position_of.get(obs_date)
-                if d_pos is None:
-                    counts["no_settled_bar"] += 1
+                if obs_date not in calendar_pos:
+                    counts["not_an_exchange_session"] += 1
                     continue
-                basis_session = price_basis_session(vint["pull_timestamp"], sessions)
-                s_pos = position_of.get(basis_session) if basis_session is not None else None
-                if s_pos is None or s_pos < d_pos - 1:
+                basis_session = price_basis_session(vint["pull_timestamp"])
+                gaps = calendar_gaps(sessions, obs_date, metric, basis_session, calendar, calendar_pos)
+                if gaps is None:
+                    counts["not_computable"] += 1
+                    continue
+                if gaps[0] or gaps[1]:
+                    # A bar the value needs is missing, or the provider served a
+                    # day the exchange was closed: positions would shift and the
+                    # window or basis would be wrong. Fail closed for the ETF.
+                    missing_sessions.update(gaps[0])
+                    unexpected_sessions.update(gaps[1])
+                    continue
+                d_pos = position_of[obs_date]
+                s_pos = position_of[basis_session]
+                if s_pos < d_pos - 1:
                     counts["basis_unknown"] += 1          # written before the session after it
                     continue
                 value = window_value(bars, metric, d_pos, s_pos)
@@ -449,7 +508,7 @@ def build_plan(
                 )
                 close = (float(bars["adj_close"].iat[d_pos]) * float(bars["raw_close"].iat[s_pos])
                          / float(bars["adj_close"].iat[s_pos])) if d_pos <= s_pos else float(bars["raw_close"].iat[d_pos])
-                items.append({
+                ticker_items.append({
                     "series_id": sid, "ticker": ticker, "metric": metric,
                     "obs_date": obs_date.isoformat(),
                     "value": value,
@@ -471,6 +530,16 @@ def build_plan(
                     "fetched_at": fetched_at,
                 })
                 counts["planned"] += 1
+        if missing_sessions or unexpected_sessions:
+            tickers_report[ticker] = {
+                "status": "REFUSED",
+                "error": "the provider's bars do not match the exchange calendar for a window or basis "
+                         "session a stored row needs",
+                "missing_sessions": [d.isoformat() for d in sorted(missing_sessions)],
+                "unexpected_sessions": [d.isoformat() for d in sorted(unexpected_sessions)],
+            }
+            continue
+        items.extend(ticker_items)
         tickers_report[ticker] = {"status": "OK", "sessions": len(sessions), **dict(counts)}
         left.update({k: v for k, v in counts.items() if k != "planned"})
 
@@ -536,6 +605,44 @@ def _repair_marker(plan: dict, item: dict) -> dict[str, Any]:
     }
 
 
+def _marker_matches(mark: dict, plan: dict, item: dict) -> bool:
+    """A stored repair marker is this plan's row for this item."""
+    return (mark.get("run_id") == plan["run_id"] and mark.get("kind") == RUN_KIND
+            and mark.get("plan_digest") == plan["digest"]
+            and mark.get("revises_id") == item["revises_id"]
+            and mark.get("revises_pull_timestamp") == item["revises_pull_timestamp"])
+
+
+_ORIGINAL_SQL = text(
+    "SELECT id, source_id, series_id, obs_date, value, pull_timestamp, raw_payload, pull_status "
+    "FROM raw_series WHERE id = :i"
+)
+
+
+def _original_row(conn: Any, row_id: int) -> dict | None:
+    r = conn.execute(_ORIGINAL_SQL, {"i": row_id}).fetchone()
+    if r is None:
+        return None
+    return {"id": int(r[0]), "source_id": int(r[1]), "series_id": r[2], "obs_date": _as_date(r[3]),
+            "value": float(r[4]), "pull_timestamp": _as_utc(r[5]), "raw_payload": r[6], "pull_status": r[7]}
+
+
+def _original_problem(original: dict | None, source_id: int, series_id: str, obs_date: date,
+                      item: dict) -> str | None:
+    """Why the stored row a plan item revised is not exactly the row the plan names, or None."""
+    if original is None:
+        return "missing"
+    if (original["source_id"], original["series_id"], original["obs_date"]) != (source_id, series_id, obs_date):
+        return "elsewhere"
+    if not math.isclose(original["value"], item["revises_value"], rel_tol=1e-12):
+        return "value_changed"
+    if original["pull_timestamp"] != _as_utc(item["revises_pull_timestamp"]):
+        return "time_changed"
+    if original["pull_status"] == "QUARANTINED":
+        return "quarantined"
+    return None
+
+
 def _by_series(items: list[dict]) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = defaultdict(list)
     for i in items:
@@ -565,8 +672,9 @@ def _write_series(
     """One series, one transaction, under the ETF flow write lock.
 
     ``mode`` is ``apply`` (write the plan's value where the plan's vintage is
-    still the newest) or ``undo`` (write the replaced value back where this
-    plan's row is still the newest).
+    still the newest) or ``undo`` (where this plan's own repair row is still
+    the newest, write back the original vintage it revised, read again inside
+    this transaction and required to be exactly the row the plan names).
     """
     run_id = plan["run_id"]
     floor = writer_floor(session_day)
@@ -598,14 +706,22 @@ def _write_series(
                 if current is None or not mine:
                     counts["not_newest"] += 1
                     continue
-                with_old = conn.execute(
-                    text("SELECT raw_payload FROM raw_series WHERE id = :i"), {"i": item["revises_id"]}
-                ).scalar()
-                payload = dict(_payload(with_old))
-                payload["revises_value"] = current["value"]
-                payload["repair_undo"] = {"run_id": run_id, "undoes_id": current["id"], "kind": RUN_KIND}
+                if not _marker_matches(mark, plan, item) or not math.isclose(
+                        current["value"], item["value"], rel_tol=1e-12):
+                    counts["refused_repair_row_mismatch"] += 1
+                    continue
+                original = _original_row(conn, item["revises_id"])
+                problem = _original_problem(original, puller.source_id, series_id, obs_date, item)
+                if problem:
+                    counts[f"refused_original_{problem}"] += 1
+                    continue
+                payload = dict(_payload(original["raw_payload"]))
                 payload.pop("repair", None)
-                value = item["revises_value"]
+                payload.pop("repair_undo", None)
+                payload["revises_value"] = current["value"]
+                payload["repair_undo"] = {"run_id": run_id, "kind": RUN_KIND, "plan_digest": plan["digest"],
+                                          "undoes_id": current["id"], "restores_id": original["id"]}
+                value = original["value"]
             puller._insert_raw(
                 conn=conn, series_id=series_id, obs_date=obs_date, value=value,
                 raw_payload=payload, received_at=received_at,
@@ -622,9 +738,16 @@ def run_writes(
     deadline_at: float | None = None,
     progress_path: Path | None = None,
     session_day: date | None = None,
+    expect_digest: str | None = None,
 ) -> dict[str, Any]:
-    """Write the plan (``apply``) or its undo, series by series; resumable."""
+    """Write the plan (``apply``) or its undo, series by series; resumable.
+
+    ``undo`` writes only with ``expect_digest`` equal to the plan's digest,
+    recomputed here: the approval names the exact plan being undone.
+    """
     session_day = session_day or inst._new_york_today()
+    if mode == "undo" and (expect_digest is None or expect_digest != _digest(plan) or expect_digest != plan["digest"]):
+        raise Refused("undo writes only for the exact approved plan: pass its digest")
     puller = inst.InstitutionalFlowsPuller(engine)
     if puller.source_id != plan["source_id"]:
         raise Refused(f"plan was made for source_id {plan['source_id']}, this database has {puller.source_id}")
@@ -652,56 +775,105 @@ def run_writes(
             "position": position + 1, "series_total": len(series),
             "seconds": round(_monotonic() - started, 3), **dict(counts),
         })
+    if status == "DONE" and any(k.startswith("refused_") for k in totals):
+        status = "DONE_WITH_REFUSED_ROWS"
     return {"mode": mode, "run_id": plan["run_id"], "status": status, "totals": dict(totals),
             "planned": len(plan["items"])}
 
 
 def verify_plan(engine: Engine, plan: dict) -> dict[str, Any]:
-    """Read-only check of a plan against what is stored."""
+    """Read-only receipt of a plan against what is stored.
+
+    Three answers, reported apart:
+
+    * integrity (``integrity_ok``): every revised vintage is still the row the
+      plan names; every row carrying this run id is a planned item's, once,
+      with this plan's value and a marker naming this digest and that vintage;
+      every undo row restores that vintage's value over this plan's row.
+    * completion (``complete``): every item is ``applied``, ``undone``,
+      ``applied_then_superseded`` or ``superseded_before_apply`` (another
+      vintage became newest before the repair reached it). An item whose
+      revised vintage is still the newest is ``not_applied``.
+    * ``ok`` is both. The command exits 0 only then: 1 on an integrity
+      problem, 4 when the plan is intact but not (fully) applied.
+    """
     run_id = plan["run_id"]
     lo = min(date.fromisoformat(i["obs_date"]) for i in plan["items"]) if plan["items"] else date.min
     hi = max(date.fromisoformat(i["obs_date"]) for i in plan["items"]) if plan["items"] else lo
     series_ids = sorted({i["series_id"] for i in plan["items"]})
-    counts: Counter = Counter()
+    states: Counter = Counter()
     problems: list[str] = []
     with read_only_connection(engine) as conn:
         rows = conn.execute(text(
-            "SELECT id, series_id, obs_date, value, raw_payload, pull_status FROM raw_series "
-            "WHERE source_id = :src AND series_id IN :sids"
+            "SELECT id, series_id, obs_date, value, raw_payload, pull_status, pull_timestamp, source_id "
+            "FROM raw_series WHERE source_id = :src AND series_id IN :sids"
         ).bindparams(bindparam("sids", expanding=True)), {"src": plan["source_id"], "sids": series_ids or [""]}).fetchall()
         newest = newest_vintages(conn, plan["source_id"], series_ids or [""], lo, hi)
-    mine: dict[tuple[str, date], list] = defaultdict(list)
+        stray_elsewhere = conn.execute(text(
+            "SELECT COUNT(*) FROM raw_series WHERE source_id = :src AND series_id LIKE 'ETF_FLOW:%' "
+            "AND series_id NOT IN :sids AND CAST(raw_payload AS TEXT) LIKE :pat"
+        ).bindparams(bindparam("sids", expanding=True)),
+            {"pat": f"%{run_id}%", "src": plan["source_id"], "sids": series_ids or [""]}).scalar()
+    repairs: dict[tuple[str, date], list] = defaultdict(list)
+    undos: dict[tuple[str, date], list] = defaultdict(list)
     by_id = {}
     for r in rows:
         by_id[int(r[0])] = r
         p = _payload(r[4])
+        key = (r[1], _as_date(r[2]))
         if (p.get("repair") or {}).get("run_id") == run_id:
-            mine[(r[1], _as_date(r[2]))].append(r)
+            repairs[key].append((r, p["repair"]))
+        if (p.get("repair_undo") or {}).get("run_id") == run_id:
+            undos[key].append((r, p["repair_undo"]))
     planned_keys = set()
     for item in plan["items"]:
         key = (item["series_id"], date.fromisoformat(item["obs_date"]))
         planned_keys.add(key)
-        found = mine.get(key, [])
         old = by_id.get(item["revises_id"])
-        if old is None or not math.isclose(float(old[3]), item["revises_value"], rel_tol=1e-12):
-            problems.append(f"{key}: the revised vintage {item['revises_id']} is missing or changed")
+        original = None if old is None else {
+            "id": int(old[0]), "source_id": int(old[7]), "series_id": old[1], "obs_date": _as_date(old[2]),
+            "value": float(old[3]), "pull_timestamp": _as_utc(old[6]), "pull_status": old[5]}
+        why = _original_problem(original, plan["source_id"], key[0], key[1], item)
+        if why:
+            problems.append(f"{key}: the revised vintage {item['revises_id']} is {why.replace('_', ' ')}")
+        found = repairs.get(key, [])
+        for r, mark in found:
+            if not _marker_matches(mark, plan, item):
+                problems.append(f"{key}: repair row {r[0]} carries a marker that is not this plan's for this item")
+            if not math.isclose(float(r[3]), item["value"], rel_tol=1e-12):
+                problems.append(f"{key}: repair row {r[0]} value differs from the plan")
         if len(found) > 1:
-            counts["duplicated"] += 1
             problems.append(f"{key}: written {len(found)} times")
-        elif len(found) == 1:
-            counts["applied"] += 1
-            if not math.isclose(float(found[0][3]), item["value"], rel_tol=1e-12):
-                problems.append(f"{key}: stored repair value differs from the plan")
-            cur = newest.get(key)
-            if cur is None or cur["id"] != int(found[0][0]):
-                counts["applied_then_superseded"] += 1
+        for r, mark in undos.get(key, []):
+            if (not found or mark.get("undoes_id") != int(found[0][0][0])
+                    or mark.get("plan_digest") != plan["digest"]
+                    or not math.isclose(float(r[3]), item["revises_value"], rel_tol=1e-12)):
+                problems.append(f"{key}: undo row {r[0]} does not restore this plan's revised value")
+        cur = newest.get(key)
+        if found:
+            repair_id = int(found[0][0][0])
+            if cur is not None and cur["id"] == repair_id:
+                states["applied"] += 1
+            elif cur is not None and (cur["payload"].get("repair_undo") or {}).get("undoes_id") == repair_id:
+                states["undone"] += 1
+            else:
+                states["applied_then_superseded"] += 1
+        elif cur is not None and cur["id"] == item["revises_id"]:
+            states["not_applied"] += 1
         else:
-            counts["not_applied"] += 1
-    stray = [k for k in mine if k not in planned_keys]
+            states["superseded_before_apply"] += 1
+    stray = [k for k in list(repairs) + list(undos) if k not in planned_keys]
     if stray:
         problems.append(f"{len(stray)} row(s) carry this run id outside the plan")
-    return {"run_id": run_id, "planned": len(plan["items"]), **dict(counts),
-            "problems": problems, "ok": not problems}
+    if stray_elsewhere:
+        problems.append(f"{stray_elsewhere} row(s) outside the plan's series mention this run id")
+    integrity_ok = not problems
+    complete = states["not_applied"] == 0
+    return {"run_id": run_id, "digest": plan["digest"], "planned": len(plan["items"]),
+            "states": {k: states[k] for k in ("applied", "undone", "applied_then_superseded",
+                                              "superseded_before_apply", "not_applied")},
+            "integrity_ok": integrity_ok, "complete": complete, "ok": integrity_ok and complete,
+            "problems": problems}
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -737,6 +909,8 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
             w.add_argument("--allow-incomplete-plan", action="store_true",
                            help="apply a plan in which some ETF was not planned (they stay unrepaired)")
         else:
+            w.add_argument("--expect-digest", required=True,
+                           help="the digest of the plan being undone (as printed when it was made)")
             w.add_argument("--apply", action="store_true", help="write; without it, only count")
     v = sub.add_parser("verify")
     v.add_argument("--plan", required=True, type=Path)
@@ -769,19 +943,31 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
             plan = load_plan(args.plan)
             result = verify_plan(engine, plan)
             print("VERIFY " + json.dumps(result, sort_keys=True))
-            return _EXIT_OK if result["ok"] else _EXIT_FAILED
+            if not result["integrity_ok"]:
+                return _EXIT_FAILED
+            if not result["complete"]:
+                print(f"NOT COMPLETE: {result['states']['not_applied']} planned row(s) not applied; "
+                      "run apply again", file=sys.stderr)
+                return _EXIT_INCOMPLETE
+            return _EXIT_OK
         plan = load_plan(args.plan, getattr(args, "expect_digest", None),
                          require_complete=args.mode == "apply" and not args.allow_incomplete_plan)
         progress = args.plan.with_suffix(f".{args.mode}.progress.jsonl")
         if args.mode == "undo" and not args.apply:
             result = verify_plan(engine, plan)
             print("UNDO (dry run: nothing written) would restore up to "
-                  f"{result.get('applied', 0) - result.get('applied_then_superseded', 0)} row(s); "
-                  "re-run with --apply to write them")
+                  f"{result['states']['applied']} row(s); re-run with --apply to write them")
+            if not result["integrity_ok"]:
+                print("integrity problems: " + json.dumps(result["problems"]), file=sys.stderr)
+                return _EXIT_FAILED
             return _EXIT_OK
         deadline_at = _monotonic() + args.deadline_minutes * 60
-        result = run_writes(engine, plan, mode=args.mode, deadline_at=deadline_at, progress_path=progress)
+        result = run_writes(engine, plan, mode=args.mode, deadline_at=deadline_at, progress_path=progress,
+                            expect_digest=getattr(args, "expect_digest", None))
         print("RESULT " + json.dumps(result, sort_keys=True))
+        if result["status"] == "DONE_WITH_REFUSED_ROWS":
+            print("some rows were refused (see totals); nothing was written for them", file=sys.stderr)
+            return _EXIT_FAILED
         if result["status"] != "DONE":
             print("stopped early; run the same command again to continue", file=sys.stderr)
             return _EXIT_STOPPED

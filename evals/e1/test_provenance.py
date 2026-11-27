@@ -26,10 +26,14 @@ A writer that must read raw *and* adjusted closes to store a source's
 adjusted basis as of a past provider state (a repair recomputing a stored
 vintage on its own basis) is declared in :data:`DERIVED_BASIS_WRITERS`
 instead: the basis it stores must equal the source's declared writers'
-flag, its own download flag must be explicit at every call, and it names a
-test that compares its stored values with the declared writer's on the same
-bars. It is not an exemption: an undeclared writer, an implicit flag, a
-stored basis that differs or a missing parity test fails the gate.
+flag, its own download flag must be explicit at every call, and it names
+parity tests (under ``tests/``) that compare its stored values with the
+declared writer's on the same bars and cover how the past basis is chosen.
+This gate runs those tests itself and fails unless every one is collected
+and passes (none skipped), so the parity claim is executed on every E1 run,
+not just named. It is not an exemption: an undeclared writer, an implicit
+flag, a stored basis that differs, or a missing, skipped or failing parity
+test fails the gate.
 
 The fixture test (``test_gates_pg.py``) runs the shared writer
 (``BasePuller._insert_raw``) against the real DDL on PostgreSQL.
@@ -271,18 +275,26 @@ PRICE_WRITERS: dict[str, tuple[str, bool]] = {
 }
 
 # module -> (source name, auto_adjust basis it stores, auto_adjust at every
-# yfinance download, "tests/<file>.py::<test>" comparing its stored values with
-# the source's PRICE_WRITERS writer on the same provider bars)
-DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, str]] = {
+# yfinance download, parity tests "tests/<file>.py::<test>" that this gate runs)
+DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, tuple[str, ...]]] = {
     # Recomputes ETF flow rows stored from a partial bar on the price basis of
     # the run that stored them: needs the raw close (Close, auto_adjust=False)
     # and today's Adj Close to state that run's adjusted close
     # (AdjNow(k) * Raw(S) / AdjNow(S)), i.e. the auto_adjust=True basis the
     # live writer stores.
     "scripts/repair_etf_flow_partial_bars.py": (
-        "INSTITUTIONAL_FLOWS", True, False,
-        "tests/test_etf_flow_partial_bar_repair.py::"
-        "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars",
+        "INSTITUTIONAL_FLOWS", True, False, (
+            # stored values equal the live writer's run the morning after, on
+            # rows whose original-versus-current adjustment factor is not 1
+            "tests/test_etf_flow_partial_bar_repair.py::"
+            "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars",
+            # same-day ex-dividend basis: an after-close row keeps the day before's
+            "tests/test_etf_flow_partial_bar_repair.py::"
+            "test_an_after_close_row_on_its_ex_dividend_date_keeps_the_day_befores_basis",
+            # a missing open session (or a bar on a closed day) refuses; a holiday does not
+            "tests/test_etf_flow_partial_bar_repair.py::"
+            "test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not",
+        ),
     ),
 }
 
@@ -309,6 +321,8 @@ def writes_raw_series(source: str) -> bool:
 
 def _test_exists(ref: str, tests: dict[str, str] | None) -> bool:
     rel, _, name = ref.partition("::")
+    if not rel.startswith("tests/") or not rel.endswith(".py"):
+        return False
     if tests is not None:
         source = tests.get(rel)
     else:
@@ -320,7 +334,7 @@ def _test_exists(ref: str, tests: dict[str, str] | None) -> bool:
 
 
 def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[str, str],
-                          derived: dict[str, tuple[str, bool, bool, str]] | None = None,
+                          derived: dict[str, tuple[str, bool, bool, tuple[str, ...]]] | None = None,
                           tests: dict[str, str] | None = None) -> list[str]:
     derived = derived or {}
     problems = []
@@ -354,8 +368,11 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
         for line, got in yfinance_downloads(source):
             if got != download:
                 problems.append(f"{rel}:{line}: auto_adjust={got} but the derived-basis writer declares {download}")
-        if not _test_exists(parity, tests):
-            problems.append(f"{rel}: parity test {parity!r} does not exist")
+        if not parity or isinstance(parity, str):
+            problems.append(f"{rel}: derived-basis writer names no parity tests (a tuple of test refs)")
+        for ref in ([] if isinstance(parity, str) else parity):
+            if not _test_exists(ref, tests):
+                problems.append(f"{rel}: parity test {ref!r} does not exist")
         by_source.setdefault(name.lower(), set()).add(stored)
     for name, flags in sorted(by_source.items()):
         if len(flags) > 1:
@@ -366,6 +383,49 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
 def test_one_price_basis_per_source():
     problems = price_writer_problems(PRICE_WRITERS, _module_sources(), DERIVED_BASIS_WRITERS)
     assert not problems, "\n".join(problems)
+
+
+def parity_run_problems(refs: list[str], cwd: Path) -> list[str]:
+    """Run ``refs`` with pytest in ``cwd``; the problems unless every one is collected and passes."""
+    import subprocess
+    import sys
+
+    env = {**os.environ, "TZ": os.environ.get("TZ", "UTC")}
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", *refs, "-q", "-rA", "-p", "no:cacheprovider"],
+        cwd=cwd, env=env, capture_output=True, text=True, timeout=600,
+    )
+    out = proc.stdout + proc.stderr
+    problems = []
+    if proc.returncode != 0:
+        problems.append(f"parity tests exited {proc.returncode}")
+    passed = set(re.findall(r"^PASSED (\S+)", out, re.M))
+    for ref in refs:
+        if ref not in passed:
+            problems.append(f"parity test {ref} did not pass")
+    if re.search(r"^(SKIPPED|XFAIL|XPASS|ERROR|FAILED)\b", out, re.M):
+        problems.append("a parity test was skipped, xfailed or failed")
+    return problems
+
+
+@pytest.mark.parametrize("rel", sorted(DERIVED_BASIS_WRITERS))
+def test_derived_basis_writers_parity_tests_run_and_pass(rel):
+    """Run each declared parity test here, so the claim is executed, not only named."""
+    problems = parity_run_problems(list(DERIVED_BASIS_WRITERS[rel][3]), REPO)
+    assert not problems, "\n".join(problems)
+
+
+def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_p.py").write_text(
+        "import pytest\n"
+        "def test_ok():\n    pass\n"
+        "def test_bad():\n    assert False\n"
+        "def test_skip():\n    pytest.skip('no database')\n")
+    assert parity_run_problems(["tests/test_p.py::test_ok"], tmp_path) == []
+    assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path))
+    assert any("skipped" in p for p in parity_run_problems(["tests/test_p.py::test_skip"], tmp_path))
+    assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_absent"], tmp_path))
 
 
 def test_derived_basis_self_test_catches_each_rule():
@@ -381,18 +441,21 @@ def repair(conn):
     sources = {"live.py": live, "repair.py": writer}
     declared = {"live.py": ("SRC", True)}
     tests = {"tests/t.py": "def test_parity():\n    pass\n"}
-    ok = {"repair.py": ("SRC", True, False, "tests/t.py::test_parity")}
+    ok = {"repair.py": ("SRC", True, False, ("tests/t.py::test_parity",))}
     assert price_writer_problems(declared, sources, ok, tests) == []
 
     def problems(derived=ok, srcs=sources):
         return "\n".join(price_writer_problems(declared, srcs, derived, tests))
 
-    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, "tests/t.py::test_parity")})
-    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, "tests/t.py::test_parity")})
+    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, ("tests/t.py::test_parity",))})
+    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, ("tests/t.py::test_parity",))})
     assert "auto_adjust=implicit" in problems(
         srcs={**sources, "repair.py": writer.replace(", auto_adjust=False, actions=True", "")})
-    assert "does not exist" in problems({"repair.py": ("SRC", True, False, "tests/t.py::test_missing")})
-    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, "tests/t.py::test_parity")})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, ("tests/t.py::test_missing",))})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, ("evals/t.py::test_parity",))})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, ())})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, "tests/t.py::test_parity")})
+    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, ("tests/t.py::test_parity",))})
     assert "repair.py: downloads yfinance prices and writes raw_series but is not declared" in problems({})
 
 
