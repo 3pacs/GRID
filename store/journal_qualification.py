@@ -26,12 +26,25 @@ _JOURNAL_MARKER_WHITESPACE = (
     "\u2028\u2029\u202f\u205f\u3000"
 )
 
+# A contagion trade ticket written to the journal (trading/contagion_to_ticket.py::write_ticket_to_journal)
+# is a position record, not a regime state: its `inferred_state` is CONTAGION_<shock type> and its
+# `state_confidence` is a ticket's confidence or sizing default. Every such row carries
+# contradiction_flags.flow_thesis = 'contagion_derived' (old rows too). It must not be served as the
+# latest or historical regime. The match is on that tag, never on the CONTAGION_ state prefix: regime
+# subtypes of the same name are genuine regime states.
+CONTAGION_TICKET_JOURNAL_MARKER = (
+    "LOWER(BTRIM(COALESCE(contradiction_flags ->> 'flow_thesis', ''), "
+    ":journal_marker_whitespace) COLLATE \"C\") = 'contagion_derived'"
+)
+NOT_CONTAGION_TICKET_JOURNAL_PREDICATE = "(NOT " + CONTAGION_TICKET_JOURNAL_MARKER + ")"
+
 # These exact family names contain only ASCII letters with no non-ASCII
 # casefold equivalents. C collation makes LOWER independent of DB locale and
 # matches casefold for the marker prefix; a source's suffix is not classified.
 NON_PROVISIONAL_JOURNAL_PREDICATE = """(
     NOT (
-        LEFT(UPPER(COALESCE(inferred_state, '')), 12) = 'PROVISIONAL_'
+        """ + CONTAGION_TICKET_JOURNAL_MARKER + """
+        OR LEFT(UPPER(COALESCE(inferred_state, '')), 12) = 'PROVISIONAL_'
         OR UPPER(COALESCE(action_taken, '')) = 'PROVISIONAL'
         OR LEFT(UPPER(COALESCE(action_taken, '')), 12) = 'PROVISIONAL '
         OR LEFT(LOWER(COALESCE(counterfactual, '')), 26) = 'provisional-from-contract:'
@@ -81,3 +94,13 @@ def non_provisional_journal_select(*column_names: str) -> Select:
             journal_marker_whitespace=_JOURNAL_MARKER_WHITESPACE
         )
     )
+
+
+def exclude_contagion_tickets(statement):
+    """``text()`` journal SQL with the contagion-ticket exclusion appended, and its whitespace bound.
+
+    For the raw historical regime reads that deliberately keep provisional evidence but must never show
+    a trade ticket as a regime state. ``statement`` must already contain a WHERE; use
+    ``NOT_CONTAGION_TICKET_JOURNAL_PREDICATE`` for the clause text.
+    """
+    return statement.bindparams(journal_marker_whitespace=_JOURNAL_MARKER_WHITESPACE)

@@ -19,11 +19,13 @@ from sqlalchemy.sql import Select
 from store.journal_qualification import (
     DECISION_JOURNAL,
     NON_PROVISIONAL_JOURNAL_PREDICATE as PREDICATE,
+    NOT_CONTAGION_TICKET_JOURNAL_PREDICATE,
     non_provisional_journal_select,
 )
 
 
 PG_PREDICATE = str(text(PREDICATE).compile(dialect=postgresql.dialect()))
+PG_NOT_CONTAGION = str(text(NOT_CONTAGION_TICKET_JOURNAL_PREDICATE).compile(dialect=postgresql.dialect()))
 NOW = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
 # Derive the reference from Python, rather than copying the SQL helper's list.
 PYTHON_STRIP_WHITESPACE = "".join(chr(i) for i in range(0x110000) if chr(i).isspace())
@@ -277,6 +279,34 @@ def test_historical_regime_apis_keep_provisional_evidence(monkeypatch):
     assert transitions.transitions[-1].to_state == "PROVISIONAL_FUNDAMENTAL_DIVERGENCE"
     assert len(queries) == 2
     assert all(PG_PREDICATE not in sql for sql in queries)
+    # ...but a contagion trade ticket is never a regime state, so both exclude it by its tag.
+    assert all(PG_NOT_CONTAGION in sql for sql in queries)
+    engine.begin.assert_not_called()
+
+
+def test_contagion_ticket_tag_is_excluded_by_the_shared_current_guard_not_by_state_prefix():
+    # Matched on contradiction_flags.flow_thesis only: regime subtypes named CONTAGION_* are real states.
+    assert "'contagion_derived'" in PREDICATE
+    assert "CONTAGION_" not in PREDICATE
+    assert "LIKE" not in PREDICATE
+
+
+def test_mcp_regime_current_uses_the_current_guard_and_history_excludes_tickets(monkeypatch):
+    from api.routers import mcp_export
+
+    rows = [(date(2026, 11, 7), "GROWTH", 0.8)]
+    engine, queries = _engine(rows)
+    monkeypatch.setattr(mcp_export, "get_db_engine", lambda: engine)
+    mcp_export.mcp_regime(_token="fixture")
+    reads = [q for q in queries if "FROM decision_journal" in q]
+    assert len(reads) == 2
+    current, history = reads
+    # Current: the same guard as /api/v1/regime/current, applied before ORDER BY / LIMIT.
+    assert PG_PREDICATE in current
+    assert current.index(PG_PREDICATE) < current.index("ORDER BY") < current.index("LIMIT")
+    # History: raw like the regime history API, but a trade ticket is never a regime state.
+    assert PG_NOT_CONTAGION in history
+    assert PG_PREDICATE not in history
     engine.begin.assert_not_called()
 
 
@@ -393,11 +423,13 @@ def test_builder_feedback_cutoff_and_verdict_remain_fixed_clauses():
     """LOWER(BTRIM(COALESCE(contradiction_flags #>> '{context,producer_module}', ''), :journal_marker_whitespace) COLLATE "C")""",
     """LOWER(BTRIM(COALESCE(contradiction_flags ->> 'source', ''), :journal_marker_whitespace) COLLATE "C")""",
     """LOWER(BTRIM(COALESCE(contradiction_flags #>> '{context,source}', ''), :journal_marker_whitespace) COLLATE "C")""",
+    # A contagion trade ticket row (#959): tagged by flow_thesis, normalized like the others.
+    """LOWER(BTRIM(COALESCE(contradiction_flags ->> 'flow_thesis', ''), :journal_marker_whitespace) COLLATE "C")""",
 ])
 def test_every_structured_financial_marker_normalizes_case_and_outer_whitespace(normalized_marker):
     assert normalized_marker in PREDICATE
     # Fixed normalization is applied before exact equality or prefix slicing.
-    assert PREDICATE.count("LOWER(BTRIM(") == 8
+    assert PREDICATE.count("LOWER(BTRIM(") == 9   # 8 financial markers + the contagion ticket tag
     compiled = non_provisional_journal_select("id").compile(dialect=postgresql.dialect())
     assert compiled.params == {"journal_marker_whitespace": PYTHON_STRIP_WHITESPACE}
     assert PYTHON_STRIP_WHITESPACE not in str(compiled)

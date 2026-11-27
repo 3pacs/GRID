@@ -20,7 +20,12 @@ from api.schemas.regime import (
     RegimeTransition,
     RegimeTransitionsResponse,
 )
-from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
+from store.journal_qualification import (
+    DECISION_JOURNAL,
+    NOT_CONTAGION_TICKET_JOURNAL_PREDICATE,
+    exclude_contagion_tickets,
+    non_provisional_journal_select,
+)
 from store.snapshots import strip_binding_flags
 
 router = APIRouter(prefix="/api/v1/regime", tags=["regime"])
@@ -480,14 +485,16 @@ def get_history(
     engine = get_db_engine()
 
     with engine.connect() as conn:
+        # Historical reads keep provisional evidence, but a contagion trade ticket is not a regime state.
         rows = conn.execute(
-            text(
+            exclude_contagion_tickets(text(
                 "SELECT DATE(decision_timestamp) AS dt, "
                 "inferred_state, state_confidence "
                 "FROM decision_journal "
                 "WHERE decision_timestamp >= NOW() - make_interval(days => :days) "
+                "AND " + NOT_CONTAGION_TICKET_JOURNAL_PREDICATE + " "
                 "ORDER BY decision_timestamp"
-            ),
+            )),
             {"days": days},
         ).fetchall()
 
@@ -512,11 +519,12 @@ def get_transitions(
 
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
+            exclude_contagion_tickets(text(
                 "SELECT decision_timestamp, inferred_state, state_confidence "
                 "FROM decision_journal "
+                "WHERE " + NOT_CONTAGION_TICKET_JOURNAL_PREDICATE + " "
                 "ORDER BY decision_timestamp"
-            )
+            ))
         ).fetchall()
 
     transitions: list[RegimeTransition] = []
