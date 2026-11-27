@@ -102,10 +102,12 @@ _13F_OBSERVATION_REASONS: frozenset[str] = frozenset({"no_identity_coverage"})
 #
 # A contract names, per source type, the one shape the current rule can
 # write. It is enforced three times from this single definition:
-#   - ``_persist_flows`` refuses (and counts) a flow that breaks it;
+#   - ``_persist_flows`` checks every flow before its window DELETE; one that
+#     breaks it makes the run write nothing (the last good window is kept)
+#     and ``scripts/run_dollar_flows.py`` exits 4 (unexpected: a regression);
 #   - ``count_stored_contract_violations`` reads the WHOLE table after every
-#     run, so an old row in a superseded shape is reported, and
-#     ``scripts/run_dollar_flows.py`` exits non-zero (the unit fails);
+#     run, so an old row in a superseded shape is reported and the runner
+#     exits 3 after a good window committed (expected until the repair);
 #   - the CHECK constraint ``DOLLAR_FLOWS_CONTRACT_CONSTRAINT`` (alembic
 #     revision ``df_13f_observed_20261127``) rejects it for every
 #     other writer.
@@ -2049,12 +2051,15 @@ def _persist_flows(
     directly with unfiltered flows and it must never persist a future-dated
     row either (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3 item 2).
 
-    A flow that breaks its source's stored-row contract
-    (``STORED_ROW_CONTRACTS``) is not inserted; it is counted per source type
-    in ``rejected_counts`` when given. The window's DELETE still applies, so a
-    writer regression that emits only breaking flows of one source leaves no
-    rows of that source in the window: nothing wrong is stored, and the
-    runner exits 3 naming the refusals.
+    Contract preflight: before anything is deleted, every flow is checked
+    against its source's stored-row contract (``STORED_ROW_CONTRACTS``). If
+    any breaks it, this run writes nothing at all (no DELETE, no INSERT), so
+    the last good window stays as it was; the refusals are counted per source
+    type in ``rejected_counts`` when given and the runner exits 4. A breaking
+    flow is a writer regression, never an expected state. The refusal is for
+    the whole run, so one bad 13F flow also holds back that day's options,
+    ETF and insider rows until the regression is fixed; the failed unit says
+    so. (A per-source scope would need a per-source DELETE; not done here.)
 
     A database error on an insert is raised, never swallowed: on PostgreSQL
     the failed statement aborts the transaction, so every later insert and
@@ -2064,7 +2069,7 @@ def _persist_flows(
         engine: SQLAlchemy engine.
         flows: List of normalized flow dicts.
         rejected_counts: Optional dict that receives per-source-type counts
-            of contract-breaking flows that were refused.
+            of contract-breaking flows that made the run refuse.
 
     Returns:
         Number of rows inserted.
@@ -2073,6 +2078,22 @@ def _persist_flows(
         return 0
 
     today = date.today()
+    refused: dict[str, int] = {}
+    for f in flows:
+        if (bad := flow_contract_violation(f)) is not None:
+            refused[bad] = refused.get(bad, 0) + 1
+    if refused:
+        if rejected_counts is not None:
+            for st, n in refused.items():
+                rejected_counts[st] = rejected_counts.get(st, 0) + n
+        log.error(
+            "dollar_flows run refused before writing: {r} flow(s) break the stored-row "
+            "contract ({rules}); nothing deleted or inserted, the last good window is kept",
+            r=refused,
+            rules="; ".join(STORED_ROW_CONTRACTS[st]["rule"] for st in sorted(refused)),
+        )
+        return 0
+
     inserted = 0
     with engine.begin() as conn:
         # Determine date range (future-dated rows never count toward it,
@@ -2105,18 +2126,6 @@ def _persist_flows(
                 log.debug(
                     "Dropping future-dated/unparseable flow (flow_date={fd}) — never persist",
                     fd=f["flow_date"],
-                )
-                continue
-            if (bad := flow_contract_violation(f)) is not None:
-                if rejected_counts is not None:
-                    rejected_counts[bad] = rejected_counts.get(bad, 0) + 1
-                log.error(
-                    "Refusing a {st} flow that breaks its stored-row contract ({rule}): "
-                    "direction={d}, flow_date={fd}",
-                    st=bad,
-                    rule=STORED_ROW_CONTRACTS[bad]["rule"],
-                    d=f.get("direction"),
-                    fd=f.get("flow_date"),
                 )
                 continue
             try:

@@ -15,16 +15,25 @@ This script is the only way such rows are removed. Every step is explicit:
     amount sum and the sha256 of its rows. Review the manifest.
 
 ``apply --manifest FILE --expect-count N --expect-sha256 H [--dry-run]``
-    One transaction. Takes ``SHARE ROW EXCLUSIVE`` on ``dollar_flows`` (the
-    daily writer waits; readers do not), re-reads the rows that break a
-    contract and refuses unless they are exactly the manifest's rows, column
-    for column. Deletes by the manifest's explicit id list, refuses unless
-    exactly N rows were deleted and none that break a contract remain, then
-    commits. Afterwards validates a NOT VALID ``dollar_flows_13f_observed_only``
-    constraint in its own transaction; if that cannot get its lock the rows are
-    still deleted, the report says ``"constraint": "not_valid"`` with the error
-    and the statement to run, and the exit status is 4. ``--dry-run`` does
-    every check and the delete, then rolls back.
+    One transaction, all or nothing. Takes ``SHARE ROW EXCLUSIVE`` on
+    ``dollar_flows`` (the daily writer waits; readers do not). Refuses unless
+    the CHECK ``dollar_flows_13f_observed_only`` exists with the expected
+    definition (so it never runs before the release that adds it). Re-reads
+    the rows that break a contract and refuses unless they are exactly the
+    manifest's rows, column for column. Deletes by the manifest's explicit
+    id list, refuses unless exactly N rows were deleted and none that break a
+    contract remain, then validates the constraint, and only then commits.
+    Any refusal or error (a lock timeout, a failed VALIDATE) rolls the whole
+    transaction back: nothing is deleted and the same manifest can be applied
+    again. ``--dry-run`` does all of it, VALIDATE included, then rolls back.
+    Lock scope: the VALIDATE scan (one sequential read of the table) runs
+    under the SHARE ROW EXCLUSIVE already held, so readers are never blocked
+    and the writer waits for the scan.
+
+``validate [--dry-run]``
+    For a table with no rows that break a contract and a NOT VALID
+    constraint (a database where the migration found nothing to remove):
+    validates it under the same lock, or refuses if any row breaks it.
 
 ``restore --manifest FILE --expect-sha256 H [--dry-run]``
     One transaction. Re-inserts the manifest's rows with their original ids
@@ -34,8 +43,8 @@ This script is the only way such rows are removed. Every step is explicit:
     database keeps its alembic version, so no later ``alembic upgrade`` puts the
     constraint back; the report prints the statement that re-adds it NOT VALID.
 
-Exit status: 0 done, 2 refused (nothing written), 4 rows deleted but the
-constraint is still NOT VALID (run the printed VALIDATE statement).
+Exit status: 0 done, 2 refused (nothing written). A database error ends in
+a traceback (exit 1) with the transaction rolled back.
 """
 
 from __future__ import annotations
@@ -44,6 +53,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -56,7 +66,6 @@ if str(_ROOT) not in sys.path:
 
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
-from sqlalchemy.exc import DBAPIError  # noqa: E402
 
 from intelligence.dollar_flows import (  # noqa: E402
     DOLLAR_FLOWS_CONTRACT_CHECK_SQL,
@@ -72,7 +81,6 @@ _COLUMNS = (
 
 
 EXIT_REFUSED = 2
-EXIT_VALIDATE_PENDING = 4
 VALIDATE_SQL = f"ALTER TABLE dollar_flows VALIDATE CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}"
 DROP_SQL = f"ALTER TABLE dollar_flows DROP CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}"
 
@@ -144,6 +152,50 @@ def _constraint_state(conn: Connection) -> bool | None:
     return None if row is None else bool(row[0])
 
 
+def _normalized_def(defn: str) -> str:
+    """Compare-form of a CHECK definition: no casts, parentheses or whitespace.
+
+    It equals for PostgreSQL 14 and 16 deparses of our CHECK and rejects other
+    operators or operands. Dropping parentheses also drops grouping, which is
+    unambiguous for today's single ``a OR b`` contract only; a second contract
+    needs a grouping-aware comparison (pinned by a test that fails when one is
+    added).
+    """
+    return re.sub(r"::[a-z_ ]+|[()\s]", "", defn.lower())
+
+
+EXPECTED_CONSTRAINT_DEF = _normalized_def(f"CHECK ({DOLLAR_FLOWS_CONTRACT_CHECK_SQL})")
+
+
+def _require_constraint(conn: Connection) -> bool:
+    """Refuse unless the expected CHECK exists; return whether it is validated."""
+    row = conn.execute(
+        text(
+            "SELECT contype, convalidated, pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conname = :c AND conrelid = to_regclass('dollar_flows')"
+        ),
+        {"c": DOLLAR_FLOWS_CONTRACT_CONSTRAINT},
+    ).fetchone()
+    if row is None:
+        raise Refused(
+            f"constraint {DOLLAR_FLOWS_CONTRACT_CONSTRAINT} is absent: run this after the release "
+            "whose alembic upgrade adds it, so nothing can re-insert the rows"
+        )
+    got = _normalized_def(row[2]).removesuffix("notvalid")
+    if row[0] != "c" or got != EXPECTED_CONSTRAINT_DEF:
+        raise Refused(
+            f"constraint {DOLLAR_FLOWS_CONTRACT_CONSTRAINT} is not the expected CHECK: "
+            f"{row[2]!r} (expected CHECK ({DOLLAR_FLOWS_CONTRACT_CHECK_SQL}))"
+        )
+    return bool(row[1])
+
+
+def _lock(conn: Connection) -> None:
+    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    conn.execute(text("SET LOCAL statement_timeout = '60s'"))
+    conn.execute(text("LOCK TABLE dollar_flows IN SHARE ROW EXCLUSIVE MODE"))
+
+
 def build_manifest(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "kind": MANIFEST_KIND,
@@ -207,9 +259,8 @@ def apply(engine: Engine, man: dict[str, Any], *, expect_count: int, dry_run: bo
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-            conn.execute(text("SET LOCAL statement_timeout = '60s'"))
-            conn.execute(text("LOCK TABLE dollar_flows IN SHARE ROW EXCLUSIVE MODE"))
+            _lock(conn)
+            was_valid = _require_constraint(conn)
             current = _read_violations(conn)
             if current != man["rows"]:
                 cur_ids = {r["id"] for r in current}
@@ -231,6 +282,11 @@ def apply(engine: Engine, man: dict[str, Any], *, expect_count: int, dry_run: bo
             remaining = len(_read_violations(conn))
             if remaining:
                 raise Refused(f"{remaining} rows still break the contract after the delete")
+            if not was_valid:
+                _validate_in_transaction(conn)
+            validated = _require_constraint(conn)
+            if not validated:
+                raise Refused("the constraint is still NOT VALID after VALIDATE")
             if dry_run:
                 trans.rollback()
             else:
@@ -239,36 +295,43 @@ def apply(engine: Engine, man: dict[str, Any], *, expect_count: int, dry_run: bo
             if trans.is_active:
                 trans.rollback()
             raise
-    report: dict[str, Any] = {
+    return {
         "action": "apply",
         "dry_run": dry_run,
         "deleted": deleted,
         "remaining_violations": remaining,
         "ids": ids,
+        "constraint": "validated",
     }
-    if not dry_run:
+
+
+def _validate_in_transaction(conn: Connection) -> None:
+    """VALIDATE inside the caller's locked transaction (a failure rolls it all back)."""
+    conn.execute(text(VALIDATE_SQL))
+
+
+def validate(engine: Engine, *, dry_run: bool) -> dict[str, Any]:
+    with engine.connect() as conn:
+        trans = conn.begin()
         try:
-            state = _validate_constraint(engine)
-        except DBAPIError as exc:
-            # The delete has committed; only the validation is outstanding.
-            with engine.connect() as conn:
-                state = _constraint_state(conn)
-            report["validate_error"] = str(exc.orig if getattr(exc, "orig", None) else exc).strip()
-        report["constraint"] = "absent" if state is None else ("validated" if state else "not_valid")
-        if state is False:
-            report["next"] = VALIDATE_SQL
-    return report
-
-
-def _validate_constraint(engine: Engine) -> bool | None:
-    """Validate a NOT VALID constraint in its own transaction; return its state."""
-    with engine.begin() as conn:
-        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-        state = _constraint_state(conn)
-        if state is False:
-            conn.execute(text(VALIDATE_SQL))
-            state = _constraint_state(conn)
-    return state
+            _lock(conn)
+            was_valid = _require_constraint(conn)
+            remaining = len(_read_violations(conn))
+            if remaining:
+                raise Refused(f"{remaining} rows break the contract; remove them with export/apply first")
+            if not was_valid:
+                _validate_in_transaction(conn)
+            if not _require_constraint(conn):
+                raise Refused("the constraint is still NOT VALID after VALIDATE")
+            if dry_run:
+                trans.rollback()
+            else:
+                trans.commit()
+        except BaseException:
+            if trans.is_active:
+                trans.rollback()
+            raise
+    return {"action": "validate", "dry_run": dry_run, "was_validated": was_valid, "constraint": "validated"}
 
 
 def restore(engine: Engine, man: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
@@ -336,6 +399,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--expect-count", type=int, required=True)
     a.add_argument("--expect-sha256", required=True)
     a.add_argument("--dry-run", action="store_true")
+    v = sub.add_parser("validate", help="validate the constraint on a table with nothing to remove")
+    v.add_argument("--dry-run", action="store_true")
     r = sub.add_parser("restore", help="re-insert the manifest's rows in one transaction")
     r.add_argument("--manifest", type=Path, required=True)
     r.add_argument("--expect-sha256", required=True)
@@ -359,14 +424,14 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
                 expect_count=args.expect_count,
                 dry_run=args.dry_run,
             )
+        elif args.cmd == "validate":
+            report = validate(engine, dry_run=args.dry_run)
         else:
             report = restore(engine, load_manifest(args.manifest, args.expect_sha256), dry_run=args.dry_run)
     except Refused as exc:
         print(json.dumps({"action": args.cmd, "refused": str(exc)}, sort_keys=True))
         return EXIT_REFUSED
     print(json.dumps(report, sort_keys=True))
-    if args.cmd == "apply" and not args.dry_run and report.get("constraint") == "not_valid":
-        return EXIT_VALIDATE_PENDING
     return 0
 
 

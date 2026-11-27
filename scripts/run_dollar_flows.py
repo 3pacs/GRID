@@ -18,14 +18,16 @@ staleness bound added per PR #712 review):
 All three are counted in the printed summary (``skipped_no_vwap`` /
 ``skipped_stale_vwap`` / ``skipped_future_date``), never silently absorbed.
 
-Stored-row contract (``intelligence.dollar_flows.STORED_ROW_CONTRACTS``):
-a run rebuilds only the dates inside ``--days``, so rows an older rule wrote
-at earlier dates are never rewritten. After persisting, the run counts every
-stored row, at any date, that breaks its source's contract, and every flow
-it refused for breaking it. Either one makes the exit status 3 (the systemd
-unit fails), after this run's window has been written. Stored rows are
-removed only by the reviewed repair
-``scripts/repair_dollar_flows_stored_contract.py``.
+Stored-row contract (``intelligence.dollar_flows.STORED_ROW_CONTRACTS``),
+two separate alarms (the systemd unit fails on either):
+  - exit 4, unexpected: this run produced a flow that breaks its source's
+    contract (a writer regression). Nothing was deleted or inserted; the last
+    good window is kept.
+  - exit 3, expected until the repair: this run's window was written, but
+    stored rows at older dates (never rewritten, since a run rebuilds only
+    ``--days``) still break the contract. They are removed only by the
+    reviewed repair ``scripts/repair_dollar_flows_stored_contract.py``.
+Exit 4 takes precedence when both hold.
 
 Usage:
     python3 scripts/run_dollar_flows.py                    # last 90 days, persist
@@ -47,8 +49,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-# Exit status when the stored-row contract is broken (see module docstring).
-EXIT_CONTRACT_BROKEN = 3
+# Exit statuses for the stored-row contract (see module docstring).
+EXIT_STORED_ROWS_BREAK_CONTRACT = 3
+EXIT_WRITER_REFUSED = 4
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,16 +94,25 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             f"by_source={out['by_source']}"
             + (" [dry-run]" if out["dry_run"] else "")
         )
-    if not summary.contract_ok:
+    if summary.rejected_by_contract:
         print(
-            "dollar-flows stored-row contract broken: "
-            f"rejected_by_contract={out['rejected_by_contract']}, "
-            f"stored_contract_violations={out['stored_contract_violations']}; "
-            "rows are removed only by the reviewed repair "
+            "dollar-flows run REFUSED: flows that break the stored-row contract "
+            f"rejected_by_contract={out['rejected_by_contract']}; nothing deleted or inserted, "
+            "the last good window is kept (writer regression)"
+            + (f"; stored_contract_violations={out['stored_contract_violations']}"
+               if summary.stored_contract_violations else ""),
+            file=sys.stderr,
+        )
+        return EXIT_WRITER_REFUSED
+    if summary.stored_contract_violations:
+        print(
+            "dollar-flows stored-row contract broken by older stored rows: "
+            f"stored_contract_violations={out['stored_contract_violations']}; this run's window "
+            "was written; the rows are removed only by the reviewed repair "
             "scripts/repair_dollar_flows_stored_contract.py",
             file=sys.stderr,
         )
-        return EXIT_CONTRACT_BROKEN
+        return EXIT_STORED_ROWS_BREAK_CONTRACT
     return 0
 
 

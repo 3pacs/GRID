@@ -156,6 +156,13 @@ def _rows(engine) -> list[tuple]:
 
 # ── one definition ──────────────────────────────────────────────────────────
 
+def test_a_second_contract_needs_a_grouping_aware_constraint_check():
+    """The repair's constraint-definition check drops parentheses, which is exact
+    only for one ``a OR b`` contract. Adding a contract must come with a
+    grouping-aware comparison in scripts/repair_dollar_flows_stored_contract.py."""
+    assert list(dollar_flows.STORED_ROW_CONTRACTS) == ["13f"]
+
+
 def test_one_contract_text_for_writer_audit_migration_and_schema():
     migration = importlib.import_module("migrations.versions.df_13f_observed_20261127")
     check = dollar_flows.DOLLAR_FLOWS_CONTRACT_CHECK_SQL
@@ -184,17 +191,30 @@ def test_flow_contract_violation(flow, expected):
 
 # ── writer ──────────────────────────────────────────────────────────────────
 
-def test_persist_refuses_and_counts_a_contract_breaking_flow(engine):
+_GOOD_13F = {**_LEGACY_13F, "direction": "observed", "confidence": "derived", "ticker": "XOM", "actor_name": "W"}
+_INSIDER = {"source_type": "insider", "actor_name": "A", "ticker": "GRDX", "amount_usd": 10.0,
+            "direction": "inflow", "confidence": "confirmed", "evidence": {}}
+
+
+def _seed_last_good_window(engine) -> list[tuple]:
+    """A window an earlier good run wrote: rows of several sources, a valid 13F row."""
     _pre_revision_table(engine)
+    _insert_row(engine, _GOOD_13F, YESTERDAY)
+    _insert_row(engine, {**_INSIDER, "actor_name": "Old"}, YESTERDAY)
+    _insert_row(engine, {**_INSIDER, "source_type": "options_flow", "ticker": "SPY"}, TODAY - timedelta(days=3))
+    return _rows(engine)
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["all_invalid", "mixed"])
+def test_a_refused_flow_keeps_the_last_good_window(engine, mixed):
+    before = _seed_last_good_window(engine)
+    flows = [{**_LEGACY_13F, "flow_date": YESTERDAY}]
+    if mixed:
+        flows += [{**_GOOD_13F, "flow_date": YESTERDAY}, {**_INSIDER, "flow_date": TODAY - timedelta(days=3)}]
     rejected: dict[str, int] = {}
-    flows = [
-        {**_LEGACY_13F, "flow_date": YESTERDAY},
-        {"source_type": "insider", "actor_name": "A", "ticker": "GRDX", "amount_usd": 10.0,
-         "direction": "inflow", "confidence": "confirmed", "evidence": {}, "flow_date": YESTERDAY},
-    ]
-    assert dollar_flows._persist_flows(engine, flows, rejected_counts=rejected) == 1
+    assert dollar_flows._persist_flows(engine, flows, rejected_counts=rejected) == 0
     assert rejected == {"13f": 1}
-    assert _rows(engine) == [("insider", "inflow", YESTERDAY.isoformat())]
+    assert _rows(engine) == before  # no DELETE, no INSERT: every source's rows kept
 
 
 def test_persist_raises_on_an_insert_error_and_rolls_back_the_window(engine):
@@ -268,16 +288,17 @@ def test_observed_13f_rows_are_within_the_contract(engine):
 
 # ── runner exit status ──────────────────────────────────────────────────────
 
-def test_runner_exits_3_while_a_stored_row_breaks_the_contract_then_0(engine, capsys):
+def test_runner_exits_3_while_an_older_stored_row_breaks_the_contract_then_0(engine, capsys):
     _pre_revision_table(engine)
     _insert_row(engine, _LEGACY_13F, OLD)
     _insider_signal(engine, YESTERDAY)
 
     rc = run_dollar_flows.main(["--days", "7", "--json"], engine=engine)
     captured = capsys.readouterr()
-    assert rc == run_dollar_flows.EXIT_CONTRACT_BROKEN == 3
+    assert rc == run_dollar_flows.EXIT_STORED_ROWS_BREAK_CONTRACT == 3
     assert json.loads(captured.out)["stored_contract_violations"] == {"13f": 1}
-    assert "stored-row contract broken" in captured.err
+    assert "broken by older stored rows" in captured.err
+    assert "window was written" in captured.err
     assert "repair_dollar_flows_stored_contract.py" in captured.err
     # The window was still written before the non-zero exit.
     assert any(r[0] == "congressional" for r in _rows(engine))
@@ -288,15 +309,31 @@ def test_runner_exits_3_while_a_stored_row_breaks_the_contract_then_0(engine, ca
     assert "contract" not in capsys.readouterr().err
 
 
-def test_runner_exits_3_when_the_writer_refuses_a_flow(engine, monkeypatch, capsys):
-    _pre_revision_table(engine)
-    monkeypatch.setattr(
-        dollar_flows, "_normalize_13f_flows",
-        lambda *a, **k: [{**_LEGACY_13F, "flow_date": YESTERDAY}],
-    )
+@pytest.mark.parametrize("mixed", [False, True], ids=["all_invalid", "mixed"])
+def test_runner_exits_4_and_keeps_the_window_when_the_writer_refuses(engine, monkeypatch, capsys, mixed):
+    before = _seed_last_good_window(engine)
+    bad = [{**_LEGACY_13F, "flow_date": YESTERDAY}]
+    good = [{**_GOOD_13F, "flow_date": YESTERDAY}] if mixed else []
+    monkeypatch.setattr(dollar_flows, "_normalize_13f_flows", lambda *a, **k: bad + good)
+    if mixed:
+        _insider_signal(engine, YESTERDAY)
     rc = run_dollar_flows.main(["--days", "7", "--json"], engine=engine)
-    out = json.loads(capsys.readouterr().out)
-    assert rc == 3
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert rc == run_dollar_flows.EXIT_WRITER_REFUSED == 4
     assert out["rejected_by_contract"] == {"13f": 1}
-    assert out["stored_contract_violations"] == {}
-    assert all(r[0] != "13f" for r in _rows(engine))
+    assert out["persisted"] == 0
+    assert "REFUSED" in captured.err and "last good window is kept" in captured.err
+    assert _rows(engine) == before
+
+
+def test_runner_exit_4_takes_precedence_over_older_stored_rows(engine, monkeypatch, capsys):
+    before = _seed_last_good_window(engine)
+    _insert_row(engine, _LEGACY_13F, OLD)
+    monkeypatch.setattr(dollar_flows, "_normalize_13f_flows", lambda *a, **k: [{**_LEGACY_13F, "flow_date": YESTERDAY}])
+    rc = run_dollar_flows.main(["--days", "7", "--json"], engine=engine)
+    captured = capsys.readouterr()
+    assert rc == 4
+    assert json.loads(captured.out)["stored_contract_violations"] == {"13f": 1}
+    assert "stored_contract_violations" in captured.err
+    assert len(_rows(engine)) == len(before) + 1

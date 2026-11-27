@@ -26,7 +26,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
 from intelligence import dollar_flows
 from scripts import repair_dollar_flows_stored_contract as repair
@@ -199,18 +199,35 @@ def test_revision_on_a_table_with_superseded_rows_is_not_valid_and_enforced(pg):
 
     with pg.begin() as conn:
         conn.execute(text("DELETE FROM dollar_flows WHERE id = ANY(:ids)"), {"ids": ids["legacy"]})
-    _migrate(pg)  # a re-run validates once clean
-    assert _constraint(pg) is True
+    _migrate(pg)  # never validates, even once clean: that scan would run under ACCESS EXCLUSIVE
+    assert _constraint(pg) is False
 
 
-def test_revision_on_a_clean_table_validates_at_once(pg):
+def test_revision_on_a_clean_table_adds_not_valid_and_the_validate_step_validates(pg, capsys):
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
         _insert(conn, source_type="13f", direction="observed", flow_date=YESTERDAY)
     _migrate(pg)
-    assert _constraint(pg) is True
+    assert _constraint(pg) is False
     _migrate(pg)
+    assert _constraint(pg) is False
+    assert repair.main(["validate", "--dry-run"], engine=pg) == 0
+    assert _constraint(pg) is False
+    assert repair.main(["validate"], engine=pg) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["constraint"] == "validated"
     assert _constraint(pg) is True
+    assert repair.main(["validate"], engine=pg) == 0  # already validated: a no-op
+    capsys.readouterr()
+
+
+def test_validate_step_refuses_while_rows_break_the_contract(pg, capsys):
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+    _seed_production_shape(pg)
+    _migrate(pg)
+    assert repair.main(["validate"], engine=pg) == 2
+    assert "export/apply" in json.loads(capsys.readouterr().out)["refused"]
+    assert _constraint(pg) is False
 
 
 def test_revision_without_the_table_is_a_no_op(pg):
@@ -272,6 +289,30 @@ def test_writer_raises_when_postgres_rejects_a_row_and_keeps_the_window(pg, monk
     assert _ids(pg) == [kept]
 
 
+@pytest.mark.parametrize("mixed", [False, True], ids=["all_invalid", "mixed"])
+def test_refused_flow_keeps_the_last_good_window_on_postgres(pg, monkeypatch, capsys, mixed):
+    """The preflight on PostgreSQL types: a refused batch runs no DELETE and no
+    INSERT, so an earlier good window of several sources survives; exit 4."""
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+        _insert(conn, source_type="13f", direction="observed", confidence="derived", flow_date=YESTERDAY, actor="W")
+        _insert(conn, source_type="insider", direction="inflow", flow_date=YESTERDAY, actor="Old")
+        _insert(conn, source_type="options_flow", direction="inflow", flow_date=TODAY - timedelta(days=3))
+    _migrate(pg)
+    with pg.connect() as conn:
+        before = conn.execute(text("SELECT * FROM dollar_flows ORDER BY id")).fetchall()
+    bad = {"source_type": "13f", "actor_name": "C", "ticker": "", "amount_usd": 7.0, "direction": "inflow",
+           "confidence": "confirmed", "evidence": {}, "flow_date": YESTERDAY}
+    good = [{"source_type": "13f", "actor_name": "W", "ticker": "XOM", "amount_usd": 9.0, "direction": "observed",
+             "confidence": "derived", "evidence": {}, "flow_date": TODAY - timedelta(days=3)}] if mixed else []
+    monkeypatch.setattr(dollar_flows, "_normalize_13f_flows", lambda *a, **k: [bad] + good)
+    assert run_dollar_flows.main(["--days", "7", "--json"], engine=pg) == 4
+    out = json.loads(capsys.readouterr().out)
+    assert out["rejected_by_contract"] == {"13f": 1} and out["persisted"] == 0
+    with pg.connect() as conn:
+        assert conn.execute(text("SELECT * FROM dollar_flows ORDER BY id")).fetchall() == before
+
+
 def test_runner_on_postgres_exits_3_then_0_after_the_repair(pg, tmp_path, capsys):
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
@@ -320,6 +361,7 @@ def test_repair_export_dry_run_apply_restore_round_trip(pg, tmp_path, capsys):
     dry = json.loads(capsys.readouterr().out)
     assert dry["deleted"] == n and dry["dry_run"] is True
     assert _ids(pg) == before
+    assert _constraint(pg) is False  # the dry run's VALIDATE rolled back too
 
     assert repair.main(args, engine=pg) == 0
     done = json.loads(capsys.readouterr().out)
@@ -374,43 +416,81 @@ def test_after_restore_nothing_re_adds_the_constraint_but_the_printed_statement_
             _insert(conn, source_type="13f", direction="inflow", flow_date=YESTERDAY, ticker="")
 
 
-def test_apply_reports_a_pending_validation_and_exits_4(pg, tmp_path, capsys, monkeypatch):
-    """The delete commits first; if the separate VALIDATE cannot get its lock,
-    the report says so, names the statement, and the exit status is 4.
-
-    The failure is injected (``_validate_constraint`` raises the error a lock
-    timeout gives), so this proves the reporting path, not a real lock wait;
-    a real lock wait is covered for the delete's own transaction below."""
+def test_a_failed_validate_rolls_the_delete_back_and_the_same_manifest_retries(pg, tmp_path, capsys, monkeypatch):
+    """Delete and VALIDATE are one transaction: a VALIDATE error (injected here,
+    the statement raises) leaves every row and the NOT VALID constraint as they
+    were, and applying the same manifest again then succeeds."""
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
     ids = _seed_production_shape(pg)
     _migrate(pg)
     path, rep = _export(pg, tmp_path, capsys)
+    before = _ids(pg)
+    args = ["apply", "--manifest", str(path), "--expect-count", str(len(ids["legacy"])),
+            "--expect-sha256", rep["rows_sha256"]]
 
-    def busy(engine):
-        with engine.begin() as conn:
-            conn.execute(text("SET LOCAL lock_timeout = '1ms'"))
-            conn.execute(text("SELECT pg_advisory_xact_lock(1)"))  # keep the transaction real
-            raise OperationalError("ALTER TABLE ... VALIDATE", {}, Exception("canceling statement due to lock timeout"))
+    monkeypatch.setattr(repair, "_validate_in_transaction", lambda conn: conn.execute(text("SELECT 1/0")))
+    with pytest.raises(DBAPIError, match="division by zero"):
+        repair.main(args, engine=pg)
+    assert _ids(pg) == before
+    assert _constraint(pg) is False
 
-    monkeypatch.setattr(repair, "_validate_constraint", busy)
+    monkeypatch.undo()
+    assert repair.main(args, engine=pg) == 0
+    done = json.loads(capsys.readouterr().out)
+    assert done["deleted"] == len(ids["legacy"]) and done["constraint"] == "validated"
+    assert _ids(pg) == ids["keep"]
+    assert _constraint(pg) is True
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "dry_run"])
+def test_repair_apply_refuses_without_the_constraint(pg, tmp_path, capsys, dry_run):
+    """Before the release (no constraint) nothing would stop a re-insert: refuse."""
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+    ids = _seed_production_shape(pg)
+    path, rep = _export(pg, tmp_path, capsys)
+    before = _ids(pg)
+    rc = repair.main(["apply", "--manifest", str(path), "--expect-count", str(len(ids["legacy"])),
+                      "--expect-sha256", rep["rows_sha256"]] + (["--dry-run"] if dry_run else []), engine=pg)
+    assert rc == 2
+    assert "absent" in json.loads(capsys.readouterr().out)["refused"]
+    assert _ids(pg) == before
+
+
+def test_repair_apply_refuses_a_constraint_of_that_name_with_another_check(pg, tmp_path, capsys):
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+    ids = _seed_production_shape(pg)
+    with pg.begin() as conn:
+        conn.execute(text(f"ALTER TABLE dollar_flows ADD CONSTRAINT {dollar_flows.DOLLAR_FLOWS_CONTRACT_CONSTRAINT} "
+                          "CHECK (amount_usd >= 0) NOT VALID"))
+    path, rep = _export(pg, tmp_path, capsys)
+    before = _ids(pg)
     rc = repair.main(["apply", "--manifest", str(path), "--expect-count", str(len(ids["legacy"])),
                       "--expect-sha256", rep["rows_sha256"]], engine=pg)
-    out = json.loads(capsys.readouterr().out)
-    assert rc == repair.EXIT_VALIDATE_PENDING == 4
-    assert out["deleted"] == len(ids["legacy"])
-    assert out["constraint"] == "not_valid"
-    assert "lock timeout" in out["validate_error"]
-    assert out["next"] == repair.VALIDATE_SQL
-    assert _ids(pg) == ids["keep"]
-    monkeypatch.undo()
+    assert rc == 2
+    assert "not the expected CHECK" in json.loads(capsys.readouterr().out)["refused"]
+    assert _ids(pg) == before
+
+
+def test_the_expected_constraint_definition_matches_what_postgres_stores(pg):
     with pg.begin() as conn:
-        conn.execute(text(out["next"]))
-    assert _constraint(pg) is True
+        conn.execute(text(_PRE_REVISION_DDL))
+    _migrate(pg)
+    with pg.connect() as conn:
+        assert repair._require_constraint(conn) is False
+    with pg.begin() as conn:
+        conn.execute(text("DROP TABLE dollar_flows"))
+    dollar_flows._ensure_table(pg)  # the writer's DDL form
+    with pg.connect() as conn:
+        assert repair._require_constraint(conn) is True
 
 
 @pytest.mark.parametrize("change", ["new_violation", "row_changed", "row_gone"])
 def test_repair_apply_refuses_a_stale_manifest(pg, tmp_path, capsys, change):
+    """The table changed after the export (before the constraint existed, since
+    afterwards the first two changes are rejected by PostgreSQL itself)."""
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
     ids = _seed_production_shape(pg)
@@ -422,6 +502,7 @@ def test_repair_apply_refuses_a_stale_manifest(pg, tmp_path, capsys, change):
             conn.execute(text("UPDATE dollar_flows SET amount_usd = 1 WHERE id = :i"), {"i": ids["legacy"][0]})
         else:
             conn.execute(text("DELETE FROM dollar_flows WHERE id = :i"), {"i": ids["legacy"][0]})
+    _migrate(pg)
     before = _ids(pg)
     rc = repair.main(["apply", "--manifest", str(path), "--expect-count", str(len(ids["legacy"])),
                       "--expect-sha256", rep["rows_sha256"]], engine=pg)
@@ -434,6 +515,7 @@ def test_repair_apply_refuses_wrong_count_digest_or_edited_manifest(pg, tmp_path
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
     ids = _seed_production_shape(pg)
+    _migrate(pg)
     path, rep = _export(pg, tmp_path, capsys)
     n, sha = len(ids["legacy"]), rep["rows_sha256"]
     before = _ids(pg)
@@ -458,6 +540,7 @@ def test_repair_apply_waits_for_a_concurrent_writer_and_gives_up_cleanly(pg, tmp
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
     ids = _seed_production_shape(pg)
+    _migrate(pg)
     path, rep = _export(pg, tmp_path, capsys)
     before = _ids(pg)
 
@@ -479,6 +562,7 @@ def test_repair_blocks_the_writer_until_it_commits(pg, tmp_path, capsys):
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
     ids = _seed_production_shape(pg)
+    _migrate(pg)
     path, rep = _export(pg, tmp_path, capsys)
     man = repair.load_manifest(path, rep["rows_sha256"])
 
