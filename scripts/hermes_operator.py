@@ -297,6 +297,10 @@ DAILY_INTEL_CLEANUP_TASK_BUDGET_S = 30        # documented default per-task budg
 # that were flagged late. 300 s is a deliberate middle: a longer budget would hold the daemon cycle for minutes.
 DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = 300
 DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S = 60  # >= one worst-case LLM post-mortem row plus its store
+DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S = 5      # the whole call (work AND the backlog diagnostics) must return this long before the wrapper's limit
+# Cycle admission is SOFT by design: the driver starts a task while cumulative block time is < DAILY_INTEL_CYCLE_BUDGET_SECONDS
+# and then gives it its full own budget, so the block can end up to budget+task (480+300 s) after it started.
+# postmortem_batch is the LAST task, so it only ever delays the end of the block, never another task.
 DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_maintenance_subagent only QUEUES a subagent dispatch command (_execute_hermes_repair_command) — no LLM call in this step itself — so it gets the SQL-class default, not the LLM one.
 
 # capital_flow_rollups / fundamental_divergence per-task budgets
@@ -2021,9 +2025,12 @@ def _daily_intel_postmortem_batch(
     deadline = time.monotonic() + max(
         0.0, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S - DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S,
     )
+    finish_by = time.monotonic() + max(
+        0.0, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S - DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S,
+    )
     results["postmortem_batch"] = _run_intel_task(
         "postmortem_batch", batch_postmortem, state, engine,
-        limit=POSTMORTEM_BATCH_LIMIT, deadline=deadline,
+        limit=POSTMORTEM_BATCH_LIMIT, deadline=deadline, finish_by=finish_by,
     )
     _daily_intel_raise_if_task_status_failed(state, "postmortem_batch")
 

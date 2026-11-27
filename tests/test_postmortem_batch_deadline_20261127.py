@@ -79,8 +79,21 @@ def test_rows_stop_being_started_at_the_deadline_and_a_running_row_finishes(monk
 
 def test_the_deadline_applies_across_trades_and_predictions(monkeypatch):
     result, started = _batch(monkeypatch, trade_ids=[1, 2], pred_ids=["a", "b"], per_row_s=60.0, deadline=100.0)
-    # t=0 trade 1, t=60 trade 2, t=120 >= deadline: no prediction is started.
-    assert [i for i, _ in started] == [1, 2]
+    # Sources alternate: t=0 trade 1, t=60 prediction a, t=120 >= deadline: nothing else starts.
+    assert [i for i, _ in started] == [1, "a"]
+
+
+def test_a_long_trade_queue_cannot_starve_predictions(monkeypatch):
+    # Codex: trades consumed the whole window before predictions could start.
+    result, started = _batch(monkeypatch, trade_ids=list(range(10)), pred_ids=list("abcdefghij"), per_row_s=10.0, deadline=65.0)
+    ids = [i for i, _ in started]
+    assert ids == [0, "a", 1, "b", 2, "c", 3]   # alternating; the next start at t=70 is past the deadline (65)
+    assert any(isinstance(i, str) for i in ids) and any(isinstance(i, int) for i in ids)
+
+
+def test_unequal_queues_still_drain_the_longer_one(monkeypatch):
+    result, started = _batch(monkeypatch, trade_ids=[1], pred_ids=["a", "b", "c"], per_row_s=1.0, deadline=1e9)
+    assert [i for i, _ in started] == [1, "a", "b", "c"]
 
 
 def test_an_already_passed_deadline_starts_nothing(monkeypatch):
@@ -181,3 +194,88 @@ def test_a_failed_count_reads_unknown_and_never_fails_the_batch(monkeypatch):
     result, waiting, _sql = _batch_with_counts(monkeypatch, {}, count_fails=True)
     assert result == []
     assert waiting == "trades=unknown, predictions=unknown"
+
+
+# ── Codex review 6085439290: one absolute deadline for work AND diagnostics ─────────────────────────────────
+
+def _timed_batch(monkeypatch, *, row_s, count_s, rows, deadline, finish_by):
+    """batch_postmortem on a fake clock where every row costs row_s and every COUNT costs count_s."""
+    clock = _Clock()
+    monkeypatch.setattr(pm_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
+    monkeypatch.setattr(pm_mod, "_log_aggregate_patterns", lambda *_a, **_k: None)
+    statements: list[str] = []
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt, params=None):
+            sql = " ".join(str(stmt).split())
+            statements.append(sql)
+            res = MagicMock()
+            if sql.startswith("SELECT COUNT(*) FROM ("):
+                clock.now += count_s
+                res.scalar.return_value = 7
+            elif "oracle_predictions" in sql:
+                res.fetchall.return_value = [(i,) for i in rows]
+            else:
+                res.fetchall.return_value = []
+            return res
+
+    engine = MagicMock()
+    engine.connect.side_effect = lambda: _Conn()
+
+    def _gen(_e, ident):
+        clock.now += row_s
+        return SimpleNamespace(ticker="X", failure_category="c", actual_return=-0.1, which_signals_were_wrong=[])
+
+    monkeypatch.setattr(pm_mod, "generate_prediction_postmortem", _gen)
+    monkeypatch.setattr(pm_mod, "generate_postmortem", _gen)
+    fake_log = MagicMock()
+    monkeypatch.setattr(pm_mod, "log", fake_log)
+    result = pm_mod.batch_postmortem(engine, days=30, limit=20, deadline=deadline, finish_by=finish_by)
+    complete = [c for c in fake_log.info.call_args_list if "Batch post-mortem complete" in c.args[0]]
+    return result, clock.now, complete[0].kwargs["w"], statements
+
+
+def test_a_near_limit_row_plus_slow_counts_still_finishes_inside_the_wrapper(monkeypatch):
+    # Codex's reproduction: five 59 s rows (last starts at t=236 < the 240 deadline) and two 7 s counts finished at
+    # t=309 against the 300 s wrapper. Now the counts do not start when they cannot finish before finish_by=295.
+    result, elapsed, waiting, statements = _timed_batch(
+        monkeypatch, row_s=59.0, count_s=7.0, rows=list(range(30)), deadline=240.0, finish_by=295.0)
+    assert len(result) == 5
+    assert elapsed <= 300.0
+    assert waiting == "trades=skipped (no time left), predictions=skipped (no time left)"
+    assert not any(q.startswith("SELECT COUNT(*) FROM (") for q in statements)
+
+
+def test_the_counts_run_when_there_is_time_and_each_is_bounded_by_a_statement_timeout(monkeypatch):
+    result, elapsed, waiting, statements = _timed_batch(
+        monkeypatch, row_s=10.0, count_s=2.0, rows=list(range(3)), deadline=240.0, finish_by=295.0)
+    assert len(result) == 3
+    assert waiting == "trades=7, predictions=7"
+    assert elapsed == 30.0 + 4.0
+    for idx, q in enumerate(statements):
+        if q.startswith("SELECT COUNT(*) FROM ("):
+            assert statements[idx - 1] == "SET LOCAL statement_timeout = '3000ms'"
+
+
+def test_without_finish_by_the_counts_still_run_for_callers_that_pass_no_budget(monkeypatch):
+    result, _elapsed, waiting, _s = _timed_batch(
+        monkeypatch, row_s=1.0, count_s=1.0, rows=[1], deadline=None, finish_by=None)
+    assert waiting == "trades=7, predictions=7"
+
+
+def test_the_postmortem_step_passes_a_finish_by_inside_the_wrapper_budget(monkeypatch):
+    seen: dict = {}
+    clock = _Clock(500.0)
+    monkeypatch.setattr(ho, "time", SimpleNamespace(monotonic=clock.monotonic, time=lambda: 0.0))
+    monkeypatch.setattr(ho, "_run_intel_task", lambda name, fn, state, engine, **kw: seen.update(kw) or [])
+    monkeypatch.setattr(ho, "_daily_intel_raise_if_task_status_failed", lambda *_a, **_k: None)
+    ho._daily_intel_postmortem_batch(MagicMock(), MagicMock(), None, {})
+    assert seen["finish_by"] == 500.0 + ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S - ho.DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S
+    assert seen["deadline"] < seen["finish_by"] < 500.0 + ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
