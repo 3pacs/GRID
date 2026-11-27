@@ -117,7 +117,8 @@ def outbound_alert(health: dict[str, Any]) -> tuple[str, str]:
         "This message carries no detail on purpose. An authenticated admin can read what happened on the"
         " Oracle page or at GET /api/v1/oracle/forward-health; on the host,"
         " scripts/oracle_forward_health_check.py prints it.\n\n"
-        "One alert is sent per session."
+        "One alert per session is intended. A second copy is possible if the mail was accepted and the"
+        " record of sending it could not then be saved."
     )
     return subject, body
 
