@@ -29,11 +29,13 @@ instead: the basis it stores must equal the source's declared writers'
 flag, its own download flag must be explicit at every call, and it names
 parity tests (under ``tests/``) that compare its stored values with the
 declared writer's on the same bars and cover how the past basis is chosen.
-This gate runs those tests itself and fails unless every one is collected
-and passes (none skipped), so the parity claim is executed on every E1 run,
+Each parity test is pinned by the sha256 of its own function source, so a
+weakened test body fails the gate until a new E1 version is released, and
+this gate runs those tests itself and fails unless every one is collected
+and passes (none skipped): the parity claim is executed on every E1 run,
 not just named. It is not an exemption: an undeclared writer, an implicit
-flag, a stored basis that differs, or a missing, skipped or failing parity
-test fails the gate.
+flag, a stored basis that differs, or a missing, changed, skipped or failing
+parity test fails the gate.
 
 The fixture test (``test_gates_pg.py``) runs the shared writer
 (``BasePuller._insert_raw``) against the real DDL on PostgreSQL.
@@ -275,26 +277,27 @@ PRICE_WRITERS: dict[str, tuple[str, bool]] = {
 }
 
 # module -> (source name, auto_adjust basis it stores, auto_adjust at every
-# yfinance download, parity tests "tests/<file>.py::<test>" that this gate runs)
-DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, tuple[str, ...]]] = {
+# yfinance download, {"tests/<file>.py::<test>": sha256 of that function's
+# source (LF)}: the parity tests this gate pins and runs)
+DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, dict[str, str]]] = {
     # Recomputes ETF flow rows stored from a partial bar on the price basis of
     # the run that stored them: needs the raw close (Close, auto_adjust=False)
     # and today's Adj Close to state that run's adjusted close
     # (AdjNow(k) * Raw(S) / AdjNow(S)), i.e. the auto_adjust=True basis the
     # live writer stores.
     "scripts/repair_etf_flow_partial_bars.py": (
-        "INSTITUTIONAL_FLOWS", True, False, (
+        "INSTITUTIONAL_FLOWS", True, False, {
             # stored values equal the live writer's run the morning after, on
             # rows whose original-versus-current adjustment factor is not 1
             "tests/test_etf_flow_partial_bar_repair.py::"
-            "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars",
+            "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars": "a91f905531fcb982f1841455170ce791031061691a9cfb8febd9eb87a57528e9",
             # same-day ex-dividend basis: an after-close row keeps the day before's
             "tests/test_etf_flow_partial_bar_repair.py::"
-            "test_an_after_close_row_on_its_ex_dividend_date_keeps_the_day_befores_basis",
+            "test_an_after_close_row_on_its_ex_dividend_date_keeps_the_day_befores_basis": "d36300487846679eac82914928d6eeb75c544c551f6a4d2f69194f0257a2fa75",
             # a missing open session (or a bar on a closed day) refuses; a holiday does not
             "tests/test_etf_flow_partial_bar_repair.py::"
-            "test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not",
-        ),
+            "test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not": "e70d1ec3af4bcc67ba5730c7a7305f49774598326d6fb027d8adda6e14c01c24",
+        },
     ),
 }
 
@@ -319,22 +322,31 @@ def writes_raw_series(source: str) -> bool:
     return bool(re.search(r"insert\s+into\s+(?:public\.)?raw_series", source, re.I)) or "_insert_raw(" in source
 
 
-def _test_exists(ref: str, tests: dict[str, str] | None) -> bool:
+def parity_test_sha256(ref: str, tests: dict[str, str] | None = None) -> str | None:
+    """sha256 of the source (LF) of top-level test function ``tests/<file>.py::<name>``, or None."""
+    import hashlib
+
     rel, _, name = ref.partition("::")
-    if not rel.startswith("tests/") or not rel.endswith(".py"):
-        return False
+    if not rel.startswith("tests/") or not rel.endswith(".py") or not name:
+        return None
     if tests is not None:
         source = tests.get(rel)
     else:
         try:
             source = (REPO / rel).read_text(encoding="utf-8")
         except OSError:
-            return False
-    return bool(name) and source is not None and re.search(rf"^def {re.escape(name)}\(", source, re.M) is not None
+            return None
+    if source is None:
+        return None
+    source = source.replace("\r\n", "\n")
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return hashlib.sha256(ast.get_source_segment(source, node).encode()).hexdigest()
+    return None
 
 
 def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[str, str],
-                          derived: dict[str, tuple[str, bool, bool, tuple[str, ...]]] | None = None,
+                          derived: dict[str, tuple[str, bool, bool, dict[str, str]]] | None = None,
                           tests: dict[str, str] | None = None) -> list[str]:
     derived = derived or {}
     problems = []
@@ -368,11 +380,15 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
         for line, got in yfinance_downloads(source):
             if got != download:
                 problems.append(f"{rel}:{line}: auto_adjust={got} but the derived-basis writer declares {download}")
-        if not parity or isinstance(parity, str):
-            problems.append(f"{rel}: derived-basis writer names no parity tests (a tuple of test refs)")
-        for ref in ([] if isinstance(parity, str) else parity):
-            if not _test_exists(ref, tests):
+        if not parity or not isinstance(parity, dict):
+            problems.append(f"{rel}: derived-basis writer names no parity tests ({{ref: sha256}})")
+        for ref, pinned in (parity.items() if isinstance(parity, dict) else []):
+            got = parity_test_sha256(ref, tests)
+            if got is None:
                 problems.append(f"{rel}: parity test {ref!r} does not exist")
+            elif got != pinned:
+                problems.append(f"{rel}: parity test {ref!r} changed since it was pinned "
+                                "(re-release E1 with its new sha256)")
         by_source.setdefault(name.lower(), set()).add(stored)
     for name, flags in sorted(by_source.items()):
         if len(flags) > 1:
@@ -411,7 +427,7 @@ def parity_run_problems(refs: list[str], cwd: Path) -> list[str]:
 @pytest.mark.parametrize("rel", sorted(DERIVED_BASIS_WRITERS))
 def test_derived_basis_writers_parity_tests_run_and_pass(rel):
     """Run each declared parity test here, so the claim is executed, not only named."""
-    problems = parity_run_problems(list(DERIVED_BASIS_WRITERS[rel][3]), REPO)
+    problems = parity_run_problems(sorted(DERIVED_BASIS_WRITERS[rel][3]), REPO)
     assert not problems, "\n".join(problems)
 
 
@@ -429,33 +445,36 @@ def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path):
 
 
 def test_derived_basis_self_test_catches_each_rule():
-    writer = '''
+    writer = """
 import yfinance as yf
 def repair(conn):
     name = "SRC"
     data = yf.download("SPY", auto_adjust=False, actions=True)
     conn.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
                       "VALUES (:s, :src, :d, :v, 'SUCCESS')"))
-'''
+"""
     live = writer.replace("auto_adjust=False, actions=True", "auto_adjust=True")
     sources = {"live.py": live, "repair.py": writer}
     declared = {"live.py": ("SRC", True)}
     tests = {"tests/t.py": "def test_parity():\n    pass\n"}
-    ok = {"repair.py": ("SRC", True, False, ("tests/t.py::test_parity",))}
+    pin = parity_test_sha256("tests/t.py::test_parity", tests)
+    pinned = {"tests/t.py::test_parity": pin}
+    ok = {"repair.py": ("SRC", True, False, pinned)}
     assert price_writer_problems(declared, sources, ok, tests) == []
 
-    def problems(derived=ok, srcs=sources):
-        return "\n".join(price_writer_problems(declared, srcs, derived, tests))
+    def problems(derived=ok, srcs=sources, tst=tests):
+        return "\n".join(price_writer_problems(declared, srcs, derived, tst))
 
-    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, ("tests/t.py::test_parity",))})
-    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, ("tests/t.py::test_parity",))})
+    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, pinned)})
+    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, pinned)})
     assert "auto_adjust=implicit" in problems(
         srcs={**sources, "repair.py": writer.replace(", auto_adjust=False, actions=True", "")})
-    assert "does not exist" in problems({"repair.py": ("SRC", True, False, ("tests/t.py::test_missing",))})
-    assert "does not exist" in problems({"repair.py": ("SRC", True, False, ("evals/t.py::test_parity",))})
-    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, ())})
-    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, "tests/t.py::test_parity")})
-    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, ("tests/t.py::test_parity",))})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {"tests/t.py::test_missing": pin})})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {"evals/t.py::test_parity": pin})})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, {})})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, ("tests/t.py::test_parity",))})
+    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, pinned)})
+    assert "changed since it was pinned" in problems(tst={"tests/t.py": "def test_parity():\n    assert True\n"})
     assert "repair.py: downloads yfinance prices and writes raw_series but is not declared" in problems({})
 
 

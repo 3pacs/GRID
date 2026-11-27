@@ -200,6 +200,21 @@ def test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not(world
     assert far["tickers"]["SPY"]["status"] == "OK"                      # a bar no stored row needs
 
 
+def test_a_missing_basis_session_outside_every_window_refuses_the_etf(world):
+    """A row written days after its date has its basis session S after every window it is in."""
+    engine, market, _ = world
+    d, written = date(2026, 4, 10), date(2026, 4, 24)
+    m.seed_row(engine, "SPY", d, m.old_writer_values(market, d, (0.3, 1.0), seen_on=written), m.ny(written, 12))
+    basis = mod.price_basis_session(m.ny(written, 12))
+    assert basis == date(2026, 4, 23)
+    kw = {"from_date": FROM, "to_date": d, "session_day": SESSION_DAY}
+    assert mod.build_plan(engine, m.FakeYF(market), **kw)["tickers"]["SPY"]["status"] == "OK"
+    plan = mod.build_plan(engine, m.FakeYF(market, drop={basis}), **kw)
+    assert plan["tickers"]["SPY"]["status"] == "REFUSED"
+    assert plan["tickers"]["SPY"]["missing_sessions"] == [basis.isoformat()]
+    assert plan["items"] == []
+
+
 def _own_bar_delta(market, d, stored_payload, basis_session):
     """settled own bar minus the stored one, both priced as of ``basis_session``."""
     ts = pd.Timestamp(d)
@@ -332,7 +347,9 @@ def test_apply_appends_the_planned_rows_and_keeps_every_old_one(world):
     assert mod.verify_plan(engine, plan) == {
         "run_id": plan["run_id"], "digest": plan["digest"], "planned": len(plan["items"]),
         "states": {"applied": len(plan["items"]), "undone": 0, "applied_then_superseded": 0,
-                   "superseded_before_apply": 0, "not_applied": 0},
+                   "superseded_before_apply": 0, "not_applied": 0, "repair_quarantined": 0},
+        "plan_gaps": {"tickers_not_ok": {}, "rows_left_unrepaired": {}}, "plan_gaps_accepted": False,
+        "superseded_vs_plan": {"count": 0, "max_rel_diff_of_5d": None, "over_tolerance": 0},
         "integrity_ok": True, "complete": True, "ok": True, "problems": []}
 
 
@@ -345,7 +362,7 @@ def test_verify_is_not_ok_before_apply_or_after_an_interrupted_apply(world, monk
     assert before["states"]["not_applied"] == n
     path = tmp_path / "plan.json"
     path.write_text(json.dumps(plan))
-    assert mod.main(["verify", "--plan", str(path)], engine=engine) == 4
+    assert mod.main(["verify", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 4
     clock = {"t": 0.0}
     monkeypatch.setattr(inst, "_monotonic", lambda: clock["t"])
     monkeypatch.setattr(mod, "_monotonic", lambda: clock["t"])
@@ -361,10 +378,10 @@ def test_verify_is_not_ok_before_apply_or_after_an_interrupted_apply(world, monk
     partial = mod.verify_plan(engine, plan)
     assert partial["integrity_ok"] and not partial["complete"]
     assert 0 < partial["states"]["applied"] < n and partial["states"]["not_applied"] == n - partial["states"]["applied"]
-    assert mod.main(["verify", "--plan", str(path)], engine=engine) == 4
+    assert mod.main(["verify", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 4
     mod.run_writes(engine, plan, session_day=SESSION_DAY)
     assert mod.verify_plan(engine, plan)["ok"]
-    assert mod.main(["verify", "--plan", str(path)], engine=engine) == 0
+    assert mod.main(["verify", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 0
 
 
 def test_verify_counts_a_legitimate_supersession_as_complete(world):
@@ -383,6 +400,51 @@ def test_verify_counts_a_legitimate_supersession_as_complete(world):
     assert result["states"]["superseded_before_apply"] == 3
     assert result["states"]["applied_then_superseded"] == 3
     assert result["states"]["applied"] == len(plan["items"]) - 6
+    assert result["superseded_vs_plan"]["count"] == 6                    # reported, with how far off
+    assert result["superseded_vs_plan"]["over_tolerance"] == 6 and result["superseded_vs_plan"]["max_rel_diff_of_5d"] > 0.9
+
+
+def test_verify_does_not_count_a_quarantined_repair_row_as_done(world, tmp_path):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    item = plan["items"][0]
+    repair = m.vintages(engine, item["series_id"], date.fromisoformat(item["obs_date"]))[-1]
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE raw_series SET pull_status = 'QUARANTINED' WHERE id = :i"), {"i": repair["id"]})
+    result = mod.verify_plan(engine, plan)
+    assert result["integrity_ok"] and not result["complete"] and not result["ok"]
+    assert result["states"]["repair_quarantined"] == 1 and result["states"]["applied_then_superseded"] == 0
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    assert mod.main(["verify", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 4
+    again = mod.run_writes(engine, plan, session_day=SESSION_DAY)      # apply writes it again
+    assert again["totals"] == {"written": 1, "already_applied": len(plan["items"]) - 1}
+    assert mod.verify_plan(engine, plan)["ok"]
+
+
+def test_verify_is_not_complete_while_the_plan_left_an_etf_or_rows_unrepaired(world, monkeypatch, tmp_path):
+    engine, market, _ = world
+    monkeypatch.setattr(inst, "ETF_FLOW_TICKERS", ["SPY", "QQQ"])
+    _seed_history(engine, market, tickers=("QQQ",))
+    path = tmp_path / "plan.json"
+    assert mod.main(["plan", "--plan-out", str(path)], yf=m.FakeYF(market, fail={"QQQ"}), engine=engine) == 1
+    plan = json.loads(path.read_text())
+    assert mod.main(["apply", "--plan", str(path), "--expect-digest", plan["digest"],
+                     "--allow-incomplete-plan"], engine=engine) == 0
+    result = mod.verify_plan(engine, plan)
+    assert result["integrity_ok"] and result["states"]["not_applied"] == 0 and not result["complete"]
+    assert result["plan_gaps"] == {"tickers_not_ok": {"QQQ": "FAILED"}, "rows_left_unrepaired": {}}
+    verify = ["verify", "--plan", str(path), "--expect-digest", plan["digest"]]
+    assert mod.main(verify, engine=engine) == 4
+    assert mod.main([*verify, "--accept-plan-gaps"], engine=engine) == 0
+    assert mod.verify_plan(engine, plan, accept_plan_gaps=True)["plan_gaps_accepted"] is True
+    assert mod.main(["verify", "--plan", str(path), "--expect-digest", "0" * 64], engine=engine) == 2
+    unpriced = json.loads(json.dumps(plan))
+    unpriced["tickers"] = {"SPY": plan["tickers"]["SPY"]}
+    unpriced["summary"]["left_alone"] = {"within_tolerance": 9, "not_computable": 3}
+    gaps = mod.plan_gaps(unpriced)
+    assert gaps == {"tickers_not_ok": {}, "rows_left_unrepaired": {"not_computable": 3}}
 
 
 def test_verify_flags_a_repair_row_whose_marker_is_not_this_plans(world):
@@ -558,6 +620,33 @@ def test_undo_appends_the_replaced_values_and_keeps_the_repair(world):
     assert reapplied["totals"] == {"superseded": len(plan["items"])}      # an undo is not re-applied
 
 
+def test_undoing_a_repair_of_an_earlier_repair_keeps_that_earlier_runs_lineage():
+    # Bars to the session before SESSION_DAY, so the first run's rows (dated 07-20 here) have a basis.
+    market = m.Market(end=date(2026, 7, 17), periods=150,
+                      dividends={date(2026, 5, 15): 1.5, EX_DIVIDEND_AFTER_CLOSE: 1.2})
+    engine = s.make_sqlite_engine()
+    _seed_history(engine, market)
+    first = _plan(engine, market)
+    mod.run_writes(engine, first, session_day=SESSION_DAY)
+    with engine.begin() as conn:                                         # the first run, dated in this world
+        conn.execute(text("UPDATE raw_series SET pull_timestamp = :t WHERE raw_payload LIKE :p"),
+                     {"t": "2026-07-20 15:30:00.000000", "p": f'%{first["run_id"]}%'})
+    d = date.fromisoformat(first["items"][0]["obs_date"])
+    market.vol[pd.Timestamp(d)] *= 1.05                                   # the provider revises that bar
+    second = _plan(engine, market)
+    item = next(i for i in second["items"] if i["obs_date"] == d.isoformat() and i["metric"] == "5d")
+    earlier = m.vintages(engine, item["series_id"], d)[-1]
+    assert item["revises_id"] == earlier["id"] and earlier["payload"]["repair"]["run_id"] == first["run_id"]
+    mod.run_writes(engine, second, session_day=SESSION_DAY)
+    mod.run_writes(engine, second, mode="undo", session_day=SESSION_DAY, expect_digest=second["digest"])
+    restored = m.vintages(engine, item["series_id"], d)[-1]
+    assert restored["value"] == earlier["value"]
+    assert restored["payload"]["restored_repair"] == earlier["payload"]["repair"]
+    assert "repair" not in restored["payload"]
+    assert mod.verify_plan(engine, second)["ok"]
+    assert mod.verify_plan(engine, first)["integrity_ok"]                # no second row of the first run
+
+
 def test_undo_writes_only_for_the_exact_approved_digest(world, tmp_path):
     engine, market, _ = world
     plan = _plan(engine, market)
@@ -616,6 +705,6 @@ def test_the_command_plans_then_applies_then_verifies(world, tmp_path, capsys):
     assert m.row_count(engine) == before
     assert mod.main(["apply", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 0
     assert m.row_count(engine) == before + plan["summary"]["rows"]
-    assert mod.main(["verify", "--plan", str(path)], engine=engine) == 0
+    assert mod.main(["verify", "--plan", str(path), "--expect-digest", plan["digest"]], engine=engine) == 0
     assert '"ok": true' in capsys.readouterr().out
     assert (tmp_path / "plan.apply.progress.jsonl").exists()
