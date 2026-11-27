@@ -25,6 +25,10 @@ The second rule is decided from the runs, not from the registry's
 than 60 s, and most of them finish in seconds and are repaired successfully
 (GoogleTrends eight times, Social_Smart_Money six times in the same days).
 
+No case reads the real clock for a date: the failure time and the run counts
+are fixed data, the timed cases use monotonic intervals, and the PostgreSQL
+cases write and read relative to the database's own NOW().
+
 Real here: the registry, the handler resolution, the puller classes' own
 signatures, diagnose_and_fix_pulls, and (``real_types`` cases) the pull_log
 query on PostgreSQL. Replaced: the provider calls, the failed-pull query's
@@ -184,8 +188,10 @@ def test_a_recovery_between_overruns_restarts_the_count(monkeypatch):
     try:
         for _ in range(5):
             state.cooldowns = OperatorState().cooldowns
-            hf.diagnose_and_fix_pulls(_failed(["SYNTH_SLOW"], at=datetime.now(timezone.utc)), False, state)
-            # the failed-pull query still lists it: forget the recovery stamp
+            hf.diagnose_and_fix_pulls(_failed(["SYNTH_SLOW"]), False, state)
+            # The failed-pull query still lists it after the recovery; the
+            # recovery stamp (the one real-clock write here) is dropped so the
+            # next pass does not depend on how it compares with FAILED_AT.
             hf._REPAIR_RECOVERED_AT.clear()
     finally:
         release.set()
