@@ -31,10 +31,13 @@ def _engine(rows=()):
     queries: list[str] = []
 
     def execute(statement, *_a, **_k):
-        queries.append(str(statement.compile(dialect=PG)))
+        sql = str(statement.compile(dialect=PG))
+        queries.append(sql)
         result = MagicMock()
-        result.fetchone.return_value = rows[0] if rows else None
-        result.fetchall.return_value = list(rows)
+        # Only journal reads return the fixture rows; other tables (e.g. feature movers) are empty.
+        journal = "FROM decision_journal" in sql
+        result.fetchone.return_value = rows[0] if (rows and journal) else None
+        result.fetchall.return_value = list(rows) if journal else []
         return result
 
     conn.execute.side_effect = execute
@@ -99,3 +102,71 @@ def test_the_sealed_qualification_guard_is_untouched():
     # predicate is a decision for that seal's owner, not part of this change.
     path = Path(__file__).resolve().parents[1] / "store" / "journal_qualification.py"
     assert hashlib.sha256(path.read_bytes()).hexdigest() == "5ec7e6b2dd01446a2cfc6c313d6b95d1e688956f2fdd2ed4d1700e170b45d65b"
+
+
+# ── the three selectors Codex named at 853e39e68 (get_weights, get_all_active, get_synthesis) ──────────────
+
+def _assert_excluded_before_ordering(queries, *, distinct):
+    reads = [q for q in queries if "FROM decision_journal" in q]
+    assert len(reads) == 1
+    sql = reads[0]
+    assert PG_PRED in sql and PG_NOT_TICKET in sql
+    assert sql.index(PG_NOT_TICKET) < sql.index("ORDER BY")
+    assert ("SELECT DISTINCT ON (decision_journal.inferred_state)" in sql) is distinct
+
+
+def test_regime_weights_excludes_tickets(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from api.routers import regime
+
+    path = MagicMock()
+    path.exists.return_value = False
+    monkeypatch.setitem(sys.modules, "scripts.auto_regime", SimpleNamespace(
+        DEFAULT_FEATURE_WEIGHTS={}, FEATURE_WEIGHTS={}, WEIGHTS_OVERRIDE_PATH=path))
+    engine, queries = _engine([("GROWTH", 0.8, "S=0.125")])
+    monkeypatch.setattr(regime, "get_db_engine", lambda: engine)
+    regime.get_weights(_token="fixture")
+    _assert_excluded_before_ordering(queries, distinct=False)
+    assert "LIMIT" in queries[-1] and queries[-1].index(PG_NOT_TICKET) < queries[-1].index("LIMIT")
+
+
+def test_regime_all_active_excludes_tickets_before_distinct_selection(monkeypatch):
+    import sys
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from api.routers import regime
+
+    now = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
+    engine, queries = _engine([("GROWTH", 0.8, 0.1, {}, "HOLD", now)])
+    monkeypatch.setattr(regime, "get_db_engine", lambda: engine)
+    monkeypatch.setitem(sys.modules, "discovery.clustering", SimpleNamespace(
+        ClusterDiscovery=lambda *_: SimpleNamespace(identify_transition_leaders=lambda: {})))
+    regime.get_all_active(_token="fixture")
+    _assert_excluded_before_ordering(queries, distinct=True)
+
+
+def test_regime_synthesis_excludes_tickets_before_distinct_selection(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from api.routers import regime
+
+    engine, queries = _engine([("GROWTH", 0.8, "HOLD")])
+    monkeypatch.setattr(regime, "get_db_engine", lambda: engine)
+    client = MagicMock(is_available=True)
+    client.chat.return_value = "Fixture synthesis"
+    monkeypatch.setitem(sys.modules, "llm.router", SimpleNamespace(
+        Tier=SimpleNamespace(REASON="fixture"), get_llm=MagicMock(return_value=client)))
+    regime.get_synthesis(_token="fixture")
+    _assert_excluded_before_ordering(queries, distinct=True)
+
+
+def test_every_guarded_regime_and_mcp_selector_is_wrapped():
+    # Regression guard for the next selector added to these files: no bare non_provisional_journal_select(.
+    import re
+    root = Path(__file__).resolve().parents[1] / "api" / "routers"
+    for name in ("regime.py", "mcp_export.py"):
+        source = (root / name).read_text()
+        bare = re.findall(r"(?<!excluding_contagion_tickets\()non_provisional_journal_select\(", source)
+        assert bare == [], f"{name}: unwrapped non_provisional_journal_select( call"
+        assert source.count("excluding_contagion_tickets(non_provisional_journal_select(") >= 1, name

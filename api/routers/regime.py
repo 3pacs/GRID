@@ -58,9 +58,9 @@ def get_weights(_token: str = Depends(require_auth)) -> dict:
     confidence = None
     with engine.connect() as conn:
         row = conn.execute(
-            non_provisional_journal_select(
+            excluding_contagion_tickets(non_provisional_journal_select(
                 "inferred_state", "state_confidence", "counterfactual",
-            )
+            ))
             .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
             .limit(1)
         ).fetchone()
@@ -282,10 +282,10 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
     with engine.connect() as conn:
         # Get the latest entry for each distinct regime state
         rows = conn.execute(
-            non_provisional_journal_select(
+            excluding_contagion_tickets(non_provisional_journal_select(
                 "inferred_state", "state_confidence", "transition_probability",
                 "contradiction_flags", "grid_recommendation", "decision_timestamp",
-            )
+            ))
             .distinct(DECISION_JOURNAL.c.inferred_state)
             .order_by(
                 DECISION_JOURNAL.c.inferred_state,
@@ -375,9 +375,9 @@ def get_synthesis(_token: str = Depends(require_auth)) -> dict:
     # Gather all regime data
     with engine.connect() as conn:
         regime_rows = conn.execute(
-            non_provisional_journal_select(
+            excluding_contagion_tickets(non_provisional_journal_select(
                 "inferred_state", "state_confidence", "grid_recommendation",
-            )
+            ))
             .distinct(DECISION_JOURNAL.c.inferred_state)
             .order_by(
                 DECISION_JOURNAL.c.inferred_state,
