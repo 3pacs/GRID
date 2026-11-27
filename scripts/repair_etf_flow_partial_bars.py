@@ -360,18 +360,27 @@ def newest_vintages(conn: Any, source_id: int, series_ids: list[str], lo: date, 
     return out
 
 
+# One snapshot for every read in a read-only transaction: a commit between
+# statements cannot make plan or verify compare states that never coexisted.
+SNAPSHOT_ISOLATION = "REPEATABLE READ"
+
+
 @contextmanager
 def read_only_connection(engine: Engine) -> Iterator[Any]:
-    """A connection whose transaction refuses writes (PostgreSQL), rolled back at the end.
+    """A connection whose transaction refuses writes and reads one snapshot (PostgreSQL),
+    rolled back at the end.
 
     Uses the caller's engine, so its pool and session settings (statement
-    timeout, search path) apply; only this transaction is read-only.
+    timeout, search path) apply; only this transaction is read-only and
+    ``SNAPSHOT_ISOLATION``. SQLite serialises a connection's reads anyway.
     """
     with engine.connect() as conn:
         if conn.dialect.name == "postgresql":
-            conn.execute(text("SET TRANSACTION READ ONLY"))
+            conn.execute(text(f"SET TRANSACTION ISOLATION LEVEL {SNAPSHOT_ISOLATION} READ ONLY"))
             if conn.execute(text("SHOW transaction_read_only")).scalar() != "on":
                 raise Refused("the database did not make this transaction read-only")
+            if conn.execute(text("SHOW transaction_isolation")).scalar() != SNAPSHOT_ISOLATION.lower():
+                raise Refused(f"the database did not give this transaction {SNAPSHOT_ISOLATION}")
         try:
             yield conn
         finally:
@@ -820,10 +829,13 @@ def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False, a
 
     Three answers, reported apart:
 
+    * all three reads below come from one read-only snapshot
+      (``read_only_connection``, REPEATABLE READ on PostgreSQL).
     * integrity (``integrity_ok``): every revised vintage is still the row the
       plan names; every row carrying this run id is a planned item's, once,
       with this plan's value and a marker naming this digest and that vintage;
-      every undo row restores that vintage's value over this plan's row.
+      every undo row restores that vintage (``restores_id``, value) over this
+      plan's row (``undoes_id``).
     * completion (``complete``): every item is ``applied``, ``undone``,
       ``applied_then_superseded`` or ``superseded_before_apply`` (another
       vintage became newest before the repair reached it). An item whose
@@ -897,6 +909,7 @@ def verify_plan(engine: Engine, plan: dict, *, accept_plan_gaps: bool = False, a
             problems.append(f"{key}: written {len(found)} times")
         for r, mark in undos.get(key, []):
             if (not found or mark.get("undoes_id") != int(found[0][0][0])
+                    or mark.get("restores_id") != item["revises_id"]
                     or mark.get("plan_digest") != plan["digest"]
                     or not math.isclose(float(r[3]), item["revises_value"], rel_tol=1e-12)):
                 problems.append(f"{key}: undo row {r[0]} does not restore this plan's revised value")

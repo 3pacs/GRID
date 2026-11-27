@@ -534,6 +534,21 @@ def test_undoing_a_repair_of_an_earlier_repair_keeps_that_earlier_runs_lineage()
     assert mod.verify_plan(engine, first)["integrity_ok"]                # no second row of the first run
 
 
+def test_verify_flags_an_undo_row_that_restores_another_row(world):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    mod.run_writes(engine, plan, mode="undo", session_day=SESSION_DAY, expect_digest=plan["digest"])
+    item = plan["items"][0]
+    undo = m.vintages(engine, item["series_id"], date.fromisoformat(item["obs_date"]))[-1]
+    assert undo["payload"]["repair_undo"]["restores_id"] == item["revises_id"]
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE raw_series SET raw_payload = REPLACE(raw_payload, :a, :b) WHERE id = :i"),
+                     {"a": f'"restores_id": {item["revises_id"]}', "b": '"restores_id": 1', "i": undo["id"]})
+    result = mod.verify_plan(engine, plan, accept_undone=True)
+    assert not result["integrity_ok"] and any("undo row" in p for p in result["problems"])
+
+
 def test_accept_undone_passes_only_a_finished_undo(world, monkeypatch):
     engine, market, _ = world
     plan = _plan(engine, market)

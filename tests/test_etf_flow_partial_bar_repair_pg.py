@@ -297,3 +297,40 @@ def test_rows_are_dated_when_written_and_a_past_instant_still_reads_the_old_valu
         now = read_window_known_at(conn, "ETF_FLOW:SPY:5d", as_of=today, lag=None, start=d, as_of_ts=after)
     assert {o.obs_date: o.value for o in then}[d] == item["revises_value"]
     assert {o.obs_date: o.value for o in now}[d] == item["value"]
+
+
+@pytest.mark.parametrize("isolation", ["REPEATABLE READ", "READ COMMITTED"], ids=["one_snapshot", "control_read_committed"])
+def test_verify_reads_one_snapshot_while_a_writer_commits_between_its_reads(pg, market, monkeypatch, isolation):
+    """A vintage committed between verify's history read and its newest-vintage read: with one
+    snapshot the receipt describes one moment (the repair in force); the read-committed control
+    mixes two (a supersession by a row its history read never saw)."""
+    engine = pg()
+    plan = _plan(engine, market)
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    item = next(i for i in plan["items"] if i["metric"] == "5d")
+    d = date.fromisoformat(item["obs_date"])
+    real = mod.newest_vintages
+    committed = []
+
+    def _commit_between(conn, *a, **kw):
+        if not committed:                      # verify's second read: commit a revision first, elsewhere
+            with pg().connect() as other:
+                later = other.execute(text("SELECT clock_timestamp() + interval '1 minute'")).scalar()
+            m.seed_row(pg(), "SPY", d, {"5d": 1.0, "20d": 2.0, "accel": 3.0, "close": 1.0, "volume": 1}, later)
+            committed.append(later)
+        return real(conn, *a, **kw)
+
+    monkeypatch.setattr(mod, "SNAPSHOT_ISOLATION", isolation)
+    monkeypatch.setattr(mod, "newest_vintages", _commit_between)
+    result = mod.verify_plan(engine, plan)
+    assert committed
+    if isolation == "REPEATABLE READ":
+        assert result["ok"], result["problems"]
+        assert result["states"]["applied"] == len(plan["items"])
+        assert result["states"]["applied_then_superseded"] == 0
+    else:
+        assert result["states"]["applied_then_superseded"] == 3      # newest saw the row history did not
+    monkeypatch.setattr(mod, "newest_vintages", real)
+    after = mod.verify_plan(engine, plan, accept_superseded=True)   # a fresh snapshot sees the revision
+    assert after["states"]["applied_then_superseded"] == 3 and after["integrity_ok"]
+
