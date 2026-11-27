@@ -80,14 +80,87 @@ def test_a_failed_first_warm_stays_unavailable_not_cached_as_empty(monkeypatch):
     assert flows._feature_maps_for_request()[2]["state"] == "unavailable"
 
 
-def test_the_sector_warm_cycle_warms_the_feature_maps_and_a_maps_failure_does_not_fail_it(monkeypatch):
-    calls = []
+def test_the_sector_list_warm_no_longer_depends_on_or_runs_the_feature_maps(monkeypatch):
+    # Codex (review 6085440765): a failed list warm made zero feature attempts, and the list cycle waited for the
+    # feature warm. The list warm is now independent of the maps in both directions.
+    monkeypatch.setattr(flows, "_warm_feature_maps",
+                        lambda: (_ for _ in ()).throw(AssertionError("the list warm must not run the maps")))
     monkeypatch.setattr(flows, "_compute_sectors_payload", lambda: {"sectors": {"Technology": {}}})
     monkeypatch.setattr(flows, "_persist_sectors_snapshot", lambda _r: None)
-    monkeypatch.setattr(flows, "_warm_feature_maps", lambda: calls.append("maps") or False)
-    sleep_s = flows._sector_warm_cycle()
-    assert calls == ["maps"]
-    assert sleep_s == max(flows._SECTOR_CACHE_TTL - 60.0, flows._SECTOR_WARM_RETRY_SECONDS)   # still the success cadence
+    assert flows._sector_warm_cycle() == max(flows._SECTOR_CACHE_TTL - 60.0, flows._SECTOR_WARM_RETRY_SECONDS)
+
+
+def test_a_failed_list_warm_does_not_stop_the_feature_maps_warm(monkeypatch):
+    calls = []
+    monkeypatch.setattr(flows, "_compute_sectors_payload", lambda: (_ for _ in ()).throw(RuntimeError("list down")))
+    monkeypatch.setattr(flows, "get_db_engine", lambda: MagicMock())
+    monkeypatch.setattr(flows, "_compute_feature_maps", lambda _e: calls.append("maps") or ({"f": 1.0}, {"f": 2.0}))
+    assert flows._sector_warm_cycle() == flows._SECTOR_WARM_RETRY_SECONDS        # the list failed...
+    assert flows._feature_maps_warm_cycle() > 0                                    # ...the maps still warm on their own
+    assert calls == ["maps"] and flows._feature_maps_for_request()[2]["state"] == "fresh"
+
+
+def test_the_two_warms_run_on_separate_threads(monkeypatch):
+    started = []
+
+    class _Thread:
+        def __init__(self, target=None, daemon=None, name=None):
+            started.append((name, target))
+
+        def start(self):
+            pass
+
+    monkeypatch.undo()                                  # the autouse fixture stubs _ensure_sector_warm_thread
+    monkeypatch.setattr(flows, "_sector_warm_thread_started", False)
+    monkeypatch.setattr(flows, "_load_persisted_sectors_snapshot", lambda: None)
+    monkeypatch.setattr(flows.threading, "Thread", _Thread)
+    flows._ensure_sector_warm_thread()
+    assert dict(started) == {"sector-flow-warm": flows._sector_warm_loop,
+                             "sector-feature-maps-warm": flows._feature_maps_warm_loop}
+    monkeypatch.setattr(flows, "_sector_warm_thread_started", False)   # leave the module as a fresh process
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+
+def test_the_feature_warm_cadence_keeps_the_fill_interval_inside_the_fresh_ttl(monkeypatch):
+    # Codex's numbers: a 70 s maps warm. Scheduled relative to its own start, start-to-start is 70 + sleep.
+    clock = _Clock()
+    monkeypatch.setattr(flows.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(flows, "get_db_engine", lambda: MagicMock())
+
+    def slow(_e):
+        clock.now += 70.0
+        return {"f": 1.0}, {"f": 2.0}
+
+    monkeypatch.setattr(flows, "_compute_feature_maps", slow)
+    sleep_s = flows._feature_maps_warm_cycle()
+    assert sleep_s == pytest.approx(flows._FEATURE_MAPS_TTL - 60.0 - 70.0)           # 170 s
+    assert 70.0 + sleep_s <= flows._FEATURE_MAPS_TTL                                  # 240 s <= 300 s fresh TTL
+
+
+def test_a_warm_longer_than_the_window_retries_at_the_floor_not_negative(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(flows.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(flows, "get_db_engine", lambda: MagicMock())
+
+    def very_slow(_e):
+        clock.now += 400.0
+        return {}, {}
+
+    monkeypatch.setattr(flows, "_compute_feature_maps", very_slow)
+    assert flows._feature_maps_warm_cycle() == flows._SECTOR_WARM_RETRY_SECONDS
+
+
+def test_a_failed_maps_warm_retries_after_the_short_interval(monkeypatch):
+    monkeypatch.setattr(flows, "get_db_engine", lambda: MagicMock())
+    monkeypatch.setattr(flows, "_compute_feature_maps", lambda _e: (_ for _ in ()).throw(RuntimeError("x")))
+    assert flows._feature_maps_warm_cycle() == flows._SECTOR_WARM_RETRY_SECONDS
 
 
 def test_compute_feature_maps_keeps_the_z_score_formula(monkeypatch):

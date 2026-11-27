@@ -469,7 +469,6 @@ def _sector_warm_cycle() -> float:
             "Sector flow cache warmed ({n} sectors)",
             n=len(result.get("sectors", {})),
         )
-        _warm_feature_maps()
         return max(_SECTOR_CACHE_TTL - 60.0, _SECTOR_WARM_RETRY_SECONDS)
     except Exception as exc:
         log.warning("Sector flow cache warm failed: {e}", e=str(exc))
@@ -480,6 +479,28 @@ def _sector_warm_loop() -> None:
     """Background loop that keeps the sector cache warm for the process lifetime."""
     while True:
         time.sleep(_sector_warm_cycle())
+
+
+def _feature_maps_warm_cycle() -> float:
+    """One feature-maps warm; returns the seconds to sleep before the next one.
+
+    A loop of its own, not a step of the sector-list warm: the list warm failing must not stop the maps, and a
+    long maps computation must not delay the next list cycle (a shared loop made a 70 s list + 70 s maps cycle
+    refill every 380 s against a 300 s fresh TTL). The next start is scheduled relative to THIS start: the sleep is
+    the fresh window minus a margin minus the time the warm took, never below the retry interval, so the
+    start-to-start period stays inside the fresh TTL. A failed warm retries after the short interval.
+    """
+    started = time.monotonic()
+    if not _warm_feature_maps():
+        return _SECTOR_WARM_RETRY_SECONDS
+    elapsed = time.monotonic() - started
+    return max(_FEATURE_MAPS_TTL - 60.0 - elapsed, _SECTOR_WARM_RETRY_SECONDS)
+
+
+def _feature_maps_warm_loop() -> None:
+    """Background loop that keeps the sector-independent feature maps warm for the process lifetime."""
+    while True:
+        time.sleep(_feature_maps_warm_cycle())
 
 
 def _ensure_sector_warm_thread() -> None:
@@ -500,6 +521,9 @@ def _ensure_sector_warm_thread() -> None:
     _load_persisted_sectors_snapshot()
     threading.Thread(
         target=_sector_warm_loop, daemon=True, name="sector-flow-warm",
+    ).start()
+    threading.Thread(
+        target=_feature_maps_warm_loop, daemon=True, name="sector-feature-maps-warm",
     ).start()
 
 
