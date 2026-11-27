@@ -50,6 +50,7 @@ def publish_factor_signals(
     confidence: float = 0.6,
     valid_hours: int = 24,
     signal_type: str | None = None,
+    max_sessions_behind: int | None = None,
 ) -> int:
     """
     Publish a cross-sectional factor signal to SignalRegistry.
@@ -62,6 +63,17 @@ def publish_factor_signals(
       - "momentum"   (top=BULLISH, bottom=BEARISH): dual_horizon_*, vol_regime_*
       - unknown:     publish as NEUTRAL (no direction asserted)
 
+    ``max_sessions_behind`` (None = latest row only, the original behaviour):
+    each ticker is instead published from its own latest ranked row, provided
+    that row's date is no more than this many NYSE sessions before the
+    session on or before ``as_of_date``. A ticker whose price arrives only as
+    a settled receipt the next day (``spy_full``) is otherwise NaN on every
+    same-day row and never published. Its rank is the one it held within that
+    row's cross-section, which was fully known when it is used; a ticker
+    staler than the bound is not published (fail closed). The row's date and
+    cross-section size are recorded as ``factor_obs_date`` and
+    ``rank_universe_size``.
+
     Returns number of signals registered.
     """
     if as_of_date is None:
@@ -71,8 +83,8 @@ def publish_factor_signals(
     if signal_panel.empty:
         return 0
 
-    latest = signal_panel.iloc[-1].dropna()
-    if len(latest) < 5:
+    picked = _latest_ranks(signal_panel, as_of_date, max_sessions_behind)
+    if len(picked) < 5:
         return 0
 
     now = datetime.now(timezone.utc)
@@ -83,7 +95,7 @@ def publish_factor_signals(
     top_threshold = 1.0 - top_pct
     bottom_threshold = top_pct
 
-    for ticker, rank_value in latest.items():
+    for ticker, (rank_value, obs_date, universe_size) in picked.items():
         if np.isnan(rank_value):
             continue
 
@@ -125,7 +137,12 @@ def publish_factor_signals(
             ticker=str(ticker),
             z_score=float(rank_value - 0.5) * 2,
             freshness_hours=float(valid_hours),
-            metadata={"signal_name": signal_name, "rank": float(rank_value)},
+            metadata={
+                "signal_name": signal_name,
+                "rank": float(rank_value),
+                "factor_obs_date": obs_date.isoformat(),
+                "rank_universe_size": int(universe_size),
+            },
             provenance=f"alpha_research/{signal_name} as_of {as_of_date}",
         )
         signals.append(sig)
@@ -134,6 +151,49 @@ def publish_factor_signals(
         return 0
 
     return SignalRegistry.register(signals, engine)
+
+
+def _session_floor(as_of_date: date, sessions_behind: int) -> date:
+    """The NYSE session ``sessions_behind`` sessions before the one on or before ``as_of_date``."""
+    from ingestion.market_calendar import is_market_open, last_trading_day
+
+    floor = last_trading_day(as_of_date)
+    for _ in range(sessions_behind):
+        floor -= timedelta(days=1)
+        while not is_market_open(floor):
+            floor -= timedelta(days=1)
+    return floor
+
+
+def _latest_ranks(
+    signal_panel: pd.DataFrame,
+    as_of_date: date,
+    max_sessions_behind: int | None,
+) -> dict[Any, tuple[float, date, int]]:
+    """Ticker -> (rank, row date, ranked tickers on that row) to publish."""
+    universe = signal_panel.notna().sum(axis=1)
+
+    def _day(ts: Any) -> date:
+        return ts.date() if hasattr(ts, "date") else ts
+
+    if max_sessions_behind is None:
+        last = signal_panel.index[-1]
+        return {
+            ticker: (float(value), _day(last), int(universe.loc[last]))
+            for ticker, value in signal_panel.iloc[-1].dropna().items()
+        }
+
+    floor = _session_floor(as_of_date, max_sessions_behind)
+    picked: dict[Any, tuple[float, date, int]] = {}
+    for ticker in signal_panel.columns:
+        col = signal_panel[ticker].dropna()
+        if col.empty:
+            continue
+        row = col.index[-1]
+        if _day(row) < floor or _day(row) > as_of_date:
+            continue
+        picked[ticker] = (float(col.iloc[-1]), _day(row), int(universe.loc[row]))
+    return picked
 
 
 def publish_regime_signal(
@@ -228,13 +288,13 @@ def publish_all_alpha_signals(engine: Engine, as_of_date: date | None = None) ->
         vol_regime_eq = vol_regime_adaptive_equity(prices)
         results["vol_regime_equity"] = publish_factor_signals(
             engine, "vol_regime_equity", vol_regime_eq, as_of_date,
-            top_pct=0.20, confidence=0.5,
+            top_pct=0.20, confidence=0.5, max_sessions_behind=1,
         )
 
         dual_eq = dual_horizon_equity(prices)
         results["dual_horizon_equity"] = publish_factor_signals(
             engine, "dual_horizon_equity", dual_eq, as_of_date,
-            top_pct=0.20, confidence=0.5,
+            top_pct=0.20, confidence=0.5, max_sessions_behind=1,
         )
 
     # 2. VIX Exposure Scalar

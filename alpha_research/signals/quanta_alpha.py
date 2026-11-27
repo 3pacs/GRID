@@ -13,6 +13,8 @@ Evidence:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import pandas as pd
 
@@ -27,6 +29,32 @@ def _zscore_ts(series: pd.DataFrame, window: int) -> pd.DataFrame:
     mu = series.rolling(window, min_periods=max(window // 2, 5)).mean()
     sigma = series.rolling(window, min_periods=max(window // 2, 5)).std()
     return (series - mu) / (sigma + 1e-8)
+
+
+def _on_observed_dates(
+    prices: pd.DataFrame,
+    raw_fn: Callable[[pd.DataFrame], pd.DataFrame],
+) -> pd.DataFrame:
+    """Apply a time-series transform to each ticker on that ticker's own dates.
+
+    The price panel's index is the union of every ticker's observation dates,
+    so it carries weekend and exchange-holiday rows for 24-hour tickers
+    (crypto, GOLD) on which every equity is NaN. Computing an equity's returns
+    and rolling windows on that index measures the first session after a
+    closed day against a NaN: the value is NaN and the ticker is never ranked,
+    so the equity momentum factors went silent on every Monday and every
+    post-holiday session. Here each column is computed on its own non-NaN
+    rows (Monday is measured against Friday; windows count that ticker's own
+    observations) and then placed back on the shared index.
+    """
+    out: dict[str, pd.Series] = {}
+    for col in prices.columns:
+        own = prices[[col]].dropna()
+        if own.empty:
+            out[col] = pd.Series(np.nan, index=prices.index, dtype=float)
+            continue
+        out[col] = raw_fn(own)[col].reindex(prices.index)
+    return pd.DataFrame(out, index=prices.index, columns=prices.columns)
 
 
 def vol_regime_adaptive_momentum(
@@ -189,19 +217,23 @@ def vol_regime_adaptive_equity(
 
     Equities mean-revert faster and have noisier short-term momentum than
     commodity futures.  Wider windows + lower vol threshold reduce whipsaw.
+    Each ticker is computed on its own observed dates (``_on_observed_dates``)
+    so a weekend or holiday row from a 24-hour ticker cannot blank it.
     """
-    returns = prices.pct_change(fill_method=None)
-    short_mom = _zscore_ts(returns, short_window)
-    long_mom = _zscore_ts(returns, long_window)
-    vol_5d = returns.rolling(short_window, min_periods=5).std()
-    vol_zscore = _zscore_ts(vol_5d, vol_zscore_window)
-    high_vol = vol_zscore > vol_threshold
-    signal = pd.DataFrame(
-        np.where(high_vol, short_mom, long_mom),
-        index=prices.index,
-        columns=prices.columns,
-    )
-    return _rank_cross_section(signal)
+    def raw(own: pd.DataFrame) -> pd.DataFrame:
+        returns = own.pct_change(fill_method=None)
+        short_mom = _zscore_ts(returns, short_window)
+        long_mom = _zscore_ts(returns, long_window)
+        vol_5d = returns.rolling(short_window, min_periods=5).std()
+        vol_zscore = _zscore_ts(vol_5d, vol_zscore_window)
+        high_vol = vol_zscore > vol_threshold
+        return pd.DataFrame(
+            np.where(high_vol, short_mom, long_mom),
+            index=own.index,
+            columns=own.columns,
+        )
+
+    return _rank_cross_section(_on_observed_dates(prices, raw))
 
 
 def dual_horizon_equity(
@@ -216,12 +248,16 @@ def dual_horizon_equity(
 
     Longer lookbacks (10d/20d vs 5d/10d) capture equity momentum without
     the microstructure noise that dominates commodity futures at 5-day.
+    Each ticker is computed on its own observed dates (``_on_observed_dates``)
+    so a weekend or holiday row from a 24-hour ticker cannot blank it.
     """
-    returns = prices.pct_change(fill_method=None)
-    z_short = _zscore_ts(returns, short_window)
-    z_med = _zscore_ts(returns, medium_window)
-    signal = short_weight * z_short + medium_weight * z_med
-    return _rank_cross_section(signal)
+    def raw(own: pd.DataFrame) -> pd.DataFrame:
+        returns = own.pct_change(fill_method=None)
+        z_short = _zscore_ts(returns, short_window)
+        z_med = _zscore_ts(returns, medium_window)
+        return short_weight * z_short + medium_weight * z_med
+
+    return _rank_cross_section(_on_observed_dates(prices, raw))
 
 
 def compute_all_signals(

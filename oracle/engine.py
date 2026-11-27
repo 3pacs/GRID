@@ -194,6 +194,14 @@ class Signal:
 
 MAX_ACTOR_RECEIPT_BYTES = 16_384
 
+# A model that ran on a priced ticker but found no direction records a stated
+# abstention (verdict no_data, direction NONE) with this kind, distinct from a
+# quote abstention ("no_qualified_quote"), which a fresh capture can cure.
+ABSTENTION_KIND_NO_DIRECTION = "no_direction"
+NO_DIRECTION_REASON_BALANCED = "no_direction"   # bull == bear (e.g. only neutral signals)
+NO_DIRECTION_REASON_FEW_SIGNALS = "lt3_signals"  # fewer than 3 signals for the model
+NO_DIRECTION_SCORE_NOTE = "No directional evidence at decision time"
+
 # Proportional anti-signal veto threshold: veto a call when opposing
 # directional weighted mass exceeds this fraction of total directional mass.
 OPPOSING_VETO_FRACTION: float = 0.40
@@ -1785,6 +1793,54 @@ class OracleEngine:
             return int(horizon_days)
         return max(1, (expiry - now.date()).days)
 
+    def _no_direction_abstention(
+        self,
+        *,
+        ticker: str,
+        model: OracleModel,
+        now: datetime,
+        horizon_days: int | None,
+        flow_ctx: dict,
+        spot: float,
+        signals: list[Signal],
+        reason: str,
+    ) -> OraclePrediction:
+        """A stated abstention for a model that saw no directional evidence.
+
+        Without it a captured, priced ticker whose models all lack direction
+        writes no row at all and is indistinguishable from a ticker that was
+        never run. ``flow_context.abstention_kind = "no_direction"`` keeps it
+        apart from quote abstentions (``"no_qualified_quote"``), which are the
+        only ones a fresh capture can cure. The signals it saw are kept.
+        """
+        expiry = self._expiry_for_horizon(now, horizon_days)
+        pred_id = hashlib.md5(
+            f"{ticker}:{model.name}:no_direction:{now.isoformat()}".encode()
+        ).hexdigest()[:16]
+        return OraclePrediction(
+            id=pred_id,
+            timestamp=now,
+            ticker=ticker,
+            prediction_type=PredictionType.DIRECTION,
+            direction="NONE",
+            target_price=None,
+            current_price=spot,
+            expiry=expiry,
+            confidence=0.0,
+            expected_move_pct=0.0,
+            signals=list(signals),
+            model_name=model.name,
+            model_version=model.version,
+            verdict=Verdict.NO_DATA,
+            score_notes=NO_DIRECTION_SCORE_NOTE,
+            flow_context={
+                **flow_ctx,
+                "abstention_kind": ABSTENTION_KIND_NO_DIRECTION,
+                "no_direction_reason": reason,
+            },
+            horizon_days=self._horizon_days_for(now, expiry, horizon_days),
+        )
+
     def _oracle_one_ticker(
         self,
         idx: int,
@@ -1995,7 +2051,13 @@ class OracleEngine:
                     log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
 
                 if len(signals) < 3:
-                    continue  # Not enough data for this model
+                    # Not enough evidence for this model: abstain on the record.
+                    ticker_predictions.append(self._no_direction_abstention(
+                        ticker=ticker, model=model, now=now, horizon_days=horizon_days,
+                        flow_ctx=flow_ctx, spot=spot, signals=signals,
+                        reason=NO_DIRECTION_REASON_FEW_SIGNALS,
+                    ))
+                    continue
 
                 # ── Per-signal weight overrides ──────────────────────
                 # Multipliers from intelligence.signal_weight_overrides
@@ -2066,7 +2128,14 @@ class OracleEngine:
                 elif bear_score > bull_score:
                     direction = "PUT"
                 else:
-                    continue  # No signal
+                    # No directional evidence (e.g. only neutral signals):
+                    # abstain on the record instead of writing nothing.
+                    ticker_predictions.append(self._no_direction_abstention(
+                        ticker=ticker, model=model, now=now, horizon_days=horizon_days,
+                        flow_ctx=flow_ctx, spot=spot, signals=signals,
+                        reason=NO_DIRECTION_REASON_BALANCED,
+                    ))
+                    continue
 
                 # Count-robust signal strength: |sum(w * z_signed)| / sqrt(sum(w^2)).
                 # Opposing signals already net out here; no second anti_deduction subtraction.
