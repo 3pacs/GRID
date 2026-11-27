@@ -14,6 +14,7 @@ Evidence:
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -31,11 +32,32 @@ def _zscore_ts(series: pd.DataFrame, window: int) -> pd.DataFrame:
     return (series - mu) / (sigma + 1e-8)
 
 
+def _returns_on_own_dates(own: pd.DataFrame) -> pd.DataFrame:
+    """Simple returns between a ticker's consecutive observations.
+
+    A return is kept only when no NYSE session lies strictly between the two
+    observations: Friday to Monday and Wednesday to Friday over Thanksgiving
+    are one step, a missing session's data is not bridged (NaN, as before).
+    """
+    from ingestion.market_calendar import is_market_open
+
+    returns = own.pct_change(fill_method=None)
+    dates = [ts.date() for ts in own.index]
+    for i in range(1, len(dates)):
+        day = dates[i - 1] + timedelta(days=1)
+        while day < dates[i]:
+            if is_market_open(day):
+                returns.iloc[i] = np.nan
+                break
+            day += timedelta(days=1)
+    return returns
+
+
 def _on_observed_dates(
     prices: pd.DataFrame,
     raw_fn: Callable[[pd.DataFrame], pd.DataFrame],
 ) -> pd.DataFrame:
-    """Apply a time-series transform to each ticker on that ticker's own dates.
+    """Apply a returns transform to each ticker on that ticker's own dates.
 
     The price panel's index is the union of every ticker's observation dates,
     so it carries weekend and exchange-holiday rows for 24-hour tickers
@@ -43,9 +65,10 @@ def _on_observed_dates(
     and rolling windows on that index measures the first session after a
     closed day against a NaN: the value is NaN and the ticker is never ranked,
     so the equity momentum factors went silent on every Monday and every
-    post-holiday session. Here each column is computed on its own non-NaN
-    rows (Monday is measured against Friday; windows count that ticker's own
-    observations) and then placed back on the shared index.
+    post-holiday session. Here each column's returns are computed on its own
+    non-NaN rows (``_returns_on_own_dates``), ``raw_fn`` runs on them (its
+    windows count that ticker's own observations), and the result is placed
+    back on the shared index.
     """
     out: dict[str, pd.Series] = {}
     for col in prices.columns:
@@ -53,7 +76,7 @@ def _on_observed_dates(
         if own.empty:
             out[col] = pd.Series(np.nan, index=prices.index, dtype=float)
             continue
-        out[col] = raw_fn(own)[col].reindex(prices.index)
+        out[col] = raw_fn(_returns_on_own_dates(own))[col].reindex(prices.index)
     return pd.DataFrame(out, index=prices.index, columns=prices.columns)
 
 
@@ -220,8 +243,7 @@ def vol_regime_adaptive_equity(
     Each ticker is computed on its own observed dates (``_on_observed_dates``)
     so a weekend or holiday row from a 24-hour ticker cannot blank it.
     """
-    def raw(own: pd.DataFrame) -> pd.DataFrame:
-        returns = own.pct_change(fill_method=None)
+    def raw(returns: pd.DataFrame) -> pd.DataFrame:
         short_mom = _zscore_ts(returns, short_window)
         long_mom = _zscore_ts(returns, long_window)
         vol_5d = returns.rolling(short_window, min_periods=5).std()
@@ -229,8 +251,8 @@ def vol_regime_adaptive_equity(
         high_vol = vol_zscore > vol_threshold
         return pd.DataFrame(
             np.where(high_vol, short_mom, long_mom),
-            index=own.index,
-            columns=own.columns,
+            index=returns.index,
+            columns=returns.columns,
         )
 
     return _rank_cross_section(_on_observed_dates(prices, raw))
@@ -251,8 +273,7 @@ def dual_horizon_equity(
     Each ticker is computed on its own observed dates (``_on_observed_dates``)
     so a weekend or holiday row from a 24-hour ticker cannot blank it.
     """
-    def raw(own: pd.DataFrame) -> pd.DataFrame:
-        returns = own.pct_change(fill_method=None)
+    def raw(returns: pd.DataFrame) -> pd.DataFrame:
         z_short = _zscore_ts(returns, short_window)
         z_med = _zscore_ts(returns, medium_window)
         return short_weight * z_short + medium_weight * z_med

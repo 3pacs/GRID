@@ -319,7 +319,7 @@ class ModelFactory:
                 f"z_score, confidence, valid_from, valid_until, metadata "
                 f"FROM signal_registry WHERE {where} ORDER BY valid_from DESC"
             ), params).mappings().all()
-        return [dict(r) for r in rows]
+        return latest_factor_obs_only([dict(r) for r in rows])
 
     def list_active_models(self) -> list[ModelSpec]:
         with self.engine.connect() as conn:
@@ -338,6 +338,45 @@ class ModelFactory:
             if result.rowcount == 0:
                 raise KeyError(f"Model '{model_name}' not found")
         log.info("ModelFactory: retired '{name}'", name=model_name)
+
+
+
+def _factor_obs_date(row: dict[str, Any]) -> str | None:
+    meta = row.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            return None
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get("factor_obs_date")
+    return value if isinstance(value, str) else None
+
+
+def latest_factor_obs_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop factor rows superseded by a newer observation of the same source and ticker.
+
+    A factor published from a ticker's own latest ranked row records that
+    row's date as ``metadata.factor_obs_date``. Until it expires, a row from
+    Friday's close is still valid beside Monday's, and a model would count two
+    different observations of one factor. Keep, per (source_module, ticker),
+    only rows carrying the newest ``factor_obs_date``. Rows without it (every
+    other source, and factor rows published before it existed) are unchanged.
+    """
+    newest: dict[tuple[Any, Any], str] = {}
+    for row in rows:
+        obs = _factor_obs_date(row)
+        if obs is None:
+            continue
+        key = (row.get("source_module"), row.get("ticker"))
+        if obs > newest.get(key, ""):
+            newest[key] = obs
+    return [
+        row for row in rows
+        if (obs := _factor_obs_date(row)) is None
+        or obs == newest[(row.get("source_module"), row.get("ticker"))]
+    ]
 
 
 def migrate_default_models(engine: Engine) -> None:

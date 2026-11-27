@@ -109,3 +109,19 @@ def test_gap_free_panel_is_unchanged(factor, old) -> None:
     panel.loc[panel.index[:5], "XLE"] = np.nan  # a late-listed ticker: leading NaNs only
 
     pd.testing.assert_frame_equal(factor(panel), old(panel))
+
+
+@pytest.mark.parametrize("factor", FACTORS)
+def test_a_missing_session_is_not_bridged(factor) -> None:
+    """One ticker missing Tuesday's data: its Wednesday return is NaN, as before."""
+    panel = _panel("2026-11-25")
+    panel.loc["2026-11-24", "XLE"] = np.nan
+
+    ranked = factor(panel)
+
+    assert np.isnan(ranked.loc["2026-11-25", "XLE"])
+    assert ranked.loc["2026-11-25", [t for t in EQUITIES if t != "XLE"]].notna().all()
+    # and the ticker is ranked again once a one-step return exists
+    later = factor(_panel("2026-11-27", holidays=(THANKSGIVING,)).assign(
+        XLE=lambda df: df["XLE"].where(df.index != pd.Timestamp("2026-11-24"))))
+    assert later.loc["2026-11-27", "XLE"] == later.loc["2026-11-27", "XLE"]

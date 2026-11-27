@@ -197,9 +197,10 @@ MAX_ACTOR_RECEIPT_BYTES = 16_384
 # A model that ran on a priced ticker but found no direction records a stated
 # abstention (verdict no_data, direction NONE) with this kind, distinct from a
 # quote abstention ("no_qualified_quote"), which a fresh capture can cure.
+# Written only for a model that applies to the ticker (>= 3 signals) and finds
+# bull == bear; a model with fewer signals does not apply and records nothing.
+ABSTENTION_KIND_KEY_NO_DIRECTION = "abstention_kind"
 ABSTENTION_KIND_NO_DIRECTION = "no_direction"
-NO_DIRECTION_REASON_BALANCED = "no_direction"   # bull == bear (e.g. only neutral signals)
-NO_DIRECTION_REASON_FEW_SIGNALS = "lt3_signals"  # fewer than 3 signals for the model
 NO_DIRECTION_SCORE_NOTE = "No directional evidence at decision time"
 
 # Proportional anti-signal veto threshold: veto a call when opposing
@@ -1803,7 +1804,6 @@ class OracleEngine:
         flow_ctx: dict,
         spot: float,
         signals: list[Signal],
-        reason: str,
     ) -> OraclePrediction:
         """A stated abstention for a model that saw no directional evidence.
 
@@ -1812,8 +1812,22 @@ class OracleEngine:
         never run. ``flow_context.abstention_kind = "no_direction"`` keeps it
         apart from quote abstentions (``"no_qualified_quote"``), which are the
         only ones a fresh capture can cure. The signals it saw are kept.
+
+        The entry receipt is checked here exactly as ``_store_predictions``
+        checks it. If it fails, the row is a quote abstention (the receipt's
+        reason, no kind of its own), never a no-direction one, so a curable
+        quote failure is not recorded as "no direction".
         """
+        from oracle.entry_price_policy import validate_quote_reference
+
         expiry = self._expiry_for_horizon(now, horizon_days)
+        receipt = flow_ctx.get("entry_price_basis")
+        receipt_error = validate_quote_reference(receipt, as_of=now, ticker=ticker)
+        if receipt_error is None and spot != (receipt or {}).get("price"):
+            receipt_error = "entry_price_does_not_match_frozen_receipt"
+        context = {**flow_ctx}
+        if receipt_error is None:
+            context[ABSTENTION_KIND_KEY_NO_DIRECTION] = ABSTENTION_KIND_NO_DIRECTION
         pred_id = hashlib.md5(
             f"{ticker}:{model.name}:no_direction:{now.isoformat()}".encode()
         ).hexdigest()[:16]
@@ -1832,12 +1846,8 @@ class OracleEngine:
             model_name=model.name,
             model_version=model.version,
             verdict=Verdict.NO_DATA,
-            score_notes=NO_DIRECTION_SCORE_NOTE,
-            flow_context={
-                **flow_ctx,
-                "abstention_kind": ABSTENTION_KIND_NO_DIRECTION,
-                "no_direction_reason": reason,
-            },
+            score_notes=NO_DIRECTION_SCORE_NOTE if receipt_error is None else str(receipt_error),
+            flow_context=context,
             horizon_days=self._horizon_days_for(now, expiry, horizon_days),
         )
 
@@ -2051,12 +2061,8 @@ class OracleEngine:
                     log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
 
                 if len(signals) < 3:
-                    # Not enough evidence for this model: abstain on the record.
-                    ticker_predictions.append(self._no_direction_abstention(
-                        ticker=ticker, model=model, now=now, horizon_days=horizon_days,
-                        flow_ctx=flow_ctx, spot=spot, signals=signals,
-                        reason=NO_DIRECTION_REASON_FEW_SIGNALS,
-                    ))
+                    # The model does not apply to this ticker (its sources
+                    # hold too little about it): nothing to record.
                     continue
 
                 # ── Per-signal weight overrides ──────────────────────
@@ -2128,12 +2134,12 @@ class OracleEngine:
                 elif bear_score > bull_score:
                     direction = "PUT"
                 else:
-                    # No directional evidence (e.g. only neutral signals):
-                    # abstain on the record instead of writing nothing.
+                    # The model applies (>= 3 signals) but they give no net
+                    # direction (e.g. only neutral ones): abstain on the
+                    # record instead of writing nothing.
                     ticker_predictions.append(self._no_direction_abstention(
                         ticker=ticker, model=model, now=now, horizon_days=horizon_days,
                         flow_ctx=flow_ctx, spot=spot, signals=signals,
-                        reason=NO_DIRECTION_REASON_BALANCED,
                     ))
                     continue
 

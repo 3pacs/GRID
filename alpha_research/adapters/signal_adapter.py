@@ -72,7 +72,11 @@ def publish_factor_signals(
     row's cross-section, which was fully known when it is used; a ticker
     staler than the bound is not published (fail closed). The row's date and
     cross-section size are recorded as ``factor_obs_date`` and
-    ``rank_universe_size``.
+    ``rank_universe_size``. Such a row's ``valid_until`` is also capped at
+    ``_obs_expiry``: 00:00 UTC of the session that would put its observation
+    beyond the bound, so it stops voting when a fresh publish could no longer
+    use it. Readers keep only the newest ``factor_obs_date`` per source and
+    ticker (``oracle.model_factory.latest_factor_obs_only``).
 
     Returns number of signals registered.
     """
@@ -88,7 +92,6 @@ def publish_factor_signals(
         return 0
 
     now = datetime.now(timezone.utc)
-    valid_until = now + timedelta(hours=valid_hours)
     source = f"alpha_research:{signal_name}"
 
     signals: list[RegisteredSignal] = []
@@ -124,6 +127,15 @@ def publish_factor_signals(
 
         # Signal strength: distance from 0.5 center
         strength = abs(rank_value - 0.5) * 2  # 0 at center, 1 at extremes
+
+        valid_until = now + timedelta(hours=valid_hours)
+        if max_sessions_behind is not None:
+            # A row stops voting once its own observation falls outside the
+            # bound, not 24 h after it was published (a Monday close must
+            # not still vote at Wednesday's pass).
+            valid_until = min(valid_until, _obs_expiry(obs_date, max_sessions_behind))
+            if valid_until <= now:
+                continue
 
         sig = RegisteredSignal(
             signal_id=make_signal_id(source, f"{ticker}:{as_of_date}"),
@@ -163,6 +175,23 @@ def _session_floor(as_of_date: date, sessions_behind: int) -> date:
         while not is_market_open(floor):
             floor -= timedelta(days=1)
     return floor
+
+
+def _obs_expiry(obs_date: date, sessions_behind: int) -> datetime:
+    """00:00 UTC of the first session at which ``obs_date`` is beyond the bound.
+
+    The publisher's floor uses the host date (UTC on the Hermes host), so an
+    observation is publishable through the UTC day of the session
+    ``sessions_behind`` sessions after it, and expires as the next one begins.
+    """
+    from ingestion.market_calendar import is_market_open
+
+    day = obs_date
+    for _ in range(sessions_behind + 1):
+        day += timedelta(days=1)
+        while not is_market_open(day):
+            day += timedelta(days=1)
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
 
 
 def _latest_ranks(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import types
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -262,6 +262,7 @@ def test_publish_regime_signal_writes_neutral_regime_payload() -> None:
 def test_publish_all_alpha_signals_orchestrates_factor_and_regime_publish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _Clock.at(monkeypatch, _publish_hour(AS_OF))
     engine = _RecordingEngine()
     calls: list[tuple[str, Any]] = []
     prices = pd.DataFrame(
@@ -453,6 +454,23 @@ def _late_receipt_panel(last_day: str, spy_day: str) -> pd.DataFrame:
     return pd.DataFrame(rows, index=days)
 
 
+class _Clock:
+    """Pin signal_adapter's wall clock; a bounded row's validity depends on it."""
+
+    @staticmethod
+    def at(monkeypatch: pytest.MonkeyPatch, instant: datetime) -> None:
+        class _Fixed(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant if tz is None else instant.astimezone(tz)
+
+        monkeypatch.setattr(signal_adapter, "datetime", _Fixed)
+
+
+def _publish_hour(as_of: date) -> datetime:
+    return datetime(as_of.year, as_of.month, as_of.day, 15, 0, tzinfo=timezone.utc)
+
+
 @pytest.mark.parametrize(("as_of", "spy_day", "published"), [
     # Wednesday: Tuesday's settled close is one session back.
     (date(2026, 11, 25), "2026-11-24", True),
@@ -466,8 +484,9 @@ def _late_receipt_panel(last_day: str, spy_day: str) -> pd.DataFrame:
     (date(2026, 11, 30), "2026-11-25", False),
 ])
 def test_late_receipt_ticker_is_published_from_its_own_row_within_one_session(
-    as_of: date, spy_day: str, published: bool,
+    as_of: date, spy_day: str, published: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _Clock.at(monkeypatch, _publish_hour(as_of))
     panel = _late_receipt_panel(as_of.isoformat(), spy_day)
     engine = _RecordingEngine()
 
@@ -533,3 +552,48 @@ def test_publish_all_bounds_only_the_equity_momentum_factors(
         "vol_regime_equity": 1,
         "dual_horizon_equity": 1,
     }
+
+
+@pytest.mark.parametrize(("obs_day", "published_at", "valid_until"), [
+    # Friday's close published Monday 15:00Z: stops voting as Tuesday (UTC) begins.
+    ("2026-11-20", datetime(2026, 11, 23, 15, tzinfo=timezone.utc),
+     datetime(2026, 11, 24, tzinfo=timezone.utc)),
+    # Wednesday's close published Sunday: Thursday 11-26 is a holiday, so the
+    # second session after it is Monday 11-30.
+    ("2026-11-25", datetime(2026, 11, 29, 15, tzinfo=timezone.utc),
+     datetime(2026, 11, 30, tzinfo=timezone.utc)),
+    # Tuesday's close published Wednesday: the 24 h window ends first.
+    ("2026-11-24", datetime(2026, 11, 25, 15, tzinfo=timezone.utc),
+     datetime(2026, 11, 26, 15, tzinfo=timezone.utc)),
+])
+def test_a_bounded_row_stops_voting_when_its_observation_leaves_the_bound(
+    obs_day: str, published_at: datetime, valid_until: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _Clock.at(monkeypatch, published_at)
+    as_of = published_at.date()
+    panel = _late_receipt_panel(as_of.isoformat(), obs_day)
+    engine = _RecordingEngine()
+
+    signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=as_of, max_sessions_behind=1,
+    )
+
+    spy = _registry_rows_by_ticker(engine)["SPY"]
+    assert json.loads(spy["metadata"])["factor_obs_date"] == obs_day
+    assert spy["valid_until"] == valid_until
+
+
+def test_an_expired_observation_is_not_published_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Monday 11-23's close, published at Wednesday 02:00 UTC with an as_of of
+    # Tuesday (a host date lagging UTC): already past its Wednesday 00:00 UTC expiry.
+    _Clock.at(monkeypatch, datetime(2026, 11, 25, 2, 0, tzinfo=timezone.utc))
+    panel = _late_receipt_panel("2026-11-24", "2026-11-23")
+    engine = _RecordingEngine()
+
+    signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 24), max_sessions_behind=1,
+    )
+
+    assert "SPY" not in _registry_rows_by_ticker(engine)
+    assert "QQQ" in _registry_rows_by_ticker(engine)

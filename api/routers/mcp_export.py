@@ -226,7 +226,7 @@ def mcp_prediction_accuracy(
         "SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses, "
         "AVG(pnl) AS avg_pnl "
         "FROM " + oracle_predictions_from(include_schwab) + " oracle_predictions "
-        "WHERE verdict IS NOT NULL "
+        "WHERE verdict IN ('hit', 'miss', 'partial') "
         "  AND scored_at >= :cutoff "
         "GROUP BY " + col + " "
         "ORDER BY COUNT(*) DESC"
