@@ -68,6 +68,8 @@ Runtime safety:
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import math
 import re
@@ -75,7 +77,7 @@ import os
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import requests
 from loguru import logger as log
@@ -428,24 +430,36 @@ def _stored_snapshot_actors(engine: Any) -> frozenset[str] | None:
 _SUBMISSIONS_URL: str = "https://data.sec.gov/submissions/CIK{cik}.json"
 
 
-def _fetch_report_dates(cik_padded: str) -> dict[str, date] | None:
+class ReportDateEvidence(NamedTuple):
+    """EDGAR submissions reportDate by accession, with a reference to the response it came from."""
+    dates: dict[str, date]
+    url: str
+    sha256: str
+    received_at: str
+
+
+def _fetch_report_dates(cik_padded: str) -> ReportDateEvidence | None:
     """``accession -> reportDate`` from EDGAR submissions (``filings.recent``), or None.
 
-    Independent evidence of each filing's report period, matched by accession number.
-    None when the answer is unavailable or not the expected shape (the caller then keeps
-    the refusal: fail closed). Only complete, well-formed rows are returned.
+    Independent evidence of each filing's report period, matched by accession number, with the
+    response's url, sha256 and receipt time so it can be archived. None when the answer is
+    unavailable or not the expected shape (the caller then keeps the refusal: fail closed). Only
+    complete, well-formed rows are returned; an accession that appears more than once with
+    different valid dates is conflicting evidence and is left out, whatever the row order.
     """
+    url = _SUBMISSIONS_URL.format(cik=cik_padded)
     try:
-        resp = requests.get(_SUBMISSIONS_URL.format(cik=cik_padded), headers=_SEC_HEADERS,
-                            timeout=_REQUEST_TIMEOUT_SECS)
+        resp = requests.get(url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS)
+        received = datetime.now(timezone.utc)
         if resp.status_code != 200:
             log.warning("SEC submissions CIK={c} HTTP {s}", c=cik_padded, s=resp.status_code)
             return None
         doc = resp.json()
+        body = resp.content
     except (requests.RequestException, ValueError) as exc:
         log.warning("SEC submissions CIK={c} unavailable: {e}", c=cik_padded, e=type(exc).__name__)
         return None
-    if not isinstance(doc, dict) or str(doc.get("cik") or "").zfill(10) != cik_padded:
+    if not isinstance(body, bytes) or not isinstance(doc, dict) or str(doc.get("cik") or "").zfill(10) != cik_padded:
         return None
     filings = doc.get("filings")
     recent = filings.get("recent") if isinstance(filings, dict) else None
@@ -455,14 +469,22 @@ def _fetch_report_dates(cik_padded: str) -> dict[str, date] | None:
     if len(recent["accessionNumber"]) != len(recent["reportDate"]):
         return None
     out: dict[str, date] = {}
+    conflicted: set[str] = set()
     for accession, reported in zip(recent["accessionNumber"], recent["reportDate"]):
         if not isinstance(accession, str) or not isinstance(reported, str) or not reported:
             continue                                   # a filing without a report date: no evidence for it
         try:
-            out[accession] = date.fromisoformat(reported)
+            when = date.fromisoformat(reported)
         except ValueError:
             continue
-    return out
+        if accession in conflicted:
+            continue
+        if accession in out and out[accession] != when:
+            conflicted.add(accession)                  # two different dates: no evidence, in any order
+            del out[accession]
+            continue
+        out[accession] = when
+    return ReportDateEvidence(out, url, hashlib.sha256(body).hexdigest(), received.isoformat())
 
 
 def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
@@ -1277,11 +1299,14 @@ class SECXBRLFinancialsPuller:
                     # A recent start-less point may be an event-dated stray, which only
                     # independent report-period evidence can show: ask EDGAR submissions
                     # (reportDate by accession) and retry once. Unavailable => refuse.
-                    dates = _fetch_report_dates(cik_padded)
+                    evidence = _fetch_report_dates(cik_padded)
                     time.sleep(_RATE_LIMIT_DELAY_SECS)
-                    if not dates:
+                    if not evidence or not evidence.dates:
                         raise
-                    snapshot = prepare_snapshot(**prepare_args, report_dates=dates)
+                    snapshot = prepare_snapshot(**prepare_args, report_dates=evidence.dates)
+                    if snapshot.report_dates:
+                        snapshot = dataclasses.replace(
+                            snapshot, report_date_source=(evidence.url, evidence.sha256, evidence.received_at))
                 outcome = write_snapshot(self.engine, snapshot)
                 if outcome["status"] == "rejected_revision_regression":
                     raise ValueError("New capture regressed an existing filed revision; projection retained")

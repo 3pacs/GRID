@@ -232,6 +232,12 @@ def snapshot_db(pg_table):
             current_migration = importlib.util.module_from_spec(current_spec)
             current_spec.loader.exec_module(current_migration)
             current_migration.upgrade()
+            evidence_path = path.with_name('sec_financial_report_dates_20261127.py')
+            evidence_spec = importlib.util.spec_from_file_location('_sec_evidence_migration', evidence_path)
+            evidence_migration = importlib.util.module_from_spec(evidence_spec)
+            evidence_spec.loader.exec_module(evidence_migration)
+            evidence_migration.upgrade()
+            evidence_migration.upgrade()                 # idempotent
     try:
         yield engine
     finally:
@@ -1553,3 +1559,47 @@ def test_pg_dropping_tolerance_metadata_or_evidence_cannot_bypass_the_writer_gua
         assert stored(engine) == before                          # the owned dividends row survives
     assert write_snapshot(engine, tolerating)["status"] == "rejected_stray_would_remove_rows"
     assert stored(engine) == before
+
+
+def _archive_row(engine, snapshot_id):
+    with engine.connect() as conn:
+        return dict(conn.execute(text(
+            "SELECT report_date_evidence FROM sec_financial_snapshots WHERE snapshot_id = :i"), {"i": snapshot_id}).mappings().one())
+
+
+def test_pg_the_archive_row_alone_reproduces_a_snapshot_that_used_report_date_evidence(snapshot_db):
+    """Codex 6081926340: the report-date pairs are needed to reproduce the identity, so they are archived
+    (canonical used mapping + the EDGAR submissions reference) and a replay from the immutable row alone
+    gives the same snapshot_id. An ordinary snapshot stores NULL evidence and still replays."""
+    import dataclasses
+
+    import pytest
+    from store.sec_financial_snapshots import replay_archived_snapshot, write_snapshot
+
+    engine = snapshot_db
+    ordinary = snapshot()
+    assert write_snapshot(engine, ordinary)["status"] == "applied"
+    assert _archive_row(engine, ordinary.snapshot_id)["report_date_evidence"] is None
+    assert replay_archived_snapshot(engine, ordinary.snapshot_id) == ordinary
+
+    tolerating = dataclasses.replace(
+        _snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()),
+        report_date_source=("https://data.sec.gov/submissions/CIK0001045810.json", "b" * 64, "2026-11-27T00:00:00+00:00"))
+    assert tolerating.report_dates == ((_OWN, "2026-07-26"),)
+    assert write_snapshot(engine, tolerating)["status"] == "applied"
+    evidence = _archive_row(engine, tolerating.snapshot_id)["report_date_evidence"]
+    assert evidence == {"report_dates": {_OWN: "2026-07-26"},
+                        "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json",
+                                   "sha256": "b" * 64, "received_at": "2026-11-27T00:00:00+00:00"}}
+    replayed = replay_archived_snapshot(engine, tolerating.snapshot_id)
+    assert replayed == tolerating and replayed.snapshot_id == tolerating.snapshot_id
+    assert replayed.tolerated_stray_points == tolerating.tolerated_stray_points and replayed.rows == tolerating.rows
+
+    # the evidence is what makes the identity reproducible: without it the replay cannot
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE sec_financial_snapshots SET report_date_evidence = NULL WHERE snapshot_id = :i"),
+                     {"i": tolerating.snapshot_id})
+    with pytest.raises(ValueError):
+        replay_archived_snapshot(engine, tolerating.snapshot_id)
+    with pytest.raises(ValueError, match="No archived snapshot"):
+        replay_archived_snapshot(engine, "0" * 64)

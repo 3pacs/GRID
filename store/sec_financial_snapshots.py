@@ -26,6 +26,17 @@ _ARCHIVE = text('''INSERT INTO sec_financial_snapshots (
 ) VALUES (:snapshot_id, :actor_id, :cik, :source_url, :source_sha256, :normalized_sha256,
     :normalizer_version, :source_gzip, CAST(:normalized_rows AS JSONB), CAST(:fx_inputs AS JSONB),
     :request_started_at, :received_at) ON CONFLICT (snapshot_id) DO NOTHING''')
+_ARCHIVE_EVIDENCE = text('''INSERT INTO sec_financial_snapshots (
+    snapshot_id, actor_id, cik, source_url, source_sha256, normalized_sha256,
+    normalizer_version, source_gzip, normalized_rows, fx_inputs,
+    first_request_started_at, first_received_at, report_date_evidence
+) VALUES (:snapshot_id, :actor_id, :cik, :source_url, :source_sha256, :normalized_sha256,
+    :normalizer_version, :source_gzip, CAST(:normalized_rows AS JSONB), CAST(:fx_inputs AS JSONB),
+    :request_started_at, :received_at, CAST(:report_date_evidence AS JSONB))
+    ON CONFLICT (snapshot_id) DO NOTHING''')
+_ARCHIVED = text('''SELECT snapshot_id, actor_id, cik, source_gzip, fx_inputs,
+    first_request_started_at, first_received_at, report_date_evidence
+    FROM sec_financial_snapshots WHERE snapshot_id = :snapshot_id''')
 _DELETE_OWNED = text('''DELETE FROM capital_flows WHERE actor_id = :actor_id
     AND counterparty_id IS NULL AND period_type IN ('annual', 'quarter')
     AND split_part(source_filing, ' ', 1) IN
@@ -77,7 +88,17 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
         current = conn.execute(_CURRENT, params).mappings().first()
         if current and snapshot.request_started_at == current['request_started_at'] and snapshot.snapshot_id != current['snapshot_id']:
             raise ValueError('Conflicting snapshot at the same request-start time')
-        conn.execute(_ARCHIVE, params)
+        if snapshot.report_dates:
+            # The decision depended on EDGAR reportDate evidence: archive the canonical mapping
+            # and the reference to the response it came from, so the immutable row alone can
+            # reproduce the identity (see replay_archived_snapshot).
+            source = snapshot.report_date_source
+            conn.execute(_ARCHIVE_EVIDENCE, dict(params, report_date_evidence=json.dumps(dict(
+                report_dates=dict(snapshot.report_dates),
+                source=dict(url=source[0], sha256=source[1], received_at=source[2]) if source else None),
+                sort_keys=True)))
+        else:
+            conn.execute(_ARCHIVE, params)
         if current and snapshot.request_started_at < current['request_started_at']:
             return dict(status='ignored_older_capture', rows_written=0, snapshot_id=snapshot.snapshot_id)
         if current and snapshot.snapshot_id != current['snapshot_id']:
@@ -100,3 +121,32 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
                 confidence=row['confidence'], currency=row['currency']))
         conn.execute(_HEAD, params)
     return dict(status='applied', rows_written=len(rows), rows_removed=deleted, snapshot_id=snapshot.snapshot_id)
+
+
+def replay_archived_snapshot(engine, snapshot_id: str) -> FinancialSnapshot:
+    """Rebuild a snapshot from its immutable archive row alone and check its identity.
+
+    Company Facts bytes, FX inputs, the first receipt times and, when the admission depended on
+    EDGAR reportDate evidence, the archived accession -> reportDate mapping. Raises ``ValueError`` if
+    the row is missing or the replay does not reproduce ``snapshot_id``.
+    """
+    from datetime import date
+
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+
+    with engine.connect() as conn:
+        row = conn.execute(_ARCHIVED, dict(snapshot_id=snapshot_id)).mappings().first()
+    if row is None:
+        raise ValueError('No archived snapshot with that id')
+    fx = row['fx_inputs']
+    fx = json.loads(fx) if isinstance(fx, str) else fx
+    evidence = row['report_date_evidence']
+    evidence = json.loads(evidence) if isinstance(evidence, str) else evidence
+    dates = {a: date.fromisoformat(d) for a, d in ((evidence or {}).get('report_dates') or {}).items()}
+    snapshot = prepare_snapshot(
+        source_body=gzip.decompress(row['source_gzip']), actor_id=row['actor_id'], cik=row['cik'],
+        request_started_at=row['first_request_started_at'], received_at=row['first_received_at'],
+        fx_rates=fx, report_dates=dates)
+    if snapshot.snapshot_id != row['snapshot_id']:
+        raise ValueError('Archived snapshot does not reproduce its identity')
+    return snapshot
