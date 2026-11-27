@@ -164,3 +164,49 @@ def test_gem_run_on_postgres(pg_engine):
 
     assert receipt["tickers"] == 1 and receipt["eligible_tickers"] == 1
     assert _metrics(pg_engine)[("FLUT", FRI)] == (250.0, None, "stored_close_backfill:TIINGO")
+
+
+MON = date(2026, 11, 23)
+
+
+def test_behind_cohort_selection_on_postgres(pg_engine):
+    """2026-11-27: tickers the audit grades FRESH but whose latest stored close trails the expected session
+    (Mon 11-23 at this clock) are work, with a 30-day window; current tickers and tickers with no stored
+    close are not; the audit's own last_obs is not what decides it (the live close is read)."""
+    old = date(2026, 10, 9)                                           # 46 days back: outside 30, inside 60
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO data_freshness_audit (ticker, bucket, last_obs, audited_at) VALUES "
+            "('GONE', 'FRESH', DATE '2026-11-01', now() - interval '2 days'), "     # an earlier audit: ignored
+            "('STL', 'STALE_7_30', DATE '2026-11-10', now()), ('BEH', 'FRESH', DATE '2026-11-20', now()), "
+            "('CUR', 'FRESH', DATE '2026-11-10', now()), "     # the audit snapshot is stale, the live close is current
+            "('NOC', 'FRESH', DATE '2026-11-20', now())"))
+        conn.execute(text(
+            "INSERT INTO ticker_metrics_daily (ticker, obs_date, shares_outstanding, close_price, source) VALUES "
+            "('BEH', :fri, NULL, 5.0, 'twelvedata_universe_backfill'), ('CUR', :mon, NULL, 7.0, 'x'), "
+            "('NOC', :fri, 1000, NULL, 'sec_xbrl + yfinance'), ('GONE', :fri, NULL, 1.0, 'x')"),
+            {"fri": FRI, "mon": MON})
+        for ticker in ("BEH", "STL", "CUR", "NOC", "GONE"):
+            _close(conn, ticker, 1, FRI, 5.0 if ticker == "BEH" else 1.0)
+        _close(conn, "BEH", 1, MON, 5.5)
+        _close(conn, "BEH", 1, old, 4.0)
+        _close(conn, "STL", 1, MON, 2.0)
+        _close(conn, "STL", 1, old, 1.9)
+        _close(conn, "CUR", 1, MON, 7.0)
+
+    dry = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT, dry_run=True, only_bucket="BEHIND")
+    assert dry["tickers"] == 1 and dry["behind_cohort"] == 1           # BEH only: not STL (stale), CUR, NOC or GONE
+    stale_only = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT, dry_run=True, only_bucket="STALE_7_30")
+    assert stale_only["tickers"] == 1 and stale_only["behind_cohort"] == 0
+
+    receipt = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT)
+    assert receipt["tickers"] == 2 and receipt["behind_cohort"] == 1 and receipt["failed"] == []
+    rows = _metrics(pg_engine)
+    assert rows[("BEH", MON)] == (5.5, None, "stored_close_backfill:TIINGO")        # the missing close is copied
+    assert rows[("BEH", FRI)] == (5.0, None, "twelvedata_universe_backfill")        # an existing close is kept
+    assert ("BEH", old) not in rows                                                  # outside the 30-day window
+    assert rows[("STL", MON)][2] == "stored_close_backfill:TIINGO" and ("STL", old) in rows    # the 60-day window
+    assert ("CUR", FRI) not in rows and ("NOC", MON) not in rows and ("GONE", MON) not in rows
+
+    again = mod.run(pg_engine, "universe", evaluated_at=EVALUATED_AT, dry_run=True)
+    assert again["behind_cohort"] == 0 and again["tickers"] == 1                    # BEH is current now; STL stays graded stale
