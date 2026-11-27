@@ -800,10 +800,23 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # the two new statuses exactly as it did when those passes were called
         # "completed". No SEC, FINRA or dispatch-prefix change. Needs reviewer
         # acceptance like the prior pins.
+        # OPER re-pinned 42ba0a88 -> c40aaf76 (2026-11-27,
+        # claude/oracle-forward-retry-20261127): the forward pass's durable
+        # gate takes its interval from _oracle_forward_retry_plan (new; reads
+        # oracle.forward_health, falls back to hourly on any error) instead
+        # of a fixed 3600 s and returns retry_after_s when it defers; each
+        # pass writes how it ended through _record_oracle_forward_outcome
+        # (new; one insert-only oracle_iterations row carrying the pass
+        # status, the attempt row's own clock from INSERT ... RETURNING, and
+        # each cohort ticker's outcome); _run_oracle_forward_step
+        # keeps state.oracle_forward_gap_s through the new
+        # _oracle_forward_next_gap helper (600 s after an all-abstained or
+        # capture-less pass, else hourly). No SEC, FINRA or dispatch-prefix
+        # change. Needs reviewer acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','42ba0a88b5ba98a1adec308054e290bc83bce002625025a3e25891625045c9bb'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','c40aaf76d86f87b1c48ebac3f720a5d2698cd2bcebc0f98f97f6c4f277d76f3f'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

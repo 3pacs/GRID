@@ -579,16 +579,28 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
             """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE}).scalar_one()
             lease.commit()  # Session lock remains held across this commit.
             check()
-            if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 3600:
-                return {"status": "deferred", "reason": "hourly_attempt_already_recorded", **policy}
+            # Hourly, or sooner while the session still waits for a quote or a
+            # capture. Judged from stored attempts, outcomes and rows, so a
+            # restart agrees.
+            plan = _oracle_forward_retry_plan(engine)
+            interval = plan["interval_seconds"]
+            if last is not None:
+                elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+                if elapsed < interval:
+                    return {"status": "deferred",
+                            "reason": ("retry_interval_not_elapsed" if plan["quick"]
+                                       else "hourly_attempt_already_recorded"),
+                            "retry_after_s": max(1, int(interval - elapsed)), **policy}
             # Commit the attempt before any provider request; retries/restarts
             # cannot turn an unsuccessful attempt into repeated hourly work.
             with engine.begin() as conn:
-                conn.execute(text("""
+                # The attempt's own clock is the key its outcome row carries.
+                attempt_at = conn.execute(text("""
                     INSERT INTO oracle_iterations
                     (iteration_at, models_updated, predictions_scored, notes)
                     VALUES (clock_timestamp(), 0, 0, :note)
-                """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE})
+                    RETURNING iteration_at
+                """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE}).scalar_one()
             check()
             scoring = oracle.score_expired_predictions()
             check()
@@ -605,6 +617,8 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
                         if any(row.get("ticker") == ticker and row.get("status") == "SUCCESS"
                                for row in capture)]
             if not captured:
+                _record_oracle_forward_outcome(
+                    engine, "no_capture", attempt_at, dict.fromkeys(ORACLE_FORWARD_TICKERS, "no_capture"))
                 return {"status": "abstained", "reason": "no_fresh_cohort_capture",
                         "new_predictions": 0, "scoring": scoring, **policy}
             # No run_cycle/evolve_weights/ModelEvolver/TraceEvolver or fresh
@@ -662,6 +676,10 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
                 "leaderboard": oracle._get_leaderboard(),
                 "hallucination_guard": {},
             }
+            # A cohort ticker that was not captured has no account from the engine.
+            ticker_outcomes = {name: "no_capture" for name in ORACLE_FORWARD_TICKERS if name not in captured}
+            ticker_outcomes.update(outcome.get("ticker_outcomes") or {})
+            _record_oracle_forward_outcome(engine, result["status"], attempt_at, ticker_outcomes)
             return result
         finally:
             # Roll back any failed catalogue read before releasing the session
@@ -673,6 +691,74 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
             lease.commit()
 
 
+def _record_oracle_forward_outcome(
+    engine: Any, status: str, attempt_at: Any, ticker_outcomes: dict[str, str],
+) -> None:
+    """Write this pass's own account of how it ended (``oracle.forward_health.retry_plan`` reads it).
+
+    One insert-only row, carrying the pass status, the clock of the attempt
+    row this pass wrote before its provider request, and what each cohort
+    ticker ended the pass with (forecast, no quote, another abstention, no
+    vote, no capture). The retry plan follows the newest attempt's account
+    only, matched by that clock. A failure to write it is logged and costs
+    only the short interval: with no account for the newest attempt the plan
+    stays hourly.
+    """
+    try:
+        from oracle.forward_health import outcome_note
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO oracle_iterations
+                (iteration_at, models_updated, predictions_scored, notes)
+                VALUES (clock_timestamp(), 0, 0, :note)
+            """), {"note": outcome_note(status, attempt_at, ticker_outcomes)})
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail a pass that already ran
+        log.warning("Oracle forward outcome not recorded: {e}", e=str(exc))
+
+
+def _oracle_forward_retry_plan(engine: Any) -> dict[str, Any]:
+    """The interval before the next forward pass (``oracle.forward_health.retry_plan``).
+
+    Reads on its own connection, so a failed read cannot poison the lease that
+    holds the pass lock. Any failure falls back to the hourly interval: the
+    behaviour before retries existed.
+    """
+    hourly = {"quick": False, "interval_seconds": 3600, "reason": "retry_plan_unavailable"}
+    try:
+        from oracle.forward_health import forward_health
+
+        with engine.connect() as conn:
+            health = forward_health(conn, now=datetime.now(timezone.utc), include_schwab=True)
+        plan = health.get("retry")
+        return plan if isinstance(plan, dict) and "interval_seconds" in plan else hourly
+    except Exception as exc:  # noqa: BLE001 - the pass must not fail on its own cadence check
+        log.warning("Oracle forward retry plan unavailable, staying hourly: {e}", e=str(exc))
+        return hourly
+
+
+#: Passes that may be followed sooner than an hour later: every candidate
+#: abstained, or there was no capture at all. The in-memory gate lets the next
+#: cycle dispatch after the short interval; whether the pass then runs is
+#: decided from the durable record (attempt cap, cut-off, private-use capture).
+#: "no_result" (quotes qualified, no model voted) and "failed" (a timeout,
+#: which has its own cooldown) are not among them.
+_ORACLE_FORWARD_QUICK_RETRY_STATUSES = frozenset({"all_abstained", "abstained"})
+
+
+def _oracle_forward_next_gap(result: Any) -> int:
+    """Seconds the in-memory gate waits before dispatching the pass again."""
+    from oracle.forward_health import HOURLY_INTERVAL, RETRY_INTERVAL
+
+    status = (result or {}).get("status")
+    if status in _ORACLE_FORWARD_QUICK_RETRY_STATUSES:
+        return int(RETRY_INTERVAL.total_seconds())
+    if status == "deferred" and isinstance((result or {}).get("retry_after_s"), int):
+        # The durable gate said when it opens; do not dispatch a worker before then.
+        return max(60, min(int(HOURLY_INTERVAL.total_seconds()), result["retry_after_s"]))
+    return int(HOURLY_INTERVAL.total_seconds())
+
+
 def _oracle_forward_alert(engine: Any, state: Any, result: Any, now: datetime) -> bool:
     """Tell the operator, once per session, that the forward pass has no usable forecast.
 
@@ -681,8 +767,9 @@ def _oracle_forward_alert(engine: Any, state: Any, result: Any, now: datetime) -
 
     Nothing here is remembered in the operator's memory. Whether an alert is
     due is read from the durable record (``oracle.forward_alert.alert_due``:
-    at once when every candidate abstained, after two attempts that stored
-    nothing), and whether it was already sent is one marker row per session
+    at once when every candidate abstained and no retry is coming, after a
+    second attempt when one is, after two attempts that stored nothing), and
+    whether it was already sent is one marker row per session
     that the daily sweep shares (``send_session_alert``). A restarted
     operator therefore neither forgets a pass nor repeats an alert. Returns
     True when this call sent it. A deferred pass is not a pass, and a pass
@@ -715,8 +802,11 @@ def _run_oracle_forward_step(
     if not _oracle_forward_regular_session(now):
         cycle_result["oracle"] = {"status": "deferred", "reason": "regular_session_closed"}
         return
-    if state.last_oracle_cycle is not None and (now - state.last_oracle_cycle).total_seconds() < 3600:
-        cycle_result["oracle"] = {"status": "deferred", "reason": "hourly_cadence"}
+    gap = getattr(state, "oracle_forward_gap_s", None)
+    gap = gap if isinstance(gap, int) and gap > 0 else 3600
+    if state.last_oracle_cycle is not None and (now - state.last_oracle_cycle).total_seconds() < gap:
+        cycle_result["oracle"] = {"status": "deferred",
+                                  "reason": "hourly_cadence" if gap >= 3600 else "retry_cadence"}
         return
     if not state.cooldowns.can_retry("oracle_cycle"):
         cycle_result["oracle"] = {"status": "deferred", "reason": "timeout_or_failure_cooldown"}
@@ -762,6 +852,12 @@ def _run_oracle_forward_step(
         # Covers timeout, errors and successful return; orphan callbacks never
         # regain admission on a later cycle or after a wall-clock rollback.
         cancelled.set()
+        # A pass that left the session waiting may be followed sooner than an
+        # hour later; an exception keeps the hourly gap.
+        try:
+            state.oracle_forward_gap_s = _oracle_forward_next_gap(cycle_result.get("oracle"))
+        except Exception:  # noqa: BLE001 - cadence bookkeeping must never break the cycle
+            state.oracle_forward_gap_s = 3600
         # Every way the pass can end without a forecast: abstained everywhere,
         # no capture, a timeout or an error.
         try:

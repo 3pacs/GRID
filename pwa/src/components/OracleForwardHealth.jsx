@@ -8,16 +8,17 @@ import { colors } from '../styles/shared.js';
  * From 2026-11-23 to 2026-11-25 every candidate abstained at creation and this
  * page showed nothing about it. The line below is read from
  * /api/v1/oracle/forward-health (oracle/forward_health.py): green when every
- * cohort ticker has a forecast, yellow when one does not, red when the session
- * has none. If the status itself cannot be read, it says so instead of
+ * cohort ticker has a forecast, yellow when one does not or when the next pass
+ * is minutes away (an admin response says so), red when the session has none. If the status itself cannot be read, it says so instead of
  * showing nothing.
  */
 const LEVEL_COLOR = {
-    ok: colors.green, degraded: colors.yellow, failing: colors.red,
+    ok: colors.green, degraded: colors.yellow, retrying: colors.yellow, failing: colors.red,
     pending: colors.textMuted, info: colors.textMuted,
 };
 const LEVEL_LABEL = {
     ok: 'FORWARD PASS OK', degraded: 'FORWARD PASS DEGRADED', failing: 'NO USABLE FORECAST',
+    retrying: 'WAITING FOR A QUALIFIED QUOTE',
     pending: 'FORWARD PASS PENDING', info: 'FORWARD PASS',
 };
 

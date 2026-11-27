@@ -24,8 +24,9 @@ Who sees what. Predictions are read through
 every row, everyone else the public cohort. Three things are for admin
 requests only, because they come from tables that are not filtered by cohort:
 the attempt count and last attempt time (``oracle_iterations`` records every
-pass, private-use ones included), whether the alert was sent, and the
-sentence about a private-use capture (``operator_notes``). The public answer
+pass, private-use ones included), how the last pass ended, the retry plan,
+whether the alert was sent, and the sentence about a private-use capture
+(``operator_notes``). The public answer
 is built from public rows and the session clock alone, so it is the same
 whatever happened in the private cohort.
 
@@ -41,6 +42,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from oracle.entry_price_policy import ABSTENTION_KIND_KEY
 from store.options_provenance import (
     include_schwab_rows, oracle_predictions_from, visible_sql, withheld_capture_note,
 )
@@ -59,6 +61,41 @@ PENDING_GRACE = timedelta(minutes=90)
 #: holds millions of rows; an unbounded MAX() read all of them (2.9 s in
 #: production). Bounded, it walks the created_at index back from now.
 LAST_FORECAST_LOOKBACK = timedelta(days=90)
+
+#: After a pass that left the session waiting, the next pass may start this
+#: soon instead of an hour later. Each pass is a new decision: its own fresh
+#: capture, its own decision clock, its own frozen quote. Nothing of the
+#: earlier pass is completed or backdated.
+RETRY_INTERVAL = timedelta(minutes=10)
+#: Attempts in one session that may use the short interval (the first pass
+#: included). Every attempt is a provider request, so the short interval is
+#: bounded: after this many the pass is hourly again.
+MAX_QUICK_ATTEMPTS = 13
+#: No short-interval retry this close to the close. The hourly pass is not
+#: affected; it runs to the close as before.
+RETRY_CUTOFF_BEFORE_CLOSE = timedelta(minutes=30)
+HOURLY_INTERVAL = timedelta(hours=1)
+#: ``oracle_iterations.notes`` prefix of the row a pass writes when it ends.
+#: The note is ``<prefix><status>|attempt=<the attempt row's own
+#: iteration_at>|<TICKER>=<outcome>|...``: how the pass ended, which attempt
+#: it belongs to, and what each cohort ticker ended that pass with. Stored
+#: predictions cannot say this. They accumulate over the session, so an
+#: abstention from 14:31 is still there after a 14:41 pass in which the quote
+#: qualified and no model voted; and a ticker with no row at all may have had
+#: no capture or no candidate. Only the latest pass's own account tells them
+#: apart, and only the account of the newest attempt is read (:func:`outcome_note`,
+#: :func:`parse_outcome_note`).
+FORWARD_OUTCOME_NOTE_PREFIX = "oracle_forward_v2:SPY_QQQ:1d:outcome:"
+OUTCOME_NO_CAPTURE = "no_capture"
+
+#: What one ticker ended one pass with.
+TICKER_FORECAST = "forecast"                # holds a forecast (stored now or repeated)
+TICKER_NO_QUOTE = "no_quote"                # abstained for want of a qualified quote
+TICKER_ABSTAINED_OTHER = "abstained_other"  # abstained for another reason
+TICKER_NO_VOTE = "no_vote"                  # captured, and no model produced a candidate
+TICKER_NO_CAPTURE = "no_capture"            # the provider gave no capture for it
+#: The two a fresh capture could change.
+TICKER_RETRYABLE = frozenset({TICKER_NO_QUOTE, TICKER_NO_CAPTURE})
 
 STATUS_OK = "ok"                              # every cohort ticker has a forecast
 STATUS_PARTIAL = "partial"                    # some do, some do not
@@ -116,7 +153,22 @@ def pass_outcome(captured: list[str] | tuple[str, ...], detail: Any) -> dict[str
                  and count(t, "abstained", "duplicate_abstentions") > 0]
     without_candidates = [t for t in captured if t not in with_forecast and t not in abstained]
     ordered = dict(sorted(reasons.items(), key=lambda item: (-int(item[1]), item[0])))
+    # What each captured ticker ended this pass with (retry_plan reads the
+    # stored copy). An abstention counts as "no quote" only when every
+    # abstention of the ticker in this pass lacked one.
+    ticker_outcomes: dict[str, str] = {}
+    if known:
+        for name in captured:
+            if name in with_forecast:
+                ticker_outcomes[name] = TICKER_FORECAST
+            elif name in abstained:
+                lacking = count(name, "without_quote")
+                total = count(name, "abstained", "duplicate_abstentions")
+                ticker_outcomes[name] = TICKER_NO_QUOTE if lacking and lacking == total else TICKER_ABSTAINED_OTHER
+            else:
+                ticker_outcomes[name] = TICKER_NO_VOTE
     return {
+        "ticker_outcomes": ticker_outcomes,
         "tickers_with_forecast": with_forecast,
         "tickers_abstained": abstained,
         "tickers_without_candidates": without_candidates if known else [],
@@ -170,6 +222,90 @@ def forward_session(now: datetime, *, ended_only: bool = False) -> dict[str, Any
     raise RuntimeError("no trading session found in the last 15 days")
 
 
+def outcome_note(status: str, attempt_at: Any, ticker_outcomes: dict[str, str]) -> str:
+    """The note of a pass's outcome row. ``attempt_at`` is that pass's own attempt row's clock."""
+    parts = [FORWARD_OUTCOME_NOTE_PREFIX + status, "attempt=" + (_iso(attempt_at) or "")]
+    parts += [f"{name}={outcome}" for name, outcome in sorted(ticker_outcomes.items())]
+    return "|".join(parts)
+
+
+def parse_outcome_note(note: Any) -> dict[str, Any] | None:
+    """``{"status", "attempt", "tickers"}`` from an outcome note, or None when it is not one."""
+    if not isinstance(note, str) or not note.startswith(FORWARD_OUTCOME_NOTE_PREFIX):
+        return None
+    status, *fields = note[len(FORWARD_OUTCOME_NOTE_PREFIX):].split("|")
+    parsed: dict[str, Any] = {"status": status, "attempt": None, "tickers": {}}
+    for field in fields:
+        key, _, value = field.partition("=")
+        if key == "attempt":
+            parsed["attempt"] = value or None
+        elif key and value:
+            parsed["tickers"][key] = value
+    return parsed
+
+
+def retry_plan(health: dict[str, Any], now: datetime, *, blocked: Any = ()) -> dict[str, Any]:
+    """How soon the next forward pass may start, judged from the durable record. Admin answers only.
+
+    Judged on **what each cohort ticker ended the newest finished pass with**
+    (``health["ticker_outcomes"]``: that pass's own stored account, tied to
+    its attempt), never on the rows the session has accumulated. A ticker
+    *waits* when a fresh capture could give it what it lacks:
+
+    * ``no_quote``: it abstained for want of a qualified quote; a later one
+      may qualify;
+    * ``no_capture``: the provider gave no capture; it may ten minutes on.
+
+    It does not wait after ``forecast``, after ``no_vote`` (the quote
+    qualified and no model produced a candidate) or after an abstention of
+    another kind. So a ticker that abstained for its quote at 14:31 and at
+    14:41 got a qualified quote and no vote is done waiting, although its
+    14:31 abstention rows are still there and it still has no forecast.
+
+    While any ticker waits, the next pass may start after ``RETRY_INTERVAL``
+    instead of an hour, until the wait ends, the attempt cap, or the cut-off
+    before the close. When the newest attempt has no stored account (it timed
+    out, or is still running) nothing is known to be waiting: hourly.
+
+    ``blocked`` names tickers whose newest capture is a private-use one
+    (:func:`store.options_provenance.withheld_capture_note`). If the Oracle
+    cannot read that one it cannot read the next either, so when every ticker
+    that waits does so for a quote and is blocked, the pass stays hourly.
+
+    Read from stored rows only, so a restarted operator reaches the same
+    answer. ``quick`` says whether the short interval applies.
+    """
+    clock = _aware(now)
+    closes = _aware(health.get("session_closes_at"))
+    cutoff = closes - RETRY_CUTOFF_BEFORE_CLOSE if closes is not None else None
+    outcomes = health.get("ticker_outcomes") or {}
+    cohort = list(health.get("tickers") or {})
+    waiting_for_quote = [name for name in cohort if outcomes.get(name) == TICKER_NO_QUOTE]
+    waiting_for_capture = [name for name in cohort if outcomes.get(name) == TICKER_NO_CAPTURE]
+    waiting_tickers = [name for name in cohort if outcomes.get(name) in TICKER_RETRYABLE]
+    attempts = int(health.get("attempts") or 0)
+    if not waiting_tickers:
+        why = "not_waiting"
+    elif not waiting_for_capture and all(name in blocked for name in waiting_for_quote):
+        why = "newest_capture_is_private_use"
+    elif health.get("session_state") != "open":
+        why = "session_ended"
+    elif attempts >= MAX_QUICK_ATTEMPTS:
+        why = "attempt_cap_reached"
+    elif cutoff is None or clock is None or clock >= cutoff:
+        why = "past_retry_cutoff"
+    else:
+        why = "waiting_for_a_qualified_quote" if waiting_for_quote else "waiting_for_a_fresh_capture"
+    quick = why.startswith("waiting_for")
+    return {
+        "quick": quick, "reason": why,
+        "interval_seconds": int((RETRY_INTERVAL if quick else HOURLY_INTERVAL).total_seconds()),
+        "waiting_tickers": waiting_tickers,
+        "attempts": attempts, "max_quick_attempts": MAX_QUICK_ATTEMPTS,
+        "retry_cutoff_at": cutoff.isoformat() if cutoff is not None else None,
+    }
+
+
 def _message(health: dict[str, Any]) -> str:
     session, status = health["session_date"], health["status"]
     last = health.get("last_qualified_at")
@@ -178,6 +314,11 @@ def _message(health: dict[str, Any]) -> str:
     # Attempt counts are in an admin answer only.
     attempts = health.get("attempts")
     over = f" over {attempts} attempt(s)" if attempts is not None else ""
+    retry = health.get("retry") or {}
+    if retry.get("quick"):
+        tail += (f" Trying again about every {retry['interval_seconds'] // 60} minutes with a fresh"
+                 f" capture until a quote qualifies, {retry['max_quick_attempts']} attempts have been"
+                 f" made, or {retry['retry_cutoff_at']}.")
     if status == STATUS_OK:
         return f"Oracle forward pass has a forecast for every cohort ticker in the {session} session."
     if status == STATUS_PARTIAL:
@@ -206,10 +347,11 @@ def forward_health(
 
     ``include_schwab`` is the viewer flag of ``store.options_provenance``:
     exactly ``True`` reads every prediction and adds the admin-only fields
-    (``attempts``, ``first_attempt_at``, ``last_attempt_at``, ``alert_sent``,
-    ``operator_notes``);
-    anything else reads the public cohort and gets none of them. ``level`` is
-    ``ok``, ``pending``, ``degraded`` (a cohort ticker has no forecast),
+    (``attempts``, ``first_attempt_at``, ``last_attempt_at``, ``last_outcome``,
+    ``ticker_outcomes``, ``alert_sent``, ``operator_notes``, ``retry``); anything else reads the
+    public cohort and gets none of them. ``level`` is ``ok``, ``pending``,
+    ``degraded`` (a cohort ticker has no forecast), ``retrying`` (none yet, and
+    the next pass is minutes away: :func:`retry_plan`; admin answers only),
     ``failing`` (the session has none) or ``info``.
 
     Nothing later than ``now`` is read, on any path.
@@ -225,6 +367,8 @@ def forward_health(
     attempts = 0
     attempt_row = None
     alert_sent = False
+    last_outcome = None
+    ticker_outcomes: dict[str, str] = {}
     if admin:
         # oracle_iterations is not cohort-filtered: every pass is recorded,
         # private-use ones included. Read for admin requests only.
@@ -236,16 +380,33 @@ def forward_health(
         alert_sent = conn.execute(text(
             "SELECT 1 FROM oracle_iterations WHERE notes = :note AND iteration_at <= :now LIMIT 1"
         ), {"note": alert_note(day), "now": window["now"]}).fetchone() is not None
+        # The newest attempt's own account of how it ended, matched by the
+        # attempt clock written into the note. No account for the newest
+        # attempt (it timed out, or is still running) means none is used: an
+        # earlier pass's account says nothing about this one.
+        newest_attempt = _iso(attempt_row[1]) if attempt_row else None
+        if newest_attempt is not None:
+            for (note,) in conn.execute(text(
+                "SELECT notes FROM oracle_iterations WHERE notes LIKE :prefix"
+                " AND iteration_at >= :start AND iteration_at < :end AND iteration_at <= :now"
+                " ORDER BY iteration_at DESC LIMIT 20"
+            ), {"prefix": FORWARD_OUTCOME_NOTE_PREFIX + "%", **window}).fetchall():
+                parsed = parse_outcome_note(note)
+                if parsed is not None and parsed["attempt"] == newest_attempt:
+                    last_outcome, ticker_outcomes = parsed["status"], parsed["tickers"]
+                    break
 
     source = oracle_predictions_from(include_schwab)
     rows = conn.execute(visible_sql(
         "SELECT ticker, CASE WHEN direction = 'NONE' THEN 1 ELSE 0 END AS abstained, score_notes,"
-        " COUNT(*), MIN(created_at) FROM " + source + " oracle_predictions"
+        " COUNT(*), MIN(created_at), flow_context ->> :kind_key AS kind"
+        " FROM " + source + " oracle_predictions"
         " WHERE recording_policy = :policy AND dedup_keep = TRUE"
         " AND created_at >= :start AND created_at < :end AND created_at <= :now"
-        " GROUP BY ticker, CASE WHEN direction = 'NONE' THEN 1 ELSE 0 END, score_notes",
+        " GROUP BY ticker, CASE WHEN direction = 'NONE' THEN 1 ELSE 0 END, score_notes,"
+        " flow_context ->> :kind_key",
         include_schwab,
-    ), {"policy": FORWARD_RECORDING_POLICY, **window}).fetchall()
+    ), {"policy": FORWARD_RECORDING_POLICY, "kind_key": ABSTENTION_KIND_KEY, **window}).fetchall()
     last_row = conn.execute(visible_sql(
         "SELECT created_at FROM " + source + " oracle_predictions"
         " WHERE recording_policy = :policy AND dedup_keep = TRUE AND direction <> 'NONE'"
@@ -262,7 +423,10 @@ def forward_health(
     }
     reasons: dict[str, int] = {}
     ticker_reasons: dict[str, dict[str, int]] = {}
-    for name, abstained, note, count, first in rows:
+    kinds: dict[str, int] = {}             # every abstention by the kind its writer gave it
+    for name, abstained, note, count, first, kind in rows:
+        if abstained:
+            kinds[kind or "unspecified"] = kinds.get(kind or "unspecified", 0) + int(count)
         row = per_ticker.setdefault(name, {
             "qualified": 0, "abstained": 0, "top_reason": None,
             "first_forecast_at": None, "first_abstention_at": None,
@@ -321,6 +485,10 @@ def forward_health(
         },
         "abstention_reasons": dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0]))),
         "top_reason": top(reasons),
+        # Why the session's abstentions abstained, by the kind on each row
+        # (``no_qualified_quote`` from the engine; "unspecified" for rows
+        # written before kinds existed). The stored reasons above say it in words.
+        "abstention_kinds": dict(sorted(kinds.items(), key=lambda item: (-item[1], item[0]))),
         "last_qualified_at": _iso(last_row[0]) if last_row else None,
         "cohort": "all" if admin else "public",
         "checked_at": _aware(now).isoformat(),
@@ -330,6 +498,8 @@ def forward_health(
         health["last_attempt_at"] = _iso(attempt_row[1]) if attempt_row else None
         health["first_attempt_at"] = _iso(attempt_row[2]) if attempt_row else None
         health["alert_sent"] = alert_sent
+        health["last_outcome"] = last_outcome
+        health["ticker_outcomes"] = ticker_outcomes
         notes: dict[str, str] = {}
         for name, row in per_ticker.items():
             if row["qualified"] or row["first_abstention_at"] is None:
@@ -341,6 +511,12 @@ def forward_health(
             if note:
                 notes[name] = note
         health["operator_notes"] = notes
+        # The cadence is the operator's: it depends on attempts, outcomes and
+        # private-use captures, none of which a non-admin answer may show.
+        health["retry"] = retry_plan(health, now, blocked=notes)
+        if level == "failing" and health["retry"]["quick"]:
+            # Still no forecast, and the session is not over: the next pass is minutes away.
+            health["level"] = "retrying"
     health["message"] = _message(health)
     return health
 

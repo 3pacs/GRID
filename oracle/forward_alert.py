@@ -70,7 +70,10 @@ def _clock(value: Any) -> datetime | None:
 def alert_due(health: dict[str, Any]) -> tuple[bool, str]:
     """Whether this session's record calls for the alert, and why. Needs an admin answer.
 
-    * every candidate abstained: at once (a refused quote does not fix itself);
+    * every candidate abstained: at once when no retry is coming (the record
+      says the next pass is an hour away: the newest capture is private-use,
+      the cap or the cut-off was reached); when a retry is minutes away, once
+      a second attempt is on record and it abstained too;
     * passes ran and stored nothing (no capture, or no model produced a
       candidate): while the session is open, once
       ``BARREN_ATTEMPTS_BEFORE_ALERT`` attempts are on record and the first
@@ -88,6 +91,8 @@ def alert_due(health: dict[str, Any]) -> tuple[bool, str]:
     status = health.get("status")
     attempts = int(health.get("attempts") or 0)
     if status == STATUS_ALL_ABSTAINED:
+        if health.get("level") == "retrying" and attempts < BARREN_ATTEMPTS_BEFORE_ALERT:
+            return False, "retry is minutes away"
         return True, "every candidate abstained"
     if status == STATUS_NO_ROWS and health.get("session_state") == "ended":
         return True, f"the session ended with {attempts} attempt(s) and nothing stored"

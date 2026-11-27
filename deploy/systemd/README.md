@@ -704,5 +704,27 @@ sudo install -m 0755 -o root -g root \
   /usr/local/bin/grid-data-freshness-check.sh
 ```
 
+A pass that leaves the session waiting is followed sooner than an hour later
+(`oracle.forward_health.retry_plan`): about every 10 minutes, with a fresh
+capture each time, until the wait ends, 13 attempts have been made in the
+session, or 30 minutes before the close. "Waiting" is judged per ticker, on
+what it ended the newest finished pass with: it waits after `no_quote` (it
+abstained for want of a qualified quote, `flow_context.abstention_kind` =
+`no_qualified_quote`) and after `no_capture`. It does not wait after `no_vote`
+(the quote qualified and no model produced a candidate), so a ticker that
+abstained for its quote at 14:31 and got a qualified quote and no vote at 14:41
+is done, although its earlier abstention rows are still there. A session whose
+newest capture is a private-use one does not wait either (if the Oracle cannot
+read that one it cannot read the next; the pass stays hourly and the alert is
+sent at once). Each pass writes its own account as one row in
+`oracle_iterations`
+(`oracle_forward_v2:SPY_QQQ:1d:outcome:<status>|attempt=<attempt clock>|SPY=...|QQQ=...`);
+only the newest attempt's account is read, matched by that clock.
+
+The pass that succeeds makes the forecast, with its own decision time and its
+own frozen quote. An earlier abstention keeps its row and its clock. The
+20-minute and same-session quote rules are unchanged. While a retry is minutes
+away the alert waits for the second attempt.
+
 An abstention is the honest record of a pass with no qualified quote. Nothing
 here repairs or regenerates one; the fix for the cause is the switch above.
