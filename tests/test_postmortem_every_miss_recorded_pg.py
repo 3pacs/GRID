@@ -45,7 +45,8 @@ def pg():
             conn.execute(text(
                 "CREATE TABLE oracle_predictions (id text PRIMARY KEY, verdict text, "
                 "scored_at timestamptz, pnl_pct double precision, flow_context jsonb DEFAULT '{}'::jsonb, "
-                "ticker text, direction text, expiry date, model_name text)"
+                "ticker text, direction text, expiry date, model_name text, prediction_type text, "
+                "horizon_days integer, created_at timestamptz)"
             ))
             conn.execute(text(
                 "CREATE TABLE options_recommendations (id integer PRIMARY KEY, outcome text, "
@@ -60,12 +61,15 @@ def pg():
         admin.dispose()
 
 
-def _miss(engine, pid, scored_at, pnl=-4.0, ticker="SPY", direction="CALL", expiry="2026-11-20", model="m"):
+def _miss(engine, pid, scored_at, pnl=-4.0, ticker="SPY", direction="CALL", expiry="2026-11-20", model="m",
+          decided="2026-11-13T15:00:00+00:00", horizon=7, ptype="directional"):
     with engine.begin() as conn:
         conn.execute(text(
-            "INSERT INTO oracle_predictions (id, verdict, scored_at, pnl_pct, ticker, direction, expiry, model_name)"
-            " VALUES (:i, 'miss', :s, :p, :t, :d, :e, :m)"
-        ), {"i": pid, "s": scored_at, "p": pnl, "t": ticker, "d": direction, "e": expiry, "m": model})
+            "INSERT INTO oracle_predictions (id, verdict, scored_at, pnl_pct, ticker, direction, expiry, model_name,"
+            " prediction_type, horizon_days, created_at)"
+            " VALUES (:i, 'miss', :s, :p, :t, :d, :e, :m, :pt, :h, :c)"
+        ), {"i": pid, "s": scored_at, "p": pnl, "t": ticker, "d": direction, "e": expiry, "m": model,
+            "pt": ptype, "h": horizon, "c": decided})
 
 
 def _trade(engine, tid, closed_at, ret=-0.4, outcome="LOSS"):
@@ -249,6 +253,54 @@ def test_auto_improve_counts_each_logical_miss_once(pg, monkeypatch):
         monkeypatch.setattr(ai, "_POSTMORTEM_CORPUS_CUTOFF", (RECENT - timedelta(days=1)).date().isoformat())
         ratios = {r["signal"]: r for r in ai._signal_ratios(conn)}
     assert ratios["iv_skew"]["wrong_count"] == 1.0     # the SPY call once (4 x 0.25), not four times
+
+
+def test_the_same_expiry_from_another_decision_day_or_horizon_is_another_miss(pg):
+    # Codex review 6094174470: an expiry shared by independent decisions is not one call.
+    import scripts.auto_improve_from_postmortems as ai
+
+    _miss(pg, "day1", RECENT, decided="2026-11-13T15:00:00+00:00")
+    _miss(pg, "day1-other-model", RECENT, decided="2026-11-13T19:00:00+00:00", model="m2")   # same session
+    _miss(pg, "day2", RECENT, decided="2026-11-14T15:00:00+00:00")
+    _miss(pg, "h14", RECENT, decided="2026-11-13T15:00:00+00:00", horizon=14)
+    for pid in ("day1", "day1-other-model", "day2", "h14"):
+        pm_mod._store_postmortem(pg, _pm(), trade_id=None, prediction_id=pid)
+    with pg.connect() as conn:
+        weights = dict(conn.execute(text(
+            "SELECT prediction_id, miss_weight FROM " + pm_mod.logical_miss_postmortems_sql("TRUE") + " tp"
+        )).fetchall())
+        assert ai._failure_categories(conn) == {"wrong_signal": 3.0}   # three decisions, not one
+    assert {k: float(v) for k, v in weights.items()} == {"day1": 0.5, "day1-other-model": 0.5, "day2": 1.0, "h14": 1.0}
+
+
+def test_rows_with_no_type_or_horizon_still_group_by_ticker_direction_expiry_and_day(pg):
+    # 99.7% of the May rows have prediction_type or horizon_days NULL (partner check).
+    for pid, day in (("n1", "2026-05-12T16:00:00+00:00"), ("n2", "2026-05-12T20:00:00+00:00"),
+                     ("n3", "2026-05-13T16:00:00+00:00")):
+        _miss(pg, pid, RECENT, decided=day, horizon=None, ptype=None)
+        pm_mod._store_postmortem(pg, _pm(), trade_id=None, prediction_id=pid)
+    with pg.connect() as conn:
+        weights = dict(conn.execute(text(
+            "SELECT prediction_id, miss_weight FROM " + pm_mod.logical_miss_postmortems_sql("TRUE") + " tp"
+        )).fetchall())
+    assert {k: float(v) for k, v in weights.items()} == {"n1": 0.5, "n2": 0.5, "n3": 1.0}
+
+
+def test_trace_evolver_learns_the_same_before_and_after_narration(pg, monkeypatch):
+    # Codex review 6094174470: the learning reader must not see narration change a miss it learned from.
+    from oracle.trace_evolver import TraceAnalyzer
+
+    _miss(pg, "learn", RECENT)
+    pm_mod._store_postmortem(pg, _pm(), trade_id=None, prediction_id="learn")
+    cutoff = NOW - timedelta(days=30)
+    before = [r for r in TraceAnalyzer(pg)._load_postmortems(cutoff) if r["prediction_id"] == "learn"]
+    monkeypatch.setattr(pm_mod, "_get_llm_postmortem",
+                        lambda **k: {"what_we_missed": "iv_skew FOMC", "recommended_fix": "wait", "confidence": 0.9})
+    assert pm_mod.narrate_postmortem(pg, _rows(pg, "prediction_id = 'learn'")[0][0]) is not None
+    after = [r for r in TraceAnalyzer(pg)._load_postmortems(cutoff) if r["prediction_id"] == "learn"]
+    assert before == after and after[0]["what_we_missed"] == "rule text" and after[0]["confidence"] is None
+    shown = [r for r in pm_mod.load_postmortems(pg, days=30) if r["prediction_id"] == "learn"]
+    assert shown[0]["what_we_missed"] == "iv_skew FOMC" and shown[0]["analysis_method"] == ANALYSIS_LLM   # display: labelled
 
 
 def test_a_ticker_of_trade_losses_only_is_not_listed_first(pg):

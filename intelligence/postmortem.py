@@ -104,6 +104,27 @@ def miss_on_or_after_sql(bound: str, alias: str = "tp") -> str:
     )
 
 
+# The baseline prose of a row: what it said when first written. A narrated row keeps the values it
+# replaced in full_analysis.rule_narrative; any other row's columns never change after insert.
+# Learning readers (TraceEvolver) read these, so narration later cannot change what they learn from
+# a miss (Codex review 6094174470); the narration has its own narrated_at and provenance.
+# A narrated row's baseline is taken from rule_narrative whole (a JSON null there stays NULL, it
+# never falls back to the narrated column).
+_HAS_RULE_NARRATIVE = "tp.full_analysis->'rule_narrative' IS NOT NULL"
+BASELINE_WHAT_WE_MISSED_SQL = (
+    "(CASE WHEN " + _HAS_RULE_NARRATIVE + " THEN tp.full_analysis->'rule_narrative'->>'what_we_missed'"
+    " ELSE tp.what_we_missed END)"
+)
+BASELINE_RECOMMENDED_FIX_SQL = (
+    "(CASE WHEN " + _HAS_RULE_NARRATIVE + " THEN tp.full_analysis->'rule_narrative'->>'recommended_fix'"
+    " ELSE tp.recommended_fix END)"
+)
+BASELINE_CONFIDENCE_SQL = (
+    "(CASE WHEN " + _HAS_RULE_NARRATIVE + " THEN (tp.full_analysis->'rule_narrative'->>'confidence')::numeric"
+    " ELSE tp.confidence END)"
+)
+
+
 def analysis_method_of(record: dict[str, Any]) -> str:
     """How a stored record's narrative was produced: ANALYSIS_LLM or ANALYSIS_RULES.
 
@@ -132,11 +153,17 @@ def logical_miss_postmortems_sql(where_sql: str) -> str:
     """A derived table (use it as ``FROM <this> tp``): the rows matching ``where_sql`` (alias ``tp``),
     one per prediction or trade, each carrying ``miss_weight`` so that every logical miss weighs 1.
 
-    A prediction's logical miss is its call, ``(ticker, direction, expiry)``: one market outcome,
-    however many models made it. The May 2026 cohort is 318,763 predictions from about 115 models
-    but only 433 calls, and 76,710 predictions have 2 to 34 rows. So: the newest row of each
-    prediction or trade is kept (duplicate copies dropped), and each kept row weighs
-    ``1 / (predictions in its call)``. Sum ``miss_weight`` instead of counting rows: every call
+    A prediction's logical miss is its call: one market bet made in one decision session, i.e. the
+    same ``(ticker, direction, expiry, prediction_type, horizon_days)`` decided on the same UTC day
+    (the day of the Oracle's own dedup key), however many models made it. The same expiry reached
+    from another decision day or horizon is a separate decision, so a separate miss (Codex review
+    6094174470). The day is the Oracle's own decision-day convention (UTC), not a market session:
+    a cycle that crosses UTC midnight splits into two calls, which only ever separates decisions,
+    never merges them. ``prediction_type`` and ``horizon_days`` are NULL on 99.7% of the May rows
+    and then add nothing to the key. On 2026-11-27 the 318,763 unrecorded May predictions were
+    2,216 such calls (433 by ticker, direction and expiry; 842 adding type and horizon; the rest of
+    the split is the decision day), and the recorded ones 2,467; 76,710 predictions have 2 to 34 rows. So: the newest row of each prediction or trade is
+    kept (duplicate copies dropped), and each kept row weighs ``1 / (predictions in its call)``. Sum ``miss_weight`` instead of counting rows: every call
     weighs 1 in total, and the different models' signals within it are all kept, each at its
     share (Codex HOLD 6093994627; partner review). A trade is its own logical miss; a prediction
     hidden from the public cohort keeps its own id as its call.
@@ -146,7 +173,10 @@ def logical_miss_postmortems_sql(where_sql: str) -> str:
         "SELECT DISTINCT ON (lm.copy_key) tp.*, lm.miss_key FROM trade_postmortems tp"
         " CROSS JOIN LATERAL (SELECT COALESCE("
         "(SELECT 'call:' || op_k.ticker || '|' || COALESCE(op_k.direction, '') || '|'"
-        " || COALESCE(op_k.expiry::text, '') FROM " + VISIBLE_ORACLE_PREDICTIONS + " op_k"
+        " || COALESCE(op_k.expiry::text, '') || '|' || COALESCE(op_k.prediction_type, '') || '|'"
+        " || COALESCE(op_k.horizon_days::text, '') || '|'"
+        " || COALESCE(((op_k.created_at AT TIME ZONE 'UTC')::date)::text, '')"
+        " FROM " + VISIBLE_ORACLE_PREDICTIONS + " op_k"
         " WHERE op_k.id = tp.prediction_id),"
         " 'prediction:' || tp.prediction_id, 'trade:' || tp.trade_id::text, 'row:' || tp.id::text"
         ") AS miss_key, COALESCE('prediction:' || tp.prediction_id, 'trade:' || tp.trade_id::text,"

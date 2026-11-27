@@ -397,15 +397,23 @@ class TraceAnalyzer:
             with self.engine.connect() as conn:
                 # Windowed on the miss's own date, so a record written today for an
                 # old miss is not loaded as a recent one (miss_on_or_after_sql).
-                from intelligence.postmortem import miss_on_or_after_sql
+                # Learning reads each row's baseline (as first written): a later LLM narration
+                # must not change what this cycle learns from a miss. The classification
+                # columns never change; the prose comes from BASELINE_*_SQL.
+                from intelligence.postmortem import (
+                    BASELINE_CONFIDENCE_SQL,
+                    BASELINE_RECOMMENDED_FIX_SQL,
+                    BASELINE_WHAT_WE_MISSED_SQL,
+                    miss_on_or_after_sql,
+                )
 
                 # prediction_id is NULL for paper-trade postmortems. Pattern 1
                 # joins it to the eligible scored predictions in Python, which
                 # also supplies model_name (_eligible_failure_postmortems).
                 rows = conn.execute(text("""
                     SELECT tp.ticker, tp.outcome, tp.failure_category, tp.root_cause,
-                           tp.signals_wrong, tp.signals_right, tp.what_we_missed,
-                           tp.recommended_fix, tp.confidence, tp.generated_at,
+                           tp.signals_wrong, tp.signals_right, """ + BASELINE_WHAT_WE_MISSED_SQL + """,
+                           """ + BASELINE_RECOMMENDED_FIX_SQL + """, """ + BASELINE_CONFIDENCE_SQL + """, tp.generated_at,
                            tp.prediction_id
                     FROM trade_postmortems tp
                     WHERE """ + miss_on_or_after_sql(":cutoff") + """
