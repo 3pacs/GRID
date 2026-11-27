@@ -913,7 +913,17 @@ def _incident_health(engine: Any, now: datetime | None = None) -> dict[str, Any]
         return fh.forward_health(conn, now=now or _utc(WED, 21), include_schwab=True)
 
 
-def test_the_marker_is_written_only_after_the_mail_was_accepted(db) -> None:
+def test_the_marker_is_written_only_after_the_mail_was_accepted(monkeypatch, db) -> None:
+    # The marker's write time is pinned inside the incident's own evening. Read at the real clock,
+    # the health answer is for whichever session is newest today, not for the incident.
+    written_at = _utc(WED, 21, 0, 30)
+
+    class MarkerClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return written_at.astimezone(tz)
+
+    monkeypatch.setattr(fa, "datetime", MarkerClock)
     with db.begin() as conn:
         _incident(conn)
     health = _incident_health(db)
@@ -925,9 +935,14 @@ def test_the_marker_is_written_only_after_the_mail_was_accepted(db) -> None:
     assert fa.send_session_alert(db, health, send=lambda *a: bool(calls.append(a)) or True) == fa.ALREADY_SENT
     assert calls == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]
     # The session's attempt count is not changed by the marker row, and an admin answer shows it was sent.
-    after = _incident_health(db, datetime.now(timezone.utc) + timedelta(minutes=1))
+    after = _incident_health(db, _utc(WED, 22))
+    assert after["session_date"] == WED.isoformat()
     assert after["alert_sent"] is True
-    assert _incident_health(db)["attempts"] == 6
+    assert after["attempts"] == 6
+    # A read at an instant before the marker was written does not show it.
+    before = _incident_health(db)
+    assert before["alert_sent"] is False
+    assert before["attempts"] == 6
 
 
 def test_hermes_then_the_sweep_send_one_alert_for_the_session(monkeypatch, capsys, ho, db, tmp_path) -> None:
