@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
+from sqlalchemy import text
 
 import scripts.repair_etf_flow_partial_bars as mod
 from ingestion.altdata import institutional_flows as inst
@@ -28,7 +29,7 @@ SETTLED_SAME_DAY = date(2026, 5, 12)          # written after the close, volume 
 SETTLED_NEXT_MORNING = date(2026, 6, 3)       # written before the next open, volume final
 SHORT_NEXT_MORNING = date(2026, 5, 14)        # written before the next open, volume 3 % short
 BEFORE_RANGE = date(2026, 3, 25)              # partial, but before --from
-PARTIAL = (0.3, None)                         # 30 % of the volume, price set per day
+EX_DIVIDEND_OWN_DAY = date(2026, 5, 15)       # written mid-session on its ex-dividend date
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +54,7 @@ def _seed_history(engine, market: m.Market, tickers=("SPY",)) -> dict[date, str]
             if d < date(2026, 3, 20):
                 continue
             if d == SETTLED_SAME_DAY:
-                m.seed_row(engine, ticker, d, m.old_writer_values(market, d, None), m.ny(d, 20))
+                m.seed_row(engine, ticker, d, m.old_writer_values(market, d, None, seen_on=d), m.ny(d, 20))
                 kinds[d] = "settled_same_day"
             elif d == SETTLED_NEXT_MORNING:
                 m.seed_row(engine, ticker, d, m.old_writer_values(market, d, None),
@@ -66,7 +67,8 @@ def _seed_history(engine, market: m.Market, tickers=("SPY",)) -> dict[date, str]
                 kinds[d] = "short_next_morning"
             else:
                 price = float(market.raw[pd.Timestamp(d)]) * 1.01
-                m.seed_row(engine, ticker, d, m.old_writer_values(market, d, (0.3, price)), m.ny(d, 14, 30))
+                m.seed_row(engine, ticker, d, m.old_writer_values(market, d, (0.3, price), seen_on=d),
+                           m.ny(d, 14, 30))
                 kinds[d] = "partial_same_day"
     return kinds
 
@@ -90,32 +92,40 @@ def _planned(plan) -> dict[tuple[str, date], dict]:
 # ── 1. The arithmetic ────────────────────────────────────────────────────
 
 
-def test_todays_values_times_the_basis_factor_are_the_values_on_that_sessions_basis(market):
-    """settled(D) on L's basis = recompute_now(D) x RawClose(L) / AdjClose_now(L), every metric."""
-    now = mod.settled_frame(mod.fetch_settled_bars(m.FakeYF(market), "SPY", date(2026, 1, 1), SESSION_DAY))
-    for d, basis_session in [(date(2026, 5, 12), date(2026, 5, 12)),     # before both dividends
-                             (date(2026, 5, 12), date(2026, 6, 1)),      # L after the first one
-                             (date(2026, 6, 25), date(2026, 6, 25))]:    # after both
-        asof = market.view(basis_session)
-        dv = asof.adj * asof.vol
-        direct = {"5d": dv.rolling(5).sum(), "20d": dv.rolling(20).sum()}
-        direct["accel"] = direct["5d"].diff(5)
-        factor = now.at[basis_session, "basis"]
-        for metric in mod.METRICS:
-            assert math.isclose(now.at[d, metric] * factor, direct[metric][pd.Timestamp(d)], rel_tol=1e-12)
+def _bars(market):
+    return mod.fetch_settled_bars(m.FakeYF(market), "SPY", date(2026, 1, 1), SESSION_DAY)
+
+
+@pytest.mark.parametrize(("d", "basis_session"), [
+    (date(2026, 5, 12), date(2026, 5, 12)),      # before both dividends
+    (date(2026, 5, 12), date(2026, 6, 1)),       # S after the first one
+    (date(2026, 5, 15), date(2026, 5, 14)),      # the ex-dividend day, seen before its dividend
+    (date(2026, 6, 25), date(2026, 6, 25)),      # after both
+])
+def test_todays_bars_priced_as_of_s_are_the_bars_the_writing_run_saw(market, d, basis_session):
+    """close_S(k) = AdjClose_now(k) x RawClose(S) / AdjClose_now(S) for k <= S, the raw close after S."""
+    bars = _bars(market)
+    pos = {x: k for k, x in enumerate(bars.index)}
+    seen = market.view(max(d, basis_session), seen_on=basis_session + timedelta(days=1))
+    dv = seen.adj * seen.vol
+    direct = {"5d": dv.rolling(5).sum(), "20d": dv.rolling(20).sum()}
+    direct["accel"] = direct["5d"].diff(5)
+    for metric in mod.METRICS:
+        got = mod.window_value(bars, metric, pos[d], pos[basis_session])
+        assert math.isclose(got, direct[metric][pd.Timestamp(d)], rel_tol=1e-12), metric
     # and the dividend matters: on today's basis 05-12 is not what was stored then
-    assert not math.isclose(now.at[date(2026, 5, 12), "5d"],
-                            m.old_writer_values(market, date(2026, 5, 12), None)["5d"], rel_tol=1e-3)
+    now = mod.window_value(bars, "5d", pos[date(2026, 5, 12)], len(bars) - 1)
+    assert not math.isclose(now, m.old_writer_values(market, date(2026, 5, 12), None)["5d"], rel_tol=1e-3)
 
 
 @pytest.mark.parametrize(("pulled", "expected"), [
-    (m.ny(date(2026, 5, 12), 14, 30), date(2026, 5, 12)),     # mid-session: that bar
-    (m.ny(date(2026, 5, 12), 20), date(2026, 5, 12)),         # after the close
+    (m.ny(date(2026, 5, 12), 14, 30), date(2026, 5, 11)),     # mid-session: the dividend state of the day before
+    (m.ny(date(2026, 5, 12), 20), date(2026, 5, 11)),         # after the close, likewise
     (m.ny(date(2026, 5, 13), 4), date(2026, 5, 12)),          # before the next open
     (m.ny(date(2026, 5, 16), 10), date(2026, 5, 15)),         # a Saturday
-    (datetime(2026, 11, 27, 20, tzinfo=timezone.utc), date(2026, 11, 26)),  # settled-bars writer, mid-session
+    (datetime(2026, 11, 27, 20, tzinfo=timezone.utc), date(2026, 11, 26)),  # the settled-bars writer
 ])
-def test_the_price_basis_is_the_newest_session_the_writing_run_saw(pulled, expected):
+def test_the_price_basis_is_the_last_session_before_the_new_york_date_of_the_write(pulled, expected):
     sessions = [d.date() for d in pd.bdate_range("2026-05-01", "2026-11-30")]
     assert mod.price_basis_session(pulled, sessions) == expected
 
@@ -128,7 +138,7 @@ def test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars(
     engine, market, kinds = world
     planned = _planned(_plan(engine, market))
     checked = 0
-    for d in (date(2026, 4, 1), date(2026, 5, 15), date(2026, 6, 22), SHORT_NEXT_MORNING):
+    for d in (date(2026, 4, 1), date(2026, 5, 18), date(2026, 6, 22), SHORT_NEXT_MORNING):
         fresh = s.make_sqlite_engine()
         m.install_yfinance(monkeypatch, m.FakeYF(market, asof=d))
         monkeypatch.setattr(inst, "_new_york_today", lambda d=d: market.next_session(d))
@@ -140,6 +150,41 @@ def test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars(
             assert planned[(sid, d)]["volume"] == writer_row["payload"]["volume"]
             checked += 1
     assert checked == 12
+
+
+def _own_bar_delta(market, d, stored_payload, basis_session):
+    """settled own bar minus the stored one, both priced as of ``basis_session``."""
+    ts = pd.Timestamp(d)
+    if basis_session < d:
+        close = float(market.raw[ts])
+    else:
+        seen = market.view(basis_session)
+        close = float(seen.adj[ts])
+    return close * float(market.vol[ts]) - stored_payload["close"] * stored_payload["volume"]
+
+
+def test_a_same_day_row_changes_by_its_own_bar_only_even_on_an_ex_dividend_date(world):
+    """The other bars of a same-day row were settled; the repair moves the row by its own bar and
+    keeps the dividend basis it was written on (the partner review's ex-dividend case)."""
+    engine, market, kinds = world
+    planned = _planned(_plan(engine, market))
+    checked = 0
+    for (sid, d), item in planned.items():
+        if kinds[d] != "partial_same_day":
+            continue
+        (old,) = m.vintages(engine, sid, d)
+        delta = _own_bar_delta(market, d, old["payload"], date.fromisoformat(item["price_basis_session"]))
+        scale = abs(planned[(sid.rsplit(":", 1)[0] + ":5d", d)]["value"])
+        assert abs(item["value"] - old["value"] - delta) / scale < 1e-12, (sid, d)
+        assert abs(item["stored_bar_residual"]) < 1e-12
+        checked += 1
+    assert checked > 150
+    ex = planned[("ETF_FLOW:SPY:5d", EX_DIVIDEND_OWN_DAY)]
+    assert ex["price_basis_session"] == "2026-05-14"
+    assert ex["close"] == pytest.approx(float(market.raw[pd.Timestamp(EX_DIVIDEND_OWN_DAY)]))
+    next_morning = market.view(EX_DIVIDEND_OWN_DAY)                     # the dividend applied
+    dv = next_morning.adj * next_morning.vol
+    assert not math.isclose(ex["value"], dv.rolling(5).sum()[pd.Timestamp(EX_DIVIDEND_OWN_DAY)], rel_tol=1e-4)
 
 
 def test_the_plan_takes_every_short_row_in_range_and_nothing_else(world):
@@ -156,7 +201,7 @@ def test_the_plan_takes_every_short_row_in_range_and_nothing_else(world):
     assert plan["tickers"]["SPY"]["status"] == "OK"
     every = plan["items"][0]
     assert every["revises_value"] != every["value"] and every["revises_id"]
-    assert plan["digest"] == mod._digest(plan["items"])
+    assert plan["digest"] == mod._digest(plan)
 
 
 def test_recomputing_on_todays_basis_would_also_rewrite_a_correct_row(world, monkeypatch):
@@ -303,10 +348,61 @@ def test_an_edited_plan_or_another_digest_is_refused(world, tmp_path):
     assert mod.load_plan(path, plan["digest"])["run_id"] == plan["run_id"]
     with pytest.raises(mod.Refused, match="expected"):
         mod.load_plan(path, "0" * 64)
-    plan["items"][0]["value"] *= 2
-    path.write_text(json.dumps(plan))
-    with pytest.raises(mod.Refused, match="edited"):
-        mod.load_plan(path)
+    for field, edit in (("items", lambda p: p["items"][0].update(value=p["items"][0]["value"] * 2)),
+                        ("run_id", lambda p: p.update(run_id="etfpb-other")),
+                        ("source_id", lambda p: p.update(source_id=1)),
+                        ("tickers", lambda p: p["tickers"]["SPY"].update(status="OK", planned=0))):
+        edited = json.loads(json.dumps(plan))
+        edit(edited)
+        path.write_text(json.dumps(edited))
+        with pytest.raises(mod.Refused, match="edited"):
+            mod.load_plan(path)
+
+
+def test_apply_refuses_a_plan_in_which_an_etf_was_not_planned(world, monkeypatch, tmp_path):
+    engine, market, _ = world
+    monkeypatch.setattr(inst, "ETF_FLOW_TICKERS", ["SPY", "QQQ"])
+    _seed_history(engine, market, tickers=("QQQ",))
+    path = tmp_path / "plan.json"
+    fake = m.FakeYF(market, fail={"QQQ"})
+    assert mod.main(["plan", "--plan-out", str(path)], yf=fake, engine=engine) == 1
+    digest = json.loads(path.read_text())["digest"]
+    before = m.row_count(engine)
+    assert mod.main(["apply", "--plan", str(path), "--expect-digest", digest], engine=engine) == 2
+    assert m.row_count(engine) == before
+    assert mod.main(["apply", "--plan", str(path), "--expect-digest", digest,
+                     "--allow-incomplete-plan"], engine=engine) == 0
+    with engine.connect() as conn:
+        tickers = {r[0] for r in conn.execute(text(
+            "SELECT DISTINCT series_id FROM raw_series WHERE raw_payload LIKE '%\"repair\"%'"))}
+    assert tickers and all(":SPY:" in t for t in tickers)
+
+
+def test_a_plan_for_another_database_is_refused(world):
+    engine, market, _ = world
+    plan = _plan(engine, market)
+    plan["source_id"] = 99
+    with pytest.raises(mod.Refused, match="source_id"):
+        mod.run_writes(engine, plan, session_day=SESSION_DAY)
+
+
+def test_a_date_stored_twice_is_repaired_once_from_its_newest_vintage(world):
+    """04-06 / 04-08 on production: two rows, milliseconds apart, the same partial value."""
+    engine, market, _ = world
+    d = date(2026, 4, 6)
+    (first,) = m.vintages(engine, "ETF_FLOW:SPY:5d", d)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, pull_status) "
+            "SELECT series_id, source_id, obs_date, pull_timestamp, value, raw_payload, pull_status "
+            "FROM raw_series WHERE obs_date = :d"), {"d": d})
+    plan = _plan(engine, market)
+    item = _planned(plan)[("ETF_FLOW:SPY:5d", d)]
+    assert item["revises_id"] > first["id"]                   # the newer of the two
+    mod.run_writes(engine, plan, session_day=SESSION_DAY)
+    rows = m.vintages(engine, "ETF_FLOW:SPY:5d", d)
+    assert [("repair" in r["payload"]) for r in rows] == [False, False, True]
+    assert mod.verify_plan(engine, plan)["ok"]
 
 
 def test_a_read_for_an_instant_before_the_repair_still_sees_what_was_held_then(world):

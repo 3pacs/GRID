@@ -17,18 +17,33 @@ by yfinance's dividend-adjusted close, and that adjustment moves every past
 close on each dividend. Recomputing on today's basis (the writer's
 ``revise_from``) would also move rows that are correct, by the dividends paid
 since, which for TLT and HYG is as large as many of the volume corrections.
-So for a stored row whose run last saw session ``L``::
 
-    settled(D) = recompute_now(D) * RawClose(L) / AdjClose_now(L)
+The run's dividend state is ``S``, the last session before the New York date
+of the write: the provider applies a dividend to the adjusted history from
+the day after its ex-date, even to a request made after that day's close.
+Each bar ``k`` of the window is priced as that run saw it::
 
-Exact algebra: the adjusted close of bar ``k`` as of ``L`` is
-``AdjClose_now(k) * RawClose(L) / AdjClose_now(L)``, and the 5d, 20d and
-accel values are linear in it. Measured on production 2026-11-27: the formula
-reproduces the 51,678 backfill vintages (dates 2020-01-02..2026-03-26) to
-2.5e-6 of the 5d value at worst, and the 198 revisions the fixed writer wrote
-that day exactly. ``TOLERANCE`` (1e-5) sits above that noise floor.
+    close_S(k) = AdjClose_now(k) * RawClose(S) / AdjClose_now(S)   for k <= S
+    close_S(k) = RawClose(k)                                       for k > S
 
-Every repair row records ``L`` and the two closes used, so the arithmetic
+(the second line is the session the run was trading, on its ex-dividend day
+not yet adjusted), and ``settled(D)`` is the writer's arithmetic on
+``close_S(k) * settled_volume(k)``. Exact algebra: the adjusted close of bar
+``k`` as of ``S`` is the first line, and the 5d, 20d and accel values are
+linear in it. Measured on production 2026-11-27: the formula reproduces the
+51,678 backfill vintages (dates 2020-01-02..2026-03-26) to 2.5e-6 of the 5d
+value at worst, and the 198 revisions the fixed writer wrote that day
+exactly; on the 31 own-day rows written on an ex-dividend date, the 23 whose
+other bars were settled match with ``S`` the day before and none with the day
+itself (found by the partner review). ``TOLERANCE`` (1e-5) sits above that
+noise floor.
+
+So on an ex-dividend date the repaired row keeps the pre-dividend basis it was
+written on: it differs from what a writer running the next morning would
+store by that dividend (0.1 % to 0.7 %). The repair changes the bars that were
+wrong, not the basis.
+
+Every repair row records ``S`` and the two closes used, so the arithmetic
 can be checked later from the row alone.
 
 The series stays on mixed price bases, as it already was: dates before
@@ -39,7 +54,8 @@ invariant), but an ETF with a split in the fetched range is refused anyway.
 
 A date the scheduled writer fails to revise inside its window becomes
 eligible here the day it leaves the window (the default ``--to`` follows the
-window), so no date is left to neither writer.
+window), but only for a plan made after that: a follow-up plan about 15 days
+after a repair shows any date the writer missed.
 
 Modes
 -----
@@ -48,7 +64,9 @@ the provider once per ETF. It writes a plan file: every (series, date) whose
 newest stored vintage differs from its settled value by more than the
 tolerance, with the vintage it revises and the value to write, and a digest.
 
-``apply`` writes exactly the plan's rows, nothing it computes anew. Per
+``apply`` writes exactly the plan's rows, nothing it computes anew, and
+refuses a plan in which an ETF was not planned in full (provider failure,
+split, deadline) unless ``--allow-incomplete-plan`` is given. Per
 series, in one transaction under the ETF flow write lock of GRID #1501
 (``_serialize_etf_write``): the newest stored vintage of each planned date is
 read again; the row is written only when that is still the vintage the plan
@@ -106,7 +124,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from datetime import date, datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -129,11 +147,6 @@ REPAIR_FROM_DEFAULT = date(2026, 3, 27)
 # Relative to the settled 5d value of the same ETF and date (accel can be
 # near zero, so it is measured on the 5d scale too).
 TOLERANCE = 1e-5
-# Both writers ran the settled-bars code (GRID #1496) from 07:10:33Z / 07:10:48Z
-# this day; a row written after this saw no bar for the New York date it was
-# written on.
-SETTLED_WRITER_SINCE = datetime(2026, 11, 27, 7, 10, 0, tzinfo=timezone.utc)
-_MARKET_OPEN = dtime(9, 30)
 # Bars fetched before the first date: the 20-day window and the acceleration
 # need 19 and 9 sessions before it; 90 calendar days hold at least 55.
 FETCH_PAD_DAYS = 90
@@ -201,18 +214,38 @@ def fetch_settled_bars(yf: Any, ticker: str, start: date, session_day: date) -> 
     raise ProviderError(f"{ticker}: {last_exc}")
 
 
-def settled_frame(bars: pd.DataFrame) -> pd.DataFrame:
-    """The three series on today's adjusted basis, and each session's basis factor."""
-    dv = bars["adj_close"] * bars["volume"]
-    out = pd.DataFrame(index=bars.index)
-    out["5d"] = dv.rolling(inst._FLOW_WINDOW_5D, min_periods=inst._FLOW_WINDOW_5D).sum()
-    out["20d"] = dv.rolling(inst._FLOW_WINDOW_20D, min_periods=inst._FLOW_WINDOW_20D).sum()
-    out["accel"] = out["5d"].diff(periods=inst._FLOW_WINDOW_5D)
-    # Multiplying a value on today's basis by this puts it on that session's.
-    out["basis"] = bars["raw_close"] / bars["adj_close"]
-    out["adj_close"] = bars["adj_close"]
-    out["volume"] = bars["volume"]
-    return out
+def window_value(
+    bars: pd.DataFrame, metric: str, d_pos: int, s_pos: int, own_bar: tuple[float, float] | None = None,
+) -> float:
+    """The writer's ``metric`` for the bar at ``d_pos``, priced as of session ``s_pos``.
+
+    ``bars`` is ``fetch_settled_bars``' frame. Each bar is ``close_S(k) x
+    volume(k)`` (see the module docstring). ``own_bar``, a (close, volume)
+    pair, stands in for the bar at ``d_pos`` itself: the stored row's own bar,
+    to see how well the settled bars explain it. NaN when the window reaches
+    before the first fetched bar.
+    """
+    adj = bars["adj_close"].to_numpy()
+    raw = bars["raw_close"].to_numpy()
+    vol = bars["volume"].to_numpy()
+    factor = raw[s_pos] / adj[s_pos]
+
+    def bar(k: int) -> float:
+        if own_bar is not None and k == d_pos:
+            return own_bar[0] * own_bar[1]
+        close = adj[k] * factor if k <= s_pos else raw[k]
+        return close * vol[k]
+
+    def total(end: int, n: int) -> float:
+        if end - n + 1 < 0:
+            return math.nan
+        return sum(bar(k) for k in range(end - n + 1, end + 1))
+
+    if metric == "5d":
+        return total(d_pos, inst._FLOW_WINDOW_5D)
+    if metric == "20d":
+        return total(d_pos, inst._FLOW_WINDOW_20D)
+    return total(d_pos, inst._FLOW_WINDOW_5D) - total(d_pos - inst._FLOW_WINDOW_5D, inst._FLOW_WINDOW_5D)
 
 
 def _as_utc(ts: Any) -> datetime:
@@ -232,22 +265,17 @@ def _as_date(d: Any) -> date:
 
 
 def price_basis_session(pull_ts: Any, sessions: list[date]) -> date | None:
-    """The newest session the run that wrote a row at ``pull_ts`` saw.
+    """``S``: the last session before the New York date of a write at ``pull_ts``.
 
-    Before the market opened, or for the settled-bars writer, that is the
-    last session before the New York date of the write; otherwise the
-    session of that date (the bar then trading). None if no session is that
-    old in ``sessions`` (sorted).
+    The dividend state of the provider's adjusted history at that write. None
+    if ``sessions`` (sorted) has no session that early.
     """
-    ts = _as_utc(pull_ts)
-    ny = ts.astimezone(inst._NEW_YORK)
-    strictly_before = ts >= SETTLED_WRITER_SINCE or ny.time() < _MARKET_OPEN
+    ny_day = _as_utc(pull_ts).astimezone(inst._NEW_YORK).date()
     best = None
     for s in sessions:
-        if s < ny.date() or (s == ny.date() and not strictly_before):
-            best = s
-        else:
+        if s >= ny_day:
             break
+        best = s
     return best
 
 
@@ -321,8 +349,10 @@ def writer_floor(session_day: date) -> date:
 # ── Plan ─────────────────────────────────────────────────────────────────
 
 
-def _digest(items: list[dict]) -> str:
-    blob = json.dumps(items, sort_keys=True, separators=(",", ":")).encode()
+def _digest(plan: dict[str, Any]) -> str:
+    """Over the whole plan except the digest itself: header, ticker report and items."""
+    body = {k: v for k, v in plan.items() if k != "digest"}
+    blob = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(blob).hexdigest()
 
 
@@ -374,43 +404,57 @@ def build_plan(
         if splits:
             tickers_report[ticker] = {"status": "REFUSED", "error": f"split(s) in the fetched range: {splits}"}
             continue
-        calc = settled_frame(bars)
-        sessions = list(calc.index)
+        sessions = list(bars.index)
+        position_of = {d: k for k, d in enumerate(sessions)}
         counts: Counter = Counter()
         for metric in METRICS:
             sid = f"ETF_FLOW:{ticker}:{metric}"
             for (s_sid, obs_date), vint in sorted(stored.items()):
                 if s_sid != sid:
                     continue
-                if obs_date not in calc.index:
+                d_pos = position_of.get(obs_date)
+                if d_pos is None:
                     counts["no_settled_bar"] += 1
                     continue
                 basis_session = price_basis_session(vint["pull_timestamp"], sessions)
-                if basis_session is None or basis_session < obs_date:
-                    counts["basis_unknown"] += 1
+                s_pos = position_of.get(basis_session) if basis_session is not None else None
+                if s_pos is None or s_pos < d_pos - 1:
+                    counts["basis_unknown"] += 1          # written before the session after it
                     continue
-                factor = float(calc.at[basis_session, "basis"])
-                value_now = calc.at[obs_date, metric]
-                scale = calc.at[obs_date, "5d"]
-                if pd.isna(value_now) or pd.isna(scale) or not math.isfinite(factor):
+                value = window_value(bars, metric, d_pos, s_pos)
+                scale = abs(window_value(bars, "5d", d_pos, s_pos))
+                if not math.isfinite(value) or not math.isfinite(scale) or scale == 0:
                     counts["not_computable"] += 1
                     continue
-                value = float(value_now) * factor
-                scale = abs(float(scale) * factor)
-                rel = (value - vint["value"]) / scale if scale else math.inf
+                rel = (value - vint["value"]) / scale
                 if abs(rel) <= TOLERANCE:
                     counts["within_tolerance"] += 1
                     continue
                 old = vint["payload"]
+                own = None
+                try:
+                    own = (float(old["close"]), float(old["volume"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+                explained = (
+                    (window_value(bars, metric, d_pos, s_pos, own) - vint["value"]) / scale
+                    if own is not None else None
+                )
+                close = (float(bars["adj_close"].iat[d_pos]) * float(bars["raw_close"].iat[s_pos])
+                         / float(bars["adj_close"].iat[s_pos])) if d_pos <= s_pos else float(bars["raw_close"].iat[d_pos])
                 items.append({
                     "series_id": sid, "ticker": ticker, "metric": metric,
                     "obs_date": obs_date.isoformat(),
                     "value": value,
-                    "close": float(calc.at[obs_date, "adj_close"]) * factor,
-                    "volume": int(calc.at[obs_date, "volume"]),
+                    "close": close,
+                    "volume": int(bars["volume"].iat[d_pos]),
                     "price_basis_session": basis_session.isoformat(),
-                    "basis_raw_close": float(bars.at[basis_session, "raw_close"]),
-                    "basis_adj_close_now": float(bars.at[basis_session, "adj_close"]),
+                    "basis_raw_close": float(bars["raw_close"].iat[s_pos]),
+                    "basis_adj_close_now": float(bars["adj_close"].iat[s_pos]),
+                    # The stored row against the settled bars with its own bar
+                    # put back: near 0 when only its own bar was wrong; larger
+                    # when other bars of its window were unsettled too.
+                    "stored_bar_residual": explained,
                     "rel_change": rel,
                     "revises_id": vint["id"],
                     "revises_value": vint["value"],
@@ -432,7 +476,7 @@ def build_plan(
     def q(p: float) -> float | None:
         return round(changes[min(len(changes) - 1, int(p * len(changes)))], 6) if changes else None
 
-    return {
+    plan = {
         "kind": RUN_KIND, "run_id": run_id, "planned_at": now.isoformat(),
         "session_day": session_day.isoformat(), "writer_floor": floor.isoformat(),
         "from": from_date.isoformat(), "to": to_date.isoformat(),
@@ -448,19 +492,26 @@ def build_plan(
             "below_settled": sum(1 for i in items if i["value"] > i["revises_value"]),
         },
         "items": items,
-        "digest": _digest(items),
     }
+    plan["digest"] = _digest(plan)
+    return plan
 
 
-def load_plan(path: Path, expect_digest: str | None = None) -> dict[str, Any]:
+def load_plan(
+    path: Path, expect_digest: str | None = None, *, require_complete: bool = False,
+) -> dict[str, Any]:
     plan = json.loads(Path(path).read_text())
     if plan.get("kind") != RUN_KIND:
         raise Refused(f"{path} is not a {RUN_KIND} plan")
-    actual = _digest(plan["items"])
+    actual = _digest(plan)
     if actual != plan.get("digest"):
-        raise Refused(f"{path}: items do not match the plan's digest (edited?)")
+        raise Refused(f"{path}: the plan does not match its digest (edited?)")
     if expect_digest is not None and actual != expect_digest:
         raise Refused(f"{path}: digest {actual} is not the expected {expect_digest}")
+    incomplete = {t: r.get("status") for t, r in plan.get("tickers", {}).items() if r.get("status") != "OK"}
+    if require_complete and incomplete:
+        raise Refused(f"{path}: not every ETF was planned ({incomplete}); make a new plan, "
+                      "or pass --allow-incomplete-plan to repair only the others")
     return plan
 
 
@@ -676,6 +727,8 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
         w.add_argument("--deadline-minutes", type=float, default=DEFAULT_DEADLINE_MIN)
         if name == "apply":
             w.add_argument("--expect-digest", required=True)
+            w.add_argument("--allow-incomplete-plan", action="store_true",
+                           help="apply a plan in which some ETF was not planned (they stay unrepaired)")
         else:
             w.add_argument("--apply", action="store_true", help="write; without it, only count")
     v = sub.add_parser("verify")
@@ -710,7 +763,8 @@ def main(argv: list[str] | None = None, *, yf: Any = None, engine: Engine | None
             result = verify_plan(engine, plan)
             print("VERIFY " + json.dumps(result, sort_keys=True))
             return _EXIT_OK if result["ok"] else _EXIT_FAILED
-        plan = load_plan(args.plan, getattr(args, "expect_digest", None))
+        plan = load_plan(args.plan, getattr(args, "expect_digest", None),
+                         require_complete=args.mode == "apply" and not args.allow_incomplete_plan)
         progress = args.plan.with_suffix(f".{args.mode}.progress.jsonl")
         if args.mode == "undo" and not args.apply:
             result = verify_plan(engine, plan)

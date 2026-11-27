@@ -84,7 +84,7 @@ def pg(market):
     for d in market.sessions:
         if FROM <= d <= date(2026, 7, 2):
             price = float(market.raw[pd.Timestamp(d)]) * 1.01
-            m.seed_row(first, "SPY", d, m.old_writer_values(market, d, (0.3, price)), m.ny(d, 14, 30))
+            m.seed_row(first, "SPY", d, m.old_writer_values(market, d, (0.3, price), seen_on=d), m.ny(d, 14, 30))
     yield _engine
     for engine in engines:
         engine.dispose()
@@ -118,14 +118,24 @@ def _broken_chains(engine) -> list[tuple]:
     return broken
 
 
+MEET_SERIES = "ETF_FLOW:SPY:5d"
+
+
 def _meet_after_first_read(monkeypatch, barrier: threading.Barrier) -> None:
-    """Each thread, at its first read of stored values, waits for the other (or 1.5 s)."""
+    """Each thread, at its first read of ``MEET_SERIES``, waits for the other (or 1.5 s).
+
+    One series for both, so without the lock the two reads of it overlap
+    every time; with it, the second read waits for the first writer's commit.
+    """
     paused = threading.local()
+
+    def _reads_meet_series(a) -> bool:
+        return any(x == MEET_SERIES or (isinstance(x, list) and MEET_SERIES in x) for x in a)
 
     def _wrap(real):
         def _inner(*a, **kw):
             out = real(*a, **kw)
-            if not getattr(paused, "done", False):
+            if _reads_meet_series(a) and not getattr(paused, "done", False):
                 paused.done = True
                 try:
                     barrier.wait()

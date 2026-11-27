@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import types
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -41,8 +41,16 @@ class Market:
     def next_session(self, d: date) -> date:
         return next(s for s in self.sessions if s > d)
 
-    def view(self, asof: date, partial: tuple[float, float] | None = None) -> pd.DataFrame:
-        """Bars to ``asof`` as the provider served them then."""
+    def view(self, asof: date, partial: tuple[float, float] | None = None,
+             seen_on: date | None = None) -> pd.DataFrame:
+        """Bars to ``asof`` as the provider served them on New York date ``seen_on``.
+
+        A dividend is in the adjusted history from the day after its ex-date
+        (as yfinance served it on production), so a request on the ex-date
+        itself, during or after the session, gets the closes before it
+        unadjusted by it. ``seen_on`` defaults to the day after ``asof``.
+        """
+        seen_on = seen_on or asof + timedelta(days=1)
         raw = self.raw[self.raw.index <= pd.Timestamp(asof)].copy()
         vol = self.vol[self.vol.index <= pd.Timestamp(asof)].copy()
         if partial is not None:
@@ -53,7 +61,7 @@ class Market:
         divs = pd.Series(0.0, index=raw.index)
         for ex, amount in self.dividends.items():
             ex_ts = pd.Timestamp(ex)
-            if ex_ts > pd.Timestamp(asof) or ex_ts not in raw.index:
+            if ex_ts > pd.Timestamp(asof) or ex_ts >= pd.Timestamp(seen_on) or ex_ts not in raw.index:
                 continue
             prev = raw[raw.index < ex_ts].iloc[-1]
             factor[factor.index < ex_ts] *= 1 - amount / prev
@@ -92,9 +100,10 @@ def install_yfinance(monkeypatch, fake: FakeYF) -> None:
     monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=fake.download))
 
 
-def old_writer_values(market: Market, d: date, partial: tuple[float, float] | None) -> dict[str, Any]:
-    """What the pre-#1496 writer stored for ``d`` from the provider's view of ``d``."""
-    v = market.view(d, partial)
+def old_writer_values(market: Market, d: date, partial: tuple[float, float] | None,
+                      seen_on: date | None = None) -> dict[str, Any]:
+    """What the pre-#1496 writer stored for ``d`` from the provider's view of ``d`` on ``seen_on``."""
+    v = market.view(d, partial, seen_on)
     dv = v.adj * v.vol
     f5 = dv.rolling(5).sum()
     f20 = dv.rolling(20).sum()
