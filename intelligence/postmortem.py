@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections import Counter
+from itertools import zip_longest
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -673,10 +675,54 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
 
 # ── 3. Batch Post-Mortem ──────────────────────────────────────────────────
 
+_WAITING_COUNT_BOUND = 1000
+
+
+_WAITING_COUNT_TIMEOUT_S = 3
+
+
+def _count_waiting(
+    engine: Engine,
+    selections: dict[str, str],
+    params: dict[str, Any],
+    finish_by: float | None = None,
+) -> str:
+    """"trades=N, predictions=M" still eligible, each counted up to ``_WAITING_COUNT_BOUND`` ("1000+").
+
+    Diagnostics must never push the batch past its own time budget: a source is not counted when fewer than
+    ``_WAITING_COUNT_TIMEOUT_S + 1`` seconds remain before ``finish_by`` ("skipped"), and every count runs under
+    a ``_WAITING_COUNT_TIMEOUT_S`` statement timeout. Never raises: a failed count reads "unknown".
+    """
+    cutoff_params = {"cutoff": params["cutoff"]}
+    parts: list[str] = []
+    for name, base_sql in selections.items():
+        if finish_by is not None and time.monotonic() + _WAITING_COUNT_TIMEOUT_S + 1 > finish_by:
+            parts.append(f"{name}=skipped (no time left)")
+            continue
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SET LOCAL statement_timeout = '" + str(_WAITING_COUNT_TIMEOUT_S * 1000) + "ms'"))
+                n = conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM (" + base_sql + "\n        LIMIT "
+                        + str(_WAITING_COUNT_BOUND + 1) + ") AS waiting"
+                    ),
+                    cutoff_params,
+                ).scalar()
+            n = int(n)
+            parts.append(f"{name}={_WAITING_COUNT_BOUND}+" if n > _WAITING_COUNT_BOUND else f"{name}={n}")
+        except Exception as exc:
+            log.debug("Post-mortem: waiting count for {k} failed: {e}", k=name, e=str(exc))
+            parts.append(f"{name}=unknown")
+    return ", ".join(parts)
+
+
 def batch_postmortem(
     engine: Engine,
     days: int = 30,
     limit: int | None = None,
+    deadline: float | None = None,
+    finish_by: float | None = None,
 ) -> list[PostMortem]:
     """Generate post-mortems for all failed trades and predictions in the last N days.
 
@@ -697,6 +743,15 @@ def batch_postmortem(
             minutes on the live corpus (2026-05-16 audit observed 256
             new rows in 30 min on the LLM-narrative path). Cron-friendly
             pattern: schedule every 15 min with ``limit=20``.
+
+    deadline: ``time.monotonic()`` value after which no NEW row is started (a row already running
+        finishes). The caller picks it so the batch ends inside its own time budget: rows left over are
+        simply picked up by the next run (the ``NOT IN trade_postmortems`` selection), and the batch
+        completes and reports on time instead of being abandoned by its wrapper and finishing late.
+    finish_by: ``time.monotonic()`` value by which the whole call must return (the wrapper's own limit minus a
+        guard). The "still waiting" diagnostics run only if they fit before it, so they can never push the
+        batch past its budget. Trades and predictions are served alternately, so a long trade queue cannot
+        consume the window before predictions start.
 
     Returns:
         list of PostMortem objects.
@@ -730,6 +785,8 @@ def batch_postmortem(
         ORDER BY scored_at DESC
     """
     params: dict[str, Any] = {"cutoff": cutoff}
+    # The same selections without the batch LIMIT, for the bounded "how many are still waiting" count below.
+    remaining_sql = {"trades": trade_sql, "predictions": pred_sql}
     if limit is not None and int(limit) > 0:
         trade_sql += "\n        LIMIT :lim"
         pred_sql += "\n        LIMIT :lim"
@@ -740,33 +797,56 @@ def batch_postmortem(
         trade_rows = conn.execute(text(trade_sql), params).fetchall()
         pred_rows = conn.execute(text(pred_sql), params).fetchall()
 
-    # Generate trade post-mortems
-    for (trade_id,) in trade_rows:
-        try:
-            pm = generate_postmortem(engine, trade_id)
-            if pm:
-                postmortems.append(pm)
-        except Exception as exc:
-            log.warning("Post-mortem failed for trade {id}: {e}", id=trade_id, e=str(exc))
+    stopped_at_deadline = False
 
-    # Generate prediction post-mortems
-    for (pred_id,) in pred_rows:
-        try:
-            pm = generate_prediction_postmortem(engine, pred_id)
-            if pm:
-                postmortems.append(pm)
-        except Exception as exc:
-            log.warning("Post-mortem failed for prediction {id}: {e}", id=pred_id, e=str(exc))
+    def _past_deadline() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    # Trades and predictions alternate: a long queue of one source cannot consume the whole window before
+    # the other starts (a fixed trades-then-predictions order starved predictions under a deadline).
+    for trade_row, pred_row in zip_longest(trade_rows, pred_rows):
+        if trade_row is not None:
+            if _past_deadline():
+                stopped_at_deadline = True
+                break
+            (trade_id,) = trade_row
+            try:
+                pm = generate_postmortem(engine, trade_id)
+                if pm:
+                    postmortems.append(pm)
+            except Exception as exc:
+                log.warning("Post-mortem failed for trade {id}: {e}", id=trade_id, e=str(exc))
+        if pred_row is not None:
+            if _past_deadline():
+                stopped_at_deadline = True
+                break
+            (pred_id,) = pred_row
+            try:
+                pm = generate_prediction_postmortem(engine, pred_id)
+                if pm:
+                    postmortems.append(pm)
+            except Exception as exc:
+                log.warning("Post-mortem failed for prediction {id}: {e}", id=pred_id, e=str(exc))
 
     # Aggregate patterns
     if postmortems:
         _log_aggregate_patterns(postmortems, days)
 
+    # How many eligible rows are STILL waiting after this run, counted up to a bound (an unbounded NOT IN
+    # count over the whole corpus is not something a nightly step should run). A batch that processes fewer
+    # rows than arrive falls behind; this makes that visible in the log instead of silent.
+    waiting = _count_waiting(engine, remaining_sql, params, finish_by)
+
     log.info(
         "Batch post-mortem complete: {n} failures analysed over {d} days"
-        "{lim_note}",
+        "{lim_note}{dl_note}; still waiting after this run: {w}",
         n=len(postmortems), d=days,
+        w=waiting,
         lim_note=f" (limit={limit} per source)" if limit else "",
+        dl_note=(
+            " (stopped at its deadline; the remaining rows are picked up by the next run)"
+            if stopped_at_deadline else ""
+        ),
     )
     return postmortems
 
