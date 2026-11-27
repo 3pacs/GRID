@@ -232,6 +232,10 @@ def test_apply_appends_the_planned_rows_and_keeps_every_old_one(world):
     assert new["payload"]["repair"]["run_id"] == plan["run_id"]
     assert new["payload"]["repair"]["revises_id"] == old["id"]
     assert new["payload"]["repair"]["plan_digest"] == plan["digest"]
+    mark = new["payload"]["repair"]
+    basis_day = pd.Timestamp(mark["price_basis_session"])
+    assert mark["basis_raw_close"] == pytest.approx(float(market.raw[basis_day]))
+    assert mark["basis_adj_close_now"] == pytest.approx(float(market.view(market.sessions[-1]).adj[basis_day]))
     assert mod.verify_plan(engine, plan) == {"run_id": plan["run_id"], "planned": len(plan["items"]),
                                              "applied": len(plan["items"]), "problems": [], "ok": True}
 

@@ -28,6 +28,19 @@ reproduces the 51,678 backfill vintages (dates 2020-01-02..2026-03-26) to
 2.5e-6 of the 5d value at worst, and the 198 revisions the fixed writer wrote
 that day exactly. ``TOLERANCE`` (1e-5) sits above that noise floor.
 
+Every repair row records ``L`` and the two closes used, so the arithmetic
+can be checked later from the row alone.
+
+The series stays on mixed price bases, as it already was: dates before
+2026-03-27 on the basis of their 2026-03-28 backfill, repaired dates on their
+own day's, and dates the scheduled writer revises on the basis of its last
+run inside its 14-day window. Splits do not enter (dollar volume is split
+invariant), but an ETF with a split in the fetched range is refused anyway.
+
+A date the scheduled writer fails to revise inside its window becomes
+eligible here the day it leaves the window (the default ``--to`` follows the
+window), so no date is left to neither writer.
+
 Modes
 -----
 ``plan`` reads only: the database in a read-only transaction,
@@ -396,6 +409,8 @@ def build_plan(
                     "close": float(calc.at[obs_date, "adj_close"]) * factor,
                     "volume": int(calc.at[obs_date, "volume"]),
                     "price_basis_session": basis_session.isoformat(),
+                    "basis_raw_close": float(bars.at[basis_session, "raw_close"]),
+                    "basis_adj_close_now": float(bars.at[basis_session, "adj_close"]),
                     "rel_change": rel,
                     "revises_id": vint["id"],
                     "revises_value": vint["value"],
@@ -457,7 +472,9 @@ def _repair_marker(plan: dict, item: dict) -> dict[str, Any]:
         "run_id": plan["run_id"], "kind": RUN_KIND, "plan_digest": plan["digest"],
         "revises_id": item["revises_id"], "revises_pull_timestamp": item["revises_pull_timestamp"],
         "revises_volume": item["revises_volume"], "revises_close": item["revises_close"],
-        "price_basis_session": item["price_basis_session"], "fetched_at": item["fetched_at"],
+        "price_basis_session": item["price_basis_session"],
+        "basis_raw_close": item["basis_raw_close"], "basis_adj_close_now": item["basis_adj_close_now"],
+        "fetched_at": item["fetched_at"],
     }
 
 
