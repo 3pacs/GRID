@@ -2051,7 +2051,10 @@ def _persist_flows(
 
     A flow that breaks its source's stored-row contract
     (``STORED_ROW_CONTRACTS``) is not inserted; it is counted per source type
-    in ``rejected_counts`` when given.
+    in ``rejected_counts`` when given. The window's DELETE still applies, so a
+    writer regression that emits only breaking flows of one source leaves no
+    rows of that source in the window: nothing wrong is stored, and the
+    runner exits 3 naming the refusals.
 
     A database error on an insert is raised, never swallowed: on PostgreSQL
     the failed statement aborts the transaction, so every later insert and

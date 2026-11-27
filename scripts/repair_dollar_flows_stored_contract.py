@@ -21,15 +21,21 @@ This script is the only way such rows are removed. Every step is explicit:
     for column. Deletes by the manifest's explicit id list, refuses unless
     exactly N rows were deleted and none that break a contract remain, then
     commits. Afterwards validates a NOT VALID ``dollar_flows_13f_observed_only``
-    constraint. ``--dry-run`` does every check and the delete, then rolls back.
+    constraint in its own transaction; if that cannot get its lock the rows are
+    still deleted, the report says ``"constraint": "not_valid"`` with the error
+    and the statement to run, and the exit status is 4. ``--dry-run`` does
+    every check and the delete, then rolls back.
 
 ``restore --manifest FILE --expect-sha256 H [--dry-run]``
     One transaction. Re-inserts the manifest's rows with their original ids
     and ``created_at``; refuses if any id exists. While the constraint exists
     PostgreSQL rejects these rows, so restore refuses up front and prints the
-    statement that drops it (a schema change: the operator's decision).
+    statement that drops it (a schema change: the operator's decision). The
+    database keeps its alembic version, so no later ``alembic upgrade`` puts the
+    constraint back; the report prints the statement that re-adds it NOT VALID.
 
-Exit status: 0 done, 2 refused (nothing written).
+Exit status: 0 done, 2 refused (nothing written), 4 rows deleted but the
+constraint is still NOT VALID (run the printed VALIDATE statement).
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ if str(_ROOT) not in sys.path:
 
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
+from sqlalchemy.exc import DBAPIError  # noqa: E402
 
 from intelligence.dollar_flows import (  # noqa: E402
     DOLLAR_FLOWS_CONTRACT_CHECK_SQL,
@@ -61,6 +68,16 @@ MANIFEST_VERSION = 1
 _COLUMNS = (
     "id", "source_type", "actor_name", "ticker", "amount_usd", "direction",
     "confidence", "evidence", "flow_date", "created_at",
+)
+
+
+EXIT_REFUSED = 2
+EXIT_VALIDATE_PENDING = 4
+VALIDATE_SQL = f"ALTER TABLE dollar_flows VALIDATE CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}"
+DROP_SQL = f"ALTER TABLE dollar_flows DROP CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}"
+READD_SQL = (
+    f"ALTER TABLE dollar_flows ADD CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT} "
+    f"CHECK {DOLLAR_FLOWS_CONTRACT_CHECK_SQL} NOT VALID"
 )
 
 
@@ -222,16 +239,28 @@ def apply(engine: Engine, man: dict[str, Any], *, expect_count: int, dry_run: bo
         "ids": ids,
     }
     if not dry_run:
-        with engine.begin() as conn:
-            conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-            state = _constraint_state(conn)
-            if state is False:
-                conn.execute(
-                    text(f"ALTER TABLE dollar_flows VALIDATE CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}")
-                )
+        try:
+            state = _validate_constraint(engine)
+        except DBAPIError as exc:
+            # The delete has committed; only the validation is outstanding.
+            with engine.connect() as conn:
                 state = _constraint_state(conn)
+            report["validate_error"] = str(exc.orig if getattr(exc, "orig", None) else exc).strip()
         report["constraint"] = "absent" if state is None else ("validated" if state else "not_valid")
+        if state is False:
+            report["next"] = VALIDATE_SQL
     return report
+
+
+def _validate_constraint(engine: Engine) -> bool | None:
+    """Validate a NOT VALID constraint in its own transaction; return its state."""
+    with engine.begin() as conn:
+        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+        state = _constraint_state(conn)
+        if state is False:
+            conn.execute(text(VALIDATE_SQL))
+            state = _constraint_state(conn)
+    return state
 
 
 def restore(engine: Engine, man: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
@@ -243,8 +272,7 @@ def restore(engine: Engine, man: dict[str, Any], *, dry_run: bool) -> dict[str, 
             if _constraint_state(conn) is not None:
                 raise Refused(
                     f"constraint {DOLLAR_FLOWS_CONTRACT_CONSTRAINT} rejects these rows; restoring "
-                    "them needs it dropped first (a schema change): ALTER TABLE dollar_flows "
-                    f"DROP CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}"
+                    f"them needs it dropped first (a schema change): {DROP_SQL}"
                 )
             present = conn.execute(
                 text("SELECT id FROM dollar_flows WHERE id = ANY(:ids) ORDER BY id"),
@@ -280,7 +308,14 @@ def restore(engine: Engine, man: dict[str, Any], *, dry_run: bool) -> dict[str, 
             if trans.is_active:
                 trans.rollback()
             raise
-    return {"action": "restore", "dry_run": dry_run, "restored": len(rows), "rows_sha256": rows_sha256(back)}
+    return {
+        "action": "restore",
+        "dry_run": dry_run,
+        "restored": len(rows),
+        "rows_sha256": rows_sha256(back),
+        # alembic still records the revision, so nothing re-adds the constraint by itself.
+        "re_add_constraint": READD_SQL,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -320,8 +355,10 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
             report = restore(engine, load_manifest(args.manifest, args.expect_sha256), dry_run=args.dry_run)
     except Refused as exc:
         print(json.dumps({"action": args.cmd, "refused": str(exc)}, sort_keys=True))
-        return 2
+        return EXIT_REFUSED
     print(json.dumps(report, sort_keys=True))
+    if args.cmd == "apply" and not args.dry_run and report.get("constraint") == "not_valid":
+        return EXIT_VALIDATE_PENDING
     return 0
 
 

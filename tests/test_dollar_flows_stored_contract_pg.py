@@ -343,6 +343,66 @@ def test_repair_export_dry_run_apply_restore_round_trip(pg, tmp_path, capsys):
         assert repair._read_violations(conn) == man["rows"]
     # A second restore refuses: the ids exist.
     assert repair.main(restore, engine=pg) == 2
+    capsys.readouterr()
+
+
+def test_after_restore_nothing_re_adds_the_constraint_but_the_printed_statement_does(pg, tmp_path, capsys):
+    """alembic still records the revision after a restore, so no upgrade puts the
+    constraint back; the report's statement re-adds it NOT VALID over the rows."""
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+    ids = _seed_production_shape(pg)
+    _migrate(pg)
+    path, rep = _export(pg, tmp_path, capsys)
+    n, sha = len(ids["legacy"]), rep["rows_sha256"]
+    assert repair.main(["apply", "--manifest", str(path), "--expect-count", str(n), "--expect-sha256", sha],
+                       engine=pg) == 0
+    capsys.readouterr()
+    with pg.begin() as conn:
+        conn.execute(text(repair.DROP_SQL))
+    assert repair.main(["restore", "--manifest", str(path), "--expect-sha256", sha], engine=pg) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["re_add_constraint"] == repair.READD_SQL
+    assert _constraint(pg) is None
+    with pg.begin() as conn:
+        conn.execute(text(out["re_add_constraint"]))
+    assert _constraint(pg) is False
+    with pg.connect() as conn:
+        assert dollar_flows.count_stored_contract_violations(conn) == {"13f": n}
+    with pytest.raises(IntegrityError):
+        with pg.begin() as conn:
+            _insert(conn, source_type="13f", direction="inflow", flow_date=YESTERDAY, ticker="")
+
+
+def test_apply_reports_a_pending_validation_and_exits_4(pg, tmp_path, capsys, monkeypatch):
+    """The delete commits first; if the separate VALIDATE cannot get its lock,
+    the report says so, names the statement, and the exit status is 4."""
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+    ids = _seed_production_shape(pg)
+    _migrate(pg)
+    path, rep = _export(pg, tmp_path, capsys)
+
+    def busy(engine):
+        with engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '1ms'"))
+            conn.execute(text("SELECT pg_advisory_xact_lock(1)"))  # keep the transaction real
+            raise OperationalError("ALTER TABLE ... VALIDATE", {}, Exception("canceling statement due to lock timeout"))
+
+    monkeypatch.setattr(repair, "_validate_constraint", busy)
+    rc = repair.main(["apply", "--manifest", str(path), "--expect-count", str(len(ids["legacy"])),
+                      "--expect-sha256", rep["rows_sha256"]], engine=pg)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == repair.EXIT_VALIDATE_PENDING == 4
+    assert out["deleted"] == len(ids["legacy"])
+    assert out["constraint"] == "not_valid"
+    assert "lock timeout" in out["validate_error"]
+    assert out["next"] == repair.VALIDATE_SQL
+    assert _ids(pg) == ids["keep"]
+    monkeypatch.undo()
+    with pg.begin() as conn:
+        conn.execute(text(out["next"]))
+    assert _constraint(pg) is True
 
 
 @pytest.mark.parametrize("change", ["new_violation", "row_changed", "row_gone"])
