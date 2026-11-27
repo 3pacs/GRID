@@ -21,10 +21,9 @@ The real writer and readers run against the fake EDGAR of
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 
 import pytest
-from sqlalchemy import text
 
 from ingestion.altdata import institutional_flows as inst
 from ingestion.smart_scheduler import _classify_outcome
@@ -48,42 +47,12 @@ def engine():
     return s.make_sqlite_engine()
 
 
-def _three_quarters(current_declares_omissions: bool, prior_declares_omissions: bool = False) -> s.FakeEdgar:
-    """Alpha: Q-2 holds PEER_A; Q-1 adds PEER_B (so PEER_B is an observed
-    holding); Q0 lists PEER_A (increased) and ROOT (new) and not PEER_B."""
-    edgar = s.FakeEdgar()
-    dates = {q: s.quarter_dates(q) for q in range(3)}
-    edgar.add(s.CIK_ALPHA, s.Filing("A-2", dates[2][1], dates[2][0], {
-        s.PEER_A_CUSIP: ("PEER A CORP", 50_000, 500)}))
-    edgar.add(s.CIK_ALPHA, s.Filing("A-1", dates[1][1], dates[1][0], {
-        s.PEER_A_CUSIP: ("PEER A CORP", 50_000, 500),
-        s.PEER_B_CUSIP: ("PEER B INC", 30_000, 300)}, confidential_omitted=prior_declares_omissions))
-    edgar.add(s.CIK_ALPHA, s.Filing("A-0", dates[0][1], dates[0][0], {
-        s.PEER_A_CUSIP: ("PEER A CORP", 120_000, 1_000),
-        s.ROOT_CUSIP: ("ROOT HOLDINGS INC", 260_000, 2_000)}, confidential_omitted=current_declares_omissions))
-    return edgar
+_three_quarters = s.three_quarter_scenario
+_age_rows = s.age_13f_rows
 
 
 def _run_both_quarters(engine, monkeypatch, edgar) -> list[dict]:
-    """Q-2 -> Q-1 on Q-1's filing day, then Q-1 -> Q0 today. Returns the second run."""
-    edgar.today = s.quarter_dates(1)[1]
-    s.run_writer(engine, monkeypatch, edgar, ALPHA_ONLY)
-    _age_rows(engine)
-    edgar.today = date.today()
-    return s.run_writer(engine, monkeypatch, edgar, ALPHA_ONLY)
-
-
-def _age_rows(engine, days: int = 2) -> None:
-    """Make stored 13F rows clearly older than the next run's (SQLite's
-    CURRENT_TIMESTAMP has one-second resolution)."""
-    base = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) - timedelta(days=days)
-    with engine.begin() as conn:
-        ids = [r[0] for r in conn.execute(text(
-            "SELECT id FROM raw_series WHERE series_id LIKE '13F%' AND pull_timestamp > :b ORDER BY id"),
-            {"b": base})]
-        for n, row_id in enumerate(ids):
-            conn.execute(text("UPDATE raw_series SET pull_timestamp = :ts WHERE id = :id"),
-                         {"ts": base + timedelta(seconds=n), "id": row_id})
+    return s.run_two_quarters(engine, monkeypatch, edgar, ALPHA_ONLY)
 
 
 def _q0_rows(engine) -> dict[str, dict]:
@@ -224,18 +193,10 @@ def test_the_position_was_shown_before_the_filing_that_omits_it(engine, monkeypa
 def _closed_then_not_shown(engine, monkeypatch) -> None:
     """The stored state production has today: the old writer ignored the cover
     page and wrote CLOSED; the new writer then reads the same filings."""
-    edgar = _three_quarters(current_declares_omissions=True)
-    real = inst.InstitutionalFlowsPuller._compare_holdings
-
-    def ignoring_the_cover(self, prev, curr, *, quarantine_counts=None, current_declares_omissions=False):
-        return real(self, prev, curr, quarantine_counts=quarantine_counts)
-
-    with monkeypatch.context() as old_writer:
-        old_writer.setattr(inst.InstitutionalFlowsPuller, "_compare_holdings", ignoring_the_cover)
-        _run_both_quarters(engine, old_writer, edgar)
+    s.old_writer_state(engine, monkeypatch, ALPHA_ONLY)
     assert f"13F:{s.CIK_ALPHA}:{s.PEER_B_CUSIP}:CLOSED" in _q0_rows(engine)
     _age_rows(engine)
-    s.run_writer(engine, monkeypatch, edgar, ALPHA_ONLY)
+    s.run_writer(engine, monkeypatch, s.three_quarter_scenario(True), ALPHA_ONLY)
 
 
 def test_a_later_not_shown_outranks_the_closed_row_the_old_writer_left_in_the_reader(engine, monkeypatch):

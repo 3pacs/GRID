@@ -577,3 +577,74 @@ def test_overlapping_writers_with_different_payloads_store_both_in_commit_order(
     assert [float(v) for (v,) in root] == [260_000.0, 280_000.0]      # both kept; the later commit is newest
     assert copies == 1                                                # every unchanged series once
     assert _count(pg_engine, "13F-FILING:%") == 2
+
+
+# ── Actor metrics count a corrected position once (GRID #1498) ─────────────
+#
+# Codex review 6084681196: the correction is append-only. A position the old
+# writer left as CLOSED gets a NOT_SHOWN row beside it for the same day, and
+# intelligence/actor_discovery counted every raw 13F row and summed every
+# value, so the same position became two events and twice the dollars.
+
+def _raw_13f_metrics(engine) -> tuple[int, float]:
+    with engine.connect() as conn:
+        n, total = conn.execute(text(
+            "SELECT COUNT(*), SUM(value) FROM raw_series WHERE series_id LIKE '13F:%' "
+            "AND pull_status = 'SUCCESS'")).one()
+    return int(n), float(total)
+
+
+def _actor_metrics(engine) -> tuple[int, int, float]:
+    from intelligence import actor_discovery
+
+    with engine.connect() as conn:
+        ((cik, tickers, filings, total),) = actor_discovery._13f_filer_aggregates(conn)
+    assert cik == s.CIK_ALPHA
+    return int(tickers), int(filings), float(total)
+
+
+def test_actor_metrics_do_not_grow_when_a_closed_row_is_corrected_to_not_shown(pg_engine, monkeypatch):
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    s.old_writer_state(pg_engine, monkeypatch, filers)                  # what production holds today
+    raw_before, metrics_before = _raw_13f_metrics(pg_engine), _actor_metrics(pg_engine)
+    assert metrics_before[1:] == raw_before                             # one row per position-day so far
+
+    s.age_13f_rows(pg_engine)
+    s.run_writer(pg_engine, monkeypatch, s.three_quarter_scenario(True), filers)
+
+    series = [sid for sid, _p in s.series_rows(pg_engine, "13F:%")]
+    closed = f"13F:{s.CIK_ALPHA}:{s.PEER_B_CUSIP}:CLOSED"
+    not_shown = f"13F:{s.CIK_ALPHA}:{s.PEER_B_CUSIP}:NOT_SHOWN"
+    assert closed in series and not_shown in series                     # the legacy row is kept
+    raw_after = _raw_13f_metrics(pg_engine)
+    assert raw_after == (raw_before[0] + 1, raw_before[1] + 30_000.0)   # what counting raw rows would report
+    assert _actor_metrics(pg_engine) == metrics_before                  # the position is still one event
+
+
+def test_actor_metrics_take_the_newest_vintage_of_a_position_day(pg_engine, monkeypatch):
+    """Any correction, not only NOT_SHOWN: a re-read whose value changed
+    appends a second vintage of the same series and date."""
+    edgar = s.two_quarter_scenario()
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    s.run_writer(pg_engine, monkeypatch, edgar, filers)
+    tickers, filings, total = _actor_metrics(pg_engine)
+    s.age_13f_rows(pg_engine)
+
+    edgar.filings[s.CIK_ALPHA][1].holdings[s.ROOT_CUSIP] = ("ROOT HOLDINGS INC", 280_000, 2_000)
+    s.run_writer(pg_engine, monkeypatch, edgar, filers)
+
+    assert _raw_13f_metrics(pg_engine)[0] == filings + 1                # two vintages of ROOT's NEW row
+    assert _actor_metrics(pg_engine) == (tickers, filings, total + 20_000.0)   # counted once, at 280,000
+
+
+def test_actor_metrics_ignore_a_quarantined_vintage(pg_engine, monkeypatch):
+    filers = {s.CIK_ALPHA: s.ALPHA}
+    s.run_writer(pg_engine, monkeypatch, s.two_quarter_scenario(), filers)
+    before = _actor_metrics(pg_engine)
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+            "SELECT series_id, source_id, obs_date, value * 10, raw_payload, 'QUARANTINED' "
+            "FROM raw_series WHERE series_id LIKE :p"), {"p": f"13F:{s.CIK_ALPHA}:{s.ROOT_CUSIP}:%"})
+
+    assert _actor_metrics(pg_engine) == before
