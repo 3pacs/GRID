@@ -622,9 +622,20 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
                     "Oracle forward pass: every captured ticker abstained ({t}); reasons: {r}",
                     t=",".join(captured), r=outcome["abstention_reasons"],
                 )
+            elif outcome["no_result"]:
+                log.error(
+                    "Oracle forward pass: no captured ticker ({t}) has a forecast or a candidate",
+                    t=",".join(captured),
+                )
+            # "completed" and "partial" mean at least one captured ticker holds a
+            # forecast (stored now or repeated from earlier today). A pass that
+            # left every captured ticker without one says so, whatever was
+            # captured: "all_abstained" when some abstained, "no_result" when
+            # none even had a candidate.
             result = {
                 **policy,
                 "status": ("all_abstained" if outcome["all_abstained"]
+                           else "no_result" if outcome["no_result"]
                            else "partial" if len(captured) < len(ORACLE_FORWARD_TICKERS)
                            or counts.get("failed_tickers", 0) else "completed"),
                 "tickers_with_forecast": outcome["tickers_with_forecast"],
@@ -662,56 +673,34 @@ def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]
             lease.commit()
 
 
-#: Consecutive passes that ended without a capture or a result before the
-#: operator is told. One such pass is a provider hiccup; "every ticker
-#: abstained" is a refused quote and alerts on the first pass.
-ORACLE_FORWARD_BARREN_PASSES_BEFORE_ALERT = 2
-
-
 def _oracle_forward_alert(engine: Any, state: Any, result: Any, now: datetime) -> bool:
     """Tell the operator, once per session, that the forward pass has no usable forecast.
 
     Until 2026-11-27 a pass in which all 610 candidates abstained reported
-    "completed" and the only signal was the report e-mail not arriving. Sends
-    through ``alerts.email.send_alert``; the body is built from the durable
-    record (``oracle.forward_health``), so it says what the Oracle page says.
-    Returns True when an alert was sent. A deferred pass is not a pass.
+    "completed" and the only signal was the report e-mail not arriving.
+
+    Nothing here is remembered in the operator's memory. Whether an alert is
+    due is read from the durable record (``oracle.forward_alert.alert_due``:
+    at once when every candidate abstained, after two attempts that stored
+    nothing), and whether it was already sent is one marker row per session
+    that the daily sweep shares (``send_session_alert``). A restarted
+    operator therefore neither forgets a pass nor repeats an alert. Returns
+    True when this call sent it. A deferred pass is not a pass, and a pass
+    that left a ticker with a forecast has nothing to report.
     """
     status = (result or {}).get("status")
-    if status in {None, "deferred"}:
+    if status in {None, "deferred", "completed", "partial"}:
         return False
-    from zoneinfo import ZoneInfo
-
-    session = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
-    book = getattr(state, "oracle_forward_alerts", None)
-    if not isinstance(book, dict) or book.get("session") != session:
-        book = {"session": session, "barren_passes": 0, "sent": False}
-        state.oracle_forward_alerts = book
-    if status in {"completed", "partial"}:
-        book["barren_passes"] = 0
-        return False
-    if status == "all_abstained":
-        due = True
-    else:  # "abstained" (no fresh capture) or "failed" (timeout or error)
-        book["barren_passes"] += 1
-        due = book["barren_passes"] >= ORACLE_FORWARD_BARREN_PASSES_BEFORE_ALERT
-    if not due or book["sent"]:
-        return False
-    from alerts.email import send_alert
-    from oracle.forward_health import FAILING, alert_text, forward_health
+    from oracle.forward_alert import SENT, alert_due, send_session_alert
+    from oracle.forward_health import forward_health
 
     with engine.connect() as conn:
         health = forward_health(conn, now=datetime.now(timezone.utc), include_schwab=True)
-    if health["status"] not in FAILING:
-        # The record shows a forecast for this session after all (an earlier pass).
+    due, _why = alert_due(health)
+    if not due:
         return False
-    subject, body = alert_text(health)
-    body += f"\n\nThis pass: {status}" + (f" ({result.get('reason')})" if result.get("reason") else "")
-    log.error("Oracle forward pass has no usable forecast: {m}", m=health["message"])
-    book["sent"] = bool(send_alert(subject, body, severity="critical"))
-    if not book["sent"]:
-        log.error("Oracle forward alert e-mail was not sent (alert e-mail disabled or failed)")
-    return book["sent"]
+    this_pass = f"This pass: {status}" + (f" ({result.get('reason')})" if result.get("reason") else "")
+    return send_session_alert(engine, health, extra=this_pass) == SENT
 
 
 def _run_oracle_forward_step(
@@ -758,9 +747,10 @@ def _run_oracle_forward_step(
             cycle_result["oracle"] = {"status": "failed", "reason": "timeout_or_worker_failure"}
             return
         cycle_result["oracle"] = result
-        # "all_abstained" is a pass that ran to the end, as before; what changed
-        # is that it is no longer called "completed" and that it alerts.
-        if result.get("status") in {"completed", "partial", "all_abstained"}:
+        # "all_abstained" and "no_result" are passes that ran to the end, as
+        # before; what changed is that they are no longer called "completed"
+        # and that they alert.
+        if result.get("status") in {"completed", "partial", "all_abstained", "no_result"}:
             state.cooldowns.record_attempt("oracle_cycle", success=True)
             if result.get("new_predictions", 0) > 0:
                 from oracle.report import send_oracle_report

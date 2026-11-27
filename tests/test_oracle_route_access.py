@@ -29,7 +29,8 @@ ORACLE_ROUTE_ACCESS: dict[tuple[str, str], tuple[str, str]] = {
         "public", "EnsemblePredictor never reads the Oracle's private-use flag"),
     ("GET", "/api/v1/oracle/guard"): ("public", "a fresh engine: no verdicts of a stored cycle"),
     ("GET", "/api/v1/oracle/forward-health"): (
-        "viewer", "counts through oracle_predictions_from(viewer_is_admin); withheld-capture notes admin-only"),
+        "viewer", "counts through oracle_predictions_from(viewer_is_admin); attempts, alert state and "
+        "capture notes for admin only"),
     ("POST", "/api/v1/oracle/publish"): ("public", "writes the request's own AstroGrid record; reads nothing private"),
     ("POST", "/api/v1/oracle/evolve"): ("admin", "maintenance write; summary built from private-inclusive state"),
 }

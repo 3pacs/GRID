@@ -669,15 +669,30 @@ its own forward capture: it freezes an older public quote, the entry-price
 policy refuses it, and every model abstains (2026-11-23 to 11-25: 1,830
 `no_data` rows, each pass reported `completed`). That is now loud:
 
-- the pass reports `all_abstained`, logs an ERROR and sends one
-  `[GRID CRITICAL] Oracle forward pass: no usable forecast` e-mail per session
-  (two passes in a row without a capture or a result send the same alert);
+- the pass reports `all_abstained` (some ticker abstained) or `no_result` (no
+  ticker even had a candidate) instead of `completed`, and logs an ERROR.
+  `completed` and `partial` now mean that at least one captured ticker holds a
+  forecast;
+- one `[GRID CRITICAL] Oracle forward pass: no usable forecast` e-mail per
+  session: at once when every candidate abstained, after two or more attempts
+  that stored nothing over at least an hour, and from the daily sweep for a
+  session in which no pass ran or which ended with a cohort ticker lacking a
+  forecast (a ticker on which no model produces a candidate writes no row).
+  "Already sent" is one marker row per session in `oracle_iterations`
+  (`oracle/forward_alert.py`), shared by Hermes and the sweep, so a Hermes
+  restart or the sweep judging Friday again over a weekend sends nothing new.
+  The e-mail carries counts and stored reasons, never capture metadata;
 - `GET /api/v1/oracle/forward-health` and the status line on the Oracle page
-  say whether the session has a forecast for every cohort ticker; an admin
-  request also gets the cause when a newer private-use capture was withheld;
+  say whether the session has a forecast for every cohort ticker. An admin
+  request also gets the attempt count, whether the alert was sent, and, when a
+  private-use capture was the newest one at the decision, a note saying so and
+  what to check. Everyone else gets an answer built from public rows and the
+  clock alone. No read looks past the instant it is asked about;
 - `scripts/oracle_forward_health_check.py --ended` exits 1 for a session that
-  ended with none. The daily freshness sweep runs it. The sweep's installed
-  copy is root-owned, so after a release that changes it, reinstall it:
+  ended with none (`--notes` adds the possible cause, for an operator at the
+  terminal). The daily freshness sweep runs it with `--alert --write-alert`.
+  The sweep's installed copy is root-owned, so after a release that changes
+  it, reinstall it:
 
 ```bash
 sudo install -m 0755 -o root -g root \

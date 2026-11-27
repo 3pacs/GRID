@@ -320,23 +320,27 @@ def _metadata_provider(clock_metadata: Any) -> str:
 
 
 def withheld_capture_note(conn: Any, ticker: str, *, as_of: Any) -> str | None:
-    """For the operator: the newest capture of ``ticker`` by ``as_of`` is one the public cohort may not read.
+    """For an admin request: a private-use capture of ``ticker`` was the newest one registered by ``as_of``.
 
-    With the Oracle's private-use switch off, the Oracle reads non-Schwab
-    batches only (``VISIBLE_CAPTURE_BATCHES``). When its own forward capture
-    is a Schwab batch it then freezes an older public quote, the entry-price
-    policy refuses that quote as stale, and every model abstains. The stored
-    reason ("quote belongs to a different market session") is true and names
-    the wrong thing to fix (2026-11-23 to 11-25: three sessions of abstentions
-    while a quote seconds old sat in the table).
+    What this establishes, and what it does not. It reads one row: the newest
+    capture batch registered by ``as_of``, its provider class and completion
+    time. A non-``None`` return means that batch is one the public cohort may
+    not read (``VISIBLE_CAPTURE_BATCHES`` would hide it). It does **not**
+    establish that the Oracle's private-use switch was off at that time, nor
+    that this is why a prediction abstained: the switch is process
+    environment, not recorded on any row. So the sentence is conditional. It
+    names something to check.
 
-    Returns one sentence naming the cause, or ``None`` when the newest capture
-    is a public one (or there is none). It reads the provider class and the
-    completion time of one batch and returns neither a price nor a row. The
-    sentence says a private-use capture exists, so it is for operator alerts
-    and admin requests only: a batch listing hides those batches from everyone
-    else. It does not read the switch: a stored abstention is judged by what
-    was in the table at its decision time, in whichever process asks.
+    Why it is worth saying at all: with the switch off and a private-use
+    capture as the newest one, the Oracle freezes an older public quote, the
+    entry-price policy refuses it as stale, and the stored reason ("quote
+    belongs to a different market session") is true and points away from the
+    cause (2026-11-23 to 11-25).
+
+    It returns no price and no row. It does say that a private-use capture
+    exists and when it completed, which a batch listing hides from non-admin
+    readers, so callers give it to admin requests only and keep it out of
+    stored rows and out of e-mail.
     """
     from sqlalchemy import text
 
@@ -351,10 +355,11 @@ def withheld_capture_note(conn: Any, ticker: str, *, as_of: Any) -> str | None:
         return None
     completed = row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])
     return (
-        f"the newest {ticker} capture at that time (completed {completed}) is a private-use"
-        f" (Schwab) batch, which the Oracle reads only when {ORACLE_SCHWAB_ENV}={ORACLE_SCHWAB_ON}"
-        " is set for the process that runs it; with the switch off it froze an older public quote"
-        " (deploy/systemd/README.md)"
+        f"a private-use capture of {ticker} was the newest one registered by that time (completed"
+        f" {completed}). If the Oracle's private-use switch ({ORACLE_SCHWAB_ENV}={ORACLE_SCHWAB_ON})"
+        " was off for the process that made the decision, that capture was not readable and an older"
+        " public quote would have been frozen instead. Check the switch before anything else"
+        " (deploy/systemd/README.md). This shows what was in the table, not why the pass abstained."
     )
 
 

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy import create_engine, text
 
+from oracle import forward_alert as fa
 from oracle import forward_health as fh
 from store import options_provenance as op
 
@@ -158,8 +159,31 @@ def test_a_captured_ticker_with_no_candidate_is_named() -> None:
 @pytest.mark.parametrize("detail", [None, {}, {"tickers": None}, "junk"])
 def test_missing_detail_never_claims_all_abstained(detail: Any) -> None:
     outcome = fh.pass_outcome(["SPY", "QQQ"], detail)
-    assert outcome["all_abstained"] is False
+    assert outcome["all_abstained"] is False and outcome["no_result"] is False
     assert outcome["tickers_without_candidates"] == []
+
+
+def test_a_pass_with_no_forecast_and_no_candidate_is_no_result() -> None:
+    # Both tickers captured, quotes qualified, and no model produced a candidate
+    # (or none is admitted): the engine stored nothing and reports empty detail.
+    outcome = fh.pass_outcome(["SPY", "QQQ"], {"tickers": {}, "abstention_reasons": {}})
+    assert outcome["no_result"] is True and outcome["all_abstained"] is False
+    assert outcome["tickers_without_candidates"] == ["SPY", "QQQ"]
+    assert outcome["tickers_with_forecast"] == [] and outcome["tickers_abstained"] == []
+
+
+def test_repeated_forecasts_are_the_control_for_no_result() -> None:
+    # Also zero new rows, and the opposite finding: the tickers hold this morning's forecast.
+    outcome = fh.pass_outcome(["SPY", "QQQ"], _detail(
+        SPY={"duplicate_forecasts": 40}, QQQ={"duplicate_forecasts": 111}))
+    assert outcome["no_result"] is False and outcome["all_abstained"] is False
+    one = fh.pass_outcome(["SPY", "QQQ"], _detail(QQQ={"duplicate_forecasts": 111}))
+    assert one["no_result"] is False and one["tickers_without_candidates"] == ["SPY"]
+
+
+def test_an_abstention_beside_a_ticker_without_candidates_is_all_abstained() -> None:
+    outcome = fh.pass_outcome(["SPY", "QQQ"], _detail(SPY={"abstained": 305}))
+    assert outcome["all_abstained"] is True and outcome["no_result"] is False
 
 
 def test_nothing_captured_is_not_all_abstained() -> None:
@@ -222,8 +246,11 @@ def test_admin_is_told_a_newer_private_use_capture_was_withheld(db) -> None:
         health = fh.forward_health(conn, now=_utc(WED, 21), include_schwab=True)
     assert set(health["operator_notes"]) == {"SPY", "QQQ"}
     note = health["operator_notes"]["SPY"]
-    assert "2026-11-25T15:43:17+00:00" in note and "private-use (Schwab) batch" in note
-    assert op.ORACLE_SCHWAB_ENV + "=" + op.ORACLE_SCHWAB_ON in note
+    assert note.startswith("a private-use capture of SPY was the newest one registered by that time"
+                           " (completed 2026-11-25T15:43:17+00:00).")
+    # Conditional: the table shows the capture, not the state of the switch or the cause.
+    assert "If the Oracle's private-use switch (" + op.ORACLE_SCHWAB_ENV + "=" + op.ORACLE_SCHWAB_ON + ") was off" in note
+    assert note.endswith("This shows what was in the table, not why the pass abstained.")
     assert "100.0" not in note                       # never a price
 
 
@@ -235,8 +262,12 @@ def test_everyone_else_gets_the_status_without_the_private_capture_note(db, flag
         health = fh.forward_health(conn, now=_utc(WED, 21), include_schwab=flag)
     assert health["status"] == fh.STATUS_ALL_ABSTAINED      # these abstentions are public rows
     assert health["cohort"] == "public"
-    assert "operator_notes" not in health
+    for admin_only in ("operator_notes", "attempts", "last_attempt_at", "alert_sent"):
+        assert admin_only not in health
     assert "Schwab" not in json.dumps(health) and "private" not in json.dumps(health)
+    assert "attempt" not in health["message"]
+    assert health["message"].startswith(
+        "No usable Oracle forecast in the 2026-11-25 session: all 610 candidates abstained. Top reason: ")
 
 
 def test_forecasts_for_every_ticker_are_ok(db) -> None:
@@ -345,10 +376,15 @@ def test_alert_text_carries_the_counts_reasons_and_notes(db) -> None:
         _incident(conn)
     with db.connect() as conn:
         subject, body = fh.alert_text(fh.forward_health(conn, now=_utc(WED, 21), include_schwab=True))
+        with_notes = fh.alert_text(
+            fh.forward_health(conn, now=_utc(WED, 21), include_schwab=True), with_notes=True)[1]
     assert subject == "Oracle forward pass: no usable forecast (2026-11-25)"
     assert "SPY: 0 forecast(s), 305 abstention(s); " + OLD_REASON in body
-    assert "private-use (Schwab) batch" in body
     assert "Nothing was repaired or regenerated." in body
+    # The e-mail leaves the host: no capture metadata in it, only where an admin can look.
+    assert "private-use" not in body and "15:43:17" not in body and "Schwab" not in body
+    assert "given to admin requests only" in body
+    assert "completed 2026-11-25T15:43:17+00:00" in with_notes
 
 
 # ── The same statements on PostgreSQL ─────────────────────────────────
@@ -399,11 +435,105 @@ def test_the_incident_reads_the_same_on_postgresql(pgdb) -> None:
     assert admin["status"] == public["status"] == fh.STATUS_ALL_ABSTAINED
     assert admin["attempts"] == 6 and admin["abstention_reasons"] == {OLD_REASON: 610}
     assert admin["tickers"]["QQQ"]["first_abstention_at"] == DECISION.isoformat()
-    assert "completed 2026-11-25T15:43:17+00:00" in admin["operator_notes"]["SPY"]
+    assert "(completed 2026-11-25T15:43:17+00:00)" in admin["operator_notes"]["SPY"]
     # The private-use forecast of the day before is the admin's last real forecast, never the public one.
     assert admin["last_qualified_at"] == "2026-11-24T15:00:00+00:00"
     assert public["last_qualified_at"] == "2026-11-19T15:42:44+00:00"
     assert "operator_notes" not in public
+
+
+def test_the_marker_and_lock_work_on_postgresql_and_two_callers_send_once(pgdb) -> None:
+    with pgdb.begin() as conn:
+        _incident(conn)
+    health = _incident_health(pgdb)
+    calls: list[str] = []
+    send = lambda subject, body, severity: bool(calls.append(subject)) or True  # noqa: E731
+    assert fa.send_session_alert(pgdb, health, send=send) == fa.SENT
+    assert fa.send_session_alert(pgdb, health, send=send) == fa.ALREADY_SENT
+    assert calls == ["Oracle forward pass: no usable forecast (2026-11-25)"]
+    with pgdb.connect() as conn:
+        rows = conn.execute(text("SELECT notes, models_updated FROM oracle_iterations WHERE notes LIKE :p"),
+                            {"p": fh.FORWARD_ALERT_NOTE_PREFIX + "%"}).fetchall()
+    assert [tuple(r) for r in rows] == [(fh.alert_note("2026-11-25"), 0)]
+    assert _incident_health(pgdb)["attempts"] == 6                 # a marker is not an attempt
+
+
+# ── What a non-admin answer may depend on ─────────────────────────────
+
+
+def _public(engine: Any, now: datetime) -> dict[str, Any]:
+    with engine.connect() as conn:
+        health = fh.forward_health(conn, now=now, include_schwab=False)
+    health.pop("checked_at")
+    return health
+
+
+@pytest.mark.parametrize("now", [_utc(WED, 15), _utc(WED, 17), _utc(WED, 22)])
+def test_the_public_answer_is_the_same_whatever_happened_in_the_private_cohort(db, now: datetime) -> None:
+    """Attempts, alert markers and private-use rows live in unfiltered tables. None may show through."""
+    quiet = _public(db, now)
+    with db.begin() as conn:
+        _attempts(conn, WED, 6)
+        _rows(conn, "SPY", _utc(WED, 14, 31, 6), 40, direction="PUT", private=True)
+        _rows(conn, "QQQ", _utc(WED, 14, 31, 6), 305, private=True)
+        _batch(conn, "SPY", _utc(WED, 14, 31), "schwab", 20)
+        conn.execute(text("INSERT INTO oracle_iterations VALUES (:at, 0, 0, :note)"),
+                     {"at": _utc(WED, 14, 32).isoformat(sep=" "), "note": fh.alert_note(WED)})
+    busy = _public(db, now)
+    assert busy == quiet
+    for admin_only in ("attempts", "last_attempt_at", "alert_sent", "operator_notes"):
+        assert admin_only not in busy
+    assert busy["status"] in {fh.STATUS_PENDING, fh.STATUS_NO_PUBLIC_FORECAST}
+    assert "attempt" not in busy["message"]
+
+
+def test_the_public_answer_still_reports_public_rows(db) -> None:
+    with db.begin() as conn:
+        _attempts(conn, WED, 2)
+        _rows(conn, "QQQ", DECISION, 111, direction="CALL")
+        _rows(conn, "SPY", DECISION, 40, direction="PUT", private=True)
+    public = _public(db, _utc(WED, 17))
+    assert public["status"] == fh.STATUS_PARTIAL
+    assert (public["tickers"]["QQQ"]["qualified"], public["tickers"]["SPY"]["qualified"]) == (111, 0)
+
+
+# ── Nothing later than the supplied instant is read ───────────────────
+
+
+@pytest.mark.parametrize("admin", [True, False])
+def test_a_midday_replay_does_not_see_the_afternoon(db, admin: bool) -> None:
+    """Asked about 15:00Z, the answer must not contain a 15:43Z row or a 16:31Z attempt of the same day."""
+    with db.begin() as conn:
+        _attempts(conn, WED, 3)                                # 14:31, 15:31, 16:31
+        for ticker in ("SPY", "QQQ"):
+            _rows(conn, ticker, _utc(WED, 14, 31, 6), 305, reason=SESSION_REASON)
+            _rows(conn, ticker, DECISION, 80, direction="CALL")          # 15:43:32
+    with db.connect() as conn:
+        at_noon = fh.forward_health(conn, now=_utc(WED, 15), include_schwab=admin)
+        at_close = fh.forward_health(conn, now=_utc(WED, 21), include_schwab=admin)
+        on_the_row = fh.forward_health(conn, now=DECISION, include_schwab=admin)
+    assert at_noon["status"] == fh.STATUS_ALL_ABSTAINED
+    assert at_noon["tickers"]["SPY"] == {
+        "qualified": 0, "abstained": 305, "top_reason": SESSION_REASON,
+        "first_forecast_at": None, "first_abstention_at": _utc(WED, 14, 31, 6).isoformat(),
+    }
+    assert at_noon["last_qualified_at"] is None
+    assert at_close["status"] == fh.STATUS_OK and at_close["last_qualified_at"] == DECISION.isoformat()
+    assert on_the_row["status"] == fh.STATUS_OK                # a row at the instant itself is known
+    if admin:
+        assert (at_noon["attempts"], at_noon["last_attempt_at"]) == (1, _utc(WED, 14, 31).isoformat())
+        assert at_close["attempts"] == 3
+    else:
+        assert "attempts" not in at_noon and "attempts" not in at_close
+
+
+def test_an_alert_sent_later_is_not_known_to_an_earlier_instant(db) -> None:
+    with db.begin() as conn:
+        _incident(conn)
+        conn.execute(text("INSERT INTO oracle_iterations VALUES (:at, 0, 0, :note)"),
+                     {"at": _utc(WED, 15, 44).isoformat(sep=" "), "note": fh.alert_note(WED)})
+    assert _incident_health(db, _utc(WED, 15, 43, 40))["alert_sent"] is False
+    assert _incident_health(db, _utc(WED, 15, 45))["alert_sent"] is True
 
 
 # ── The withheld-capture note ─────────────────────────────────────────
@@ -424,7 +554,7 @@ def test_note_judges_what_was_in_the_table_at_the_decision(db) -> None:
         _batch(conn, "SPY", _utc(WED, 15, 43, 17), "schwab", 20)
     with db.connect() as conn:
         assert op.withheld_capture_note(conn, "SPY", as_of=_utc(WED, 15, 43, 16)) is None
-        assert "completed 2026-11-25T15:43:17+00:00" in op.withheld_capture_note(conn, "SPY", as_of=DECISION)
+        assert "(completed 2026-11-25T15:43:17+00:00)" in op.withheld_capture_note(conn, "SPY", as_of=DECISION)
 
 
 def test_note_fails_closed_on_an_unknown_provider_after_the_cutoff(db) -> None:
@@ -577,6 +707,24 @@ def test_the_incident_pass_reports_all_abstained_not_completed(monkeypatch, ho) 
     assert result["abstention_reasons"] == {OLD_REASON: 610}
 
 
+def test_a_pass_with_no_forecast_and_no_candidate_reports_no_result_not_completed(monkeypatch, ho) -> None:
+    _stub_pass(monkeypatch, ho, detail={"tickers": {}, "abstention_reasons": {}},
+               counts={"qualified": 0, "inserted": 0})
+    result = ho._run_oracle_forward_pass(_PassEngine(), should_continue=lambda: True)
+    assert result["status"] == "no_result"
+    assert result["tickers_without_candidates"] == ["SPY", "QQQ"]
+
+
+def test_a_partial_capture_without_a_forecast_is_not_called_partial(monkeypatch, ho) -> None:
+    # "partial" would reset nothing and alert nothing; it now means a ticker holds a forecast.
+    _stub_pass(monkeypatch, ho, detail={"tickers": {}, "abstention_reasons": {}},
+               counts={"qualified": 0, "failed_tickers": 1})
+    assert ho._run_oracle_forward_pass(_PassEngine(), should_continue=lambda: True)["status"] == "no_result"
+    _stub_pass(monkeypatch, ho, detail=_detail(QQQ={"qualified": 111}),
+               counts={"qualified": 111, "failed_tickers": 1})
+    assert ho._run_oracle_forward_pass(_PassEngine(), should_continue=lambda: True)["status"] == "partial"
+
+
 def test_a_pass_that_repeats_the_mornings_forecasts_still_reports_completed(monkeypatch, ho) -> None:
     _stub_pass(monkeypatch, ho,
                detail=_detail(SPY={"duplicate_forecasts": 40}, QQQ={"duplicate_forecasts": 111}),
@@ -586,7 +734,7 @@ def test_a_pass_that_repeats_the_mornings_forecasts_still_reports_completed(monk
     assert result["tickers_with_forecast"] == ["SPY", "QQQ"]
 
 
-def _alert_harness(monkeypatch, health_status: str = fh.STATUS_ALL_ABSTAINED, sends: bool = True):
+def _mail(monkeypatch, sends: bool = True) -> list[tuple[str, str, str]]:
     sent: list[tuple[str, str, str]] = []
     email = types.ModuleType("alerts.email")
 
@@ -596,76 +744,253 @@ def _alert_harness(monkeypatch, health_status: str = fh.STATUS_ALL_ABSTAINED, se
 
     email.send_alert = send_alert                               # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "alerts.email", email)
-    health = {
-        "status": health_status, "session_date": "2026-11-25", "attempts": 2,
-        "last_attempt_at": None, "message": "No usable Oracle forecast in the 2026-11-25 session.",
-        "tickers": {"SPY": {"qualified": 0, "abstained": 305, "top_reason": OLD_REASON}},
-        "operator_notes": {"SPY": "the newest SPY capture is a private-use (Schwab) batch"},
-    }
-    seen: list[Any] = []
-
-    def fake_health(conn, *, now, include_schwab=False, **kw):
-        seen.append(include_schwab)
-        return health
-
-    monkeypatch.setattr(fh, "forward_health", fake_health)
-    return sent, seen, SimpleNamespace(), MagicMock()
+    return sent
 
 
-def test_all_abstained_alerts_on_the_first_pass_and_once_per_session(monkeypatch, ho) -> None:
-    sent, seen, state, engine = _alert_harness(monkeypatch)
+def _clock(monkeypatch, ho, now: datetime) -> None:
+    class SessionClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(ho, "datetime", SessionClock)
+
+
+def _markers(db) -> list[str]:
+    with db.connect() as conn:
+        return [r[0] for r in conn.execute(text(
+            "SELECT notes FROM oracle_iterations WHERE notes LIKE :p ORDER BY notes"),
+            {"p": fh.FORWARD_ALERT_NOTE_PREFIX + "%"})]
+
+
+def test_all_abstained_alerts_on_the_first_pass_and_once_per_session(monkeypatch, ho, db) -> None:
+    with db.begin() as conn:
+        _incident(conn)
+    sent = _mail(monkeypatch)
+    _clock(monkeypatch, ho, DECISION + timedelta(seconds=5))
     result = {"status": "all_abstained"}
-    assert ho._oracle_forward_alert(engine, state, result, DECISION) is True
-    assert ho._oracle_forward_alert(engine, state, result, DECISION + timedelta(hours=1)) is False
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), result, DECISION) is True
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), result, DECISION) is False
     assert len(sent) == 1
     subject, body, severity = sent[0]
     assert subject == "Oracle forward pass: no usable forecast (2026-11-25)"
     assert severity == "critical"
-    assert "private-use (Schwab) batch" in body and "This pass: all_abstained" in body
-    assert seen == [True]                                # the operator reads every row
-    # The next session alerts again.
-    assert ho._oracle_forward_alert(engine, state, result, DECISION + timedelta(days=5)) is True
-    assert len(sent) == 2
+    assert "This pass: all_abstained" in body
+    assert "private-use" not in body and "15:43:17" not in body      # no capture metadata by e-mail
+    assert _markers(db) == [fh.alert_note("2026-11-25")]
 
 
-def test_one_pass_without_a_capture_waits_and_the_second_alerts(monkeypatch, ho) -> None:
-    sent, _seen, state, engine = _alert_harness(monkeypatch, fh.STATUS_NO_ROWS)
-    no_capture = {"status": "abstained", "reason": "no_fresh_cohort_capture"}
-    assert ho._oracle_forward_alert(engine, state, no_capture, DECISION) is False
+def test_a_restarted_operator_does_not_send_the_same_session_again(monkeypatch, ho, db) -> None:
+    with db.begin() as conn:
+        _incident(conn)
+    sent = _mail(monkeypatch)
+    _clock(monkeypatch, ho, DECISION + timedelta(seconds=5))
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is True
+    # A restart: nothing in memory survives. The marker row does.
+    fresh_state = SimpleNamespace()
+    _clock(monkeypatch, ho, DECISION + timedelta(hours=1))
+    assert ho._oracle_forward_alert(db, fresh_state, {"status": "all_abstained"}, DECISION) is False
+    assert len(sent) == 1 and vars(fresh_state) == {}
+
+
+def test_the_next_session_alerts_again(monkeypatch, ho, db) -> None:
+    friday = date(2026, 11, 27)
+    with db.begin() as conn:
+        _incident(conn)
+        _attempts(conn, friday, 1)
+        _rows(conn, "SPY", _utc(friday, 14, 31, 6), 305, reason=SESSION_REASON)
+    sent = _mail(monkeypatch)
+    _clock(monkeypatch, ho, DECISION + timedelta(seconds=5))
+    ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION)
+    _clock(monkeypatch, ho, _utc(friday, 14, 32))
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is True
+    assert [subject for subject, _b, _s in sent] == [
+        "Oracle forward pass: no usable forecast (2026-11-25)",
+        "Oracle forward pass: no usable forecast (2026-11-27)"]
+    assert _markers(db) == [fh.alert_note("2026-11-25"), fh.alert_note("2026-11-27")]
+
+
+@pytest.mark.parametrize("status", ["no_result", "abstained", "failed"])
+def test_two_passes_that_stored_nothing_alert_and_one_does_not(monkeypatch, ho, db, status: str) -> None:
+    sent = _mail(monkeypatch)
+    result = {"status": status, "reason": "no_fresh_cohort_capture" if status == "abstained" else None}
+    with db.begin() as conn:
+        _attempts(conn, WED, 1)
+    _clock(monkeypatch, ho, _utc(WED, 14, 40))
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), result, DECISION) is False
     assert sent == []
-    failed = {"status": "failed", "reason": "timeout_or_worker_failure"}
-    assert ho._oracle_forward_alert(engine, state, failed, DECISION + timedelta(hours=1)) is True
-    assert "This pass: failed (timeout_or_worker_failure)" in sent[0][1]
+    with db.begin() as conn:                                  # the second pass, an hour later
+        _attempts(conn, WED, 1, first_hour=15)
+    _clock(monkeypatch, ho, _utc(WED, 15, 40))
+    # A new state object each time: the count comes from the stored attempts.
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), result, DECISION) is True
+    assert "2 attempt(s) ran and stored nothing" in sent[0][1]
+    assert f"This pass: {status}" in sent[0][1]
 
 
-def test_a_pass_with_a_forecast_resets_the_count(monkeypatch, ho) -> None:
-    sent, _seen, state, engine = _alert_harness(monkeypatch, fh.STATUS_NO_ROWS)
-    no_capture = {"status": "abstained", "reason": "no_fresh_cohort_capture"}
-    ho._oracle_forward_alert(engine, state, no_capture, DECISION)
-    ho._oracle_forward_alert(engine, state, {"status": "completed"}, DECISION)
-    assert ho._oracle_forward_alert(engine, state, no_capture, DECISION) is False
+def test_a_pass_that_left_a_forecast_never_alerts_and_reads_nothing(monkeypatch, ho) -> None:
+    sent = _mail(monkeypatch)
+    engine = MagicMock()
+    for result in ({"status": "completed"}, {"status": "partial"}, None, {},
+                   {"status": "deferred", "reason": "hourly_cadence"}):
+        assert ho._oracle_forward_alert(engine, SimpleNamespace(), result, DECISION) is False
+    engine.connect.assert_not_called()
     assert sent == []
 
 
-@pytest.mark.parametrize("result", [None, {}, {"status": "deferred", "reason": "hourly_cadence"}])
-def test_a_deferred_pass_is_not_a_pass(monkeypatch, ho, result: Any) -> None:
-    sent, seen, state, engine = _alert_harness(monkeypatch)
-    assert ho._oracle_forward_alert(engine, state, result, DECISION) is False
-    assert sent == [] and seen == [] and not hasattr(state, "oracle_forward_alerts")
+def test_no_alert_when_the_record_shows_a_forecast_for_the_session(monkeypatch, ho, db) -> None:
+    with db.begin() as conn:
+        _attempts(conn, WED, 2)
+        _rows(conn, "QQQ", _utc(WED, 14, 31, 6), 111, direction="CALL")
+    sent = _mail(monkeypatch)
+    _clock(monkeypatch, ho, DECISION)
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is False
+    assert sent == [] and _markers(db) == []
 
 
-def test_no_alert_when_the_record_shows_a_forecast_for_the_session(monkeypatch, ho) -> None:
-    sent, _seen, state, engine = _alert_harness(monkeypatch, fh.STATUS_PARTIAL)
-    assert ho._oracle_forward_alert(engine, state, {"status": "all_abstained"}, DECISION) is False
+def test_an_alert_that_could_not_be_sent_leaves_no_marker_and_is_tried_again(monkeypatch, ho, db) -> None:
+    with db.begin() as conn:
+        _incident(conn)
+    _clock(monkeypatch, ho, DECISION + timedelta(seconds=5))
+    failed = _mail(monkeypatch, sends=False)
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is False
+    assert len(failed) == 1 and _markers(db) == []
+    sent = _mail(monkeypatch)
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is True
+    assert len(sent) == 1 and _markers(db) == [fh.alert_note("2026-11-25")]
+
+
+# ── When the alert is due, and the shared marker ──────────────────────
+
+
+@pytest.mark.parametrize(("health", "due"), [
+    ({"status": fh.STATUS_ALL_ABSTAINED, "attempts": 1}, True),
+    ({"status": fh.STATUS_NO_ROWS, "attempts": 1, "first_attempt_at": "2026-11-25T14:31:00+00:00",
+      "checked_at": "2026-11-25T16:00:00+00:00"}, False),
+    ({"status": fh.STATUS_NO_ROWS, "attempts": 2, "first_attempt_at": "2026-11-25T14:31:00+00:00",
+      "checked_at": "2026-11-25T15:31:00+00:00"}, True),
+    # Two attempts ten minutes apart are a slow morning, not yet a dead session.
+    ({"status": fh.STATUS_NO_ROWS, "attempts": 2, "first_attempt_at": "2026-11-25T14:31:00+00:00",
+      "checked_at": "2026-11-25T14:41:30+00:00"}, False),
+    ({"status": fh.STATUS_NO_ROWS, "attempts": 2}, False),      # no clock on record: not due
+    ({"status": fh.STATUS_NO_ATTEMPTS, "attempts": 0, "session_state": "open"}, False),
+    ({"status": fh.STATUS_NO_ATTEMPTS, "attempts": 0, "session_state": "ended"}, True),
+    ({"status": fh.STATUS_OK, "attempts": 6}, False),
+    ({"status": fh.STATUS_PARTIAL, "attempts": 6, "session_state": "open"}, False),   # a later pass may fix it
+    ({"status": fh.STATUS_PARTIAL, "attempts": 6, "session_state": "ended"}, True),
+    ({"status": fh.STATUS_PENDING, "attempts": 0}, False),
+    ({"status": fh.STATUS_NO_PUBLIC_FORECAST}, False),
+])
+def test_when_the_alert_is_due(health: dict[str, Any], due: bool) -> None:
+    assert fa.alert_due(health)[0] is due
+
+
+def _incident_health(engine: Any, now: datetime | None = None) -> dict[str, Any]:
+    with engine.connect() as conn:
+        return fh.forward_health(conn, now=now or _utc(WED, 21), include_schwab=True)
+
+
+def test_the_marker_is_written_only_after_the_mail_was_accepted(db) -> None:
+    with db.begin() as conn:
+        _incident(conn)
+    health = _incident_health(db)
+    assert health["alert_sent"] is False
+    assert fa.send_session_alert(db, health, send=lambda *a: False) == fa.SEND_FAILED
+    assert _markers(db) == []
+    calls: list[tuple[str, str, str]] = []
+    assert fa.send_session_alert(db, health, send=lambda *a: bool(calls.append(a)) or True,
+                                 extra="Sent by the daily freshness sweep.") == fa.SENT
+    assert fa.send_session_alert(db, health, send=lambda *a: bool(calls.append(a)) or True) == fa.ALREADY_SENT
+    assert len(calls) == 1 and calls[0][1].endswith("Sent by the daily freshness sweep.")
+    assert calls[0][2] == "critical"
+    # The session's attempt count is not changed by the marker row, and an admin answer shows it was sent.
+    after = _incident_health(db, datetime.now(timezone.utc) + timedelta(minutes=1))
+    assert after["alert_sent"] is True
+    assert _incident_health(db)["attempts"] == 6
+
+
+def test_hermes_then_the_sweep_send_one_alert_for_the_session(monkeypatch, capsys, ho, db, tmp_path) -> None:
+    import db as db_module
+    from scripts import oracle_forward_health_check as check
+
+    with db.begin() as conn:
+        _incident(conn)
+    sent = _mail(monkeypatch)
+    _clock(monkeypatch, ho, DECISION + timedelta(seconds=5))
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is True
+    # 05:00Z on Thursday (a holiday) and on Friday before the open: each sweep judges Wednesday's session.
+    monkeypatch.setattr(db_module, "get_engine", lambda: db)
+    real = fh.forward_health
+    for day in (26, 27):
+        at = _utc(date(2026, 11, day), 5)
+        monkeypatch.setattr(check, "forward_health", lambda conn, _at=at, **kw: real(conn, **{**kw, "now": _at}))
+        assert check.main(["--ended", "--alert", "--write-alert", str(tmp_path)]) == 1
+        assert "alert: already_sent" in capsys.readouterr().out
+    assert len(sent) == 1
+    assert [p.name for p in tmp_path.iterdir()] == ["oracle-forward-2026-11-25.txt"]   # one file per session
+
+
+def test_the_sweep_then_hermes_send_one_alert_for_the_session(monkeypatch, capsys, ho, db, tmp_path) -> None:
+    import db as db_module
+    from scripts import oracle_forward_health_check as check
+
+    with db.begin() as conn:
+        _incident(conn)
+    sent = _mail(monkeypatch)
+    monkeypatch.setattr(db_module, "get_engine", lambda: db)
+    real = fh.forward_health
+    at = _utc(date(2026, 11, 26), 5)
+    monkeypatch.setattr(check, "forward_health", lambda conn, **kw: real(conn, **{**kw, "now": at}))
+    assert check.main(["--ended", "--alert"]) == 1
+    assert "alert: sent" in capsys.readouterr().out
+    assert check.main(["--ended", "--alert"]) == 1                  # the next day's sweep, same session
+    assert "alert: already_sent" in capsys.readouterr().out
+    _clock(monkeypatch, ho, _utc(WED, 20))                           # an operator replaying the same session
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is False
+    assert len(sent) == 1 and "Sent by the daily freshness sweep." in sent[0][1]
+    assert list(tmp_path.iterdir()) == []                            # no --write-alert, no file
+
+
+def test_the_sweep_alerts_once_for_a_session_that_left_a_ticker_without_a_forecast(
+        monkeypatch, capsys, ho, db, tmp_path) -> None:
+    """SPY: captured every pass, no model produced a candidate, so no row of any kind was written."""
+    import db as db_module
+    from scripts import oracle_forward_health_check as check
+
+    with db.begin() as conn:
+        _attempts(conn, WED, 6)
+        _rows(conn, "QQQ", DECISION, 111, direction="CALL")
+    sent = _mail(monkeypatch)
+    # During the session Hermes says nothing about it: a later pass may still give SPY a forecast.
+    _clock(monkeypatch, ho, _utc(WED, 16))
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "completed"}, DECISION) is False
     assert sent == []
+    monkeypatch.setattr(db_module, "get_engine", lambda: db)
+    real = fh.forward_health
+    at = _utc(date(2026, 11, 26), 5)
+    monkeypatch.setattr(check, "forward_health", lambda conn, **kw: real(conn, **{**kw, "now": at}))
+    assert check.main(["--ended", "--alert", "--write-alert", str(tmp_path)]) == 1
+    assert check.main(["--ended", "--alert", "--write-alert", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "alert: sent" in out and "alert: already_sent" in out
+    assert len(sent) == 1
+    subject, body, _severity = sent[0]
+    assert subject == "Oracle forward pass: no forecast for SPY (2026-11-25)"
+    assert "SPY: 0 forecast(s), 0 abstention(s)" in body and "QQQ: 111 forecast(s)" in body
+    assert [p.name for p in tmp_path.iterdir()] == ["oracle-forward-2026-11-25.txt"]
 
 
-def test_an_alert_that_could_not_be_sent_is_tried_again(monkeypatch, ho) -> None:
-    sent, _seen, state, engine = _alert_harness(monkeypatch, sends=False)
-    result = {"status": "all_abstained"}
-    assert ho._oracle_forward_alert(engine, state, result, DECISION) is False
-    assert ho._oracle_forward_alert(engine, state, result, DECISION + timedelta(hours=1)) is False
-    assert len(sent) == 2
+def test_the_sweep_alerts_for_a_session_in_which_no_pass_ran(monkeypatch, capsys, db) -> None:
+    import db as db_module
+    from scripts import oracle_forward_health_check as check
+
+    sent = _mail(monkeypatch)
+    monkeypatch.setattr(db_module, "get_engine", lambda: db)
+    real = fh.forward_health
+    at = _utc(date(2026, 11, 26), 5)
+    monkeypatch.setattr(check, "forward_health", lambda conn, **kw: real(conn, **{**kw, "now": at}))
+    assert check.main(["--ended", "--alert"]) == 1
+    assert "The Oracle forward pass did not run in the 2026-11-25 session." in sent[0][1]
 
 
 def _run_step(monkeypatch, ho, worker_result: Any, *, ok: bool = True):
@@ -696,6 +1021,14 @@ def test_the_step_hands_an_all_abstained_pass_to_the_alert(monkeypatch, ho) -> N
     assert cycle_result["oracle"] == result
     assert alerts == [(result, DECISION)]
     # The worker ran to the end: the timeout cooldown is unchanged, and no report is sent.
+    state.cooldowns.record_attempt.assert_called_once_with("oracle_cycle", success=True)
+    report.assert_not_called()
+
+
+def test_the_step_treats_no_result_as_a_pass_that_ran_to_the_end(monkeypatch, ho) -> None:
+    result = {"status": "no_result", "new_predictions": 0}
+    state, cycle_result, alerts, report = _run_step(monkeypatch, ho, result)
+    assert alerts == [(result, DECISION)]
     state.cooldowns.record_attempt.assert_called_once_with("oracle_cycle", success=True)
     report.assert_not_called()
 
@@ -767,7 +1100,12 @@ def test_the_check_script_exits_one_for_a_failing_session(monkeypatch, capsys, d
                         lambda conn, **kw: real(conn, **{**kw, "now": _utc(date(2026, 11, 27), 5)}))
     assert check.main(["--ended"]) == 1
     out = capsys.readouterr().out
-    assert "all 610 candidates abstained" in out and "private-use (Schwab) batch" in out
+    assert "all 610 candidates abstained" in out
+    assert "private-use" not in out and "alert:" not in out      # no --notes, no --alert
+    assert check.main(["--ended", "--notes"]) == 1
+    assert "a private-use capture of SPY was the newest one registered by that time" in capsys.readouterr().out
+    assert check.main(["--ended", "--json"]) == 1
+    assert "operator_notes" not in json.loads(capsys.readouterr().out)
 
 
 def test_the_check_script_exits_zero_for_a_session_with_forecasts(monkeypatch, capsys, db) -> None:
@@ -788,5 +1126,5 @@ def test_the_check_script_exits_zero_for_a_session_with_forecasts(monkeypatch, c
 
 def test_the_daily_sweep_runs_the_check_on_the_last_ended_session() -> None:
     sweep = (ROOT / "server_setup" / "grid-data-freshness-check.sh").read_text()
-    assert "scripts/oracle_forward_health_check.py --ended --alert" in sweep
-    assert 'oracle-forward-${TODAY}.txt' in sweep
+    assert 'scripts/oracle_forward_health_check.py --ended --alert --write-alert "$ALERT_DIR"' in sweep
+    assert "${TODAY}.txt" not in sweep.split("Oracle forward pass")[1]      # named for the session, not today
