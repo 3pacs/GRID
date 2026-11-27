@@ -763,10 +763,33 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # task has a final outcome. Each weekly call is unchanged. No SEC,
         # FINRA or dispatch-prefix change. Needs reviewer acceptance like the
         # prior pins.
+        # OPER re-pinned 754dfee2 -> d7cd2a46 (2026-11-27,
+        # claude/m1-postmortem-budget-20261127; revised after Codex review
+        # 6085439290): the only operator edits are the daily-intel postmortem
+        # budget (DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S 180 -> 300, with its
+        # comment), the new DAILY_INTEL_POSTMORTEM_DEADLINE_MARGIN_S and
+        # DAILY_INTEL_POSTMORTEM_FINISH_GUARD_S, a comment stating that cycle
+        # admission is soft by design, and _daily_intel_postmortem_batch, which
+        # now passes deadline (no new rows after budget - margin) and finish_by
+        # (the whole call returns before the wrapper's limit) to batch_postmortem
+        # so the batch ends inside its budget instead of timing out, being
+        # blacklisted and finishing late. No SEC, FINRA or dispatch change.
+        # Needs reviewer acceptance like the prior pins.
+        # OPER re-pinned again d7cd2a46 -> d833a7fa (2026-11-27, same branch; revised after Codex
+        # review 6086916890): the postmortem task's wrapper budget is capped
+        # to what is left of the OUTER intelligence step (new
+        # DAILY_INTEL_OUTER_STEP_RESERVE_S and DAILY_INTEL_POSTMORTEM_MIN_ALLOWANCE_S,
+        # DailyIntelTask.bounded_by_outer set only on postmortem_batch,
+        # _run_daily_intel_block(step_deadline=...) granting min(budget, outer
+        # remainder - reserve) or deferring the task without counting an attempt,
+        # _DAILY_INTEL_TASK_ALLOWANCE_S read by _daily_intel_postmortem_batch,
+        # and run_intelligence_tasks computing step_deadline at its start). No
+        # other task's budget, no SEC, FINRA or dispatch change. Needs reviewer
+        # acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','d833a7fa8dfc636b899ef6b3d6118dd5d64597ddfa60fd784ae373ff200ea801'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

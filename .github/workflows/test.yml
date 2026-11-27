@@ -252,6 +252,20 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_etf_flows_single_writer_20261126.py -q -rA -k real_session
 
+      # dollar_flows readers asked about a past date (GRID follow-up to #1496):
+      # the adapter's created_at window closed at `now` on TIMESTAMPTZ, and
+      # the past/current answers of get_aggregate_flows and the flow map's
+      # prediction-markets node on NUMERIC. The test fails instead of skipping
+      # when REQUIRE_DOLLAR_FLOWS_PG=1.
+      - name: dollar_flows past-date readers PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_DOLLAR_FLOWS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dollar_flows_past_date_readers.py -q -rA -k real_types
+
       # Stored-close backfill (scripts/close_backfill_universe.py): the work
       # queries, the completed-close reader and the fill-only write on
       # PostgreSQL. The test fails instead of skipping when

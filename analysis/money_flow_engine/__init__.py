@@ -22,6 +22,7 @@ from datetime import date, datetime, timezone
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from .etf_flow_evidence import utc_today
 from .flow_inference import infer_flow_edges
 from .layer_corporate import build_corporate_layer
 from .layer_credit import build_credit_layer
@@ -54,7 +55,7 @@ def build_flow_map(engine: Engine, as_of: date | None = None) -> FlowMap:
     Returns an immutable FlowMap with all layers and edges.
     """
     if as_of is None:
-        as_of = date.today()
+        as_of = utc_today()
 
     log.info("Building 8-layer flow map for {d}", d=as_of)
 

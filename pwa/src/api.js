@@ -4,6 +4,7 @@
  */
 import { clearAuthSession, getStoredToken } from './authSession.js';
 import useRealtimeStore from './stores/realtimeStore.js';
+import { httpErrorMessage } from './utils/httpError.js';
 
 const DEFAULT_GET_CACHE_TTL_MS = 60_000;
 const PRELOAD_CONCURRENCY = 4;
@@ -262,7 +263,9 @@ class GRIDApi {
                     collectorUnavailable = gammaState && response.status === 503
                         && parsed.status === 'unavailable' && parsed.data === null;
                 } catch (_) {
-                    if (body) message = body;
+                    message = httpErrorMessage(
+                        response.status, response.statusText, body, response.headers?.get?.('content-type'),
+                    );
                 }
 
                 // Only treat 401 as session expiry for non-auth endpoints
@@ -619,7 +622,9 @@ class GRIDApi {
                     const parsed = JSON.parse(body);
                     message = parsed.detail || parsed.message || message;
                 } catch (_) {
-                    if (body) message = body;
+                    message = httpErrorMessage(
+                        response.status, response.statusText, body, response.headers?.get?.('content-type'),
+                    );
                 }
                 return { error: true, status: response.status, message };
             }

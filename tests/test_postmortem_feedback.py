@@ -459,8 +459,11 @@ def test_batch_postmortem_limit_param_caps_per_source():
         batch_postmortem(_SpyEngine(), days=30)
         # The DDL/ensure path may also call execute; filter to the trade
         # + pred SELECTs by SQL contents.
-        select_calls = [c for c in captured if "FROM options_recommendations" in c["sql"]
-                        or "FROM oracle_predictions" in c["sql"]]
+        # The bounded "still waiting" COUNT queries (their own LIMIT 1001, #959 budget follow-up) are not
+        # the batch selections this test is about.
+        select_calls = [c for c in captured
+                        if ("FROM options_recommendations" in c["sql"] or "FROM oracle_predictions" in c["sql"])
+                        and not c["sql"].strip().startswith("SELECT COUNT(*) FROM (")]
         assert len(select_calls) == 2  # one trades, one predictions
         for call in select_calls:
             assert "LIMIT" not in call["sql"].upper()
@@ -469,8 +472,11 @@ def test_batch_postmortem_limit_param_caps_per_source():
         # Now: limit=20 → both SELECTs gain LIMIT :lim and params carry lim=20.
         captured.clear()
         batch_postmortem(_SpyEngine(), days=30, limit=20)
-        select_calls = [c for c in captured if "FROM options_recommendations" in c["sql"]
-                        or "FROM oracle_predictions" in c["sql"]]
+        # The bounded "still waiting" COUNT queries (their own LIMIT 1001, #959 budget follow-up) are not
+        # the batch selections this test is about.
+        select_calls = [c for c in captured
+                        if ("FROM options_recommendations" in c["sql"] or "FROM oracle_predictions" in c["sql"])
+                        and not c["sql"].strip().startswith("SELECT COUNT(*) FROM (")]
         assert len(select_calls) == 2
         for call in select_calls:
             assert "LIMIT :lim" in call["sql"]
@@ -479,8 +485,11 @@ def test_batch_postmortem_limit_param_caps_per_source():
         # Edge: limit=0 (or negative) → behave like no limit (off-switch).
         captured.clear()
         batch_postmortem(_SpyEngine(), days=30, limit=0)
-        select_calls = [c for c in captured if "FROM options_recommendations" in c["sql"]
-                        or "FROM oracle_predictions" in c["sql"]]
+        # The bounded "still waiting" COUNT queries (their own LIMIT 1001, #959 budget follow-up) are not
+        # the batch selections this test is about.
+        select_calls = [c for c in captured
+                        if ("FROM options_recommendations" in c["sql"] or "FROM oracle_predictions" in c["sql"])
+                        and not c["sql"].strip().startswith("SELECT COUNT(*) FROM (")]
         for call in select_calls:
             assert "LIMIT" not in call["sql"].upper()
 
