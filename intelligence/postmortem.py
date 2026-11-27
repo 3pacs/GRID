@@ -674,6 +674,34 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
 
 # ── 3. Batch Post-Mortem ──────────────────────────────────────────────────
 
+_WAITING_COUNT_BOUND = 1000
+
+
+def _count_waiting(engine: Engine, selections: dict[str, str], params: dict[str, Any]) -> str:
+    """"trades=N, predictions=M" still eligible, each counted up to ``_WAITING_COUNT_BOUND`` ("1000+").
+
+    Never raises: a failed count reads "unknown", it must not fail the batch.
+    """
+    cutoff_params = {"cutoff": params["cutoff"]}
+    parts: list[str] = []
+    for name, base_sql in selections.items():
+        try:
+            with engine.connect() as conn:
+                n = conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM (" + base_sql + "\n        LIMIT "
+                        + str(_WAITING_COUNT_BOUND + 1) + ") AS waiting"
+                    ),
+                    cutoff_params,
+                ).scalar()
+            n = int(n)
+            parts.append(f"{name}={_WAITING_COUNT_BOUND}+" if n > _WAITING_COUNT_BOUND else f"{name}={n}")
+        except Exception as exc:
+            log.debug("Post-mortem: waiting count for {k} failed: {e}", k=name, e=str(exc))
+            parts.append(f"{name}=unknown")
+    return ", ".join(parts)
+
+
 def batch_postmortem(
     engine: Engine,
     days: int = 30,
@@ -737,6 +765,8 @@ def batch_postmortem(
         ORDER BY scored_at DESC
     """
     params: dict[str, Any] = {"cutoff": cutoff}
+    # The same selections without the batch LIMIT, for the bounded "how many are still waiting" count below.
+    remaining_sql = {"trades": trade_sql, "predictions": pred_sql}
     if limit is not None and int(limit) > 0:
         trade_sql += "\n        LIMIT :lim"
         pred_sql += "\n        LIMIT :lim"
@@ -780,10 +810,16 @@ def batch_postmortem(
     if postmortems:
         _log_aggregate_patterns(postmortems, days)
 
+    # How many eligible rows are STILL waiting after this run, counted up to a bound (an unbounded NOT IN
+    # count over the whole corpus is not something a nightly step should run). A batch that processes fewer
+    # rows than arrive falls behind; this makes that visible in the log instead of silent.
+    waiting = _count_waiting(engine, remaining_sql, params)
+
     log.info(
         "Batch post-mortem complete: {n} failures analysed over {d} days"
-        "{lim_note}{dl_note}",
+        "{lim_note}{dl_note}; still waiting after this run: {w}",
         n=len(postmortems), d=days,
+        w=waiting,
         lim_note=f" (limit={limit} per source)" if limit else "",
         dl_note=(
             " (stopped at its deadline; the remaining rows are picked up by the next run)"

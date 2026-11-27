@@ -119,3 +119,65 @@ def test_the_budget_is_sized_to_the_work_and_fits_the_daily_intel_cycle():
     task = next(t for t in ho.DAILY_INTEL_TASKS if t.name == "postmortem_batch")
     assert task.budget_s == ho.DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S
     assert ho.DAILY_INTEL_TASKS[-1].name == "postmortem_batch"      # still last: it must not delay the others
+
+
+# ── falling behind must be visible: the run logs how many eligible rows are still waiting ───────────────
+
+def _batch_with_counts(monkeypatch, counts, *, count_fails=False):
+    """batch_postmortem on an engine whose bounded COUNT(*) queries return ``counts`` per source."""
+    clock = _Clock()
+    monkeypatch.setattr(pm_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
+    monkeypatch.setattr(pm_mod, "_log_aggregate_patterns", lambda *_a, **_k: None)
+    seen_sql: list[str] = []
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt, params=None):
+            sql = " ".join(str(stmt).split())
+            seen_sql.append(sql)
+            res = MagicMock()
+            if sql.startswith("SELECT COUNT(*) FROM ("):
+                if count_fails:
+                    raise RuntimeError("count blip")
+                res.scalar.return_value = counts["trades" if "options_recommendations" in sql else "predictions"]
+            else:
+                res.fetchall.return_value = []
+            return res
+
+    engine = MagicMock()
+    engine.connect.side_effect = lambda: _Conn()
+    fake_log = MagicMock()
+    monkeypatch.setattr(pm_mod, "log", fake_log)
+    result = pm_mod.batch_postmortem(engine, days=30, limit=20, deadline=100.0)
+    complete = [c for c in fake_log.info.call_args_list if "Batch post-mortem complete" in c.args[0]]
+    assert len(complete) == 1
+    return result, complete[0].kwargs["w"], seen_sql
+
+
+def test_the_run_reports_how_many_eligible_rows_are_still_waiting(monkeypatch):
+    result, waiting, sql = _batch_with_counts(monkeypatch, {"trades": 0, "predictions": 37})
+    assert result == []
+    assert waiting == "trades=0, predictions=37"
+    counts = [q for q in sql if q.startswith("SELECT COUNT(*) FROM (")]
+    assert len(counts) == 2
+    # Bounded, so a nightly step never counts the whole corpus; and it is the same selection the batch uses.
+    assert all(q.endswith("LIMIT 1001) AS waiting") for q in counts)
+    assert any("options_recommendations" in q and "actual_return" in q for q in counts)
+    assert any("oracle_predictions" in q and "pnl_pct" in q for q in counts)
+
+
+def test_a_large_backlog_reads_as_at_least_the_bound(monkeypatch):
+    _result, waiting, _sql = _batch_with_counts(monkeypatch, {"trades": 5, "predictions": 1001})
+    assert waiting == "trades=5, predictions=1000+"
+
+
+def test_a_failed_count_reads_unknown_and_never_fails_the_batch(monkeypatch):
+    result, waiting, _sql = _batch_with_counts(monkeypatch, {}, count_fails=True)
+    assert result == []
+    assert waiting == "trades=unknown, predictions=unknown"
