@@ -32,52 +32,99 @@ def _zscore_ts(series: pd.DataFrame, window: int) -> pd.DataFrame:
     return (series - mu) / (sigma + 1e-8)
 
 
-def _returns_on_own_dates(own: pd.DataFrame) -> pd.DataFrame:
-    """Simple returns between a ticker's consecutive observations.
+#: A ticker is ranked on a date only against at least this many peers on the
+#: same market calendar, so each 20 % tail holds at least four names. A row
+#: with fewer gives no rank (never percentile 1.0 for a lone name).
+MIN_RANK_PEERS = 20
 
-    A return is kept only when no NYSE session lies strictly between the two
-    observations: Friday to Monday and Wednesday to Friday over Thanksgiving
-    are one step, a missing session's data is not bridged (NaN, as before).
-    """
+CALENDAR_XNYS = "XNYS"            # trades NYSE sessions only
+CALENDAR_CONTINUOUS = "24x7"      # observed on weekends/holidays (crypto, GOLD)
+#: Share of a ticker's observations on non-NYSE days above which it is a
+#: 24-hour series. A daily-traded series has about 2/7 on weekends alone; an
+#: equity with a stray holiday print stays XNYS and that print is dropped.
+_CONTINUOUS_SHARE = 0.15
+
+
+def _ticker_calendar(dates: list) -> str:
     from ingestion.market_calendar import is_market_open
 
-    returns = own.pct_change(fill_method=None)
-    dates = [ts.date() for ts in own.index]
-    for i in range(1, len(dates)):
-        day = dates[i - 1] + timedelta(days=1)
-        while day < dates[i]:
-            if is_market_open(day):
-                returns.iloc[i] = np.nan
-                break
-            day += timedelta(days=1)
-    return returns
+    off = sum(1 for d in dates if not is_market_open(d))
+    return CALENDAR_CONTINUOUS if dates and off / len(dates) > _CONTINUOUS_SHARE else CALENDAR_XNYS
+
+
+def _calendar_grid(first, last, calendar: str) -> list:
+    """Every date the ticker's market was open from ``first`` to ``last``."""
+    from ingestion.market_calendar import is_market_open
+
+    days, day = [], first
+    while day <= last:
+        if calendar == CALENDAR_CONTINUOUS or is_market_open(day):
+            days.append(day)
+        day += timedelta(days=1)
+    return days
 
 
 def _on_observed_dates(
     prices: pd.DataFrame,
     raw_fn: Callable[[pd.DataFrame], pd.DataFrame],
-) -> pd.DataFrame:
-    """Apply a returns transform to each ticker on that ticker's own dates.
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Apply a returns transform to each ticker on its own market calendar.
 
     The price panel's index is the union of every ticker's observation dates,
-    so it carries weekend and exchange-holiday rows for 24-hour tickers
-    (crypto, GOLD) on which every equity is NaN. Computing an equity's returns
-    and rolling windows on that index measures the first session after a
-    closed day against a NaN: the value is NaN and the ticker is never ranked,
-    so the equity momentum factors went silent on every Monday and every
-    post-holiday session. Here each column's returns are computed on its own
-    non-NaN rows (``_returns_on_own_dates``), ``raw_fn`` runs on them (its
-    windows count that ticker's own observations), and the result is placed
-    back on the shared index.
+    so it carries weekend and exchange-holiday rows for 24-hour tickers on
+    which every equity is NaN. On that index the first equity return after a
+    closed day was NaN and windows counted other tickers' days.
+
+    Here each ticker is placed on its own calendar (``_ticker_calendar``):
+    NYSE sessions for an equity, every day for a 24-hour series. Closed days
+    are not rows, so Friday to Monday and Wednesday to Friday over Thanksgiving
+    are one step. A session the market held but the data lacks stays a NaN
+    row: the return into it and the return out of it are NaN, and it occupies
+    one slot of every rolling window (a 20-session window after a missing
+    session covers 20 sessions with 19 or fewer returns; ``min_periods``
+    decides). ``raw_fn`` runs on those returns; the result is placed back on
+    the shared index. Returns the result and each ticker's calendar.
     """
     out: dict[str, pd.Series] = {}
+    calendars: dict[str, str] = {}
     for col in prices.columns:
-        own = prices[[col]].dropna()
+        own = prices[col].dropna()
         if own.empty:
             out[col] = pd.Series(np.nan, index=prices.index, dtype=float)
             continue
-        out[col] = raw_fn(_returns_on_own_dates(own))[col].reindex(prices.index)
-    return pd.DataFrame(out, index=prices.index, columns=prices.columns)
+        dates = [ts.date() for ts in own.index]
+        calendar = _ticker_calendar(dates)
+        calendars[col] = calendar
+        grid = pd.DatetimeIndex(_calendar_grid(dates[0], dates[-1], calendar))
+        series = own[own.index.isin(grid)].reindex(grid)
+        returns = series.pct_change(fill_method=None).to_frame(col)
+        out[col] = raw_fn(returns)[col].reindex(prices.index)
+    return pd.DataFrame(out, index=prices.index, columns=prices.columns), calendars
+
+
+def _rank_by_calendar(
+    signal: pd.DataFrame, calendars: dict[str, str], min_peers: int,
+) -> pd.DataFrame:
+    """Cross-sectional percentile per row within each market calendar.
+
+    Equities are never ranked against 24-hour series. A row of a calendar
+    with fewer than ``min_peers`` values gives no rank. The returned frame's
+    ``attrs["rank_universe_size"]`` holds, per cell, the number of peers its
+    rank was taken among.
+    """
+    ranked = pd.DataFrame(np.nan, index=signal.index, columns=signal.columns)
+    sizes = pd.DataFrame(np.nan, index=signal.index, columns=signal.columns)
+    for calendar in sorted(set(calendars.values())):
+        cols = [c for c in signal.columns if calendars.get(c) == calendar]
+        group = signal[cols]
+        count = group.notna().sum(axis=1)
+        enough = count >= min_peers
+        ranked.loc[enough, cols] = group.loc[enough].rank(axis=1, pct=True)
+        sizes.loc[enough, cols] = group.loc[enough].notna().mul(count[enough], axis=0).where(
+            group.loc[enough].notna())
+    ranked.attrs["rank_universe_size"] = sizes
+    ranked.attrs["calendar"] = dict(calendars)
+    return ranked
 
 
 def vol_regime_adaptive_momentum(
@@ -234,14 +281,16 @@ def vol_regime_adaptive_equity(
     vol_window: int = 30,
     vol_zscore_window: int = 30,
     vol_threshold: float = 0.3,
+    min_peers: int = MIN_RANK_PEERS,
 ) -> pd.DataFrame:
     """
     Vol Regime Adaptive Momentum — equity-tuned variant.
 
     Equities mean-revert faster and have noisier short-term momentum than
     commodity futures.  Wider windows + lower vol threshold reduce whipsaw.
-    Each ticker is computed on its own observed dates (``_on_observed_dates``)
-    so a weekend or holiday row from a 24-hour ticker cannot blank it.
+    Each ticker is computed on its own market calendar
+    (``_on_observed_dates``) and ranked only among at least ``min_peers``
+    peers on that calendar (``_rank_by_calendar``).
     """
     def raw(returns: pd.DataFrame) -> pd.DataFrame:
         short_mom = _zscore_ts(returns, short_window)
@@ -255,7 +304,8 @@ def vol_regime_adaptive_equity(
             columns=returns.columns,
         )
 
-    return _rank_cross_section(_on_observed_dates(prices, raw))
+    signal, calendars = _on_observed_dates(prices, raw)
+    return _rank_by_calendar(signal, calendars, min_peers)
 
 
 def dual_horizon_equity(
@@ -264,21 +314,24 @@ def dual_horizon_equity(
     medium_window: int = 20,
     short_weight: float = 1.5,
     medium_weight: float = 1.0,
+    min_peers: int = MIN_RANK_PEERS,
 ) -> pd.DataFrame:
     """
     Dual Horizon Momentum — equity-tuned variant.
 
     Longer lookbacks (10d/20d vs 5d/10d) capture equity momentum without
     the microstructure noise that dominates commodity futures at 5-day.
-    Each ticker is computed on its own observed dates (``_on_observed_dates``)
-    so a weekend or holiday row from a 24-hour ticker cannot blank it.
+    Each ticker is computed on its own market calendar
+    (``_on_observed_dates``) and ranked only among at least ``min_peers``
+    peers on that calendar (``_rank_by_calendar``).
     """
     def raw(returns: pd.DataFrame) -> pd.DataFrame:
         z_short = _zscore_ts(returns, short_window)
         z_med = _zscore_ts(returns, medium_window)
         return short_weight * z_short + medium_weight * z_med
 
-    return _rank_cross_section(_on_observed_dates(prices, raw))
+    signal, calendars = _on_observed_dates(prices, raw)
+    return _rank_by_calendar(signal, calendars, min_peers)
 
 
 def compute_all_signals(

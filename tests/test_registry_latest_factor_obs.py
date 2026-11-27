@@ -50,18 +50,25 @@ def test_republish_count_does_not_change_a_tickers_weight() -> None:
     assert sorted(r["id"] for r in kept) == [0, 100]
 
 
-def test_rows_without_an_observation_date_are_untouched() -> None:
+def test_rows_of_other_sources_are_untouched() -> None:
     rows = [
         _row("alpha_research:vol_price_divergence", "QQQ", None, 1),
         _row("alpha_research:vol_price_divergence", "QQQ", None, 2),
         _row("alpha_research:vix_exposure", None, None, 3),
-        _row(SRC, "QQQ", None, 4),  # published before the field existed
-        _row(SRC, "QQQ", "2026-11-30", 5),
+        _row(SRC, "SPY", None, 4),  # no dated row for SPY yet: kept
         {"id": 6, "source_module": "x", "ticker": "QQQ", "metadata": "not json"},
         {"id": 7, "source_module": "x", "ticker": "QQQ", "metadata": None},
     ]
 
-    assert [r["id"] for r in latest_factor_obs_only(rows)] == [1, 2, 3, 4, 5, 6, 7]
+    assert [r["id"] for r in latest_factor_obs_only(rows)] == [1, 2, 3, 4, 6, 7]
+
+
+def test_changeover_counts_one_vote() -> None:
+    """Rows from the previous code (no factor_obs_date) stay valid up to 24 h after deploy."""
+    legacy = [_row(SRC, "QQQ", None, 10 + i, minutes=-30 - i) for i in range(50)]
+    rows = legacy + [_row(SRC, "QQQ", "2026-11-30", 1, minutes=5)]
+
+    assert [r["id"] for r in latest_factor_obs_only(rows)] == [1]
 
 
 def test_sources_are_kept_apart() -> None:

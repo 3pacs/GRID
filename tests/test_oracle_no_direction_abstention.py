@@ -229,9 +229,72 @@ def test_a_receipt_that_fails_at_the_decision_clock_turns_no_direction_into_a_qu
     assert abstain[0].flow_context["abstention_kind"] == "no_direction"
     late = [replace(p, timestamp=NOW + timedelta(minutes=16)) for p in abstain]  # quote now 21 min old
 
-    committed, inserts, counts = _store(late, [True], monkeypatch)
+    _, inserts, counts = _store(late, [True], monkeypatch)
 
     fc = json.loads(inserts[0]["fc"])
     assert fc["abstention_kind"] == "no_qualified_quote"
     assert inserts[0]["score_notes"] == "quote is older than the 20-minute reference limit"
     assert counts["abstentions"] == 1
+
+
+def test_a_no_direction_row_after_a_quote_abstention_is_a_duplicate_and_the_pass_reads_abstained_other(
+    monkeypatch,
+) -> None:
+    """Both kinds are NONE under one unique key: the first stored row stays.
+
+    The 14:31 pass stored a quote abstention for the model; the 14:41 pass,
+    with a valid quote and no direction, collides with it. The stored row
+    keeps the quote reason, while this pass's outcome (what the retry plan
+    reads) says the ticker abstained for another reason, not for a quote.
+    """
+    from dataclasses import replace
+
+    first = _oracle([_neutral(n) for n in "abc"], receipt=_receipt(
+        market_at=(NOW - timedelta(minutes=25)).isoformat(),
+        capture_started_at=(NOW - timedelta(minutes=24)).isoformat(),
+        capture_completed_at=(NOW - timedelta(minutes=24)).isoformat(),
+        available_at=(NOW - timedelta(minutes=24)).isoformat(),
+        read_observed_at=(NOW - timedelta(minutes=23)).isoformat(),
+    ))._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)
+    later = NOW + timedelta(minutes=10)
+    second = _oracle([_neutral(n) for n in "abc"], receipt=_receipt(
+        market_at=(later - timedelta(minutes=5)).isoformat(),
+        capture_started_at=(later - timedelta(minutes=4)).isoformat(),
+        capture_completed_at=(later - timedelta(minutes=4)).isoformat(),
+        available_at=(later - timedelta(minutes=4)).isoformat(),
+        read_observed_at=(later - timedelta(minutes=3)).isoformat(),
+    ))._oracle_one_ticker(1, "SPY", 1, later, {}, horizon_days=1)
+    second = [replace(p, timestamp=later) for p in second]
+
+    _, first_rows, _ = _store(first, [True], monkeypatch)
+    _, second_rows, counts = _store(second, [False], monkeypatch)
+
+    key = ("t", "d", "exp", "pt", "mn", "mv", "rp")
+    assert [first_rows[0][k] for k in key] == [second_rows[0][k] for k in key]
+    assert first_rows[0]["created_at"].date() == second_rows[0]["created_at"].date()
+    assert json.loads(first_rows[0]["fc"])["abstention_kind"] == "no_qualified_quote"
+    assert json.loads(second_rows[0]["fc"])["abstention_kind"] == "no_direction"
+    assert counts["duplicates"] == 1
+
+
+def test_pass_outcome_of_a_duplicate_no_direction_row(monkeypatch) -> None:
+    from oracle.forward_health import TICKER_ABSTAINED_OTHER, pass_outcome
+
+    abstain = _oracle([_neutral(n) for n in "abc"])._oracle_one_ticker(1, "SPY", 1, NOW, {}, horizon_days=1)
+    from oracle.model_factory import ModelFactory
+
+    conn = _InsertRecorder([False])
+    begin = MagicMock()
+    begin.__enter__ = lambda self: conn
+    begin.__exit__ = lambda self, *exc: False
+    oracle = oe.OracleEngine.__new__(oe.OracleEngine)
+    oracle.engine = MagicMock()
+    oracle.engine.begin.return_value = begin
+    monkeypatch.setattr(ModelFactory, "active_model_names",
+                        staticmethod(lambda conn, names, lock=False: set(names)))
+    oracle._store_predictions(abstain)
+
+    outcome = pass_outcome(["SPY"], oracle._last_store_detail)
+
+    assert outcome["ticker_outcomes"]["SPY"] == TICKER_ABSTAINED_OTHER
+    assert outcome["all_abstained"] is True

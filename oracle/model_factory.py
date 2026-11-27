@@ -366,8 +366,10 @@ def latest_factor_obs_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     at each session's first pull), so it would weight tickers by publication
     count, not evidence. Keep, per (source_module, ticker), the single row
     with the newest ``factor_obs_date`` and, among those, the newest
-    ``valid_from``. Rows without the field (every other source, and factor
-    rows published before it existed) are unchanged.
+    ``valid_from``. Once a (source_module, ticker) has a row with the field,
+    its rows without it (published by the previous code and still valid for
+    up to 24 h after the change) are dropped too, so the changeover counts one
+    vote. Rows of a key with no such row (every other source) are unchanged.
     """
     best: dict[tuple[Any, Any], tuple[str, Any, int]] = {}
     for i, row in enumerate(rows):
@@ -380,7 +382,12 @@ def latest_factor_obs_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if held is None or _newer(rank, held):
             best[key] = rank
     keep = {-rank[2] for rank in best.values()}
-    return [row for i, row in enumerate(rows) if _factor_obs_date(row) is None or i in keep]
+    return [
+        row for i, row in enumerate(rows)
+        if i in keep
+        or (_factor_obs_date(row) is None
+            and (row.get("source_module"), row.get("ticker")) not in best)
+    ]
 
 
 def _newer(a: tuple[str, Any, int], b: tuple[str, Any, int]) -> bool:

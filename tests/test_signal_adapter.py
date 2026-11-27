@@ -192,11 +192,11 @@ def test_publish_factor_signals_writes_registry_payload_shape() -> None:
     assert row["freshness_hours"] == 3.0
     assert row["valid_from"].tzinfo is timezone.utc
     assert row["valid_until"] - row["valid_from"] == timedelta(hours=3)
+    # The unbounded path keeps the original payload: no factor_obs_date, so
+    # the registry reader leaves its copies (and their vote) as they were.
     assert json.loads(row["metadata"]) == {
         "signal_name": "dual_horizon_equity",
         "rank": 0.95,
-        "factor_obs_date": "2026-06-15",
-        "rank_universe_size": 5,
     }
     assert row["provenance"] == f"alpha_research/dual_horizon_equity as_of {AS_OF}"
 
@@ -318,6 +318,7 @@ def test_publish_all_alpha_signals_orchestrates_factor_and_regime_publish(
         "alpha_research.signals.quanta_alpha",
         _module(
             "alpha_research.signals.quanta_alpha",
+            MIN_RANK_PEERS=5,
             vol_price_divergence=factor("vol_price_divergence"),
             vol_regime_adaptive_equity=factor("vol_regime_adaptive_equity"),
             dual_horizon_equity=factor("dual_horizon_equity"),
@@ -357,6 +358,14 @@ def test_publish_all_alpha_signals_orchestrates_factor_and_regime_publish(
         "alpha_research:vix_exposure": 1,
         "alpha_research:credit_cycle": 1,
     }
+
+    for row in _registry_rows(engine):
+        meta = json.loads(row["metadata"])
+        if row["source_module"] == "alpha_research:vol_price_divergence":
+            assert "factor_obs_date" not in meta  # unbounded: payload and vote unchanged
+        elif row["source_module"] in ("alpha_research:vol_regime_equity",
+                                      "alpha_research:dual_horizon_equity"):
+            assert meta["factor_obs_date"] == "2026-06-15"
 
     vix_row = [
         row
@@ -406,6 +415,7 @@ def test_publish_all_alpha_signals_skips_empty_prices_and_unknown_regimes(
         "alpha_research.signals.quanta_alpha",
         _module(
             "alpha_research.signals.quanta_alpha",
+            MIN_RANK_PEERS=5,
             vol_price_divergence=lambda *_args, **_kwargs: _factor_panel(),
             vol_regime_adaptive_equity=lambda *_args, **_kwargs: _factor_panel(),
             dual_horizon_equity=lambda *_args, **_kwargs: _factor_panel(),
@@ -517,6 +527,8 @@ def test_without_a_session_bound_only_the_last_row_is_published() -> None:
 
     assert count == 5
     assert "SPY" not in _registry_rows_by_ticker(engine)
+    assert all("factor_obs_date" not in json.loads(r["metadata"])
+               for r in _registry_rows(engine))
 
 
 def test_publish_all_bounds_only_the_equity_momentum_factors(
@@ -526,7 +538,7 @@ def test_publish_all_bounds_only_the_equity_momentum_factors(
 
     def recorder(engine_arg: Any, signal_name: str, panel: Any, as_of_date: Any = None,
                  **kwargs: Any) -> int:
-        seen[signal_name] = kwargs.get("max_sessions_behind")
+        seen[signal_name] = (kwargs.get("max_sessions_behind"), kwargs.get("min_row_universe", 5))
         return 0
 
     prices = pd.DataFrame({"AAPL": [1.0, 2.0]}, index=pd.to_datetime(["2026-06-12", "2026-06-15"]))
@@ -540,6 +552,7 @@ def test_publish_all_bounds_only_the_equity_momentum_factors(
         "alpha_research.signals.credit_cycle", compute_credit_cycle=lambda *a: {"confidence": 0}))
     monkeypatch.setitem(sys.modules, "alpha_research.signals.quanta_alpha", _module(
         "alpha_research.signals.quanta_alpha",
+        MIN_RANK_PEERS=20,
         vol_price_divergence=lambda p: p,
         vol_regime_adaptive_equity=lambda p: p,
         dual_horizon_equity=lambda p: p,
@@ -548,9 +561,9 @@ def test_publish_all_bounds_only_the_equity_momentum_factors(
     signal_adapter.publish_all_alpha_signals(_RecordingEngine(), as_of_date=AS_OF)
 
     assert seen == {
-        "vol_price_divergence": None,
-        "vol_regime_equity": 1,
-        "dual_horizon_equity": 1,
+        "vol_price_divergence": (None, 5),
+        "vol_regime_equity": (1, 20),
+        "dual_horizon_equity": (1, 20),
     }
 
 
@@ -597,3 +610,84 @@ def test_an_expired_observation_is_not_published_at_all(monkeypatch: pytest.Monk
 
     assert "SPY" not in _registry_rows_by_ticker(engine)
     assert "QQQ" in _registry_rows_by_ticker(engine)
+
+
+# ── Per-row peer coverage (min_row_universe) ────────────────────────────────
+
+
+def _sparse_latest_panel(prior_names: int) -> pd.DataFrame:
+    """Tuesday: ``prior_names`` tickers ranked. Wednesday: QQQ alone (percentile 1.0)."""
+    names = ["QQQ"] + [f"T{i}" for i in range(prior_names - 1)]
+    tue = {t: (i + 1) / prior_names for i, t in enumerate(names)}
+    wed = {t: float("nan") for t in names} | {"QQQ": 1.0}
+    return pd.DataFrame([tue, wed], index=pd.to_datetime(["2026-11-24", "2026-11-25"]))
+
+
+def test_a_lone_name_on_the_newest_row_is_published_from_its_last_populated_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 25)))
+    panel = _sparse_latest_panel(prior_names=8)
+    engine = _RecordingEngine()
+
+    signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 25),
+        max_sessions_behind=1, min_row_universe=8,
+    )
+
+    meta = json.loads(_registry_rows_by_ticker(engine)["QQQ"]["metadata"])
+    assert meta["factor_obs_date"] == "2026-11-24"   # not the 1-name Wednesday row
+    assert meta["rank"] == pytest.approx(1 / 8)
+    assert meta["rank_universe_size"] == 8
+
+
+@pytest.mark.parametrize(("prior_names", "published"), [(8, True), (7, False)])
+def test_peer_minimum_boundary(prior_names: int, published: bool,
+                               monkeypatch: pytest.MonkeyPatch) -> None:
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 25)))
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", _sparse_latest_panel(prior_names),
+        as_of_date=date(2026, 11, 25), max_sessions_behind=1, min_row_universe=8,
+    )
+
+    assert ("QQQ" in _registry_rows_by_ticker(engine)) is published
+    assert count == (prior_names if published else 0)
+
+
+def test_a_lone_name_with_no_populated_row_in_the_bound_is_not_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Thursday 11-26 is a holiday; on Monday 11-30 the bound reaches back to
+    # Friday 11-27 only, so Tuesday's populated row is out of reach.
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 30)))
+    panel = _sparse_latest_panel(prior_names=8)
+    panel.index = pd.to_datetime(["2026-11-25", "2026-11-30"])
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 30),
+        max_sessions_behind=1, min_row_universe=8,
+    )
+
+    assert count == 0
+
+
+def test_recorded_same_calendar_peers_take_precedence_over_the_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A factor that ranked within a calendar group records that group's size."""
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 25)))
+    panel = _sparse_latest_panel(prior_names=8)
+    sizes = panel.notna().astype(float).where(panel.notna())
+    sizes.loc[pd.Timestamp("2026-11-24")] = 3.0  # only 3 same-calendar peers that day
+    panel.attrs["rank_universe_size"] = sizes
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 25),
+        max_sessions_behind=1, min_row_universe=8,
+    )
+
+    assert count == 0
