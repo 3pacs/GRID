@@ -75,10 +75,18 @@ EXIT_REFUSED = 2
 EXIT_VALIDATE_PENDING = 4
 VALIDATE_SQL = f"ALTER TABLE dollar_flows VALIDATE CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}"
 DROP_SQL = f"ALTER TABLE dollar_flows DROP CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT}"
-READD_SQL = (
-    f"ALTER TABLE dollar_flows ADD CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT} "
-    f"CHECK {DOLLAR_FLOWS_CONTRACT_CHECK_SQL} NOT VALID"
-)
+
+
+def readd_sql(check_sql: str = DOLLAR_FLOWS_CONTRACT_CHECK_SQL) -> str:
+    """ADD ... NOT VALID for ``check_sql``; parenthesised whole, so several
+    contracts joined by AND stay one CHECK expression."""
+    return (
+        f"ALTER TABLE dollar_flows ADD CONSTRAINT {DOLLAR_FLOWS_CONTRACT_CONSTRAINT} "
+        f"CHECK ({check_sql}) NOT VALID"
+    )
+
+
+READD_SQL = readd_sql()
 
 
 class Refused(RuntimeError):

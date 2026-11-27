@@ -376,7 +376,11 @@ def test_after_restore_nothing_re_adds_the_constraint_but_the_printed_statement_
 
 def test_apply_reports_a_pending_validation_and_exits_4(pg, tmp_path, capsys, monkeypatch):
     """The delete commits first; if the separate VALIDATE cannot get its lock,
-    the report says so, names the statement, and the exit status is 4."""
+    the report says so, names the statement, and the exit status is 4.
+
+    The failure is injected (``_validate_constraint`` raises the error a lock
+    timeout gives), so this proves the reporting path, not a real lock wait;
+    a real lock wait is covered for the delete's own transaction below."""
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
     ids = _seed_production_shape(pg)
@@ -508,3 +512,21 @@ def test_repair_blocks_the_writer_until_it_commits(pg, tmp_path, capsys):
     assert out["deleted"] == len(ids["legacy"])
     assert order.index("repair_read_done") < order.index("writer_committed")
     assert len(_ids(pg)) == len(ids["keep"]) + 1
+
+
+def test_re_add_statement_stays_one_check_with_several_contracts(pg):
+    """With two contracts joined by AND, the printed ADD ... NOT VALID is still
+    valid SQL and enforces both terms."""
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+    two = dollar_flows.DOLLAR_FLOWS_CONTRACT_CHECK_SQL + " AND (source_type <> 'etf_flow' OR evidence ? 'direction_basis')"
+    with pg.begin() as conn:
+        conn.execute(text(repair.readd_sql(two)))
+    assert _constraint(pg) is False
+    for bad in ({"source_type": "13f", "direction": "inflow"}, {"source_type": "etf_flow", "direction": "inflow"}):
+        with pytest.raises(IntegrityError):
+            with pg.begin() as conn:
+                _insert(conn, flow_date=YESTERDAY, **bad)
+    with pg.begin() as conn:
+        _insert(conn, source_type="etf_flow", direction="neutral", flow_date=YESTERDAY,
+                evidence={"direction_basis": "unsigned_volume"})
