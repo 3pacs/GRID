@@ -13,8 +13,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.observations import read_window_known_at
-
+from .etf_flow_evidence import known_5d_flows
 from .types import FlowLayer, FlowNode
 
 # ── Constants ────────────────────────────────────────────────────────────
@@ -123,7 +122,7 @@ def _build_etf_flow_proxy(engine: Engine, as_of: date) -> FlowNode:
     Looks for series matching ``ETF_FLOW:<ticker>:5d`` pattern.
 
     Point-in-time: a date's value is the newest vintage *pulled by the end of
-    the UTC day* ``as_of`` (``store.observations.read_window_known_at``, pull
+    the UTC day* ``as_of`` (``etf_flow_evidence.known_5d_flows``, pull
     evidence only). The writer revises a recent date whose value changed, and
     stores a date no earlier than the day after it; neither a later revision
     nor a date first stored after ``as_of`` can reach a read for ``as_of``.
@@ -134,27 +133,11 @@ def _build_etf_flow_proxy(engine: Engine, as_of: date) -> FlowNode:
 
     try:
         with engine.connect() as conn:
-            series_ids = [str(row[0]) for row in conn.execute(
-                text("""
-                    SELECT DISTINCT series_id
-                    FROM raw_series
-                    WHERE series_id LIKE :pattern
-                      AND obs_date >= :start
-                      AND obs_date <= :end
-                      AND pull_status = 'SUCCESS'
-                """),
-                {"pattern": "ETF_FLOW:%:5d", "start": lookback, "end": as_of},
-            ).fetchall()]
-
-            # The latest date of each series that was held by the end of as_of.
-            seen: dict[str, float] = {}
-            for sid in sorted(series_ids):
-                known = read_window_known_at(conn, sid, as_of=as_of, lag=None, start=lookback)
-                if known:
-                    seen[sid] = known[-1].value
-            if seen:
-                value = sum(seen.values())
-                etf_count = len(seen)
+            held = known_5d_flows(conn, as_of, lookback)
+        # The latest date of each ETF that was held by the end of as_of.
+        if held:
+            value = sum(observations[-1].value for observations in held.values())
+            etf_count = len(held)
     except Exception as exc:
         log.warning("etf_flow_proxy query failed: {}", exc)
 

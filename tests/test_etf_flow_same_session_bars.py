@@ -28,7 +28,8 @@ import pandas as pd
 import pytest
 from sqlalchemy import text
 
-from analysis.money_flow_engine import layer_institutional
+from analysis import money_flow_engine
+from analysis.money_flow_engine import etf_flow_evidence, layer_crypto, layer_institutional, layer_market
 from ingestion import flow_materializer
 from ingestion.altdata import institutional_flows as inst
 from ingestion.smart_scheduler import _classify_outcome
@@ -367,3 +368,129 @@ def test_a_later_sync_replaces_the_value_so_the_table_is_not_a_history(engine, m
 
     assert _materialized(engine) == {"2026-11-20": 490.0}             # 403 is gone from this table
     assert "not a history" in flow_materializer.sync_etf_flows.__doc__
+
+
+# ── The whole flow map for a past date ─────────────────────────────────────
+#
+# Codex review 6084431576: with the 20 November value materialized as 403,
+# then corrected to 490 on the 24th and materialized again, the institutional
+# node kept 403 for as_of = 20 November while the market node, reading the
+# etf_flows table, returned the corrected value. Both are built by
+# build_flow_map(engine, as_of=...).
+
+NOV27 = date(2026, 11, 27)
+
+
+@pytest.fixture()
+def today_is(monkeypatch):
+    return lambda day: monkeypatch.setattr(etf_flow_evidence, "_utc_today", lambda: day)
+
+
+def _materialize_revise_and_materialize_again(engine, monkeypatch) -> None:
+    _store(engine, NOV19, 380.0, volume=1, pulled=datetime(2026, 11, 20, 5, 10))
+    _store(engine, NOV20, 403.0, volume=1, pulled=datetime(2026, 11, 20, 15, 0))
+    _etf_flows_table(engine, monkeypatch)
+    flow_materializer.sync_etf_flows(engine)
+    assert _materialized(engine) == {"2026-11-19": 380.0, "2026-11-20": 403.0}
+    _store(engine, NOV20, 490.0, volume=1, pulled=datetime(2026, 11, 24, 5, 10))
+    flow_materializer.sync_etf_flows(engine)
+    assert _materialized(engine) == {"2026-11-19": 380.0, "2026-11-20": 490.0}     # the table now holds the correction
+
+
+def _node(flow_map, node_id: str):
+    (node,) = [n for layer in flow_map.layers for n in layer.nodes if n.id == node_id]
+    return node
+
+
+@pytest.mark.parametrize("as_of,proxy,market", [
+    (NOV19, None, None),            # the 19th was first received on the 20th
+    (NOV20, 403.0, 380.0 + 403.0),  # the correction did not exist yet
+    (NOV23, 403.0, 380.0 + 403.0),
+    (NOV24, 490.0, 380.0 + 490.0),  # received that day
+], ids=["before_first_receipt", "old_as_of", "day_before_the_correction", "day_of_the_correction"])
+def test_a_past_flow_map_shows_what_was_held_then_in_both_etf_nodes_after_rematerialization(
+    engine, monkeypatch, today_is, as_of, proxy, market
+):
+    _materialize_revise_and_materialize_again(engine, monkeypatch)
+    today_is(NOV27)
+
+    flow_map = money_flow_engine.build_flow_map(engine, as_of=as_of)
+
+    assert _node(flow_map, "etf_flow_proxy").value == proxy                 # institutional layer
+    market_node = _node(flow_map, "etf_flows")                              # market layer
+    assert market_node.value == market
+    assert market_node.source == etf_flow_evidence.RAW_SOURCE
+    assert market_node.metadata["current_views_withheld"] is True
+
+
+def test_control_the_table_alone_would_give_the_corrected_value_for_the_old_date(engine, monkeypatch):
+    """What the market node returned before: the current view, read for a past date."""
+    _materialize_revise_and_materialize_again(engine, monkeypatch)
+    with engine.connect() as conn:
+        leaked = conn.execute(text(
+            "SELECT SUM(flow_value) FROM etf_flows WHERE flow_date >= :s AND flow_date <= :e"),
+            {"s": NOV20 - timedelta(days=7), "e": NOV20}).scalar()
+    assert leaked == 380.0 + 490.0
+
+
+def test_todays_flow_map_still_reads_the_current_view(engine, monkeypatch, today_is):
+    _materialize_revise_and_materialize_again(engine, monkeypatch)
+    today_is(NOV24)
+
+    flow_map = money_flow_engine.build_flow_map(engine, as_of=NOV24)
+
+    market_node = _node(flow_map, "etf_flows")
+    assert market_node.value == 380.0 + 490.0 and market_node.source == "etf_flows"
+    assert market_node.metadata["evidence"] == "current_view"
+    assert _node(flow_map, "etf_flow_proxy").value == 490.0
+
+
+def test_the_market_nodes_dollar_flows_fallback_is_also_withheld_for_a_past_date(engine, today_is):
+    """dollar_flows is rewritten on each normalization: a current view too."""
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO dollar_flows (source_type, amount_usd, direction, flow_date) "
+            "VALUES ('etf_flow', 999.0, 'neutral', :d)"), {"d": NOV20})
+
+    today_is(NOV27)
+    past = layer_market._build_etf_flows(engine, NOV20)
+    assert past.value is None and past.metadata["current_views_withheld"] is True
+
+    today_is(NOV20)
+    current = layer_market._build_etf_flows(engine, NOV20)
+    assert current.value == 999.0 and current.source == "dollar_flows:etf_flow"
+
+
+def test_the_btc_etf_node_follows_the_same_rule(engine, monkeypatch, today_is):
+    _store(engine, NOV20, 10.0, volume=1, pulled=datetime(2026, 11, 20, 15, 0), series_id="ETF_FLOW:IBIT:5d")
+    _store(engine, NOV20, 25.0, volume=1, pulled=datetime(2026, 11, 24, 5, 10), series_id="ETF_FLOW:IBIT:5d")
+    _etf_flows_table(engine, monkeypatch)
+    flow_materializer.sync_etf_flows(engine)                             # the table holds 25
+
+    today_is(NOV27)
+    assert layer_crypto._build_btc_etf_flows_node(engine, NOV20).value == 10.0
+    assert layer_crypto._build_btc_etf_flows_node(engine, NOV24).value == 25.0
+    nothing_held = layer_crypto._build_btc_etf_flows_node(engine, NOV19)
+    assert nothing_held.value == 0.0 and nothing_held.source == "estimate"
+
+    today_is(NOV24)
+    current = layer_crypto._build_btc_etf_flows_node(engine, NOV24)
+    assert current.value == 25.0 and current.source == "etf_flows"
+
+
+def test_historical_means_before_todays_utc_date(today_is):
+    today_is(NOV24)
+    assert etf_flow_evidence.is_historical(NOV23) is True
+    assert etf_flow_evidence.is_historical(NOV24) is False
+    assert etf_flow_evidence.is_historical(NOV27) is False
+
+
+def test_known_5d_flows_is_keyed_by_ticker_and_limited_to_what_was_held(engine):
+    _first_seen_403_then_revised_to_490(engine)
+    with engine.connect() as conn:
+        on_the_20th = etf_flow_evidence.known_5d_flows(conn, NOV20, NOV20 - timedelta(days=10))
+        on_the_24th = etf_flow_evidence.known_5d_flows(conn, NOV24, NOV24 - timedelta(days=10))
+        only_qqq = etf_flow_evidence.known_5d_flows(conn, NOV24, NOV24 - timedelta(days=10), ["QQQ"])
+    assert [(o.obs_date, o.value) for o in on_the_20th["SPY"]] == [(NOV19, 380.0), (NOV20, 403.0)]
+    assert [(o.obs_date, o.value) for o in on_the_24th["SPY"]] == [(NOV19, 380.0), (NOV20, 490.0)]
+    assert only_qqq == {}

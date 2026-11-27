@@ -20,6 +20,7 @@ from .helpers import (
     compute_changes,
     dominant_confidence,
 )
+from .etf_flow_evidence import RAW_SOURCE, is_historical, known_5d_flows
 from .types import FlowLayer, FlowNode
 
 # ---------------------------------------------------------------------------
@@ -195,13 +196,25 @@ def _build_crypto_fear_greed_node(engine: Engine, as_of: date) -> FlowNode:
 
 
 def _build_btc_etf_flows_node(engine: Engine, as_of: date) -> FlowNode:
-    """BTC ETF flows from etf_flows table (IBIT, GBTC, FBTC)."""
+    """BTC ETF flows from etf_flows table (IBIT, GBTC, FBTC).
+
+    ``etf_flows`` is a current view with no receipt clock, so it is read only
+    for today. For a past ``as_of`` the node sums what the raw series held by
+    the end of that day (``etf_flow_evidence.known_5d_flows``) and falls back
+    to its estimate when nothing was held.
+    """
     total_flow: float | None = None
     per_ticker: dict[str, float] = {}
+    historical = is_historical(as_of)
 
     try:
         with engine.connect() as conn:
-            for ticker in _BTC_ETF_TICKERS:
+            if historical:
+                held = known_5d_flows(conn, as_of, as_of - timedelta(days=30), _BTC_ETF_TICKERS)
+                per_ticker = {
+                    ticker: sum(o.value for o in observations) for ticker, observations in held.items()
+                }
+            for ticker in ([] if historical else _BTC_ETF_TICKERS):
                 row = conn.execute(text("""
                     SELECT COALESCE(SUM(flow_value), 0) FROM etf_flows
                     WHERE ticker = :t
@@ -222,7 +235,7 @@ def _build_btc_etf_flows_node(engine: Engine, as_of: date) -> FlowNode:
 
     if total_flow is not None:
         confidence = "derived"
-        source = "etf_flows"
+        source = RAW_SOURCE if historical else "etf_flows"
         value = total_flow
     else:
         confidence = "estimated"
