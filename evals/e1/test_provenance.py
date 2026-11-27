@@ -29,17 +29,16 @@ instead: the basis it stores must equal the source's declared writers'
 flag, its own download flag must be explicit at every call, and it names
 parity tests (under ``tests/``) that compare its stored values with the
 declared writer's on the same bars and cover how the past basis is chosen.
-Each parity test is pinned by a sha256 over its source and everything in its
-file it depends on (fixtures, helpers, constants, autouse fixtures), the
-autouse fixtures of tests/conftest.py, and the tests.* support modules it
-imports, so a weakened test, fixture or helper fails the gate
-until a new E1 version is released; a pinned name bound twice or decorated
-fails too. And
-this gate runs those tests itself and fails unless every one is collected
-and passes (none skipped): the parity claim is executed on every E1 run,
-not just named. It is not an exemption: an undeclared writer, an implicit
-flag, a stored basis that differs, or a missing, changed, skipped or failing
-parity test fails the gate.
+Its parity tests live in one file under ``tests/``. That file and every
+``tests.*`` module it imports, transitively, are pinned whole by one sha256
+(an import that cannot be resolved fails), so any change to a test, fixture,
+helper or support module fails the gate until a new E1 version is released.
+The gate runs the named tests itself, isolated from everything not pinned (no
+conftest, no pytest configuration file, no auto-loaded plugins), and fails
+unless each is collected and passes (none skipped): the parity claim is
+executed on every E1 run, not just named. It is not an exemption: an undeclared writer, an implicit
+flag, a stored basis that differs, a changed parity file or support module,
+or a missing, skipped or failing parity test fails the gate.
 
 The fixture test (``test_gates_pg.py``) runs the shared writer
 (``BasePuller._insert_raw``) against the real DDL on PostgreSQL.
@@ -58,6 +57,7 @@ import functools
 import os
 import re
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 import pytest
@@ -281,9 +281,9 @@ PRICE_WRITERS: dict[str, tuple[str, bool]] = {
 }
 
 # module -> (source name, auto_adjust basis it stores, auto_adjust at every
-# yfinance download, {"tests/<file>.py::<test>": parity_test_sha256 of it}:
-# the parity tests this gate pins (with their dependencies) and runs)
-DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, dict[str, str]]] = {
+# yfinance download, {"file": tests/<file>.py, "sha256": parity_file_sha256 of
+# it, "tests": names in it}: the parity evidence this gate pins and runs)
+DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, dict[str, Any]]] = {
     # Recomputes ETF flow rows stored from a partial bar on the price basis of
     # the run that stored them: needs the raw close (Close, auto_adjust=False)
     # and today's Adj Close to state that run's adjusted close
@@ -291,16 +291,17 @@ DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, dict[str, str]]] = {
     # live writer stores.
     "scripts/repair_etf_flow_partial_bars.py": (
         "INSTITUTIONAL_FLOWS", True, False, {
-            # stored values equal the live writer's run the morning after, on
-            # rows whose original-versus-current adjustment factor is not 1
-            "tests/test_etf_flow_partial_bar_repair.py::"
-            "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars": "e47dd2aec42478794de064996fedc303d8357648cc414d09cd73631db763a147",
-            # same-day ex-dividend basis: an after-close row keeps the day before's
-            "tests/test_etf_flow_partial_bar_repair.py::"
-            "test_an_after_close_row_on_its_ex_dividend_date_keeps_the_day_befores_basis": "2e501427dc53020ef4358d5a50b5eb8982e0cab596f23561b4c43a625c54e574",
-            # a missing open session (or a bar on a closed day) refuses; a holiday does not
-            "tests/test_etf_flow_partial_bar_repair.py::"
-            "test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not": "bf261fef048acc5d5ffe59b71ff4559b60b1b59206cf0ea93eaca3ae86834e09",
+            "file": "tests/test_etf_flow_repair_parity.py",
+            "sha256": "6193bb201f8750ca8317591387341ac0fcfe16415bd98ea7e0cf824abf4e87e9",
+            "tests": (
+                # stored values equal the live writer's run the morning after, on
+                # rows whose original-versus-current adjustment factor is not 1
+                "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars",
+                # same-day ex-dividend basis: an after-close row keeps the day before's
+                "test_an_after_close_row_on_its_ex_dividend_date_keeps_the_day_befores_basis",
+                # a missing open session (or a bar on a closed day) refuses; a holiday does not
+                "test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not",
+            ),
         },
     ),
 }
@@ -326,121 +327,58 @@ def writes_raw_series(source: str) -> bool:
     return bool(re.search(r"insert\s+into\s+(?:public\.)?raw_series", source, re.I)) or "_insert_raw(" in source
 
 
-def _module_bindings(tree: ast.Module) -> dict[str, list[ast.AST]]:
-    """Every name bound at module level, with each statement that binds it."""
-    out: dict[str, list[ast.AST]] = {}
+def parity_file_sha256(rel: str, tests: dict[str, str] | None = None) -> str | None:
+    """sha256 over the whole of ``rel`` and every ``tests.*`` module it imports, transitively.
 
-    def bind(name: str, node: ast.AST) -> None:
-        out.setdefault(name, []).append(node)
-
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bind(node.name, node)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                bind((alias.asname or alias.name).split(".")[0], node)
-        else:
-            for target in ast.walk(node) if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) else []:
-                if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store):
-                    bind(target.id, node)
-    return out
-
-
-def _segment(source: str, node: ast.AST) -> str:
-    """The node's source lines, decorators included."""
-    first = min([node.lineno, *(d.lineno for d in getattr(node, "decorator_list", []))])
-    return "\n".join(source.splitlines()[first - 1:node.end_lineno])
-
-
-def _is_autouse_fixture(node: ast.AST) -> bool:
-    for d in getattr(node, "decorator_list", []):
-        if isinstance(d, ast.Call) and any(k.arg == "autouse" and isinstance(k.value, ast.Constant)
-                                           and k.value.value is True for k in d.keywords):
-            return True
-    return False
-
-
-def parity_test_sha256(ref: str, tests: dict[str, str] | None = None) -> str | None:
-    """sha256 over a parity test and what it runs with, or None.
-
-    ``ref`` is ``tests/<file>.py::<name>``: a top-level, undecorated plain
-    function bound exactly once in that file. The hash covers, decorators
-    included: its source; transitively every module-level binding it names
-    (fixtures by parameter name, helpers, constants); the file's autouse
-    fixtures; the autouse fixtures of ``tests/conftest.py`` with what they
-    name; and the whole source of each ``tests.<module>`` reached through an
-    import. None when the test or any name it depends on is missing or bound
-    more than once, so pytest could run something other than what was pinned.
+    None when ``rel`` or any of those modules cannot be read, or when any of
+    them makes a relative import (it could reach something unpinned).
     """
     import hashlib
 
-    def read(rel: str) -> str | None:
+    def read(path: str) -> str | None:
         if tests is not None:
-            text = tests.get(rel)
+            text = tests.get(path)
         else:
             try:
-                text = (REPO / rel).read_text(encoding="utf-8")
+                text = (REPO / path).read_text(encoding="utf-8")
             except OSError:
                 return None
         return None if text is None else text.replace("\r\n", "\n")
 
+    if not rel.startswith("tests/") or not rel.endswith(".py"):
+        return None
     parts: dict[str, str] = {}
-
-    def closure(rel: str, source: str, seeds: list[str]) -> bool:
-        tree = ast.parse(source)
-        bindings = _module_bindings(tree)
-        todo = list(seeds) + [n.name for n in tree.body if _is_autouse_fixture(n)]
-        seen: set[str] = set()
-        while todo:
-            n = todo.pop()
-            if n in seen:
-                continue
-            seen.add(n)
-            nodes = bindings.get(n, [])
-            if not nodes:
-                continue                                  # a builtin, or a name pytest provides
-            if len(nodes) != 1:
-                return False
-            node = nodes[0]
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                mods = [a.name for a in node.names]
-                if isinstance(node, ast.ImportFrom):
-                    mods += [node.module or ""] + [f"{node.module}.{a.name}" for a in node.names]
-                for mod in mods:
-                    if mod.startswith("tests."):
-                        support = read(mod.replace(".", "/") + ".py")
-                        if support is not None:
-                            parts[f"module:{mod}"] = support
-                parts[f"{rel}:import:{n}"] = _segment(source, node)
-                continue
-            parts[f"{rel}:def:{n}"] = _segment(source, node)
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.Name):
-                    todo.append(sub.id)
-                elif isinstance(sub, ast.arg):
-                    todo.append(sub.arg)                  # a fixture, by parameter name
-        return True
-
-    rel, _, name = ref.partition("::")
-    if not rel.startswith("tests/") or not rel.endswith(".py") or not name:
-        return None
-    source = read(rel)
-    if source is None:
-        return None
-    target = _module_bindings(ast.parse(source)).get(name, [])
-    if len(target) != 1 or not isinstance(target[0], ast.FunctionDef) or target[0].decorator_list:
-        return None
-    if not closure(rel, source, [name]):
-        return None
-    conftest = read("tests/conftest.py")
-    if conftest is not None and not closure("tests/conftest.py", conftest, []):
-        return None
+    todo = [rel]
+    while todo:
+        path = todo.pop()
+        if path in parts:
+            continue
+        source = read(path)
+        if source is None:
+            return None
+        parts[path] = source
+        for node in ast.walk(ast.parse(source)):
+            names: list[str] = []
+            if isinstance(node, ast.ImportFrom):
+                if node.level:
+                    return None
+                names = [node.module or ""] + [f"{node.module}.{a.name}" for a in node.names]
+            elif isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            for name in names:
+                if name == "tests" or not name.startswith("tests."):
+                    continue
+                module = name.replace(".", "/") + ".py"
+                if read(module) is not None:
+                    todo.append(module)
+                elif read(name.rsplit(".", 1)[0].replace(".", "/") + ".py") is None:
+                    return None                           # neither a module nor a name in one
     blob = "\n".join(f"== {k}\n{v}" for k, v in sorted(parts.items()))
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[str, str],
-                          derived: dict[str, tuple[str, bool, bool, dict[str, str]]] | None = None,
+                          derived: dict[str, tuple[str, bool, bool, dict[str, Any]]] | None = None,
                           tests: dict[str, str] | None = None) -> list[str]:
     derived = derived or {}
     problems = []
@@ -474,16 +412,21 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
         for line, got in yfinance_downloads(source):
             if got != download:
                 problems.append(f"{rel}:{line}: auto_adjust={got} but the derived-basis writer declares {download}")
-        if not parity or not isinstance(parity, dict):
-            problems.append(f"{rel}: derived-basis writer names no parity tests ({{ref: sha256}})")
-        for ref, pinned in (parity.items() if isinstance(parity, dict) else []):
-            got = parity_test_sha256(ref, tests)
+        if (not isinstance(parity, dict) or not parity.get("tests") or not parity.get("file")
+                or not isinstance(parity.get("tests"), tuple)):
+            problems.append(f"{rel}: derived-basis writer names no parity tests ({{file, sha256, tests}})")
+        else:
+            got = parity_file_sha256(parity["file"], tests)
+            source = None if got is None else (tests.get(parity["file"]) if tests is not None
+                                               else (REPO / parity["file"]).read_text(encoding="utf-8"))
             if got is None:
-                problems.append(f"{rel}: parity test {ref!r} does not exist (or is decorated, or it or "
-                                "a name it depends on is bound more than once)")
-            elif got != pinned:
-                problems.append(f"{rel}: parity test {ref!r} changed since it was pinned "
-                                "(re-release E1 with its new sha256)")
+                problems.append(f"{rel}: parity file {parity['file']!r} or a tests.* module it imports does not exist")
+            elif got != parity.get("sha256"):
+                problems.append(f"{rel}: parity file {parity['file']!r} or a tests.* module it imports changed "
+                                "since it was pinned (re-release E1 with its new sha256)")
+            for test in parity["tests"]:
+                if source is not None and not re.search(rf"^def {re.escape(test)}\(", source, re.M):
+                    problems.append(f"{rel}: parity test {parity['file']}::{test} does not exist")
         by_source.setdefault(name.lower(), set()).add(stored)
     for name, flags in sorted(by_source.items()):
         if len(flags) > 1:
@@ -501,9 +444,13 @@ def parity_run_problems(refs: list[str], cwd: Path) -> list[str]:
     import subprocess
     import sys
 
-    env = {**os.environ, "TZ": os.environ.get("TZ", "UTC")}
+    # Isolated from what is not pinned: no conftest, no pytest config file, no
+    # auto-loaded plugins; the repository on the path for its own imports.
+    env = {**os.environ, "TZ": os.environ.get("TZ", "UTC"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+           "PYTHONPATH": str(cwd)}
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", *refs, "-q", "-rA", "-p", "no:cacheprovider"],
+        [sys.executable, "-m", "pytest", *refs, "-q", "-rA", "--noconftest", "-c", os.devnull,
+         "--rootdir", str(cwd), "-p", "no:cacheprovider"],
         cwd=cwd, env=env, capture_output=True, text=True, timeout=600,
     )
     out = proc.stdout + proc.stderr
@@ -522,7 +469,8 @@ def parity_run_problems(refs: list[str], cwd: Path) -> list[str]:
 @pytest.mark.parametrize("rel", sorted(DERIVED_BASIS_WRITERS))
 def test_derived_basis_writers_parity_tests_run_and_pass(rel):
     """Run each declared parity test here, so the claim is executed, not only named."""
-    problems = parity_run_problems(sorted(DERIVED_BASIS_WRITERS[rel][3]), REPO)
+    parity = DERIVED_BASIS_WRITERS[rel][3]
+    problems = parity_run_problems([f"{parity['file']}::{t}" for t in parity["tests"]], REPO)
     assert not problems, "\n".join(problems)
 
 
@@ -551,51 +499,37 @@ def repair(conn):
     live = writer.replace("auto_adjust=False, actions=True", "auto_adjust=True")
     sources = {"live.py": live, "repair.py": writer}
     declared = {"live.py": ("SRC", True)}
-    tests = {"tests/t.py": "def test_parity():\n    pass\n"}
-    pin = parity_test_sha256("tests/t.py::test_parity", tests)
-    pinned = {"tests/t.py::test_parity": pin}
-    ok = {"repair.py": ("SRC", True, False, pinned)}
-    assert price_writer_problems(declared, sources, ok, tests) == []
+    tests = {"tests/test_p.py": "from tests import helpers as h\ndef test_parity():\n    assert h.ok()\n",
+             "tests/helpers.py": "from tests.deeper import X\ndef ok():\n    return X\n",
+             "tests/deeper.py": "X = True\n"}
+    pin = parity_file_sha256("tests/test_p.py", tests)
+    parity = {"file": "tests/test_p.py", "sha256": pin, "tests": ("test_parity",)}
+    ok = {"repair.py": ("SRC", True, False, parity)}
+    assert pin and price_writer_problems(declared, sources, ok, tests) == []
 
     def problems(derived=ok, srcs=sources, tst=tests):
         return "\n".join(price_writer_problems(declared, srcs, derived, tst))
 
-    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, pinned)})
-    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, pinned)})
+    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, parity)})
+    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, parity)})
     assert "auto_adjust=implicit" in problems(
         srcs={**sources, "repair.py": writer.replace(", auto_adjust=False, actions=True", "")})
-    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {"tests/t.py::test_missing": pin})})
-    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {"evals/t.py::test_parity": pin})})
-    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, {})})
-    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, ("tests/t.py::test_parity",))})
-    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, pinned)})
-    assert "changed since it was pinned" in problems(tst={"tests/t.py": "def test_parity():\n    assert True\n"})
-    # The pin covers what the test depends on in its file and its tests.* support modules.
-    with_deps = {"tests/t.py": "from tests import helpers as h\nLIMIT = 3\n"
-                               "def fixture_x():\n    return LIMIT\n"
-                               "def test_parity(fixture_x):\n    assert h.ok(fixture_x)\n",
-                 "tests/helpers.py": "def ok(x):\n    return x == 3\n"}
-    deps_pin = {"tests/t.py::test_parity": parity_test_sha256("tests/t.py::test_parity", with_deps)}
-    assert deps_pin["tests/t.py::test_parity"]
-    deps_ok = {"repair.py": ("SRC", True, False, deps_pin)}
-    assert problems(deps_ok, tst=with_deps) == ""
-    for rel, old, new in (("tests/t.py", "LIMIT = 3", "LIMIT = 4"),
-                          ("tests/t.py", "return LIMIT", "return 3"),
-                          ("tests/helpers.py", "x == 3", "True")):
-        edited = {**with_deps, rel: with_deps[rel].replace(old, new)}
-        assert "changed since it was pinned" in problems(deps_ok, tst=edited), (rel, old)
-    for bad in ("def test_parity(fixture_x):\n    pass\n",                       # bound twice: pytest runs the last
-                "LIMIT = 5\n"):                                                # a dependency bound twice
-        assert "does not exist" in problems(deps_ok, tst={**with_deps, "tests/t.py": with_deps["tests/t.py"] + bad})
-    autouse = {**with_deps, "tests/t.py": with_deps["tests/t.py"] + "@pytest.fixture(autouse=True)\ndef env():\n    pass\n"}
-    auto_pin = {"repair.py": ("SRC", True, False, {"tests/t.py::test_parity": parity_test_sha256("tests/t.py::test_parity", autouse)})}
-    assert problems(auto_pin, tst=autouse) == ""
-    for rel, text in (("tests/t.py", autouse["tests/t.py"].replace("def env():\n    pass", "def env():\n    raise SystemExit")),
-                      ("tests/conftest.py", "import pytest\n@pytest.fixture(autouse=True)\ndef patch():\n    pass\n")):
-        assert "changed since it was pinned" in problems(auto_pin, tst={**autouse, rel: text}), rel  # autouse fixtures count
-    decorated = with_deps["tests/t.py"].replace("def test_parity", "@pytest.mark.skip\ndef test_parity")
-    assert "does not exist" in problems(deps_ok, tst={**with_deps, "tests/t.py": decorated})
+    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, parity)})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, {**parity, "tests": ()})})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, "tests/test_p.py::test_parity")})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {**parity, "tests": ("test_absent",)})})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {**parity, "file": "evals/x.py"})})
+    for path, old, new in (("tests/test_p.py", "assert h.ok()", "assert True"),     # the test
+                           ("tests/helpers.py", "return X", "return True"),         # a support module
+                           ("tests/deeper.py", "X = True", "X = 1"),                # imported by that one
+                           ("tests/test_p.py", "def test_parity", "import pytest\n@pytest.mark.skip\ndef test_parity")):
+        edited = {**tests, path: tests[path].replace(old, new)}
+        assert "changed since it was pinned" in problems(tst=edited), (path, old)
+    for bad in ({**tests, "tests/helpers.py": "from tests.missing import Y\n"},       # an unresolvable import
+                {**tests, "tests/test_p.py": "from .helpers import ok\n" + tests["tests/test_p.py"]}):  # relative
+        assert "does not exist" in problems(tst=bad)
     assert "repair.py: downloads yfinance prices and writes raw_series but is not declared" in problems({})
+
 
 
 def test_one_meaning_self_test_catches_the_april_2026_contamination():

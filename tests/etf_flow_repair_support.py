@@ -16,7 +16,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 from ingestion import market_calendar as xnys
 from ingestion.altdata import institutional_flows as inst
@@ -166,3 +167,24 @@ def vintages(engine, series_id: str, d: date) -> list[dict]:
 def row_count(engine) -> int:
     with engine.connect() as conn:
         return conn.execute(text("SELECT COUNT(*) FROM raw_series")).scalar()
+
+
+_DDL_SQLITE = (
+    "CREATE TABLE source_catalog (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+    "CREATE TABLE raw_series (id INTEGER PRIMARY KEY AUTOINCREMENT, series_id TEXT NOT NULL, "
+    "source_id INTEGER NOT NULL, obs_date DATE NOT NULL, "
+    "pull_timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, value REAL NOT NULL, "
+    "raw_payload TEXT, pull_status TEXT NOT NULL)",
+)
+
+
+def make_sqlite_engine() -> Engine:
+    """The writer's two tables and its source row, on SQLite."""
+    import sqlite3
+
+    engine = create_engine("sqlite://", connect_args={"detect_types": sqlite3.PARSE_DECLTYPES})
+    with engine.begin() as conn:
+        for ddl in _DDL_SQLITE:
+            conn.execute(text(ddl))
+        conn.execute(text("INSERT INTO source_catalog (id, name) VALUES (:i, 'INSTITUTIONAL_FLOWS')"), {"i": SOURCE_ID})
+    return engine
