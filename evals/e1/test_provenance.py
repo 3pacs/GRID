@@ -295,7 +295,7 @@ DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, dict[str, Any]]] = {
     "scripts/repair_etf_flow_partial_bars.py": (
         "INSTITUTIONAL_FLOWS", True, False, {
             "file": "tests/test_etf_flow_repair_parity.py",
-            "sha256": "6193bb201f8750ca8317591387341ac0fcfe16415bd98ea7e0cf824abf4e87e9",
+            "sha256": "f85c719522a504daf5e7eddd0d4e7d9a009b2d753ba377105467f40adb17ed29",
             "tests": (
                 # stored values equal the live writer's run the morning after, on
                 # rows whose original-versus-current adjustment factor is not 1
@@ -360,6 +360,13 @@ def parity_file_sha256(rel: str, tests: dict[str, str] | None = None) -> str | N
         if source is None:
             return None
         parts[path] = source
+        # Every package __init__ on the way is imported too ("from tests import x").
+        package = path.rsplit("/", 1)[0]
+        while package:
+            init = f"{package}/__init__.py"
+            if init not in parts and read(init) is not None:
+                todo.append(init)
+            package = package.rsplit("/", 1)[0] if "/" in package else ""
         for node in ast.walk(ast.parse(source)):
             names: list[str] = []
             if isinstance(node, ast.ImportFrom):
@@ -449,8 +456,9 @@ def parity_run_problems(refs: list[str], cwd: Path) -> list[str]:
 
     # Isolated from what is not pinned: no conftest, no pytest config file, no
     # auto-loaded plugins; the repository on the path for its own imports.
-    env = {**os.environ, "TZ": os.environ.get("TZ", "UTC"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-           "PYTHONPATH": str(cwd)}
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS")}
+    env.update({"TZ": os.environ.get("TZ", "UTC"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                "PYTHONPATH": str(cwd)})
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", *refs, "-q", "-rA", "--noconftest", "-c", os.devnull,
          "--rootdir", str(cwd), "-p", "no:cacheprovider"],
@@ -485,6 +493,15 @@ def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path):
         "def test_bad():\n    assert False\n"
         "def test_skip():\n    pytest.skip('no database')\n")
     assert parity_run_problems(["tests/test_p.py::test_ok"], tmp_path) == []
+    # A plugin named in the environment is not loaded into the isolated run.
+    (tmp_path / "evil_plugin.py").write_text(
+        "def pytest_pyfunc_call(pyfuncitem):\n    return True\n")
+    os.environ["PYTEST_PLUGINS"] = "evil_plugin"
+    os.environ["PYTEST_ADDOPTS"] = "-p evil_plugin"
+    try:
+        assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path))
+    finally:
+        del os.environ["PYTEST_PLUGINS"], os.environ["PYTEST_ADDOPTS"]
     assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path))
     assert any("skipped" in p for p in parity_run_problems(["tests/test_p.py::test_skip"], tmp_path))
     assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_absent"], tmp_path))
@@ -531,6 +548,11 @@ def repair(conn):
     for bad in ({**tests, "tests/helpers.py": "from tests.missing import Y\n"},       # an unresolvable import
                 {**tests, "tests/test_p.py": "from .helpers import ok\n" + tests["tests/test_p.py"]}):  # relative
         assert "does not exist" in problems(tst=bad)
+    with_init = {**tests, "tests/__init__.py": '"""tests"""\n'}
+    init_pin = {"repair.py": ("SRC", True, False, {**parity, "sha256": parity_file_sha256("tests/test_p.py", with_init)})}
+    assert problems(init_pin, tst=with_init) == ""
+    patched = {**with_init, "tests/__init__.py": "import scripts.x as x\nx.f = lambda: 1\n"}
+    assert "changed since it was pinned" in problems(init_pin, tst=patched)          # the package __init__ counts
     assert "repair.py: downloads yfinance prices and writes raw_series but is not declared" in problems({})
 
 
