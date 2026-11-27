@@ -48,6 +48,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from db import get_engine
+from intelligence.postmortem import miss_on_or_after_sql
 
 
 _VAULT_SESSIONS = Path("/data/grid_obsidian/Sessions")
@@ -129,17 +130,17 @@ def _signal_ratios(conn) -> list[dict[str, Any]]:
                 WHEN jsonb_typeof(signals_right::jsonb) = 'array'
                 THEN signals_right::jsonb ELSE '[]'::jsonb END) AS sig,
                 'right' AS side
-            FROM trade_postmortems
+            FROM trade_postmortems tp
             WHERE signals_right IS NOT NULL
-              AND generated_at >= CAST(:cutoff AS date)
+              AND """ + miss_on_or_after_sql("CAST(:cutoff AS date)") + """
             UNION ALL
             SELECT jsonb_array_elements_text(CASE
                 WHEN jsonb_typeof(signals_wrong::jsonb) = 'array'
                 THEN signals_wrong::jsonb ELSE '[]'::jsonb END) AS sig,
                 'wrong' AS side
-            FROM trade_postmortems
+            FROM trade_postmortems tp
             WHERE signals_wrong IS NOT NULL
-              AND generated_at >= CAST(:cutoff AS date)
+              AND """ + miss_on_or_after_sql("CAST(:cutoff AS date)") + """
         )
         SELECT sig,
                SUM(CASE WHEN side='right' THEN 1 ELSE 0 END) AS right_ct,
@@ -175,9 +176,9 @@ def _wrong_direction_tickers(conn) -> list[dict[str, Any]]:
                COUNT(*) FILTER (WHERE outcome IN ('miss','wrong')) AS wrong_n,
                COUNT(*) AS total_n,
                STRING_AGG(DISTINCT failure_category, ', ' ORDER BY failure_category) AS categories
-        FROM trade_postmortems
+        FROM trade_postmortems tp
         WHERE ticker IS NOT NULL
-          AND generated_at >= NOW() - INTERVAL '30 days'
+          AND """ + miss_on_or_after_sql("NOW() - INTERVAL '30 days'") + """
         GROUP BY ticker
         HAVING COUNT(*) >= 100
         ORDER BY COUNT(*) FILTER (WHERE outcome IN ('miss','wrong'))::float / NULLIF(COUNT(*), 0) DESC
@@ -195,14 +196,14 @@ def _anti_signal_override_clusters(conn) -> dict[str, Any]:
     """How many ``Anti-signals overridden`` postmortems exist? Has the
     cluster shrunk since the veto landed?"""
     last_24h = int(conn.execute(text("""
-        SELECT COUNT(*) FROM trade_postmortems
+        SELECT COUNT(*) FROM trade_postmortems tp
         WHERE root_cause LIKE 'Anti-signals warned%'
-          AND generated_at >= NOW() - INTERVAL '24 hours'
+          AND """ + miss_on_or_after_sql("NOW() - INTERVAL '24 hours'") + """
     """)).scalar() or 0)
     last_7d = int(conn.execute(text("""
-        SELECT COUNT(*) FROM trade_postmortems
+        SELECT COUNT(*) FROM trade_postmortems tp
         WHERE root_cause LIKE 'Anti-signals warned%'
-          AND generated_at >= NOW() - INTERVAL '7 days'
+          AND """ + miss_on_or_after_sql("NOW() - INTERVAL '7 days'") + """
     """)).scalar() or 0)
     total = int(conn.execute(text("""
         SELECT COUNT(*) FROM trade_postmortems
@@ -225,8 +226,8 @@ def _hypothesis_kill_reasons(conn) -> dict[str, int]:
 
 def _failure_categories(conn) -> dict[str, int]:
     rows = conn.execute(text("""
-        SELECT failure_category, COUNT(*) FROM trade_postmortems
-        WHERE generated_at >= NOW() - INTERVAL '30 days'
+        SELECT failure_category, COUNT(*) FROM trade_postmortems tp
+        WHERE """ + miss_on_or_after_sql("NOW() - INTERVAL '30 days'") + """
         GROUP BY 1 ORDER BY 2 DESC
     """)).fetchall()
     return {str(r[0] or "NULL"): int(r[1] or 0) for r in rows}

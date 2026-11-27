@@ -42,7 +42,9 @@ def _batch(monkeypatch, *, trade_ids=(), pred_ids=(), per_row_s=40.0, deadline=N
         def execute(self, stmt, params=None):
             sql = " ".join(str(stmt).split())
             res = MagicMock()
-            if "FROM options_recommendations" in sql:
+            if sql.startswith("SELECT tp.id"):
+                res.fetchall.return_value = []   # the narration phase: no rule-based records here
+            elif "FROM options_recommendations" in sql:
                 res.fetchall.return_value = [(i,) for i in trade_ids]
             elif "oracle_predictions" in sql:
                 res.fetchall.return_value = [(i,) for i in pred_ids]
@@ -54,7 +56,7 @@ def _batch(monkeypatch, *, trade_ids=(), pred_ids=(), per_row_s=40.0, deadline=N
     engine.connect.side_effect = lambda: _Conn()
     started: list = []
 
-    def _gen(_engine, ident):
+    def _gen(_engine, ident, **_kw):
         started.append((ident, clock.now))
         clock.now += per_row_s
         return SimpleNamespace(ticker="X", failure_category="c", actual_return=-0.1, which_signals_were_wrong=[])
@@ -220,6 +222,8 @@ def _timed_batch(monkeypatch, *, row_s, count_s, rows, deadline, finish_by):
             if sql.startswith("SELECT COUNT(*) FROM ("):
                 clock.now += count_s
                 res.scalar.return_value = 7
+            elif sql.startswith("SELECT tp.id"):
+                res.fetchall.return_value = []   # the narration phase: no rule-based records here
             elif "oracle_predictions" in sql:
                 res.fetchall.return_value = [(i,) for i in rows]
             else:
@@ -229,7 +233,7 @@ def _timed_batch(monkeypatch, *, row_s, count_s, rows, deadline, finish_by):
     engine = MagicMock()
     engine.connect.side_effect = lambda: _Conn()
 
-    def _gen(_e, ident):
+    def _gen(_e, ident, **_kw):
         clock.now += row_s
         return SimpleNamespace(ticker="X", failure_category="c", actual_return=-0.1, which_signals_were_wrong=[])
 

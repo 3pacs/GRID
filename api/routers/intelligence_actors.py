@@ -791,11 +791,15 @@ def trigger_batch_postmortem(
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
     token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Trigger batch post-mortem generation for all recent failures.
+    """Trigger the batch post-mortem for recent failures.
 
-    Generates post-mortems for all failed trades and missed predictions
-    in the lookback window that do not already have a post-mortem.
-    Returns a summary with the generated post-mortems.
+    Records every failed trade and missed prediction of the window that has no
+    post-mortem (rule-based), then narrates a few of the newest, under the same
+    bounds as the nightly batch: at most ``API_POSTMORTEM_NARRATE_LIMIT`` LLM
+    narrations and an ``API_POSTMORTEM_DEADLINE_S`` deadline. The window is
+    capped at ``POSTMORTEM_EVENT_WINDOW_DAYS``: recording older misses is the
+    backfill (``scripts/postmortem_backfill.py``), an owner decision, never a
+    request. ``days_applied`` says which window ran.
     """
     with _lf_propagate_attributes(
         user_id=_lf_user_id_from_token(token),
@@ -803,10 +807,22 @@ def trigger_batch_postmortem(
     ):
         _lf_set_input(days=days)
         try:
-            from intelligence.postmortem import batch_postmortem, generate_lessons_learned
+            from intelligence.postmortem import (
+                API_POSTMORTEM_DEADLINE_S,
+                API_POSTMORTEM_NARRATE_LIMIT,
+                POSTMORTEM_EVENT_WINDOW_DAYS,
+                batch_postmortem,
+                generate_lessons_learned,
+            )
 
             engine = get_db_engine()
-            postmortems = batch_postmortem(engine, days=days)
+            days_applied = min(int(days), POSTMORTEM_EVENT_WINDOW_DAYS)
+            postmortems = batch_postmortem(
+                engine,
+                days=days_applied,
+                limit=API_POSTMORTEM_NARRATE_LIMIT,
+                deadline=time.monotonic() + API_POSTMORTEM_DEADLINE_S,
+            )
             lessons = generate_lessons_learned(engine, postmortems) if postmortems else ""
 
             return {
@@ -814,6 +830,7 @@ def trigger_batch_postmortem(
                 "postmortems": [pm.to_dict() for pm in postmortems],
                 "lessons_learned": lessons,
                 "days": days,
+                "days_applied": days_applied,
             }
         except Exception as exc:
             log.warning("Batch post-mortem generation failed: {e}", e=str(exc))

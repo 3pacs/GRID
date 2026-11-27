@@ -395,6 +395,10 @@ class TraceAnalyzer:
     def _load_postmortems(self, cutoff: datetime) -> list[dict]:
         try:
             with self.engine.connect() as conn:
+                # Windowed on the miss's own date, so a record written today for an
+                # old miss is not loaded as a recent one (miss_on_or_after_sql).
+                from intelligence.postmortem import miss_on_or_after_sql
+
                 # prediction_id is NULL for paper-trade postmortems. Pattern 1
                 # joins it to the eligible scored predictions in Python, which
                 # also supplies model_name (_eligible_failure_postmortems).
@@ -404,7 +408,7 @@ class TraceAnalyzer:
                            tp.recommended_fix, tp.confidence, tp.generated_at,
                            tp.prediction_id
                     FROM trade_postmortems tp
-                    WHERE tp.generated_at >= :cutoff
+                    WHERE """ + miss_on_or_after_sql(":cutoff") + """
                     ORDER BY tp.generated_at DESC
                 """), {"cutoff": cutoff}).fetchall()
             return [

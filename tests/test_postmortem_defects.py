@@ -57,6 +57,14 @@ from oracle.engine import DEFAULT_MODELS, ModelRegistry
 from oracle.trace_evolver import FailurePattern, TargetedMutator, TraceAnalyzer
 
 
+@pytest.fixture(autouse=True)
+def _misses_inside_the_event_window(monkeypatch):
+    """These tests pin what a PostmortemCompleted carries; their fixture misses are dated
+    April-May 2026, older than POSTMORTEM_EVENT_WINDOW_DAYS, which emit nothing since
+    2026-11-27 (tests/test_postmortem_every_miss_recorded_20261127.py). Treat them as recent."""
+    monkeypatch.setattr(pm_mod, "_miss_is_recent", lambda _when: True)
+
+
 def _capture_emits(monkeypatch) -> list:
     """Patch ``contracts.emit.emit`` safely (contracts.__init__ re-exports emit)."""
     captured: list = []

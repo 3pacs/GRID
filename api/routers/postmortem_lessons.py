@@ -158,6 +158,17 @@ def _lessons_label(count: int, date_range: str | None) -> str:
     return f"LLM summary of {count} postmortems"
 
 
+def _coverage(engine, days: int) -> dict[str, Any]:
+    """How much of the window the postmortems cover (recorded / narrated / not analysed). Never raises."""
+    try:
+        from intelligence.postmortem import postmortem_coverage
+
+        return postmortem_coverage(engine, days=days)
+    except Exception as exc:
+        log.warning("postmortem-lessons coverage failed: {e}", e=str(exc))
+        return {"window_days": int(days), "error": str(exc)}
+
+
 def _generate(engine, n: int, days: int) -> Any:
     """Run the LLM lessons synthesis from the most recent n postmortems.
 
@@ -177,6 +188,7 @@ def _generate(engine, n: int, days: int) -> Any:
             "text": f"No post-mortems found in the last {days} days.",
             "count": 0,
             "label": None,
+            "coverage": _coverage(engine, days),
         }
 
     # Every return is put in one unit (a fraction) whichever writer stored it;
@@ -213,6 +225,8 @@ def _generate(engine, n: int, days: int) -> Any:
         # without it was written before the unit fix and is never served.
         "return_units": RETURN_UNITS,
         "excluded_unknown_return": excluded,
+        # The window is on the miss's own date; misses in it with no record are "not_analysed".
+        "coverage": _coverage(engine, days),
     }
 
 

@@ -69,6 +69,9 @@ def _setup(monkeypatch):
     monkeypatch.setattr(emit_mod, "emit", lambda c: captured.append(c) or c.event_id)
     monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
     monkeypatch.setattr(pm_mod, "_store_postmortem", lambda *a, **k: None)
+    # The fixture miss is dated May 2026; these tests pin the emitted P&L, so treat it as recent
+    # (old misses emit nothing since 2026-11-27, POSTMORTEM_EVENT_WINDOW_DAYS).
+    monkeypatch.setattr(pm_mod, "_miss_is_recent", lambda _when: True)
     seen: dict = {}
 
     def _llm(**k):

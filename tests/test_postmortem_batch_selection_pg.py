@@ -56,8 +56,11 @@ def _run_batch(monkeypatch, engine, limit):
     trade_calls: list[int] = []
     monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
     # The writers' own refusal is what leaves a row selectable; record the selection, write nothing.
-    monkeypatch.setattr(pm_mod, "generate_prediction_postmortem", lambda _e, pid: pred_calls.append(pid))
-    monkeypatch.setattr(pm_mod, "generate_postmortem", lambda _e, tid: trade_calls.append(tid))
+    monkeypatch.setattr(pm_mod, "generate_prediction_postmortem", lambda _e, pid, **_k: pred_calls.append(pid))
+    monkeypatch.setattr(pm_mod, "generate_postmortem", lambda _e, tid, **_k: trade_calls.append(tid))
+    # Since 2026-11-27 the record selections are bounded by RECORD_PHASE_MAX_ROWS (``limit`` caps
+    # narration), so the bound under test is that one.
+    monkeypatch.setattr(pm_mod, "RECORD_PHASE_MAX_ROWS", limit if limit else 5000)
     pm_mod.batch_postmortem(engine, days=30, limit=limit)
     return pred_calls, trade_calls
 

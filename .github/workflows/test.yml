@@ -345,7 +345,7 @@ jobs:
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
-        run: python -m pytest tests/test_postmortem_batch_selection_pg.py -q -rA
+        run: python -m pytest tests/test_postmortem_batch_selection_pg.py tests/test_postmortem_every_miss_recorded_pg.py -q -rA
 
       # A contagion trade ticket written to decision_journal must never be served as the regime
       # (current, history or MCP); regime subtypes with the same name are still regime states (#959).
