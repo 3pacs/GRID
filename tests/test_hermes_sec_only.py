@@ -786,7 +786,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # and run_intelligence_tasks computing step_deadline at its start). No
         # other task's budget, no SEC, FINRA or dispatch change. Needs reviewer
         # acceptance like the prior pins.
-        # OPER re-pinned d833a7fa -> c674c076 (2026-11-27,
+        # OPER re-pinned d833a7fa -> 42ba0a88 (2026-11-27,
         # claude/oracle-loud-all-abstained-20261127, on main after #1500): the
         # Oracle forward pass reports "all_abstained" (some captured ticker
         # abstained) or "no_result" (none had a candidate) instead of
@@ -794,7 +794,8 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # result keys (tickers_with_forecast, tickers_abstained,
         # tickers_without_candidates, abstention_reasons); the new stateless
         # _oracle_forward_alert helper asks oracle.forward_alert whether the
-        # session's alert is due and sends it once; _run_oracle_forward_step
+        # session's alert is due and sends the generic e-mail once (how the
+        # pass ended goes to the log, not the mail); _run_oracle_forward_step
         # calls it in its finally block and records the timeout cooldown for
         # the two new statuses exactly as it did when those passes were called
         # "completed". No SEC, FINRA or dispatch-prefix change. Needs reviewer
@@ -802,7 +803,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','c674c076d624964f7cca417c69cbc5648ef0ac30f07683e9873cfaa77ceba713'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','42ba0a88b5ba98a1adec308054e290bc83bce002625025a3e25891625045c9bb'),(SCHED,'\nimport calendar\n','bb3f67d02233d956f54c3634367f95dfd4e458b4c5e7589576cadd510d63ec6b')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

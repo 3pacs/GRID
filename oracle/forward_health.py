@@ -345,19 +345,18 @@ def forward_health(
     return health
 
 
-def alert_text(health: dict[str, Any], *, with_notes: bool = False) -> tuple[str, str]:
-    """Subject and plain body of the operator alert for a failing session.
+def local_report(health: dict[str, Any], *, with_notes: bool = False) -> str:
+    """The detailed account of a session, for the host only. Never e-mailed.
 
-    The body carries counts and stored reasons. It does not carry the
-    ``operator_notes`` (when a private-use capture completed) unless
-    ``with_notes`` is set: an e-mail leaves the host for whoever the alert
-    address reaches, so the mail points at the admin view instead. An operator
-    at the terminal can ask the check script for the notes.
+    Two uses: the sweep's alert file (a file in the service user's own
+    directory) and an operator's terminal. It is built from an admin answer:
+    counts, per-ticker stored reasons and the admin message, all of which
+    include the private-use cohort. The e-mail is
+    ``oracle.forward_alert.outbound_alert`` instead, which carries none of it.
+
+    ``with_notes`` adds the ``operator_notes`` (when a private-use capture
+    completed). That is for the terminal: the alert file is written without it.
     """
-    missing = [name for name, row in health["tickers"].items() if not row["qualified"]]
-    subject = (f"Oracle forward pass: no forecast for {', '.join(missing)} ({health['session_date']})"
-               if health["status"] == STATUS_PARTIAL
-               else f"Oracle forward pass: no usable forecast ({health['session_date']})")
     lines = [health["message"], "",
              f"status: {health['status']}   attempts: {health.get('attempts', '-')}"
              f"   last attempt: {health.get('last_attempt_at') or '-'}"]
@@ -368,9 +367,8 @@ def alert_text(health: dict[str, Any], *, with_notes: bool = False) -> tuple[str
         for name, note in (health.get("operator_notes") or {}).items():
             lines.append(f"{name}: {note}")
     else:
-        lines += ["", "Possible causes, where the record shows one, are given to admin requests only:"
-                  " the Oracle page, GET /api/v1/oracle/forward-health, or"
-                  " scripts/oracle_forward_health_check.py --notes on the host."]
+        lines += ["", "Possible causes, where the record shows one: run"
+                  " scripts/oracle_forward_health_check.py --notes on this host."]
     lines += ["", "Abstentions are the honest record of a pass with no qualified quote."
               " Nothing was repaired or regenerated."]
-    return subject, "\n".join(lines)
+    return "\n".join(lines)

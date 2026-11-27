@@ -673,15 +673,19 @@ policy refuses it, and every model abstains (2026-11-23 to 11-25: 1,830
   ticker even had a candidate) instead of `completed`, and logs an ERROR.
   `completed` and `partial` now mean that at least one captured ticker holds a
   forecast;
-- one `[GRID CRITICAL] Oracle forward pass: no usable forecast` e-mail per
-  session: at once when every candidate abstained, after two or more attempts
+- one `[GRID CRITICAL] Oracle forward pass needs attention (<session date>)`
+  e-mail per session: at once when every candidate abstained, after two or more attempts
   that stored nothing over at least an hour, and from the daily sweep for a
   session in which no pass ran or which ended with a cohort ticker lacking a
   forecast (a ticker on which no model produces a candidate writes no row).
   "Already sent" is one marker row per session in `oracle_iterations`
   (`oracle/forward_alert.py`), shared by Hermes and the sweep, so a Hermes
   restart or the sweep judging Friday again over a weekend sends nothing new.
-  The e-mail carries counts and stored reasons, never capture metadata;
+  The e-mail is generic on purpose: the session date and where an
+  authenticated admin can read the rest. Counts, tickers, reasons and the
+  status stay on the host (the log, the sweep's alert file, the check script).
+  An ended session with a single attempt and nothing stored is reported by the
+  sweep too; the two-attempt, one-hour grace applies only while it is open;
 - `GET /api/v1/oracle/forward-health` and the status line on the Oracle page
   say whether the session has a forecast for every cohort ticker. An admin
   request also gets the attempt count, whether the alert was sent, and, when a

@@ -699,8 +699,11 @@ def _oracle_forward_alert(engine: Any, state: Any, result: Any, now: datetime) -
     due, _why = alert_due(health)
     if not due:
         return False
-    this_pass = f"This pass: {status}" + (f" ({result.get('reason')})" if result.get("reason") else "")
-    return send_session_alert(engine, health, extra=this_pass) == SENT
+    # The e-mail is generic (oracle.forward_alert.outbound_alert). How this
+    # pass ended goes to the log, which stays on the host.
+    log.error("Oracle forward pass ended {s}{r}; session alert is due", s=status,
+              r=f" ({result.get('reason')})" if result.get("reason") else "")
+    return send_session_alert(engine, health) == SENT
 
 
 def _run_oracle_forward_step(

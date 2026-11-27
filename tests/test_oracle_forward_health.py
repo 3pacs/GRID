@@ -371,19 +371,42 @@ def test_the_sweep_judges_the_last_session_that_closed(db) -> None:
     assert (health["session_date"], health["status"]) == ("2026-11-25", fh.STATUS_ALL_ABSTAINED)
 
 
-def test_alert_text_carries_the_counts_reasons_and_notes(db) -> None:
+GENERIC_SUBJECT = "Oracle forward pass needs attention (2026-11-25)"
+GENERIC_BODY = (
+    "The Oracle forward pass for the 2026-11-25 session needs attention.\n\n"
+    "This message carries no detail on purpose. An authenticated admin can read what happened on the"
+    " Oracle page or at GET /api/v1/oracle/forward-health; on the host,"
+    " scripts/oracle_forward_health_check.py prints it.\n\n"
+    "One alert is sent per session."
+)
+
+
+def test_the_e_mail_is_generic_and_built_from_an_allowlist_of_one_field(db) -> None:
+    """Counts, tickers, reasons, status and notes come from tables that include the private cohort."""
     with db.begin() as conn:
         _incident(conn)
     with db.connect() as conn:
-        subject, body = fh.alert_text(fh.forward_health(conn, now=_utc(WED, 21), include_schwab=True))
-        with_notes = fh.alert_text(
-            fh.forward_health(conn, now=_utc(WED, 21), include_schwab=True), with_notes=True)[1]
-    assert subject == "Oracle forward pass: no usable forecast (2026-11-25)"
-    assert "SPY: 0 forecast(s), 305 abstention(s); " + OLD_REASON in body
-    assert "Nothing was repaired or regenerated." in body
-    # The e-mail leaves the host: no capture metadata in it, only where an admin can look.
-    assert "private-use" not in body and "15:43:17" not in body and "Schwab" not in body
-    assert "given to admin requests only" in body
+        health = fh.forward_health(conn, now=_utc(WED, 21), include_schwab=True)
+    assert fa.OUTBOUND_ALERT_FIELDS == ("session_date",)
+    assert fa.outbound_alert(health) == (GENERIC_SUBJECT, GENERIC_BODY)
+    # Nothing else of the admin answer can reach it: the same text for any other content.
+    other = {**health, "status": "ok", "message": "x", "tickers": {}, "attempts": 99, "operator_notes": {"SPY": "y"}}
+    assert fa.outbound_alert(other) == (GENERIC_SUBJECT, GENERIC_BODY)
+    for leaked in ("610", "305", "SPY", "QQQ", OLD_REASON, "abstain", "attempt(s)", health["status"],
+                   "private-use", "Schwab", "15:43"):
+        assert leaked not in GENERIC_SUBJECT + GENERIC_BODY
+
+
+def test_the_host_local_report_carries_the_counts_reasons_and_optionally_the_notes(db) -> None:
+    with db.begin() as conn:
+        _incident(conn)
+    with db.connect() as conn:
+        health = fh.forward_health(conn, now=_utc(WED, 21), include_schwab=True)
+    report, with_notes = fh.local_report(health), fh.local_report(health, with_notes=True)
+    assert "SPY: 0 forecast(s), 305 abstention(s); " + OLD_REASON in report
+    assert "Nothing was repaired or regenerated." in report
+    # The alert file is written from this form: no capture metadata in it.
+    assert "private-use" not in report and "15:43:17" not in report and "Schwab" not in report
     assert "completed 2026-11-25T15:43:17+00:00" in with_notes
 
 
@@ -450,7 +473,7 @@ def test_the_marker_and_lock_work_on_postgresql_and_two_callers_send_once(pgdb) 
     send = lambda subject, body, severity: bool(calls.append(subject)) or True  # noqa: E731
     assert fa.send_session_alert(pgdb, health, send=send) == fa.SENT
     assert fa.send_session_alert(pgdb, health, send=send) == fa.ALREADY_SENT
-    assert calls == ["Oracle forward pass: no usable forecast (2026-11-25)"]
+    assert calls == [GENERIC_SUBJECT]
     with pgdb.connect() as conn:
         rows = conn.execute(text("SELECT notes, models_updated FROM oracle_iterations WHERE notes LIKE :p"),
                             {"p": fh.FORWARD_ALERT_NOTE_PREFIX + "%"}).fetchall()
@@ -772,11 +795,8 @@ def test_all_abstained_alerts_on_the_first_pass_and_once_per_session(monkeypatch
     assert ho._oracle_forward_alert(db, SimpleNamespace(), result, DECISION) is True
     assert ho._oracle_forward_alert(db, SimpleNamespace(), result, DECISION) is False
     assert len(sent) == 1
-    subject, body, severity = sent[0]
-    assert subject == "Oracle forward pass: no usable forecast (2026-11-25)"
-    assert severity == "critical"
-    assert "This pass: all_abstained" in body
-    assert "private-use" not in body and "15:43:17" not in body      # no capture metadata by e-mail
+    # Exactly the generic text is handed to the mailer: no counts, reasons, tickers or pass summary.
+    assert sent == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]
     assert _markers(db) == [fh.alert_note("2026-11-25")]
 
 
@@ -805,8 +825,7 @@ def test_the_next_session_alerts_again(monkeypatch, ho, db) -> None:
     _clock(monkeypatch, ho, _utc(friday, 14, 32))
     assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is True
     assert [subject for subject, _b, _s in sent] == [
-        "Oracle forward pass: no usable forecast (2026-11-25)",
-        "Oracle forward pass: no usable forecast (2026-11-27)"]
+        GENERIC_SUBJECT, "Oracle forward pass needs attention (2026-11-27)"]
     assert _markers(db) == [fh.alert_note("2026-11-25"), fh.alert_note("2026-11-27")]
 
 
@@ -824,8 +843,7 @@ def test_two_passes_that_stored_nothing_alert_and_one_does_not(monkeypatch, ho, 
     _clock(monkeypatch, ho, _utc(WED, 15, 40))
     # A new state object each time: the count comes from the stored attempts.
     assert ho._oracle_forward_alert(db, SimpleNamespace(), result, DECISION) is True
-    assert "2 attempt(s) ran and stored nothing" in sent[0][1]
-    assert f"This pass: {status}" in sent[0][1]
+    assert sent == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]
 
 
 def test_a_pass_that_left_a_forecast_never_alerts_and_reads_nothing(monkeypatch, ho) -> None:
@@ -873,6 +891,10 @@ def test_an_alert_that_could_not_be_sent_leaves_no_marker_and_is_tried_again(mon
     ({"status": fh.STATUS_NO_ROWS, "attempts": 2, "first_attempt_at": "2026-11-25T14:31:00+00:00",
       "checked_at": "2026-11-25T14:41:30+00:00"}, False),
     ({"status": fh.STATUS_NO_ROWS, "attempts": 2}, False),      # no clock on record: not due
+    # Ended: the grace is over, even for a single attempt.
+    ({"status": fh.STATUS_NO_ROWS, "attempts": 1, "session_state": "ended"}, True),
+    ({"status": fh.STATUS_NO_ROWS, "attempts": 1, "session_state": "open",
+      "first_attempt_at": "2026-11-25T14:31:00+00:00", "checked_at": "2026-11-25T20:50:00+00:00"}, False),
     ({"status": fh.STATUS_NO_ATTEMPTS, "attempts": 0, "session_state": "open"}, False),
     ({"status": fh.STATUS_NO_ATTEMPTS, "attempts": 0, "session_state": "ended"}, True),
     ({"status": fh.STATUS_OK, "attempts": 6}, False),
@@ -898,11 +920,9 @@ def test_the_marker_is_written_only_after_the_mail_was_accepted(db) -> None:
     assert fa.send_session_alert(db, health, send=lambda *a: False) == fa.SEND_FAILED
     assert _markers(db) == []
     calls: list[tuple[str, str, str]] = []
-    assert fa.send_session_alert(db, health, send=lambda *a: bool(calls.append(a)) or True,
-                                 extra="Sent by the daily freshness sweep.") == fa.SENT
+    assert fa.send_session_alert(db, health, send=lambda *a: bool(calls.append(a)) or True) == fa.SENT
     assert fa.send_session_alert(db, health, send=lambda *a: bool(calls.append(a)) or True) == fa.ALREADY_SENT
-    assert len(calls) == 1 and calls[0][1].endswith("Sent by the daily freshness sweep.")
-    assert calls[0][2] == "critical"
+    assert calls == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]
     # The session's attempt count is not changed by the marker row, and an admin answer shows it was sent.
     after = _incident_health(db, datetime.now(timezone.utc) + timedelta(minutes=1))
     assert after["alert_sent"] is True
@@ -947,7 +967,7 @@ def test_the_sweep_then_hermes_send_one_alert_for_the_session(monkeypatch, capsy
     assert "alert: already_sent" in capsys.readouterr().out
     _clock(monkeypatch, ho, _utc(WED, 20))                           # an operator replaying the same session
     assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "all_abstained"}, DECISION) is False
-    assert len(sent) == 1 and "Sent by the daily freshness sweep." in sent[0][1]
+    assert sent == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]      # the sweep's path hands over the same text
     assert list(tmp_path.iterdir()) == []                            # no --write-alert, no file
 
 
@@ -974,10 +994,11 @@ def test_the_sweep_alerts_once_for_a_session_that_left_a_ticker_without_a_foreca
     out = capsys.readouterr().out
     assert "alert: sent" in out and "alert: already_sent" in out
     assert len(sent) == 1
-    subject, body, _severity = sent[0]
-    assert subject == "Oracle forward pass: no forecast for SPY (2026-11-25)"
-    assert "SPY: 0 forecast(s), 0 abstention(s)" in body and "QQQ: 111 forecast(s)" in body
+    assert sent == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]      # not even the ticker leaves the host
     assert [p.name for p in tmp_path.iterdir()] == ["oracle-forward-2026-11-25.txt"]
+    # The detail is in the host-local file.
+    local = (tmp_path / "oracle-forward-2026-11-25.txt").read_text()
+    assert "no forecast for SPY" in local and "QQQ: 111 forecast(s)" in local
 
 
 def test_the_sweep_alerts_for_a_session_in_which_no_pass_ran(monkeypatch, capsys, db) -> None:
@@ -990,7 +1011,33 @@ def test_the_sweep_alerts_for_a_session_in_which_no_pass_ran(monkeypatch, capsys
     at = _utc(date(2026, 11, 26), 5)
     monkeypatch.setattr(check, "forward_health", lambda conn, **kw: real(conn, **{**kw, "now": at}))
     assert check.main(["--ended", "--alert"]) == 1
-    assert "The Oracle forward pass did not run in the 2026-11-25 session." in sent[0][1]
+    assert sent == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]
+
+
+def test_the_sweep_alerts_for_an_ended_session_with_one_attempt_and_no_row(monkeypatch, capsys, ho, db, tmp_path) -> None:
+    """One pass ran, stored nothing, and the session ended. While open that is within the grace;
+    ended, it is a session without a forecast, and only the sweep can say so."""
+    import db as db_module
+    from scripts import oracle_forward_health_check as check
+
+    with db.begin() as conn:
+        _attempts(conn, WED, 1)
+    sent = _mail(monkeypatch)
+    # During the session one attempt with nothing stored is not yet an alert, however late it gets.
+    _clock(monkeypatch, ho, _utc(WED, 20, 50))
+    assert ho._oracle_forward_alert(db, SimpleNamespace(), {"status": "no_result"}, DECISION) is False
+    assert sent == []
+    monkeypatch.setattr(db_module, "get_engine", lambda: db)
+    real = fh.forward_health
+    outputs = []
+    for day in (26, 27):          # Thursday (holiday) and Friday before the open: the same ended session
+        at = _utc(date(2026, 11, day), 5)
+        monkeypatch.setattr(check, "forward_health", lambda conn, _at=at, **kw: real(conn, **{**kw, "now": _at}))
+        assert check.main(["--ended", "--alert", "--write-alert", str(tmp_path)]) == 1
+        outputs.append(capsys.readouterr().out)
+    assert "alert: sent" in outputs[0] and "alert: already_sent" in outputs[1]
+    assert sent == [(GENERIC_SUBJECT, GENERIC_BODY, "critical")]
+    assert "1 attempt(s) ran and stored nothing" in (tmp_path / "oracle-forward-2026-11-25.txt").read_text()
 
 
 def _run_step(monkeypatch, ho, worker_result: Any, *, ok: bool = True):
