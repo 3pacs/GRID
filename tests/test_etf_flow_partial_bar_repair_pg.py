@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import threading
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta, timezone
 from uuid import uuid4
 
 import pandas as pd
@@ -211,7 +211,8 @@ def test_the_scheduled_writer_waits_for_the_repair_and_writes_after_it(pg, marke
 
     def _writer():
         repair_holds_lock.wait(timeout=10)
-        started = datetime.now(timezone.utc)
+        with pg().connect() as conn:                     # the clock the rows are dated by
+            started = conn.execute(text("SELECT clock_timestamp()")).scalar()
         threading.Timer(1.0, release.set).start()
         return started, inst.InstitutionalFlowsPuller(pg()).pull_etf_recent()
 

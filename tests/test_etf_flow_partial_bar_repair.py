@@ -411,11 +411,13 @@ def test_a_read_for_an_instant_before_the_repair_still_sees_what_was_held_then(w
     mod.run_writes(engine, plan, session_day=SESSION_DAY)
     item = next(i for i in plan["items"] if i["metric"] == "5d")
     d = date.fromisoformat(item["obs_date"])
+    repaired = max(v["pulled"] for v in m.vintages(engine, "ETF_FLOW:SPY:5d", d))
+    repaired = datetime.fromisoformat(repaired) if isinstance(repaired, str) else repaired
     with engine.connect() as conn:
         then = {o.obs_date: o.value for o in read_window_known_at(
             conn, "ETF_FLOW:SPY:5d", as_of=date(2026, 7, 10), lag=None, start=d)}
-        now = {o.obs_date: o.value for o in read_window_known_at(
-            conn, "ETF_FLOW:SPY:5d", as_of=date.today() + timedelta(days=1), lag=None, start=d)}
+        now = {o.obs_date: o.value for o in read_window_known_at(   # the day after the repair row's own date
+            conn, "ETF_FLOW:SPY:5d", as_of=repaired.date() + timedelta(days=1), lag=None, start=d)}
     assert then[d] == item["revises_value"]
     assert now[d] == item["value"]
 

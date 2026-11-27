@@ -330,14 +330,21 @@ def read_only_connection(engine: Engine) -> Iterator[Any]:
             conn.rollback()
 
 
+# The source the live ETF flow writer stores under (declared for the E1
+# provenance gate in evals/e1/test_provenance.py, DERIVED_BASIS_WRITERS).
+SOURCE_NAME = "INSTITUTIONAL_FLOWS"
+
+
 def source_id_of(conn: Any) -> int:
     """The writer's source_catalog id, looked up without creating it."""
+    if inst.InstitutionalFlowsPuller.SOURCE_NAME != SOURCE_NAME:
+        raise Refused(f"the ETF flow writer now stores under {inst.InstitutionalFlowsPuller.SOURCE_NAME!r}, "
+                      f"not {SOURCE_NAME!r}: this repair and its provenance declaration need updating")
     sid = conn.execute(
-        text("SELECT id FROM source_catalog WHERE LOWER(name) = LOWER(:n)"),
-        {"n": inst.InstitutionalFlowsPuller.SOURCE_NAME},
+        text("SELECT id FROM source_catalog WHERE LOWER(name) = LOWER(:n)"), {"n": SOURCE_NAME},
     ).scalar()
     if sid is None:
-        raise Refused(f"no source_catalog row for {inst.InstitutionalFlowsPuller.SOURCE_NAME}")
+        raise Refused(f"no source_catalog row for {SOURCE_NAME}")
     return int(sid)
 
 
@@ -652,7 +659,7 @@ def run_writes(
 def verify_plan(engine: Engine, plan: dict) -> dict[str, Any]:
     """Read-only check of a plan against what is stored."""
     run_id = plan["run_id"]
-    lo = min(date.fromisoformat(i["obs_date"]) for i in plan["items"]) if plan["items"] else date.today()
+    lo = min(date.fromisoformat(i["obs_date"]) for i in plan["items"]) if plan["items"] else date.min
     hi = max(date.fromisoformat(i["obs_date"]) for i in plan["items"]) if plan["items"] else lo
     series_ids = sorted({i["series_id"] for i in plan["items"]})
     counts: Counter = Counter()

@@ -212,6 +212,17 @@
       "released_in": "GRID #1372 (draft; merge pending)",
       "approved_by": "Anik (owner) signed off 2026-11-23: E1 v1.4, E1-V7c closed by the bridge stamping fix; historical backdated TwelveData rows left for separate remediation",
       "note": "E1 v1.4: E1-V7c closed. scripts/backfill_resolved_series_from_ticker_metrics.sql stamps release_date = vintage_date = the ticker_metrics_daily fetch day (UTC, never before obs_date), so its strict xfail XPASSed and is removed. Rows written before the fix are not rewritten (count: scripts/count_release_before_vintage.py)."
+    },
+    {
+      "seq": 16,
+      "kind": "suite",
+      "suite": "e1",
+      "version": "e1-v1.5",
+      "path": "evals/e1",
+      "manifest_sha256": "8d304497ba5104f38eeec35098aa181058faa9d3a45ee97130bf0ecc0b09299d",
+      "released_in": "GRID #1509 (draft; merge pending)",
+      "approved_by": "PENDING: owner sign-off requested 2026-11-27, not given; this entry must not merge without it",
+      "note": "E1 v1.5: provenance gate gains DERIVED_BASIS_WRITERS, for a writer that reads raw and adjusted closes to store a source's adjusted basis as of a past provider state (scripts/repair_etf_flow_partial_bars.py, INSTITUTIONAL_FLOWS, stores the auto_adjust=True basis, downloads auto_adjust=False). The stored basis must equal the source's declared writers', the download flag must be explicit at every call, and a named parity test must exist; new self-test covers each rule. No existing declaration, xfail or check is relaxed."
     }
   ]
 }

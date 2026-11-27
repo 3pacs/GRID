@@ -22,6 +22,14 @@ flag must be passed explicitly at every download and two writers sharing a
 source name must share the flag (the April 2026 contamination:
 ``scripts/fill_missing_features.py`` wrote ``auto_adjust=True`` closes under
 yfinance's source next to ``yfinance_pull``'s ``auto_adjust=False``).
+A writer that must read raw *and* adjusted closes to store a source's
+adjusted basis as of a past provider state (a repair recomputing a stored
+vintage on its own basis) is declared in :data:`DERIVED_BASIS_WRITERS`
+instead: the basis it stores must equal the source's declared writers'
+flag, its own download flag must be explicit at every call, and it names a
+test that compares its stored values with the declared writer's on the same
+bars. It is not an exemption: an undeclared writer, an implicit flag, a
+stored basis that differs or a missing parity test fails the gate.
 
 The fixture test (``test_gates_pg.py``) runs the shared writer
 (``BasePuller._insert_raw``) against the real DDL on PostgreSQL.
@@ -262,6 +270,22 @@ PRICE_WRITERS: dict[str, tuple[str, bool]] = {
     "scripts/fill_missing_features.py": ("yfinance_adjusted_extended", True),
 }
 
+# module -> (source name, auto_adjust basis it stores, auto_adjust at every
+# yfinance download, "tests/<file>.py::<test>" comparing its stored values with
+# the source's PRICE_WRITERS writer on the same provider bars)
+DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, str]] = {
+    # Recomputes ETF flow rows stored from a partial bar on the price basis of
+    # the run that stored them: needs the raw close (Close, auto_adjust=False)
+    # and today's Adj Close to state that run's adjusted close
+    # (AdjNow(k) * Raw(S) / AdjNow(S)), i.e. the auto_adjust=True basis the
+    # live writer stores.
+    "scripts/repair_etf_flow_partial_bars.py": (
+        "INSTITUTIONAL_FLOWS", True, False,
+        "tests/test_etf_flow_partial_bar_repair.py::"
+        "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars",
+    ),
+}
+
 
 def yfinance_downloads(source: str) -> list[tuple[int, object]]:
     """(line, auto_adjust) for every yfinance download/history call; ``"implicit"`` when absent."""
@@ -283,10 +307,26 @@ def writes_raw_series(source: str) -> bool:
     return bool(re.search(r"insert\s+into\s+(?:public\.)?raw_series", source, re.I)) or "_insert_raw(" in source
 
 
-def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[str, str]) -> list[str]:
+def _test_exists(ref: str, tests: dict[str, str] | None) -> bool:
+    rel, _, name = ref.partition("::")
+    if tests is not None:
+        source = tests.get(rel)
+    else:
+        try:
+            source = (REPO / rel).read_text(encoding="utf-8")
+        except OSError:
+            return False
+    return bool(name) and source is not None and re.search(rf"^def {re.escape(name)}\(", source, re.M) is not None
+
+
+def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[str, str],
+                          derived: dict[str, tuple[str, bool, bool, str]] | None = None,
+                          tests: dict[str, str] | None = None) -> list[str]:
+    derived = derived or {}
     problems = []
     for rel, source in sorted(sources.items()):
-        if "yfinance" in source and writes_raw_series(source) and yfinance_downloads(source) and rel not in declared:
+        if ("yfinance" in source and writes_raw_series(source) and yfinance_downloads(source)
+                and rel not in declared and rel not in derived):
             problems.append(f"{rel}: downloads yfinance prices and writes raw_series but is not declared")
     by_source: dict[str, set[bool]] = {}
     for rel, (name, flag) in declared.items():
@@ -300,6 +340,23 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
             if got != flag:
                 problems.append(f"{rel}:{line}: auto_adjust={got} but the writer declares {flag}")
         by_source.setdefault(name.lower(), set()).add(flag)
+    for rel, (name, stored, download, parity) in sorted(derived.items()):
+        source = sources.get(rel)
+        if source is None:
+            problems.append(f"{rel}: declared derived-basis writer does not exist")
+            continue
+        if rel in declared:
+            problems.append(f"{rel}: declared both as a price writer and a derived-basis writer")
+        if f'"{name}"' not in source and f"'{name}'" not in source:
+            problems.append(f"{rel}: never names the source {name!r} it is declared to write under")
+        if name.lower() not in by_source:
+            problems.append(f"{rel}: derived-basis writer for {name!r}, which has no declared price writer")
+        for line, got in yfinance_downloads(source):
+            if got != download:
+                problems.append(f"{rel}:{line}: auto_adjust={got} but the derived-basis writer declares {download}")
+        if not _test_exists(parity, tests):
+            problems.append(f"{rel}: parity test {parity!r} does not exist")
+        by_source.setdefault(name.lower(), set()).add(stored)
     for name, flags in sorted(by_source.items()):
         if len(flags) > 1:
             problems.append(f"source {name!r} has writers with different auto_adjust flags {sorted(flags)}")
@@ -307,8 +364,36 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
 
 
 def test_one_price_basis_per_source():
-    problems = price_writer_problems(PRICE_WRITERS, _module_sources())
+    problems = price_writer_problems(PRICE_WRITERS, _module_sources(), DERIVED_BASIS_WRITERS)
     assert not problems, "\n".join(problems)
+
+
+def test_derived_basis_self_test_catches_each_rule():
+    writer = '''
+import yfinance as yf
+def repair(conn):
+    name = "SRC"
+    data = yf.download("SPY", auto_adjust=False, actions=True)
+    conn.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
+                      "VALUES (:s, :src, :d, :v, 'SUCCESS')"))
+'''
+    live = writer.replace("auto_adjust=False, actions=True", "auto_adjust=True")
+    sources = {"live.py": live, "repair.py": writer}
+    declared = {"live.py": ("SRC", True)}
+    tests = {"tests/t.py": "def test_parity():\n    pass\n"}
+    ok = {"repair.py": ("SRC", True, False, "tests/t.py::test_parity")}
+    assert price_writer_problems(declared, sources, ok, tests) == []
+
+    def problems(derived=ok, srcs=sources):
+        return "\n".join(price_writer_problems(declared, srcs, derived, tests))
+
+    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, "tests/t.py::test_parity")})
+    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, "tests/t.py::test_parity")})
+    assert "auto_adjust=implicit" in problems(
+        srcs={**sources, "repair.py": writer.replace(", auto_adjust=False, actions=True", "")})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, "tests/t.py::test_missing")})
+    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, "tests/t.py::test_parity")})
+    assert "repair.py: downloads yfinance prices and writes raw_series but is not declared" in problems({})
 
 
 def test_one_meaning_self_test_catches_the_april_2026_contamination():
