@@ -24,6 +24,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(sec,'_sector_map_tickers',lambda:['NVDA'])
     monkeypatch.setattr(sec,'_load_fx_rates',lambda _: {'USD':1})
     monkeypatch.setattr(sec,'_fetch_ticker_to_cik_map',lambda:{'NVDA':'0001045810'})
+    monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik:None)   # no network: refusals stay refusals
     monkeypatch.setattr(sec,'_load_checkpoint',lambda:{})
     monkeypatch.setattr(sec.time,'sleep',lambda _:None)
     checkpoints=[]
@@ -135,3 +136,109 @@ def test_no_cik_is_attempted_not_successful(runner,monkeypatch):
     assert checkpoints[0][0]==[] and checkpoints[0][3]==['NVDA']
     fetch.assert_not_called()
     write.assert_not_called()
+
+
+def _stray_response():
+    raw,now,_=response()
+    data=json.loads(raw)
+    data['facts']['us-gaap']['PaymentsOfDividends']={'units':{'USD':[dict(
+        end='2026-06-15',val=1,form='10-Q',fp='Q2',accn='0001045810-26-000075',filed='2026-08-26')]}}
+    return json.dumps(data).encode(),now,now
+
+
+def test_a_start_less_point_is_retried_once_with_edgar_report_dates_and_the_issuer_is_written(runner,monkeypatch):
+    from datetime import date
+    puller,fetch,write,checkpoints=runner
+    fetch.return_value=_stray_response()
+    asked=[]
+    ref=sec.ReportDateEvidence({'0001045810-26-000075':date(2026,7,26)},'https://data.sec.gov/submissions/CIK0001045810.json','a'*64,'2026-11-27T00:00:00+00:00',b'raw response')
+    monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik:asked.append(cik) or ref)
+    result=puller.pull_all()
+    assert result[0]['status']=='SUCCESS' and result[-1]['tolerated_stray_points']==1
+    assert asked==['0001045810']                                       # one extra EDGAR call, only after the refusal
+    assert write.call_count==1 and write.call_args.args[1].report_dates==(('0001045810-26-000075','2026-07-26'),)
+    assert write.call_args.args[1].report_date_source==(ref.url,'a'*64,'2026-11-27T00:00:00+00:00')   # archived with the dates
+    assert write.call_args.args[1].report_date_source_body==b'raw response'
+
+
+def test_without_report_date_evidence_the_refusal_stands_and_nothing_is_written(runner,monkeypatch):
+    puller,fetch,write,checkpoints=runner
+    fetch.return_value=_stray_response()
+    empty=sec.ReportDateEvidence({},'u','a'*64,'t',b'x')
+    for unavailable in (None,empty):
+        monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik,u=unavailable:u)
+        result=puller.pull_all(resume=False)
+        assert result[0]['status']=='FAILED' and 'duration' in result[0]['error']
+    write.assert_not_called()
+
+
+def test_clean_issuers_make_no_submissions_request(runner,monkeypatch):
+    puller,fetch,write,checkpoints=runner
+    monkeypatch.setattr(sec,'_fetch_report_dates',lambda cik:pytest.fail('asked for report dates'))
+    assert puller.pull_all()[0]['status']=='SUCCESS'
+
+
+def _submissions(**changes):
+    doc={'cik':1045810,'filings':{'recent':{'accessionNumber':['0001045810-26-000075','0001045810-26-000070','0001045810-26-000001'],
+                                            'reportDate':['2026-07-26','','not-a-date']}}}
+    doc.update(changes)
+    return doc
+
+
+def _http(monkeypatch,status=200,body=None,exc=None,content=b'{"cik":1045810}'):
+    def get(url,**kw):
+        if exc:
+            raise exc
+        return MagicMock(status_code=status,json=lambda:body,content=content)
+    monkeypatch.setattr(sec.requests,'get',get)
+
+
+def test_report_dates_come_only_from_well_formed_rows_with_a_reference_to_the_response(monkeypatch):
+    from datetime import date
+    import hashlib
+    _http(monkeypatch,body=_submissions(),content=b'raw submissions bytes')
+    got=sec._fetch_report_dates('0001045810')
+    assert got.dates=={'0001045810-26-000075':date(2026,7,26)}          # blank/garbled rows give no evidence
+    assert got.url=='https://data.sec.gov/submissions/CIK0001045810.json' and got.body==b'raw submissions bytes'
+    assert got.sha256==hashlib.sha256(b'raw submissions bytes').hexdigest() and got.received_at.endswith('+00:00')
+
+
+@pytest.mark.parametrize('order',[('2026-07-26','2026-04-26'),('2026-04-26','2026-07-26')])
+def test_conflicting_duplicate_report_dates_are_dropped_whatever_the_row_order(monkeypatch,order):
+    """Codex 6081926340: the last row used to win, so a nearer old date after the current one re-admitted
+    the comparative-only projection."""
+    from datetime import date
+    body=_submissions(filings={'recent':{'accessionNumber':['0001045810-26-000075','0001045810-26-000075','0001045810-26-000070'],
+                                         'reportDate':[order[0],order[1],'2026-04-26']}})
+    _http(monkeypatch,body=body)
+    got=sec._fetch_report_dates('0001045810')
+    assert got.dates=={'0001045810-26-000070':date(2026,4,26)}          # the conflicted accession carries no evidence
+
+
+def test_identical_duplicate_report_dates_are_fine(monkeypatch):
+    from datetime import date
+    body=_submissions(filings={'recent':{'accessionNumber':['0001045810-26-000075']*3,'reportDate':['2026-07-26']*3}})
+    _http(monkeypatch,body=body)
+    assert sec._fetch_report_dates('0001045810').dates=={'0001045810-26-000075':date(2026,7,26)}
+
+
+def test_a_conflicted_accession_cannot_be_used_by_a_later_third_row(monkeypatch):
+    body=_submissions(filings={'recent':{'accessionNumber':['0001045810-26-000075']*3,
+                                         'reportDate':['2026-07-26','2026-04-26','2026-07-26']}})
+    _http(monkeypatch,body=body)
+    assert sec._fetch_report_dates('0001045810').dates=={}
+
+
+@pytest.mark.parametrize('name, kwargs',[
+    ('http error',dict(status=500,body=None)),
+    ('network down',dict(exc=sec.requests.ConnectionError('x'))),
+    ('another cik',dict(body=_submissions(cik=99))),
+    ('no filings',dict(body={'cik':1045810})),
+    ('no recent arrays',dict(body={'cik':1045810,'filings':{'recent':{'accessionNumber':[]}}})),
+    ('arrays of different length',dict(body={'cik':1045810,'filings':{'recent':{'accessionNumber':['a','b'],'reportDate':['2026-07-26']}}})),
+    ('not an object',dict(body=[1])),
+    ('no raw body to reference',dict(body=_submissions(),content=None)),
+])
+def test_report_dates_are_unavailable_unless_the_answer_is_well_formed(monkeypatch,name,kwargs):
+    _http(monkeypatch,**kwargs)
+    assert sec._fetch_report_dates('0001045810') is None,name

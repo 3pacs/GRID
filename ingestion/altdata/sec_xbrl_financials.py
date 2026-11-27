@@ -68,6 +68,8 @@ Runtime safety:
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import math
 import re
@@ -75,7 +77,7 @@ import os
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import requests
 from loguru import logger as log
@@ -423,6 +425,81 @@ def _stored_snapshot_actors(engine: Any) -> frozenset[str] | None:
                     e=type(exc).__name__)
         return None
     return frozenset(str(r[0]) for r in rows if r and r[0])
+
+
+_SUBMISSIONS_URL: str = "https://data.sec.gov/submissions/CIK{cik}.json"
+
+
+class ReportDateEvidence(NamedTuple):
+    """EDGAR submissions reportDate by accession, with the response it came from."""
+    dates: dict[str, date]
+    url: str
+    sha256: str
+    received_at: str
+    body: bytes = b""
+
+
+def report_dates_from_submissions(doc: Any, cik_padded: str) -> dict[str, date] | None:
+    """``accession -> reportDate`` from a parsed EDGAR submissions document, or None.
+
+    Only the expected envelope counts (the requested CIK, ``filings.recent`` with aligned
+    ``accessionNumber`` / ``reportDate`` arrays). Only complete, well-formed rows are returned; an
+    accession that appears more than once with different valid dates is conflicting evidence and is
+    left out, whatever the row order. Pure: also used to re-derive archived evidence.
+    """
+    if not isinstance(doc, dict) or str(doc.get("cik") or "").zfill(10) != cik_padded:
+        return None
+    filings = doc.get("filings")
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    keys = ("accessionNumber", "reportDate")
+    if not isinstance(recent, dict) or not all(isinstance(recent.get(k), list) for k in keys):
+        return None
+    if len(recent["accessionNumber"]) != len(recent["reportDate"]):
+        return None
+    out: dict[str, date] = {}
+    conflicted: set[str] = set()
+    for accession, reported in zip(recent["accessionNumber"], recent["reportDate"]):
+        if not isinstance(accession, str) or not isinstance(reported, str) or not reported:
+            continue                                   # a filing without a report date: no evidence for it
+        try:
+            when = date.fromisoformat(reported)
+        except ValueError:
+            continue
+        if accession in conflicted:
+            continue
+        if accession in out and out[accession] != when:
+            conflicted.add(accession)                  # two different dates: no evidence, in any order
+            del out[accession]
+            continue
+        out[accession] = when
+    return out
+
+
+def _fetch_report_dates(cik_padded: str) -> ReportDateEvidence | None:
+    """EDGAR submissions reportDate evidence for ``cik_padded`` with the raw response, or None.
+
+    None when the answer is unavailable or not the expected shape (the caller then keeps the
+    refusal: fail closed). The response's url, sha256, receipt time and bytes are returned so they can
+    be archived next to the dates they produced.
+    """
+    url = _SUBMISSIONS_URL.format(cik=cik_padded)
+    try:
+        resp = requests.get(url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS)
+        received = datetime.now(timezone.utc)
+        if resp.status_code != 200:
+            log.warning("SEC submissions CIK={c} HTTP {s}", c=cik_padded, s=resp.status_code)
+            return None
+        doc = resp.json()
+        body = resp.content
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("SEC submissions CIK={c} unavailable: {e}", c=cik_padded, e=type(exc).__name__)
+        return None
+    if not isinstance(body, bytes) or not body:
+        return None
+    dates = report_dates_from_submissions(doc, cik_padded)
+    if dates is None:
+        return None
+    return ReportDateEvidence(dates, url, hashlib.sha256(body).hexdigest(), received.isoformat(), body)
 
 
 def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
@@ -1148,6 +1225,7 @@ class SECXBRLFinancialsPuller:
         processed = 0
         rows_this_run = 0
         tolerated_total = 0
+        stray_points_total = 0
         no_cik_tickers: list[str] = []
         cik_lost = 0
         coverage_unavailable = 0
@@ -1224,13 +1302,32 @@ class SECXBRLFinancialsPuller:
                 record_attempt(ticker)
                 continue
             try:
-                snapshot = prepare_snapshot(
+                prepare_args = dict(
                     source_body=captured[0], actor_id=actor_id, cik=cik_padded,
                     request_started_at=captured[1], received_at=captured[2], fx_rates=fx_rates,
                 )
+                try:
+                    snapshot = prepare_snapshot(**prepare_args)
+                except ValueError as first_refusal:
+                    if str(first_refusal) != "Invalid mapped financial-flow duration":
+                        raise
+                    # A recent start-less point may be an event-dated stray, which only
+                    # independent report-period evidence can show: ask EDGAR submissions
+                    # (reportDate by accession) and retry once. Unavailable => refuse.
+                    evidence = _fetch_report_dates(cik_padded)
+                    time.sleep(_RATE_LIMIT_DELAY_SECS)
+                    if not evidence or not evidence.dates:
+                        raise
+                    snapshot = prepare_snapshot(**prepare_args, report_dates=evidence.dates)
+                    if snapshot.report_dates:
+                        snapshot = dataclasses.replace(
+                            snapshot, report_date_source=(evidence.url, evidence.sha256, evidence.received_at),
+                            report_date_source_body=evidence.body)
                 outcome = write_snapshot(self.engine, snapshot)
                 if outcome["status"] == "rejected_revision_regression":
                     raise ValueError("New capture regressed an existing filed revision; projection retained")
+                if outcome["status"] == "rejected_stray_would_remove_rows":
+                    raise ValueError("A tolerated start-less point would remove stored periods; projection retained")
             except Exception as exc:
                 # The transactional writer already rolled back any SQL failure.
                 # Never checkpoint failed admission as a completed ticker.
@@ -1249,6 +1346,12 @@ class SECXBRLFinancialsPuller:
                 "tolerated_legacy_entries": snapshot.tolerated_legacy_entries,
             })
             tolerated_total += snapshot.tolerated_legacy_entries
+            if snapshot.tolerated_stray_points:
+                stray_points_total += len(snapshot.tolerated_stray_points)
+                log.info("SEC_XBRL: {t} tolerated {n} stray start-less point(s) (EDGAR reportDate {d}): {p}",
+                         t=ticker, n=len(snapshot.tolerated_stray_points),
+                         d=", ".join(f"{a} {r}" for a, r in snapshot.report_dates[:5]),
+                         p="; ".join(f"{tag} end {end} {accn}" for tag, end, accn in snapshot.tolerated_stray_points[:5]))
             record_attempt(ticker, success=True)
 
         if carried:
@@ -1274,6 +1377,7 @@ class SECXBRLFinancialsPuller:
             "tickers_processed": processed,
             "rows_written": rows_this_run,
             "tolerated_legacy_entries": tolerated_total,
+            "tolerated_stray_points": stray_points_total,
             "no_cik": len(no_cik_tickers),
             "no_cik_tickers": no_cik_tickers[:50],
             "cik_lost": cik_lost,

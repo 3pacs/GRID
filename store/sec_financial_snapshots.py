@@ -6,7 +6,9 @@ reconciles unmarked legacy rows. No environment/default database discovery.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,6 +28,18 @@ _ARCHIVE = text('''INSERT INTO sec_financial_snapshots (
 ) VALUES (:snapshot_id, :actor_id, :cik, :source_url, :source_sha256, :normalized_sha256,
     :normalizer_version, :source_gzip, CAST(:normalized_rows AS JSONB), CAST(:fx_inputs AS JSONB),
     :request_started_at, :received_at) ON CONFLICT (snapshot_id) DO NOTHING''')
+_ARCHIVE_EVIDENCE = text('''INSERT INTO sec_financial_snapshots (
+    snapshot_id, actor_id, cik, source_url, source_sha256, normalized_sha256,
+    normalizer_version, source_gzip, normalized_rows, fx_inputs,
+    first_request_started_at, first_received_at, report_date_evidence, report_date_source_gzip
+) VALUES (:snapshot_id, :actor_id, :cik, :source_url, :source_sha256, :normalized_sha256,
+    :normalizer_version, :source_gzip, CAST(:normalized_rows AS JSONB), CAST(:fx_inputs AS JSONB),
+    :request_started_at, :received_at, CAST(:report_date_evidence AS JSONB), :report_date_source_gzip)
+    ON CONFLICT (snapshot_id) DO NOTHING''')
+_ARCHIVED = text('''SELECT snapshot_id, actor_id, cik, source_gzip, fx_inputs,
+    first_request_started_at, first_received_at, report_date_evidence, report_date_source_gzip
+    FROM sec_financial_snapshots WHERE snapshot_id = :snapshot_id''')
+_SHA256 = re.compile(r'[0-9a-f]{64}')
 _DELETE_OWNED = text('''DELETE FROM capital_flows WHERE actor_id = :actor_id
     AND counterparty_id IS NULL AND period_type IN ('annual', 'quarter')
     AND split_part(source_filing, ' ', 1) IN
@@ -33,7 +47,7 @@ _DELETE_OWNED = text('''DELETE FROM capital_flows WHERE actor_id = :actor_id
     AND split_part(source_filing, ' ', 2) = '[SEC-XBRL-PERIOD-V1]' ''')
 _HEAD = text('''INSERT INTO sec_financial_snapshot_heads
     (actor_id, snapshot_id, request_started_at, received_at)
-    VALUES (:actor_id, :snapshot_id, :request_started_at, :received_at)
+    VALUES (:actor_id, :snapshot_id, :request_started_at, :head_received_at)
     ON CONFLICT (actor_id) DO UPDATE SET snapshot_id=EXCLUDED.snapshot_id,
         request_started_at=EXCLUDED.request_started_at, received_at=EXCLUDED.received_at,
         updated_at=NOW()''')
@@ -43,6 +57,70 @@ def _revision_regressed(previous: list[dict[str, Any]], incoming: list[dict[str,
     old = {(r['fiscal_period'], r['period_type'], r['flow_type']): r['filed_date'] for r in previous}
     return any(r['filed_date'] < old.get((r['fiscal_period'], r['period_type'], r['flow_type']), '')
                for r in incoming)
+
+
+def report_date_receipt(snapshot: FinancialSnapshot):
+    """The timezone-aware receipt time of the report-date evidence, or None without evidence."""
+    from datetime import datetime as _dt
+
+    if not snapshot.report_dates or snapshot.report_date_source is None:
+        return None
+    return _dt.fromisoformat(str(snapshot.report_date_source[2]))
+
+
+def available_at(snapshot: FinancialSnapshot):
+    """When an as-of consumer may first use the snapshot: after every receipt it depends on.
+
+    The Company Facts receipt, and for an evidence-dependent snapshot also the later EDGAR
+    submissions receipt. The Company Facts receipt itself stays separate (the archive's
+    first_received_at); this is the head's availability time.
+    """
+    evidence = report_date_receipt(snapshot)
+    return snapshot.received_at if evidence is None else max(snapshot.received_at, evidence)
+
+
+def validate_report_date_provenance(snapshot: FinancialSnapshot, now=None) -> None:
+    """Whenever EDGAR reportDate evidence was used, its provenance must be complete and matched.
+
+    The source reference must be the submissions url of this snapshot's CIK, a lowercase SHA-256 of the
+    archived response bytes and a timezone-aware receipt time, and the raw response must independently
+    yield the used accession -> reportDate pairs. Ordinary snapshots carry none of it.
+    """
+    from datetime import datetime as _dt
+
+    from ingestion.altdata.sec_xbrl_financials import report_dates_from_submissions
+
+    if not snapshot.report_dates:
+        if snapshot.report_date_source is not None or snapshot.report_date_source_body is not None:
+            raise ValueError('Report-date provenance without report-date evidence')
+        return
+    source, body = snapshot.report_date_source, snapshot.report_date_source_body
+    if source is None or not isinstance(body, bytes) or not body:
+        raise ValueError('Report-date evidence requires its source reference and response')
+    url, digest, received = source
+    if url != f'https://data.sec.gov/submissions/CIK{snapshot.cik}.json':
+        raise ValueError('Report-date source url does not match the snapshot CIK')
+    if not _SHA256.fullmatch(str(digest)) or hashlib.sha256(body).hexdigest() != digest:
+        raise ValueError('Report-date source hash is not the lowercase SHA-256 of the response')
+    try:
+        when = _dt.fromisoformat(str(received))
+    except ValueError as exc:
+        raise ValueError('Report-date source receipt time is not an ISO timestamp') from exc
+    if when.tzinfo is None or when.utcoffset() is None:
+        raise ValueError('Report-date source receipt time must be timezone-aware')
+    if when > (now or _dt.now(timezone.utc)):
+        raise ValueError('Report-date source receipt time is in the future')
+    try:
+        derived = report_dates_from_submissions(json.loads(body), snapshot.cik)
+    except ValueError as exc:
+        raise ValueError('Report-date source response is not JSON') from exc
+    if derived is None or any(derived.get(a) is None or derived[a].isoformat() != d for a, d in snapshot.report_dates):
+        raise ValueError('Report-date source response does not yield the used report dates')
+
+
+def _removes_owned_keys(previous: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> bool:
+    key = lambda r: (r['fiscal_period'], r['period_type'], r['flow_type'])  # noqa: E731
+    return bool({key(r) for r in previous} - {key(r) for r in incoming})
 
 
 def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
@@ -58,6 +136,7 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
 
     validate_snapshot(snapshot)
     now = datetime.now(timezone.utc)
+    validate_report_date_provenance(snapshot, now)
     if snapshot.received_at > now or snapshot.request_started_at > now:
         raise ValueError('Future source receipt cannot advance current projection')
     params = dict(snapshot_id=snapshot.snapshot_id, actor_id=snapshot.actor_id, cik=snapshot.cik,
@@ -65,14 +144,26 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
                   normalized_sha256=snapshot.normalized_sha256, normalizer_version=snapshot.normalizer_version,
                   source_gzip=gzip.compress(snapshot.source_body, mtime=0),
                   normalized_rows=snapshot.normalized_json, fx_inputs=snapshot.fx_json,
-                  request_started_at=snapshot.request_started_at, received_at=snapshot.received_at)
+                  request_started_at=snapshot.request_started_at, received_at=snapshot.received_at,
+                  head_received_at=available_at(snapshot))
     rows = snapshot.rows
     with engine.begin() as conn:
         conn.execute(_LOCK, params)
         current = conn.execute(_CURRENT, params).mappings().first()
         if current and snapshot.request_started_at == current['request_started_at'] and snapshot.snapshot_id != current['snapshot_id']:
             raise ValueError('Conflicting snapshot at the same request-start time')
-        conn.execute(_ARCHIVE, params)
+        if snapshot.report_dates:
+            # The decision depended on EDGAR reportDate evidence: archive the canonical mapping
+            # and the reference to the response it came from, so the immutable row alone can
+            # reproduce the identity (see replay_archived_snapshot).
+            source = snapshot.report_date_source
+            conn.execute(_ARCHIVE_EVIDENCE, dict(
+                params, report_date_evidence=json.dumps(dict(
+                    report_dates=dict(snapshot.report_dates),
+                    source=dict(url=source[0], sha256=source[1], received_at=source[2])), sort_keys=True),
+                report_date_source_gzip=gzip.compress(snapshot.report_date_source_body, mtime=0)))
+        else:
+            conn.execute(_ARCHIVE, params)
         if current and snapshot.request_started_at < current['request_started_at']:
             return dict(status='ignored_older_capture', rows_written=0, snapshot_id=snapshot.snapshot_id)
         if current and snapshot.snapshot_id != current['snapshot_id']:
@@ -80,6 +171,10 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
             old = json.loads(old) if isinstance(old, str) else old
             if _revision_regressed(old, rows):
                 return dict(status='rejected_revision_regression', rows_written=0, snapshot_id=snapshot.snapshot_id)
+            if snapshot.tolerated_stray_points and _removes_owned_keys(old, rows):
+                # A capture that tolerated start-less points must never erase a stored
+                # period: that needs an explicit, supported reconciliation, not this path.
+                return dict(status='rejected_stray_would_remove_rows', rows_written=0, snapshot_id=snapshot.snapshot_id)
         if current and snapshot.snapshot_id == current['snapshot_id']:
             conn.execute(_HEAD, params)
             return dict(status='unchanged', rows_written=0, snapshot_id=snapshot.snapshot_id)
@@ -91,3 +186,43 @@ def write_snapshot(engine, snapshot: FinancialSnapshot) -> dict[str, Any]:
                 confidence=row['confidence'], currency=row['currency']))
         conn.execute(_HEAD, params)
     return dict(status='applied', rows_written=len(rows), rows_removed=deleted, snapshot_id=snapshot.snapshot_id)
+
+
+def replay_archived_snapshot(engine, snapshot_id: str) -> FinancialSnapshot:
+    """Rebuild a snapshot from its immutable archive row alone and check its identity.
+
+    Company Facts bytes, FX inputs, the first receipt times and, when the admission depended on
+    EDGAR reportDate evidence, the archived accession -> reportDate mapping. Raises ``ValueError`` if
+    the row is missing or the replay does not reproduce ``snapshot_id``.
+    """
+    from dataclasses import replace
+    from datetime import date
+
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+
+    with engine.connect() as conn:
+        row = conn.execute(_ARCHIVED, dict(snapshot_id=snapshot_id)).mappings().first()
+    if row is None:
+        raise ValueError('No archived snapshot with that id')
+    fx = row['fx_inputs']
+    fx = json.loads(fx) if isinstance(fx, str) else fx
+    evidence = row['report_date_evidence']
+    evidence = json.loads(evidence) if isinstance(evidence, str) else evidence
+    stored_body = row['report_date_source_gzip']
+    dates = {a: date.fromisoformat(d) for a, d in ((evidence or {}).get('report_dates') or {}).items()}
+    snapshot = prepare_snapshot(
+        source_body=gzip.decompress(row['source_gzip']), actor_id=row['actor_id'], cik=row['cik'],
+        request_started_at=row['first_request_started_at'], received_at=row['first_received_at'],
+        fx_rates=fx, report_dates=dates)
+    if snapshot.snapshot_id != row['snapshot_id']:
+        raise ValueError('Archived snapshot does not reproduce its identity')
+    if snapshot.report_dates:
+        source = (evidence or {}).get('source') or {}
+        if stored_body is None:
+            raise ValueError('Archived report-date evidence has no source response')
+        # restore the complete provenance and verify it exactly as the write boundary does
+        snapshot = replace(
+            snapshot, report_date_source=(source.get('url'), source.get('sha256'), source.get('received_at')),
+            report_date_source_body=gzip.decompress(stored_body))
+    validate_report_date_provenance(snapshot)
+    return snapshot

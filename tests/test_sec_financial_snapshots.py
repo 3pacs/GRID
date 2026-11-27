@@ -320,3 +320,198 @@ def test_tolerated_legacy_entries_are_counted_but_not_part_of_the_identity():
     s = prepared(data)
     assert s.tolerated_legacy_entries == 2 and clean.tolerated_legacy_entries == 0
     validate_snapshot(s)                                    # replay at the write boundary still matches
+
+
+# ── event-dated stray points do not refuse the issuer (2026-11-26) ────────────
+# INTC, EOG, ON and WLK (and later DHI, RPD, NXE) were refused "Invalid mapped
+# financial-flow duration" for ONE or TWO start-less entries each: a one-day debt
+# issuance, share issuance or buyback in a notes disclosure, tagged with a flow
+# concept but no start. Codex 6081201501 / 6081419580 / 6081574064: nothing inferred
+# from Company Facts (other periods in the accession, a balance-sheet date, a
+# filing-age window) establishes the filing's report period, so the tolerance needs
+# EDGAR's reportDate for the accession, supplied as evidence, plus a qualifying flow
+# at that date; without it the entry refuses (fail closed).
+
+from datetime import date as _date                  # noqa: E402
+from dataclasses import replace as _replace          # noqa: E402
+
+OWN = '0001045810-26-000075'          # the accession of payload()'s usable Q2 entry (period end 2026-07-26)
+RD = {OWN: _date(2026, 7, 26)}        # EDGAR submissions reportDate for that accession
+
+
+def _stray(end, *, accn=OWN, filed='2026-08-26', **extra):
+    return _legacy(end=end, filed=filed, accn=accn, form='10-Q', fp='Q2', **extra)
+
+
+def _stray_payload(tag='PaymentsOfDividends', end='2026-06-15'):
+    data = payload()
+    data['facts']['us-gaap'][tag] = _stray(end)
+    return data
+
+
+def test_an_event_dated_stray_point_with_edgar_report_date_does_not_refuse_and_is_traceable():
+    clean = prepared()
+    s = prepared(_stray_payload(), report_dates=RD)
+    assert s.rows == clean.rows and s.normalized_sha256 == clean.normalized_sha256
+    assert s.tolerated_stray_points == (('PaymentsOfDividends', '2026-06-15', OWN),)
+    assert s.report_dates == ((OWN, '2026-07-26'),)            # the evidence the decision rested on
+    assert s.tolerated_legacy_entries == 1 and clean.tolerated_stray_points == () and clean.report_dates == ()
+    assert s.snapshot_id != clean.snapshot_id                   # the evidence is part of the identity
+    validate_snapshot(s)
+    assert s.source_sha256 != clean.source_sha256
+
+
+def test_without_edgar_report_date_evidence_nothing_is_tolerated():
+    with pytest.raises(ValueError, match='duration'):
+        prepared(_stray_payload())
+    with pytest.raises(ValueError, match='duration'):
+        prepared(_stray_payload(), report_dates={'0001045810-26-000099': _date(2026, 7, 26)})   # another accession
+
+
+def test_ordinary_snapshots_keep_their_identity_when_evidence_is_offered_but_not_used():
+    assert prepared(report_dates=RD).snapshot_id == prepared().snapshot_id
+
+
+def test_a_stray_point_at_the_report_date_stays_fatal():
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2026-07-26')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+
+
+def test_a_stray_point_at_a_period_end_reported_by_another_accession_stays_fatal():
+    data = payload()
+    prior = dict(start='2025-04-28', end='2025-07-27', val=1, accn='0001045810-25-000070',
+                 filed='2025-08-27', form='10-Q', fp='Q2')
+    data['facts']['us-gaap']['Revenues']['units']['USD'].append(prior)
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2025-07-27')       # a comparative period end
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+
+
+def test_a_nearer_comparative_with_the_real_report_date_elsewhere_stays_fatal():
+    """Codex 6081574064: a 10-Q (reportDate 2026-07-26) whose only qualifying flow is an earlier
+    comparative, with a start-less current Revenue. The report date is established by EDGAR, so the
+    current period is seen to have no qualifying flow of its own."""
+    data = {'cik': 1045810, 'entityName': 'NVIDIA CORP', 'facts': {'us-gaap': {'Revenues': {'units': {'USD': [
+        dict(start='2026-01-27', end='2026-04-26', val=1, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2'),
+        dict(end='2026-07-26', val=96_221_000_000, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2')]}}}}}
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+    data['facts']['us-gaap']['Revenues']['units']['USD'].pop()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2026-06-15')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+
+
+def test_comparative_only_evidence_cannot_hide_a_missing_current_period():
+    data = {'cik': 1045810, 'entityName': 'NVIDIA CORP', 'facts': {'us-gaap': {'Revenues': {'units': {'USD': [
+        dict(start='2025-04-28', end='2025-07-27', val=1, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2'),
+        dict(end='2026-07-26', val=96_221_000_000, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2')]}}}}}
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+
+
+@pytest.mark.parametrize('name, form, start, end', [
+    ('a two-day 8-K span', '8-K', '2026-07-24', '2026-07-26'),
+    ('a nine-month year-to-date duration', '10-Q', '2025-10-27', '2026-07-26'),
+    ('a quarter in a form the normalizer does not read', '10-K405', '2026-04-27', '2026-07-26'),
+])
+def test_a_nonqualifying_duration_is_not_evidence_of_the_current_period(name, form, start, end):
+    data = {'cik': 1045810, 'entityName': 'NVIDIA CORP', 'facts': {'us-gaap': {'Revenues': {'units': {'USD': [
+        dict(start=start, end=end, val=1, accn=OWN, filed='2026-08-26', form=form, fp='Q2')]}}}}}
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray('2026-06-15')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+
+
+@pytest.mark.parametrize('age_days, refused', [(0, False), (31, False), (150, False), (151, True), (395, True), (-1, True)])
+def test_the_report_date_must_also_be_plausible_for_the_filing(age_days, refused):
+    filed = _date(2026, 8, 26)
+    r = filed - timedelta(days=age_days)
+    data = {'cik': 1045810, 'entityName': 'NVIDIA CORP', 'facts': {'us-gaap': {
+        'Revenues': {'units': {'USD': [dict(start=(r - timedelta(days=89)).isoformat(), end=r.isoformat(),
+                                            val=96_221_000_000, accn=OWN, filed=filed.isoformat(), form='10-Q', fp='Q2')]}},
+        'PaymentsOfDividends': _stray((r - timedelta(days=40)).isoformat())}}}
+    if refused:
+        with pytest.raises(ValueError, match='duration'):
+            prepared(data, report_dates={OWN: r})
+    else:
+        assert len(prepared(data, report_dates={OWN: r}).tolerated_stray_points) == 1
+
+
+@pytest.mark.parametrize('bad', [{'not-an-accession': _date(2026, 7, 26)}, {OWN: '2026-07-26'},
+                                 {OWN: datetime(2026, 7, 26, tzinfo=timezone.utc)}])
+def test_malformed_report_date_evidence_is_rejected(bad):
+    with pytest.raises(ValueError, match='report-date evidence'):
+        prepared(_stray_payload(), report_dates=bad)
+
+
+def test_tolerance_metadata_and_evidence_cannot_be_dropped_without_failing_the_replay():
+    s = prepared(_stray_payload(), report_dates=RD)
+    for tampered in (_replace(s, tolerated_stray_points=()), _replace(s, tolerated_legacy_entries=0),
+                     _replace(s, tolerated_stray_points=(('PaymentsOfDividends', '2026-06-16', OWN),)),
+                     _replace(s, report_dates=()),
+                     _replace(s, report_dates=((OWN, '2026-07-27'),))):
+        with pytest.raises(ValueError):
+            validate_snapshot(tampered)
+    validate_snapshot(s)
+
+
+def test_a_recent_entry_filed_before_its_end_stays_fatal_even_with_evidence():
+    data = payload()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = {'units': {'USD': [dict(
+        start='2026-06-01', end='2026-09-30', val=5, accn=OWN, filed='2026-08-26', form='10-Q', fp='Q2')]}}
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+
+
+def test_one_tolerable_and_one_fatal_entry_still_refuse():
+    data = _stray_payload()
+    data['facts']['us-gaap']['PaymentsForRepurchaseOfCommonStock'] = _stray('2026-07-26')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data, report_dates=RD)
+
+
+@pytest.mark.parametrize('days_before_capture, tolerated_as', [(10, 'stray'), (730, 'stray'), (731, 'legacy'), (4000, 'legacy')])
+def test_the_horizon_still_decides_what_is_legacy(days_before_capture, tolerated_as):
+    data = payload()
+    end = (AT.date() - timedelta(days=days_before_capture)).isoformat()
+    data['facts']['us-gaap']['PaymentsOfDividends'] = _stray(end, filed=AT.date().isoformat())
+    # the accession of this entry is OWN, filed on the capture day; its report date is 2026-07-26 (104 days before)
+    s = prepared(data, report_dates=RD)
+    assert s.tolerated_legacy_entries == 1
+    assert (len(s.tolerated_stray_points) == 1) == (tolerated_as == 'stray')
+
+
+@pytest.mark.parametrize('name, taxonomy, tag, stray_end', [
+    ('INTC', 'us-gaap', 'ProceedsFromIssuanceOfCommonStock', '2026-06-29'),
+    ('EOG', 'us-gaap', 'ProceedsFromIssuanceOfLongTermDebt', '2026-07-01'),
+    ('ON', 'us-gaap', 'PaymentsForRepurchaseOfCommonStock', '2026-05-11'),
+    ('WLK', 'us-gaap', 'RepaymentsOfLongTermDebt', '2026-05-29'),
+    ('DHI', 'us-gaap', 'PaymentsToAcquireBusinessesNetOfCashAcquired', '2026-07-27'),
+    ('RPD', 'us-gaap', 'ProceedsFromIssuanceOfCommonStock', '2026-03-14'),
+    ('NXE', 'ifrs-full', 'ProceedsFromIssuingShares', '2026-04-15'),
+])
+def test_the_refused_issuers_shapes_are_admitted_with_evidence(name, taxonomy, tag, stray_end):
+    data = payload()
+    data['facts'].setdefault(taxonomy, {})[tag] = _stray(stray_end)
+    s = prepared(data, report_dates=RD)
+    assert s.rows[0]['amount_usd'] == 96_221_000_000
+    assert s.tolerated_stray_points == ((tag, stray_end, OWN),), name
+    with pytest.raises(ValueError, match='duration'):
+        prepared(data)                                          # and refused without the evidence
+
+
+def test_the_wolf_and_ee_shapes_stay_refused():
+    wolf = payload()
+    for tag in ('OperatingExpenses', 'ResearchAndDevelopmentExpense', 'IncomeTaxExpenseBenefit'):
+        wolf['facts']['us-gaap'][tag] = _stray('2026-07-26')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(wolf, report_dates=RD)
+    ee = payload()
+    ee['facts']['us-gaap']['Revenues']['units']['USD'].append(dict(
+        start='2025-04-28', end='2025-07-27', val=1, accn='0001045810-25-000070', filed='2025-08-27', form='10-Q', fp='Q2'))
+    ee['facts']['us-gaap']['ProceedsFromIssuanceOfCommonStock'] = _stray('2025-07-27')
+    with pytest.raises(ValueError, match='duration'):
+        prepared(ee, report_dates=RD)

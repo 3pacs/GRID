@@ -232,6 +232,12 @@ def snapshot_db(pg_table):
             current_migration = importlib.util.module_from_spec(current_spec)
             current_spec.loader.exec_module(current_migration)
             current_migration.upgrade()
+            evidence_path = path.with_name('sec_financial_report_dates_20261127.py')
+            evidence_spec = importlib.util.spec_from_file_location('_sec_evidence_migration', evidence_path)
+            evidence_migration = importlib.util.module_from_spec(evidence_spec)
+            evidence_spec.loader.exec_module(evidence_migration)
+            evidence_migration.upgrade()
+            evidence_migration.upgrade()                 # idempotent
     try:
         yield engine
     finally:
@@ -1354,7 +1360,7 @@ def test_pg_normalization_never_coerces_nonstring_markers(journal_db, location, 
     assert _raw_journal_evidence(journal_db) == before
 
 
-def _snapshot_with_extra_facts(extra: dict, *, second: int):
+def _snapshot_with_extra_facts(extra: dict, *, second: int, report_dates=None):
     """The ``snapshot()`` capture plus extra Company Facts concepts, at a later request time."""
     import json
     from datetime import datetime, timedelta, timezone
@@ -1367,7 +1373,7 @@ def _snapshot_with_extra_facts(extra: dict, *, second: int):
     started = datetime(2026, 11, 1, tzinfo=timezone.utc) + timedelta(seconds=second)
     return prepare_snapshot(source_body=json.dumps(body).encode(), actor_id="nvda", cik="1045810",
                             request_started_at=started, received_at=started + timedelta(seconds=1),
-                            fx_rates={"USD": 1.0})
+                            fx_rates={"USD": 1.0}, report_dates=report_dates)
 
 
 def test_pg_tolerated_legacy_entry_cannot_remove_an_existing_current_row(snapshot_db):
@@ -1398,3 +1404,363 @@ def test_pg_tolerated_legacy_entry_cannot_remove_an_existing_current_row(snapsho
     with pytest.raises(ValueError, match="duration"):
         _snapshot_with_extra_facts(current_period, second=20)
     assert stored(engine) == before                              # refused before the writer: projection retained
+
+
+_OWN = "0001045810-26-000075"
+
+
+def _rd():
+    from datetime import date
+    return {_OWN: date(2026, 7, 26)}                              # EDGAR submissions reportDate for the accession
+
+
+def _submissions_body(dates=None, cik=1045810):
+    """A raw EDGAR submissions response whose recent filings carry the given accession -> reportDate pairs."""
+    import json
+    dates = dates or {_OWN: "2026-07-26"}
+    return json.dumps({"cik": cik, "name": "Synthetic Test Issuer", "filings": {"recent": {
+        "accessionNumber": list(dates), "reportDate": list(dates.values())}}}).encode()
+
+
+def _with_provenance(snapshot_, *, url="https://data.sec.gov/submissions/CIK0001045810.json",
+                     received="2026-11-02T00:00:00+00:00", body=None, digest=None):
+    """Attach the complete evidence provenance a puller would: matched url, lowercase sha256, aware receipt, response."""
+    import dataclasses
+    import hashlib
+
+    body = _submissions_body() if body is None else body
+    return dataclasses.replace(snapshot_, report_date_source=(url, digest or hashlib.sha256(body).hexdigest(), received),
+                               report_date_source_body=body)
+
+
+def _stray_fact(tag="PaymentsOfDividends", end="2026-06-15"):
+    return {tag: {"units": {"USD": [dict(end=end, val=1000, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+
+
+def _custom_snapshot(facts: dict, *, second: int, report_dates=None):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+
+    started = datetime(2026, 11, 1, tzinfo=timezone.utc) + timedelta(seconds=second)
+    return prepare_snapshot(
+        source_body=json.dumps({"cik": 1045810, "entityName": "Synthetic Test Issuer", "facts": {"us-gaap": facts}}).encode(),
+        actor_id="nvda", cik="1045810", request_started_at=started, received_at=started + timedelta(seconds=1),
+        fx_rates={"USD": 1.0}, report_dates=report_dates)
+
+
+_REV = "RevenueFromContractWithCustomerExcludingAssessedTax"
+
+
+def test_pg_tolerated_stray_point_with_edgar_evidence_cannot_remove_an_existing_current_row(snapshot_db):
+    """An event-dated start-less point, with EDGAR's reportDate for its accession, a qualifying flow
+    at that date and the point not a period end, changes nothing the normalizer emits: the writer
+    replaces the owned projection with the same rows. Without the evidence, or at the report date,
+    it is refused before the writer."""
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    first = snapshot()
+    assert write_snapshot(engine, first)["status"] == "applied"
+    before = stored(engine)
+    assert len(before) == 1
+
+    with pytest.raises(ValueError, match="duration"):
+        _snapshot_with_extra_facts(_stray_fact(), second=25)                      # no evidence: fail closed
+    later = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()))
+    assert later.tolerated_stray_points == (("PaymentsOfDividends", "2026-06-15", _OWN),)
+    assert later.report_dates == ((_OWN, "2026-07-26"),)
+    assert later.rows == first.rows and later.snapshot_id != first.snapshot_id
+    result = write_snapshot(engine, later)
+    assert result["status"] == "applied" and result["rows_written"] == len(first.rows)
+    assert result["rows_removed"] == len(first.rows)             # the same owned rows replaced by the same rows
+    assert stored(engine) == before                              # no current row lost or changed
+
+    with pytest.raises(ValueError, match="duration"):
+        _snapshot_with_extra_facts(_stray_fact(end="2026-07-26"), second=40, report_dates=_rd())
+    assert stored(engine) == before                              # refused before the writer: projection retained
+
+
+def test_pg_nearer_comparative_and_comparative_only_evidence_cannot_hide_the_current_period(snapshot_db):
+    """Codex 6081201501 / 6081574064: the filing's real report date is 2026-07-26 (EDGAR) but its only
+    qualifying flows are earlier comparatives; the 2026 Revenue is start-less. Refused, owned row kept."""
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    assert write_snapshot(engine, snapshot())["status"] == "applied"
+    before = stored(engine)
+    for comparative in (dict(start="2025-04-28", end="2025-07-27"), dict(start="2026-01-27", end="2026-04-26")):
+        facts = {_REV: {"units": {"USD": [
+            dict(val=1, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2", **comparative),
+            dict(end="2026-07-26", val=100, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+        with pytest.raises(ValueError, match="duration"):
+            _custom_snapshot(facts, second=50, report_dates=_rd())
+    assert stored(engine) == before                              # the 2026 owned row is still there
+
+
+def test_pg_fresh_insert_with_only_comparative_evidence_stores_nothing(snapshot_db):
+    import pytest
+
+    engine = snapshot_db
+    facts = {_REV: {"units": {"USD": [
+        dict(start="2026-01-27", end="2026-04-26", val=1, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2"),
+        dict(end="2026-07-26", val=100, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    with pytest.raises(ValueError, match="duration"):
+        _custom_snapshot(facts, second=100, report_dates=_rd())
+    assert stored(engine) == []
+
+
+def test_pg_a_nonqualifying_duration_cannot_lead_to_an_empty_projection(snapshot_db):
+    """Only a two-day 8-K span supports the accession; the normalizer rejects it, so a tolerated point
+    would otherwise yield an empty projection and clear owned rows."""
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    assert write_snapshot(engine, snapshot())["status"] == "applied"
+    before = stored(engine)
+    facts = {_REV: {"units": {"USD": [dict(start="2026-07-24", end="2026-07-26", val=1, accn=_OWN,
+                                           filed="2026-08-26", form="8-K", fp="Q2")]}}, **_stray_fact()}
+    with pytest.raises(ValueError, match="duration"):
+        _custom_snapshot(facts, second=60, report_dates=_rd())
+    assert stored(engine) == before
+
+
+def test_pg_a_tolerating_capture_never_erases_a_stored_period_but_a_clean_one_may(snapshot_db):
+    """The writer's own guard (no inference involved): a capture that tolerated start-less points and
+    lacks a previously owned key is rejected with the projection retained; the same removal in a capture
+    with no tolerated point is the ordinary replacement and still applies."""
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    dividends = {"PaymentsOfDividends": {"units": {"USD": [dict(
+        start="2026-04-27", end="2026-07-26", val=40, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    first = _snapshot_with_extra_facts(dividends, second=70)
+    assert len(first.rows) == 2 and write_snapshot(engine, first)["status"] == "applied"
+    before = stored(engine)
+    assert len(before) == 2
+
+    tolerating = _with_provenance(_snapshot_with_extra_facts(_stray_fact("PaymentsForRepurchaseOfCommonStock"), second=80, report_dates=_rd()))
+    assert tolerating.tolerated_stray_points and len(tolerating.rows) == 1       # the dividends row is gone from the source
+    result = write_snapshot(engine, tolerating)
+    assert result["status"] == "rejected_stray_would_remove_rows" and result["rows_written"] == 0
+    assert stored(engine) == before                                             # nothing erased
+
+    clean = _snapshot_with_extra_facts({}, second=90)                           # same removal, nothing tolerated
+    assert not clean.tolerated_stray_points
+    assert write_snapshot(engine, clean)["status"] == "applied"
+    assert len(stored(engine)) == 1
+
+
+def test_pg_dropping_tolerance_metadata_or_evidence_cannot_bypass_the_writer_guard(snapshot_db):
+    """With owned rows stored, the honest tolerating capture is rejected by the guard; the same snapshot
+    with tolerated_stray_points or report_dates removed (same bytes) must fail the write-boundary replay."""
+    from dataclasses import replace
+
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    dividends = {"PaymentsOfDividends": {"units": {"USD": [dict(
+        start="2026-04-27", end="2026-07-26", val=40, accn=_OWN, filed="2026-08-26", form="10-Q", fp="Q2")]}}}
+    assert write_snapshot(engine, _snapshot_with_extra_facts(dividends, second=110))["status"] == "applied"
+    before = stored(engine)
+    assert len(before) == 2
+
+    tolerating = _with_provenance(_snapshot_with_extra_facts(_stray_fact("PaymentsForRepurchaseOfCommonStock"), second=120, report_dates=_rd()))
+    assert tolerating.tolerated_stray_points and len(tolerating.rows) == 1
+    for drifted in (replace(tolerating, tolerated_stray_points=()), replace(tolerating, report_dates=())):
+        with pytest.raises(ValueError):
+            write_snapshot(engine, drifted)
+        assert stored(engine) == before                          # the owned dividends row survives
+    assert write_snapshot(engine, tolerating)["status"] == "rejected_stray_would_remove_rows"
+    assert stored(engine) == before
+
+
+def _archive_row(engine, snapshot_id):
+    with engine.connect() as conn:
+        return dict(conn.execute(text(
+            "SELECT report_date_evidence, report_date_source_gzip FROM sec_financial_snapshots WHERE snapshot_id = :i"),
+            {"i": snapshot_id}).mappings().one())
+
+
+def test_pg_the_archive_row_alone_reproduces_a_snapshot_and_its_complete_provenance(snapshot_db):
+    """Codex 6081926340 / 6082027007: the used mapping, the matched source reference AND the raw
+    submissions response are archived; a replay from the immutable row alone restores all of it and gives
+    the same identity. An ordinary snapshot stores NULLs and still replays."""
+    import gzip
+
+    import pytest
+    from store.sec_financial_snapshots import replay_archived_snapshot, write_snapshot
+
+    engine = snapshot_db
+    ordinary = snapshot()
+    assert write_snapshot(engine, ordinary)["status"] == "applied"
+    row = _archive_row(engine, ordinary.snapshot_id)
+    assert row["report_date_evidence"] is None and row["report_date_source_gzip"] is None
+    assert replay_archived_snapshot(engine, ordinary.snapshot_id) == ordinary
+
+    body = _submissions_body()
+    tolerating = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()), body=body)
+    assert write_snapshot(engine, tolerating)["status"] == "applied"
+    row = _archive_row(engine, tolerating.snapshot_id)
+    assert row["report_date_evidence"] == {
+        "report_dates": {_OWN: "2026-07-26"},
+        "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json",
+                   "sha256": tolerating.report_date_source[1], "received_at": "2026-11-02T00:00:00+00:00"}}
+    assert gzip.decompress(bytes(row["report_date_source_gzip"])) == body
+    replayed = replay_archived_snapshot(engine, tolerating.snapshot_id)
+    assert replayed == tolerating and replayed.snapshot_id == tolerating.snapshot_id
+    assert replayed.report_date_source == tolerating.report_date_source                 # the complete triple
+    assert replayed.report_date_source_body == body
+    assert replayed.tolerated_stray_points == tolerating.tolerated_stray_points and replayed.rows == tolerating.rows
+
+    # without the archived evidence the identity cannot be reproduced; without the response it cannot be verified
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE sec_financial_snapshots SET report_date_source_gzip = NULL, report_date_evidence = NULL "
+                          "WHERE snapshot_id = :i"), {"i": tolerating.snapshot_id})
+    with pytest.raises(ValueError):
+        replay_archived_snapshot(engine, tolerating.snapshot_id)
+    with pytest.raises(ValueError, match="No archived snapshot"):
+        replay_archived_snapshot(engine, "0" * 64)
+
+
+def test_pg_the_write_boundary_requires_complete_matched_provenance_whenever_evidence_was_used(snapshot_db):
+    """Codex 6082027007: evidence-dependent snapshots no longer apply with source=None, a malformed
+    url / hash / receipt clock, a url for another CIK, a response that does not hash to the reference or
+    does not yield the used pairs; provenance without evidence is refused too. Nothing is stored."""
+    import dataclasses
+
+    import pytest
+    from store.sec_financial_snapshots import write_snapshot
+
+    engine = snapshot_db
+    good = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()))
+    url = "https://data.sec.gov/submissions/CIK0001045810.json"
+    other = _submissions_body({_OWN: "2026-04-26"})                   # a response that yields different pairs
+    cases = {
+        "no source": dataclasses.replace(good, report_date_source=None),
+        "no response": dataclasses.replace(good, report_date_source_body=None),
+        "empty response": dataclasses.replace(good, report_date_source_body=b""),
+        "url for another cik": _with_provenance(good, url="https://data.sec.gov/submissions/CIK0000000099.json"),
+        "malformed url": _with_provenance(good, url="http://example.com/x"),
+        "uppercase hash": dataclasses.replace(good, report_date_source=(url, good.report_date_source[1].upper(), "2026-11-02T00:00:00+00:00")),
+        "short hash": dataclasses.replace(good, report_date_source=(url, "abc", "2026-11-02T00:00:00+00:00")),
+        "hash not of the response": dataclasses.replace(good, report_date_source=(url, "0" * 64, "2026-11-02T00:00:00+00:00")),
+        "naive receipt": _with_provenance(good, received="2026-11-27T00:00:00"),
+        "garbled receipt": _with_provenance(good, received="yesterday"),
+        "response yields other pairs": _with_provenance(good, body=other),
+        "response not json": _with_provenance(good, body=b"not json"),
+        "response for another cik": _with_provenance(good, body=_submissions_body(cik=99)),
+    }
+    for name, bad in cases.items():
+        with pytest.raises(ValueError):
+            write_snapshot(engine, bad)
+        assert stored(engine) == [], name
+    ordinary = snapshot()
+    with pytest.raises(ValueError, match="without report-date evidence"):
+        write_snapshot(engine, _with_provenance(ordinary))
+    assert write_snapshot(engine, good)["status"] == "applied"
+
+
+def test_pg_the_archive_checks_reject_invalid_evidence_rows_and_unpaired_columns(snapshot_db):
+    """The CHECKs are an evidence validation, not only an object test."""
+    import json
+
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+
+    engine = snapshot_db
+    good = {"report_dates": {_OWN: "2026-07-26"},
+            "source": {"url": "https://data.sec.gov/submissions/CIK0001045810.json", "sha256": "a" * 64,
+                       "received_at": "2026-11-02T00:00:00+00:00"}}
+
+    def insert(evidence, gz, key):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO sec_financial_snapshots (snapshot_id, actor_id, cik, source_url, source_sha256, normalized_sha256, "
+                "normalizer_version, source_gzip, normalized_rows, fx_inputs, first_request_started_at, first_received_at, "
+                "report_date_evidence, report_date_source_gzip) VALUES (:k, 'x', '1', 'u', :h, :h, 'v', :g, "
+                "CAST('[]' AS JSONB), CAST('{}' AS JSONB), NOW(), NOW(), CAST(:e AS JSONB), :z)"),
+                {"k": key.ljust(64, "0"), "h": "b" * 64, "g": b"x",
+                 "e": None if evidence is None else json.dumps(evidence), "z": gz})
+
+    insert(good, b"z", "ok")                                          # a valid pair inserts
+    insert(None, None, "ordinary")                                    # NULL, NULL inserts
+    bads = {
+        "empty mapping": {**good, "report_dates": {}},
+        "no source": {"report_dates": good["report_dates"]},
+        "uppercase hash": {**good, "source": {**good["source"], "sha256": "A" * 64}},
+        "short hash": {**good, "source": {**good["source"], "sha256": "a" * 63}},
+        "url for a non-sec host": {**good, "source": {**good["source"], "url": "https://example.com/submissions/CIK0001045810.json"}},
+        "short cik in url": {**good, "source": {**good["source"], "url": "https://data.sec.gov/submissions/CIK1045810.json"}},
+        "naive receipt": {**good, "source": {**good["source"], "received_at": "2026-11-27T00:00:00"}},
+        "not an object": [1],
+    }
+    for i, (name, evidence) in enumerate(bads.items()):
+        with pytest.raises(IntegrityError):
+            insert(evidence, b"z", f"bad{i}")
+    with pytest.raises(IntegrityError):
+        insert(good, None, "nobody")                                  # evidence without the response
+    with pytest.raises(IntegrityError):
+        insert(None, b"z", "nometa")                                  # response without the evidence
+
+
+def _head(engine):
+    with engine.connect() as conn:
+        return dict(conn.execute(text(
+            "SELECT h.request_started_at, h.received_at, s.first_received_at "
+            "FROM sec_financial_snapshot_heads h JOIN sec_financial_snapshots s ON s.snapshot_id = h.snapshot_id "
+            "WHERE h.actor_id = 'nvda'")).mappings().one())
+
+
+def test_pg_evidence_receipt_is_bounded_by_the_write_clock_and_keeps_the_facts_receipt_separate(snapshot_db):
+    """Codex 6082240621: a future evidence receipt is refused (nothing applied, no head); a normal receipt
+    later than the Company Facts receipt is accepted and replays; the facts receipt stays in the archive
+    while the head's availability time is the later of the two receipts."""
+    from datetime import datetime, timezone
+
+    import pytest
+    from store.sec_financial_snapshots import available_at, replay_archived_snapshot, write_snapshot
+
+    engine = snapshot_db
+    base = _snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd())     # facts received 2026-11-01 00:00:31
+    for future in ("2099-01-01T00:00:00+00:00", "2099-01-01T00:00:00Z"):
+        with pytest.raises(ValueError, match="future"):
+            write_snapshot(engine, _with_provenance(base, received=future))
+    with engine.connect() as conn:
+        assert stored(engine) == [] and conn.execute(text("SELECT count(*) FROM sec_financial_snapshot_heads")).scalar() == 0
+
+    later = _with_provenance(base, received="2026-11-02T00:00:00+00:00")                # evidence arrived a day after the facts
+    assert available_at(later) == datetime(2026, 11, 2, tzinfo=timezone.utc) > later.received_at
+    assert write_snapshot(engine, later)["status"] == "applied"
+    head = _head(engine)
+    assert head["first_received_at"] == later.received_at                              # the facts receipt, retained
+    assert head["received_at"] == datetime(2026, 11, 2, tzinfo=timezone.utc)           # usable only after BOTH receipts
+    assert head["request_started_at"] == later.request_started_at
+    assert replay_archived_snapshot(engine, later.snapshot_id) == later
+
+
+def test_pg_an_evidence_receipt_before_the_facts_receipt_leaves_availability_at_the_facts_receipt(snapshot_db):
+    from store.sec_financial_snapshots import available_at, write_snapshot
+
+    engine = snapshot_db
+    earlier = _with_provenance(_snapshot_with_extra_facts(_stray_fact(), second=30, report_dates=_rd()),
+                               received="2026-10-30T00:00:00+00:00")
+    assert available_at(earlier) == earlier.received_at
+    assert write_snapshot(engine, earlier)["status"] == "applied"
+    assert _head(engine)["received_at"] == earlier.received_at
+
+
+def test_pg_ordinary_snapshots_keep_the_facts_receipt_as_their_availability(snapshot_db):
+    from store.sec_financial_snapshots import available_at, write_snapshot
+
+    engine = snapshot_db
+    ordinary = snapshot()
+    assert available_at(ordinary) == ordinary.received_at
+    assert write_snapshot(engine, ordinary)["status"] == "applied"
+    head = _head(engine)
+    assert head["received_at"] == ordinary.received_at == head["first_received_at"]
