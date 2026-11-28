@@ -181,8 +181,14 @@ class RepairEventStore:
         """Append one event; ``recorded_at`` defaults to the database clock."""
         from sqlalchemy import text
 
+        from utils.redaction import redact_secrets
+
         if event not in EVENTS:
             raise ValueError(f"unknown repair event {event!r}")
+        # Provider errors embed request URLs, keys and tokens: nothing reaches
+        # the table unredacted, whoever the caller (the clear command too).
+        reason = redact_secrets(reason)
+        fingerprint = redact_secrets(fingerprint)
         with self.engine.begin() as conn:
             conn.execute(text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}"))
             return int(conn.execute(text(

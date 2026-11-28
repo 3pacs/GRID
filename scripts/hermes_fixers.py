@@ -27,6 +27,8 @@ from typing import Any, Callable
 
 from loguru import logger as log
 
+from utils.redaction import redact_secrets
+
 from scripts.hermes_health import (
     OperatorState,
     log_issue,
@@ -416,6 +418,11 @@ def _record_repair_event(event: str, source_name: str, **fields: Any) -> None:
     store = _REPAIR_STORE["store"]
     if store is None:
         return
+    # Redacted here and again in RepairEventStore.record: no key or token in
+    # a provider's error text reaches a stored row.
+    for name in ("reason", "fingerprint"):
+        if fields.get(name) is not None:
+            fields[name] = redact_secrets(fields[name])
     try:
         store.record(event, _normalize_source_key(source_name), source_name, **fields)
     except Exception as exc:
@@ -517,7 +524,9 @@ def note_repair_failure(source_name: str, reason: str) -> bool:
     A different reason restarts the count; note_repair_recovered clears it.
     """
     key = _normalize_source_key(source_name)
-    fingerprint = re.sub(r"\d+", "N", str(reason or ""))[:200]
+    # Redacted first: the stored rows carry no secret (hermes_repair_store),
+    # and a restart must compare the next failure with the same text.
+    fingerprint = re.sub(r"\d+", "N", redact_secrets(str(reason or "")))[:200]
     with _REPAIR_SCHEDULE_LOCK:
         entry = _REPEATED_FAILURES.get(key)
         if entry is None or entry[0] != fingerprint:
@@ -537,7 +546,7 @@ def note_repair_failure(source_name: str, reason: str) -> bool:
     _record_repair_event("repair_failed", source_name, fingerprint=fingerprint, reason=str(reason or ""))
     if not tripped:
         return False
-    skip_reason = f"same failure {count}x in a row: {str(reason or '')[:160]}"
+    skip_reason = f"same failure {count}x in a row: {redact_secrets(str(reason or ''))[:160]}"
     _record_deterministic_failure(source_name, skip_reason, cooldown_s=cooldown)
     _record_repair_event(
         "long_skip", source_name, fingerprint=fingerprint, reason=skip_reason,

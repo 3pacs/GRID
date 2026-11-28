@@ -393,6 +393,29 @@ def test_concurrent_failures_are_all_recorded(monkeypatch, table):
     assert sorted(e.source_key for e in table.events) == sorted(f"s{n}" for n in range(20))
 
 
+# ── no secret is stored ────────────────────────────────────────────────────
+
+
+SECRET_REASON = ("HTTPError: 403 for url https://api.example.test/v2/aggs?apiKey=sk_live_0123456789abcdef"
+                 "&ticker=FNGR (token=abcdef0123456789abcdef)")
+
+
+def test_reasons_are_redacted_before_they_are_stored_and_still_count_alike(monkeypatch, table):
+    hf._REPAIR_STORE.update(store=table, engine="the engine")
+    for _ in range(3):
+        hf.note_repair_failure("TIINGO", SECRET_REASON)
+    live = _tables()
+
+    stored = " ".join(f"{e.fingerprint} {e.reason}" for e in table.events)
+    assert "sk_live_0123456789abcdef" not in stored and "abcdef0123456789abcdef" not in stored
+    assert "[REDACTED]" in stored or "?" not in stored
+    assert [e.event for e in table.events] == ["repair_failed"] * 3 + ["long_skip"]
+
+    _restart(monkeypatch)
+    hf._sync_repair_store("the engine", OperatorState())
+    assert _tables() == live, "the live fingerprint is the redacted one, so a restart compares alike"
+
+
 # ── the operator command ───────────────────────────────────────────────────
 
 
@@ -480,6 +503,13 @@ def test_real_types_the_store_round_trips_and_reads_only_what_it_is_asked(pg_eng
     second = real.record("long_skip", "tiingo", "TIINGO", fingerprint="f", reason="same", skip_until=until, strikes=1)
     clear = real.record("cleared", "tiingo", "TIINGO", reason="fixed")
     assert first < second < clear
+    secret = real.record("cleared", "tiingo", "TIINGO", fingerprint=SECRET_REASON, reason=SECRET_REASON)
+    with pg_engine.connect() as conn:
+        row = conn.execute(text("SELECT fingerprint || ' ' || reason FROM hermes_repair_events WHERE id = :i"),
+                           {"i": secret}).scalar()
+    assert "sk_live_0123456789abcdef" not in row and "abcdef0123456789abcdef" not in row
+    with pg_engine.begin() as conn:
+        conn.execute(text("DELETE FROM hermes_repair_events WHERE id = :i"), {"i": secret})
 
     events = real.read_since(datetime(2000, 1, 1, tzinfo=timezone.utc))
     assert [e.event for e in events] == ["repair_failed", "long_skip", "cleared"]
