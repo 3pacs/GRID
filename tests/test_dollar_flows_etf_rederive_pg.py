@@ -194,9 +194,10 @@ def test_audit_agrees_with_the_check_and_python(pg):
     assert by_check == by_python == len(ids["legacy_etf"]) + 1
 
 
-@pytest.mark.parametrize("encoded", [False, True], ids=["json_object", "json_string_scalar"])
+@pytest.mark.parametrize(("encoded", "old_preflight"), [(False, False), (True, False), (True, True)],
+                         ids=["json_object", "json_string_scalar", "control_old_preflight_decodes_text"])
 def test_the_writer_refuses_evidence_it_would_store_as_a_json_string_before_any_delete(pg, monkeypatch, capsys,
-                                                                                         encoded):
+                                                                                         encoded, old_preflight):
     """Evidence already JSON-encoded would be encoded again and reach PostgreSQL as a JSON
     string, which the CHECK rejects. The preflight judges it as stored: refused before the
     window DELETE (exit 4, the last good window intact), not a database error mid-write."""
@@ -206,23 +207,39 @@ def test_the_writer_refuses_evidence_it_would_store_as_a_json_string_before_any_
         _insert(conn, source_type="insider", direction="inflow", flow_date=YESTERDAY, actor="Old")
         _insert(conn, source_type="etf_flow", direction="neutral", flow_date=YESTERDAY, ticker="SPY",
                 evidence={"direction_basis": "unsigned_volume"})
+        # Inside the run's window [TODAY, TODAY]: a DELETE of the window would remove it.
+        _insert(conn, source_type="options_flow", direction="inflow", flow_date=TODAY, actor="InWindow")
     _both(pg)
+    snapshot = "SELECT *, xmax::text AS xmax FROM dollar_flows ORDER BY id"
     with pg.connect() as conn:
-        before = conn.execute(text("SELECT * FROM dollar_flows ORDER BY id")).fetchall()
+        before = conn.execute(text(snapshot)).fetchall()
+    assert all(r.xmax == "0" for r in before)
     evidence = {"series_id": "ETF_FLOW:SPY:5d", "raw_value": 1000.0, "direction_basis": "unsigned_volume"}
     flow = {"source_type": "etf_flow", "actor_name": "ETF:SPY", "ticker": "SPY", "amount_usd": 3.0,
             "direction": "neutral", "confidence": "estimated", "flow_date": TODAY,
             "evidence": json.dumps(evidence) if encoded else evidence}
     monkeypatch.setattr(dollar_flows, "_normalize_etf_flows", lambda *a, **k: [flow])
+    if old_preflight:                                     # the preflight before review 6094742304
+        real = dollar_flows.flow_contract_violation
+        monkeypatch.setattr(dollar_flows, "flow_contract_violation",
+                            lambda f, **k: real(f, stored_json_text=True))
+        with pytest.raises(IntegrityError, match="dollar_flows_etf_flow_direction_basis"):
+            run_dollar_flows.main(["--days", "7", "--json"], engine=pg)
+        with pg.connect() as conn:
+            after = conn.execute(text(snapshot)).fetchall()
+        # Rolled back, but only after its DELETE ran: the in-window row's xmax names that transaction.
+        in_window = [r for r in after if r.actor_name == "InWindow"]
+        assert in_window and in_window[0].xmax != "0"
+        return
     code = run_dollar_flows.main(["--days", "7", "--json"], engine=pg)
     out = json.loads(capsys.readouterr().out)
     with pg.connect() as conn:
-        after = conn.execute(text("SELECT * FROM dollar_flows ORDER BY id")).fetchall()
+        after = conn.execute(text(snapshot)).fetchall()
         stored = conn.execute(text("SELECT jsonb_typeof(evidence) FROM dollar_flows WHERE flow_date = :d "
                                    "AND source_type = 'etf_flow'"), {"d": TODAY}).scalars().all()
     if encoded:
         assert code == 4 and out["rejected_by_contract"] == {"etf_flow": 1} and out["persisted"] == 0
-        assert after == before                                              # no DELETE, no INSERT
+        assert after == before                          # every row, its xmax 0 included: no DELETE was attempted
     else:
         assert code == 0 and out["persisted"] == 1 and stored == ["object"]
 

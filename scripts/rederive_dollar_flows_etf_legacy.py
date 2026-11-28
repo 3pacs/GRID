@@ -16,7 +16,9 @@ and rewrites its window; no reader reconstructs a past date from it, see
 ``get_aggregate_flows``' past-date refusal), so after the re-derive
 ``created_at`` still records when the old rule first wrote the row, never when
 the neutral value became available. It must not be read as proof of past
-availability; the ``rederived`` marker says the row was rewritten. ``intelligence.dollar_flows.STORED_ROW_CONTRACTS["etf_flow"]`` is the
+availability; the ``rederived`` marker says the row was rewritten.
+
+``intelligence.dollar_flows.STORED_ROW_CONTRACTS["etf_flow"]`` is the
 contract; alembic revision ``df_etf_flow_basis_20261128`` adds its CHECK
 ``dollar_flows_etf_flow_direction_basis`` NOT VALID. The 13F contract and its
 delete repair (``scripts/repair_dollar_flows_stored_contract.py``) are not
