@@ -32,7 +32,8 @@ goes.
 from alembic import op
 
 revision = 'hermes_repair_events_20261128'
-down_revision = 'df_13f_observed_20261127'
+# After #1518's df_etf_flow_basis_20261128, which landed first (coordinator's order).
+down_revision = 'df_etf_flow_basis_20261128'
 branch_labels = None
 depends_on = None
 

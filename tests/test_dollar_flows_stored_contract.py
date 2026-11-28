@@ -156,11 +156,17 @@ def _rows(engine) -> list[tuple]:
 
 # ── one definition ──────────────────────────────────────────────────────────
 
-def test_a_second_contract_needs_a_grouping_aware_constraint_check():
-    """The repair's constraint-definition check drops parentheses, which is exact
-    only for one ``a OR b`` contract. Adding a contract must come with a
-    grouping-aware comparison in scripts/repair_dollar_flows_stored_contract.py."""
-    assert list(dollar_flows.STORED_ROW_CONTRACTS) == ["13f"]
+def test_each_contract_has_its_own_constraint_and_the_13f_repair_checks_only_its_own():
+    """The 13F repair's constraint-definition check drops parentheses, which is exact
+    only for its one ``a OR b`` CHECK. So every further contract gets its own
+    constraint and its own remedy (etf_flow: scripts/rederive_dollar_flows_etf_legacy.py,
+    which checks its CHECK by behaviour), and the 13F CHECK stays exactly as released."""
+    contracts = dollar_flows.STORED_ROW_CONTRACTS
+    assert list(contracts) == ["13f", "etf_flow"]
+    assert contracts["13f"]["check_sql"] == dollar_flows.DOLLAR_FLOWS_CONTRACT_CHECK_SQL
+    assert contracts["13f"]["constraint"] == dollar_flows.DOLLAR_FLOWS_CONTRACT_CONSTRAINT
+    assert len({c["constraint"] for c in contracts.values()}) == len(contracts)
+    assert {st: c["remedy"] for st, c in contracts.items()} == {"13f": "delete", "etf_flow": "rederive"}
 
 
 def test_one_contract_text_for_writer_audit_migration_and_schema():
@@ -182,11 +188,32 @@ def test_one_contract_text_for_writer_audit_migration_and_schema():
         ({"source_type": "13f", "direction": "outflow"}, "13f"),
         ({"source_type": "13f"}, "13f"),
         ({"source_type": "insider", "direction": "inflow"}, None),
-        ({"source_type": "etf_flow", "direction": "inflow"}, None),
+        ({"source_type": "etf_flow", "direction": "inflow"}, "etf_flow"),                    # the old rule
+        ({"source_type": "etf_flow", "direction": "inflow",
+          "evidence": {"series_id": "ETF_FLOW:SPY:5d", "raw_value": 1.0}}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "neutral",
+          "evidence": {"direction_basis": "unsigned_volume"}}, None),                        # the current rule
+        ({"source_type": "etf_flow", "direction": "inflow",
+          "evidence": {"direction_basis": "unsigned_volume"}}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "outflow",
+          "evidence": {"direction_basis": "net_flow"}}, None),                               # a signed measure
+        ({"source_type": "etf_flow", "direction": "neutral", "evidence": {"direction_basis": ""}}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "neutral", "evidence": None}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "inflow", "evidence": {"direction_basis": 5}}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "neutral", "evidence": {"direction_basis": None}}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "neutral", "evidence": [1]}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "neutral",                                  # a str the writer
+          "evidence": '{"direction_basis": "unsigned_volume"}'}, "etf_flow"),                # would encode again
     ],
 )
 def test_flow_contract_violation(flow, expected):
     assert dollar_flows.flow_contract_violation(flow) == expected
+
+
+def test_a_row_read_back_as_json_text_is_decoded_only_when_asked():
+    stored = {"source_type": "etf_flow", "direction": "neutral", "evidence": '{"direction_basis": "unsigned_volume"}'}
+    assert dollar_flows.flow_contract_violation(stored, stored_json_text=True) is None
+    assert dollar_flows.flow_contract_violation(stored) == "etf_flow"
 
 
 # ── writer ──────────────────────────────────────────────────────────────────
