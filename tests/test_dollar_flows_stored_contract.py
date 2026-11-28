@@ -202,12 +202,18 @@ def test_one_contract_text_for_writer_audit_migration_and_schema():
         ({"source_type": "etf_flow", "direction": "inflow", "evidence": {"direction_basis": 5}}, "etf_flow"),
         ({"source_type": "etf_flow", "direction": "neutral", "evidence": {"direction_basis": None}}, "etf_flow"),
         ({"source_type": "etf_flow", "direction": "neutral", "evidence": [1]}, "etf_flow"),
-        ({"source_type": "etf_flow", "direction": "neutral",
-          "evidence": '{"direction_basis": "unsigned_volume"}'}, None),                      # JSON text evidence
+        ({"source_type": "etf_flow", "direction": "neutral",                                  # a str the writer
+          "evidence": '{"direction_basis": "unsigned_volume"}'}, "etf_flow"),                # would encode again
     ],
 )
 def test_flow_contract_violation(flow, expected):
     assert dollar_flows.flow_contract_violation(flow) == expected
+
+
+def test_a_row_read_back_as_json_text_is_decoded_only_when_asked():
+    stored = {"source_type": "etf_flow", "direction": "neutral", "evidence": '{"direction_basis": "unsigned_volume"}'}
+    assert dollar_flows.flow_contract_violation(stored, stored_json_text=True) is None
+    assert dollar_flows.flow_contract_violation(stored) == "etf_flow"
 
 
 # ── writer ──────────────────────────────────────────────────────────────────

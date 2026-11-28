@@ -131,8 +131,11 @@ DOLLAR_FLOWS_CONTRACT_CHECK_SQL = "(source_type <> '13f' OR direction = 'observe
 # 2026-02-27..11-13). NULL-safe and typed: the basis must be a non-empty JSON
 # string, so a missing, JSON-null, empty or non-string basis, and a NULL or
 # non-object evidence, all break it (``jsonb_typeof`` of a missing key is NULL,
-# COALESCE ''). The Python check agrees; it also reads JSON text evidence,
-# which only SQLite stores (a PostgreSQL string scalar is not an object there).
+# COALESCE ''). The Python check agrees and judges evidence as it will be
+# STORED: the writer JSON-encodes whatever ``evidence`` holds, so a str there
+# becomes a JSON string scalar and breaks the contract. Only a read of a row
+# already stored as JSON text (SQLite) decodes it, by asking explicitly
+# (``stored_json_text=True``).
 ETF_FLOW_CONTRACT_CONSTRAINT = "dollar_flows_etf_flow_direction_basis"
 UNSIGNED_VOLUME_BASIS = "unsigned_volume"
 ETF_FLOW_CONTRACT_CHECK_SQL = (
@@ -148,9 +151,9 @@ _ETF_FLOW_CONTRACT_CHECK_SQLITE = (
 )
 
 
-def _evidence_dict(flow: dict[str, Any]) -> dict[str, Any]:
+def _evidence_dict(flow: dict[str, Any], stored_json_text: bool = False) -> dict[str, Any]:
     ev = flow.get("evidence")
-    if isinstance(ev, str):
+    if isinstance(ev, str) and stored_json_text:
         try:
             ev = json.loads(ev)
         except (json.JSONDecodeError, TypeError):
@@ -158,12 +161,12 @@ def _evidence_dict(flow: dict[str, Any]) -> dict[str, Any]:
     return ev if isinstance(ev, dict) else {}
 
 
-def _conforms_13f(flow: dict[str, Any]) -> bool:
+def _conforms_13f(flow: dict[str, Any], stored_json_text: bool = False) -> bool:
     return flow.get("direction") == OBSERVED_13F_DIRECTION
 
 
-def _conforms_etf_flow(flow: dict[str, Any]) -> bool:
-    basis = _evidence_dict(flow).get("direction_basis")
+def _conforms_etf_flow(flow: dict[str, Any], stored_json_text: bool = False) -> bool:
+    basis = _evidence_dict(flow, stored_json_text).get("direction_basis")
     if not isinstance(basis, str) or basis == "":
         return False
     return flow.get("direction") == "neutral" or basis != UNSIGNED_VOLUME_BASIS
@@ -192,13 +195,18 @@ STORED_ROW_CONTRACTS: dict[str, dict[str, Any]] = {
 }
 
 
-def flow_contract_violation(flow: dict[str, Any]) -> str | None:
-    """Return the broken contract's source type, or ``None`` if the flow conforms."""
+def flow_contract_violation(flow: dict[str, Any], *, stored_json_text: bool = False) -> str | None:
+    """Return the broken contract's source type, or ``None`` if the flow conforms.
+
+    Judges the flow as the writer will store it (``evidence`` JSON-encoded as
+    given). ``stored_json_text=True`` is for a row read back from a database
+    that keeps ``evidence`` as JSON text (SQLite): its str is decoded first.
+    """
     stype = flow.get("source_type")
     contract = STORED_ROW_CONTRACTS.get(stype) if isinstance(stype, str) else None
     if contract is None:
         return None
-    return None if contract["conforms"](flow) else stype
+    return None if contract["conforms"](flow, stored_json_text) else stype
 
 
 def contract_check_sql(stype: str, dialect: str = "postgresql") -> str:

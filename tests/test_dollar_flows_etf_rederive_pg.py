@@ -194,6 +194,39 @@ def test_audit_agrees_with_the_check_and_python(pg):
     assert by_check == by_python == len(ids["legacy_etf"]) + 1
 
 
+@pytest.mark.parametrize("encoded", [False, True], ids=["json_object", "json_string_scalar"])
+def test_the_writer_refuses_evidence_it_would_store_as_a_json_string_before_any_delete(pg, monkeypatch, capsys,
+                                                                                         encoded):
+    """Evidence already JSON-encoded would be encoded again and reach PostgreSQL as a JSON
+    string, which the CHECK rejects. The preflight judges it as stored: refused before the
+    window DELETE (exit 4, the last good window intact), not a database error mid-write."""
+    from tests.test_dollar_flows_stored_contract_pg import TODAY, YESTERDAY
+    with pg.begin() as conn:
+        conn.execute(text(_PRE_REVISION_DDL))
+        _insert(conn, source_type="insider", direction="inflow", flow_date=YESTERDAY, actor="Old")
+        _insert(conn, source_type="etf_flow", direction="neutral", flow_date=YESTERDAY, ticker="SPY",
+                evidence={"direction_basis": "unsigned_volume"})
+    _both(pg)
+    with pg.connect() as conn:
+        before = conn.execute(text("SELECT * FROM dollar_flows ORDER BY id")).fetchall()
+    evidence = {"series_id": "ETF_FLOW:SPY:5d", "raw_value": 1000.0, "direction_basis": "unsigned_volume"}
+    flow = {"source_type": "etf_flow", "actor_name": "ETF:SPY", "ticker": "SPY", "amount_usd": 3.0,
+            "direction": "neutral", "confidence": "estimated", "flow_date": TODAY,
+            "evidence": json.dumps(evidence) if encoded else evidence}
+    monkeypatch.setattr(dollar_flows, "_normalize_etf_flows", lambda *a, **k: [flow])
+    code = run_dollar_flows.main(["--days", "7", "--json"], engine=pg)
+    out = json.loads(capsys.readouterr().out)
+    with pg.connect() as conn:
+        after = conn.execute(text("SELECT * FROM dollar_flows ORDER BY id")).fetchall()
+        stored = conn.execute(text("SELECT jsonb_typeof(evidence) FROM dollar_flows WHERE flow_date = :d "
+                                   "AND source_type = 'etf_flow'"), {"d": TODAY}).scalars().all()
+    if encoded:
+        assert code == 4 and out["rejected_by_contract"] == {"etf_flow": 1} and out["persisted"] == 0
+        assert after == before                                              # no DELETE, no INSERT
+    else:
+        assert code == 0 and out["persisted"] == 1 and stored == ["object"]
+
+
 # ── export ──────────────────────────────────────────────────────────────────
 
 

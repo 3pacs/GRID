@@ -9,7 +9,14 @@ and the same amount (0.3% of the stored 5d dollar volume). The daily writer
 rebuilds only its window, so the old rows stayed (693 on production,
 2026-02-27..11-13); the flow aggregator's 30- and 60-day views counted them as
 inflows. Owner decision 2026-11-28: re-derive them in place as neutral, amount
-kept. ``intelligence.dollar_flows.STORED_ROW_CONTRACTS["etf_flow"]`` is the
+kept.
+
+``created_at`` is kept. ``dollar_flows`` is a current view (each run deletes
+and rewrites its window; no reader reconstructs a past date from it, see
+``get_aggregate_flows``' past-date refusal), so after the re-derive
+``created_at`` still records when the old rule first wrote the row, never when
+the neutral value became available. It must not be read as proof of past
+availability; the ``rederived`` marker says the row was rewritten. ``intelligence.dollar_flows.STORED_ROW_CONTRACTS["etf_flow"]`` is the
 contract; alembic revision ``df_etf_flow_basis_20261128`` adds its CHECK
 ``dollar_flows_etf_flow_direction_basis`` NOT VALID. The 13F contract and its
 delete repair (``scripts/repair_dollar_flows_stored_contract.py``) are not
