@@ -30,6 +30,42 @@ LEGACY_ENTRY_HORIZON_DAYS = 730
 # days before the filing was filed (10-Q/10-K/20-F/40-F deadlines, with room for extensions).
 REPORT_END_MAX_AGE_DAYS = 150
 
+DURATION_REFUSAL_MESSAGE = "Invalid mapped financial-flow duration"
+# The refusal shapes the gate produces on purpose with all its evidence in hand. A run
+# whose only failures are these is not partial (owner, 2026-11-28); the puller reports
+# them as their own item. Every other refusal stays a failure.
+BY_DESIGN_REFUSAL_SHAPES = frozenset({"forward_dated", "period_end_point"})
+
+
+class FlowDurationRefusal(ValueError):
+    """The duration gate refused the issuer; ``entries`` say which recent entries and why.
+
+    Each entry is ``(shape, taxonomy, tag, end_iso, accn)``. Shapes:
+
+    * ``forward_dated``: a mapped flow WITH a start whose end is after its filing date;
+    * ``period_end_point``: a start-less point whose accession has a plausible EDGAR
+      reportDate with a qualifying flow ending on it, and whose end IS that reportDate or
+      the end of a qualifying flow, so it may stand in for a reporting period;
+    * ``forward_dated_point``: a start-less entry whose end is after its filing date;
+    * ``point_without_evidence``: a start-less point with no EDGAR reportDate for its accession;
+    * ``unexplained_point``: a start-less point whose reportDate fails the plausibility or
+      qualifying-flow check.
+
+    The message stays the gate's historical text, so callers matching it are unchanged.
+    """
+
+    def __init__(self, entries: list[tuple[str, str, str, str, str]]):
+        super().__init__(DURATION_REFUSAL_MESSAGE)
+        self.entries = tuple(entries)
+
+    @property
+    def shapes(self) -> frozenset[str]:
+        return frozenset(entry[0] for entry in self.entries)
+
+    @property
+    def by_design(self) -> bool:
+        return bool(self.entries) and self.shapes <= BY_DESIGN_REFUSAL_SHAPES
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -172,7 +208,7 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
     # only matter if it stands in for a reporting period the projection would then
     # lack. These indexes let the gate tell such a period stand-in from an
     # event-dated stray point; see the tolerance rule below.
-    unusable: list[tuple[str, str, date, str, bool, date]] = []      # (taxonomy, tag, end, accn, is_stray_point, filed)
+    unusable: list[tuple[str, str, date, str, bool, date, bool]] = []  # (taxonomy, tag, end, accn, is_stray_point, filed, has_start)
     qualifying_ends_all: set[date] = set()                           # ends of entries the normalizer accepts
     qualifying_ends_by_accn: dict[str, set[date]] = {}
     for taxonomy in ('us-gaap', 'ifrs-full'):
@@ -208,7 +244,8 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                     if tag_name in mapped_tags[taxonomy]:
                         if start is None or filed < end:
                             unusable_ends.append(end)
-                            unusable.append((taxonomy, tag_name, end, str(entry['accn']), start is None and filed >= end, filed))
+                            unusable.append((taxonomy, tag_name, end, str(entry['accn']), start is None and filed >= end, filed,
+                                             start is not None))
                         elif _normalize_entry(entry) is not None:
                             # Only what the normalizer would turn into a row counts as
                             # evidence of a reporting period: a nonqualifying form or
@@ -218,7 +255,8 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
     capture_day = received.date()
     tolerated_points: list[tuple[str, str, str]] = []
     used_report_dates: dict[str, date] = {}
-    for taxonomy, tag_name, end, accn, is_stray_point, filed_at in unusable:
+    refused: list[tuple[str, str, str, str, str]] = []
+    for taxonomy, tag_name, end, accn, is_stray_point, filed_at, has_start in unusable:
         if (capture_day - end).days > LEGACY_ENTRY_HORIZON_DAYS:
             continue                                   # legacy: cannot affect a current row
         # A recent unusable entry refuses the issuer, EXCEPT an event-dated stray point: a
@@ -237,14 +275,26 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
         # Real shapes: a one-day debt issuance, share issuance or buyback in a notes
         # disclosure (2026-11-26: INTC, EOG, ON, WLK, DHI, RPD, NXE, each refused for one).
         report_date = report_dates_in.get(accn)
-        if (is_stray_point and report_date is not None
-                and 0 <= (filed_at - report_date).days <= REPORT_END_MAX_AGE_DAYS
-                and report_date in qualifying_ends_by_accn.get(accn, ())
-                and end != report_date and end not in qualifying_ends_all):
+        evidenced = (report_date is not None
+                     and 0 <= (filed_at - report_date).days <= REPORT_END_MAX_AGE_DAYS
+                     and report_date in qualifying_ends_by_accn.get(accn, ()))
+        if is_stray_point and evidenced and end != report_date and end not in qualifying_ends_all:
             tolerated_points.append((tag_name, end.isoformat(), accn))
             used_report_dates[accn] = report_date
             continue
-        raise ValueError("Invalid mapped financial-flow duration")
+        # Refused. Every refused entry is named with its shape (all of them, not the first),
+        # so the caller can tell a refusal the gate makes on purpose from one it cannot explain.
+        if filed_at < end:
+            shape = "forward_dated" if has_start else "forward_dated_point"
+        elif report_date is None:
+            shape = "point_without_evidence"
+        elif evidenced:
+            shape = "period_end_point"
+        else:
+            shape = "unexplained_point"
+        refused.append((shape, taxonomy, tag_name, end.isoformat(), accn))
+    if refused:
+        raise FlowDurationRefusal(refused)
     rates = _AppliedFxRates(json.loads(_json(fx_rates)))
     rows = _collect_all_flows(payload, rates)
     fx_json = _json(rates.applied)
