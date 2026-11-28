@@ -22,6 +22,28 @@ flag must be passed explicitly at every download and two writers sharing a
 source name must share the flag (the April 2026 contamination:
 ``scripts/fill_missing_features.py`` wrote ``auto_adjust=True`` closes under
 yfinance's source next to ``yfinance_pull``'s ``auto_adjust=False``).
+A writer that must read raw *and* adjusted closes to store a source's
+adjusted basis as of a past provider state (a repair recomputing a stored
+vintage on its own basis) is declared in :data:`DERIVED_BASIS_WRITERS`
+instead: the basis it stores must equal the source's declared writers'
+flag, its own download flag must be explicit at every call, and it names
+parity tests (under ``tests/``) that compare its stored values with the
+declared writer's on the same bars and cover how the past basis is chosen.
+Its parity tests live in one file under ``tests/``. That file and every
+``tests.*`` module it imports, transitively, are pinned whole by one sha256
+(an import that cannot be resolved fails), so any change to a test, fixture,
+helper or support module fails the gate until a new E1 version is released.
+The gate runs the named tests itself, isolated from everything not pinned (no
+conftest, no pytest configuration file, no auto-loaded plugins), and fails
+unless each is collected and passes (none skipped): the parity claim is
+executed on every E1 run, not just named. The pin is a tripwire against the
+evidence being weakened or bypassed, not a proof that the evidence is
+sufficient: the code under test is deliberately not pinned (so, for one, the
+missing-session test and the repair share ingestion.market_calendar and
+cannot see a change to it), and whether these tests are enough is the
+reviewer's and the owner's judgement at sign-off. It is not an exemption: an undeclared writer, an implicit
+flag, a stored basis that differs, a changed parity file or support module,
+or a missing, skipped or failing parity test fails the gate.
 
 The fixture test (``test_gates_pg.py``) runs the shared writer
 (``BasePuller._insert_raw``) against the real DDL on PostgreSQL.
@@ -40,6 +62,7 @@ import functools
 import os
 import re
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 import pytest
@@ -262,6 +285,32 @@ PRICE_WRITERS: dict[str, tuple[str, bool]] = {
     "scripts/fill_missing_features.py": ("yfinance_adjusted_extended", True),
 }
 
+# module -> (source name, auto_adjust basis it stores, auto_adjust at every
+# yfinance download, {"file": tests/<file>.py, "sha256": parity_file_sha256 of
+# it, "tests": names in it}: the parity evidence this gate pins and runs)
+DERIVED_BASIS_WRITERS: dict[str, tuple[str, bool, bool, dict[str, Any]]] = {
+    # Recomputes ETF flow rows stored from a partial bar on the price basis of
+    # the run that stored them: needs the raw close (Close, auto_adjust=False)
+    # and today's Adj Close to state that run's adjusted close
+    # (AdjNow(k) * Raw(S) / AdjNow(S)), i.e. the auto_adjust=True basis the
+    # live writer stores.
+    "scripts/repair_etf_flow_partial_bars.py": (
+        "INSTITUTIONAL_FLOWS", True, False, {
+            "file": "tests/test_etf_flow_repair_parity.py",
+            "sha256": "f85c719522a504daf5e7eddd0d4e7d9a009b2d753ba377105467f40adb17ed29",
+            "tests": (
+                # stored values equal the live writer's run the morning after, on
+                # rows whose original-versus-current adjustment factor is not 1
+                "test_a_repaired_value_is_what_the_fixed_writer_stores_from_the_settled_bars",
+                # same-day ex-dividend basis: an after-close row keeps the day before's
+                "test_an_after_close_row_on_its_ex_dividend_date_keeps_the_day_befores_basis",
+                # a missing open session (or a bar on a closed day) refuses; a holiday does not
+                "test_a_missing_exchange_session_refuses_the_etf_but_a_holiday_does_not",
+            ),
+        },
+    ),
+}
+
 
 def yfinance_downloads(source: str) -> list[tuple[int, object]]:
     """(line, auto_adjust) for every yfinance download/history call; ``"implicit"`` when absent."""
@@ -283,10 +332,71 @@ def writes_raw_series(source: str) -> bool:
     return bool(re.search(r"insert\s+into\s+(?:public\.)?raw_series", source, re.I)) or "_insert_raw(" in source
 
 
-def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[str, str]) -> list[str]:
+def parity_file_sha256(rel: str, tests: dict[str, str] | None = None) -> str | None:
+    """sha256 over the whole of ``rel`` and every ``tests.*`` module it imports, transitively.
+
+    None when ``rel`` or any of those modules cannot be read, or when any of
+    them makes a relative import (it could reach something unpinned).
+    """
+    import hashlib
+
+    def read(path: str) -> str | None:
+        if tests is not None:
+            text = tests.get(path)
+        else:
+            try:
+                text = (REPO / path).read_text(encoding="utf-8")
+            except OSError:
+                return None
+        return None if text is None else text.replace("\r\n", "\n")
+
+    if not rel.startswith("tests/") or not rel.endswith(".py"):
+        return None
+    parts: dict[str, str] = {}
+    todo = [rel]
+    while todo:
+        path = todo.pop()
+        if path in parts:
+            continue
+        source = read(path)
+        if source is None:
+            return None
+        parts[path] = source
+        # Every package __init__ on the way is imported too ("from tests import x").
+        package = path.rsplit("/", 1)[0]
+        while package:
+            init = f"{package}/__init__.py"
+            if init not in parts and read(init) is not None:
+                todo.append(init)
+            package = package.rsplit("/", 1)[0] if "/" in package else ""
+        for node in ast.walk(ast.parse(source)):
+            names: list[str] = []
+            if isinstance(node, ast.ImportFrom):
+                if node.level:
+                    return None
+                names = [node.module or ""] + [f"{node.module}.{a.name}" for a in node.names]
+            elif isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            for name in names:
+                if name == "tests" or not name.startswith("tests."):
+                    continue
+                module = name.replace(".", "/") + ".py"
+                if read(module) is not None:
+                    todo.append(module)
+                elif read(name.rsplit(".", 1)[0].replace(".", "/") + ".py") is None:
+                    return None                           # neither a module nor a name in one
+    blob = "\n".join(f"== {k}\n{v}" for k, v in sorted(parts.items()))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[str, str],
+                          derived: dict[str, tuple[str, bool, bool, dict[str, Any]]] | None = None,
+                          tests: dict[str, str] | None = None) -> list[str]:
+    derived = derived or {}
     problems = []
     for rel, source in sorted(sources.items()):
-        if "yfinance" in source and writes_raw_series(source) and yfinance_downloads(source) and rel not in declared:
+        if ("yfinance" in source and writes_raw_series(source) and yfinance_downloads(source)
+                and rel not in declared and rel not in derived):
             problems.append(f"{rel}: downloads yfinance prices and writes raw_series but is not declared")
     by_source: dict[str, set[bool]] = {}
     for rel, (name, flag) in declared.items():
@@ -300,6 +410,36 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
             if got != flag:
                 problems.append(f"{rel}:{line}: auto_adjust={got} but the writer declares {flag}")
         by_source.setdefault(name.lower(), set()).add(flag)
+    for rel, (name, stored, download, parity) in sorted(derived.items()):
+        source = sources.get(rel)
+        if source is None:
+            problems.append(f"{rel}: declared derived-basis writer does not exist")
+            continue
+        if rel in declared:
+            problems.append(f"{rel}: declared both as a price writer and a derived-basis writer")
+        if f'"{name}"' not in source and f"'{name}'" not in source:
+            problems.append(f"{rel}: never names the source {name!r} it is declared to write under")
+        if name.lower() not in by_source:
+            problems.append(f"{rel}: derived-basis writer for {name!r}, which has no declared price writer")
+        for line, got in yfinance_downloads(source):
+            if got != download:
+                problems.append(f"{rel}:{line}: auto_adjust={got} but the derived-basis writer declares {download}")
+        if (not isinstance(parity, dict) or not parity.get("tests") or not parity.get("file")
+                or not isinstance(parity.get("tests"), tuple)):
+            problems.append(f"{rel}: derived-basis writer names no parity tests ({{file, sha256, tests}})")
+        else:
+            got = parity_file_sha256(parity["file"], tests)
+            source = None if got is None else (tests.get(parity["file"]) if tests is not None
+                                               else (REPO / parity["file"]).read_text(encoding="utf-8"))
+            if got is None:
+                problems.append(f"{rel}: parity file {parity['file']!r} or a tests.* module it imports does not exist")
+            elif got != parity.get("sha256"):
+                problems.append(f"{rel}: parity file {parity['file']!r} or a tests.* module it imports changed "
+                                "since it was pinned (re-release E1 with its new sha256)")
+            for test in parity["tests"]:
+                if source is not None and not re.search(rf"^def {re.escape(test)}\(", source, re.M):
+                    problems.append(f"{rel}: parity test {parity['file']}::{test} does not exist")
+        by_source.setdefault(name.lower(), set()).add(stored)
     for name, flags in sorted(by_source.items()):
         if len(flags) > 1:
             problems.append(f"source {name!r} has writers with different auto_adjust flags {sorted(flags)}")
@@ -307,8 +447,114 @@ def price_writer_problems(declared: dict[str, tuple[str, bool]], sources: dict[s
 
 
 def test_one_price_basis_per_source():
-    problems = price_writer_problems(PRICE_WRITERS, _module_sources())
+    problems = price_writer_problems(PRICE_WRITERS, _module_sources(), DERIVED_BASIS_WRITERS)
     assert not problems, "\n".join(problems)
+
+
+def parity_run_problems(refs: list[str], cwd: Path) -> list[str]:
+    """Run ``refs`` with pytest in ``cwd``; the problems unless every one is collected and passes."""
+    import subprocess
+    import sys
+
+    # Isolated from what is not pinned: no conftest, no pytest config file, no
+    # auto-loaded plugins; the repository on the path for its own imports.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env.update({"TZ": os.environ.get("TZ", "UTC"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                "PYTHONPATH": str(cwd)})
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", *refs, "-q", "-rA", "--noconftest", "-c", os.devnull,
+         "--rootdir", str(cwd), "-p", "no:cacheprovider"],
+        cwd=cwd, env=env, capture_output=True, text=True, timeout=600,
+    )
+    out = proc.stdout + proc.stderr
+    problems = []
+    if proc.returncode != 0:
+        problems.append(f"parity tests exited {proc.returncode}")
+    passed = set(re.findall(r"^PASSED (\S+)", out, re.M))
+    for ref in refs:
+        if ref not in passed:
+            problems.append(f"parity test {ref} did not pass")
+    if re.search(r"^(SKIPPED|XFAIL|XPASS|ERROR|FAILED)\b", out, re.M):
+        problems.append("a parity test was skipped, xfailed or failed")
+    return problems
+
+
+@pytest.mark.parametrize("rel", sorted(DERIVED_BASIS_WRITERS))
+def test_derived_basis_writers_parity_tests_run_and_pass(rel):
+    """Run each declared parity test here, so the claim is executed, not only named."""
+    parity = DERIVED_BASIS_WRITERS[rel][3]
+    problems = parity_run_problems([f"{parity['file']}::{t}" for t in parity["tests"]], REPO)
+    assert not problems, "\n".join(problems)
+
+
+def test_parity_runner_self_test_fails_a_skipped_or_failing_test(tmp_path, monkeypatch):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_p.py").write_text(
+        "import pytest\n"
+        "def test_ok():\n    pass\n"
+        "def test_bad():\n    assert False\n"
+        "def test_skip():\n    pytest.skip('no database')\n")
+    assert parity_run_problems(["tests/test_p.py::test_ok"], tmp_path) == []
+    # A plugin named in the environment is not loaded into the isolated run.
+    (tmp_path / "evil_plugin.py").write_text(
+        "def pytest_pyfunc_call(pyfuncitem):\n    return True\n")
+    for key, value in (("PYTEST_PLUGINS", "evil_plugin"), ("PYTEST_ADDOPTS", "-p evil_plugin")):
+        with monkeypatch.context() as env:
+            env.setenv(key, value)
+            assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path)), key
+    assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_bad"], tmp_path))
+    assert any("skipped" in p for p in parity_run_problems(["tests/test_p.py::test_skip"], tmp_path))
+    assert any("did not pass" in p for p in parity_run_problems(["tests/test_p.py::test_absent"], tmp_path))
+
+
+def test_derived_basis_self_test_catches_each_rule():
+    writer = """
+import yfinance as yf
+def repair(conn):
+    name = "SRC"
+    data = yf.download("SPY", auto_adjust=False, actions=True)
+    conn.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
+                      "VALUES (:s, :src, :d, :v, 'SUCCESS')"))
+"""
+    live = writer.replace("auto_adjust=False, actions=True", "auto_adjust=True")
+    sources = {"live.py": live, "repair.py": writer}
+    declared = {"live.py": ("SRC", True)}
+    tests = {"tests/test_p.py": "from tests import helpers as h\ndef test_parity():\n    assert h.ok()\n",
+             "tests/helpers.py": "from tests.deeper import X\ndef ok():\n    return X\n",
+             "tests/deeper.py": "X = True\n"}
+    pin = parity_file_sha256("tests/test_p.py", tests)
+    parity = {"file": "tests/test_p.py", "sha256": pin, "tests": ("test_parity",)}
+    ok = {"repair.py": ("SRC", True, False, parity)}
+    assert pin and price_writer_problems(declared, sources, ok, tests) == []
+
+    def problems(derived=ok, srcs=sources, tst=tests):
+        return "\n".join(price_writer_problems(declared, srcs, derived, tst))
+
+    assert "different auto_adjust flags" in problems({"repair.py": ("SRC", False, False, parity)})
+    assert "derived-basis writer declares True" in problems({"repair.py": ("SRC", True, True, parity)})
+    assert "auto_adjust=implicit" in problems(
+        srcs={**sources, "repair.py": writer.replace(", auto_adjust=False, actions=True", "")})
+    assert "no declared price writer" in problems({"repair.py": ("OTHER", True, False, parity)})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, {**parity, "tests": ()})})
+    assert "names no parity tests" in problems({"repair.py": ("SRC", True, False, "tests/test_p.py::test_parity")})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {**parity, "tests": ("test_absent",)})})
+    assert "does not exist" in problems({"repair.py": ("SRC", True, False, {**parity, "file": "evals/x.py"})})
+    for path, old, new in (("tests/test_p.py", "assert h.ok()", "assert True"),     # the test
+                           ("tests/helpers.py", "return X", "return True"),         # a support module
+                           ("tests/deeper.py", "X = True", "X = 1"),                # imported by that one
+                           ("tests/test_p.py", "def test_parity", "import pytest\n@pytest.mark.skip\ndef test_parity")):
+        edited = {**tests, path: tests[path].replace(old, new)}
+        assert "changed since it was pinned" in problems(tst=edited), (path, old)
+    for bad in ({**tests, "tests/helpers.py": "from tests.missing import Y\n"},       # an unresolvable import
+                {**tests, "tests/test_p.py": "from .helpers import ok\n" + tests["tests/test_p.py"]}):  # relative
+        assert "does not exist" in problems(tst=bad)
+    with_init = {**tests, "tests/__init__.py": '"""tests"""\n'}
+    init_pin = {"repair.py": ("SRC", True, False, {**parity, "sha256": parity_file_sha256("tests/test_p.py", with_init)})}
+    assert problems(init_pin, tst=with_init) == ""
+    patched = {**with_init, "tests/__init__.py": "import scripts.x as x\nx.f = lambda: 1\n"}
+    assert "changed since it was pinned" in problems(init_pin, tst=patched)          # the package __init__ counts
+    assert "repair.py: downloads yfinance prices and writes raw_series but is not declared" in problems({})
+
 
 
 def test_one_meaning_self_test_catches_the_april_2026_contamination():
