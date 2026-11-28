@@ -460,9 +460,6 @@ def _transact(
             since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
             cleared = False
             for ev in store.read_clears_for(conn, key, since):
-                if ev.id in _REPAIR_STORE["clear_ids"]:
-                    continue
-                _REPAIR_STORE["clear_ids"].add(ev.id)
                 cleared = _apply_clear(ev, None) or cleared
             cooldowns = _REPAIR_STORE["cooldowns"]
             if cleared and cooldowns is not None:
@@ -516,11 +513,17 @@ def _sync_repair_store(engine: Any, state: Any) -> None:
             # The whole replay window, every pass: a clear can commit late
             # with any earlier time, so no time floor is safe either.
             since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-            for ev in _REPAIR_STORE["store"].read_clears_since(since):
+            store = _REPAIR_STORE["store"]
+            for ev in store.read_clears_since(since):
                 if ev.id in _REPAIR_STORE["clear_ids"]:
                     continue
-                _REPAIR_STORE["clear_ids"].add(ev.id)
-                _apply_clear(ev, getattr(state, "cooldowns", None))
+                # Consumed under the source's store lock, which every
+                # transition for the source also holds (its own connection
+                # from any thread or process), so the clear is applied whole
+                # before or after each of them, never between its read of the
+                # clears and its rows.
+                with store.locked(ev.source_key):
+                    _apply_clear(ev, getattr(state, "cooldowns", None))
             return
         store = RepairEventStore(engine)
         if not store.available():
@@ -583,10 +586,16 @@ def _apply_clear(ev: Any, cooldowns: Any) -> bool:
     was followed by that event, so a replay would apply the clear first and
     the later event on top of it: here it is superseded likewise and changes
     nothing. Returns True when it cleared.
+
+    Recording the clear's id as seen and applying it are one step under one
+    lock, so nothing can find it seen and not yet applied. Applying a clear
+    again changes nothing: its own time is then the newest event, so it is
+    superseded.
     """
     key = ev.source_key
     at = ev.recorded_at if ev.recorded_at.tzinfo else ev.recorded_at.replace(tzinfo=timezone.utc)
     with _REPAIR_SCHEDULE_LOCK:
+        _REPAIR_STORE["clear_ids"].add(ev.id)
         newest = _LAST_EVENT_AT.get(key)
         if newest is not None and at <= newest:
             superseded = True

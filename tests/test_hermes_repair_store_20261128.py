@@ -88,6 +88,7 @@ class FakeStore:
     def __init__(self) -> None:
         self.events: list[RepairEvent] = []
         self.batches: list[list[str]] = []
+        self.locks: list[str] = []
         self.absent = False
         self.fail_reads = False
         self.fail_writes = False
@@ -120,6 +121,7 @@ class FakeStore:
     def locked(self, source_key):
         if self.fail_writes:
             raise RuntimeError("connection reset")
+        self.locks.append(source_key)
         yield "the transaction"
 
     def read_clears_for(self, _conn, source_key, since):
@@ -1042,3 +1044,80 @@ def test_real_types_a_clear_between_attempts_resets_the_cooldown_on_real_rows(pg
     cold = OperatorState()
     hf._sync_repair_store(pg_engine, cold)
     assert cold.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
+
+
+def test_real_types_a_pass_paused_while_applying_a_clear_cannot_let_a_failure_trip_past_it(pg_engine, monkeypatch):
+    """Codex 6095172882's witness: two failures and a committed clear; the
+    pass is paused just as it applies the clear; a failure for the same
+    source arrives. The pass holds the source's locks while it applies, so
+    the failure waits, then counts after the clear: no long skip, and the
+    stored sequence is failed, failed, cleared, failed."""
+    _upgrade(pg_engine)
+    state = OperatorState()
+    hf._sync_repair_store(pg_engine, state)
+    hf.note_repair_failure("TIINGO", REASON)
+    hf.note_repair_failure("TIINGO", REASON)
+    store_mod.RepairEventStore(pg_engine).record("cleared", "tiingo", "TIINGO", reason="between polls")
+
+    real_apply = hf._apply_clear
+    paused, resume = threading.Event(), threading.Event()
+    poll_thread: dict = {}
+
+    def pausing_apply(ev, cooldowns):
+        if threading.get_ident() == poll_thread.get("id"):
+            paused.set()
+            resume.wait(10)
+        return real_apply(ev, cooldowns)
+
+    monkeypatch.setattr(hf, "_apply_clear", pausing_apply)
+
+    def poll():
+        poll_thread["id"] = threading.get_ident()
+        hf._sync_repair_store(pg_engine, state)
+
+    result: dict = {}
+    poller = threading.Thread(target=poll)
+    poller.start()
+    assert paused.wait(10), "the pass reached the clear"
+    third = threading.Thread(target=lambda: result.update(tripped=hf.note_repair_failure("TIINGO", REASON)))
+    third.start()
+    time.sleep(0.5)
+    try:
+        assert third.is_alive(), "the failure waits for the pass to finish applying the clear"
+    finally:
+        resume.set()
+        poller.join(10)
+        third.join(10)
+
+    assert result == {"tripped": False} and _count("TIINGO") == 1
+    assert hf.repair_deterministically_blocked("TIINGO") is None
+    with pg_engine.connect() as c:
+        assert [r[0] for r in c.execute(text(
+            "SELECT event FROM hermes_repair_events ORDER BY recorded_at, id")).fetchall()] == \
+            ["repair_failed", "repair_failed", "cleared", "repair_failed"]
+    monkeypatch.setattr(hf, "_apply_clear", real_apply)
+    live = _tables()
+    _restart(monkeypatch)
+    hf._sync_repair_store(pg_engine, OperatorState())
+    assert _tables() == live and live["skips"] == {}
+
+
+def test_a_pass_applies_each_clear_once_and_then_leaves_it(monkeypatch, table):
+    hf._sync_repair_store("the engine", OperatorState())
+    hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")
+    table.record("cleared", "tiingo", "TIINGO", reason="once")
+    hf._sync_repair_store("the engine", OperatorState())
+    assert "tiingo" not in hf._DETERMINISTIC_SKIPS and table.locks == ["tiingo"]
+    for _ in range(3):
+        hf._sync_repair_store("the engine", OperatorState())
+    assert table.locks == ["tiingo"], "a consumed clear takes no lock on later passes"
+
+
+def test_applying_a_clear_twice_changes_nothing_the_second_time(monkeypatch, table):
+    hf._sync_repair_store("the engine", OperatorState())
+    hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")
+    ev = RepairEvent(99, datetime.now(timezone.utc), "tiingo", "TIINGO", "cleared", None, "once")
+    assert hf._apply_clear(ev, None) is True
+    hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held again")
+    assert hf._apply_clear(ev, None) is False
+    assert "tiingo" in hf._DETERMINISTIC_SKIPS
