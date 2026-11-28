@@ -48,7 +48,9 @@ def projection(path):
   '_UNROUTED_FAILURES_REPORTED':{},'_guest_pull_log_names':lambda:GUEST_PULL_LOG_NAMES,
   # No fixture source is a scheduler registry entry, so none is too slow for a repair
   # (tests/test_hermes_repair_slow_source_20261127.py covers the real helper).
-  '_slow_repair_reason':lambda source,engine:None};exec(compile(mod,str(path),'exec'),ns)
+  '_slow_repair_reason':lambda source,engine:None,
+  # The durable repair store (2026-11-28): none here; tests/test_hermes_repair_store_20261128.py covers it.
+  '_sync_repair_store':lambda engine,state:None};exec(compile(mod,str(path),'exec'),ns)
  return ns['diagnose_and_fix_pulls'],log
 
 GUEST_PULL_LOG_NAMES=frozenset({'smart:finra_dix'})

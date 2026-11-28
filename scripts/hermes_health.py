@@ -294,6 +294,31 @@ class SourceCooldown:
     def get_status(self, source: str) -> dict[str, Any] | None:
         return self._sources.get(source.lower())
 
+    def restore(
+        self, source: str, last_attempt: datetime, consecutive_fails: int, last_error: str | None,
+    ) -> bool:
+        """Seed a source's state from stored repair history (hermes_repair_store).
+
+        Never over state this process has recorded itself. Returns True when
+        it seeded. The timeout blacklist is not restored: it is about a cycle
+        step this process ran, not about the source.
+        """
+        key = source.lower()
+        if key in self._sources:
+            return False
+        if last_attempt.tzinfo is None:
+            last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+        self._sources[key] = {
+            "last_attempt": last_attempt,
+            "consecutive_fails": max(0, int(consecutive_fails)),
+            "last_error": last_error,
+        }
+        return True
+
+    def forget(self, source: str) -> None:
+        """Drop a source's state (an operator cleared its hold)."""
+        self._sources.pop(source.lower(), None)
+
     def skipped_sources(self) -> list[str]:
         """Return sources currently in cooldown."""
         return [s for s in self._sources if not self.can_retry(s)]

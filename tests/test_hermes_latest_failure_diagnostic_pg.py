@@ -186,7 +186,10 @@ def _diagnose(conn):
                  # No fixture source is a scheduler registry entry, so none is too
                  # slow for a repair and the pass still runs one query
                  # (tests/test_hermes_repair_slow_source_20261127.py covers the real helper).
-                 "_slow_repair_reason": lambda source, engine: None}
+                 "_slow_repair_reason": lambda source, engine: None,
+                 # The durable repair store (2026-11-28): none here;
+                 # tests/test_hermes_repair_store_20261128.py covers it.
+                 "_sync_repair_store": lambda engine, state: None}
     exec(compile(module, str(SOURCE), "exec"), namespace)
     engine = _OneConnection(conn)
     # BOTH flags are necessary: production dry_run is checked after optional LLM diagnosis.
