@@ -285,7 +285,11 @@ _UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
 # absent); "engine": the engine it was opened on; "restored": whether this
 # process has read its history back (once); "clear_ids": the clear events
 # already looked at, each once.
-_REPAIR_STORE: dict[str, Any] = {"store": None, "engine": None, "restored": False, "clear_ids": set()}
+# "cooldowns": the pass's SourceCooldown (OperatorState.cooldowns), so a clear
+# applied inside a repair write resets the ordinary cooldown too.
+_REPAIR_STORE: dict[str, Any] = {
+    "store": None, "engine": None, "restored": False, "clear_ids": set(), "cooldowns": None,
+}
 # source_key -> recorded_at of the newest stored event for it (written by this
 # process or restored), in the store's per-source commit order. A clear older
 # than this is superseded, here as in the replay.
@@ -421,7 +425,9 @@ def repair_rules() -> Any:
                  REPEATED_FAILURE_MAX_COOLDOWN_SECONDS)
 
 
-def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) -> None:
+def _transact(
+    source_name: str, transition: Callable[[], list[dict[str, Any]]], *, attempt_failed: bool,
+) -> None:
     """Apply one repair transition for a source, and store its events, in the stored order.
 
     ``transition`` updates the in-memory tables and returns the events to
@@ -431,6 +437,12 @@ def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) 
     since the last pass is part of the state the transition is computed
     from, exactly where a replay would put it, so a failure after a clear
     starts a new count instead of continuing the old one.
+
+    The ordinary cooldown is reset by such a clear too, and the attempt the
+    caller has just recorded (every caller records it with
+    ``state.cooldowns.record_attempt`` before noting the outcome) is put back
+    on top: one failed attempt after the clear, or none after a recovery, as
+    a replay counts it.
 
     Best effort: if the store cannot be used the transition still runs in
     memory and a throttled warning says the event is not stored.
@@ -446,11 +458,19 @@ def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) 
     try:
         with store.locked(key) as conn:
             since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+            cleared = False
             for ev in store.read_clears_for(conn, key, since):
                 if ev.id in _REPAIR_STORE["clear_ids"]:
                     continue
                 _REPAIR_STORE["clear_ids"].add(ev.id)
-                _apply_clear(ev, None)
+                cleared = _apply_clear(ev, None) or cleared
+            cooldowns = _REPAIR_STORE["cooldowns"]
+            if cleared and cooldowns is not None:
+                attempt = cooldowns.get_status(source_name)
+                cooldowns.forget(source_name)
+                if attempt and attempt.get("last_attempt") is not None:
+                    cooldowns.restore(source_name, attempt["last_attempt"],
+                                      1 if attempt_failed else 0, attempt.get("last_error"))
             events = transition()
             applied = True
             rows = []
@@ -488,6 +508,7 @@ def _sync_repair_store(engine: Any, state: Any) -> None:
     """
     from scripts.hermes_repair_store import LOOKBACK_DAYS, RepairEventStore, replay
 
+    _REPAIR_STORE["cooldowns"] = getattr(state, "cooldowns", None)
     try:
         if _REPAIR_STORE["restored"]:
             if _REPAIR_STORE["engine"] is not engine:
@@ -499,7 +520,7 @@ def _sync_repair_store(engine: Any, state: Any) -> None:
                 if ev.id in _REPAIR_STORE["clear_ids"]:
                     continue
                 _REPAIR_STORE["clear_ids"].add(ev.id)
-                _apply_clear(ev, state)
+                _apply_clear(ev, getattr(state, "cooldowns", None))
             return
         store = RepairEventStore(engine)
         if not store.available():
@@ -555,7 +576,7 @@ def _restore_repair_history(restored: Any, state: Any, now: datetime) -> dict[st
     return counts
 
 
-def _apply_clear(ev: Any, state: Any) -> bool:
+def _apply_clear(ev: Any, cooldowns: Any) -> bool:
     """Apply an operator clear where the stored order puts it.
 
     A clear older than the newest event this process knows for the source
@@ -578,7 +599,6 @@ def _apply_clear(ev: Any, state: Any) -> bool:
         log.info("Operator clear of {s} at {t} is older than its last repair event; "
                  "superseded, as a restart would read it", s=ev.source_name, t=at.isoformat())
         return False
-    cooldowns = getattr(state, "cooldowns", None)
     if cooldowns is not None:
         cooldowns.forget(ev.source_name)
     log.warning("Repair hold on {s} cleared by an operator: {r}", s=ev.source_name, r=ev.reason or "")
@@ -631,7 +651,7 @@ def note_repair_failure(source_name: str, reason: str) -> bool:
             skip_until=datetime.now(timezone.utc) + timedelta(seconds=cooldown), strikes=strikes,
         )]
 
-    _transact(source_name, transition)
+    _transact(source_name, transition, attempt_failed=True)
     return outcome["tripped"]
 
 
@@ -646,7 +666,7 @@ def note_repair_recovered(source_name: str) -> None:
         # The same instant, so a restart compares it with a failure time exactly as this process did.
         return [dict(event="recovered", occurred_at=recovered_at)]
 
-    _transact(source_name, transition)
+    _transact(source_name, transition, attempt_failed=False)
 
 
 def _recovered_after(source_name: str, last_fail: Any) -> bool:
