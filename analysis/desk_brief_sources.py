@@ -772,7 +772,16 @@ _LEAVES = {"market": {"phase": "text", "trend_pct": "num", "bend_pct": "num"},
            "vix": {"third": "text", "spike_state": "text", "obs_date": "date", "stale": "bool"},
            "overnight_rule": {"market_gate": "bool"}}
 _NUM_BOUND = 1e9                           # no printed figure (percent, count) comes near this
-_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _calendar_date(value: Any) -> date | None:
+    if not isinstance(value, str) or _DATE.fullmatch(value) is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _leaf_bad(v: Any, kind: str) -> bool:
@@ -789,7 +798,7 @@ def _leaf_bad(v: Any, kind: str) -> bool:
     if kind == "bool":
         return not isinstance(v, bool)
     if kind == "date":
-        return not (isinstance(v, str) and _DATE.match(v))
+        return _calendar_date(v) is None
     return not isinstance(v, str)
 
 
@@ -802,6 +811,9 @@ def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
     for field, want in (("schema", SECTOR_SCHEMA), ("kind", row_kind), ("data_through", day)):
         if rec.get(field) != want:
             return f"body's {field} {rec.get(field)!r} is not the row's {want!r}"
+    data_through = _calendar_date(day)
+    if data_through is None:
+        return "row data_through is not a YYYY-MM-DD date"
     sectors = rec.get("sectors")
     if not isinstance(sectors, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in sectors.items()):
         return "sectors is not an object of objects"
@@ -819,8 +831,11 @@ def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
             return f"{f} is not an object"
     for part, leaves in _LEAVES.items():
         for f, kind in leaves.items():
-            if _leaf_bad((rec.get(part) or {}).get(f), kind):
+            value = (rec.get(part) or {}).get(f)
+            if _leaf_bad(value, kind):
                 return f"{part}.{f} is not {'a finite number' if kind == 'num' else 'true or false' if kind == 'bool' else 'a YYYY-MM-DD date' if kind == 'date' else 'text'}"
+            if kind == "date" and value is not None and date.fromisoformat(value) > data_through:
+                return f"{part}.{f} is after the row's data_through {day}"
     if _leaf_bad(rec.get("sectors_rising"), "num"):
         return "sectors_rising is not a finite number"
     for f in ("leaders", "laggards"):
@@ -831,6 +846,8 @@ def _sector_body_problem(rec: Any, day: str, row_kind: str) -> str | None:
     ahead = (rec.get("events") or {}).get("within_7_days")
     if ahead is not None and not (isinstance(ahead, list) and all(isinstance(e, dict) for e in ahead)):
         return "events.within_7_days is not a list of objects"
+    # A published schedule can name a future day. The row's computed_at is
+    # checked separately; an event date is not evidence of publication.
     if ahead and not all(isinstance(e.get("event"), str) and e["event"] and not _leaf_bad(e.get("date"), "date") and e.get("date")
                          for e in ahead):
         return "events.within_7_days has an entry without an event name and a YYYY-MM-DD date"
