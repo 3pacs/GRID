@@ -425,9 +425,7 @@ def repair_rules() -> Any:
                  REPEATED_FAILURE_MAX_COOLDOWN_SECONDS)
 
 
-def _transact(
-    source_name: str, transition: Callable[[], list[dict[str, Any]]], *, attempt_failed: bool,
-) -> None:
+def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) -> None:
     """Apply one repair transition for a source, and store its events, in the stored order.
 
     ``transition`` updates the in-memory tables and returns the events to
@@ -438,11 +436,12 @@ def _transact(
     from, exactly where a replay would put it, so a failure after a clear
     starts a new count instead of continuing the old one.
 
-    The ordinary cooldown is reset by such a clear too, and the attempt the
-    caller has just recorded (every caller records it with
-    ``state.cooldowns.record_attempt`` before noting the outcome) is put back
-    on top: one failed attempt after the clear, or none after a recovery, as
-    a replay counts it.
+    The ordinary cooldown is reset by such a clear too. Every caller records
+    the attempt with ``state.cooldowns.record_attempt`` before noting its
+    outcome, so that attempt is still awaiting its stored outcome and is kept
+    (SourceCooldown.reset_for_clear): one failure in a row after the clear,
+    or none after a recovery, as a replay counts it. Once the rows are stored
+    the attempt is settled, so a later clear drops it with the rest.
 
     Best effort: if the store cannot be used the transition still runs in
     memory and a throttled warning says the event is not stored.
@@ -463,11 +462,7 @@ def _transact(
                 cleared = _apply_clear(ev, None) or cleared
             cooldowns = _REPAIR_STORE["cooldowns"]
             if cleared and cooldowns is not None:
-                attempt = cooldowns.get_status(source_name)
-                cooldowns.forget(source_name)
-                if attempt and attempt.get("last_attempt") is not None:
-                    cooldowns.restore(source_name, attempt["last_attempt"],
-                                      1 if attempt_failed else 0, attempt.get("last_error"))
+                cooldowns.reset_for_clear(source_name)
             events = transition()
             applied = True
             rows = []
@@ -489,6 +484,9 @@ def _transact(
         if not applied:
             transition()
         return
+    cooldowns = _REPAIR_STORE["cooldowns"]
+    if cooldowns is not None:
+        cooldowns.settle(source_name)
     with _REPAIR_SCHEDULE_LOCK:
         for _event_id, recorded_at in written:
             if key not in _LAST_EVENT_AT or recorded_at > _LAST_EVENT_AT[key]:
@@ -609,7 +607,9 @@ def _apply_clear(ev: Any, cooldowns: Any) -> bool:
                  "superseded, as a restart would read it", s=ev.source_name, t=at.isoformat())
         return False
     if cooldowns is not None:
-        cooldowns.forget(ev.source_name)
+        # Keeps an attempt whose outcome is still to be stored: it lands
+        # after this clear, live and in a replay.
+        cooldowns.reset_for_clear(ev.source_name)
     log.warning("Repair hold on {s} cleared by an operator: {r}", s=ev.source_name, r=ev.reason or "")
     return True
 
@@ -660,7 +660,7 @@ def note_repair_failure(source_name: str, reason: str) -> bool:
             skip_until=datetime.now(timezone.utc) + timedelta(seconds=cooldown), strikes=strikes,
         )]
 
-    _transact(source_name, transition, attempt_failed=True)
+    _transact(source_name, transition)
     return outcome["tripped"]
 
 
@@ -675,7 +675,7 @@ def note_repair_recovered(source_name: str) -> None:
         # The same instant, so a restart compares it with a failure time exactly as this process did.
         return [dict(event="recovered", occurred_at=recovered_at)]
 
-    _transact(source_name, transition, attempt_failed=False)
+    _transact(source_name, transition)
 
 
 def _recovered_after(source_name: str, last_fail: Any) -> bool:

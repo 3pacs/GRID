@@ -500,6 +500,46 @@ def test_a_clear_taken_in_by_a_recovery_leaves_no_failure_in_the_cooldown(monkey
     assert state.cooldowns.can_retry("TIINGO") is False, "the attempt just made still counts for the cadence"
 
 
+def test_a_pass_clear_between_an_attempt_and_its_stored_failure_keeps_that_attempt(monkeypatch, table):
+    """Codex 6095220439, the caller order: two failures, a committed clear,
+    a fresh attempt recorded, the pass applies the clear, then the failure
+    is noted. The fresh attempt's outcome is stored after the clear, so it
+    is kept: one failure in a row and no immediate retry, live and after a
+    restart."""
+    state = OperatorState()
+    hf._sync_repair_store("the engine", state)
+    for _ in range(2):
+        state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
+        hf.note_repair_failure("TIINGO", REASON)
+    table.record("cleared", "tiingo", "TIINGO", reason="between polls")
+    state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
+    hf._sync_repair_store("the engine", state)                        # the pass applies the clear here
+    hf.note_repair_failure("TIINGO", REASON)
+
+    live = state.cooldowns.get_status("TIINGO")
+    assert live["consecutive_fails"] == 1 and state.cooldowns.can_retry("TIINGO") is False
+    _restart(monkeypatch)
+    cold = OperatorState()
+    hf._sync_repair_store("the engine", cold)
+    assert cold.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
+    assert cold.cooldowns.can_retry("TIINGO") is False
+
+
+def test_a_clear_drops_settled_attempts_and_keeps_only_the_unsettled_one(monkeypatch, table):
+    state = OperatorState()
+    hf._sync_repair_store("the engine", state)
+    state.cooldowns.record_attempt("TIINGO", success=False, error="x")
+    hf.note_repair_failure("TIINGO", REASON)                           # settled
+    table.record("cleared", "tiingo", "TIINGO", reason="nothing pending")
+    hf._sync_repair_store("the engine", state)
+    assert state.cooldowns.get_status("TIINGO") is None, "a settled attempt goes with the clear"
+    state.cooldowns.record_attempt("TIINGO", success=True)             # unsettled success
+    table.record("cleared", "tiingo", "TIINGO", reason="success pending")
+    hf._sync_repair_store("the engine", state)
+    kept = state.cooldowns.get_status("TIINGO")
+    assert kept["consecutive_fails"] == 0 and kept["outcome_pending"] is True
+
+
 @pytest.mark.parametrize("seed", range(6))
 def test_live_and_replayed_bookkeeping_agree_after_every_step(monkeypatch, table, seed):
     """Random interleavings of failures (two reasons), recoveries, clears and
@@ -1121,3 +1161,23 @@ def test_applying_a_clear_twice_changes_nothing_the_second_time(monkeypatch, tab
     hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held again")
     assert hf._apply_clear(ev, None) is False
     assert "tiingo" in hf._DETERMINISTIC_SKIPS
+
+
+def test_real_types_a_pass_clear_between_an_attempt_and_its_failure_keeps_the_attempt(pg_engine, monkeypatch):
+    _upgrade(pg_engine)
+    state = OperatorState()
+    hf._sync_repair_store(pg_engine, state)
+    for _ in range(2):
+        state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
+        hf.note_repair_failure("TIINGO", REASON)
+    store_mod.RepairEventStore(pg_engine).record("cleared", "tiingo", "TIINGO", reason="between polls")
+    state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
+    hf._sync_repair_store(pg_engine, state)
+    hf.note_repair_failure("TIINGO", REASON)
+    assert state.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
+    assert state.cooldowns.can_retry("TIINGO") is False
+    _restart(monkeypatch)
+    cold = OperatorState()
+    hf._sync_repair_store(pg_engine, cold)
+    assert cold.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
+    assert cold.cooldowns.can_retry("TIINGO") is False
