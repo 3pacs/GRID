@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, fields
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -149,6 +150,23 @@ def net_t_matrix(targets, sides, cost):
     return t.astype(np.float32)
 
 
+
+def _family_session_keys(families):
+    """One row per family and New York cash-session date, as emitted by build_rows.
+
+    A local date identifies the row bucket, not exchange admission, opening hours,
+    or an overnight trading session. Distinct fixed-clock families may share it.
+    """
+    market_zone = ZoneInfo("America/New_York")
+    by_family = {}
+    for family, rows in families.items():
+        keys = [orp.stamp(row["decision_at"]).astimezone(market_zone).date().isoformat() for row in rows]
+        if len(set(keys)) != len(keys):
+            raise ValueError("multiple decisions in one family/session are not supported")
+        by_family[family] = keys
+    return by_family
+
+
 def max_t_adjusted(families, ledger, protocol, block):
     """Westfall-Young step-down max-T adjusted p over every tested trial (one-sided).
 
@@ -159,7 +177,8 @@ def max_t_adjusted(families, ledger, protocol, block):
     ``selection_alpha`` = the run's first-step bar, sessions), the p lists
     aligned with ``ledger``.
     """
-    sessions = sorted({row["decision_at"][:10] for rows in families.values() for row in rows})
+    keys_by_family = _family_session_keys(families)
+    sessions = sorted({key for keys in keys_by_family.values() for key in keys})
     at = {d: i for i, d in enumerate(sessions)}
     tested = [i for i, t in enumerate(ledger) if t["status"] == "tested"]
     adjusted, marginal = [1.0] * len(ledger), [1.0] * len(ledger)
@@ -175,8 +194,8 @@ def max_t_adjusted(families, ledger, protocol, block):
         y = np.full(len(sessions), np.nan)
         cost = np.zeros(len(sessions))
         sides = np.zeros((len(sessions), len(members)))
-        for row in rows:
-            k = at[row["decision_at"][:10]]
+        for row, key in zip(rows, keys_by_family[family]):
+            k = at[key]
             y[k] = row["target"]
             cost[k] = row_cost(row, protocol)
             for j, (_, feature) in enumerate(members):
@@ -336,7 +355,8 @@ def cofiring(families, trials, signal_of, by="jaccard", threshold=0.5):
         raise ValueError(f"co-firing measure is one of {COFIRING_MEASURES}")
     if not 0 < threshold <= 1:
         raise ValueError("co-firing threshold lies in (0, 1]")
-    sessions = sorted({row["decision_at"][:10] for rows in families.values() for row in rows})
+    keys_by_family = _family_session_keys(families)
+    sessions = sorted({key for keys in keys_by_family.values() for key in keys})
     at = {d: i for i, d in enumerate(sessions)}
     names, fired = [], {}
     signal = {}
@@ -347,8 +367,8 @@ def cofiring(families, trials, signal_of, by="jaccard", threshold=0.5):
             names.append(name)
             fired[name] = set()
         fired[name].update(
-            at[row["decision_at"][:10]]
-            for row in families[trial["family"]]
+            at[key]
+            for key, row in zip(keys_by_family[trial["family"]], families[trial["family"]])
             if row["features"][trial["feature"]]["value"] is not None
         )
     x = np.zeros((len(sessions), len(names)), dtype=np.float32)
