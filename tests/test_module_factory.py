@@ -370,3 +370,24 @@ def test_factory_protocol_keeps_the_offline_proof_checks_and_its_own():
     # the offline proof itself (E0 v1 machinery) still knows nothing of the factory
     with pytest.raises(ValueError):
         Protocol(**{**good, "origin": "synthetic_fixture", "statistic": "net_when_fires"}).validate()
+
+def test_factory_max_t_refuses_within_family_session_aliases_before_selection():
+    """NYSE local civil date is the existing cash-session builder's bucket, not a calendar proof."""
+    from analysis.factory_stats import FactoryProtocol
+    p = FactoryProtocol(run_id="fixture", features=("A",), split="2042-01-01T00:00:00Z",
+                        end="2043-01-01T00:00:00Z", selection_alpha=0.05, perms=99)
+    # These are different UTC dates but the same New York civil date.
+    rows = [{"decision_at": "2040-01-02T14:00:00-05:00"},
+            {"decision_at": "2040-01-03T00:01:00+00:00"}]
+    with pytest.raises(ValueError, match="multiple decisions in one family/session"):
+        max_t_adjusted({"target": rows}, [], p, 1)
+    # Independent daily slot families share the global permutation index, not the per-family collision gate.
+    marg, adj, critical, sessions_count = max_t_adjusted({"early": rows[:1], "late": rows[1:]}, [], p, 1)
+    if (marg, adj, critical, sessions_count) != ([], [], None, 1):
+        raise AssertionError("separate families must share the same date bucket")
+    from analysis.factory_stats import cofiring
+    with pytest.raises(ValueError, match="multiple decisions in one family/session"):
+        cofiring({"target": rows}, [], lambda family, feat: feat)
+    matrix, _, _ = cofiring({"early": rows[:1], "late": rows[1:]}, [], lambda family, feat: feat)
+    if matrix["sessions"] != 1:
+        raise AssertionError("co-firing and the permutation axis disagree")
