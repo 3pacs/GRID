@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import types
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -192,6 +192,8 @@ def test_publish_factor_signals_writes_registry_payload_shape() -> None:
     assert row["freshness_hours"] == 3.0
     assert row["valid_from"].tzinfo is timezone.utc
     assert row["valid_until"] - row["valid_from"] == timedelta(hours=3)
+    # The unbounded path keeps the original payload: no factor_obs_date, so
+    # the registry reader leaves its copies (and their vote) as they were.
     assert json.loads(row["metadata"]) == {
         "signal_name": "dual_horizon_equity",
         "rank": 0.95,
@@ -260,6 +262,7 @@ def test_publish_regime_signal_writes_neutral_regime_payload() -> None:
 def test_publish_all_alpha_signals_orchestrates_factor_and_regime_publish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _Clock.at(monkeypatch, _publish_hour(AS_OF))
     engine = _RecordingEngine()
     calls: list[tuple[str, Any]] = []
     prices = pd.DataFrame(
@@ -315,6 +318,7 @@ def test_publish_all_alpha_signals_orchestrates_factor_and_regime_publish(
         "alpha_research.signals.quanta_alpha",
         _module(
             "alpha_research.signals.quanta_alpha",
+            MIN_RANK_PEERS=5,
             vol_price_divergence=factor("vol_price_divergence"),
             vol_regime_adaptive_equity=factor("vol_regime_adaptive_equity"),
             dual_horizon_equity=factor("dual_horizon_equity"),
@@ -354,6 +358,14 @@ def test_publish_all_alpha_signals_orchestrates_factor_and_regime_publish(
         "alpha_research:vix_exposure": 1,
         "alpha_research:credit_cycle": 1,
     }
+
+    for row in _registry_rows(engine):
+        meta = json.loads(row["metadata"])
+        if row["source_module"] == "alpha_research:vol_price_divergence":
+            assert "factor_obs_date" not in meta  # unbounded: payload and vote unchanged
+        elif row["source_module"] in ("alpha_research:vol_regime_equity",
+                                      "alpha_research:dual_horizon_equity"):
+            assert meta["factor_obs_date"] == "2026-06-15"
 
     vix_row = [
         row
@@ -403,6 +415,7 @@ def test_publish_all_alpha_signals_skips_empty_prices_and_unknown_regimes(
         "alpha_research.signals.quanta_alpha",
         _module(
             "alpha_research.signals.quanta_alpha",
+            MIN_RANK_PEERS=5,
             vol_price_divergence=lambda *_args, **_kwargs: _factor_panel(),
             vol_regime_adaptive_equity=lambda *_args, **_kwargs: _factor_panel(),
             dual_horizon_equity=lambda *_args, **_kwargs: _factor_panel(),
@@ -431,3 +444,250 @@ def test_publish_regime_signal_docstring_has_no_dangling_todo_doc_reference() ->
         "publish_regime_signal must not reference the missing "
         "docs/TODO-REGIME-SIGNAL-USAGE.md file"
     )
+
+
+# ── Session-bounded latest rank (max_sessions_behind) ───────────────────────
+
+
+def _late_receipt_panel(last_day: str, spy_day: str) -> pd.DataFrame:
+    """Six tickers ranked on every row; SPY has no value after ``spy_day``."""
+    days = pd.to_datetime(["2026-11-20", "2026-11-23", "2026-11-24", "2026-11-25",
+                           "2026-11-27", "2026-11-30"])
+    days = days[days <= pd.Timestamp(last_day)]
+    tickers = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK"]
+    rows = []
+    for i, day in enumerate(days):
+        ranks = {t: (j + 1 + i) % 6 / 6 + 1 / 12 for j, t in enumerate(tickers)}
+        if day > pd.Timestamp(spy_day):
+            ranks["SPY"] = float("nan")
+        rows.append(ranks)
+    return pd.DataFrame(rows, index=days)
+
+
+class _Clock:
+    """Pin signal_adapter's wall clock; a bounded row's validity depends on it."""
+
+    @staticmethod
+    def at(monkeypatch: pytest.MonkeyPatch, instant: datetime) -> None:
+        class _Fixed(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant if tz is None else instant.astimezone(tz)
+
+        monkeypatch.setattr(signal_adapter, "datetime", _Fixed)
+
+
+def _publish_hour(as_of: date) -> datetime:
+    return datetime(as_of.year, as_of.month, as_of.day, 15, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(("as_of", "spy_day", "published"), [
+    # Wednesday: Tuesday's settled close is one session back.
+    (date(2026, 11, 25), "2026-11-24", True),
+    # Wednesday: Monday's close is two sessions back -> fail closed.
+    (date(2026, 11, 25), "2026-11-23", False),
+    # Friday after Thanksgiving: Wednesday is one NYSE session back.
+    (date(2026, 11, 27), "2026-11-25", True),
+    # Monday: Friday is one session back, across the weekend.
+    (date(2026, 11, 30), "2026-11-27", True),
+    # Monday: Wednesday is two sessions back (Thursday was a holiday).
+    (date(2026, 11, 30), "2026-11-25", False),
+])
+def test_late_receipt_ticker_is_published_from_its_own_row_within_one_session(
+    as_of: date, spy_day: str, published: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _Clock.at(monkeypatch, _publish_hour(as_of))
+    panel = _late_receipt_panel(as_of.isoformat(), spy_day)
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=as_of, max_sessions_behind=1,
+    )
+
+    rows = _registry_rows_by_ticker(engine)
+    assert ("SPY" in rows) is published
+    assert count == (6 if published else 5)
+    if published:
+        meta = json.loads(rows["SPY"]["metadata"])
+        assert meta["factor_obs_date"] == spy_day
+        assert meta["rank"] == pytest.approx(panel.loc[spy_day, "SPY"])
+        assert meta["rank_universe_size"] == 6
+    # Tickers with a value on the last row are published from it, as before.
+    assert json.loads(rows["QQQ"]["metadata"])["factor_obs_date"] == as_of.isoformat()
+    assert json.loads(rows["QQQ"]["metadata"])["rank"] == pytest.approx(panel.iloc[-1]["QQQ"])
+
+
+def test_without_a_session_bound_only_the_last_row_is_published() -> None:
+    panel = _late_receipt_panel("2026-11-25", "2026-11-24")
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 25),
+    )
+
+    assert count == 5
+    assert "SPY" not in _registry_rows_by_ticker(engine)
+    assert all("factor_obs_date" not in json.loads(r["metadata"])
+               for r in _registry_rows(engine))
+
+
+def test_publish_all_bounds_only_the_equity_momentum_factors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def recorder(engine_arg: Any, signal_name: str, panel: Any, as_of_date: Any = None,
+                 **kwargs: Any) -> int:
+        seen[signal_name] = (kwargs.get("max_sessions_behind"), kwargs.get("min_row_universe", 5))
+        return 0
+
+    prices = pd.DataFrame({"AAPL": [1.0, 2.0]}, index=pd.to_datetime(["2026-06-12", "2026-06-15"]))
+    monkeypatch.setattr(signal_adapter, "publish_factor_signals", recorder)
+    monkeypatch.setitem(sys.modules, "alpha_research.data.panel_builder", _module(
+        "alpha_research.data.panel_builder", build_price_panel=lambda *a, **k: prices))
+    monkeypatch.setitem(sys.modules, "alpha_research.signals.exposure_scaler", _module(
+        "alpha_research.signals.exposure_scaler",
+        compute_vix_exposure_scalar=lambda *a: {"regime_hint": "unknown"}))
+    monkeypatch.setitem(sys.modules, "alpha_research.signals.credit_cycle", _module(
+        "alpha_research.signals.credit_cycle", compute_credit_cycle=lambda *a: {"confidence": 0}))
+    monkeypatch.setitem(sys.modules, "alpha_research.signals.quanta_alpha", _module(
+        "alpha_research.signals.quanta_alpha",
+        MIN_RANK_PEERS=20,
+        vol_price_divergence=lambda p: p,
+        vol_regime_adaptive_equity=lambda p: p,
+        dual_horizon_equity=lambda p: p,
+    ))
+
+    signal_adapter.publish_all_alpha_signals(_RecordingEngine(), as_of_date=AS_OF)
+
+    assert seen == {
+        "vol_price_divergence": (None, 5),
+        "vol_regime_equity": (1, 20),
+        "dual_horizon_equity": (1, 20),
+    }
+
+
+@pytest.mark.parametrize(("obs_day", "published_at", "valid_until"), [
+    # Friday's close published Monday 15:00Z: stops voting as Tuesday (UTC) begins.
+    ("2026-11-20", datetime(2026, 11, 23, 15, tzinfo=timezone.utc),
+     datetime(2026, 11, 24, tzinfo=timezone.utc)),
+    # Wednesday's close published Sunday: Thursday 11-26 is a holiday, so the
+    # second session after it is Monday 11-30.
+    ("2026-11-25", datetime(2026, 11, 29, 15, tzinfo=timezone.utc),
+     datetime(2026, 11, 30, tzinfo=timezone.utc)),
+    # Tuesday's close published Wednesday: the 24 h window ends first.
+    ("2026-11-24", datetime(2026, 11, 25, 15, tzinfo=timezone.utc),
+     datetime(2026, 11, 26, 15, tzinfo=timezone.utc)),
+])
+def test_a_bounded_row_stops_voting_when_its_observation_leaves_the_bound(
+    obs_day: str, published_at: datetime, valid_until: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _Clock.at(monkeypatch, published_at)
+    as_of = published_at.date()
+    panel = _late_receipt_panel(as_of.isoformat(), obs_day)
+    engine = _RecordingEngine()
+
+    signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=as_of, max_sessions_behind=1,
+    )
+
+    spy = _registry_rows_by_ticker(engine)["SPY"]
+    assert json.loads(spy["metadata"])["factor_obs_date"] == obs_day
+    assert spy["valid_until"] == valid_until
+
+
+def test_an_expired_observation_is_not_published_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Monday 11-23's close, published at Wednesday 02:00 UTC with an as_of of
+    # Tuesday (a host date lagging UTC): already past its Wednesday 00:00 UTC expiry.
+    _Clock.at(monkeypatch, datetime(2026, 11, 25, 2, 0, tzinfo=timezone.utc))
+    panel = _late_receipt_panel("2026-11-24", "2026-11-23")
+    engine = _RecordingEngine()
+
+    signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 24), max_sessions_behind=1,
+    )
+
+    assert "SPY" not in _registry_rows_by_ticker(engine)
+    assert "QQQ" in _registry_rows_by_ticker(engine)
+
+
+# ── Per-row peer coverage (min_row_universe) ────────────────────────────────
+
+
+def _sparse_latest_panel(prior_names: int) -> pd.DataFrame:
+    """Tuesday: ``prior_names`` tickers ranked. Wednesday: QQQ alone (percentile 1.0)."""
+    names = ["QQQ"] + [f"T{i}" for i in range(prior_names - 1)]
+    tue = {t: (i + 1) / prior_names for i, t in enumerate(names)}
+    wed = {t: float("nan") for t in names} | {"QQQ": 1.0}
+    return pd.DataFrame([tue, wed], index=pd.to_datetime(["2026-11-24", "2026-11-25"]))
+
+
+def test_a_lone_name_on_the_newest_row_is_published_from_its_last_populated_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 25)))
+    panel = _sparse_latest_panel(prior_names=8)
+    engine = _RecordingEngine()
+
+    signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 25),
+        max_sessions_behind=1, min_row_universe=8,
+    )
+
+    meta = json.loads(_registry_rows_by_ticker(engine)["QQQ"]["metadata"])
+    assert meta["factor_obs_date"] == "2026-11-24"   # not the 1-name Wednesday row
+    assert meta["rank"] == pytest.approx(1 / 8)
+    assert meta["rank_universe_size"] == 8
+
+
+@pytest.mark.parametrize(("prior_names", "published"), [(8, True), (7, False)])
+def test_peer_minimum_boundary(prior_names: int, published: bool,
+                               monkeypatch: pytest.MonkeyPatch) -> None:
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 25)))
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", _sparse_latest_panel(prior_names),
+        as_of_date=date(2026, 11, 25), max_sessions_behind=1, min_row_universe=8,
+    )
+
+    assert ("QQQ" in _registry_rows_by_ticker(engine)) is published
+    assert count == (prior_names if published else 0)
+
+
+def test_a_lone_name_with_no_populated_row_in_the_bound_is_not_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Thursday 11-26 is a holiday; on Monday 11-30 the bound reaches back to
+    # Friday 11-27 only, so Tuesday's populated row is out of reach.
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 30)))
+    panel = _sparse_latest_panel(prior_names=8)
+    panel.index = pd.to_datetime(["2026-11-25", "2026-11-30"])
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 30),
+        max_sessions_behind=1, min_row_universe=8,
+    )
+
+    assert count == 0
+
+
+def test_recorded_same_calendar_peers_take_precedence_over_the_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A factor that ranked within a calendar group records that group's size."""
+    _Clock.at(monkeypatch, _publish_hour(date(2026, 11, 25)))
+    panel = _sparse_latest_panel(prior_names=8)
+    sizes = panel.notna().astype(float).where(panel.notna())
+    sizes.loc[pd.Timestamp("2026-11-24")] = 3.0  # only 3 same-calendar peers that day
+    panel.attrs["rank_universe_size"] = sizes
+    engine = _RecordingEngine()
+
+    count = signal_adapter.publish_factor_signals(
+        engine, "dual_horizon_equity", panel, as_of_date=date(2026, 11, 25),
+        max_sessions_behind=1, min_row_universe=8,
+    )
+
+    assert count == 0

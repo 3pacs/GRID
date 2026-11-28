@@ -319,7 +319,7 @@ class ModelFactory:
                 f"z_score, confidence, valid_from, valid_until, metadata "
                 f"FROM signal_registry WHERE {where} ORDER BY valid_from DESC"
             ), params).mappings().all()
-        return [dict(r) for r in rows]
+        return latest_factor_obs_only([dict(r) for r in rows])
 
     def list_active_models(self) -> list[ModelSpec]:
         with self.engine.connect() as conn:
@@ -339,6 +339,66 @@ class ModelFactory:
                 raise KeyError(f"Model '{model_name}' not found")
         log.info("ModelFactory: retired '{name}'", name=model_name)
 
+
+
+def _factor_obs_date(row: dict[str, Any]) -> str | None:
+    meta = row.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            return None
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get("factor_obs_date")
+    return value if isinstance(value, str) else None
+
+
+def latest_factor_obs_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per (source_module, ticker) for a session-bounded factor.
+
+    A factor published from a ticker's own latest ranked row records that
+    row's date as ``metadata.factor_obs_date`` and is republished every cycle.
+    Every copy stays valid, so a model would count Friday's and Monday's
+    observations together, and n identical copies of one observation give
+    sqrt(n) times its strength. The copy count differs by ticker (SPY's D-1
+    rows accumulate from its overnight receipt; a same-day ticker's restart
+    at each session's first pull), so it would weight tickers by publication
+    count, not evidence. Keep, per (source_module, ticker), the single row
+    with the newest ``factor_obs_date`` and, among those, the newest
+    ``valid_from``. Once a (source_module, ticker) has a row with the field,
+    its rows without it (published by the previous code and still valid for
+    up to 24 h after the change) are dropped too, so the changeover counts one
+    vote. Rows of a key with no such row (every other source) are unchanged.
+    """
+    best: dict[tuple[Any, Any], tuple[str, Any, int]] = {}
+    for i, row in enumerate(rows):
+        obs = _factor_obs_date(row)
+        if obs is None:
+            continue
+        key = (row.get("source_module"), row.get("ticker"))
+        rank = (obs, row.get("valid_from"), -i)
+        held = best.get(key)
+        if held is None or _newer(rank, held):
+            best[key] = rank
+    keep = {-rank[2] for rank in best.values()}
+    return [
+        row for i, row in enumerate(rows)
+        if i in keep
+        or (_factor_obs_date(row) is None
+            and (row.get("source_module"), row.get("ticker")) not in best)
+    ]
+
+
+def _newer(a: tuple[str, Any, int], b: tuple[str, Any, int]) -> bool:
+    """Newer observation date, then newer publish time, then the earlier row (ties)."""
+    if a[0] != b[0]:
+        return a[0] > b[0]
+    if a[1] != b[1] and a[1] is not None and b[1] is not None:
+        return a[1] > b[1]
+    if a[1] is not None and b[1] is None:
+        return True
+    return False
 
 def migrate_default_models(engine: Engine) -> None:
     """Populate JSONB columns for the legacy Oracle models. Idempotent.

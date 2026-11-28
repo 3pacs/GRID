@@ -194,6 +194,14 @@ class Signal:
 
 MAX_ACTOR_RECEIPT_BYTES = 16_384
 
+# A model that ran on a priced ticker but found no direction records a stated
+# abstention (verdict no_data, direction NONE) with this kind, distinct from a
+# quote abstention ("no_qualified_quote"), which a fresh capture can cure.
+# Written only for a model that applies to the ticker (>= 3 signals) and finds
+# bull == bear; a model with fewer signals does not apply and records nothing.
+ABSTENTION_KIND_NO_DIRECTION = "no_direction"
+NO_DIRECTION_SCORE_NOTE = "No directional evidence at decision time"
+
 # Proportional anti-signal veto threshold: veto a call when opposing
 # directional weighted mass exceeds this fraction of total directional mass.
 OPPOSING_VETO_FRACTION: float = 0.40
@@ -1785,6 +1793,63 @@ class OracleEngine:
             return int(horizon_days)
         return max(1, (expiry - now.date()).days)
 
+    def _no_direction_abstention(
+        self,
+        *,
+        ticker: str,
+        model: OracleModel,
+        now: datetime,
+        horizon_days: int | None,
+        flow_ctx: dict,
+        spot: float,
+        signals: list[Signal],
+    ) -> OraclePrediction:
+        """A stated abstention for a model that saw no directional evidence.
+
+        Without it a captured, priced ticker whose models all lack direction
+        writes no row at all and is indistinguishable from a ticker that was
+        never run. ``flow_context.abstention_kind = "no_direction"`` keeps it
+        apart from quote abstentions (``"no_qualified_quote"``), which are the
+        only ones a fresh capture can cure. The signals it saw are kept.
+
+        The entry receipt is checked here exactly as ``_store_predictions``
+        checks it. If it fails, the row is a quote abstention (the receipt's
+        reason, no kind of its own), never a no-direction one, so a curable
+        quote failure is not recorded as "no direction".
+        """
+        from oracle.entry_price_policy import validate_quote_reference
+
+        expiry = self._expiry_for_horizon(now, horizon_days)
+        receipt = flow_ctx.get("entry_price_basis")
+        receipt_error = validate_quote_reference(receipt, as_of=now, ticker=ticker)
+        if receipt_error is None and spot != (receipt or {}).get("price"):
+            receipt_error = "entry_price_does_not_match_frozen_receipt"
+        context = {**flow_ctx}
+        if receipt_error is None:
+            context[ABSTENTION_KIND_KEY] = ABSTENTION_KIND_NO_DIRECTION
+        pred_id = hashlib.md5(
+            f"{ticker}:{model.name}:no_direction:{now.isoformat()}".encode()
+        ).hexdigest()[:16]
+        return OraclePrediction(
+            id=pred_id,
+            timestamp=now,
+            ticker=ticker,
+            prediction_type=PredictionType.DIRECTION,
+            direction="NONE",
+            target_price=None,
+            current_price=spot,
+            expiry=expiry,
+            confidence=0.0,
+            expected_move_pct=0.0,
+            signals=list(signals),
+            model_name=model.name,
+            model_version=model.version,
+            verdict=Verdict.NO_DATA,
+            score_notes=NO_DIRECTION_SCORE_NOTE if receipt_error is None else str(receipt_error),
+            flow_context=context,
+            horizon_days=self._horizon_days_for(now, expiry, horizon_days),
+        )
+
     def _oracle_one_ticker(
         self,
         idx: int,
@@ -1995,7 +2060,9 @@ class OracleEngine:
                     log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
 
                 if len(signals) < 3:
-                    continue  # Not enough data for this model
+                    # The model does not apply to this ticker (its sources
+                    # hold too little about it): nothing to record.
+                    continue
 
                 # ── Per-signal weight overrides ──────────────────────
                 # Multipliers from intelligence.signal_weight_overrides
@@ -2066,7 +2133,14 @@ class OracleEngine:
                 elif bear_score > bull_score:
                     direction = "PUT"
                 else:
-                    continue  # No signal
+                    # The model applies (>= 3 signals) but they give no net
+                    # direction (e.g. only neutral ones): abstain on the
+                    # record instead of writing nothing.
+                    ticker_predictions.append(self._no_direction_abstention(
+                        ticker=ticker, model=model, now=now, horizon_days=horizon_days,
+                        flow_ctx=flow_ctx, spot=spot, signals=signals,
+                    ))
+                    continue
 
                 # Count-robust signal strength: |sum(w * z_signed)| / sqrt(sum(w^2)).
                 # Opposing signals already net out here; no second anti_deduction subtraction.
@@ -3123,7 +3197,13 @@ class OracleEngine:
                     abstention_context = dict(p.flow_context)
                     if receipt_error is not None:
                         # No qualified quote at the decision. An abstention for
-                        # another reason keeps the kind its writer gave it.
+                        # another reason keeps the kind its writer gave it,
+                        # except "no direction": that was judged on a receipt
+                        # which has since failed at the decision clock, so the
+                        # missing quote is the reason a fresh capture can cure.
+                        if abstention_context.get(ABSTENTION_KIND_KEY) == ABSTENTION_KIND_NO_DIRECTION:
+                            abstention_context[ABSTENTION_KIND_KEY] = ABSTENTION_NO_QUALIFIED_QUOTE
+                            p = replace(p, score_notes=str(receipt_error))
                         abstention_context.setdefault(ABSTENTION_KIND_KEY, ABSTENTION_NO_QUALIFIED_QUOTE)
                     if p.direction != "NONE":
                         abstention_context["candidate_direction"] = p.direction

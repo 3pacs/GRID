@@ -434,7 +434,7 @@ class TraceAnalyzer:
                            AVG(CASE WHEN pnl_pct IS NOT NULL THEN pnl_pct ELSE 0 END) AS avg_pnl
                     FROM oracle_predictions
                     WHERE scored_at >= :cutoff
-                      AND verdict IS NOT NULL
+                      AND verdict IN ('hit', 'miss', 'partial')
                       AND dedup_keep = TRUE
                       AND id NOT LIKE 'astrogrid:%'
                     GROUP BY model_name
@@ -903,7 +903,8 @@ class TargetedMutator:
                     SELECT model_name,
                            COUNT(*) FILTER (WHERE verdict = 'hit') * 1.0 / NULLIF(COUNT(*), 0) AS hr
                     FROM oracle_predictions
-                    WHERE verdict IS NOT NULL
+                    WHERE verdict IN ('hit', 'miss', 'partial')
+                      AND dedup_keep = TRUE
                       AND id NOT LIKE 'astrogrid:%'
                     GROUP BY model_name
                     HAVING COUNT(*) >= :min_preds
