@@ -191,7 +191,7 @@ def test_load_batch_price_cagrs_computes_per_ticker_and_respects_min_obs():
         if "count(*)" in s and "from raw_series" in s:
             # BBB has too few observations to qualify.
             return _res(rows=[("YF:AAA:close", 800), ("YF:BBB:close", 10)])
-        if "distinct on" in s and "from raw_series" in s:
+        if "cross join lateral" in s and "from raw_series" in s:
             return _res(rows=[("YF:AAA:close", 120.0, as_of)])
         return _res()
 
@@ -201,14 +201,14 @@ def test_load_batch_price_cagrs_computes_per_ticker_and_respects_min_obs():
 
     assert out["BBB"] is None, "under MIN_PRICE_OBS must map to None"
     # Same (val, date) row returned for both the "latest" and "prior"
-    # DISTINCT ON calls above -> flat price -> cagr == 0.
+    # lateral calls above -> flat price -> cagr == 0.
     assert out["AAA"] == pytest.approx(0.0)
 
 
 def test_load_batch_price_cagrs_filters_pull_status_success():
     """Regression guard for the raw_series read-guard fix: both new
     batched raw_series reads (the MIN_PRICE_OBS count and the
-    DISTINCT ON latest/prior vintage lookup) must filter
+    latest/prior vintage lookup) must filter
     pull_status = 'SUCCESS', the same way store/observations.py and
     the sanctioned per-ticker pattern do. Without this, a FAILED pull
     (value=0, obs_date=today) or a stale PARTIAL vintage could feed
@@ -224,7 +224,7 @@ def test_load_batch_price_cagrs_filters_pull_status_success():
             return _res(one=_regclass("public.x"))
         if "count(*)" in s and "from raw_series" in s:
             return _res(rows=[("YF:AAA:close", 800)])
-        if "distinct on" in s and "from raw_series" in s:
+        if "cross join lateral" in s and "from raw_series" in s:
             return _res(rows=[("YF:AAA:close", 120.0, as_of)])
         return _res()
 
@@ -233,13 +233,98 @@ def test_load_batch_price_cagrs_filters_pull_status_success():
         fd._load_batch_price_cagrs(conn, ["AAA"], as_of)
 
     raw_series_reads = [sql for sql in captured if "from raw_series" in sql.lower()]
-    # 1 count query + 2 DISTINCT ON calls (_latest_by_sid runs once for
+    # 1 count query + 2 lateral calls (_latest_by_sid runs once for
     # `as_of` and once for the prior-3y date).
-    assert len(raw_series_reads) == 3, "expected the count + 2 DISTINCT ON reads"
+    assert len(raw_series_reads) == 3, "expected the count + 2 latest/prior reads"
     for sql in raw_series_reads:
         assert "pull_status" in sql and "SUCCESS" in sql, (
             f"raw_series read missing pull_status = 'SUCCESS' filter: {sql}"
         )
+
+
+def test_load_batch_price_cagrs_reads_are_bounded_per_series():
+    """Regression for the nightly statement_timeout (2026-11-22 on).
+
+    raw_series keeps every vintage (a close series holds ~440k SUCCESS rows),
+    so a read that aggregates or sorts a series' whole history cannot finish
+    in the 120 s statement_timeout for the ~1,100-ticker universe. Every
+    raw_series read the price loader issues must be a per-series probe that
+    stops after a bounded number of rows: a LATERAL join over the series ids
+    with a LIMIT, and no whole-history GROUP BY / DISTINCT ON.
+    """
+    as_of = date(2026, 4, 11)
+    captured: list[str] = []
+
+    def side_effect(sql: str):
+        captured.append(sql)
+        s = sql.lower()
+        if "to_regclass" in s:
+            return _res(one=_regclass("public.x"))
+        if "count(*)" in s and "from raw_series" in s:
+            return _res(rows=[("YF:AAA:close", fd.MIN_PRICE_OBS)])
+        if "cross join lateral" in s and "from raw_series" in s:
+            return _res(rows=[("YF:AAA:close", 120.0, as_of)])
+        return _res()
+
+    engine = _make_engine(side_effect)
+    with engine.connect() as conn:
+        out = fd._load_batch_price_cagrs(conn, ["AAA"], as_of)
+
+    assert out["AAA"] == pytest.approx(0.0)
+    reads = [sql.lower() for sql in captured if "from raw_series" in sql.lower()]
+    assert len(reads) == 3
+    for sql in reads:
+        assert "limit" in sql, f"raw_series read is not bounded per series: {sql}"
+        assert "lateral" in sql or "unnest" in sql, (
+            f"raw_series read must probe one series at a time: {sql}"
+        )
+        assert "distinct on" not in sql
+        assert "group by" not in sql
+        assert "= any(" not in sql, (
+            f"raw_series read scans every vintage of every series: {sql}"
+        )
+
+
+def _failing_loader_engine(fail_marker: str):
+    """Engine whose read matching ``fail_marker`` raises like Postgres does
+    on statement_timeout."""
+
+    def side_effect(sql: str):
+        s = sql.lower()
+        if "to_regclass" in s:
+            return _res(one=_regclass("public.x"))
+        if fail_marker in s:
+            raise RuntimeError(
+                "(psycopg2.errors.QueryCanceled) canceling statement due to "
+                "statement timeout"
+            )
+        if "count(*)" in s and "from raw_series" in s:
+            return _res(rows=[("YF:AAA:close", 800)])
+        return _res()
+
+    return _make_engine(side_effect)
+
+
+def test_compute_divergence_price_load_failure_raises_cause_not_neutral_scores():
+    """A failed batched price load must stop the run with its own error.
+
+    It used to be swallowed (all-None price cache -> neutral price score 50
+    for every ticker) and the aborted Postgres transaction then surfaced only
+    as the misleading ``Financial source generation unavailable``.
+    """
+    universe = [fd.SectorTicker(ticker="AAA", sector="Technology")]
+    engine = _failing_loader_engine("cross join lateral")
+    with patch.object(fd, "_load_universe", return_value=universe):
+        with pytest.raises(fd.DivergenceInputLoadError, match="price load failed"):
+            fd.compute_divergence(engine, as_of=date(2026, 4, 11))
+
+
+def test_compute_divergence_fundamentals_load_failure_raises_cause():
+    universe = [fd.SectorTicker(ticker="AAA", sector="Technology")]
+    engine = _failing_loader_engine("from capital_flows")
+    with patch.object(fd, "_load_universe", return_value=universe):
+        with pytest.raises(fd.DivergenceInputLoadError, match="fundamentals load failed"):
+            fd.compute_divergence(engine, as_of=date(2026, 4, 11))
 
 
 def test_load_batch_price_cagrs_missing_table_returns_all_none():
@@ -336,7 +421,7 @@ def test_compute_divergence_writes_long_candidate_for_fundamentals_beating_price
     # _load_batch_fundamentals/_load_batch_price_cagrs. Call sequence is
     # now: one combined capital_flows query (all tickers' annual rows,
     # tagged by ticker_key), one raw_series COUNT(*) query (all series),
-    # then two DISTINCT-ON raw_series queries in a fixed order (latest
+    # then two LATERAL raw_series queries in a fixed order (latest
     # as_of, then prior as_of — see _load_batch_price_cagrs).
     combined_fund_rows = [
         (tk, fp, ft, amt)
@@ -367,7 +452,7 @@ def test_compute_divergence_writes_long_candidate_for_fundamentals_beating_price
         if "count(*)" in s and "from raw_series" in s:
             return _res(rows=count_rows)
 
-        if "distinct on" in s and "from raw_series" in s:
+        if "cross join lateral" in s and "from raw_series" in s:
             state["price_asof_calls"] += 1
             rows = latest_rows if state["price_asof_calls"] == 1 else prior_rows
             return _res(rows=rows)
