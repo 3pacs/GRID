@@ -72,11 +72,17 @@ def _state(engine):
         return rederive._constraint_state(conn)
 
 
-def _legacy_etf(conn, ticker: str, d: date, raw: str) -> int:
+OLD_RULE_CREATED = "2026-11-20 11:45:18+00"                              # inside the old rule's period
+
+
+def _legacy_etf(conn, ticker: str, d: date, raw: str, created: str = OLD_RULE_CREATED) -> int:
     """A row as the old rule stored it: inflow, {series_id, raw_value}, amount 0.3% of raw."""
-    return _insert(conn, source_type="etf_flow", direction="inflow", flow_date=d, ticker=ticker,
-                   actor=f"ETF:{ticker}", amount=str(Decimal(raw) * Decimal("0.003")), confidence="estimated",
-                   evidence={"series_id": f"ETF_FLOW:{ticker}:5d", "raw_value": float(raw)})
+    rid = _insert(conn, source_type="etf_flow", direction="inflow", flow_date=d, ticker=ticker,
+                  actor=f"ETF:{ticker}", amount=str(Decimal(raw) * Decimal("0.003")), confidence="estimated",
+                  evidence={"series_id": f"ETF_FLOW:{ticker}:5d", "raw_value": float(raw)})
+    conn.execute(text("UPDATE dollar_flows SET created_at = CAST(:c AS TIMESTAMPTZ) WHERE id = :i"),
+                 {"c": created, "i": rid})
+    return rid
 
 
 def _seed(engine) -> dict[str, list[int]]:
@@ -122,7 +128,8 @@ def test_revision_on_a_table_with_old_rule_rows_is_not_valid_and_enforced(pg):
     _migrate(pg, _ETF_MIGRATION)                                          # idempotent
     assert _state(pg) is False
     assert repair13f._constraint_state(pg.connect()) is False             # 13F's own, unchanged
-    for evidence in ({"series_id": "ETF_FLOW:SPY:5d", "raw_value": 1.0}, {"direction_basis": None}, {}, None):
+    for evidence in ({"series_id": "ETF_FLOW:SPY:5d", "raw_value": 1.0}, {"direction_basis": None}, {}, None,
+                     {"direction_basis": 5}, [1]):
         with pytest.raises(IntegrityError, match="dollar_flows_etf_flow_direction_basis"):
             with pg.begin() as conn:
                 conn.execute(text(
@@ -211,22 +218,30 @@ def test_export_plans_each_old_rule_row_and_writes_nothing(pg, tmp_path, capsys)
         rederive.export(pg, path)                                         # never overwritten
 
 
-@pytest.mark.parametrize("odd", ["outflow", "extra_key", "series_mismatch", "amount_off"])
+@pytest.mark.parametrize("odd", ["outflow", "extra_key", "series_mismatch", "amount_off",
+                                 "created_after_the_old_rule", "dated_after_the_old_rule"])
 def test_export_refuses_a_breaking_row_that_is_not_the_old_rules_shape(pg, tmp_path, capsys, odd):
     with pg.begin() as conn:
         conn.execute(text(_PRE_REVISION_DDL))
         ev = {"series_id": "ETF_FLOW:SPY:5d", "raw_value": 100.0}
         kw = dict(source_type="etf_flow", direction="inflow", flow_date=date(2026, 5, 1), ticker="SPY",
                   amount="0.3", evidence=ev)
+        created = OLD_RULE_CREATED
         if odd == "outflow":
             kw["direction"] = "outflow"
         elif odd == "extra_key":
             kw["evidence"] = {**ev, "note": "hand-written"}
         elif odd == "series_mismatch":
             kw["ticker"] = "QQQ"
-        else:
+        elif odd == "amount_off":
             kw["amount"] = "0.31"
-        _insert(conn, **kw)
+        elif odd == "created_after_the_old_rule":
+            created = "2026-11-27 09:00:00+00"                            # same shape, written later by hand
+        else:
+            kw["flow_date"] = date(2026, 11, 20)
+        rid = _insert(conn, **kw)
+        conn.execute(text("UPDATE dollar_flows SET created_at = CAST(:c AS TIMESTAMPTZ) WHERE id = :i"),
+                     {"c": created, "i": rid})
     assert rederive.main(["export", "--out", str(tmp_path / "m.json")], engine=pg) == 2
     assert "need a person" in capsys.readouterr().err
     assert not (tmp_path / "m.json").exists()
@@ -339,16 +354,25 @@ def test_apply_refuses_without_the_constraint_or_with_one_grouped_otherwise(pg, 
     assert _apply(pg, path, rep) == 2
     assert "is absent" in capsys.readouterr().err
     # Same operators and operands, so the flat text comparison passes, grouped differently:
-    # only the probe rows see it.
-    regrouped = ("(source_type <> 'etf_flow' OR COALESCE(evidence ->> 'direction_basis', '') <> '' "
-                 "AND direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')")
-    assert rederive._flat(f"CHECK {regrouped}") == rederive.EXPECTED_FLAT_DEF
-    with pg.begin() as conn:
-        conn.execute(text(f"ALTER TABLE dollar_flows ADD CONSTRAINT {rederive.ETF_FLOW_CONTRACT_CONSTRAINT} "
-                          f"CHECK {regrouped} NOT VALID"))
-    assert _apply(pg, path, rep) == 2
-    assert "does not behave as the contract" in capsys.readouterr().err
-    assert _rows(pg, ids["legacy_etf"]) == before
+    # only the probe rows see it. The second is the partner review's regrouping, which
+    # rejects an insider row carrying a basis.
+    typed = "COALESCE(jsonb_typeof(evidence -> 'direction_basis'), '') = 'string'"
+    nonempty = "evidence ->> 'direction_basis' <> ''"
+    for regrouped in (
+        f"(source_type <> 'etf_flow' OR {typed} AND {nonempty} AND direction = 'neutral' "
+        "OR evidence ->> 'direction_basis' <> 'unsigned_volume')",
+        f"((source_type <> 'etf_flow' OR {typed} AND {nonempty}) AND (direction = 'neutral' "
+        "OR evidence ->> 'direction_basis' <> 'unsigned_volume'))",
+    ):
+        assert rederive._flat(f"CHECK {regrouped}") == rederive.EXPECTED_FLAT_DEF
+        with pg.begin() as conn:
+            conn.execute(text(f"ALTER TABLE dollar_flows DROP CONSTRAINT IF EXISTS "
+                              f"{rederive.ETF_FLOW_CONTRACT_CONSTRAINT}"))
+            conn.execute(text(f"ALTER TABLE dollar_flows ADD CONSTRAINT {rederive.ETF_FLOW_CONTRACT_CONSTRAINT} "
+                              f"CHECK {regrouped} NOT VALID"))
+        assert _apply(pg, path, rep) == 2
+        assert "does not behave as the contract" in capsys.readouterr().err
+        assert _rows(pg, ids["legacy_etf"]) == before
 
 
 def test_the_probes_leave_no_row_and_the_contract_check_passes_on_every_server(pg):

@@ -27,7 +27,8 @@ depends_on = None
 
 CONSTRAINT = 'dollar_flows_etf_flow_direction_basis'
 CHECK_SQL = (
-    "(source_type <> 'etf_flow' OR (COALESCE(evidence ->> 'direction_basis', '') <> '' "
+    "(source_type <> 'etf_flow' OR (COALESCE(jsonb_typeof(evidence -> 'direction_basis'), '') = 'string' "
+    "AND evidence ->> 'direction_basis' <> '' "
     "AND (direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')))"
 )
 

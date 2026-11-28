@@ -128,17 +128,22 @@ DOLLAR_FLOWS_CONTRACT_CHECK_SQL = "(source_type <> '13f' OR direction = 'observe
 # records why a row has its direction in ``evidence.direction_basis`` and
 # writes 'neutral' unless a signed measure exists. Before 2026-11-16 an older
 # rule stored every ETF row as 'inflow' with no basis (693 rows on production,
-# 2026-02-27..11-13). NULL-safe: a missing, JSON-null or empty basis, a NULL
-# or non-object evidence, all break it (``->>`` yields NULL, COALESCE '').
+# 2026-02-27..11-13). NULL-safe and typed: the basis must be a non-empty JSON
+# string, so a missing, JSON-null, empty or non-string basis, and a NULL or
+# non-object evidence, all break it (``jsonb_typeof`` of a missing key is NULL,
+# COALESCE ''). The Python check agrees; it also reads JSON text evidence,
+# which only SQLite stores (a PostgreSQL string scalar is not an object there).
 ETF_FLOW_CONTRACT_CONSTRAINT = "dollar_flows_etf_flow_direction_basis"
 UNSIGNED_VOLUME_BASIS = "unsigned_volume"
 ETF_FLOW_CONTRACT_CHECK_SQL = (
-    "(source_type <> 'etf_flow' OR (COALESCE(evidence ->> 'direction_basis', '') <> '' "
+    "(source_type <> 'etf_flow' OR (COALESCE(jsonb_typeof(evidence -> 'direction_basis'), '') = 'string' "
+    "AND evidence ->> 'direction_basis' <> '' "
     "AND (direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')))"
 )
 # The same predicate for SQLite (evidence is JSON text there).
 _ETF_FLOW_CONTRACT_CHECK_SQLITE = (
-    "(source_type <> 'etf_flow' OR (COALESCE(json_extract(evidence, '$.direction_basis'), '') <> '' "
+    "(source_type <> 'etf_flow' OR (COALESCE(json_type(evidence, '$.direction_basis'), '') = 'text' "
+    "AND json_extract(evidence, '$.direction_basis') <> '' "
     "AND (direction = 'neutral' OR json_extract(evidence, '$.direction_basis') <> 'unsigned_volume')))"
 )
 
@@ -274,7 +279,7 @@ CREATE TABLE IF NOT EXISTS dollar_flows (
     flow_date DATE NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT dollar_flows_13f_observed_only CHECK (source_type <> '13f' OR direction = 'observed'),
-    CONSTRAINT dollar_flows_etf_flow_direction_basis CHECK (source_type <> 'etf_flow' OR (COALESCE(evidence ->> 'direction_basis', '') <> '' AND (direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')))
+    CONSTRAINT dollar_flows_etf_flow_direction_basis CHECK (source_type <> 'etf_flow' OR (COALESCE(jsonb_typeof(evidence -> 'direction_basis'), '') = 'string' AND evidence ->> 'direction_basis' <> '' AND (direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')))
 );
 CREATE INDEX IF NOT EXISTS idx_dollar_flows_ticker
     ON dollar_flows (ticker, flow_date DESC);

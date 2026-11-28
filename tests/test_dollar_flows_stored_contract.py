@@ -199,6 +199,9 @@ def test_one_contract_text_for_writer_audit_migration_and_schema():
           "evidence": {"direction_basis": "net_flow"}}, None),                               # a signed measure
         ({"source_type": "etf_flow", "direction": "neutral", "evidence": {"direction_basis": ""}}, "etf_flow"),
         ({"source_type": "etf_flow", "direction": "neutral", "evidence": None}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "inflow", "evidence": {"direction_basis": 5}}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "neutral", "evidence": {"direction_basis": None}}, "etf_flow"),
+        ({"source_type": "etf_flow", "direction": "neutral", "evidence": [1]}, "etf_flow"),
         ({"source_type": "etf_flow", "direction": "neutral",
           "evidence": '{"direction_basis": "unsigned_volume"}'}, None),                      # JSON text evidence
     ],

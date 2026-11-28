@@ -22,9 +22,11 @@ and refusal (``_canonical_row``, ``rows_sha256``, ``_lock``, ``Refused``).
     the row each becomes: direction 'neutral', ``evidence`` plus
     ``direction_basis`` 'unsigned_volume' and a ``rederived`` marker, every
     other column unchanged. Refuses if any such row is not exactly the old
-    rule's shape (direction 'inflow'; evidence keys exactly series_id and
-    raw_value; series ``ETF_FLOW:<ticker>:5d`` with that ticker; amount 0.3%
-    of raw_value): that row needs a person, not this script.
+    rule's shape and provenance (direction 'inflow'; evidence keys exactly
+    series_id and raw_value; series ``ETF_FLOW:<ticker>:5d`` with that
+    ticker; amount 0.3% of raw_value; flow_date and created_at inside the old
+    rule's period): that row needs a person, not this script. Loading a
+    manifest checks the same again.
 
 ``apply --manifest FILE --expect-count N --expect-sha256 H [--dry-run]``
     One transaction, all or nothing, under ``SHARE ROW EXCLUSIVE`` on
@@ -100,6 +102,12 @@ _COLUMNS = (
     "confidence", "evidence", "flow_date", "created_at",
 )
 _SERIES = re.compile(r"^ETF_FLOW:([A-Z0-9.\-]{1,10}):5d$")
+# The old rule's provenance: the current rule wrote every etf_flow row from
+# 2026-11-16 on; the last old-rule row on production was created 2026-11-20
+# 11:45Z for flow_date 2026-11-13. A row of the old shape outside these bounds
+# was written by something else and is refused.
+OLD_RULE_LAST_FLOW_DATE = "2026-11-15"
+OLD_RULE_CREATED_BEFORE = "2026-11-21T00:00:00+00:00"
 VALIDATE_SQL = f"ALTER TABLE dollar_flows VALIDATE CONSTRAINT {ETF_FLOW_CONTRACT_CONSTRAINT}"
 DROP_SQL = f"ALTER TABLE dollar_flows DROP CONSTRAINT {ETF_FLOW_CONTRACT_CONSTRAINT}"
 READD_SQL = (f"ALTER TABLE dollar_flows ADD CONSTRAINT {ETF_FLOW_CONTRACT_CONSTRAINT} "
@@ -142,7 +150,9 @@ EXPECTED_FLAT_DEF = _flat(f"CHECK {ETF_FLOW_CONTRACT_CHECK_SQL}")
 
 # Probe rows the contract's CHECK must accept (True) or reject (False). They
 # pin the grouping the flat text comparison cannot see: a CHECK with the same
-# operators grouped differently accepts or rejects at least one of them.
+# operators grouped differently accepts or rejects at least one of them (the
+# PostgreSQL tests check two regroupings). Each probe run consumes SERIAL ids
+# (sequences are not rolled back), so ids after an apply are not contiguous.
 CONSTRAINT_PROBES: tuple[tuple[str, str, Any, bool], ...] = (
     ("etf_flow", "inflow", {"series_id": "ETF_FLOW:SPY:5d", "raw_value": 1.0}, False),   # the old rule's row
     ("etf_flow", "inflow", {"direction_basis": UNSIGNED_VOLUME_BASIS}, False),
@@ -151,7 +161,12 @@ CONSTRAINT_PROBES: tuple[tuple[str, str, Any, bool], ...] = (
     ("etf_flow", "neutral", {}, False),
     ("etf_flow", "neutral", None, False),
     ("etf_flow", "neutral", {"direction_basis": ""}, False),
-    ("insider", "inflow", None, True),                                                   # other sources untouched
+    ("etf_flow", "neutral", {"direction_basis": None}, False),                           # JSON null
+    ("etf_flow", "inflow", {"direction_basis": 5}, False),                               # not a string
+    ("etf_flow", "neutral", [1], False),                                                 # not an object
+    ("insider", "inflow", None, True),                                                   # other sources untouched,
+    ("insider", "inflow", {"direction_basis": UNSIGNED_VOLUME_BASIS}, True),             # whatever their evidence
+    ("insider", "inflow", {}, True),
 )
 
 
@@ -220,6 +235,11 @@ def _not_old_rule(r: dict[str, Any]) -> str | None:
     expect = raw * AMOUNT_SHARE
     if not math.isclose(float(Decimal(r["amount_usd"])), float(expect), rel_tol=1e-9):
         return f"amount {r['amount_usd']} is not 0.3% of raw_value {raw}"
+    if str(r["flow_date"]) > OLD_RULE_LAST_FLOW_DATE:
+        return f"flow_date {r['flow_date']} is after the old rule ({OLD_RULE_LAST_FLOW_DATE})"
+    created = r["created_at"]
+    if created is None or datetime.fromisoformat(created) >= datetime.fromisoformat(OLD_RULE_CREATED_BEFORE):
+        return f"created_at {created} is not before {OLD_RULE_CREATED_BEFORE}"
     return None
 
 
@@ -280,6 +300,9 @@ def load_manifest(path: Path, expect_sha256: str) -> dict[str, Any]:
         raise Refused("manifest ids/count do not match its rows")
     if len(set(man["ids"])) != len(man["ids"]):
         raise Refused("manifest lists an id twice")
+    not_old = {r["id"]: why for r in rows if (why := _not_old_rule(r))}
+    if not_old:
+        raise Refused(f"manifest rows are not the old rule's shape: {dict(list(not_old.items())[:10])}")
     if man.get("after") != [rederived(r, digest) for r in rows] or rows_sha256(man["after"]) != man.get("after_sha256"):
         raise Refused("manifest 'after' rows are not the re-derive of its rows (edited?)")
     return man
