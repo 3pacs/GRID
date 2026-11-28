@@ -62,7 +62,7 @@ if str(_ROOT) not in sys.path:
 JOB = "grade_publication_review"
 REVIEW_SCHEMA = "publication-review-verdicts-v1"
 RECEIPT_SCHEMA = "publication-review-grader-receipt-v1"
-GRADER_VERSION = "grid/grade_publication_review-v3-range-pairing"
+GRADER_VERSION = "grid/grade_publication_review-v4-causes-moves"
 DEFAULT_PACKET_ROOT = Path(os.environ.get(
     "GRID_PUBLICATION_PACKET_PUBLIC_ROOT",
     os.environ.get("GRID_PUBLICATION_PACKET_ROOT", "~/research/publication-packets"))).expanduser()
@@ -133,11 +133,20 @@ class Figure:
     label: str
     names: str          # regex alternation, case-insensitive, matched on word boundaries
     pct: bool = False
+    #: Further raw_series ids holding the same quantity, read in order when ``series_id`` has
+    #: nothing in the lookback (DGS10: GRID's bare FRED pull stopped 2026-04-02, see
+    #: analysis/factory_macro.py; ingestion/altdata/yield_curve_full.py stores it as yc_10y).
+    alt_series: tuple[str, ...] = ()
+    lookback_days: int = 14          # non-YF series: label window before the statement (monthly: longer)
+    #: A level that is never near zero: a stated value outside SCALE_BAND x what GRID holds is
+    #: a ratio, return or score that happened to follow the name ("VIX/VIX3M=0.90"), not the
+    #: level. Spreads cross zero, so they are exempt.
+    scale_guard: bool = True
 
 
 FIGURES: tuple[Figure, ...] = (
     Figure("YF:^VIX9D:close", "VIX 9-day", r"VIX9D|9-day VIX|VIX 9-day(?: tenor)?|9-day tenor"),
-    Figure("YF:^VIX3M:close", "VIX 3-month", r"VIX3M|3-month VIX|VIX 3-month(?: tenor)?"),
+    Figure("YF:^VIX3M:close", "VIX 3-month", r"VIX3M|3-month VIX|VIX 3-month(?: tenor)?|3-month tenor"),
     Figure("YF:^VIX:close", "VIX", r"VIX(?![ -]?(?:9|3M|9-day|3-month))"),
     Figure("YF:^GSPC:close", "S&P 500", r"S&P 500|S&P|SPX|\^GSPC"),
     Figure("YF:^IXIC:close", "Nasdaq Composite", r"Nasdaq(?: Composite)?|\^IXIC"),
@@ -147,22 +156,47 @@ FIGURES: tuple[Figure, ...] = (
     Figure("YF:LQD:close", "LQD", r"LQD"),
     Figure("YF:JNK:close", "JNK", r"JNK"),
     Figure("YF:EMB:close", "EMB", r"EMB"),
+    Figure("YF:EEM:close", "EEM", r"EEM"),
+    Figure("YF:FXE:close", "FXE", r"FXE"),
+    Figure("YF:FXY:close", "FXY", r"FXY"),
     Figure("YF:GLD:close", "GLD", r"GLD"),
     Figure("YF:UUP:close", "UUP", r"UUP"),
-    Figure("T10Y2Y", "10Y-2Y spread", r"10Y-2Y(?: yield curve)?(?: spread)?|2s10s|10-year minus 2-year", pct=True),
-    Figure("T10Y3M", "10Y-3M spread", r"10Y-3M(?: spread)?|10-year minus 3-month", pct=True),
+    Figure("T10Y2Y", "10Y-2Y spread", r"10Y-2Y(?: yield curve)?(?: spread)?|2s10s|10-year minus 2-year|"
+                                       r"10-year(?:/| to )2-year(?: Treasury)?(?: yield)?(?: curve)?(?: spread)?",
+           pct=True, scale_guard=False),
+    Figure("T10Y3M", "10Y-3M spread", r"10Y-3M(?: spread)?|10-year minus 3-month", pct=True, scale_guard=False),
     Figure("DFF", "fed funds rate", r"(?:effective )?fed funds(?: rate)?", pct=True),
     Figure("DGS2", "2-year Treasury yield", r"2-year (?:Treasury )?yield", pct=True),
     Figure("DGS5", "5-year Treasury yield", r"5-year (?:Treasury )?yield", pct=True),
+    Figure("DGS10", "10-year Treasury yield", r"10-year (?:Treasury )?yield|DGS10", pct=True, alt_series=("yc_10y",)),
+    Figure("T5YIE", "5-year breakeven inflation", r"T5YIE|5-year (?:inflation expectations?|breakeven(?: inflation)?(?: rate)?)",
+           pct=True),
+    Figure("UNRATE", "unemployment rate", r"unemployment rate|UNRATE", pct=True, lookback_days=100),   # monthly, ~5 weeks lag
 )
+SCALE_BAND = (0.2, 5.0)
 #: Between the name and the number: a short run of words with no digit, ending in a level verb.
+#: An optional ")" (the name was a parenthesised ticker: "volatility (VIX) stands at") and an
+#: optional "(TICKER)" after a long name ("fed funds rate (DFF) is") are allowed; a parenthesised
+#: number ("9-day VIX (29.26)") is the level itself.
 #: Anything naming a derived quantity (z-score, momentum, ratio, change ...) is not a level claim.
-_FIGURE_GAP = r"(?P<gap>[^0-9\n.;()\[\]]{0,48}?)\b(?:stands at|stood at|is at|was at|closed at|at|of|is|was|=)\s*"
-_FIGURE_NUMBER = r"(?P<num>\$?[0-9][0-9,]*(?:\.[0-9]+)?)(?P<pct>\s?%)?"
+_FIGURE_GAP = (r"(?P<gap>\)?(?:\s*\([A-Za-z^][A-Za-z0-9^=]{0,7}\))?[^0-9\n.;()\[\]]{0,48}?)"
+               r"(?:\b(?:stands at|stood at|is at|was at|closed at|at|of|is|was|=)\s*|(?P<paren>\(\s*)"
+               r"|(?P<bare>\x20(?=[+\-\u2212$]?[0-9])))")
+#: A bare "VIX 19.46" is a level only right after the name, printed with decimals, and right before
+#: a list or sentence boundary ("VIX 19.46 vs. VIX3M 20.64", "HYG 76.63, LQD 102.74"); "VIX 30 days
+#: ago" and "the Nasdaq 100," are not.
+_BARE_END = re.compile(r"\s*(?:[,;)\]]|vs\b|versus\b|and\b|\.(?:\s|$)|$)")
+#: The number must end there: "(9-day" is a tenor's name, not the level 9.
+_FIGURE_NUMBER = r"(?P<sign>[+\-\u2212])?(?P<num>\$?[0-9][0-9,]*(?:\.[0-9]+)?)(?![0-9A-Za-z\-])(?P<pct>\s?%)?"
 _DERIVED = re.compile(r"z-score|\bz\b|momentum|ratio|change|volume|percentile|score|return|breadth|ma\b|average|"
                       r"put/call|spread change|week|day move|bps", re.IGNORECASE)
-_FIGURE_RES = tuple((fig, re.compile(rf"(?<![A-Za-z0-9^])(?P<name>{fig.names})(?![A-Za-z0-9]){_FIGURE_GAP}{_FIGURE_NUMBER}",
+#: "/" on either side is a ratio or a pair ("VIX/VIX3M", "HYG/LQD"), never one level.
+_FIGURE_RES = tuple((fig, re.compile(rf"(?<![A-Za-z0-9^/])(?P<name>{fig.names})(?![A-Za-z0-9/]){_FIGURE_GAP}{_FIGURE_NUMBER}",
                                      re.IGNORECASE)) for fig in FIGURES)
+#: A signed number after words of movement is a change ("spread moved by +0.04%"), not a level.
+_MOVEMENT = re.compile(r"\b(?:move[sd]?|moving|widen\w*|narrow\w*|steepen\w*|flatten\w*|ros[ei]|rising|fell|fall\w*|"
+                       r"up|down|increas\w*|decreas\w*|jump\w*|drop\w*|gain\w*|loss\w*|lost|shift\w*|by)\b",
+                       re.IGNORECASE)
 FIGURE_HORIZON = timedelta(minutes=1)   # a current-state figure is checkable at once; the ingest wants horizon > stated
 
 
@@ -442,9 +476,36 @@ def _row(pub: Publication, span: str, claim_type: str, **fields: Any) -> dict[st
     return row
 
 
-def unscorable(pub: Publication, span: str, claim_type: str, reason: str, **fields: Any) -> dict[str, Any]:
-    return _row(pub, span, claim_type, verdict="unscorable", evidence=[], root_cause=reason[:2000],
-                grader_confidence=1.0, **fields)
+#: Why a row is unscorable, as a machine-readable key (counted into ``unscorable_by_cause`` in
+#: the receipt and header.grader). Carried on the row as CAUSE_KEY and stripped before writing.
+CAUSE_KEY = "_cause"
+WITHHELD_REASON = ("no narrative to grade: the record says its AI narrative was withheld or unavailable "
+                   "(data summary only)")
+NOTHING_EXTRACTED_REASON = "narrative present but no checkable claim was extracted"
+NOT_A_CLOSE_LEVEL_REASON = "describes a return/score, not a close level"
+INTERNAL_SIGNAL_REASON = "GRID-internal signal; no external truth"
+INTERNAL_STATISTIC_REASON = "GRID-internal derived statistic"
+
+
+def unscorable(pub: Publication, span: str, claim_type: str, reason: str, *, cause: str = "other",
+               **fields: Any) -> dict[str, Any]:
+    row = _row(pub, span, claim_type, verdict="unscorable", evidence=[], root_cause=reason[:2000],
+               grader_confidence=1.0, **fields)
+    row[CAUSE_KEY] = cause
+    return row
+
+
+KIND_KEY = "_kind"      # which grader path wrote the row (counted into the receipt's rows_by_kind)
+
+
+def _kind(row: dict[str, Any], kind: str) -> dict[str, Any]:
+    row.setdefault(KIND_KEY, kind)
+    return row
+
+
+def public_row(row: dict[str, Any]) -> dict[str, Any]:
+    """The row as the review file carries it (the ingest's contract): no private keys."""
+    return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
 def grade_direction(conn: Any, pub: Publication, span: str, ticker: str, claimed: str, horizon_session: date,
@@ -457,7 +518,7 @@ def grade_direction(conn: Any, pub: Publication, span: str, ticker: str, claimed
     base = _close_on(obs, base_session)   # exact: an older close would credit moves the claim never saw
     if base is None or not _usable_price(base.value):
         return unscorable(pub, span, "direction", f"no usable {PRICE_SOURCE} close for {ticker} on {base_session}",
-                          instrument=ticker, horizon_end=iso(horizon_end), **direction_fields)
+                          cause="no_usable_close", instrument=ticker, horizon_end=iso(horizon_end), **direction_fields)
     evidence = [{"source": f"{PRICE_SOURCE} {INSTRUMENT_SERIES[ticker]}", "observed": f"{base.value:.4f} close {base.obs_date}",
                  "as_of": iso(session_close_utc(base.obs_date)), "url": None}]
     out = _close_on(obs, horizon_session)
@@ -466,7 +527,7 @@ def grade_direction(conn: Any, pub: Publication, span: str, ticker: str, claimed
                     evidence=evidence, grader_confidence=0.5, **direction_fields)
     if not _usable_price(out.value):
         return unscorable(pub, span, "direction", f"unusable {PRICE_SOURCE} close for {ticker} on {horizon_session}",
-                          instrument=ticker, horizon_end=iso(horizon_end), **direction_fields)
+                          cause="no_usable_close", instrument=ticker, horizon_end=iso(horizon_end), **direction_fields)
     pct = (out.value - base.value) / base.value * 100.0
     actual = actual_direction_of(pct)
     verdict = direction_verdict(claimed, actual)
@@ -483,9 +544,41 @@ def grade_direction(conn: Any, pub: Publication, span: str, ticker: str, claimed
                 **direction_fields)
 
 
+#: A level claim is a forecast only when its own words say so: a forecast verb or a horizon.
+#: "SPY 5-day return is -0.63%" (market_briefings:5116) is a description the model read as "SPY < 0".
+_FORECAST = re.compile(
+    r"\b(?:will|should|would|could|may|might|expect(?:s|ed|ing)?|forecasts?|project(?:s|ed|ing)?|targets?|"
+    r"likely|poised|set to|on track|seen|head(?:s|ed|ing)? (?:to|toward|towards|for|into)|finish(?:es|ing)?|"
+    r"close (?:above|below|over|under|higher|lower)|closes (?:above|below|over|under)|"
+    r"(?:stay|stays|hold|holds|remain|remains|break|breaks) (?:above|below|over|under)|reach(?:es)?|"
+    r"by (?:the )?(?:close|end of|friday|monday|tuesday|wednesday|thursday|next)|into (?:the )?close|"
+    r"tomorrow|next (?:week|session|close|day)|this week|end of (?:the )?(?:day|week|session)|eod)\b",
+    re.IGNORECASE)
+LEVEL_SCALE_BAND = (0.2, 5.0)        # a stated close level within 0.2x-5x of the last close
+
+
+def level_claim_problem(conn: Any, pub: Publication, span: str, ticker: str, level: float) -> str | None:
+    """Why an extracted level claim is not a forecast close level of ``ticker``, or None."""
+    if not _FORECAST.search(span):
+        return f"{NOT_A_CLOSE_LEVEL_REASON}: no forecast verb or horizon in the claim"
+    base_session = baseline_session(pub.published_at)
+    obs = [o for o in closes(conn, ticker, base_session - timedelta(days=10), base_session) if _usable_price(o.value)]
+    if not obs:
+        return f"{NOT_A_CLOSE_LEVEL_REASON}: no {PRICE_SOURCE} close for {ticker} on or before {base_session} to check its scale"
+    last = obs[-1]
+    ratio = level / last.value
+    if not LEVEL_SCALE_BAND[0] <= ratio <= LEVEL_SCALE_BAND[1]:
+        return (f"{NOT_A_CLOSE_LEVEL_REASON}: {level:g} is {ratio:.2f}x {ticker}'s {last.obs_date} close "
+                f"{last.value:.2f}, outside {LEVEL_SCALE_BAND[0]:g}x-{LEVEL_SCALE_BAND[1]:g}x")
+    return None
+
+
 def grade_level(conn: Any, pub: Publication, span: str, ticker: str, comparator: str, level: float,
                 horizon_session: date, graded_at: datetime) -> dict[str, Any]:
     horizon_end = session_close_utc(horizon_session)
+    problem = level_claim_problem(conn, pub, span, ticker, level)
+    if problem is not None:
+        return unscorable(pub, span, "level", problem, cause="not_a_close_level", instrument=ticker)
     obs = closes(conn, ticker, horizon_session, horizon_session)
     out = _close_on(obs, horizon_session)
     if horizon_end > graded_at or out is None:
@@ -493,7 +586,7 @@ def grade_level(conn: Any, pub: Publication, span: str, ticker: str, comparator:
                     grader_confidence=0.5)
     if not _usable_price(out.value):
         return unscorable(pub, span, "level", f"unusable {PRICE_SOURCE} close for {ticker} on {horizon_session}",
-                          instrument=ticker, horizon_end=iso(horizon_end))
+                          cause="no_usable_close", instrument=ticker, horizon_end=iso(horizon_end))
     holds = COMPARATORS[comparator](out.value, level)
     evidence = [{"source": f"{PRICE_SOURCE} {INSTRUMENT_SERIES[ticker]}", "observed": f"{out.value:.4f} close {out.obs_date}",
                  "as_of": iso(horizon_end), "url": None},
@@ -513,7 +606,7 @@ def grade_thesis(conn: Any, pub: Publication, graded_at: datetime) -> list[dict[
     claimed = stored.strip().lower() if isinstance(stored, str) else None
     if claimed not in DIRECTIONS:
         return [unscorable(pub, span, "direction", "snapshot has no bullish/bearish/neutral overall_direction",
-                           instrument="SPY")]
+                           cause="no_thesis_direction", instrument="SPY")]
     horizon_session = next_session_on_or_after(ny_date(pub.published_at) + timedelta(days=THESIS_HORIZON_DAYS))
     return [grade_direction(conn, pub, span, "SPY", claimed, horizon_session, graded_at)]
 
@@ -670,26 +763,45 @@ class StatedFigure:
     span: str
     stated: float
     decimals: int
+    start: int = -1          # offset of the span in the window the figure was found in
 
 
-def extract_figures(window: str) -> list[StatedFigure]:
-    """Deterministic: "<instrument name> ... at <number>" level statements in a narrative window."""
+def _overlaps(start: int, end: int, taken: list[tuple[int, int]]) -> bool:
+    return any(a < end and start < b for a, b in taken)
+
+
+def extract_figures(window: str, exclude: list[tuple[int, int]] | None = None) -> list[StatedFigure]:
+    """Deterministic: "<instrument name> ... at <number>" level statements in a narrative window.
+
+    ``exclude`` holds offsets another deterministic claim already covers (a realized move that
+    states the close too): a figure inside one is not graded twice.
+    """
     found: list[StatedFigure] = []
-    taken: list[tuple[int, int]] = []
+    taken: list[tuple[int, int]] = list(exclude or [])
     for fig, pattern in _FIGURE_RES:
         for m in pattern.finditer(window):
             start, end = m.start("name"), m.end("num") + (len(m.group("pct")) if m.group("pct") else 0)
-            if any(a < end and start < b for a, b in taken):
+            if m.group("paren") and window[end:end + 1] == ")":
+                end += 1                        # "9-day VIX (29.26)": keep the closing parenthesis
+            if start > 0 and window[start - 1] == "(" and (m.group("gap") or "").startswith(")"):
+                start -= 1                      # "(VIX) stands at 28.44"
+            if m.group("bare") and (m.group("gap") or "." not in m.group("num") or not _BARE_END.match(window, end)):
+                continue
+            if _overlaps(start, end, taken):
                 continue                        # a more specific figure already claimed this text
             if _DERIVED.search(m.group("gap") or ""):
                 continue
             if bool(m.group("pct")) != fig.pct:
                 continue                        # "S&P 500 at -2.68%" is a move, "spread at 0.38" is not a rate
+            if m.group("sign") and (not fig.pct or _MOVEMENT.search(m.group("gap") or "")):
+                continue                        # a signed price, or a signed number after "moved", is a move
             raw = m.group("num").lstrip("$").replace(",", "")
             try:
                 stated = float(raw)
             except ValueError:
                 continue
+            if m.group("sign") in ("-", "\u2212"):
+                stated = -stated
             if not math.isfinite(stated):
                 continue
             span = window[start:end].strip()
@@ -697,8 +809,8 @@ def extract_figures(window: str) -> list[StatedFigure]:
                 continue
             decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
             taken.append((start, end))
-            found.append(StatedFigure(fig, span, stated, decimals))
-    found.sort(key=lambda f: window.find(f.span))
+            found.append(StatedFigure(fig, span, stated, decimals, start))
+    found.sort(key=lambda f: f.start)
     return found
 
 
@@ -822,7 +934,12 @@ def gather_facts(conn: Any, fig: Figure, at: datetime) -> Facts:
                 target[o.obs_date] = o.value          # oldest pull first: the last write is the newest
                 facts.range_rows.setdefault((o.obs_date, name.rsplit(":", 1)[1]), []).append(o)
     else:
-        rows = _vintages(conn, fig.series_id, at.date() - timedelta(days=14), at.date())
+        rows = []
+        for series_id in (fig.series_id, *fig.alt_series):
+            rows = _vintages(conn, series_id, at.date() - timedelta(days=fig.lookback_days), at.date())
+            if rows:
+                facts.series_id = series_id   # the first id that holds the quantity in the window
+                break
         facts.sessions = sorted({o.obs_date for o in rows}, reverse=True)
     for o in rows:
         facts.by_date.setdefault(o.obs_date, []).append(o)
@@ -867,7 +984,7 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
     """None when GRID holds nothing for the instrument around ``at`` (unscorable)."""
     fig, value, dec = stated.figure, stated.stated, stated.decimals
     unit = "%" if fig.pct else ""
-    src = f"raw_series {fig.series_id}"
+    src = f"raw_series {facts.series_id}"
     if not any(facts.by_date.values()):
         return None
     # Intraday current-level claims require market event times for confirmation.
@@ -882,7 +999,7 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
         after = [o for o in rows if o.pull_timestamp > at]
         bracket = before[-1:] + after[:1]
         if bracket and _within(value, dec, min(o.value for o in bracket), max(o.value for o in bracket)):
-            ev = [_ev(f"{o.source} {fig.series_id}",
+            ev = [_ev(f"{o.source} {facts.series_id}",
                       f"{o.value:g}{unit} retrieved {iso(o.pull_timestamp)}; market event time unknown",
                       o.pull_timestamp) for o in bracket]
             return Judgment("partially_confirmed", ev,
@@ -896,7 +1013,7 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
             low_at, high_at = pair.low.pull_timestamp, pair.high.pull_timestamp
             paired = ("same pull run" if pair.basis == "pull_run_id"
                       else f"retrieved within {int(RANGE_PAIR_TOLERANCE.total_seconds())} s")
-            ev = [_ev(f"{o.source} {fig.series_id.rsplit(':', 1)[0]}:{name}",
+            ev = [_ev(f"{o.source} {facts.series_id.rsplit(':', 1)[0]}:{name}",
                       f"session {session} {name} {o.value:g}{unit}; retrieved {iso(o.pull_timestamp)}; "
                       f"paired: {paired}", o.pull_timestamp)
                   for name, o in (("low", pair.low), ("high", pair.high))]
@@ -926,11 +1043,11 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
     for s, o in closes:
         if not figure_matches(value, dec, o.value):
             continue
-        ev = [_ev(f"{o.source} {fig.series_id}", f"{o.value:g}{unit} close {s} (captured {iso(o.pull_timestamp)})",
+        ev = [_ev(f"{o.source} {facts.series_id}", f"{o.value:g}{unit} close {s} (captured {iso(o.pull_timestamp)})",
                   o.pull_timestamp)]
         if newest_known is not None and s < newest_known:
             newer = dict(known_at)[newest_known]
-            ev.append(_ev(f"{newer.source} {fig.series_id}", f"{newer.value:g}{unit} close {newest_known} "
+            ev.append(_ev(f"{newer.source} {facts.series_id}", f"{newer.value:g}{unit} close {newest_known} "
                           f"(captured {iso(newer.pull_timestamp)}, before the statement)", newer.pull_timestamp))
             return Judgment("partially_confirmed", ev,
                             f"stale: {stated.span!r} is the {s} close; the {newest_known} close "
@@ -942,14 +1059,14 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
         lo, hi = facts.low.get(s), facts.high.get(s)
         if lo is not None and hi is not None and _within(value, dec, lo, hi):
             return Judgment("partially_confirmed",
-                            [_ev(f"raw_series {fig.series_id.rsplit(':', 1)[0]}:low/high",
+                            [_ev(f"raw_series {facts.series_id.rsplit(':', 1)[0]}:low/high",
                                  f"session {s} range {lo:g}-{hi:g}{unit}", at)],
                             f"{stated.span!r} lies inside the {s} range {lo:g}-{hi:g}{unit}, but no capture "
                             f"pins it to the statement time", None, 0.6)
         hit = next((o for o in facts.by_date.get(s, []) if figure_matches(value, dec, o.value)), None)
         if hit is not None:
             return Judgment("partially_confirmed",
-                            [_ev(f"{hit.source} {fig.series_id}", f"{hit.value:g}{unit} intraday capture "
+                            [_ev(f"{hit.source} {facts.series_id}", f"{hit.value:g}{unit} intraday capture "
                                  f"{iso(hit.pull_timestamp)}", hit.pull_timestamp)],
                             f"{stated.span!r} equals an intraday capture of {s}, not a close", None, 0.6)
     # 4. nothing supports it
@@ -958,7 +1075,7 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
         rows = facts.by_date.get(s, [])
         if rows:
             near = min(rows, key=lambda o: abs((o.pull_timestamp - at).total_seconds()))
-            ev.append(_ev(f"{near.source} {fig.series_id}", f"{near.value:g}{unit} captured "
+            ev.append(_ev(f"{near.source} {facts.series_id}", f"{near.value:g}{unit} captured "
                           f"{iso(near.pull_timestamp)} (label {s})", near.pull_timestamp))
         if s in facts.low and s in facts.high:
             ev.append(_ev(src + " low/high", f"session {s} range {facts.low[s]:g}-{facts.high[s]:g}{unit}", at))
@@ -969,21 +1086,46 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
                     True, 0.85)
 
 
+def _off_scale(stated: StatedFigure, facts: Facts) -> str | None:
+    """A stated level far off every value GRID holds for the series is not the level."""
+    fig = stated.figure
+    values = [o.value for rows in facts.by_date.values() for o in rows if o.value > 0]
+    if not fig.scale_guard or not values:
+        return None
+    ref = sorted(values)[len(values) // 2]
+    ratio = stated.stated / ref
+    if SCALE_BAND[0] <= ratio <= SCALE_BAND[1]:
+        return None
+    unit = "%" if fig.pct else ""
+    return (f"{fig.label}: stated {stated.stated:g}{unit} is {ratio:.2f}x the {facts.series_id} level GRID holds "
+            f"({ref:g}{unit}): a ratio, return or score, not the level")
+
+
 def grade_figure(conn: Any, pub: Publication, stated: StatedFigure) -> dict[str, Any]:
     fig = stated.figure
     horizon = iso(pub.published_at + FIGURE_HORIZON)
     try:
         facts = gather_facts(conn, fig, pub.published_at)
-        judgment = judge_level(stated, pub.published_at, facts)
+        off_scale = _off_scale(stated, facts)
+        judgment = None if off_scale else judge_level(stated, pub.published_at, facts)
     except Exception as exc:  # a reader fault is this claim's reason, not the day's
         return unscorable(pub, stated.span, "data_quality",
-                          f"{fig.label}: {fig.series_id} unreadable ({type(exc).__name__})", horizon_end=horizon)
+                          f"{fig.label}: {fig.series_id} unreadable ({type(exc).__name__})", cause="reader_fault",
+                          horizon_end=horizon)
+    if off_scale:
+        return unscorable(pub, stated.span, "data_quality", off_scale, cause="off_scale",
+                          instrument=_instrument_for(fig), horizon_end=horizon)
     if judgment is None:
+        series = "/".join((fig.series_id, *fig.alt_series))
         return unscorable(pub, stated.span, "data_quality",
-                          f"{fig.label}: GRID holds no {fig.series_id} capture around the statement", horizon_end=horizon)
-    return _row(pub, stated.span, "data_quality", instrument=_instrument_for(fig), horizon_end=horizon,
-                verdict=judgment.verdict, evidence=judgment.evidence, knowable_at_stated_at=judgment.knowable,
-                root_cause=judgment.root_cause, grader_confidence=judgment.confidence)
+                          f"{fig.label}: GRID holds no {series} capture around the statement", cause="no_capture",
+                          horizon_end=horizon)
+    row = _row(pub, stated.span, "data_quality", instrument=_instrument_for(fig), horizon_end=horizon,
+               verdict=judgment.verdict, evidence=judgment.evidence, knowable_at_stated_at=judgment.knowable,
+               root_cause=judgment.root_cause, grader_confidence=judgment.confidence)
+    if judgment.verdict == "unscorable":
+        row[CAUSE_KEY] = "intraday_unpinned"
+    return row
 
 
 def _instrument_for(fig: Figure) -> str:
@@ -991,49 +1133,309 @@ def _instrument_for(fig: Figure) -> str:
     return (sid.split(":")[1] if sid.startswith("YF:") else sid)[:32]
 
 
+# ── realized moves ("the S&P 500 fell 1.92% to 7416.59") ──────────────────────────────
+#
+# The diary's WHAT HAPPENED section (intelligence/market_diary.py) and a briefing's
+# "## What Changed" restate one session's close-to-close move. That is checkable at once on
+# the diary's own basis: yfinance raw closes YF:<ticker>:close (market_diary PRICE_BASIS
+# "raw_close", _PRICE_SOURCE "yfinance"), close(session) / close(previous session) - 1 at the
+# printed precision. Confirmed only when GRID had captured both completed closes at or before
+# the statement; a match on closes captured later is partially_confirmed, knowable=false.
+
+MOVE_PRICE_SOURCE = "yfinance"      # intelligence/market_diary.py _PRICE_SOURCE
+
+
+@dataclass(frozen=True)
+class MoveInstrument:
+    series_id: str
+    label: str
+    names: str
+    diary_only: bool = False         # "Gold" is GC=F in the diary; in a briefing it may mean GLD
+
+
+MOVE_INSTRUMENTS: tuple[MoveInstrument, ...] = (
+    MoveInstrument("YF:^GSPC:close", "S&P 500", r"S&P 500|S&P|SPX"),
+    MoveInstrument("YF:^DJI:close", "Dow Jones", r"Dow Jones(?: Industrial Average)?|Dow"),
+    MoveInstrument("YF:^IXIC:close", "Nasdaq Composite", r"Nasdaq(?: Composite)?"),
+    MoveInstrument("YF:^RUT:close", "Russell 2000", r"Russell 2000"),
+    MoveInstrument("YF:^VIX:close", "VIX", r"VIX(?![ -]?(?:9|3M|9-day|3-month))"),
+    MoveInstrument("YF:SPY:close", "SPY", r"SPY"),
+    *(MoveInstrument(f"YF:{t}:close", t, t)
+      for t in ("XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "XLB")),
+    MoveInstrument("YF:UUP:close", "UUP", r"UUP"),
+    MoveInstrument("YF:TLT:close", "TLT", r"TLT"),
+    MoveInstrument("YF:GC=F:close", "Gold", r"Gold", diary_only=True),
+    MoveInstrument("YF:CL=F:close", "Crude Oil", r"Crude Oil|Crude|WTI", diary_only=True),
+)
+_MOVE_UP = (r"up|rose|rises|rising|gained|gains|gaining|added|adds|adding|climbed|climbs|climbing|advanced|advances|"
+            r"advancing|surged|surges|surging|jumped|jumps|jumping|rallied|rallies|rallying|increased|increases|"
+            r"increasing|soared|soaring|rebounded|rebounding|higher")
+_MOVE_DOWN = (r"down|fell|falls|falling|dropped|drops|dropping|lost|loses|losing|declined|declines|declining|slipped|"
+              r"slips|slipping|slid|slides|sliding|retreated|retreats|retreating|shed|sheds|shedding|sank|sinks|sinking|"
+              r"tumbled|tumbles|tumbling|plunged|plunges|plunging|decreased|decreases|decreasing|eased|eases|easing|lower")
+_MOVE_NOUN_UP, _MOVE_NOUN_DOWN = r"gain|rise|increase|jump|advance|rally|surge", r"decline|drop|fall|loss|slide|retreat"
+_MOVE_NUM = r"[0-9][0-9,]*(?:\.[0-9]+)?"
+_MOVE_NAMES = "|".join(f"(?:{i.names})" for i in MOVE_INSTRUMENTS)
+_MOVE_NAME_AT = rf"(?<![A-Za-z0-9^/])(?:{_MOVE_NAMES})(?![A-Za-z0-9/])"
+_MOVE_RE = re.compile(
+    rf"(?<![A-Za-z0-9^/])(?P<name>{_MOVE_NAMES})(?![A-Za-z0-9/])"
+    rf"(?P<gap>\)?(?:\s+closed\s+at\s+\$?(?P<lvl1>{_MOVE_NUM}),?)?(?:(?!{_MOVE_NAME_AT})[^0-9\n.;:()\[\]%$]){{0,60}}?)"
+    rf"(?:\b(?P<verb>{_MOVE_UP}|{_MOVE_DOWN})\s+(?P<s1>[+\-−])?(?P<p1>{_MOVE_NUM})%"
+    rf"|\b(?:at|of)\s+(?P<s2>[+\-−])(?P<p2>{_MOVE_NUM})%"
+    rf"|\(\s*(?P<s3>[+\-−])(?P<p3>{_MOVE_NUM})%\s*\)"
+    rf"|\ba\s+(?P<s4>[+\-−])?(?P<p4>{_MOVE_NUM})%\s+(?P<noun>{_MOVE_NOUN_UP}|{_MOVE_NOUN_DOWN})\b)"
+    rf"(?:\s+(?:to|at)\s+\$?(?P<lvl2>{_MOVE_NUM})(?![0-9]))?"
+    rf"(?=(?P<tail>[^\n]{{0,48}}))",
+    re.IGNORECASE)
+#: Words that make the number something other than this session's close-to-close move.
+_MOVE_GAP_REJECT = re.compile(r"\b(?:week|month|year|since|ytd|to-date|intraday|pre-?market|after-?hours|futures|"
+                              r"overnight|five-day|weekly|monthly|both|each|combined|together|average|respectively)",
+                              re.IGNORECASE)
+_MOVE_TAIL_REJECT = re.compile(
+    r"^\W{0,3}(?:(?:over|in|during|for|since|from|across|this|last|past|on|so far)\b[^.;\n]{0,30}?"
+    r"\b(?:days?|weeks?|months?|years?|sessions?|ytd|highs?|lows?|peak)\b"
+    r"|year-to-date|ytd|month-to-date|week-to-date|respectively|week-over-week|month-over-month|year-over-year)",
+    re.IGNORECASE)
+_DIARY_HEAD = re.compile(r"(?mi)^[ \t]*(?:#{1,4}[ \t]*)?(?:\*\*)?WHAT HAPPENED(?:\*\*)?[ \t]*$")
+_BRIEFING_HEAD = re.compile(r"(?m)^##[ \t]+What Changed[ \t]*$")
+_SECTION_END = re.compile(r"(?m)^[ \t]*(?:#{1,4}[ \t]+\S|\*\*[A-Z][A-Za-z ]+\*\*[ \t]*$|---[ \t]*$)")
+
+
+@dataclass(frozen=True)
+class StatedMove:
+    instrument: MoveInstrument
+    span: str
+    start: int
+    end: int
+    pct: float              # signed, percent
+    pct_decimals: int
+    level: float | None     # the close the sentence states too ("to 7416.59", "closed at 7561.67")
+    level_decimals: int
+
+
+def _num(raw: str) -> tuple[float, int]:
+    clean = raw.replace(",", "")
+    return float(clean), (len(clean.split(".", 1)[1]) if "." in clean else 0)
+
+
+def move_section(pub: Publication, window: str) -> tuple[int, int] | None:
+    """Offsets of the section that restates the session: the diary's WHAT HAPPENED, a briefing's What Changed."""
+    head = (_DIARY_HEAD if pub.channel == "market_diary" else _BRIEFING_HEAD).search(window)
+    if head is None:
+        return None
+    end = _SECTION_END.search(window, head.end())
+    return head.end(), end.start() if end else len(window)
+
+
+def extract_moves(pub: Publication, window: str) -> list[StatedMove]:
+    """Deterministic: "<name> (closed at X,)? <up/down verb> N.NN% (to X)?" in the restating section."""
+    section = move_section(pub, window)
+    if section is None:
+        return []
+    lo, hi = section
+    by_name = [(re.compile(rf"(?:{i.names})\Z", re.IGNORECASE), i) for i in MOVE_INSTRUMENTS]
+    found: list[StatedMove] = []
+    pos = lo
+    while True:
+        m = _MOVE_RE.search(window, pos, hi)
+        if m is None:
+            return found
+        pos = m.start() + 1
+        inst = next((i for rx, i in by_name if rx.match(m.group("name"))), None)
+        if inst is None or (inst.diary_only and pub.channel != "market_diary"):
+            continue
+        if _MOVE_GAP_REJECT.search(m.group("gap") or "") or _MOVE_TAIL_REJECT.search(m.group("tail") or ""):
+            continue
+        sign = next((m.group(g) for g in ("s1", "s2", "s3", "s4") if m.group(g)), None)
+        raw = next(m.group(g) for g in ("p1", "p2", "p3", "p4") if m.group(g))
+        word = (m.group("verb") or m.group("noun") or "").lower()
+        if word:
+            up = re.fullmatch(_MOVE_UP + "|" + _MOVE_NOUN_UP, word, re.IGNORECASE) is not None
+            if sign and (sign == "+") != up:
+                continue                       # "rose -0.4%": the sentence contradicts itself
+            negative = not up
+        else:
+            negative = sign in ("-", "−")
+        pct, pct_dec = _num(raw)
+        if negative:
+            pct = -pct
+        level_raw = m.group("lvl1") or m.group("lvl2")
+        level, level_dec = _num(level_raw) if level_raw else (None, 0)
+        start, end = m.start("name"), m.end()
+        if start > 0 and window[start - 1] == "(" and (m.group("gap") or "").startswith(")"):
+            start -= 1
+        span = window[start:end].strip()
+        if not MIN_SPAN_CHARS <= len(span) <= MAX_SPAN_CHARS or not math.isfinite(pct):
+            continue
+        found.append(StatedMove(inst, span, start, end, pct, pct_dec, level, level_dec))
+        pos = end
+
+
+def move_session(pub: Publication) -> tuple[date | None, str | None]:
+    """The session whose close-to-close move the record restates, or (None, why not)."""
+    at = pub.published_at
+    if pub.channel == "market_diary":
+        raw = pub.source_record.get("date")
+        try:
+            d = date.fromisoformat(raw[:10]) if isinstance(raw, str) else None
+        except ValueError:
+            d = None
+        if d is None or not _is_market_open(d) or session_close_utc(d) > at:
+            return None, f"diary date {raw!r} is not a session completed before the statement"
+        return d, None
+    today = ny_date(at)
+    if _is_market_open(today) and session_open_utc(today) <= at < session_close_utc(today):
+        return None, "stated during the session: an intraday move, not a close-to-close one"
+    return baseline_session(at), None
+
+
+def _closeness(stated: float, decimals: int, actual: float, slack: float, extra: float = 0.0) -> str:
+    """'match' at the printed precision (plus ``extra``), 'miss' beyond that plus ``slack``, 'near' between."""
+    tolerance = 0.5 * 10 ** (-decimals) + extra + 1e-9
+    diff = abs(stated - actual)
+    if diff <= tolerance:
+        return "match"
+    return "miss" if diff > tolerance + slack else "near"
+
+
+def grade_move(conn: Any, pub: Publication, mv: StatedMove) -> dict[str, Any]:
+    inst, at = mv.instrument, pub.published_at
+    horizon = iso(at + FIGURE_HORIZON)
+    instrument = inst.series_id.split(":")[1][:32]
+    session, why = move_session(pub)
+    if session is None:
+        return unscorable(pub, mv.span, "data_quality", f"{inst.label} move: {why}", cause="no_session",
+                          instrument=instrument, horizon_end=horizon)
+    prev = previous_session(session)
+    try:
+        rows = [o for o in _vintages(conn, inst.series_id, prev, session) if o.source == MOVE_PRICE_SOURCE]
+    except Exception as exc:  # a reader fault is this claim's reason, not the day's
+        return unscorable(pub, mv.span, "data_quality", f"{inst.label}: {inst.series_id} unreadable ({type(exc).__name__})",
+                          cause="reader_fault", instrument=instrument, horizon_end=horizon)
+
+    def completed(d: date) -> list[Any]:
+        return [o for o in rows if o.obs_date == d and o.pull_timestamp >= session_close_utc(d) and o.value > 0]
+
+    s_all, p_all = completed(session), completed(prev)
+    if not s_all or not p_all:
+        missing = " and ".join(str(d) for d, have in ((prev, p_all), (session, s_all)) if not have)
+        return unscorable(pub, mv.span, "data_quality",
+                          f"{inst.label}: GRID holds no completed {MOVE_PRICE_SOURCE} {inst.series_id} close for {missing}",
+                          cause="no_capture", instrument=instrument, horizon_end=horizon)
+    s_known = [o for o in s_all if o.pull_timestamp <= at]
+    p_known = [o for o in p_all if o.pull_timestamp <= at]
+    knowable = bool(s_known and p_known)
+    close_s, close_p = (s_known or s_all)[-1], (p_known or p_all)[-1]
+    actual = (close_s.value / close_p.value - 1.0) * 100.0
+    checks = [("move", _closeness(mv.pct, mv.pct_decimals, actual, max(0.02, 0.005 * abs(actual))))]
+    if mv.level is not None:       # figure_matches' tolerance: half a printed unit + 0.05 % (rounded before printing)
+        checks.append(("close", _closeness(mv.level, mv.level_decimals, close_s.value, 0.002 * abs(close_s.value),
+                                           extra=0.0005 * abs(close_s.value))))
+    src = f"{MOVE_PRICE_SOURCE} {inst.series_id}"
+    ev = [_ev(src, f"{o.value:g} close {d} (captured {iso(o.pull_timestamp)})", o.pull_timestamp)
+          for d, o in ((prev, close_p), (session, close_s))]
+    ev.append(_ev("grader", f"{inst.label} {actual:+.4f}% {prev} -> {session}; stated {mv.pct:+.{mv.pct_decimals}f}%"
+                  + (f", close {mv.level:g}" if mv.level is not None else ""),
+                  max(close_s.pull_timestamp, close_p.pull_timestamp)))
+    outcome = {name: result for name, result in checks}
+    said = f"{mv.pct:+.{mv.pct_decimals}f}%" + (f" to {mv.level:g}" if mv.level is not None else "")
+    did = f"{actual:+.2f}% to {close_s.value:g}"
+    if not knowable:
+        if all(r == "match" for r in outcome.values()):
+            return _row(pub, mv.span, "data_quality", instrument=instrument, horizon_end=horizon,
+                        verdict="partially_confirmed", evidence=ev, knowable_at_stated_at=False,
+                        root_cause=f"{inst.label} {prev} -> {session} matches, but GRID captured "
+                                   f"{'both closes' if not s_known and not p_known else 'a close'} only after the statement",
+                        grader_confidence=0.6)
+        return unscorable(pub, mv.span, "data_quality",
+                          f"{inst.label}: GRID's closes for {prev} -> {session} were captured after the statement and "
+                          f"show {did} against {said}; not judged", cause="move_unknowable",
+                          instrument=instrument, horizon_end=horizon)
+    if all(r == "match" for r in outcome.values()):
+        return _row(pub, mv.span, "data_quality", instrument=instrument, horizon_end=horizon, verdict="confirmed",
+                    evidence=ev, knowable_at_stated_at=True, grader_confidence=0.9)
+    if "miss" in outcome.values():
+        wrong = " and ".join(name for name, r in checks if r == "miss")
+        return _row(pub, mv.span, "data_quality", instrument=instrument, horizon_end=horizon, verdict="refuted",
+                    evidence=ev, knowable_at_stated_at=True, grader_confidence=0.85,
+                    root_cause=f"stated {inst.label} {said}; GRID's closes known at the statement show {did} "
+                               f"({prev} -> {session}): the {wrong} {'differ' if ' and ' in wrong else 'differs'}")
+    return _row(pub, mv.span, "data_quality", instrument=instrument, horizon_end=horizon,
+                verdict="partially_confirmed", evidence=ev, knowable_at_stated_at=True, grader_confidence=0.6,
+                root_cause=f"stated {inst.label} {said}; GRID shows {did} ({prev} -> {session}): within rounding "
+                           f"distance, not at the printed precision")
+
+
+# ── a briefing or diary record ─────────────────────────────────────────────────────────
+
+#: A claim on a quantity only GRID computes (its own scores, ratios, counts). There is no
+#: outside price to grade it against; the wording only picks the unscorable reason.
+_INTERNAL_SIGNAL = re.compile(r"\bscor(?:e|ed|es|ing)\b|insider|congress|\bbuys?\b.{0,20}\bsells?\b|ratio|sentiment|"
+                              r"breadth|mentions|\bsignal\b|risk-(?:on|off)", re.IGNORECASE)
+_INTERNAL_STATISTIC = re.compile(r"breadth|sector ETFs (?:are )?(?:positive|negative|up|down)|social mentions|mentions|"
+                                 r"bull ratio|sentiment|\bscore\b", re.IGNORECASE)
+
+
 def grade_briefing(conn: Any, pub: Publication, graded_at: datetime, folder: Path, client_factory: Any,
                    *, persist: bool = True) -> tuple[list[dict[str, Any]], str | None]:
     """Rows for a briefing/diary record plus the extraction model used (None when no model was needed)."""
     withheld = marker_span(pub.text)
     if withheld is not None:
-        return [unscorable(pub, withheld, "data_quality",
-                           "no narrative to grade: the record says its AI narrative was withheld or unavailable "
-                           "(data summary only)")], None
+        row = unscorable(pub, withheld, "data_quality", WITHHELD_REASON, cause="withheld_narrative")
+        row[KIND_KEY] = "withheld_placeholder"
+        return [row], None
     opening = first_sentence_span(pub.text)
-    figure_rows = [grade_figure(conn, pub, f) for f in extract_figures(narrative_window(pub.text))]
+    window = narrative_window(pub.text)
+    moves = extract_moves(pub, window)
+    figures = extract_figures(window, exclude=[(mv.start, mv.end) for mv in moves])
+    deterministic = [_kind(grade_move(conn, pub, mv), "realized_move") for mv in moves] + \
+                    [_kind(grade_figure(conn, pub, f), "figure") for f in figures]
+    graded_spans = [mv.span for mv in moves] + [f.span for f in figures]
     extraction = cached_extraction(folder, pub, client_factory, persist=persist)
     if extraction.error:
-        if figure_rows:
-            return figure_rows, extraction.model
-        rows = [] if opening is None else [unscorable(pub, opening, "data_quality",
-                                                      f"claim extraction unavailable: {extraction.error}")]
+        if deterministic:
+            return deterministic, extraction.model
+        rows = [] if opening is None else [_kind(unscorable(pub, opening, "data_quality",
+                                                            f"claim extraction unavailable: {extraction.error}",
+                                                            cause="extraction_unavailable"), "placeholder")]
         return rows, extraction.model
-    rows: list[dict[str, Any]] = list(figure_rows)
+    rows: list[dict[str, Any]] = list(deterministic)
     for claim in extraction.claims:
         span, kind = claim["span"], claim["claim_type"]
+        if any(g in span for g in graded_spans):
+            continue      # the sentence's figure or move is already graded deterministically
         ticker = resolve_instrument(claim["instrument"])
         session = horizon_session_for(pub, claim["horizon"])
+        internal = _INTERNAL_SIGNAL.search(span) or _INTERNAL_SIGNAL.search(claim["instrument"] or "")
         if kind == "level" and ticker is not None and resolve_instrument(claim["instrument"], allow_alias=False) is None:
-            rows.append(unscorable(pub, span, kind, f"level claim on {claim['instrument']!r}: only an ETF proxy "
-                                                     f"({ticker}) is priced and its scale differs"))
+            rows.append(_kind(unscorable(pub, span, kind, f"level claim on {claim['instrument']!r}: only an ETF proxy "
+                                                          f"({ticker}) is priced and its scale differs",
+                                         cause="alias_level"), "llm"))
             continue
         if kind == "direction":
             if ticker is None:
-                rows.append(unscorable(pub, span, kind, f"no price series for instrument {claim['instrument']!r}"))
+                row = (unscorable(pub, span, kind, INTERNAL_SIGNAL_REASON, cause="internal_signal") if internal else
+                       unscorable(pub, span, kind, f"no price series for instrument {claim['instrument']!r}",
+                                  cause="no_price_series"))
             elif claim["direction"] is None:
-                rows.append(unscorable(pub, span, kind, "direction claim without a bullish/bearish/neutral direction",
-                                       instrument=ticker))
+                row = unscorable(pub, span, kind, "direction claim without a bullish/bearish/neutral direction",
+                                 cause="no_direction", instrument=ticker)
             else:
-                rows.append(grade_direction(conn, pub, span, ticker, claim["direction"], session, graded_at))
+                row = grade_direction(conn, pub, span, ticker, claim["direction"], session, graded_at)
         elif kind == "level":
             if ticker is None or claim["comparator"] is None or claim["level"] is None:
-                rows.append(unscorable(pub, span, kind, "level claim without a priced instrument, comparator and number"))
+                row = (unscorable(pub, span, kind, INTERNAL_STATISTIC_REASON, cause="internal_statistic")
+                       if _INTERNAL_STATISTIC.search(span) else
+                       unscorable(pub, span, kind, "level claim without a priced instrument, comparator and number",
+                                  cause="incomplete_level"))
             else:
-                rows.append(grade_level(conn, pub, span, ticker, claim["comparator"], claim["level"], session, graded_at))
+                row = grade_level(conn, pub, span, ticker, claim["comparator"], claim["level"], session, graded_at)
         else:  # event, causal: v1 cannot judge; a causal claim is never confirmed from co-movement
-            rows.append(_row(pub, span, kind, instrument=ticker, verdict="unresolved", grader_confidence=0.3))
+            row = _row(pub, span, kind, instrument=ticker, verdict="unresolved", grader_confidence=0.3)
+        rows.append(_kind(row, "llm"))
     if not rows and opening is not None:
-        rows.append(unscorable(pub, opening, "data_quality", "narrative present but no checkable claim was extracted"))
+        rows.append(_kind(unscorable(pub, opening, "data_quality", NOTHING_EXTRACTED_REASON, cause="nothing_extracted"),
+                          "placeholder"))
     return rows, extraction.model
 
 
@@ -1050,11 +1452,36 @@ def dedupe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def build_header(day: date, packet_sha: str, graded_at: datetime, rows: list[dict[str, Any]], models: set[str]) -> dict[str, Any]:
+def unscorable_by_cause(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Unscorable rows per machine-readable cause (CAUSE_KEY); the counts sum to claims_unscorable."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row["verdict"] == "unscorable":
+            cause = row.get(CAUSE_KEY) or "other"
+            counts[cause] = counts.get(cause, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def withheld_records(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Records per channel whose AI narrative was withheld (one placeholder row each)."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row.get(CAUSE_KEY) == "withheld_narrative":
+            channel = row["publication_id"].split(":")[0]
+            counts[channel] = counts.get(channel, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def build_header(day: date, packet_sha: str, graded_at: datetime, rows: list[dict[str, Any]], models: set[str],
+                 by_cause: dict[str, int] | None = None, records_withheld: int = 0) -> dict[str, Any]:
+    """``by_cause`` and ``records_withheld`` go into the free-form ``grader`` object (the ingest stores it
+    as grader_json): a withheld narrative stays one unscorable row, so claims_unscorable still equals
+    the unscorable rows, and the split says how many of them are placeholders rather than claims."""
     unscorable_n = sum(1 for r in rows if r["verdict"] == "unscorable")
     return {"kind": "review_header", "schema": REVIEW_SCHEMA, "publication_day": day.isoformat(),
             "packet_sha256": packet_sha,
-            "grader": {"model": GRADER_VERSION, "role": "grader", "job": JOB, "extraction_models": sorted(models)},
+            "grader": {"model": GRADER_VERSION, "role": "grader", "job": JOB, "extraction_models": sorted(models),
+                       "unscorable_by_cause": dict(by_cause or {}), "records_withheld": records_withheld},
             "adjudicator": None, "graded_at": iso(graded_at), "claims_total": len(rows),
             "claims_graded": len(rows) - unscorable_n, "claims_unscorable": unscorable_n}
 
@@ -1116,6 +1543,36 @@ def verdict_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+MAX_REPORTED_CHANGES = 500
+
+
+def verdict_changes(before_lines: list[bytes], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rows whose verdict differs from the review file on disk (new, changed or gone), for a dry run:
+    what a grader change would do to a day, row by row, before it writes anything."""
+    def key(row: dict[str, Any]) -> tuple[Any, Any]:
+        return row.get("publication_id"), row.get("claim_sha256")
+
+    old: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for line in before_lines:
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(row, dict) and row.get("kind") == "claim_verdict":
+            old[key(row)] = row
+    new = {key(r): r for r in rows}
+    out: list[dict[str, Any]] = []
+    for k in [*new, *(k for k in old if k not in new)]:
+        a, b = old.get(k), new.get(k)
+        if a is not None and b is not None and a.get("verdict") == b.get("verdict"):
+            continue
+        r = b or a
+        out.append({"publication_id": r.get("publication_id"), "claim_span": str(r.get("claim_span"))[:120],
+                    "before": a.get("verdict") if a else None, "after": b.get("verdict") if b else None,
+                    "root_cause": str(r.get("root_cause") or "")[:200] or None})
+    return out[:MAX_REPORTED_CHANGES]
+
+
 def confirmed_ingest(receipt: dict[str, Any], review_sha: str, packet_sha: str) -> dict[str, Any] | None:
     """Only v2 evidence copied from the ingest's actual byte identity can skip a hand-off.
 
@@ -1153,7 +1610,7 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
         with engine.connect() as conn:
             for pub in packet.publications:
                 if pub.channel == "thesis_snapshots":
-                    rows.extend(grade_thesis(conn, pub, graded_at))
+                    rows.extend(_kind(r, "thesis") for r in grade_thesis(conn, pub, graded_at))
                 else:
                     briefing_rows, model = grade_briefing(conn, pub, graded_at, folder, factory, persist=not dry_run)
                     rows.extend(briefing_rows)
@@ -1162,10 +1619,17 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
         rows = dedupe(rows)
         if not rows:
             raise Refused("no publication yielded a gradeable row")
-        header = build_header(day, packet.sha256, graded_at, rows, models)
+        by_cause, withheld = unscorable_by_cause(rows), withheld_records(rows)
+        kinds: dict[str, int] = {}
+        for row in rows:
+            kinds[row.get(KIND_KEY) or "other"] = kinds.get(row.get(KIND_KEY) or "other", 0) + 1
+        rows = [public_row(r) for r in rows]
+        header = build_header(day, packet.sha256, graded_at, rows, models, by_cause, sum(withheld.values()))
         payload = render(header, rows)
         if len(payload) > MAX_REVIEW_BYTES:
             raise Refused(f"review.jsonl would be {len(payload)} bytes, more than the ingest accepts")
+        receipt.update(unscorable_by_cause=by_cause, records_withheld=sum(withheld.values()),
+                       records_withheld_by_channel=withheld, rows_by_kind=dict(sorted(kinds.items())))
         receipt.update(rows=len(rows), verdicts=verdict_counts(rows), review_sha256=sha256(payload),
                        channels={ch: sum(1 for r in rows if r["publication_id"].startswith(ch + ":"))
                                  for ch in sorted({r["publication_id"].split(":")[0] for r in rows})})
@@ -1177,6 +1641,7 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
         if dry_run:
             receipt["state"] = "DRY_RUN"
             receipt["would_write"] = not unchanged
+            receipt["verdict_changes"] = verdict_changes(before[2] if before else [], rows)
             return receipt
         if unchanged:
             receipt["state"] = "UNCHANGED"
@@ -1316,7 +1781,9 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"days ending yesterday to (re)grade (default {DEFAULT_LOOKBACK_DAYS})")
     parser.add_argument("--packet-root", default=str(DEFAULT_PACKET_ROOT))
     parser.add_argument("--review-root", default=str(DEFAULT_REVIEW_ROOT))
-    parser.add_argument("--dry-run", action="store_true", help="grade and report; write nothing, ingest nothing")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="grade and report (with --json: every row whose verdict would change); write nothing, "
+                             "ingest nothing")
     parser.add_argument("--no-ingest", action="store_true", help="write review.jsonl but leave the ingest to its timer")
     parser.add_argument("--force", action="store_true", help="rewrite review.jsonl even when the verdict rows are unchanged")
     parser.add_argument("--public-root", default=str(DEFAULT_PUBLIC_ROOT),
