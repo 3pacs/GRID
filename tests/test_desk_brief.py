@@ -847,6 +847,14 @@ def _malformed(day: str):
     yield "vix stale text", dict(good, vix=dict(good["vix"], stale="false")), "vix.stale is not true or false"
     yield "vix third number", dict(good, vix=dict(good["vix"], third=2)), "vix.third is not text"
     yield "fed date", dict(good, fed_balance_sheet={"phase": "flat", "obs_date": "11/11/2026"}), "fed_balance_sheet.obs_date is not a YYYY-MM-DD date"
+    yield "fed impossible date", dict(good, fed_balance_sheet={"obs_date": "2026-02-30"}), "fed_balance_sheet.obs_date is not a YYYY-MM-DD date"
+    yield "fed after horizon", dict(good, fed_balance_sheet={"obs_date": "2026-11-20"}), "fed_balance_sheet.obs_date is after"
+    yield "vix non-leap date", dict(good, vix={"obs_date": "2026-02-29"}), "vix.obs_date is not a YYYY-MM-DD date"
+    yield "vix after horizon", dict(good, vix={"obs_date": "2026-11-20"}), "vix.obs_date is after"
+    yield "vix basic ISO date", dict(good, vix={"obs_date": "20261119"}), "vix.obs_date is not a YYYY-MM-DD date"
+    yield "vix newline", dict(good, vix={"obs_date": "2026-11-19\n"}), "vix.obs_date is not a YYYY-MM-DD date"
+    yield "event impossible date", dict(good, events={"within_7_days": [{"event": "GDP", "date": "2026-13-01"}]}), "within_7_days has an entry without"
+    yield "event newline", dict(good, events={"within_7_days": [{"event": "GDP", "date": "2026-11-25\n"}]}), "within_7_days has an entry without"
     yield "market trend inf", dict(good, market={"phase": "rising", "trend_pct": float("inf")}), "market.trend_pct is not a finite number"
     yield "sector trend nan", dict(good, sectors={"Energy": dict(good["sectors"]["Energy"], trend_pct=float("nan"))}), "trend_pct is not a finite number"
     yield "gate text", dict(good, overnight_rule={"market_gate": "yes", "sectors_in": ["Energy"]}), "overnight_rule.market_gate is not true or false"
@@ -869,6 +877,25 @@ def test_sector_state_malformed_newer_row_falls_back_to_the_valid_one(tmp_path):
         _put_body(db2, "2026-11-19", body)
         only = S.desk_sector_state(db2, "pre_open", SESSION, PREV, PRE, PREV)
         assert only.status == "empty" and any(reason in p for p in only.problems), label
+
+
+def test_sector_state_valid_leap_observations_and_known_future_schedule(tmp_path):
+    day = "2024-02-29"
+    body = _sector_rec(day)
+    body["fed_balance_sheet"]["obs_date"] = day
+    body["vix"]["obs_date"] = day
+    body["events"]["within_7_days"] = [{"date": "2024-03-01", "event": "GDP"}]
+    prev = date.fromisoformat(day)
+    session = B.SessionTimes(date(2024, 3, 1), z("2024-03-01T14:30:00Z"), z("2024-03-01T21:00:00Z"))
+    computed = z("2024-03-01T06:45:08Z")
+    db = _sector_db(tmp_path, [])
+    _put_body(db, day, body, computed=computed.isoformat())
+    before = S.desk_sector_state(db, "pre_open", session, prev, computed - timedelta(seconds=1), prev)
+    assert before.status == "empty" and not before.facts
+    visible = S.desk_sector_state(db, "pre_open", session, prev, computed, prev)
+    assert visible.status == "ok" and not visible.problems
+    assert visible.facts["fed_balance_sheet"]["obs_date"] == visible.facts["vix"]["obs_date"] == day
+    assert "releases within 7 days: GDP 2024-03-01" in visible.lines
 
 
 def test_sector_state_gate_unstated_is_not_closed(tmp_path):
