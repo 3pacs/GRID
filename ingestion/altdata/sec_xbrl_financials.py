@@ -1173,7 +1173,9 @@ class SECXBRLFinancialsPuller:
             extras = sorted(allowed - universe_set)
             universe = base + extras
 
-        from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION, prepare_snapshot
+        from ingestion.altdata.sec_financial_snapshots import (
+            NORMALIZER_VERSION, FlowDurationRefusal, prepare_snapshot,
+        )
         from store.sec_financial_snapshots import write_snapshot
 
         checkpoint = _load_checkpoint() if resume else {}
@@ -1227,6 +1229,7 @@ class SECXBRLFinancialsPuller:
         tolerated_total = 0
         stray_points_total = 0
         no_cik_tickers: list[str] = []
+        refused_by_design: list[str] = []
         cik_lost = 0
         coverage_unavailable = 0
         completed_list: list[str] = sorted(already_done)
@@ -1328,6 +1331,27 @@ class SECXBRLFinancialsPuller:
                     raise ValueError("New capture regressed an existing filed revision; projection retained")
                 if outcome["status"] == "rejected_stray_would_remove_rows":
                     raise ValueError("A tolerated start-less point would remove stored periods; projection retained")
+            except FlowDurationRefusal as exc:
+                if not exc.by_design:
+                    log.warning("SEC_XBRL: {t} snapshot not admitted: {e} ({s})", t=ticker, e=exc,
+                                s=", ".join(sorted(exc.shapes)))
+                    results.append({"ticker": ticker, "status": "FAILED", "rows": 0, "error": str(exc),
+                                    "refusal_shapes": sorted(exc.shapes)})
+                    record_attempt(ticker)
+                    continue
+                # Refused on purpose, with the evidence in hand: a forward-dated entry, or a
+                # start-less point that may stand in for a reporting period (owner, 2026-11-28:
+                # such a run is not partial, real failures stay visible). The prior projection
+                # is retained and nothing is written. Reported as its own checked item, never as
+                # SUCCESS and never checkpointed complete; the SUMMARY and the log name the issuer.
+                refused_by_design.append(ticker)
+                log.warning("SEC_XBRL: {t} refused by design, prior projection retained: {p}", t=ticker,
+                            p="; ".join(f"{sh} {tag} end {end} {accn}" for sh, _tx, tag, end, accn in exc.entries[:5]))
+                results.append({"ticker": ticker, "status": "NO_DATA", "reason": "REFUSED_BY_DESIGN", "rows": 0,
+                                "refusal_shapes": sorted(exc.shapes),
+                                "refused_entries": [list(e) for e in exc.entries[:10]]})
+                record_attempt(ticker)
+                continue
             except Exception as exc:
                 # The transactional writer already rolled back any SQL failure.
                 # Never checkpoint failed admission as a completed ticker.
@@ -1369,8 +1393,9 @@ class SECXBRLFinancialsPuller:
         elapsed = time.monotonic() - start_ts
         log.info(
             "SEC_XBRL complete — {p} tickers, {r} rows, {t} unusable legacy entries tolerated, "
-            "{n} without a CIK, {c} covered issuers with a lost CIK, {e:.1f}s",
-            p=processed, r=rows_this_run, t=tolerated_total, n=len(no_cik_tickers), c=cik_lost, e=elapsed,
+            "{n} without a CIK, {c} covered issuers with a lost CIK, {b} refused by design ({bt}), {e:.1f}s",
+            p=processed, r=rows_this_run, t=tolerated_total, n=len(no_cik_tickers), c=cik_lost,
+            b=len(refused_by_design), bt=", ".join(refused_by_design[:20]) or "none", e=elapsed,
         )
         results.append({
             "status": "SUMMARY",
@@ -1381,6 +1406,8 @@ class SECXBRLFinancialsPuller:
             "no_cik": len(no_cik_tickers),
             "no_cik_tickers": no_cik_tickers[:50],
             "cik_lost": cik_lost,
+            "refused_by_design": len(refused_by_design),
+            "refused_by_design_tickers": refused_by_design[:50],
             "coverage_check_unavailable": coverage_unavailable,      # new this run
             "coverage_deferred_outstanding": len(carried),           # carried from earlier runs
             "elapsed_seconds": round(elapsed, 1),
