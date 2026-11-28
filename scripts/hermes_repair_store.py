@@ -41,19 +41,13 @@ transaction. A history that still shows the threshold reached with no long
 skip after it (a long-skip row lost some other way) is replayed as the live
 code would have acted: the skip is rebuilt from the failure's time.
 
-The cooldown restored is approximate and is not a safety guarantee: it counts
-only the failures the repeated-failure rule counted (budget stops, in-flight
-skips and missing keys are not stored), so after a restart a source can get
-its next ordinary attempt somewhat sooner than one process would have given it.
-
-What is not kept: a deterministic skip for a code or wiring defect, a missing
-API key or a source with no handler. Those are fixed by a deploy or an .env
-change, which restarts Hermes, so forgetting them at a restart is the retry
-that fix needs, as before.
-
-Every database call here is best effort. Without the table, or when a read
-or write fails, Hermes keeps its bookkeeping in memory as it did before; the
-caller logs the failure (throttled).
+The ordinary per-source cooldown (scripts/hermes_health.SourceCooldown, the
+30-minute retry pacing) is not stored and not restored: it stays process
+memory, as before this table, and every operator clear drops it. A restarted
+Hermes may therefore retry a source sooner than one process would have, and
+never later. Keeping it exactly in step across a restart would need every
+ordinary attempt stored, including those that store no outcome (a missing
+key, a budget stop); the pacing is not worth that.
 """
 from __future__ import annotations
 
@@ -113,9 +107,6 @@ class SourceHistory:
     skip_until: datetime | None = None
     skip_reason: str | None = None
     recovered_at: datetime | None = None
-    last_attempt: datetime | None = None
-    consecutive_fails: int = 0
-    last_error: str | None = None
     last_event_at: datetime | None = None    # the newest stored event for the source, in stored order
 
 
@@ -178,8 +169,6 @@ def replay(events: list[RepairEvent], now: datetime, *, rules: Rules) -> Replaye
                 entry[1] = 0
                 entry[2] += 1
             hist.repeated = entry
-            hist.last_attempt, hist.last_error = at, ev.reason
-            hist.consecutive_fails += 1
         elif ev.event == "long_skip":
             entry = hist.repeated or [ev.fingerprint, 0, 0]
             entry[1] = 0
@@ -189,7 +178,6 @@ def replay(events: list[RepairEvent], now: datetime, *, rules: Rules) -> Replaye
         elif ev.event == "recovered":
             hist.repeated = None
             hist.recovered_at = _utc(ev.occurred_at) or at
-            hist.last_attempt, hist.consecutive_fails, hist.last_error = at, 0, None
         elif ev.event == "cleared":
             out.clear_ids.add(ev.id)
             out.sources[ev.source_key] = SourceHistory(
@@ -358,8 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{hist.source_name}: count={hist.repeated[1] if hist.repeated else 0} "
               f"strikes={hist.repeated[2] if hist.repeated else 0} "
               f"skip_until={hist.skip_until.isoformat() if hist.skip_until else '-'} "
-              f"recovered_at={hist.recovered_at.isoformat() if hist.recovered_at else '-'} "
-              f"fails={hist.consecutive_fails}")
+              f"recovered_at={hist.recovered_at.isoformat() if hist.recovered_at else '-'}")
     return 0
 
 

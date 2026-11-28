@@ -1,7 +1,7 @@
 """Hermes's repair bookkeeping survives a restart (2026-11-28).
 
 Before: the repeated-failure count, the long skip it trips, the time a repair
-recovered a source and the per-source cooldown lived in process memory only.
+recovered a source lived in process memory only.
 grid-hermes started 15 times on 2026-11-27, and the sources whose long skip
 had tripped (TIINGO, polygon, Asset_Registries, yfinance_options) were
 repaired again after every start.
@@ -12,8 +12,10 @@ after a start replays them by the live rules. These cases pin:
 
 - replay leaves exactly the tables the live calls left, for a recorded
   sequence of the live calls themselves (equivalence, not a parallel model);
-- after a restart a long skip in force, a count short of the threshold, a
-  recovery and a cooldown all hold, and a skip that has ended does not;
+- after a restart a long skip in force, a count short of the threshold and a
+  recovery all hold, and a skip that has ended does not; the ordinary
+  cooldown is not restored, and every clear drops it, so a restarted Hermes
+  is never stricter than the running one;
 - an operator clear lets a running Hermes retry on its next pass, once;
 - without the table, or when a read or write fails, Hermes behaves as before
   (in memory), says so once, and looks again on the next pass;
@@ -273,7 +275,7 @@ def test_a_long_skip_tripped_before_a_restart_still_holds_after_it(monkeypatch, 
     assert 23.9 * 3600 < remaining <= 24 * 3600
 
 
-def test_a_count_short_of_the_threshold_and_the_cooldown_carry_over(monkeypatch, table):
+def test_a_count_short_of_the_threshold_carries_over_and_the_ordinary_cooldown_does_not(monkeypatch, table):
     calls = _failing_retry(monkeypatch)
     engine = _engine(["polygon"])
     state = OperatorState()
@@ -284,14 +286,8 @@ def test_a_count_short_of_the_threshold_and_the_cooldown_carry_over(monkeypatch,
     _restart(monkeypatch)
     engine = _engine(["polygon"])
     restarted = OperatorState()
-    right_after = hf.diagnose_and_fix_pulls(engine, False, restarted)
-    assert calls == ["polygon"] * 2, "the restored cooldown is still running"
-    assert right_after["skipped_cooldown"] == 1
-    assert restarted.cooldowns.get_status("polygon")["consecutive_fails"] == 2
-
-    restarted.cooldowns = OperatorState().cooldowns                 # past it
     hf.diagnose_and_fix_pulls(engine, False, restarted)
-    assert calls == ["polygon"] * 3
+    assert calls == ["polygon"] * 3, "no ordinary cooldown after a restart: retried at once"
     assert hf.repair_deterministically_blocked("polygon"), "the third failure across the restart trips it"
 
 
@@ -464,48 +460,18 @@ def test_a_clear_between_two_failures_and_a_third_does_not_trip_a_long_skip(monk
     assert _tables() == live and live["skips"] == {}
 
 
-def test_a_clear_taken_in_by_a_repair_write_resets_the_ordinary_cooldown_as_a_restart_would(monkeypatch, table):
-    """Codex 6095079697, on the public call order: two failed attempts, a
-    committed clear, one more attempt and failure before the next pass. The
-    clear resets the cooldown and the new attempt is counted on top of it:
-    one failure in a row, live and after a restart."""
-    state = OperatorState()
-    hf._sync_repair_store("the engine", state)
-    for _ in range(2):
-        state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
-        hf.note_repair_failure("TIINGO", REASON)
-    assert state.cooldowns.get_status("TIINGO")["consecutive_fails"] == 2
-    table.record("cleared", "tiingo", "TIINGO", reason="between polls")
-    state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
-    hf.note_repair_failure("TIINGO", REASON)
-    hf._sync_repair_store("the engine", state)                        # the next pass
-
-    live = state.cooldowns.get_status("TIINGO")
-    assert live["consecutive_fails"] == 1 and live["last_error"] == "puller reported FAILED"
+def _retry_now_live_and_after_restart(monkeypatch, state, source="TIINGO") -> tuple[bool, bool]:
+    live = state.cooldowns.can_retry(source)
     _restart(monkeypatch)
     cold = OperatorState()
     hf._sync_repair_store("the engine", cold)
-    assert cold.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
+    return live, cold.cooldowns.can_retry(source)
 
 
-def test_a_clear_taken_in_by_a_recovery_leaves_no_failure_in_the_cooldown(monkeypatch, table):
-    state = OperatorState()
-    hf._sync_repair_store("the engine", state)
-    state.cooldowns.record_attempt("TIINGO", success=False, error="x")
-    hf.note_repair_failure("TIINGO", REASON)
-    table.record("cleared", "tiingo", "TIINGO", reason="between polls")
-    state.cooldowns.record_attempt("TIINGO", success=True)
-    hf.note_repair_recovered("TIINGO")
-    assert state.cooldowns.get_status("TIINGO")["consecutive_fails"] == 0
-    assert state.cooldowns.can_retry("TIINGO") is False, "the attempt just made still counts for the cadence"
-
-
-def test_a_pass_clear_between_an_attempt_and_its_stored_failure_keeps_that_attempt(monkeypatch, table):
-    """Codex 6095220439, the caller order: two failures, a committed clear,
-    a fresh attempt recorded, the pass applies the clear, then the failure
-    is noted. The fresh attempt's outcome is stored after the clear, so it
-    is kept: one failure in a row and no immediate retry, live and after a
-    restart."""
+def test_a_clear_taken_in_by_a_repair_write_drops_the_ordinary_cooldown(monkeypatch, table):
+    """Codex 6095079697's order: two failed attempts, a committed clear, one
+    more attempt and failure before the next pass. The clear drops the
+    cooldown; neither the running nor a restarted Hermes holds the retry."""
     state = OperatorState()
     hf._sync_repair_store("the engine", state)
     for _ in range(2):
@@ -513,31 +479,47 @@ def test_a_pass_clear_between_an_attempt_and_its_stored_failure_keeps_that_attem
         hf.note_repair_failure("TIINGO", REASON)
     table.record("cleared", "tiingo", "TIINGO", reason="between polls")
     state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
-    hf._sync_repair_store("the engine", state)                        # the pass applies the clear here
     hf.note_repair_failure("TIINGO", REASON)
+    hf._sync_repair_store("the engine", state)
+    assert _retry_now_live_and_after_restart(monkeypatch, state) == (True, True)
 
-    live = state.cooldowns.get_status("TIINGO")
-    assert live["consecutive_fails"] == 1 and state.cooldowns.can_retry("TIINGO") is False
+
+@pytest.mark.parametrize("order", ["attempt, pass, note", "attempt, note, pass", "attempt only, pass"])
+def test_whatever_the_order_a_clear_leaves_the_retry_allowed_live_and_after_restart(monkeypatch, table, order):
+    """Codex 6095220439 and 6095305914: the pass applying the clear between an
+    attempt and its stored failure; after it; and an attempt whose outcome
+    is never stored (a missing key, a budget stop). The ordinary cooldown is
+    process memory and every clear drops it, so all three agree."""
+    state = OperatorState()
+    hf._sync_repair_store("the engine", state)
+    for _ in range(2):
+        state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
+        hf.note_repair_failure("TIINGO", REASON)
+    table.record("cleared", "tiingo", "TIINGO", reason="between polls")
+    state.cooldowns.record_attempt("TIINGO", success=False, error="TIINGO_API_KEY is not configured")
+    if order == "attempt, pass, note":
+        hf._sync_repair_store("the engine", state)
+        hf.note_repair_failure("TIINGO", REASON)
+    elif order == "attempt, note, pass":
+        hf.note_repair_failure("TIINGO", REASON)
+        hf._sync_repair_store("the engine", state)
+    else:
+        hf._sync_repair_store("the engine", state)
+    assert _retry_now_live_and_after_restart(monkeypatch, state) == (True, True)
+
+
+def test_after_a_restart_no_ordinary_cooldown_is_restored(monkeypatch, table):
+    state = OperatorState()
+    hf._sync_repair_store("the engine", state)
+    for _ in range(2):
+        state.cooldowns.record_attempt("TIINGO", success=False, error="x")
+        hf.note_repair_failure("TIINGO", REASON)
+    assert state.cooldowns.can_retry("TIINGO") is False
     _restart(monkeypatch)
     cold = OperatorState()
     hf._sync_repair_store("the engine", cold)
-    assert cold.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
-    assert cold.cooldowns.can_retry("TIINGO") is False
-
-
-def test_a_clear_drops_settled_attempts_and_keeps_only_the_unsettled_one(monkeypatch, table):
-    state = OperatorState()
-    hf._sync_repair_store("the engine", state)
-    state.cooldowns.record_attempt("TIINGO", success=False, error="x")
-    hf.note_repair_failure("TIINGO", REASON)                           # settled
-    table.record("cleared", "tiingo", "TIINGO", reason="nothing pending")
-    hf._sync_repair_store("the engine", state)
-    assert state.cooldowns.get_status("TIINGO") is None, "a settled attempt goes with the clear"
-    state.cooldowns.record_attempt("TIINGO", success=True)             # unsettled success
-    table.record("cleared", "tiingo", "TIINGO", reason="success pending")
-    hf._sync_repair_store("the engine", state)
-    kept = state.cooldowns.get_status("TIINGO")
-    assert kept["consecutive_fails"] == 0 and kept["outcome_pending"] is True
+    assert cold.cooldowns.get_status("TIINGO") is None
+    assert _count("TIINGO") == 2, "the count is restored; the pacing is not"
 
 
 @pytest.mark.parametrize("seed", range(6))
@@ -1068,7 +1050,7 @@ def test_real_types_a_failure_waits_for_an_open_clear_before_it_reads_the_count(
     assert _tables() == live and live["skips"] == {}
 
 
-def test_real_types_a_clear_between_attempts_resets_the_cooldown_on_real_rows(pg_engine, monkeypatch):
+def test_real_types_a_clear_between_attempts_drops_the_cooldown_on_real_rows(pg_engine, monkeypatch):
     _upgrade(pg_engine)
     state = OperatorState()
     hf._sync_repair_store(pg_engine, state)
@@ -1079,11 +1061,12 @@ def test_real_types_a_clear_between_attempts_resets_the_cooldown_on_real_rows(pg
     state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
     hf.note_repair_failure("TIINGO", REASON)
     hf._sync_repair_store(pg_engine, state)
-    assert state.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
+    assert state.cooldowns.can_retry("TIINGO") is True
     _restart(monkeypatch)
     cold = OperatorState()
     hf._sync_repair_store(pg_engine, cold)
-    assert cold.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
+    assert cold.cooldowns.can_retry("TIINGO") is True
+    assert _count("TIINGO") == 1, "the count after the clear is restored exactly"
 
 
 def test_real_types_a_pass_paused_while_applying_a_clear_cannot_let_a_failure_trip_past_it(pg_engine, monkeypatch):
@@ -1161,23 +1144,3 @@ def test_applying_a_clear_twice_changes_nothing_the_second_time(monkeypatch, tab
     hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held again")
     assert hf._apply_clear(ev, None) is False
     assert "tiingo" in hf._DETERMINISTIC_SKIPS
-
-
-def test_real_types_a_pass_clear_between_an_attempt_and_its_failure_keeps_the_attempt(pg_engine, monkeypatch):
-    _upgrade(pg_engine)
-    state = OperatorState()
-    hf._sync_repair_store(pg_engine, state)
-    for _ in range(2):
-        state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
-        hf.note_repair_failure("TIINGO", REASON)
-    store_mod.RepairEventStore(pg_engine).record("cleared", "tiingo", "TIINGO", reason="between polls")
-    state.cooldowns.record_attempt("TIINGO", success=False, error="puller reported FAILED")
-    hf._sync_repair_store(pg_engine, state)
-    hf.note_repair_failure("TIINGO", REASON)
-    assert state.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
-    assert state.cooldowns.can_retry("TIINGO") is False
-    _restart(monkeypatch)
-    cold = OperatorState()
-    hf._sync_repair_store(pg_engine, cold)
-    assert cold.cooldowns.get_status("TIINGO")["consecutive_fails"] == 1
-    assert cold.cooldowns.can_retry("TIINGO") is False

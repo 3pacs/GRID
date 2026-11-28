@@ -1,6 +1,6 @@
 """hermes_repair_events: Hermes's repair outcomes and long skips, kept across restarts.
 
-Hermes kept every repair cooldown and every long skip in process memory, so
+Hermes kept its repeated-failure counts and long skips in process memory, so
 each restart forgot them. On 2026-11-27 grid-hermes started 15 times, and the
 sources whose repeated-failure skip had tripped (TIINGO, polygon,
 Asset_Registries, yfinance_options) were repaired again after every start.

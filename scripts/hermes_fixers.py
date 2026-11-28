@@ -286,7 +286,7 @@ _UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
 # process has read its history back (once); "clear_ids": the clear events
 # already looked at, each once.
 # "cooldowns": the pass's SourceCooldown (OperatorState.cooldowns), so a clear
-# applied inside a repair write resets the ordinary cooldown too.
+# applied inside a repair write drops the ordinary cooldown too.
 _REPAIR_STORE: dict[str, Any] = {
     "store": None, "engine": None, "restored": False, "clear_ids": set(), "cooldowns": None,
 }
@@ -436,12 +436,10 @@ def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) 
     from, exactly where a replay would put it, so a failure after a clear
     starts a new count instead of continuing the old one.
 
-    The ordinary cooldown is reset by such a clear too. Every caller records
-    the attempt with ``state.cooldowns.record_attempt`` before noting its
-    outcome, so that attempt is still awaiting its stored outcome and is kept
-    (SourceCooldown.reset_for_clear): one failure in a row after the clear,
-    or none after a recovery, as a replay counts it. Once the rows are stored
-    the attempt is settled, so a later clear drops it with the rest.
+    Such a clear drops the source's ordinary cooldown too, as every clear
+    does. The ordinary cooldown is process memory only (a restart starts
+    without one), so dropping it can only make the running process as
+    permissive as a restarted one, never stricter.
 
     Best effort: if the store cannot be used the transition still runs in
     memory and a throttled warning says the event is not stored.
@@ -462,7 +460,7 @@ def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) 
                 cleared = _apply_clear(ev, None) or cleared
             cooldowns = _REPAIR_STORE["cooldowns"]
             if cleared and cooldowns is not None:
-                cooldowns.reset_for_clear(source_name)
+                cooldowns.forget(source_name)
             events = transition()
             applied = True
             rows = []
@@ -484,9 +482,6 @@ def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) 
         if not applied:
             transition()
         return
-    cooldowns = _REPAIR_STORE["cooldowns"]
-    if cooldowns is not None:
-        cooldowns.settle(source_name)
     with _REPAIR_SCHEDULE_LOCK:
         for _event_id, recorded_at in written:
             if key not in _LAST_EVENT_AT or recorded_at > _LAST_EVENT_AT[key]:
@@ -528,7 +523,7 @@ def _sync_repair_store(engine: Any, state: Any) -> None:
             _warn_throttled(
                 "repair_store_absent",
                 "hermes_repair_events is not present: repair counts, long skips and "
-                "cooldowns are kept in memory only and a restart forgets them",
+                "recoveries are kept in memory only and a restart forgets them",
             )
             return
         now = datetime.now(timezone.utc)
@@ -545,15 +540,15 @@ def _sync_repair_store(engine: Any, state: Any) -> None:
     _REPAIR_STORE.update(store=store, engine=engine, restored=True, clear_ids=set(restored.clear_ids))
     log.info(
         "Repair history restored from hermes_repair_events: {s} source(s), {k} long skip(s) "
-        "in force, {r} recovery time(s), {c} cooldown(s)",
-        s=len(restored.sources), k=counts["skips"], r=counts["recovered"], c=counts["cooldowns"],
+        "in force, {r} recovery time(s)",
+        s=len(restored.sources), k=counts["skips"], r=counts["recovered"],
     )
 
 
 def _restore_repair_history(restored: Any, state: Any, now: datetime) -> dict[str, int]:
     """Put replayed history into the in-memory tables, never over an entry
     this process has already written."""
-    counts = {"skips": 0, "recovered": 0, "cooldowns": 0}
+    counts = {"skips": 0, "recovered": 0}
     mono = time.monotonic()
     with _REPAIR_SCHEDULE_LOCK:
         for key, hist in restored.sources.items():
@@ -568,12 +563,6 @@ def _restore_repair_history(restored: Any, state: Any, now: datetime) -> dict[st
                 counts["recovered"] += 1
             if hist.last_event_at is not None and key not in _LAST_EVENT_AT:
                 _LAST_EVENT_AT[key] = hist.last_event_at
-    cooldowns = getattr(state, "cooldowns", None)
-    for hist in restored.sources.values():
-        if cooldowns is not None and hist.last_attempt is not None and cooldowns.restore(
-            hist.source_name, hist.last_attempt, hist.consecutive_fails, hist.last_error,
-        ):
-            counts["cooldowns"] += 1
     return counts
 
 
@@ -607,9 +596,7 @@ def _apply_clear(ev: Any, cooldowns: Any) -> bool:
                  "superseded, as a restart would read it", s=ev.source_name, t=at.isoformat())
         return False
     if cooldowns is not None:
-        # Keeps an attempt whose outcome is still to be stored: it lands
-        # after this clear, live and in a replay.
-        cooldowns.reset_for_clear(ev.source_name)
+        cooldowns.forget(ev.source_name)
     log.warning("Repair hold on {s} cleared by an operator: {r}", s=ev.source_name, r=ev.reason or "")
     return True
 

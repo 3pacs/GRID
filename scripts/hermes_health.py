@@ -265,11 +265,6 @@ class SourceCooldown:
         key = source.lower()
         info = self._sources.get(key, {"consecutive_fails": 0})
         info["last_attempt"] = datetime.now(timezone.utc)
-        info["last_success"] = bool(success)
-        # Until the repair code stores this attempt's outcome (settle), an
-        # operator clear keeps it: its outcome will be ordered after the
-        # clear (see hermes_fixers._apply_clear).
-        info["outcome_pending"] = True
         if success:
             info["consecutive_fails"] = 0
             info["last_error"] = None
@@ -299,60 +294,9 @@ class SourceCooldown:
     def get_status(self, source: str) -> dict[str, Any] | None:
         return self._sources.get(source.lower())
 
-    def restore(
-        self, source: str, last_attempt: datetime, consecutive_fails: int, last_error: str | None,
-    ) -> bool:
-        """Seed a source's state from stored repair history (hermes_repair_store).
-
-        Never over state this process has recorded itself. Returns True when
-        it seeded. The timeout blacklist is not restored: it is about a cycle
-        step this process ran, not about the source.
-        """
-        key = source.lower()
-        if key in self._sources:
-            return False
-        if last_attempt.tzinfo is None:
-            last_attempt = last_attempt.replace(tzinfo=timezone.utc)
-        self._sources[key] = {
-            "last_attempt": last_attempt,
-            "consecutive_fails": max(0, int(consecutive_fails)),
-            "last_error": last_error,
-        }
-        return True
-
     def forget(self, source: str) -> None:
-        """Drop a source's state (an operator cleared its hold)."""
+        """Drop a source's state: an operator cleared its hold, so retry now."""
         self._sources.pop(source.lower(), None)
-
-    def settle(self, source: str) -> None:
-        """The outcome of the last recorded attempt is now stored."""
-        info = self._sources.get(source.lower())
-        if info is not None:
-            info["outcome_pending"] = False
-
-    def reset_for_clear(self, source: str) -> None:
-        """An operator clear: the failures before it no longer count.
-
-        An attempt recorded but whose outcome is not stored yet is kept on
-        its own: its outcome will be stored after the clear, so a replay
-        counts it after the clear too (one failure in a row, or none after a
-        success). Otherwise the source's state is dropped.
-        """
-        key = source.lower()
-        info = self._sources.get(key)
-        if info is None:
-            return
-        if not info.get("outcome_pending"):
-            self._sources.pop(key, None)
-            return
-        failed = not info.get("last_success", False)
-        self._sources[key] = {
-            "last_attempt": info["last_attempt"],
-            "consecutive_fails": 1 if failed else 0,
-            "last_error": info.get("last_error") if failed else None,
-            "last_success": not failed,
-            "outcome_pending": True,
-        }
 
     def skipped_sources(self) -> list[str]:
         """Return sources currently in cooldown."""
