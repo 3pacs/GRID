@@ -54,6 +54,10 @@ class FinancialGenerationRetry(RuntimeError):
     """Financial sources changed or could not be verified; retry this job."""
 
 
+class DivergenceInputLoadError(RuntimeError):
+    """A batched input read failed; publishing without it would be wrong."""
+
+
 def _verified_generation(conn: Any) -> str:
     try:
         return get_financial_generation(conn)
@@ -429,16 +433,38 @@ def _load_batch_price_cagrs(
     # with pull_status = 'FAILED' (value=0, obs_date=today) or 'PARTIAL'
     # must never count toward MIN_PRICE_OBS or be picked as the latest/prior
     # close (see .claude/rules/data-integrity.md and store/observations.py).
+    #
+    # Every read below is ONE bounded index probe per series (a LATERAL join
+    # over the series ids), never a scan of a series' whole history.
+    # raw_series keeps every vintage of every close: a Yahoo close series now
+    # holds ~440k SUCCESS rows (~45-65 vintages per old obs_date), so the
+    # earlier ``COUNT(*) ... GROUP BY series_id`` and ``DISTINCT ON
+    # (series_id) ... ORDER BY obs_date DESC`` over ``series_id = ANY(...)``
+    # read every vintage of every series (planner estimate: 78M and 240M
+    # index entries for the ~1,100-ticker universe) and ran past the 120 s
+    # statement_timeout every night from 2026-11-22. The probes below read
+    # <= MIN_PRICE_OBS entries (count) or one obs_date's vintages (latest
+    # and prior) per series.
+    #
+    # The count is capped at MIN_PRICE_OBS: eligibility only asks "are there
+    # at least MIN_PRICE_OBS rows", and the cap returns the same answer as the
+    # uncapped count for that question (rows, not distinct days, as before).
     count_rows = conn.execute(
         text(
             """
-            SELECT series_id, COUNT(*) AS n
-            FROM raw_series
-            WHERE series_id = ANY(:sids) AND value IS NOT NULL
-              AND pull_status = 'SUCCESS'
-            GROUP BY series_id
+            SELECT s.sid AS series_id, (
+                SELECT COUNT(*) FROM (
+                    SELECT 1
+                    FROM raw_series r
+                    WHERE r.series_id = s.sid
+                      AND r.pull_status = 'SUCCESS'
+                      AND r.value IS NOT NULL
+                    LIMIT :min_obs
+                ) capped
+            ) AS n
+            FROM unnest(CAST(:sids AS text[])) AS s(sid)
             """
-        ).bindparams(sids=series_ids)
+        ).bindparams(sids=series_ids, min_obs=MIN_PRICE_OBS)
     ).fetchall()
     eligible_sids = [
         sid for sid, n in count_rows if int(n or 0) >= MIN_PRICE_OBS
@@ -447,20 +473,25 @@ def _load_batch_price_cagrs(
         return out
 
     def _latest_by_sid(d: date) -> dict[str, tuple[float, Any]]:
-        # DISTINCT ON (series_id) keeps the first row per series in ORDER BY
-        # order, so ordering by obs_date DESC, pull_timestamp DESC picks the
-        # latest vintage of the latest accepted obs_date — the same
-        # SUCCESS + latest-pull_timestamp tiebreak store/observations.py uses.
+        # Per series, ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1
+        # picks the latest vintage of the latest accepted obs_date -- the
+        # same SUCCESS + latest-pull_timestamp tiebreak store/observations.py
+        # uses, and the same row the former DISTINCT ON picked.
         result = conn.execute(
             text(
                 """
-                SELECT DISTINCT ON (series_id) series_id, value, obs_date
-                FROM raw_series
-                WHERE series_id = ANY(:sids)
-                  AND obs_date <= :d
-                  AND value IS NOT NULL
-                  AND pull_status = 'SUCCESS'
-                ORDER BY series_id, obs_date DESC, pull_timestamp DESC
+                SELECT s.sid AS series_id, r.value, r.obs_date
+                FROM unnest(CAST(:sids AS text[])) AS s(sid)
+                CROSS JOIN LATERAL (
+                    SELECT value, obs_date
+                    FROM raw_series
+                    WHERE series_id = s.sid
+                      AND obs_date <= :d
+                      AND value IS NOT NULL
+                      AND pull_status = 'SUCCESS'
+                    ORDER BY obs_date DESC, pull_timestamp DESC
+                    LIMIT 1
+                ) r
                 """
             ).bindparams(sids=eligible_sids, d=d)
         ).fetchall()
@@ -688,10 +719,16 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
         # for why: the per-ticker loop was an N+1 pattern (~4,500-6,000
         # sequential round trips for ~1,500 tickers), not a slow
         # statement, and that round-trip overhead summed to the observed
-        # ~120s DB-checkout holds. A batch-query failure is fail-soft at
-        # the whole-universe granularity (log + treat every ticker as
-        # missing that metric this cycle), trading the old code's
-        # per-ticker isolation for the elimination of the N+1 pattern.
+        # ~120s DB-checkout holds.
+        #
+        # A failed batch is NOT fail-soft any more (2026-11-28): the failed
+        # statement leaves this Postgres transaction aborted, so carrying on
+        # only surfaced later as "Financial source generation unavailable"
+        # from the generation re-read, which hid the real cause (a price load
+        # that hit statement_timeout every night). And had the transaction
+        # survived, an all-None price cache would have been published as a
+        # neutral price score of 50 for every ticker, i.e. false
+        # long/short divergences. Raise the cause instead.
         all_tickers = [st.ticker for st in universe]
         try:
             fund_cache = _load_batch_fundamentals(conn, all_tickers)
@@ -700,7 +737,9 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
                 "fundamental_divergence: batched fundamentals load failed: {e}",
                 e=str(exc),
             )
-            fund_cache = {t: None for t in all_tickers}
+            raise DivergenceInputLoadError(
+                f"batched fundamentals load failed: {type(exc).__name__}"
+            ) from exc
         try:
             price_cache = _load_batch_price_cagrs(conn, all_tickers, as_of)
         except Exception as exc:
@@ -708,7 +747,9 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
                 "fundamental_divergence: batched price load failed: {e}",
                 e=str(exc),
             )
-            price_cache = {t: None for t in all_tickers}
+            raise DivergenceInputLoadError(
+                f"batched price load failed: {type(exc).__name__}"
+            ) from exc
 
         for sector_name, members in by_sector.items():
             # Sector-relative distributions (drop None for cleaner percentiles).

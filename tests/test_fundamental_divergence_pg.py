@@ -23,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from intelligence.fundamental_divergence import (
+    MIN_PRICE_OBS,
     PRICE_LOOKBACK_DAYS,
     _load_batch_fundamentals,
     _load_batch_price_cagrs,
@@ -272,6 +273,71 @@ def test_measured_zero_treated_as_real_matches_per_ticker_function(
         "the batched loader must match the pre-batching per-ticker "
         "function on the same measured-zero data"
     )
+
+
+# ── 4. MIN_PRICE_OBS eligibility is unchanged by the capped count ──────
+
+
+def test_min_price_obs_boundary_matches_per_ticker_function(
+    pg_engine: Engine, test_ticker: str, source_id: int,
+):
+    """The batched count is capped at MIN_PRICE_OBS (one bounded probe per
+    series instead of a whole-history COUNT). The cap must not move the
+    eligibility line: MIN_PRICE_OBS - 1 SUCCESS rows is ineligible, exactly
+    MIN_PRICE_OBS is eligible, and the per-ticker function agrees."""
+    as_of = date.today()
+    target_prior = as_of - timedelta(days=PRICE_LOOKBACK_DAYS)
+    for n_rows, eligible in ((MIN_PRICE_OBS - 1, False), (MIN_PRICE_OBS, True)):
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM raw_series WHERE series_id = :sid").bindparams(
+                    sid=f"YF:{test_ticker}:close",
+                ),
+            )
+        # n_rows - 2 filler days (as_of-1 back) plus the latest and prior
+        # anchors = exactly n_rows SUCCESS rows.
+        _seed_daily_success_rows(
+            pg_engine, test_ticker, source_id, as_of - timedelta(days=1),
+            n_days=n_rows - 3,
+        )
+        _insert_raw_series_row(pg_engine, test_ticker, source_id, as_of, 150.0)
+        _insert_raw_series_row(pg_engine, test_ticker, source_id, target_prior, 100.0)
+        with pg_engine.connect() as conn:
+            total = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM raw_series WHERE series_id = :sid",
+                ).bindparams(sid=f"YF:{test_ticker}:close"),
+            ).scalar_one()
+            batched = _load_batch_price_cagrs(conn, [test_ticker], as_of)[test_ticker]
+            per_ticker = _load_ticker_price_cagr(conn, test_ticker, as_of)
+        assert total == n_rows
+        assert (batched is not None) is eligible
+        assert (per_ticker is not None) is eligible
+        if eligible:
+            assert batched == pytest.approx((150.0 / 100.0) ** (1.0 / 3.0) - 1.0)
+
+
+def test_many_vintages_per_day_pick_latest_pull(
+    pg_engine: Engine, test_ticker: str, source_id: int,
+):
+    """raw_series keeps every vintage (45-65 per old obs_date in production).
+    With many vintages at both the latest and prior dates the bounded probes
+    still pick the newest pull of each, and match the per-ticker function."""
+    as_of = date.today()
+    _seed_daily_success_rows(pg_engine, test_ticker, source_id, as_of)
+    target_prior = as_of - timedelta(days=PRICE_LOOKBACK_DAYS)
+    for k in range(1, 41):
+        for d, base in ((as_of, 200.0), (target_prior, 100.0)):
+            _insert_raw_series_row(
+                pg_engine, test_ticker, source_id, d, base + k,
+                pull_timestamp_offset_s=float(k),
+            )
+    with pg_engine.connect() as conn:
+        batched = _load_batch_price_cagrs(conn, [test_ticker], as_of)[test_ticker]
+        per_ticker = _load_ticker_price_cagr(conn, test_ticker, as_of)
+    expected = (240.0 / 140.0) ** (1.0 / 3.0) - 1.0
+    assert batched == pytest.approx(expected, rel=1e-9)
+    assert per_ticker == pytest.approx(batched, rel=1e-9)
 
 
 # ── 3. Competing vintages: latest pull wins ─────────────────────────────
