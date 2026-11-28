@@ -111,28 +111,80 @@ _13F_OBSERVATION_REASONS: frozenset[str] = frozenset({"no_identity_coverage"})
 #   - the CHECK constraint ``DOLLAR_FLOWS_CONTRACT_CONSTRAINT`` (alembic
 #     revision ``df_13f_observed_20261127``) rejects it for every
 #     other writer.
-# Removing rows that break it is a reviewed repair
-# (``scripts/repair_dollar_flows_stored_contract.py``), never automatic.
+# Removing or rewriting rows that break it is a reviewed repair, never
+# automatic: each contract has its own CHECK constraint and its own remedy,
+# so one contract's repair never touches another's rows.
+#   - 13f: delete (scripts/repair_dollar_flows_stored_contract.py). Its CHECK
+#     is ``DOLLAR_FLOWS_CONTRACT_CHECK_SQL`` / ``DOLLAR_FLOWS_CONTRACT_CONSTRAINT``.
+#   - etf_flow: re-derive in place as the current rule writes it
+#     (scripts/rederive_dollar_flows_etf_legacy.py; owner decision
+#     2026-11-28 "Yes, re-derive later"). Its CHECK is
+#     ``ETF_FLOW_CONTRACT_CHECK_SQL`` / ``ETF_FLOW_CONTRACT_CONSTRAINT``
+#     (alembic revision ``df_etf_flow_basis_20261128``).
 DOLLAR_FLOWS_CONTRACT_CONSTRAINT = "dollar_flows_13f_observed_only"
-STORED_ROW_CONTRACTS: dict[str, dict[str, str]] = {
+DOLLAR_FLOWS_CONTRACT_CHECK_SQL = "(source_type <> '13f' OR direction = 'observed')"
+
+# ETF dollar volume is unsigned: the current rule (``_normalize_etf_flows``)
+# records why a row has its direction in ``evidence.direction_basis`` and
+# writes 'neutral' unless a signed measure exists. Before 2026-11-16 an older
+# rule stored every ETF row as 'inflow' with no basis (693 rows on production,
+# 2026-02-27..11-13). NULL-safe: a missing, JSON-null or empty basis, a NULL
+# or non-object evidence, all break it (``->>`` yields NULL, COALESCE '').
+ETF_FLOW_CONTRACT_CONSTRAINT = "dollar_flows_etf_flow_direction_basis"
+UNSIGNED_VOLUME_BASIS = "unsigned_volume"
+ETF_FLOW_CONTRACT_CHECK_SQL = (
+    "(source_type <> 'etf_flow' OR (COALESCE(evidence ->> 'direction_basis', '') <> '' "
+    "AND (direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')))"
+)
+# The same predicate for SQLite (evidence is JSON text there).
+_ETF_FLOW_CONTRACT_CHECK_SQLITE = (
+    "(source_type <> 'etf_flow' OR (COALESCE(json_extract(evidence, '$.direction_basis'), '') <> '' "
+    "AND (direction = 'neutral' OR json_extract(evidence, '$.direction_basis') <> 'unsigned_volume')))"
+)
+
+
+def _evidence_dict(flow: dict[str, Any]) -> dict[str, Any]:
+    ev = flow.get("evidence")
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return ev if isinstance(ev, dict) else {}
+
+
+def _conforms_13f(flow: dict[str, Any]) -> bool:
+    return flow.get("direction") == OBSERVED_13F_DIRECTION
+
+
+def _conforms_etf_flow(flow: dict[str, Any]) -> bool:
+    basis = _evidence_dict(flow).get("direction_basis")
+    if not isinstance(basis, str) or basis == "":
+        return False
+    return flow.get("direction") == "neutral" or basis != UNSIGNED_VOLUME_BASIS
+
+
+STORED_ROW_CONTRACTS: dict[str, dict[str, Any]] = {
     "13f": {
         "column": "direction",
         "value": OBSERVED_13F_DIRECTION,
         "rule": "13F is non-directional (owner decision 2026-11-23): every stored 13f row has direction 'observed'",
+        "constraint": DOLLAR_FLOWS_CONTRACT_CONSTRAINT,
+        "check_sql": DOLLAR_FLOWS_CONTRACT_CHECK_SQL,
+        "check_sql_sqlite": DOLLAR_FLOWS_CONTRACT_CHECK_SQL,
+        "conforms": _conforms_13f,
+        "remedy": "delete",
+    },
+    "etf_flow": {
+        "rule": "ETF dollar volume is unsigned: every stored etf_flow row names its evidence.direction_basis, "
+                "and is 'neutral' when that basis is 'unsigned_volume'",
+        "constraint": ETF_FLOW_CONTRACT_CONSTRAINT,
+        "check_sql": ETF_FLOW_CONTRACT_CHECK_SQL,
+        "check_sql_sqlite": _ETF_FLOW_CONTRACT_CHECK_SQLITE,
+        "conforms": _conforms_etf_flow,
+        "remedy": "rederive",
     },
 }
-
-
-def _contract_check_sql() -> str:
-    """The CHECK expression every stored row satisfies (no bound parameters)."""
-    parts = [
-        f"(source_type <> '{st}' OR {c['column']} = '{c['value']}')"
-        for st, c in sorted(STORED_ROW_CONTRACTS.items())
-    ]
-    return " AND ".join(parts)
-
-
-DOLLAR_FLOWS_CONTRACT_CHECK_SQL = _contract_check_sql()
 
 
 def flow_contract_violation(flow: dict[str, Any]) -> str | None:
@@ -141,19 +193,26 @@ def flow_contract_violation(flow: dict[str, Any]) -> str | None:
     contract = STORED_ROW_CONTRACTS.get(stype) if isinstance(stype, str) else None
     if contract is None:
         return None
-    return None if flow.get(contract["column"]) == contract["value"] else stype
+    return None if contract["conforms"](flow) else stype
+
+
+def contract_check_sql(stype: str, dialect: str = "postgresql") -> str:
+    """The CHECK expression of ``stype``'s contract for ``dialect`` (no bound parameters)."""
+    contract = STORED_ROW_CONTRACTS[stype]
+    return contract["check_sql_sqlite"] if dialect == "sqlite" else contract["check_sql"]
 
 
 def count_stored_contract_violations(conn: Any) -> dict[str, int]:
     """Count stored rows, at any ``flow_date``, that break their source's contract."""
+    dialect = conn.dialect.name
     found: dict[str, int] = {}
-    for stype, contract in sorted(STORED_ROW_CONTRACTS.items()):
+    for stype in sorted(STORED_ROW_CONTRACTS):
         n = conn.execute(
             text(
                 f"SELECT COUNT(*) FROM dollar_flows WHERE source_type = :st "
-                f"AND ({contract['column']} IS NULL OR {contract['column']} <> :v)"
+                f"AND NOT {contract_check_sql(stype, dialect)}"
             ),
-            {"st": stype, "v": contract["value"]},
+            {"st": stype},
         ).scalar()
         if n:
             found[stype] = int(n)
@@ -214,7 +273,8 @@ CREATE TABLE IF NOT EXISTS dollar_flows (
     evidence JSONB,
     flow_date DATE NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT dollar_flows_13f_observed_only CHECK (source_type <> '13f' OR direction = 'observed')
+    CONSTRAINT dollar_flows_13f_observed_only CHECK (source_type <> '13f' OR direction = 'observed'),
+    CONSTRAINT dollar_flows_etf_flow_direction_basis CHECK (source_type <> 'etf_flow' OR (COALESCE(evidence ->> 'direction_basis', '') <> '' AND (direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')))
 );
 CREATE INDEX IF NOT EXISTS idx_dollar_flows_ticker
     ON dollar_flows (ticker, flow_date DESC);

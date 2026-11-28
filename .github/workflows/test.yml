@@ -299,6 +299,7 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_etf_flow_partial_bar_repair_pg.py -q -rA
+        run: python -m pytest tests/test_dollar_flows_stored_contract_pg.py tests/test_dollar_flows_etf_rederive_pg.py -q -rA
 
       # Stored-close backfill (scripts/close_backfill_universe.py): the work
       # queries, the completed-close reader and the fill-only write on

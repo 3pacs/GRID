@@ -25,8 +25,10 @@ two separate alarms (the systemd unit fails on either):
     good window is kept.
   - exit 3, expected until the repair: this run's window was written, but
     stored rows at older dates (never rewritten, since a run rebuilds only
-    ``--days``) still break the contract. They are removed only by the
-    reviewed repair ``scripts/repair_dollar_flows_stored_contract.py``.
+    ``--days``) still break the contract. They are repaired only by the
+    reviewed repair for their source: 13f rows are removed by
+    ``scripts/repair_dollar_flows_stored_contract.py``, etf_flow rows are
+    re-derived by ``scripts/rederive_dollar_flows_etf_legacy.py``.
 Exit 4 takes precedence when both hold.
 
 Usage:
@@ -108,8 +110,9 @@ def main(argv: list[str] | None = None, engine=None) -> int:
         print(
             "dollar-flows stored-row contract broken by older stored rows: "
             f"stored_contract_violations={out['stored_contract_violations']}; this run's window "
-            "was written; the rows are removed only by the reviewed repair "
-            "scripts/repair_dollar_flows_stored_contract.py",
+            "was written; the rows are repaired only by the reviewed repair for their source "
+            "(13f: scripts/repair_dollar_flows_stored_contract.py; "
+            "etf_flow: scripts/rederive_dollar_flows_etf_legacy.py)",
             file=sys.stderr,
         )
         return EXIT_STORED_ROWS_BREAK_CONTRACT
