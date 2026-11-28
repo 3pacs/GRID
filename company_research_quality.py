@@ -5,11 +5,13 @@ module verifies supplied text hashes, not remote authenticity or raw-file bytes.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, localcontext
+from urllib.parse import urlsplit
 
 SCHEMA = "company-research-quality-v1"
 
@@ -211,3 +213,114 @@ def evaluate_archived_company_research(packet, archive_root, *, as_of, max_age_d
     verified.pop("snapshot_ids")
     verified["documents"] = [read_document(archive_root, sid) for sid in ids]
     return evaluate_company_research(verified, as_of=as_of, max_age_days=max_age_days)
+def diagnose_sec_exhibit_evidence(root, *, cik, accession, security_id, as_of, receipts=(), consumer=None):
+    """Opt-in D1 evidence handoff; never called by legacy earnings readers.
+
+    Without a consumer, do not inspect receipts or open the archive. With one, hand
+    it only qualifying versions of a single accession, with no prices or outcomes.
+    Receipts must be from an already trusted producer; this verifies bindings, not
+    authenticity, Item 2.02/exhibit classification, or D0 admission. The producer
+    must qualify the form/item/document type; an archive path is not evidence of it.
+    No source discovery, writes or runtime wiring.
+    """
+    if consumer is None:
+        return {"status": "disabled", "evidence": ()}
+    cutoff = _time(as_of)
+    if (not isinstance(cik, str) or not re.fullmatch(r"[0-9]{10}", cik)
+            or not isinstance(accession, str) or not re.fullmatch(r"[0-9]{10}-[0-9]{2}-[0-9]{6}", accession)
+            or not isinstance(security_id, str) or not security_id.strip()):
+        raise ValueError("expected canonical CIK, accession and date-valid security identity")
+    versions = {}
+    for receipt in receipts:
+        try:
+            clocks = _sec_exhibit_clocks(receipt, cik, accession, security_id, cutoff)
+        except (KeyError, OverflowError, TypeError, ValueError):
+            continue
+        try:
+            item = _sec_exhibit_version(root, receipt, clocks)
+        except (KeyError, OSError, OverflowError, TypeError, ValueError):
+            # A proven same-chain receipt exists, but its bytes do not qualify.
+            # Don't silently resurrect an earlier version.
+            return {"status": "unusable_visible_version", "evidence": ()}
+        version = item["version"]
+        prior = versions.get(version)
+        if prior is not None:
+            fields = ("source_url", "document_sha256", "claim_sha256", "span", "supersedes", "accepted_at")
+            if any(prior[k] != item[k] for k in fields):
+                return {"status": "conflicting_version", "evidence": ()}
+            if (prior["visible_at"], prior["snapshot_id"]) <= (item["visible_at"], item["snapshot_id"]):
+                continue
+        versions[version] = item
+    entries = tuple(versions[key] for key in sorted(versions))
+    if not entries:
+        return {"status": "no_qualifying_evidence", "evidence": ()}
+    for index, entry in enumerate(entries, 1):
+        if entry["version"] != index or entry["supersedes"] != (index - 1 if index > 1 else None):
+            return {"status": "unresolved_supersession", "evidence": ()}
+        if index > 1 and any(
+            entries[index - 2][clock] > entry[clock] for clock in ("public_observed_at", "visible_at")
+        ):
+            return {"status": "non_monotone_supersession", "evidence": ()}
+    return consumer(entries)
+
+
+def _sec_exhibit_clocks(receipt, cik, accession, security_id, cutoff):
+    if not isinstance(receipt, dict) or (receipt["cik"], receipt["accession"], receipt["security_id"]) != (
+        cik, accession, security_id
+    ):
+        raise ValueError("receipt identity mismatch")
+    version, supersedes = receipt["version"], receipt["supersedes"]
+    if type(version) is not int or version < 1 or (supersedes is not None and type(supersedes) is not int):
+        raise ValueError("invalid receipt version")
+    snapshot, digest, witness = receipt["snapshot_id"], receipt["document_sha256"], receipt["visibility"]
+    if not isinstance(witness, dict) or (
+        witness["kind"], witness["snapshot_id"], witness["document_sha256"],
+        witness["accession"], witness["cik"], witness["security_id"], witness["version"],
+        witness["claim_sha256"], witness["span"], witness["supersedes"],
+        witness["source_url"], witness["accepted_at"], witness["public_observed_at"], witness["retrieved_at"],
+    ) != (
+        "primary_post_commit_readback", snapshot, digest, accession, cik, security_id, version,
+        receipt["claim_sha256"], receipt["span"], supersedes,
+        receipt["source_url"], receipt["accepted_at"], receipt["public_observed_at"], receipt["retrieved_at"],
+    ) or type(witness["version"]) is not int:
+        raise ValueError("unbound visibility")
+    accepted, public, retrieved, visible = (
+        _time(receipt["accepted_at"]), _time(receipt["public_observed_at"]),
+        _time(receipt["retrieved_at"]), _time(witness["observed_at"]),
+    )
+    if not accepted <= public <= retrieved <= visible <= cutoff:
+        raise ValueError("receipt clocks unavailable at cutoff")
+    return accepted, public, retrieved, visible
+
+
+def _sec_exhibit_version(root, receipt, clocks):
+    from ingestion.company_documents import read_document
+
+    accepted, public, retrieved, visible = clocks
+    snapshot, digest = receipt["snapshot_id"], receipt["document_sha256"]
+    cik, accession, security_id = receipt["cik"], receipt["accession"], receipt["security_id"]
+    version, supersedes = receipt["version"], receipt["supersedes"]
+    doc = read_document(root, snapshot)
+    source = urlsplit(doc["source_url"])
+    prefix = f"/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/"
+    if (doc["company_id"] != cik or doc["source_kind"] != "sec_filing"
+            or doc["content_sha256"] != digest or doc["source_url"] != receipt["source_url"]
+            or not re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9][A-Za-z0-9_.-]*", source.path)
+            or source.query or source.fragment
+            or _time(doc["published_at"]) != public or _time(doc["retrieved_at"]) != retrieved):
+        raise ValueError("archive binding mismatch")
+    raw = base64.b64decode(doc["content_base64"], validate=True)
+    start, end = receipt["span"]
+    if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(raw):
+        raise ValueError("invalid raw claim span")
+    claim = raw[start:end]
+    claim_sha = hashlib.sha256(claim).hexdigest()
+    if claim_sha != receipt["claim_sha256"]:
+        raise ValueError("claim digest mismatch")
+    return {
+        "cik": cik, "accession": accession, "security_id": security_id,
+        "version": version, "supersedes": supersedes, "source_url": doc["source_url"],
+        "snapshot_id": snapshot, "document_sha256": digest, "claim_sha256": claim_sha,
+        "span": (start, end), "claim": claim.decode("utf-8"),
+        "accepted_at": accepted, "public_observed_at": public, "retrieved_at": retrieved, "visible_at": visible,
+    }
