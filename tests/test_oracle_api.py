@@ -195,8 +195,20 @@ def test_prediction_lifecycle_filters_execute_and_preserve_unscorable_reason():
     """The actual read queries partition rows; unknown states remain reachable."""
     from api.routers import oracle as mod
 
+    # Just after UTC midnight, Los Angeles still has the previous date.
+    # Use one decision-specific clock for the fixtures and the real route.
+    request_at = datetime(2026, 11, 28, 0, 1, tzinfo=timezone.utc)
+    local_zone = timezone(timedelta(hours=-8))
+
+    class _LifecycleClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return request_at.astimezone(local_zone).replace(tzinfo=None)
+            return request_at.astimezone(tz)
+
     engine = create_engine("sqlite://")
-    today = date.today()
+    today = request_at.date()
     with engine.begin() as conn:
         conn.execute(text("""CREATE TABLE oracle_predictions (
             id TEXT, created_at TEXT, ticker TEXT, prediction_type TEXT,
@@ -230,7 +242,7 @@ def test_prediction_lifecycle_filters_execute_and_preserve_unscorable_reason():
         "unscorable": {"no-price"}, "scored": {"hit", "miss", "partial"},
         "other": {"unknown", "null-verdict", "no-expiry"},
     }
-    with patch.object(mod, "get_db_engine", return_value=engine):
+    with patch.object(mod, "get_db_engine", return_value=engine), patch.object(mod, "datetime", _LifecycleClock):
         for status, ids in expected.items():
             result = mod.get_predictions(ticker=None, model=None, status=status, limit=100, offset=0, _token="test")
             assert {p["id"] for p in result["predictions"]} == ids
