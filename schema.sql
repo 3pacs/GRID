@@ -1268,7 +1268,11 @@ CREATE TABLE IF NOT EXISTS dollar_flows (
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     -- 13F is non-directional (owner decision 2026-11-23); existing databases
     -- get this from alembic revision df_13f_observed_20261127.
-    CONSTRAINT dollar_flows_13f_observed_only CHECK (source_type <> '13f' OR direction = 'observed')
+    CONSTRAINT dollar_flows_13f_observed_only CHECK (source_type <> '13f' OR direction = 'observed'),
+    -- ETF dollar volume is unsigned: an etf_flow row names its direction_basis and
+    -- is 'neutral' on 'unsigned_volume'; existing databases get this from alembic
+    -- revision df_etf_flow_basis_20261128.
+    CONSTRAINT dollar_flows_etf_flow_direction_basis CHECK (source_type <> 'etf_flow' OR (COALESCE(jsonb_typeof(evidence -> 'direction_basis'), '') = 'string' AND evidence ->> 'direction_basis' <> '' AND (direction = 'neutral' OR evidence ->> 'direction_basis' <> 'unsigned_volume')))
 );
 
 CREATE INDEX IF NOT EXISTS idx_dollar_flows_ticker

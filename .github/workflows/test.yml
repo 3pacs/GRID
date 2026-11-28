@@ -284,7 +284,8 @@ jobs:
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
-        run: python -m pytest tests/test_dollar_flows_stored_contract_pg.py -q -rA
+        run: python -m pytest tests/test_dollar_flows_stored_contract_pg.py tests/test_dollar_flows_etf_rederive_pg.py -q -rA
+
       # ETF flow partial-bar repair (scripts/repair_etf_flow_partial_bars.py):
       # with a second writer running, every vintage revises the one before
       # it and each planned row is written once (no-lock controls show the

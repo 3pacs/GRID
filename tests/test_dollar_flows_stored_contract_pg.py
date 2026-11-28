@@ -162,7 +162,10 @@ def _seed_production_shape(engine) -> dict[str, list[int]]:
                                    flow_date=date(2026, 11, 25), ticker=None, actor="Wellington", amount="237772.0"))
         ids["keep"].append(_insert(conn, source_type="13f", direction="observed", confidence="derived",
                                    flow_date=date(2026, 11, 25), actor="Wellington", amount="41562.0"))
-        ids["keep"].append(_insert(conn, source_type="etf_flow", direction="inflow", flow_date=date(2026, 11, 13)))
+        # Another source's row the 13F repair must keep (current etf_flow shape: its own
+        # contract, tests/test_dollar_flows_etf_rederive_pg.py, covers the legacy shape).
+        ids["keep"].append(_insert(conn, source_type="etf_flow", direction="neutral", flow_date=date(2026, 11, 13),
+                                   evidence={"direction_basis": "unsigned_volume"}))
         ids["keep"].append(_insert(conn, source_type="insider", direction="outflow", flow_date=date(2026, 11, 13)))
         ids["keep"].append(_insert(conn, source_type="options_flow", direction="inflow", flow_date=YESTERDAY))
     return ids
@@ -265,7 +268,7 @@ def test_audit_agrees_with_the_check_on_production_shaped_rows(pg):
         by_check = conn.execute(
             text(f"SELECT count(*) FROM dollar_flows WHERE NOT ({dollar_flows.DOLLAR_FLOWS_CONTRACT_CHECK_SQL})")
         ).scalar()
-        rows = conn.execute(text("SELECT source_type, direction FROM dollar_flows")).mappings().all()
+        rows = conn.execute(text("SELECT source_type, direction, evidence FROM dollar_flows")).mappings().all()
     by_python = sum(1 for r in rows if dollar_flows.flow_contract_violation(dict(r)))
     assert audit == {"13f": len(ids["legacy"])}
     assert by_check == by_python == len(ids["legacy"])
