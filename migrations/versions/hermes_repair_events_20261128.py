@@ -15,8 +15,11 @@ reads the last eight days back. Without the table Hermes behaves as before,
 in memory only.
 
 Order: each writer takes a per-source transaction advisory lock before it
-inserts, and ``recorded_at`` defaults to ``clock_timestamp()``, the time
-after that lock, so for one source the stored order is the commit order.
+inserts and numbers its rows ``seq`` = the source's highest ``seq`` + 1 under
+that lock, so for one source ``seq`` is the commit order (a unique index on
+``(source_key, seq)`` refuses a writer that skipped the lock). Wall time is
+not used for order: two rows can share a timestamp and a clock can step back.
+``recorded_at`` (``clock_timestamp()``) only bounds the eight-day window.
 ``occurred_at`` is the instant the live code acted on (a recovery's time,
 which a restart compares with failure times exactly as the process did).
 
@@ -45,6 +48,7 @@ def upgrade():
         CREATE TABLE IF NOT EXISTS hermes_repair_events (
             id           BIGSERIAL PRIMARY KEY,
             recorded_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            seq          BIGINT NOT NULL,
             occurred_at  TIMESTAMPTZ,
             source_key   TEXT NOT NULL,
             source_name  TEXT NOT NULL,
@@ -67,6 +71,10 @@ def upgrade():
     op.execute(
         "CREATE INDEX IF NOT EXISTS idx_hermes_repair_events_clears "
         "ON hermes_repair_events (recorded_at) WHERE event = 'cleared'"
+    )
+    op.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_hermes_repair_events_source_seq "
+        "ON hermes_repair_events (source_key, seq)"
     )
     # Append-only for every role, the owner included: a row is history, and
     # rewriting one would change what a restart restores. Grants alone do not

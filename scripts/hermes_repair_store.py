@@ -25,16 +25,14 @@ replays them (``replay``) with the same rules as the live code, so it resumes
 with the same counts, skips and recovery times it had.
 
 One order, live and replayed. Every write for a source takes that source's
-transaction advisory lock first, and its rows are stamped with
-``clock_timestamp()`` after the lock, so for one source the order of
-``recorded_at`` is the order of commits: a clear that starts first but
-commits last is ordered last, and a repair write that waits on an open clear
-is ordered after it. The replay orders by (``recorded_at``, ``id``). A
-running Hermes applies a ``cleared`` event on its next pass only when it is
-newer than the latest event it knows for that source, which is exactly where
-a replay would place it; an older clear is superseded in both. Each pass
-reads every clear in the replay window it has not yet looked at, so a clear
-that commits late (whatever its time) is still seen.
+transaction advisory lock first and numbers its rows with the source's next
+``seq`` under that lock, so for one source ``seq`` is the order of commits:
+a write that waits on an open clear gets a higher number than the clear.
+Wall time is not an order (timestamps can tie, clocks can step back); the
+replay orders each source by ``seq``. A running Hermes applies a
+``cleared`` event only when its ``seq`` is above the newest one it knows for
+that source, exactly where a replay places it. Each pass reads every clear
+in the replay window it has not yet looked at.
 
 The failure that trips a long skip and the long skip are written in one
 transaction. A history that still shows the threshold reached with no long
@@ -96,6 +94,7 @@ class RepairEvent:
     skip_until: datetime | None = None
     strikes: int | None = None
     occurred_at: datetime | None = None
+    seq: int = 0
 
 
 @dataclass
@@ -107,7 +106,7 @@ class SourceHistory:
     skip_until: datetime | None = None
     skip_reason: str | None = None
     recovered_at: datetime | None = None
-    last_event_at: datetime | None = None    # the newest stored event for the source, in stored order
+    last_seq: int = 0                       # the source's newest stored event, in stored order
 
 
 @dataclass
@@ -153,11 +152,11 @@ def replay(events: list[RepairEvent], now: datetime, *, rules: Rules) -> Replaye
     that has ended by ``now`` is not returned.
     """
     out = Replayed()
-    for ev in sorted(events, key=lambda e: (e.recorded_at, e.id)):
+    for ev in sorted(events, key=lambda e: (e.source_key, e.seq, e.id)):
         hist = out.sources.setdefault(ev.source_key, SourceHistory(source_name=ev.source_name))
         hist.source_name = ev.source_name
         at = _utc(ev.recorded_at)
-        hist.last_event_at = at
+        hist.last_seq = ev.seq
         if ev.event == "repair_failed":
             entry = hist.repeated
             if entry is None or entry[0] != ev.fingerprint:
@@ -181,7 +180,7 @@ def replay(events: list[RepairEvent], now: datetime, *, rules: Rules) -> Replaye
         elif ev.event == "cleared":
             out.clear_ids.add(ev.id)
             out.sources[ev.source_key] = SourceHistory(
-                source_name=ev.source_name, recovered_at=hist.recovered_at, last_event_at=at,
+                source_name=ev.source_name, recovered_at=hist.recovered_at, last_seq=ev.seq,
             )
     now_utc = _utc(now)
     for hist in out.sources.values():
@@ -219,10 +218,10 @@ class RepairEventStore:
             reason=reason, skip_until=skip_until, strikes=strikes, occurred_at=occurred_at,
         )])[0][0]
 
-    def record_many(self, events: list[dict[str, Any]]) -> list[tuple[int, datetime]]:
+    def record_many(self, events: list[dict[str, Any]]) -> list[tuple[int, int]]:
         """Append events in one transaction: all of them are stored or none.
 
-        Returns (id, recorded_at) per event, in the order given.
+        Returns (id, seq) per event, in the order given.
         """
         with self.engine.begin() as conn:
             return self.insert(conn, events)
@@ -257,12 +256,12 @@ class RepairEventStore:
 
         rows = conn.execute(text(
             "SELECT id, recorded_at, source_key, source_name, event, fingerprint, reason, "
-            f"skip_until, strikes, occurred_at FROM {EVENT_TABLE} "
+            f"skip_until, strikes, occurred_at, seq FROM {EVENT_TABLE} "
             "WHERE event = 'cleared' AND source_key = :k AND recorded_at > :since "
-            "ORDER BY recorded_at, id"), {"k": source_key, "since": since}).fetchall()
+            "ORDER BY seq"), {"k": source_key, "since": since}).fetchall()
         return [RepairEvent(*row) for row in rows]
 
-    def insert(self, conn: Any, events: list[dict[str, Any]]) -> list[tuple[int, datetime]]:
+    def insert(self, conn: Any, events: list[dict[str, Any]]) -> list[tuple[int, int]]:
         """Insert on the caller's transaction, after the per-source locks."""
         from sqlalchemy import text
 
@@ -272,21 +271,24 @@ class RepairEventStore:
             if ev.get("event") not in EVENTS:
                 raise ValueError(f"unknown repair event {ev.get('event')!r}")
         self._lock(conn, [ev["source_key"] for ev in events])
-        out: list[tuple[int, datetime]] = []
+        out: list[tuple[int, int]] = []
         for ev in events:
             # Provider errors embed request URLs, keys and tokens: nothing
             # reaches the table unredacted, whoever the caller.
             reason = redact_secrets(ev.get("reason"))
+            # The source's next number, under its lock: commit order.
             row = conn.execute(text(
                 f"INSERT INTO {EVENT_TABLE} (source_key, source_name, event, fingerprint, "
-                "reason, skip_until, strikes, occurred_at, release) "
-                "VALUES (:k, :n, :e, :f, :r, :u, :s, :o, :rel) RETURNING id, recorded_at"),
+                "reason, skip_until, strikes, occurred_at, release, seq) "
+                "VALUES (:k, :n, :e, :f, :r, :u, :s, :o, :rel, "
+                f"(SELECT COALESCE(MAX(seq), 0) + 1 FROM {EVENT_TABLE} WHERE source_key = :k)) "
+                "RETURNING id, seq"),
                 {"k": ev["source_key"], "n": ev["source_name"], "e": ev["event"],
                  "f": redact_secrets(ev.get("fingerprint")),
                  "r": None if reason is None else str(reason)[:300], "u": ev.get("skip_until"),
                  "s": ev.get("strikes"), "o": ev.get("occurred_at"), "rel": current_release()},
             ).one()
-            out.append((int(row[0]), _utc(row[1])))
+            out.append((int(row[0]), int(row[1])))
         return out
 
     def _read(self, where: str, params: dict[str, Any]) -> list[RepairEvent]:
@@ -295,8 +297,8 @@ class RepairEventStore:
         with self.engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT id, recorded_at, source_key, source_name, event, fingerprint, reason, "
-                f"skip_until, strikes, occurred_at FROM {EVENT_TABLE} WHERE {where} "
-                "ORDER BY recorded_at, id"),
+                f"skip_until, strikes, occurred_at, seq FROM {EVENT_TABLE} WHERE {where} "
+                "ORDER BY source_key, seq"),
                 params).fetchall()
         return [RepairEvent(*row) for row in rows]
 

@@ -295,8 +295,18 @@ class SourceCooldown:
         return self._sources.get(source.lower())
 
     def forget(self, source: str) -> None:
-        """Drop a source's state: an operator cleared its hold, so retry now."""
-        self._sources.pop(source.lower(), None)
+        """Drop a source's state: an operator cleared its hold, so retry now.
+
+        Matched on the repair code's normalized name (case, spaces and
+        hyphens as underscores), so a clear typed "Asset Registries" drops
+        the cooldown recorded as "Asset_Registries".
+        """
+        def norm(name: str) -> str:
+            return name.strip().lower().replace(" ", "_").replace("-", "_")
+
+        target = norm(source)
+        for key in [k for k in self._sources if norm(k) == target]:
+            del self._sources[key]
 
     def skipped_sources(self) -> list[str]:
         """Return sources currently in cooldown."""

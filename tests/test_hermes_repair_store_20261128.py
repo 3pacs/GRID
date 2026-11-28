@@ -69,7 +69,7 @@ def _fresh_memory(monkeypatch) -> None:
                         {"runs": {}, "good_at": None, "attempt_at": None, "failed_reads": 0})
     monkeypatch.setattr(hf, "_REPAIR_STORE", {"store": None, "engine": None, "restored": False,
                                               "clear_ids": set(), "cooldowns": None})
-    monkeypatch.setattr(hf, "_LAST_EVENT_AT", {})
+    monkeypatch.setattr(hf, "_LAST_EVENT_SEQ", {})
 
 
 @pytest.fixture(autouse=True)
@@ -112,10 +112,21 @@ class FakeStore:
                 len(self.events) + len(made) + 1, datetime.now(timezone.utc),
                 row["source_key"], row["source_name"], row["event"], row.get("fingerprint"),
                 None if reason is None else str(reason)[:300], row.get("skip_until"), row.get("strikes"),
-                row.get("occurred_at")))
+                row.get("occurred_at"), self._next_seq(row["source_key"], made)))
         self.events.extend(made)
         self.batches.append([ev.event for ev in made])
-        return [(ev.id, ev.recorded_at) for ev in made]
+        return [(ev.id, ev.seq) for ev in made]
+
+    def _next_seq(self, source_key, pending=()):
+        return 1 + max([e.seq for e in [*self.events, *pending] if e.source_key == source_key], default=0)
+
+    def commit(self, source_key, source_name, event, *, recorded_at=None, reason=None, seq=None):
+        """A row another writer committed, with the next seq unless one is given."""
+        ev = RepairEvent(len(self.events) + 1, recorded_at or datetime.now(timezone.utc), source_key,
+                         source_name, event, None, reason, None, None, None,
+                         self._next_seq(source_key) if seq is None else seq)
+        self.events.append(ev)
+        return ev
 
     from contextlib import contextmanager
 
@@ -311,7 +322,7 @@ def test_a_recovery_before_the_restart_is_still_a_recovery_after_it(monkeypatch,
 
 def test_the_restore_never_overwrites_what_this_process_already_holds(monkeypatch, table):
     table.events.append(RepairEvent(1, FAILED_AT, "s", "S", "long_skip", "x", "old skip",
-                                    datetime.now(timezone.utc) + timedelta(hours=5), 1))
+                                    datetime.now(timezone.utc) + timedelta(hours=5), 1, None, 1))
     hf._DETERMINISTIC_SKIPS["s"] = (time.monotonic() + 60, "this process's own skip")
     state = OperatorState()
     state.cooldowns.record_attempt("S", success=True)
@@ -365,9 +376,8 @@ def test_a_clear_stamped_before_the_restore_but_committed_after_it_is_applied(mo
     warnings = _warnings(monkeypatch)
     hf._sync_repair_store("the engine", OperatorState())
     hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")
-    late = RepairEvent(1, datetime.now(timezone.utc) - timedelta(minutes=2), "tiingo", "TIINGO",
-                       "cleared", None, "opened before the restore read")
-    table.events.append(late)
+    table.commit("tiingo", "TIINGO", "cleared", reason="opened before the restore read",
+                 recorded_at=datetime.now(timezone.utc) - timedelta(minutes=2))
     hf._sync_repair_store("the engine", OperatorState())
     assert "tiingo" not in hf._DETERMINISTIC_SKIPS
     assert sum("cleared by an operator" in w for w in warnings) == 1
@@ -377,46 +387,78 @@ def test_a_clear_stamped_eleven_minutes_before_the_start_and_committed_after_it_
     """No time floor: the whole replay window is rescanned for unseen clears."""
     hf._sync_repair_store("the engine", OperatorState())
     hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")
-    table.events.append(RepairEvent(1, datetime.now(timezone.utc) - timedelta(minutes=11), "tiingo", "TIINGO",
-                                    "cleared", None, "a transaction open across the restore"))
+    table.commit("tiingo", "TIINGO", "cleared", reason="a transaction open across the restore",
+                 recorded_at=datetime.now(timezone.utc) - timedelta(minutes=11))
     hf._sync_repair_store("the engine", OperatorState())
     assert "tiingo" not in hf._DETERMINISTIC_SKIPS
 
 
-def test_a_clear_older_than_the_sources_last_event_is_superseded_live_and_on_restart(monkeypatch, table):
-    """The race in its stored form: the clear's row is ordered before the
-    tripping failure and its skip. Live and replayed, the skip stands."""
+def test_a_clear_numbered_before_the_sources_last_event_is_superseded_live_and_on_restart(monkeypatch, table):
+    """Order is the source's seq. A clear whose number is below the trip's
+    (committed before it by a writer this process did not read) is
+    superseded live and in a replay alike: the skip stands."""
     hf._sync_repair_store("the engine", OperatorState())
-    early = datetime.now(timezone.utc) - timedelta(seconds=5)
     for _ in range(3):
         hf.note_repair_failure("TIINGO", REASON)
-    table.events.append(RepairEvent(len(table.events) + 1, early, "tiingo", "TIINGO", "cleared", None, "late commit"))
+    table.commit("tiingo", "TIINGO", "cleared", reason="numbered first", seq=3)  # below the long skip's 4
     hf._sync_repair_store("the engine", OperatorState())
     live = _tables()
-    assert "tiingo" in live["skips"], "superseded: the skip came after the clear"
-
+    assert "tiingo" in live["skips"]
     _restart(monkeypatch)
     hf._sync_repair_store("the engine", OperatorState())
     assert _tables() == live
 
 
-def test_after_a_restart_a_late_clear_older_than_the_restored_trip_is_superseded(monkeypatch, table):
-    """The restore seeds each source's newest stored event, so a clear that
-    becomes visible after the restart but is ordered before the trip does
-    not lift the skip, as a later cold replay would not."""
+@pytest.mark.parametrize("stamp", ["the same instant", "a second earlier"])
+def test_a_clear_committed_after_the_trip_lifts_it_whatever_its_timestamp(monkeypatch, table, stamp):
+    """Codex 6095402357 (2): wall time is not the order. A clear committed
+    after the trip, stamped at the same instant or a second earlier (a
+    clock step), lifts the skip live and after a restart."""
     hf._sync_repair_store("the engine", OperatorState())
-    early = datetime.now(timezone.utc) - timedelta(seconds=5)
+    for _ in range(3):
+        hf.note_repair_failure("TIINGO", REASON)
+    trip_at = table.events[-1].recorded_at
+    table.commit("tiingo", "TIINGO", "cleared", reason="after the trip",
+                 recorded_at=trip_at if stamp == "the same instant" else trip_at - timedelta(seconds=1))
+    hf._sync_repair_store("the engine", OperatorState())
+    live = _tables()
+    assert live["skips"] == {} and "tiingo" not in live["repeated"]
+    _restart(monkeypatch)
+    hf._sync_repair_store("the engine", OperatorState())
+    assert _tables() == live
+
+
+def test_after_a_restart_a_clear_numbered_before_the_restored_trip_is_superseded(monkeypatch, table):
+    hf._sync_repair_store("the engine", OperatorState())
     for _ in range(3):
         hf.note_repair_failure("TIINGO", REASON)
     _restart(monkeypatch)
     hf._sync_repair_store("the engine", OperatorState())
-    table.events.append(RepairEvent(len(table.events) + 1, early, "tiingo", "TIINGO", "cleared", None, "late"))
+    table.commit("tiingo", "TIINGO", "cleared", reason="numbered first", seq=3)  # below the long skip's 4
     hf._sync_repair_store("the engine", OperatorState())
     assert hf.repair_deterministically_blocked("TIINGO") is not None
     live = _tables()
     _restart(monkeypatch)
     hf._sync_repair_store("the engine", OperatorState())
     assert _tables() == live
+
+
+def test_a_clear_typed_with_spaces_drops_the_cooldown_recorded_with_underscores(monkeypatch, table, capsys):
+    """Codex 6095402357 (1): the clear command takes "Asset Registries"; the
+    live cooldown is "Asset_Registries". Both the durable state and the
+    cooldown are dropped."""
+    monkeypatch.setattr("db.get_engine", lambda: "the engine")
+    state = OperatorState()
+    hf._sync_repair_store("the engine", state)
+    for _ in range(3):
+        state.cooldowns.record_attempt("Asset_Registries", success=False, error="x")
+        hf.note_repair_failure("Asset_Registries", REASON)
+    assert state.cooldowns.can_retry("Asset_Registries") is False
+    assert store_mod.main(["clear", "Asset Registries", "--reason", "fixed upstream"]) == 0
+    hf._sync_repair_store("the engine", state)
+    assert hf.repair_deterministically_blocked("Asset_Registries") is None
+    assert state.cooldowns.get_status("Asset_Registries") is None
+    assert state.cooldowns.can_retry("Asset_Registries") is True
 
 
 def _count(source: str) -> int:
@@ -547,7 +589,7 @@ def test_live_and_replayed_bookkeeping_agree_after_every_step(monkeypatch, table
         hf._sync_repair_store("the engine", OperatorState())       # a pass applies new clears
         live = _tables()
         memory = {name: getattr(hf, name) for name in
-                  ("_REPEATED_FAILURES", "_DETERMINISTIC_SKIPS", "_REPAIR_RECOVERED_AT", "_LAST_EVENT_AT")}
+                  ("_REPEATED_FAILURES", "_DETERMINISTIC_SKIPS", "_REPAIR_RECOVERED_AT", "_LAST_EVENT_SEQ")}
         snapshot = {k: dict(v) for k, v in memory.items()}
         _restart(monkeypatch)
         hf._sync_repair_store("the engine", OperatorState())
@@ -714,10 +756,10 @@ def test_real_types_the_migration_creates_a_table_that_refuses_incomplete_rows(p
     real = store_mod.RepairEventStore(pg_engine)
     assert real.available()
     bad = [
-        ("INSERT INTO hermes_repair_events (source_key, source_name, event) VALUES ('s','S','repair_failed')", "fingerprint"),
-        ("INSERT INTO hermes_repair_events (source_key, source_name, event) VALUES ('s','S','long_skip')", "skip"),
-        ("INSERT INTO hermes_repair_events (source_key, source_name, event) VALUES ('s','S','cleared')", "reason"),
-        ("INSERT INTO hermes_repair_events (source_key, source_name, event, reason) VALUES ('s','S','other','x')", "event"),
+        ("INSERT INTO hermes_repair_events (source_key, source_name, event, seq) VALUES ('s','S','repair_failed', 1)", "fingerprint"),
+        ("INSERT INTO hermes_repair_events (source_key, source_name, event, seq) VALUES ('s','S','long_skip', 1)", "skip"),
+        ("INSERT INTO hermes_repair_events (source_key, source_name, event, seq) VALUES ('s','S','cleared', 1)", "reason"),
+        ("INSERT INTO hermes_repair_events (source_key, source_name, event, reason, seq) VALUES ('s','S','other','x', 1)", "event"),
     ]
     for sql, _why in bad:
         with pytest.raises(Exception, match="check constraint"):
@@ -872,8 +914,8 @@ def test_real_types_a_clear_that_commits_after_a_later_one_is_still_applied(pg_e
     slow_tx = slow.begin()
     try:                                                          # never leave the open transaction behind
         slow.execute(text(
-            "INSERT INTO hermes_repair_events (source_key, source_name, event, reason) "
-            "VALUES ('tiingo', 'TIINGO', 'cleared', 'first, slow to commit')"))
+            "INSERT INTO hermes_repair_events (source_key, source_name, event, reason, seq) "
+            "VALUES ('tiingo', 'TIINGO', 'cleared', 'first, slow to commit', 1)"))
         store_mod.RepairEventStore(pg_engine).record("cleared", "polygon", "polygon", reason="second")
         with pg_engine.connect() as conn:
             lower, higher = conn.execute(text(
@@ -943,7 +985,7 @@ def test_real_types_a_clear_racing_a_trip_on_one_source_is_read_alike_live_and_o
     assert held_live is held_replayed is clear_first
     with pg_engine.connect() as c:
         order = [r[0] for r in c.execute(text(
-            "SELECT event FROM hermes_repair_events ORDER BY recorded_at, id")).fetchall()]
+            "SELECT event FROM hermes_repair_events ORDER BY seq")).fetchall()]
     expected = ["cleared"] + ["repair_failed"] * 3 + ["long_skip"]
     assert order == (expected if clear_first else expected[1:] + ["cleared"])
 
@@ -957,8 +999,8 @@ def test_real_types_a_backdated_clear_committed_after_the_restore_is_applied(pg_
     tx = conn.begin()
     try:
         conn.execute(text(
-            "INSERT INTO hermes_repair_events (recorded_at, source_key, source_name, event, reason) "
-            "VALUES (clock_timestamp() - interval '11 minutes', 'tiingo', 'TIINGO', 'cleared', 'open')"))
+            "INSERT INTO hermes_repair_events (recorded_at, source_key, source_name, event, reason, seq) "
+            "VALUES (clock_timestamp() - interval '11 minutes', 'tiingo', 'TIINGO', 'cleared', 'open', 1)"))
         hf._sync_repair_store(pg_engine, state)                    # the restore cannot see it yet
         hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")
         tx.commit()
@@ -970,10 +1012,9 @@ def test_real_types_a_backdated_clear_committed_after_the_restore_is_applied(pg_
     assert "tiingo" not in hf._DETERMINISTIC_SKIPS
 
 
-def test_real_types_a_row_is_stamped_after_the_source_lock_not_at_its_transaction_start(pg_engine):
+def test_real_types_a_row_is_numbered_after_the_source_lock_not_at_its_transaction_start(pg_engine):
     """A repair transaction that began before a clear but wrote after it is
-    ordered after it: rows take clock_timestamp() once the source's lock is
-    held, never the transaction's start time."""
+    ordered after it: its seq is taken once the source's lock is held."""
     _upgrade(pg_engine)
     real = store_mod.RepairEventStore(pg_engine)
     conn = pg_engine.connect()
@@ -992,7 +1033,7 @@ def test_real_types_a_row_is_stamped_after_the_source_lock_not_at_its_transactio
         conn.close()
     with pg_engine.connect() as c:
         order = [r[0] for r in c.execute(text(
-            "SELECT event FROM hermes_repair_events ORDER BY recorded_at, id")).fetchall()]
+            "SELECT event FROM hermes_repair_events ORDER BY seq")).fetchall()]
     assert order == ["cleared", "repair_failed"]
 
 
@@ -1013,7 +1054,7 @@ def test_real_types_a_clear_between_failures_restarts_the_count_on_real_rows(pg_
     assert _tables() == live and live["skips"] == {}
     with pg_engine.connect() as c:
         assert [r[0] for r in c.execute(text(
-            "SELECT event FROM hermes_repair_events ORDER BY recorded_at, id")).fetchall()] == \
+            "SELECT event FROM hermes_repair_events ORDER BY seq")).fetchall()] == \
             ["repair_failed", "repair_failed", "cleared", "repair_failed"]
 
 
@@ -1116,7 +1157,7 @@ def test_real_types_a_pass_paused_while_applying_a_clear_cannot_let_a_failure_tr
     assert hf.repair_deterministically_blocked("TIINGO") is None
     with pg_engine.connect() as c:
         assert [r[0] for r in c.execute(text(
-            "SELECT event FROM hermes_repair_events ORDER BY recorded_at, id")).fetchall()] == \
+            "SELECT event FROM hermes_repair_events ORDER BY seq")).fetchall()] == \
             ["repair_failed", "repair_failed", "cleared", "repair_failed"]
     monkeypatch.setattr(hf, "_apply_clear", real_apply)
     live = _tables()
@@ -1139,8 +1180,41 @@ def test_a_pass_applies_each_clear_once_and_then_leaves_it(monkeypatch, table):
 def test_applying_a_clear_twice_changes_nothing_the_second_time(monkeypatch, table):
     hf._sync_repair_store("the engine", OperatorState())
     hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")
-    ev = RepairEvent(99, datetime.now(timezone.utc), "tiingo", "TIINGO", "cleared", None, "once")
+    ev = RepairEvent(99, datetime.now(timezone.utc), "tiingo", "TIINGO", "cleared", None, "once", None, None, None, 1)
     assert hf._apply_clear(ev, None) is True
     hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held again")
     assert hf._apply_clear(ev, None) is False
     assert "tiingo" in hf._DETERMINISTIC_SKIPS
+
+
+@pytest.mark.parametrize("stamp", ["the same instant", "a second earlier"])
+def test_real_types_a_clear_after_the_trip_lifts_it_whatever_its_timestamp(pg_engine, monkeypatch, stamp):
+    """Codex 6095402357 (2) on PostgreSQL: a clear committed after the trip
+    under the source's lock, stamped equal to the trip or a second before
+    it. The seq orders it after the trip, live and on restart."""
+    _upgrade(pg_engine)
+    hf._sync_repair_store(pg_engine, OperatorState())
+    for _ in range(3):
+        hf.note_repair_failure("TIINGO", REASON)
+    offset = "0 seconds" if stamp == "the same instant" else "1 second"
+    with pg_engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended('hermes_repair_events:tiingo', 0))"))
+        conn.execute(text(
+            "INSERT INTO hermes_repair_events (recorded_at, source_key, source_name, event, reason, seq) "
+            "SELECT max(recorded_at) - CAST(:off AS interval), 'tiingo', 'TIINGO', 'cleared', 'after', max(seq) + 1 "
+            "FROM hermes_repair_events WHERE source_key = 'tiingo'"), {"off": offset})
+    hf._sync_repair_store(pg_engine, OperatorState())
+    held_live = hf.repair_deterministically_blocked("TIINGO") is not None
+    _restart(monkeypatch)
+    hf._sync_repair_store(pg_engine, OperatorState())
+    assert held_live is False and hf.repair_deterministically_blocked("TIINGO") is None
+
+
+def test_real_types_two_rows_cannot_share_a_sources_number(pg_engine):
+    _upgrade(pg_engine)
+    store_mod.RepairEventStore(pg_engine).record("cleared", "tiingo", "TIINGO", reason="first")
+    with pytest.raises(Exception, match="uq_hermes_repair_events_source_seq"):
+        with pg_engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO hermes_repair_events (source_key, source_name, event, reason, seq) "
+                "VALUES ('tiingo', 'TIINGO', 'cleared', 'skipped the lock', 1)"))

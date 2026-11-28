@@ -290,10 +290,10 @@ _UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
 _REPAIR_STORE: dict[str, Any] = {
     "store": None, "engine": None, "restored": False, "clear_ids": set(), "cooldowns": None,
 }
-# source_key -> recorded_at of the newest stored event for it (written by this
+# source_key -> seq of the newest stored event for it (written by this
 # process or restored), in the store's per-source commit order. A clear older
 # than this is superseded, here as in the replay.
-_LAST_EVENT_AT: dict[str, datetime] = {}
+_LAST_EVENT_SEQ: dict[str, int] = {}
 # The last read of scheduled run times from pull_log. "runs": registry name
 # -> (runs longer than the repair cap, completed runs); "good_at": monotonic
 # time of the last read that succeeded (None: none yet); "attempt_at": of the
@@ -483,9 +483,9 @@ def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) 
             transition()
         return
     with _REPAIR_SCHEDULE_LOCK:
-        for _event_id, recorded_at in written:
-            if key not in _LAST_EVENT_AT or recorded_at > _LAST_EVENT_AT[key]:
-                _LAST_EVENT_AT[key] = recorded_at
+        for _event_id, seq in written:
+            if seq > _LAST_EVENT_SEQ.get(key, 0):
+                _LAST_EVENT_SEQ[key] = seq
 
 
 def _sync_repair_store(engine: Any, state: Any) -> None:
@@ -561,8 +561,8 @@ def _restore_repair_history(restored: Any, state: Any, now: datetime) -> dict[st
             if hist.recovered_at is not None and key not in _REPAIR_RECOVERED_AT:
                 _REPAIR_RECOVERED_AT[key] = hist.recovered_at
                 counts["recovered"] += 1
-            if hist.last_event_at is not None and key not in _LAST_EVENT_AT:
-                _LAST_EVENT_AT[key] = hist.last_event_at
+            if hist.last_seq and key not in _LAST_EVENT_SEQ:
+                _LAST_EVENT_SEQ[key] = hist.last_seq
     return counts
 
 
@@ -575,25 +575,21 @@ def _apply_clear(ev: Any, cooldowns: Any) -> bool:
     nothing. Returns True when it cleared.
 
     Recording the clear's id as seen and applying it are one step under one
-    lock, so nothing can find it seen and not yet applied. Applying a clear
-    again changes nothing: its own time is then the newest event, so it is
-    superseded.
+    lock, so nothing can find it seen and not yet applied. Order is the
+    source's ``seq`` (commit order), never wall time. Applying a clear again
+    changes nothing: its own ``seq`` is then the newest, so it is superseded.
     """
     key = ev.source_key
-    at = ev.recorded_at if ev.recorded_at.tzinfo else ev.recorded_at.replace(tzinfo=timezone.utc)
     with _REPAIR_SCHEDULE_LOCK:
         _REPAIR_STORE["clear_ids"].add(ev.id)
-        newest = _LAST_EVENT_AT.get(key)
-        if newest is not None and at <= newest:
-            superseded = True
-        else:
-            superseded = False
+        superseded = ev.seq <= _LAST_EVENT_SEQ.get(key, 0)
+        if not superseded:
             _REPEATED_FAILURES.pop(key, None)
             _DETERMINISTIC_SKIPS.pop(key, None)
-            _LAST_EVENT_AT[key] = at
+            _LAST_EVENT_SEQ[key] = ev.seq
     if superseded:
-        log.info("Operator clear of {s} at {t} is older than its last repair event; "
-                 "superseded, as a restart would read it", s=ev.source_name, t=at.isoformat())
+        log.info("Operator clear of {s} (seq {n}) is not after its last repair event; "
+                 "superseded, as a restart would read it", s=ev.source_name, n=ev.seq)
         return False
     if cooldowns is not None:
         cooldowns.forget(ev.source_name)
