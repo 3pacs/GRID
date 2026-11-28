@@ -7,6 +7,7 @@ averaged it into the lessons report and emitted it as realized_pnl.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 
@@ -40,11 +41,14 @@ class _FakeEngine:
 
 def _generate(monkeypatch, actual_return, outcome="LOSS"):
     row = (7, "SPY", "CALL", 700.0, "2026-12-18", 1.0, 2.0, 0.5, 0.6, "thesis",
-           json.dumps({}), "2026-11-20T16:00:00Z", outcome, actual_return, None, "", None, None)
+           json.dumps({}), "2026-11-20T16:00:00Z", outcome, actual_return,
+           datetime(2026, 11, 21, 21, 0, tzinfo=timezone.utc), "", None, None)
     seen: dict = {}
     stored: list = []
     emitted: list = []
     monkeypatch.setattr(pm_mod, "_ensure_tables", lambda _e: None)
+    # A known close inside the event window on a fixed clock: only a known recent miss emits (2026-11-27).
+    monkeypatch.setattr(pm_mod, "_utcnow", lambda: datetime(2026, 11, 27, 15, 0, tzinfo=timezone.utc))
     monkeypatch.setattr(pm_mod, "_reconstruct_decision_data", lambda _e, _t, _g, s, d: {})
     monkeypatch.setattr(pm_mod, "_load_price_path_with_source", lambda *_a, **_k: ([], None))
     monkeypatch.setattr(pm_mod, "_load_underlying_entry_spot", lambda *_a, **_k: (100.0, "fixture"))

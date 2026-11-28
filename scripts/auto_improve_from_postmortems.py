@@ -48,10 +48,17 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from db import get_engine
+from intelligence.postmortem import logical_miss_postmortems_sql, miss_on_or_after_sql
 
 
 _VAULT_SESSIONS = Path("/data/grid_obsidian/Sessions")
 _MIN_OCCURRENCES_FOR_SIGNAL = 50  # ignore tail noise
+# Every count below is a weighted count of logical misses (intelligence.postmortem.
+# logical_miss_postmortems_sql: each call weighs 1 in total, split across the models that made it;
+# duplicate rows dropped), not a count of postmortem rows, so the values can be fractional. The ticker
+# cluster needed 100 ROWS, which clones met easily; 100 distinct calls on one ticker in 30 days is
+# not reachable, so its minimum is 10 misses.
+_MIN_MISSES_FOR_TICKER_CLUSTER = 10
 
 # Postmortems written before this date used the pre-fix signal_adapter
 # that emitted regime signals (credit_cycle, vix_exposure, etc.) with
@@ -128,40 +135,38 @@ def _signal_ratios(conn) -> list[dict[str, Any]]:
             SELECT jsonb_array_elements_text(CASE
                 WHEN jsonb_typeof(signals_right::jsonb) = 'array'
                 THEN signals_right::jsonb ELSE '[]'::jsonb END) AS sig,
-                'right' AS side
-            FROM trade_postmortems
+                'right' AS side, miss_weight
+            FROM """ + logical_miss_postmortems_sql(miss_on_or_after_sql("CAST(:cutoff AS date)")) + """ tp
             WHERE signals_right IS NOT NULL
-              AND generated_at >= CAST(:cutoff AS date)
             UNION ALL
             SELECT jsonb_array_elements_text(CASE
                 WHEN jsonb_typeof(signals_wrong::jsonb) = 'array'
                 THEN signals_wrong::jsonb ELSE '[]'::jsonb END) AS sig,
-                'wrong' AS side
-            FROM trade_postmortems
+                'wrong' AS side, miss_weight
+            FROM """ + logical_miss_postmortems_sql(miss_on_or_after_sql("CAST(:cutoff AS date)")) + """ tp
             WHERE signals_wrong IS NOT NULL
-              AND generated_at >= CAST(:cutoff AS date)
         )
         SELECT sig,
-               SUM(CASE WHEN side='right' THEN 1 ELSE 0 END) AS right_ct,
-               SUM(CASE WHEN side='wrong' THEN 1 ELSE 0 END) AS wrong_ct
+               SUM(CASE WHEN side='right' THEN miss_weight ELSE 0 END) AS right_ct,
+               SUM(CASE WHEN side='wrong' THEN miss_weight ELSE 0 END) AS wrong_ct
         FROM s GROUP BY sig
-        HAVING SUM(CASE WHEN side='right' THEN 1 ELSE 0 END)
-             + SUM(CASE WHEN side='wrong' THEN 1 ELSE 0 END) >= :min_n
-        ORDER BY ABS(SUM(CASE WHEN side='right' THEN 1 ELSE 0 END)
-                  - SUM(CASE WHEN side='wrong' THEN 1 ELSE 0 END)) DESC
+        HAVING SUM(miss_weight) >= :min_n
+        ORDER BY ABS(SUM(CASE WHEN side='right' THEN miss_weight ELSE 0 END)
+                  - SUM(CASE WHEN side='wrong' THEN miss_weight ELSE 0 END)) DESC
     """), {
         "min_n": _MIN_OCCURRENCES_FOR_SIGNAL,
         "cutoff": _POSTMORTEM_CORPUS_CUTOFF,
     }).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
-        right_ct, wrong_ct = int(r[1] or 0), int(r[2] or 0)
+        # Weighted counts: misses, each call weighing 1 (logical_miss_postmortems_sql).
+        right_ct, wrong_ct = round(float(r[1] or 0), 2), round(float(r[2] or 0), 2)
         denom = wrong_ct if wrong_ct > 0 else 1
         out.append({
             "signal": r[0],
             "right_count": right_ct,
             "wrong_count": wrong_ct,
-            "right_minus_wrong": right_ct - wrong_ct,
+            "right_minus_wrong": round(right_ct - wrong_ct, 2),
             "right_to_wrong_ratio": round(right_ct / denom, 3),
         })
     return out
@@ -172,20 +177,20 @@ def _wrong_direction_tickers(conn) -> list[dict[str, Any]]:
     (top wrong-direction postmortem clusters)."""
     rows = conn.execute(text("""
         SELECT ticker,
-               COUNT(*) FILTER (WHERE outcome IN ('miss','wrong')) AS wrong_n,
-               COUNT(*) AS total_n,
+               COALESCE(SUM(miss_weight) FILTER (WHERE outcome IN ('miss','wrong')), 0) AS wrong_n,
+               SUM(miss_weight) AS total_n,
                STRING_AGG(DISTINCT failure_category, ', ' ORDER BY failure_category) AS categories
-        FROM trade_postmortems
+        FROM """ + logical_miss_postmortems_sql(miss_on_or_after_sql("NOW() - INTERVAL '30 days'")) + """ tp
         WHERE ticker IS NOT NULL
-          AND generated_at >= NOW() - INTERVAL '30 days'
         GROUP BY ticker
-        HAVING COUNT(*) >= 100
-        ORDER BY COUNT(*) FILTER (WHERE outcome IN ('miss','wrong'))::float / NULLIF(COUNT(*), 0) DESC
+        HAVING SUM(miss_weight) >= :min_n
+        ORDER BY COALESCE(SUM(miss_weight) FILTER (WHERE outcome IN ('miss','wrong')), 0)
+                 / NULLIF(SUM(miss_weight), 0) DESC NULLS LAST, ticker
         LIMIT 15
-    """)).fetchall()
+    """), {"min_n": _MIN_MISSES_FOR_TICKER_CLUSTER}).fetchall()
     return [
-        {"ticker": r[0], "wrong_n": int(r[1] or 0), "total_n": int(r[2] or 0),
-         "fail_rate": round((r[1] or 0) / max(r[2] or 1, 1), 3),
+        {"ticker": r[0], "wrong_n": round(float(r[1] or 0), 2), "total_n": round(float(r[2] or 0), 2),
+         "fail_rate": round(float(r[1] or 0) / max(float(r[2] or 0), 1e-9), 3),
          "categories": r[3]}
         for r in rows
     ]
@@ -194,20 +199,18 @@ def _wrong_direction_tickers(conn) -> list[dict[str, Any]]:
 def _anti_signal_override_clusters(conn) -> dict[str, Any]:
     """How many ``Anti-signals overridden`` postmortems exist? Has the
     cluster shrunk since the veto landed?"""
-    last_24h = int(conn.execute(text("""
-        SELECT COUNT(*) FROM trade_postmortems
+    last_24h = round(float(conn.execute(text("""
+        SELECT COALESCE(SUM(miss_weight), 0) FROM """ + logical_miss_postmortems_sql(miss_on_or_after_sql("NOW() - INTERVAL '24 hours'")) + """ tp
         WHERE root_cause LIKE 'Anti-signals warned%'
-          AND generated_at >= NOW() - INTERVAL '24 hours'
-    """)).scalar() or 0)
-    last_7d = int(conn.execute(text("""
-        SELECT COUNT(*) FROM trade_postmortems
+    """)).scalar() or 0), 2)
+    last_7d = round(float(conn.execute(text("""
+        SELECT COALESCE(SUM(miss_weight), 0) FROM """ + logical_miss_postmortems_sql(miss_on_or_after_sql("NOW() - INTERVAL '7 days'")) + """ tp
         WHERE root_cause LIKE 'Anti-signals warned%'
-          AND generated_at >= NOW() - INTERVAL '7 days'
-    """)).scalar() or 0)
-    total = int(conn.execute(text("""
-        SELECT COUNT(*) FROM trade_postmortems
+    """)).scalar() or 0), 2)
+    total = round(float(conn.execute(text("""
+        SELECT COALESCE(SUM(miss_weight), 0) FROM """ + logical_miss_postmortems_sql("TRUE") + """ tp
         WHERE root_cause LIKE 'Anti-signals warned%'
-    """)).scalar() or 0)
+    """)).scalar() or 0), 2)
     return {"last_24h": last_24h, "last_7d": last_7d, "total_all_time": total}
 
 
@@ -225,11 +228,11 @@ def _hypothesis_kill_reasons(conn) -> dict[str, int]:
 
 def _failure_categories(conn) -> dict[str, int]:
     rows = conn.execute(text("""
-        SELECT failure_category, COUNT(*) FROM trade_postmortems
-        WHERE generated_at >= NOW() - INTERVAL '30 days'
+        SELECT failure_category, SUM(miss_weight) FROM """ + logical_miss_postmortems_sql(miss_on_or_after_sql("NOW() - INTERVAL '30 days'")) + """ tp
         GROUP BY 1 ORDER BY 2 DESC
     """)).fetchall()
-    return {str(r[0] or "NULL"): int(r[1] or 0) for r in rows}
+    # Weighted: each call's models split its one weight across the categories they were given.
+    return {str(r[0] or "NULL"): round(float(r[1] or 0), 2) for r in rows}
 
 
 def build_advisory(engine) -> dict[str, Any]:

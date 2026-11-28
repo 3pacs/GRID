@@ -1,5 +1,11 @@
 """Fan-out batch_postmortem across the cluster's LLM nodes.
 
+Since 2026-11-27 the nightly batch records every failure of its window rule-based and
+narrates the newest in place, and ``scripts/postmortem_backfill.py`` records older ones;
+this runner is a second, LLM-inline path (``narrate=True``, a new row per failure). The
+store still writes at most one record per prediction or trade, so it cannot duplicate,
+but it bypasses the record-then-narrate order: prefer the two above.
+
 Each failed prediction needs an LLM call to generate the postmortem
 narrative. Sequential execution on a single LLM provider takes hours
 for the kind of batch we expect post-2026-05-15 (~100K failures).
