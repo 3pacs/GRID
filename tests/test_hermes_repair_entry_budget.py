@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import ast
 import __future__
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
@@ -67,6 +67,11 @@ def _load(source: str | None = None):
                  # source here is a scheduler registry entry.
                  "_slow_repair_reason": lambda source, engine: None,
                  "REPAIR_OVERRAN_REASON": "repair exceeded the per-source cap",
+                 # The durable repair store (2026-11-28): none here;
+                 # tests/test_hermes_repair_store_20261128.py covers it.
+                 "_sync_repair_store": lambda engine, state: None,
+                 "_transact": lambda _source, transition, **_k: transition(), "timedelta": timedelta,
+                 "redact_secrets": __import__("utils.redaction", fromlist=["redact_secrets"]).redact_secrets,
                  "_UNROUTED_FAILURES_REPORTED": {},
                  "UNROUTED_GUEST_REASON": "synthetic no-route reason"}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec",

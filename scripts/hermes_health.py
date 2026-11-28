@@ -238,12 +238,19 @@ class SourceCooldown:
     """Track per-source retry state to prevent retry spam."""
 
     def __init__(self) -> None:
-        # source_name → {last_attempt, consecutive_fails, last_error}
+        # canonical source key → {last_attempt, consecutive_fails, last_error}
         self._sources: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _key(source: str) -> str:
+        """One key per source, however it is spelled: the repair code's
+        normalized name (case, and spaces and hyphens as underscores), so
+        "Asset Registries" and "Asset_Registries" are one entry."""
+        return source.strip().lower().replace(" ", "_").replace("-", "_")
 
     def can_retry(self, source: str) -> bool:
         """Check if enough time has passed since last retry for this source."""
-        info = self._sources.get(source.lower())
+        info = self._sources.get(self._key(source))
         if info is None:
             return True
         last = info["last_attempt"]
@@ -262,7 +269,7 @@ class SourceCooldown:
 
     def record_attempt(self, source: str, success: bool, error: str | None = None) -> None:
         """Record a retry attempt result."""
-        key = source.lower()
+        key = self._key(source)
         info = self._sources.get(key, {"consecutive_fails": 0})
         info["last_attempt"] = datetime.now(timezone.utc)
         if success:
@@ -278,7 +285,7 @@ class SourceCooldown:
         """Blacklist a source for TIMEOUT_BLACKLIST_HOURS after it caused
         a cycle timeout. The source won't be retried until the blacklist
         expires. This prevents the same slow source from blocking every cycle."""
-        key = source.lower()
+        key = self._key(source)
         info = self._sources.get(key, {"consecutive_fails": 0})
         info["timeout_blacklisted"] = True
         info["blacklisted_until"] = (
@@ -292,16 +299,25 @@ class SourceCooldown:
         )
 
     def get_status(self, source: str) -> dict[str, Any] | None:
-        return self._sources.get(source.lower())
+        return self._sources.get(self._key(source))
+
+    def forget(self, source: str) -> None:
+        """Drop a source's state: an operator cleared its hold, so retry now.
+
+        One dictionary pop on the canonical key: no scan of the table, so an
+        attempt recorded for another source at the same moment cannot break
+        it, and a second call changes nothing.
+        """
+        self._sources.pop(self._key(source), None)
 
     def skipped_sources(self) -> list[str]:
         """Return sources currently in cooldown."""
-        return [s for s in self._sources if not self.can_retry(s)]
+        return [s for s in list(self._sources) if not self.can_retry(s)]
 
     def blacklisted_sources(self) -> list[dict[str, Any]]:
         """Return sources blacklisted due to timeout with expiry times."""
         result = []
-        for s, info in self._sources.items():
+        for s, info in list(self._sources.items()):
             if info.get("timeout_blacklisted"):
                 bl_until = info.get("blacklisted_until")
                 result.append({

@@ -327,6 +327,20 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_hermes_repair_slow_source_20261127.py -q -rA -k real_types
 
+      # Hermes repair history kept across restarts (scripts/hermes_repair_store.py,
+      # migration hermes_repair_events_20261128): the real migration and its
+      # constraints, the store round trip, and a long skip surviving a restart
+      # on real rows. The test fails instead of skipping when
+      # REQUIRE_HERMES_REPAIR_STORE_PG=1.
+      - name: Hermes repair history PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_HERMES_REPAIR_STORE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_hermes_repair_store_20261128.py -q -rA -k real_types
+
       - name: Pipeline health PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test

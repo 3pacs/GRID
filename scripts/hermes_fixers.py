@@ -21,11 +21,13 @@ import re
 import threading
 import time
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger as log
+
+from utils.redaction import redact_secrets
 
 from scripts.hermes_health import (
     OperatorState,
@@ -277,6 +279,21 @@ _REPAIR_RECOVERED_AT: dict[str, datetime] = {}
 # OPERATOR_ISSUE_DEDUPE_HOURS). Not persisted: the cost of a restart is one
 # log line per failing guest, and there is one guest today.
 _UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
+# Durable copy of the repeated-failure count, long skips, recoveries and
+# cooldowns (scripts/hermes_repair_store.py; table hermes_repair_events).
+# "store": the RepairEventStore in use (None: none yet, or the table is
+# absent); "engine": the engine it was opened on; "restored": whether this
+# process has read its history back (once); "clear_ids": the clear events
+# already looked at, each once.
+# "cooldowns": the pass's SourceCooldown (OperatorState.cooldowns), so a clear
+# applied inside a repair write drops the ordinary cooldown too.
+_REPAIR_STORE: dict[str, Any] = {
+    "store": None, "engine": None, "restored": False, "clear_ids": set(), "cooldowns": None,
+}
+# source_key -> seq of the newest stored event for it (written by this
+# process or restored), in the store's per-source commit order. A clear older
+# than this is superseded, here as in the replay.
+_LAST_EVENT_SEQ: dict[str, int] = {}
 # The last read of scheduled run times from pull_log. "runs": registry name
 # -> (runs longer than the repair cap, completed runs); "good_at": monotonic
 # time of the last read that succeeded (None: none yet); "attempt_at": of the
@@ -400,6 +417,186 @@ def _record_deterministic_failure(
     )
 
 
+def repair_rules() -> Any:
+    """The repeated-failure rule's numbers, for replaying stored history."""
+    from scripts.hermes_repair_store import Rules
+
+    return Rules(REPEATED_FAILURE_THRESHOLD, REPEATED_FAILURE_COOLDOWN_SECONDS,
+                 REPEATED_FAILURE_MAX_COOLDOWN_SECONDS)
+
+
+def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) -> None:
+    """Apply one repair transition for a source, and store its events, in the stored order.
+
+    ``transition`` updates the in-memory tables and returns the events to
+    store. With a store it runs inside one transaction holding the source's
+    lock (the store's per-source order), after any operator clear for the
+    source that this process has not applied yet: a clear that committed
+    since the last pass is part of the state the transition is computed
+    from, exactly where a replay would put it, so a failure after a clear
+    starts a new count instead of continuing the old one.
+
+    Such a clear drops the source's ordinary cooldown too, as every clear
+    does. The ordinary cooldown is process memory only (a restart starts
+    without one), so dropping it can only make the running process as
+    permissive as a restarted one, never stricter.
+
+    Best effort: if the store cannot be used the transition still runs in
+    memory and a throttled warning says the event is not stored.
+    """
+    from scripts.hermes_repair_store import LOOKBACK_DAYS
+
+    store = _REPAIR_STORE["store"]
+    if store is None:
+        transition()
+        return
+    key = _normalize_source_key(source_name)
+    applied = False
+    try:
+        with store.locked(key) as conn:
+            since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+            cleared = False
+            for ev in store.read_clears_for(conn, key, since):
+                cleared = _apply_clear(ev, None) or cleared
+            cooldowns = _REPAIR_STORE["cooldowns"]
+            if cleared and cooldowns is not None:
+                cooldowns.forget(source_name)
+            events = transition()
+            applied = True
+            rows = []
+            for ev in events:
+                row = dict(ev, source_key=key, source_name=source_name)
+                # Redacted here and again in RepairEventStore.insert: no key or
+                # token in a provider's error text reaches a stored row.
+                for name in ("reason", "fingerprint"):
+                    if row.get(name) is not None:
+                        row[name] = redact_secrets(row[name])
+                rows.append(row)
+            written = store.insert(conn, rows) if rows else []
+    except Exception as exc:
+        _warn_throttled(
+            "repair_store_write",
+            "Repair event not stored ({kind}); Hermes keeps it in memory only until restart",
+            kind=type(exc).__name__,
+        )
+        if not applied:
+            transition()
+        return
+    with _REPAIR_SCHEDULE_LOCK:
+        for _event_id, seq in written:
+            if seq > _LAST_EVENT_SEQ.get(key, 0):
+                _LAST_EVENT_SEQ[key] = seq
+
+
+def _sync_repair_store(engine: Any, state: Any) -> None:
+    """Open the durable repair store, restore from it once per process, and
+    on later passes apply operator clears recorded since.
+
+    Without the table (migration hermes_repair_events_20261128 not applied)
+    or on a failed read, the bookkeeping stays in memory as before, with one
+    throttled warning; the table is looked for again on the next pass.
+    """
+    from scripts.hermes_repair_store import LOOKBACK_DAYS, RepairEventStore, replay
+
+    _REPAIR_STORE["cooldowns"] = getattr(state, "cooldowns", None)
+    try:
+        if _REPAIR_STORE["restored"]:
+            if _REPAIR_STORE["engine"] is not engine:
+                _REPAIR_STORE.update(store=RepairEventStore(engine), engine=engine)
+            # The whole replay window, every pass: a clear can commit late
+            # with any earlier time, so no time floor is safe either.
+            since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+            store = _REPAIR_STORE["store"]
+            for ev in store.read_clears_since(since):
+                if ev.id in _REPAIR_STORE["clear_ids"]:
+                    continue
+                # Consumed under the source's store lock, which every
+                # transition for the source also holds (its own connection
+                # from any thread or process), so the clear is applied whole
+                # before or after each of them, never between its read of the
+                # clears and its rows.
+                with store.locked(ev.source_key):
+                    _apply_clear(ev, getattr(state, "cooldowns", None))
+            return
+        store = RepairEventStore(engine)
+        if not store.available():
+            _warn_throttled(
+                "repair_store_absent",
+                "hermes_repair_events is not present: repair counts, long skips and "
+                "recoveries are kept in memory only and a restart forgets them",
+            )
+            return
+        now = datetime.now(timezone.utc)
+        restored = replay(store.read_since(now - timedelta(days=LOOKBACK_DAYS)), now,
+                          rules=repair_rules())
+    except Exception as exc:
+        _warn_throttled(
+            "repair_store_read",
+            "Repair history not read ({kind}); repair bookkeeping is in memory only for now",
+            kind=type(exc).__name__,
+        )
+        return
+    counts = _restore_repair_history(restored, state, now)
+    _REPAIR_STORE.update(store=store, engine=engine, restored=True, clear_ids=set(restored.clear_ids))
+    log.info(
+        "Repair history restored from hermes_repair_events: {s} source(s), {k} long skip(s) "
+        "in force, {r} recovery time(s)",
+        s=len(restored.sources), k=counts["skips"], r=counts["recovered"],
+    )
+
+
+def _restore_repair_history(restored: Any, state: Any, now: datetime) -> dict[str, int]:
+    """Put replayed history into the in-memory tables, never over an entry
+    this process has already written."""
+    counts = {"skips": 0, "recovered": 0}
+    mono = time.monotonic()
+    with _REPAIR_SCHEDULE_LOCK:
+        for key, hist in restored.sources.items():
+            if hist.repeated is not None and key not in _REPEATED_FAILURES:
+                _REPEATED_FAILURES[key] = list(hist.repeated)
+            if hist.skip_until is not None and key not in _DETERMINISTIC_SKIPS:
+                remaining = (hist.skip_until - now).total_seconds()
+                _DETERMINISTIC_SKIPS[key] = (mono + remaining, (hist.skip_reason or "")[:300])
+                counts["skips"] += 1
+            if hist.recovered_at is not None and key not in _REPAIR_RECOVERED_AT:
+                _REPAIR_RECOVERED_AT[key] = hist.recovered_at
+                counts["recovered"] += 1
+            if hist.last_seq and key not in _LAST_EVENT_SEQ:
+                _LAST_EVENT_SEQ[key] = hist.last_seq
+    return counts
+
+
+def _apply_clear(ev: Any, cooldowns: Any) -> bool:
+    """Apply an operator clear where the stored order puts it.
+
+    A clear older than the newest event this process knows for the source
+    was followed by that event, so a replay would apply the clear first and
+    the later event on top of it: here it is superseded likewise and changes
+    nothing. Returns True when it cleared.
+
+    Recording the clear's id as seen and applying it are one step under one
+    lock, so nothing can find it seen and not yet applied. Order is the
+    source's ``seq`` (commit order), never wall time. Applying a clear again
+    changes nothing: its own ``seq`` is then the newest, so it is superseded.
+    """
+    key = ev.source_key
+    with _REPAIR_SCHEDULE_LOCK:
+        _REPAIR_STORE["clear_ids"].add(ev.id)
+        superseded = ev.seq <= _LAST_EVENT_SEQ.get(key, 0)
+        if not superseded:
+            _REPEATED_FAILURES.pop(key, None)
+            _DETERMINISTIC_SKIPS.pop(key, None)
+            _LAST_EVENT_SEQ[key] = ev.seq
+    if superseded:
+        log.info("Operator clear of {s} (seq {n}) is not after its last repair event; "
+                 "superseded, as a restart would read it", s=ev.source_name, n=ev.seq)
+        return False
+    if cooldowns is not None:
+        cooldowns.forget(ev.source_name)
+    log.warning("Repair hold on {s} cleared by an operator: {r}", s=ev.source_name, r=ev.reason or "")
+    return True
+
+
 def note_repair_failure(source_name: str, reason: str) -> bool:
     """Count a failed (not-recovered) repair; True if it triggered a long skip.
 
@@ -407,38 +604,61 @@ def note_repair_failure(source_name: str, reason: str) -> bool:
     (digits normalized, so "5 of 5 items" == "4 of 4 items") put the source
     on a deterministic skip of REPEATED_FAILURE_COOLDOWN_SECONDS, doubling
     for each further long skip up to REPEATED_FAILURE_MAX_COOLDOWN_SECONDS.
-    A different reason restarts the count; note_repair_recovered clears it.
+    A different reason restarts the count; note_repair_recovered and an
+    operator clear clear it. Stored through _transact, so the count is taken
+    after any clear the store orders before this failure.
     """
     key = _normalize_source_key(source_name)
-    fingerprint = re.sub(r"\d+", "N", str(reason or ""))[:200]
-    with _REPAIR_SCHEDULE_LOCK:
-        entry = _REPEATED_FAILURES.get(key)
-        if entry is None or entry[0] != fingerprint:
-            strikes = entry[2] if entry is not None else 0
-            entry = _REPEATED_FAILURES[key] = [fingerprint, 0, strikes]
-        entry[1] += 1
-        if entry[1] < REPEATED_FAILURE_THRESHOLD:
-            return False
-        cooldown = min(
-            REPEATED_FAILURE_COOLDOWN_SECONDS * (2 ** entry[2]),
-            REPEATED_FAILURE_MAX_COOLDOWN_SECONDS,
-        )
-        count = entry[1]
-        entry[1] = 0
-        entry[2] += 1
-    _record_deterministic_failure(
-        source_name,
-        f"same failure {count}x in a row: {str(reason or '')[:160]}",
-        cooldown_s=cooldown,
-    )
-    return True
+    # Redacted first: the stored rows carry no secret (hermes_repair_store),
+    # and a restart must compare the next failure with the same text.
+    fingerprint = re.sub(r"\d+", "N", redact_secrets(str(reason or "")))[:200]
+    outcome = {"tripped": False}
+
+    def transition() -> list[dict[str, Any]]:
+        with _REPAIR_SCHEDULE_LOCK:
+            entry = _REPEATED_FAILURES.get(key)
+            if entry is None or entry[0] != fingerprint:
+                strikes = entry[2] if entry is not None else 0
+                entry = _REPEATED_FAILURES[key] = [fingerprint, 0, strikes]
+            entry[1] += 1
+            tripped = entry[1] >= REPEATED_FAILURE_THRESHOLD
+            if tripped:
+                cooldown = min(
+                    REPEATED_FAILURE_COOLDOWN_SECONDS * (2 ** entry[2]),
+                    REPEATED_FAILURE_MAX_COOLDOWN_SECONDS,
+                )
+                count = entry[1]
+                entry[1] = 0
+                entry[2] += 1
+                strikes = entry[2]
+        failed = dict(event="repair_failed", fingerprint=fingerprint, reason=str(reason or ""))
+        outcome["tripped"] = tripped
+        if not tripped:
+            return [failed]
+        skip_reason = f"same failure {count}x in a row: {redact_secrets(str(reason or ''))[:160]}"
+        _record_deterministic_failure(source_name, skip_reason, cooldown_s=cooldown)
+        # One transaction: a crash cannot store the tripping failure without its skip.
+        return [failed, dict(
+            event="long_skip", fingerprint=fingerprint, reason=skip_reason,
+            skip_until=datetime.now(timezone.utc) + timedelta(seconds=cooldown), strikes=strikes,
+        )]
+
+    _transact(source_name, transition)
+    return outcome["tripped"]
 
 
 def note_repair_recovered(source_name: str) -> None:
     key = _normalize_source_key(source_name)
-    with _REPAIR_SCHEDULE_LOCK:
-        _REPEATED_FAILURES.pop(key, None)
-        _REPAIR_RECOVERED_AT[key] = datetime.now(timezone.utc)
+
+    def transition() -> list[dict[str, Any]]:
+        recovered_at = datetime.now(timezone.utc)
+        with _REPAIR_SCHEDULE_LOCK:
+            _REPEATED_FAILURES.pop(key, None)
+            _REPAIR_RECOVERED_AT[key] = recovered_at
+        # The same instant, so a restart compares it with a failure time exactly as this process did.
+        return [dict(event="recovered", occurred_at=recovered_at)]
+
+    _transact(source_name, transition)
 
 
 def _recovered_after(source_name: str, last_fail: Any) -> bool:
@@ -2681,6 +2901,9 @@ def diagnose_and_fix_pulls(
     if not dry_run:
         deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
         my_token = _next_diagnostics_token()
+    # Before any hold is read: a restart resumes the counts, long skips,
+    # recoveries and cooldowns it had (scripts/hermes_repair_store.py).
+    _sync_repair_store(engine, state)
 
     from sqlalchemy import text
     result: dict[str, Any] = {
