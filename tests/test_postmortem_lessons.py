@@ -66,7 +66,9 @@ class TestGenerateLabel:
         result = pml._generate(MagicMock(), n=5, days=30)
 
         assert result["count"] == 3
-        assert result["label"] == "LLM summary of 3 postmortems dated 2026-09-01 to 2026-09-05"
+        # Since 2026-11-27 the label also says how many are narrated and how many rule-based.
+        assert result["label"] == ("LLM summary of 3 postmortems dated 2026-09-01 to 2026-09-05"
+                                   " (3 narrated, 0 rule-based: classified by rule, not a proven cause)")
         llm_mock.assert_called_once()
 
     def test_empty_window_never_calls_the_llm(self, monkeypatch):

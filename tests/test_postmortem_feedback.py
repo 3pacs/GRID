@@ -425,15 +425,15 @@ def test_missing_edge_counts_as_skipped() -> None:
 # ── batch_postmortem limit param ──────────────────────────────────────────
 
 
-def test_batch_postmortem_limit_param_caps_per_source():
-    """The optional ``limit`` argument should be threaded into both
-    SQL queries (trades + predictions). When provided, each source pool
-    is capped at ``limit`` rows so cron runs stay bounded.
+def test_batch_postmortem_limit_caps_narration_and_recording_is_bounded_separately():
+    """Since 2026-11-27 ``limit`` caps the rows NARRATED per run (the LLM phase). The record
+    phase selects every unrecorded failure in the window, bounded per source by
+    RECORD_PHASE_MAX_ROWS; ``limit`` <= 0 means no narration cap (the old off-switch).
     """
     from unittest.mock import MagicMock, patch
+    import intelligence.postmortem as pm_mod
     from intelligence.postmortem import batch_postmortem
 
-    # Spy on the two query strings + bind params.
     captured: list[dict] = []
 
     class _SpyConn:
@@ -442,9 +442,9 @@ def test_batch_postmortem_limit_param_caps_per_source():
         def __exit__(self, *args):
             return False
         def execute(self, sql, params=None):
-            captured.append({"sql": str(sql), "params": dict(params or {})})
+            captured.append({"sql": " ".join(str(sql).split()), "params": dict(params or {})})
             result = MagicMock()
-            result.fetchall.return_value = []  # no rows → loop body skipped
+            result.fetchall.return_value = []  # no rows → loop bodies skipped
             return result
 
     class _SpyEngine:
@@ -453,45 +453,26 @@ def test_batch_postmortem_limit_param_caps_per_source():
         def connect(self):
             return _SpyConn()
 
+    def _calls():
+        record = [c for c in captured
+                  if (c["sql"].startswith("SELECT id FROM options_recommendations")
+                      or c["sql"].startswith("SELECT id FROM (SELECT"))]
+        narrate = [c for c in captured if c["sql"].startswith("SELECT tp.id")]
+        return record, narrate
+
     with patch("intelligence.postmortem._ensure_tables"):
-        # First: no limit → SQL should NOT contain LIMIT, params should
-        # NOT carry "lim".
-        batch_postmortem(_SpyEngine(), days=30)
-        # The DDL/ensure path may also call execute; filter to the trade
-        # + pred SELECTs by SQL contents.
-        # The bounded "still waiting" COUNT queries (their own LIMIT 1001, #959 budget follow-up) are not
-        # the batch selections this test is about.
-        select_calls = [c for c in captured
-                        if ("FROM options_recommendations" in c["sql"] or "FROM oracle_predictions" in c["sql"])
-                        and not c["sql"].strip().startswith("SELECT COUNT(*) FROM (")]
-        assert len(select_calls) == 2  # one trades, one predictions
-        for call in select_calls:
-            assert "LIMIT" not in call["sql"].upper()
-            assert "lim" not in call["params"]
-
-        # Now: limit=20 → both SELECTs gain LIMIT :lim and params carry lim=20.
-        captured.clear()
-        batch_postmortem(_SpyEngine(), days=30, limit=20)
-        # The bounded "still waiting" COUNT queries (their own LIMIT 1001, #959 budget follow-up) are not
-        # the batch selections this test is about.
-        select_calls = [c for c in captured
-                        if ("FROM options_recommendations" in c["sql"] or "FROM oracle_predictions" in c["sql"])
-                        and not c["sql"].strip().startswith("SELECT COUNT(*) FROM (")]
-        assert len(select_calls) == 2
-        for call in select_calls:
-            assert "LIMIT :lim" in call["sql"]
-            assert call["params"].get("lim") == 20
-
-        # Edge: limit=0 (or negative) → behave like no limit (off-switch).
-        captured.clear()
-        batch_postmortem(_SpyEngine(), days=30, limit=0)
-        # The bounded "still waiting" COUNT queries (their own LIMIT 1001, #959 budget follow-up) are not
-        # the batch selections this test is about.
-        select_calls = [c for c in captured
-                        if ("FROM options_recommendations" in c["sql"] or "FROM oracle_predictions" in c["sql"])
-                        and not c["sql"].strip().startswith("SELECT COUNT(*) FROM (")]
-        for call in select_calls:
-            assert "LIMIT" not in call["sql"].upper()
+        for limit, expect_lim in ((None, None), (20, 20), (0, None), (-3, None)):
+            captured.clear()
+            batch_postmortem(_SpyEngine(), days=30, limit=limit)
+            record, narrate = _calls()
+            assert len(record) == 2  # one trades, one predictions
+            for call in record:
+                assert "LIMIT :rec_lim" in call["sql"]
+                assert call["params"]["rec_lim"] == pm_mod.RECORD_PHASE_MAX_ROWS
+                assert "lim" not in call["params"]
+            assert len(narrate) == 1
+            assert narrate[0]["params"].get("lim") == expect_lim
+            assert ("LIMIT :lim" in narrate[0]["sql"]) is (expect_lim is not None)
 
 
 def test_hermes_daily_postmortem_batch_is_bounded():
