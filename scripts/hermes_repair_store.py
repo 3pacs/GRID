@@ -22,11 +22,19 @@ append-only log of four events per source:
 
 On its first pass after a start Hermes reads the last LOOKBACK_DAYS and
 replays them (``replay``) with the same rules as the live code, so it resumes
-with the same counts, skips and recovery times it had. A running Hermes also
-applies a new ``cleared`` event on its next pass: each pass reads every clear
-recorded since shortly before its restore and applies the ones it has not
-applied yet, by id, so a clear whose transaction commits after a later one is
-still seen (an id is not a commit order).
+with the same counts, skips and recovery times it had.
+
+One order, live and replayed. Every write for a source takes that source's
+transaction advisory lock first, and its rows are stamped with
+``clock_timestamp()`` after the lock, so for one source the order of
+``recorded_at`` is the order of commits: a clear that starts first but
+commits last is ordered last, and a repair write that waits on an open clear
+is ordered after it. The replay orders by (``recorded_at``, ``id``). A
+running Hermes applies a ``cleared`` event on its next pass only when it is
+newer than the latest event it knows for that source, which is exactly where
+a replay would place it; an older clear is superseded in both. Each pass
+reads every clear in the replay window it has not yet looked at, so a clear
+that commits late (whatever its time) is still seen.
 
 The failure that trips a long skip and the long skip are written in one
 transaction. A history that still shows the threshold reached with no long
@@ -60,9 +68,7 @@ EVENTS = ("repair_failed", "recovered", "long_skip", "cleared")
 # Longer than the longest long skip (7 days), so a skip in force and the
 # count that led to it are both read back.
 LOOKBACK_DAYS = 8
-# A clear is looked for this far before the restore read, so one whose
-# transaction was still open when the restore read the table is not missed.
-CLEAR_RESCAN_MARGIN = timedelta(minutes=10)
+LOCK_TIMEOUT_MS = 2000
 STATEMENT_TIMEOUT_MS = 2000
 _REPO = Path(__file__).resolve().parents[1]
 _RELEASE: dict[str, str | None] = {}
@@ -93,6 +99,7 @@ class RepairEvent:
     reason: str | None = None
     skip_until: datetime | None = None
     strikes: int | None = None
+    occurred_at: datetime | None = None
 
 
 @dataclass
@@ -107,6 +114,7 @@ class SourceHistory:
     last_attempt: datetime | None = None
     consecutive_fails: int = 0
     last_error: str | None = None
+    last_event_at: datetime | None = None    # the newest stored event for the source, in stored order
 
 
 @dataclass
@@ -156,6 +164,7 @@ def replay(events: list[RepairEvent], now: datetime, *, rules: Rules) -> Replaye
         hist = out.sources.setdefault(ev.source_key, SourceHistory(source_name=ev.source_name))
         hist.source_name = ev.source_name
         at = _utc(ev.recorded_at)
+        hist.last_event_at = at
         if ev.event == "repair_failed":
             entry = hist.repeated
             if entry is None or entry[0] != ev.fingerprint:
@@ -177,12 +186,12 @@ def replay(events: list[RepairEvent], now: datetime, *, rules: Rules) -> Replaye
             hist.skip_until, hist.skip_reason = _utc(ev.skip_until), ev.reason
         elif ev.event == "recovered":
             hist.repeated = None
-            hist.recovered_at = at
+            hist.recovered_at = _utc(ev.occurred_at) or at
             hist.last_attempt, hist.consecutive_fails, hist.last_error = at, 0, None
         elif ev.event == "cleared":
             out.clear_ids.add(ev.id)
             out.sources[ev.source_key] = SourceHistory(
-                source_name=ev.source_name, recovered_at=hist.recovered_at,
+                source_name=ev.source_name, recovered_at=hist.recovered_at, last_event_at=at,
             )
     now_utc = _utc(now)
     for hist in out.sources.values():
@@ -202,24 +211,34 @@ class RepairEventStore:
         from sqlalchemy import text
 
         with self.engine.connect() as conn:
-            return bool(conn.execute(
+            # Exactly True: anything else (NULL, a stand-in object) is "not
+            # known to be there", and Hermes keeps its bookkeeping in memory.
+            return conn.execute(
                 text("SELECT to_regclass(:t) IS NOT NULL"), {"t": EVENT_TABLE},
-            ).scalar())
+            ).scalar() is True
 
     def record(
         self, event: str, source_key: str, source_name: str, *,
         fingerprint: str | None = None, reason: str | None = None,
         skip_until: datetime | None = None, strikes: int | None = None,
-        recorded_at: datetime | None = None,
+        occurred_at: datetime | None = None,
     ) -> int:
-        """Append one event; ``recorded_at`` defaults to the database clock."""
+        """Append one event; returns its id."""
         return self.record_many([dict(
             event=event, source_key=source_key, source_name=source_name, fingerprint=fingerprint,
-            reason=reason, skip_until=skip_until, strikes=strikes, recorded_at=recorded_at,
-        )])[0]
+            reason=reason, skip_until=skip_until, strikes=strikes, occurred_at=occurred_at,
+        )])[0][0]
 
-    def record_many(self, events: list[dict[str, Any]]) -> list[int]:
-        """Append events in one transaction: all of them are stored or none."""
+    def record_many(self, events: list[dict[str, Any]]) -> list[tuple[int, datetime]]:
+        """Append events in one transaction: all of them are stored or none.
+
+        Returns (id, recorded_at) per event, in the order given.
+        """
+        with self.engine.begin() as conn:
+            return self.insert(conn, events)
+
+    def insert(self, conn: Any, events: list[dict[str, Any]]) -> list[tuple[int, datetime]]:
+        """Insert on the caller's transaction, after the per-source locks."""
         from sqlalchemy import text
 
         from utils.redaction import redact_secrets
@@ -227,24 +246,29 @@ class RepairEventStore:
         for ev in events:
             if ev.get("event") not in EVENTS:
                 raise ValueError(f"unknown repair event {ev.get('event')!r}")
-        ids: list[int] = []
-        with self.engine.begin() as conn:
-            conn.execute(text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}"))
-            for ev in events:
-                # Provider errors embed request URLs, keys and tokens: nothing
-                # reaches the table unredacted, whoever the caller.
-                reason = redact_secrets(ev.get("reason"))
-                ids.append(int(conn.execute(text(
-                    f"INSERT INTO {EVENT_TABLE} (recorded_at, source_key, source_name, event, "
-                    "fingerprint, reason, skip_until, strikes, release) "
-                    "VALUES (COALESCE(CAST(:at AS TIMESTAMPTZ), NOW()), :k, :n, :e, :f, :r, :u, :s, :rel) "
-                    "RETURNING id"),
-                    {"at": ev.get("recorded_at"), "k": ev["source_key"], "n": ev["source_name"],
-                     "e": ev["event"], "f": redact_secrets(ev.get("fingerprint")),
-                     "r": None if reason is None else str(reason)[:300], "u": ev.get("skip_until"),
-                     "s": ev.get("strikes"), "rel": current_release()},
-                ).scalar()))
-        return ids
+        conn.execute(text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}"))
+        conn.execute(text(f"SET LOCAL lock_timeout = {int(LOCK_TIMEOUT_MS)}"))
+        for key in sorted({ev["source_key"] for ev in events}):
+            # One writer per source at a time, held to commit, so the rows'
+            # clock_timestamp() order is that source's commit order.
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+                         {"k": f"{EVENT_TABLE}:{key}"})
+        out: list[tuple[int, datetime]] = []
+        for ev in events:
+            # Provider errors embed request URLs, keys and tokens: nothing
+            # reaches the table unredacted, whoever the caller.
+            reason = redact_secrets(ev.get("reason"))
+            row = conn.execute(text(
+                f"INSERT INTO {EVENT_TABLE} (source_key, source_name, event, fingerprint, "
+                "reason, skip_until, strikes, occurred_at, release) "
+                "VALUES (:k, :n, :e, :f, :r, :u, :s, :o, :rel) RETURNING id, recorded_at"),
+                {"k": ev["source_key"], "n": ev["source_name"], "e": ev["event"],
+                 "f": redact_secrets(ev.get("fingerprint")),
+                 "r": None if reason is None else str(reason)[:300], "u": ev.get("skip_until"),
+                 "s": ev.get("strikes"), "o": ev.get("occurred_at"), "rel": current_release()},
+            ).one()
+            out.append((int(row[0]), _utc(row[1])))
+        return out
 
     def _read(self, where: str, params: dict[str, Any]) -> list[RepairEvent]:
         from sqlalchemy import text
@@ -252,7 +276,8 @@ class RepairEventStore:
         with self.engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT id, recorded_at, source_key, source_name, event, fingerprint, reason, "
-                f"skip_until, strikes FROM {EVENT_TABLE} WHERE {where} ORDER BY recorded_at, id"),
+                f"skip_until, strikes, occurred_at FROM {EVENT_TABLE} WHERE {where} "
+                "ORDER BY recorded_at, id"),
                 params).fetchall()
         return [RepairEvent(*row) for row in rows]
 
@@ -260,8 +285,9 @@ class RepairEventStore:
         return self._read("recorded_at > :since", {"since": since})
 
     def read_clears_since(self, since: datetime) -> list[RepairEvent]:
-        """Every clear recorded after ``since``. The caller applies each id
-        once; an id is not a commit order, so no id watermark is kept."""
+        """Every clear recorded after ``since``. The caller looks at each id
+        once; neither an id nor a time is a watermark, since a clear can
+        commit after later rows are visible."""
         return self._read("event = 'cleared' AND recorded_at > :since", {"since": since})
 
 

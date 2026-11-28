@@ -14,6 +14,12 @@ explicit clear an operator records; on the first pass after a start Hermes
 reads the last eight days back. Without the table Hermes behaves as before,
 in memory only.
 
+Order: each writer takes a per-source transaction advisory lock before it
+inserts, and ``recorded_at`` defaults to ``clock_timestamp()``, the time
+after that lock, so for one source the stored order is the commit order.
+``occurred_at`` is the instant the live code acted on (a recovery's time,
+which a restart compares with failure times exactly as the process did).
+
 The table is append-only for every role: a trigger refuses UPDATE, DELETE
 and TRUNCATE, and ``grid`` is granted SELECT and INSERT only. Retention is not
 automatic; the rows are small (one per counted failed repair, long skip,
@@ -37,7 +43,8 @@ def upgrade():
     op.execute("""
         CREATE TABLE IF NOT EXISTS hermes_repair_events (
             id           BIGSERIAL PRIMARY KEY,
-            recorded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            recorded_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            occurred_at  TIMESTAMPTZ,
             source_key   TEXT NOT NULL,
             source_name  TEXT NOT NULL,
             event        TEXT NOT NULL
@@ -55,6 +62,10 @@ def upgrade():
     op.execute(
         "CREATE INDEX IF NOT EXISTS idx_hermes_repair_events_recorded "
         "ON hermes_repair_events (recorded_at)"
+    )
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hermes_repair_events_clears "
+        "ON hermes_repair_events (recorded_at) WHERE event = 'cleared'"
     )
     # Append-only for every role, the owner included: a row is history, and
     # rewriting one would change what a restart restores. Grants alone do not
