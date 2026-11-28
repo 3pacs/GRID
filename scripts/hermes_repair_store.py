@@ -58,6 +58,8 @@ caller logs the failure (throttled).
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -237,6 +239,41 @@ class RepairEventStore:
         with self.engine.begin() as conn:
             return self.insert(conn, events)
 
+    @staticmethod
+    def _lock(conn: Any, source_keys: Any) -> None:
+        from sqlalchemy import text
+
+        conn.execute(text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}"))
+        conn.execute(text(f"SET LOCAL lock_timeout = {int(LOCK_TIMEOUT_MS)}"))
+        for key in sorted(set(source_keys)):
+            # One writer per source at a time, held to commit, so the rows'
+            # clock_timestamp() order is that source's commit order.
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+                         {"k": f"{EVENT_TABLE}:{key}"})
+
+    @contextmanager
+    def locked(self, source_key: str) -> Iterator[Any]:
+        """A transaction holding ``source_key``'s lock until it commits.
+
+        Inside it, every clear for the source that has committed is visible
+        (a clear in progress holds the same lock), so state read here and
+        rows written here sit at one point in the source's stored order.
+        """
+        with self.engine.begin() as conn:
+            self._lock(conn, [source_key])
+            yield conn
+
+    def read_clears_for(self, conn: Any, source_key: str, since: datetime) -> list[RepairEvent]:
+        """The source's clears after ``since``, on the caller's (locked) transaction."""
+        from sqlalchemy import text
+
+        rows = conn.execute(text(
+            "SELECT id, recorded_at, source_key, source_name, event, fingerprint, reason, "
+            f"skip_until, strikes, occurred_at FROM {EVENT_TABLE} "
+            "WHERE event = 'cleared' AND source_key = :k AND recorded_at > :since "
+            "ORDER BY recorded_at, id"), {"k": source_key, "since": since}).fetchall()
+        return [RepairEvent(*row) for row in rows]
+
     def insert(self, conn: Any, events: list[dict[str, Any]]) -> list[tuple[int, datetime]]:
         """Insert on the caller's transaction, after the per-source locks."""
         from sqlalchemy import text
@@ -246,13 +283,7 @@ class RepairEventStore:
         for ev in events:
             if ev.get("event") not in EVENTS:
                 raise ValueError(f"unknown repair event {ev.get('event')!r}")
-        conn.execute(text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}"))
-        conn.execute(text(f"SET LOCAL lock_timeout = {int(LOCK_TIMEOUT_MS)}"))
-        for key in sorted({ev["source_key"] for ev in events}):
-            # One writer per source at a time, held to commit, so the rows'
-            # clock_timestamp() order is that source's commit order.
-            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
-                         {"k": f"{EVENT_TABLE}:{key}"})
+        self._lock(conn, [ev["source_key"] for ev in events])
         out: list[tuple[int, datetime]] = []
         for ev in events:
             # Provider errors embed request URLs, keys and tokens: nothing

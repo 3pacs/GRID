@@ -113,6 +113,21 @@ class FakeStore:
         self.batches.append([ev.event for ev in made])
         return [(ev.id, ev.recorded_at) for ev in made]
 
+    from contextlib import contextmanager
+
+    @contextmanager
+    def locked(self, source_key):
+        if self.fail_writes:
+            raise RuntimeError("connection reset")
+        yield "the transaction"
+
+    def read_clears_for(self, _conn, source_key, since):
+        return [e for e in self.events if e.event == "cleared" and e.source_key == source_key
+                and e.recorded_at > since]
+
+    def insert(self, _conn, rows):
+        return self.record_many(rows)
+
     def read_since(self, since):
         self.reads += 1
         if self.fail_reads:
@@ -405,11 +420,53 @@ def test_after_a_restart_a_late_clear_older_than_the_restored_trip_is_superseded
     assert _tables() == live
 
 
+def _count(source: str) -> int:
+    entry = hf._REPEATED_FAILURES.get(hf._normalize_source_key(source))
+    return 0 if entry is None else entry[1]
+
+
+def test_a_clear_committed_between_two_failures_restarts_the_count_before_the_next_pass(monkeypatch, table):
+    """Codex 6094982867, first path: failure, a committed clear, a failure,
+    no pass in between. The second failure is counted after the clear."""
+    hf._sync_repair_store("the engine", OperatorState())
+    hf.note_repair_failure("TIINGO", REASON)
+    table.record("cleared", "tiingo", "TIINGO", reason="between polls")
+    hf.note_repair_failure("TIINGO", REASON)
+    assert _count("TIINGO") == 1
+    hf._sync_repair_store("the engine", OperatorState())             # the next pass changes nothing
+    live = _tables()
+    assert live["repeated"]["tiingo"][1] == 1
+
+    _restart(monkeypatch)
+    hf._sync_repair_store("the engine", OperatorState())
+    assert _tables() == live
+
+
+def test_a_clear_between_two_failures_and_a_third_does_not_trip_a_long_skip(monkeypatch, table):
+    """Codex 6094982867, second path: two failures, a committed clear, one
+    failure. Counted from memory alone the third would trip and store a
+    long skip the clear had ruled out."""
+    hf._sync_repair_store("the engine", OperatorState())
+    hf.note_repair_failure("TIINGO", REASON)
+    hf.note_repair_failure("TIINGO", REASON)
+    table.record("cleared", "tiingo", "TIINGO", reason="between polls")
+    assert hf.note_repair_failure("TIINGO", REASON) is False
+    assert hf.repair_deterministically_blocked("TIINGO") is None
+    assert "long_skip" not in [e.event for e in table.events]
+    hf._sync_repair_store("the engine", OperatorState())
+    live = _tables()
+
+    _restart(monkeypatch)
+    hf._sync_repair_store("the engine", OperatorState())
+    assert _tables() == live and live["skips"] == {}
+
+
 @pytest.mark.parametrize("seed", range(6))
 def test_live_and_replayed_bookkeeping_agree_after_every_step(monkeypatch, table, seed):
     """Random interleavings of failures (two reasons), recoveries, clears and
-    passes over three sources: after each step a cold replay of what is
-    stored leaves exactly the live tables."""
+    passes over three sources, with clears landing between passes: after
+    every pass a cold replay of what is stored leaves exactly the live
+    tables."""
     import random
 
     rng = random.Random(seed)
@@ -424,6 +481,8 @@ def test_live_and_replayed_bookkeeping_agree_after_every_step(monkeypatch, table
             hf.note_repair_recovered(source)
         elif roll < 0.9:
             table.record("cleared", hf._normalize_source_key(source), source, reason="operator")
+        if rng.random() < 0.5:
+            continue                                                # no pass yet: clears pile up
         hf._sync_repair_store("the engine", OperatorState())       # a pass applies new clears
         live = _tables()
         memory = {name: getattr(hf, name) for name in
@@ -874,3 +933,57 @@ def test_real_types_a_row_is_stamped_after_the_source_lock_not_at_its_transactio
         order = [r[0] for r in c.execute(text(
             "SELECT event FROM hermes_repair_events ORDER BY recorded_at, id")).fetchall()]
     assert order == ["cleared", "repair_failed"]
+
+
+def test_real_types_a_clear_between_failures_restarts_the_count_on_real_rows(pg_engine, monkeypatch):
+    """Codex 6094982867 on PostgreSQL: two failures, a committed clear, one
+    failure, no pass in between: no long skip, live or after a restart."""
+    _upgrade(pg_engine)
+    hf._sync_repair_store(pg_engine, OperatorState())
+    hf.note_repair_failure("TIINGO", REASON)
+    hf.note_repair_failure("TIINGO", REASON)
+    store_mod.RepairEventStore(pg_engine).record("cleared", "tiingo", "TIINGO", reason="between polls")
+    assert hf.note_repair_failure("TIINGO", REASON) is False
+    assert _count("TIINGO") == 1
+    hf._sync_repair_store(pg_engine, OperatorState())
+    live = _tables()
+    _restart(monkeypatch)
+    hf._sync_repair_store(pg_engine, OperatorState())
+    assert _tables() == live and live["skips"] == {}
+    with pg_engine.connect() as c:
+        assert [r[0] for r in c.execute(text(
+            "SELECT event FROM hermes_repair_events ORDER BY recorded_at, id")).fetchall()] == \
+            ["repair_failed", "repair_failed", "cleared", "repair_failed"]
+
+
+def test_real_types_a_failure_waits_for_an_open_clear_before_it_reads_the_count(pg_engine, monkeypatch):
+    """The failure reads the source's clears only once it holds the source's
+    lock. With a clear open in another transaction after two failures, the
+    third failure waits, then sees the clear and counts from it: no long
+    skip, live or after a restart."""
+    _upgrade(pg_engine)
+    hf._sync_repair_store(pg_engine, OperatorState())
+    hf.note_repair_failure("TIINGO", REASON)
+    hf.note_repair_failure("TIINGO", REASON)
+    real = store_mod.RepairEventStore(pg_engine)
+    result: dict = {}
+    conn = pg_engine.connect()
+    tx = conn.begin()
+    try:
+        real.insert(conn, [dict(event="cleared", source_key="tiingo", source_name="TIINGO", reason="open")])
+        third = threading.Thread(target=lambda: result.update(tripped=hf.note_repair_failure("TIINGO", REASON)))
+        third.start()
+        time.sleep(0.5)
+        assert third.is_alive(), "the third failure waits on the source's lock"
+        tx.commit()
+    finally:
+        if tx.is_active:
+            tx.rollback()
+        conn.close()
+    third.join(10)
+    assert result == {"tripped": False} and _count("TIINGO") == 1
+    hf._sync_repair_store(pg_engine, OperatorState())
+    live = _tables()
+    _restart(monkeypatch)
+    hf._sync_repair_store(pg_engine, OperatorState())
+    assert _tables() == live and live["skips"] == {}

@@ -421,39 +421,57 @@ def repair_rules() -> Any:
                  REPEATED_FAILURE_MAX_COOLDOWN_SECONDS)
 
 
-def _record_repair_event(event: str, source_name: str, **fields: Any) -> None:
-    """Append one repair event to the durable store, when there is one."""
-    _record_repair_events([dict(event=event, **fields)], source_name)
+def _transact(source_name: str, transition: Callable[[], list[dict[str, Any]]]) -> None:
+    """Apply one repair transition for a source, and store its events, in the stored order.
 
+    ``transition`` updates the in-memory tables and returns the events to
+    store. With a store it runs inside one transaction holding the source's
+    lock (the store's per-source order), after any operator clear for the
+    source that this process has not applied yet: a clear that committed
+    since the last pass is part of the state the transition is computed
+    from, exactly where a replay would put it, so a failure after a clear
+    starts a new count instead of continuing the old one.
 
-def _record_repair_events(events: list[dict[str, Any]], source_name: str) -> None:
-    """Append repair events for one source in one transaction, when there is a store.
-
-    Best effort: a failed write is logged (throttled) and the in-memory
-    bookkeeping, which the caller has already updated, stands.
+    Best effort: if the store cannot be used the transition still runs in
+    memory and a throttled warning says the event is not stored.
     """
+    from scripts.hermes_repair_store import LOOKBACK_DAYS
+
     store = _REPAIR_STORE["store"]
     if store is None:
+        transition()
         return
-    rows = []
-    for ev in events:
-        row = dict(ev, source_key=_normalize_source_key(source_name), source_name=source_name)
-        # Redacted here and again in RepairEventStore.record_many: no key or
-        # token in a provider's error text reaches a stored row.
-        for name in ("reason", "fingerprint"):
-            if row.get(name) is not None:
-                row[name] = redact_secrets(row[name])
-        rows.append(row)
+    key = _normalize_source_key(source_name)
+    applied = False
     try:
-        written = store.record_many(rows)
+        with store.locked(key) as conn:
+            since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+            for ev in store.read_clears_for(conn, key, since):
+                if ev.id in _REPAIR_STORE["clear_ids"]:
+                    continue
+                _REPAIR_STORE["clear_ids"].add(ev.id)
+                _apply_clear(ev, None)
+            events = transition()
+            applied = True
+            rows = []
+            for ev in events:
+                row = dict(ev, source_key=key, source_name=source_name)
+                # Redacted here and again in RepairEventStore.insert: no key or
+                # token in a provider's error text reaches a stored row.
+                for name in ("reason", "fingerprint"):
+                    if row.get(name) is not None:
+                        row[name] = redact_secrets(row[name])
+                rows.append(row)
+            written = store.insert(conn, rows) if rows else []
     except Exception as exc:
         _warn_throttled(
             "repair_store_write",
             "Repair event not stored ({kind}); Hermes keeps it in memory only until restart",
             kind=type(exc).__name__,
         )
+        if not applied:
+            transition()
         return
-    key = _normalize_source_key(source_name)
     with _REPAIR_SCHEDULE_LOCK:
         for _event_id, recorded_at in written:
             if key not in _LAST_EVENT_AT or recorded_at > _LAST_EVENT_AT[key]:
@@ -574,50 +592,61 @@ def note_repair_failure(source_name: str, reason: str) -> bool:
     (digits normalized, so "5 of 5 items" == "4 of 4 items") put the source
     on a deterministic skip of REPEATED_FAILURE_COOLDOWN_SECONDS, doubling
     for each further long skip up to REPEATED_FAILURE_MAX_COOLDOWN_SECONDS.
-    A different reason restarts the count; note_repair_recovered clears it.
+    A different reason restarts the count; note_repair_recovered and an
+    operator clear clear it. Stored through _transact, so the count is taken
+    after any clear the store orders before this failure.
     """
     key = _normalize_source_key(source_name)
     # Redacted first: the stored rows carry no secret (hermes_repair_store),
     # and a restart must compare the next failure with the same text.
     fingerprint = re.sub(r"\d+", "N", redact_secrets(str(reason or "")))[:200]
-    with _REPAIR_SCHEDULE_LOCK:
-        entry = _REPEATED_FAILURES.get(key)
-        if entry is None or entry[0] != fingerprint:
-            strikes = entry[2] if entry is not None else 0
-            entry = _REPEATED_FAILURES[key] = [fingerprint, 0, strikes]
-        entry[1] += 1
-        tripped = entry[1] >= REPEATED_FAILURE_THRESHOLD
-        if tripped:
-            cooldown = min(
-                REPEATED_FAILURE_COOLDOWN_SECONDS * (2 ** entry[2]),
-                REPEATED_FAILURE_MAX_COOLDOWN_SECONDS,
-            )
-            count = entry[1]
-            entry[1] = 0
-            entry[2] += 1
-            strikes = entry[2]
-    failed = dict(event="repair_failed", fingerprint=fingerprint, reason=str(reason or ""))
-    if not tripped:
-        _record_repair_events([failed], source_name)
-        return False
-    skip_reason = f"same failure {count}x in a row: {redact_secrets(str(reason or ''))[:160]}"
-    _record_deterministic_failure(source_name, skip_reason, cooldown_s=cooldown)
-    # One transaction: a crash cannot store the tripping failure without its skip.
-    _record_repair_events([failed, dict(
-        event="long_skip", fingerprint=fingerprint, reason=skip_reason,
-        skip_until=datetime.now(timezone.utc) + timedelta(seconds=cooldown), strikes=strikes,
-    )], source_name)
-    return True
+    outcome = {"tripped": False}
+
+    def transition() -> list[dict[str, Any]]:
+        with _REPAIR_SCHEDULE_LOCK:
+            entry = _REPEATED_FAILURES.get(key)
+            if entry is None or entry[0] != fingerprint:
+                strikes = entry[2] if entry is not None else 0
+                entry = _REPEATED_FAILURES[key] = [fingerprint, 0, strikes]
+            entry[1] += 1
+            tripped = entry[1] >= REPEATED_FAILURE_THRESHOLD
+            if tripped:
+                cooldown = min(
+                    REPEATED_FAILURE_COOLDOWN_SECONDS * (2 ** entry[2]),
+                    REPEATED_FAILURE_MAX_COOLDOWN_SECONDS,
+                )
+                count = entry[1]
+                entry[1] = 0
+                entry[2] += 1
+                strikes = entry[2]
+        failed = dict(event="repair_failed", fingerprint=fingerprint, reason=str(reason or ""))
+        outcome["tripped"] = tripped
+        if not tripped:
+            return [failed]
+        skip_reason = f"same failure {count}x in a row: {redact_secrets(str(reason or ''))[:160]}"
+        _record_deterministic_failure(source_name, skip_reason, cooldown_s=cooldown)
+        # One transaction: a crash cannot store the tripping failure without its skip.
+        return [failed, dict(
+            event="long_skip", fingerprint=fingerprint, reason=skip_reason,
+            skip_until=datetime.now(timezone.utc) + timedelta(seconds=cooldown), strikes=strikes,
+        )]
+
+    _transact(source_name, transition)
+    return outcome["tripped"]
 
 
 def note_repair_recovered(source_name: str) -> None:
     key = _normalize_source_key(source_name)
-    recovered_at = datetime.now(timezone.utc)
-    with _REPAIR_SCHEDULE_LOCK:
-        _REPEATED_FAILURES.pop(key, None)
-        _REPAIR_RECOVERED_AT[key] = recovered_at
-    # The same instant, so a restart compares it with a failure time exactly as this process did.
-    _record_repair_event("recovered", source_name, occurred_at=recovered_at)
+
+    def transition() -> list[dict[str, Any]]:
+        recovered_at = datetime.now(timezone.utc)
+        with _REPAIR_SCHEDULE_LOCK:
+            _REPEATED_FAILURES.pop(key, None)
+            _REPAIR_RECOVERED_AT[key] = recovered_at
+        # The same instant, so a restart compares it with a failure time exactly as this process did.
+        return [dict(event="recovered", occurred_at=recovered_at)]
+
+    _transact(source_name, transition)
 
 
 def _recovered_after(source_name: str, last_fail: Any) -> bool:

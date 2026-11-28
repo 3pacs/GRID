@@ -70,8 +70,7 @@ def _load(source: str | None = None):
                  # The durable repair store (2026-11-28): none here;
                  # tests/test_hermes_repair_store_20261128.py covers it.
                  "_sync_repair_store": lambda engine, state: None,
-                 "_record_repair_event": lambda *a, **k: None, "timedelta": timedelta,
-                 "_record_repair_events": lambda *a, **k: None,
+                 "_transact": lambda _source, transition: transition(), "timedelta": timedelta,
                  "redact_secrets": __import__("utils.redaction", fromlist=["redact_secrets"]).redact_secrets,
                  "_UNROUTED_FAILURES_REPORTED": {},
                  "UNROUTED_GUEST_REASON": "synthetic no-route reason"}
