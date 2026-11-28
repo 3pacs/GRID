@@ -22,8 +22,21 @@ append-only log of four events per source:
 
 On its first pass after a start Hermes reads the last LOOKBACK_DAYS and
 replays them (``replay``) with the same rules as the live code, so it resumes
-with the same counts, skips, recovery times and cooldowns it had. A running
-Hermes also applies a new ``cleared`` event on its next pass.
+with the same counts, skips and recovery times it had. A running Hermes also
+applies a new ``cleared`` event on its next pass: each pass reads every clear
+recorded since shortly before its restore and applies the ones it has not
+applied yet, by id, so a clear whose transaction commits after a later one is
+still seen (an id is not a commit order).
+
+The failure that trips a long skip and the long skip are written in one
+transaction. A history that still shows the threshold reached with no long
+skip after it (a long-skip row lost some other way) is replayed as the live
+code would have acted: the skip is rebuilt from the failure's time.
+
+The cooldown restored is approximate and is not a safety guarantee: it counts
+only the failures the repeated-failure rule counted (budget stops, in-flight
+skips and missing keys are not stored), so after a restart a source can get
+its next ordinary attempt somewhat sooner than one process would have given it.
 
 What is not kept: a deterministic skip for a code or wiring defect, a missing
 API key or a source with no handler. Those are fixed by a deploy or an .env
@@ -47,6 +60,9 @@ EVENTS = ("repair_failed", "recovered", "long_skip", "cleared")
 # Longer than the longest long skip (7 days), so a skip in force and the
 # count that led to it are both read back.
 LOOKBACK_DAYS = 8
+# A clear is looked for this far before the restore read, so one whose
+# transaction was still open when the restore read the table is not missed.
+CLEAR_RESCAN_MARGIN = timedelta(minutes=10)
 STATEMENT_TIMEOUT_MS = 2000
 _REPO = Path(__file__).resolve().parents[1]
 _RELEASE: dict[str, str | None] = {}
@@ -96,7 +112,19 @@ class SourceHistory:
 @dataclass
 class Replayed:
     sources: dict[str, SourceHistory] = field(default_factory=dict)
-    last_event_id: int = 0
+    clear_ids: set[int] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class Rules:
+    """The repeated-failure rule's numbers, as hermes_fixers holds them."""
+
+    threshold: int
+    base_seconds: float
+    max_seconds: float
+
+    def long_skip_seconds(self, strikes_before: int) -> float:
+        return min(self.base_seconds * (2 ** strikes_before), self.max_seconds)
 
 
 def _utc(value: Any) -> datetime | None:
@@ -107,22 +135,24 @@ def _utc(value: Any) -> datetime | None:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
-def replay(events: list[RepairEvent], now: datetime, *, threshold: int) -> Replayed:
+def replay(events: list[RepairEvent], now: datetime, *, rules: Rules) -> Replayed:
     """The bookkeeping these events leave at ``now``, by the live rules.
 
-    Mirrors hermes_fixers.note_repair_failure / note_repair_recovered:
-    a fingerprint unlike the current one restarts the count and keeps the
-    strikes; a long skip resets the count and sets the strikes; a recovery
-    drops the count and strikes and stamps the recovery (it does not end a
-    long skip in force, as in the live code); a clear drops everything for
-    the source. A skip that has ended by ``now`` is not returned.
-    ``threshold`` is only used to refuse a history the live code could not
-    have written (a count at or past the threshold with no long skip after
-    it), which is then left at threshold - 1 so the next failure trips it.
+    Mirrors hermes_fixers.note_repair_failure / note_repair_recovered: a
+    fingerprint unlike the current one restarts the count and keeps the
+    strikes; the failure that reaches the threshold trips a long skip, which
+    resets the count and adds a strike; a recovery drops the count and
+    strikes and stamps the recovery (it does not end a long skip in force, as
+    in the live code); a clear drops everything for the source.
+
+    The skip is tripped here on the failure itself, with the live formula
+    and the failure's time, and the ``long_skip`` row written with it in the
+    same transaction then sets the exact end and strikes the live code
+    used. So a history whose long-skip row is missing still holds. A skip
+    that has ended by ``now`` is not returned.
     """
     out = Replayed()
     for ev in sorted(events, key=lambda e: (e.recorded_at, e.id)):
-        out.last_event_id = max(out.last_event_id, ev.id)
         hist = out.sources.setdefault(ev.source_key, SourceHistory(source_name=ev.source_name))
         hist.source_name = ev.source_name
         at = _utc(ev.recorded_at)
@@ -131,6 +161,11 @@ def replay(events: list[RepairEvent], now: datetime, *, threshold: int) -> Repla
             if entry is None or entry[0] != ev.fingerprint:
                 entry = [ev.fingerprint, 0, entry[2] if entry is not None else 0]
             entry[1] += 1
+            if entry[1] >= rules.threshold:
+                hist.skip_until = at + timedelta(seconds=rules.long_skip_seconds(entry[2]))
+                hist.skip_reason = f"same failure {entry[1]}x in a row: {str(ev.reason or '')[:160]}"
+                entry[1] = 0
+                entry[2] += 1
             hist.repeated = entry
             hist.last_attempt, hist.last_error = at, ev.reason
             hist.consecutive_fails += 1
@@ -145,6 +180,7 @@ def replay(events: list[RepairEvent], now: datetime, *, threshold: int) -> Repla
             hist.recovered_at = at
             hist.last_attempt, hist.consecutive_fails, hist.last_error = at, 0, None
         elif ev.event == "cleared":
+            out.clear_ids.add(ev.id)
             out.sources[ev.source_key] = SourceHistory(
                 source_name=ev.source_name, recovered_at=hist.recovered_at,
             )
@@ -152,8 +188,6 @@ def replay(events: list[RepairEvent], now: datetime, *, threshold: int) -> Repla
     for hist in out.sources.values():
         if hist.skip_until is not None and hist.skip_until <= now_utc:
             hist.skip_until = hist.skip_reason = None
-        if hist.repeated is not None and hist.repeated[1] >= threshold:
-            hist.repeated[1] = threshold - 1
     return out
 
 
@@ -179,27 +213,38 @@ class RepairEventStore:
         recorded_at: datetime | None = None,
     ) -> int:
         """Append one event; ``recorded_at`` defaults to the database clock."""
+        return self.record_many([dict(
+            event=event, source_key=source_key, source_name=source_name, fingerprint=fingerprint,
+            reason=reason, skip_until=skip_until, strikes=strikes, recorded_at=recorded_at,
+        )])[0]
+
+    def record_many(self, events: list[dict[str, Any]]) -> list[int]:
+        """Append events in one transaction: all of them are stored or none."""
         from sqlalchemy import text
 
         from utils.redaction import redact_secrets
 
-        if event not in EVENTS:
-            raise ValueError(f"unknown repair event {event!r}")
-        # Provider errors embed request URLs, keys and tokens: nothing reaches
-        # the table unredacted, whoever the caller (the clear command too).
-        reason = redact_secrets(reason)
-        fingerprint = redact_secrets(fingerprint)
+        for ev in events:
+            if ev.get("event") not in EVENTS:
+                raise ValueError(f"unknown repair event {ev.get('event')!r}")
+        ids: list[int] = []
         with self.engine.begin() as conn:
             conn.execute(text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}"))
-            return int(conn.execute(text(
-                f"INSERT INTO {EVENT_TABLE} (recorded_at, source_key, source_name, event, "
-                "fingerprint, reason, skip_until, strikes, release) "
-                "VALUES (COALESCE(CAST(:at AS TIMESTAMPTZ), NOW()), :k, :n, :e, :f, :r, :u, :s, :rel) "
-                "RETURNING id"),
-                {"at": recorded_at, "k": source_key, "n": source_name, "e": event, "f": fingerprint,
-                 "r": None if reason is None else str(reason)[:300], "u": skip_until,
-                 "s": strikes, "rel": current_release()},
-            ).scalar())
+            for ev in events:
+                # Provider errors embed request URLs, keys and tokens: nothing
+                # reaches the table unredacted, whoever the caller.
+                reason = redact_secrets(ev.get("reason"))
+                ids.append(int(conn.execute(text(
+                    f"INSERT INTO {EVENT_TABLE} (recorded_at, source_key, source_name, event, "
+                    "fingerprint, reason, skip_until, strikes, release) "
+                    "VALUES (COALESCE(CAST(:at AS TIMESTAMPTZ), NOW()), :k, :n, :e, :f, :r, :u, :s, :rel) "
+                    "RETURNING id"),
+                    {"at": ev.get("recorded_at"), "k": ev["source_key"], "n": ev["source_name"],
+                     "e": ev["event"], "f": redact_secrets(ev.get("fingerprint")),
+                     "r": None if reason is None else str(reason)[:300], "u": ev.get("skip_until"),
+                     "s": ev.get("strikes"), "rel": current_release()},
+                ).scalar()))
+        return ids
 
     def _read(self, where: str, params: dict[str, Any]) -> list[RepairEvent]:
         from sqlalchemy import text
@@ -214,8 +259,10 @@ class RepairEventStore:
     def read_since(self, since: datetime) -> list[RepairEvent]:
         return self._read("recorded_at > :since", {"since": since})
 
-    def read_clears_after(self, event_id: int) -> list[RepairEvent]:
-        return self._read("event = 'cleared' AND id > :id", {"id": int(event_id)})
+    def read_clears_since(self, since: datetime) -> list[RepairEvent]:
+        """Every clear recorded after ``since``. The caller applies each id
+        once; an id is not a commit order, so no id watermark is kept."""
+        return self._read("event = 'cleared' AND recorded_at > :since", {"since": since})
 
 
 def _normalize(source: str) -> str:
@@ -236,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from db import get_engine
-    from scripts.hermes_fixers import REPEATED_FAILURE_THRESHOLD
+    from scripts.hermes_fixers import repair_rules
 
     store = RepairEventStore(get_engine())
     if not store.available():
@@ -247,8 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cleared {args.source} (event {event_id}); Hermes applies it on its next pass")
         return 0
     now = datetime.now(timezone.utc)
-    state = replay(store.read_since(now - timedelta(days=LOOKBACK_DAYS)), now,
-                   threshold=REPEATED_FAILURE_THRESHOLD)
+    state = replay(store.read_since(now - timedelta(days=LOOKBACK_DAYS)), now, rules=repair_rules())
     for key, hist in sorted(state.sources.items()):
         if args.source and key != _normalize(args.source):
             continue

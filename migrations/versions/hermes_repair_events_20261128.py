@@ -14,8 +14,14 @@ explicit clear an operator records; on the first pass after a start Hermes
 reads the last eight days back. Without the table Hermes behaves as before,
 in memory only.
 
-Running the upgrade again is a no-op. Downgrade drops the table: it holds
-only repair history, which Hermes rebuilds as it goes.
+The table is append-only for every role: a trigger refuses UPDATE, DELETE
+and TRUNCATE, and ``grid`` is granted SELECT and INSERT only. Retention is not
+automatic; the rows are small (one per counted failed repair, long skip,
+recovery or clear) and Hermes reads only the last eight days.
+
+Running the upgrade again is a no-op. Downgrade drops the table and its
+trigger function: they hold only repair history, which Hermes rebuilds as it
+goes.
 """
 from alembic import op
 
@@ -50,14 +56,36 @@ def upgrade():
         "CREATE INDEX IF NOT EXISTS idx_hermes_repair_events_recorded "
         "ON hermes_repair_events (recorded_at)"
     )
-    # GRANT footer (migrations/_TEMPLATE.sql): alembic runs as the owner role;
-    # grid-hermes, as `grid`, inserts and reads the rows.
+    # Append-only for every role, the owner included: a row is history, and
+    # rewriting one would change what a restart restores. Grants alone do not
+    # do this where the application role owns the table.
+    op.execute("""
+        CREATE OR REPLACE FUNCTION hermes_repair_events_append_only() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'hermes_repair_events is append-only (% refused)', TG_OP;
+        END
+        $$
+    """)
+    op.execute("DROP TRIGGER IF EXISTS hermes_repair_events_no_rewrite ON hermes_repair_events")
+    op.execute(
+        "CREATE TRIGGER hermes_repair_events_no_rewrite BEFORE UPDATE OR DELETE "
+        "ON hermes_repair_events FOR EACH ROW EXECUTE FUNCTION hermes_repair_events_append_only()"
+    )
+    op.execute("DROP TRIGGER IF EXISTS hermes_repair_events_no_truncate ON hermes_repair_events")
+    op.execute(
+        "CREATE TRIGGER hermes_repair_events_no_truncate BEFORE TRUNCATE "
+        "ON hermes_repair_events FOR EACH STATEMENT EXECUTE FUNCTION hermes_repair_events_append_only()"
+    )
+    # Grants: alembic runs as the owner role; grid-hermes, as `grid`, only
+    # inserts and reads. The table is append-only, so `grid` gets no UPDATE,
+    # DELETE or TRUNCATE (unlike the GRANT ALL footer of migrations/_TEMPLATE.sql).
     op.execute("""
         DO $$
         BEGIN
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grid') THEN
-                EXECUTE 'GRANT ALL ON hermes_repair_events TO grid';
-                EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE hermes_repair_events_id_seq TO grid';
+                EXECUTE 'GRANT SELECT, INSERT ON hermes_repair_events TO grid';
+                EXECUTE 'GRANT USAGE ON SEQUENCE hermes_repair_events_id_seq TO grid';
             END IF;
         END
         $$
@@ -66,3 +94,4 @@ def upgrade():
 
 def downgrade():
     op.execute("DROP TABLE IF EXISTS hermes_repair_events")
+    op.execute("DROP FUNCTION IF EXISTS hermes_repair_events_append_only()")

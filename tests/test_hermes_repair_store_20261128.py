@@ -46,6 +46,8 @@ from scripts import hermes_repair_store as store_mod
 from scripts.hermes_health import OperatorState
 from scripts.hermes_repair_store import RepairEvent, replay
 
+RULES = hf.repair_rules()
+
 _REQUIRE_ENV = "REQUIRE_HERMES_REPAIR_STORE_PG"
 FAILED_AT = datetime(2026, 11, 27, 13, 28, tzinfo=timezone.utc)
 REASON = "puller reported FAILED: 5 of 5 items failed or partial"
@@ -63,7 +65,8 @@ def _fresh_memory(monkeypatch) -> None:
     monkeypatch.setattr(hf, "_UNROUTED_FAILURES_REPORTED", {})
     monkeypatch.setattr(hf, "_SCHEDULED_RUNS",
                         {"runs": {}, "good_at": None, "attempt_at": None, "failed_reads": 0})
-    monkeypatch.setattr(hf, "_REPAIR_STORE", {"store": None, "engine": None, "last_event_id": 0, "restored": False})
+    monkeypatch.setattr(hf, "_REPAIR_STORE", {"store": None, "engine": None, "restored": False,
+                                              "clear_ids": set(), "clears_since": None})
 
 
 @pytest.fixture(autouse=True)
@@ -83,6 +86,7 @@ class FakeStore:
 
     def __init__(self) -> None:
         self.events: list[RepairEvent] = []
+        self.batches: list[list[str]] = []
         self.absent = False
         self.fail_reads = False
         self.fail_writes = False
@@ -91,15 +95,22 @@ class FakeStore:
     def available(self) -> bool:
         return not self.absent
 
-    def record(self, event, source_key, source_name, *, fingerprint=None, reason=None,
-               skip_until=None, strikes=None, recorded_at=None) -> int:
+    def record(self, event, source_key, source_name, **fields) -> int:
+        return self.record_many([dict(event=event, source_key=source_key, source_name=source_name, **fields)])[0]
+
+    def record_many(self, rows) -> list[int]:
         if self.fail_writes:
             raise RuntimeError("connection reset")
-        ev = RepairEvent(len(self.events) + 1, recorded_at or datetime.now(timezone.utc), source_key, source_name,
-                         event, fingerprint, None if reason is None else str(reason)[:300],
-                         skip_until, strikes)
-        self.events.append(ev)
-        return ev.id
+        made = []
+        for row in rows:                                  # all or none, like one transaction
+            reason = row.get("reason")
+            made.append(RepairEvent(
+                len(self.events) + len(made) + 1, row.get("recorded_at") or datetime.now(timezone.utc),
+                row["source_key"], row["source_name"], row["event"], row.get("fingerprint"),
+                None if reason is None else str(reason)[:300], row.get("skip_until"), row.get("strikes")))
+        self.events.extend(made)
+        self.batches.append([ev.event for ev in made])
+        return [ev.id for ev in made]
 
     def read_since(self, since):
         self.reads += 1
@@ -107,11 +118,11 @@ class FakeStore:
             raise RuntimeError("canceling statement due to statement timeout")
         return [e for e in self.events if e.recorded_at > since]
 
-    def read_clears_after(self, event_id):
+    def read_clears_since(self, since):
         self.reads += 1
         if self.fail_reads:
             raise RuntimeError("canceling statement due to statement timeout")
-        return [e for e in self.events if e.event == "cleared" and e.id > event_id]
+        return [e for e in self.events if e.event == "cleared" and e.recorded_at > since]
 
 
 @pytest.fixture()
@@ -189,15 +200,16 @@ def test_replay_leaves_exactly_what_the_live_calls_left(monkeypatch, table, step
     assert hf._REPAIR_STORE["store"] is table
 
 
-def test_a_lost_long_skip_write_leaves_the_next_failure_to_trip_it():
-    """repair_failed stored, its long_skip write lost: the history the live
-    code could not have left. The count stops one short, so the next failure
-    trips the skip instead of the count running past the threshold."""
+def test_a_missing_long_skip_row_is_rebuilt_from_the_tripping_failure():
+    """Three counted failures and no long_skip row (it is written in the same
+    transaction, so this is a row lost some other way): the replay trips the
+    skip itself, from the third failure's time, with the live formula."""
     events = [RepairEvent(n, FAILED_AT + timedelta(minutes=n), "s", "S", "repair_failed", "x", "x")
               for n in range(1, 4)]
-    state = replay(events, FAILED_AT + timedelta(hours=1), threshold=3)
-    assert state.sources["s"].repeated == ["x", 2, 0]
-    assert state.sources["s"].skip_until is None
+    state = replay(events, FAILED_AT + timedelta(hours=1), rules=RULES)
+    assert state.sources["s"].repeated == ["x", 0, 1]
+    assert state.sources["s"].skip_until == FAILED_AT + timedelta(minutes=3, seconds=RULES.long_skip_seconds(0))
+    assert state.sources["s"].skip_reason.startswith("same failure 3x in a row")
 
 
 def test_an_ended_skip_is_not_restored_and_a_clear_drops_everything():
@@ -207,10 +219,10 @@ def test_an_ended_skip_is_not_restored_and_a_clear_drops_everything():
         RepairEvent(2, FAILED_AT, "t", "T", "long_skip", "x", "same failure 3x", until, 1),
         RepairEvent(3, FAILED_AT + timedelta(hours=1), "t", "T", "cleared", None, "provider fixed"),
     ]
-    in_force = replay(events, until - timedelta(seconds=1), threshold=3)
+    in_force = replay(events, until - timedelta(seconds=1), rules=RULES)
     assert in_force.sources["s"].skip_until == until
     assert in_force.sources["t"].skip_until is None and in_force.sources["t"].repeated is None
-    ended = replay(events, until, threshold=3)
+    ended = replay(events, until, rules=RULES)
     assert ended.sources["s"].skip_until is None
     assert ended.sources["s"].repeated == ["x", 0, 1], "the strikes outlive the skip, so the next doubles"
 
@@ -228,6 +240,7 @@ def test_a_long_skip_tripped_before_a_restart_still_holds_after_it(monkeypatch, 
         hf.diagnose_and_fix_pulls(engine, False, state)
     assert calls == ["TIINGO"] * 3 and hf.repair_deterministically_blocked("TIINGO")
     assert [e.event for e in table.events] == ["repair_failed"] * 3 + ["long_skip"]
+    assert table.batches[-1] == ["repair_failed", "long_skip"], "the trip is one write, not two"
 
     _restart(monkeypatch)
     restarted = OperatorState()
@@ -330,6 +343,21 @@ def test_an_operator_clear_lets_the_running_process_retry_once(monkeypatch, tabl
     assert sum("cleared by an operator" in w for w in warnings) == 1, "applied once"
 
 
+def test_a_clear_stamped_before_the_restore_but_committed_after_it_is_applied(monkeypatch, table):
+    """recorded_at is set when the insert runs, not when it commits: a clear
+    whose transaction was open during the restore read appears later with an
+    earlier time. The rescan reaches back far enough to see it."""
+    warnings = _warnings(monkeypatch)
+    hf._sync_repair_store("the engine", OperatorState())
+    hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")
+    late = RepairEvent(1, datetime.now(timezone.utc) - timedelta(minutes=2), "tiingo", "TIINGO",
+                       "cleared", None, "opened before the restore read")
+    table.events.append(late)
+    hf._sync_repair_store("the engine", OperatorState())
+    assert "tiingo" not in hf._DETERMINISTIC_SKIPS
+    assert sum("cleared by an operator" in w for w in warnings) == 1
+
+
 def test_a_clear_recorded_while_hermes_was_down_is_part_of_the_restore(monkeypatch, table):
     until = datetime.now(timezone.utc) + timedelta(hours=20)
     table.record("long_skip", "tiingo", "TIINGO", fingerprint="x", reason="same failure 3x", skip_until=until, strikes=1)
@@ -396,8 +424,12 @@ def test_concurrent_failures_are_all_recorded(monkeypatch, table):
 # ── no secret is stored ────────────────────────────────────────────────────
 
 
-SECRET_REASON = ("HTTPError: 403 for url https://api.example.test/v2/aggs?apiKey=sk_live_0123456789abcdef"
-                 "&ticker=FNGR (token=abcdef0123456789abcdef)")
+# Assembled from fragments so this file holds no key-shaped literal
+# (tests/test_no_literal_secrets.py scans the tree).
+FAKE_KEY = "".join(("sk", "_live_", "01234", "56789", "abcdef"))
+FAKE_TOKEN = "".join(("abcdef", "01234", "56789", "abcdef"))
+SECRET_REASON = (f"HTTPError: 403 for url https://api.example.test/v2/aggs?apiKey={FAKE_KEY}"
+                 f"&ticker=FNGR (token={FAKE_TOKEN})")
 
 
 def test_reasons_are_redacted_before_they_are_stored_and_still_count_alike(monkeypatch, table):
@@ -407,7 +439,7 @@ def test_reasons_are_redacted_before_they_are_stored_and_still_count_alike(monke
     live = _tables()
 
     stored = " ".join(f"{e.fingerprint} {e.reason}" for e in table.events)
-    assert "sk_live_0123456789abcdef" not in stored and "abcdef0123456789abcdef" not in stored
+    assert FAKE_KEY not in stored and FAKE_TOKEN not in stored
     assert "[REDACTED]" in stored or "?" not in stored
     assert [e.event for e in table.events] == ["repair_failed"] * 3 + ["long_skip"]
 
@@ -503,23 +535,21 @@ def test_real_types_the_store_round_trips_and_reads_only_what_it_is_asked(pg_eng
     second = real.record("long_skip", "tiingo", "TIINGO", fingerprint="f", reason="same", skip_until=until, strikes=1)
     clear = real.record("cleared", "tiingo", "TIINGO", reason="fixed")
     assert first < second < clear
-    secret = real.record("cleared", "tiingo", "TIINGO", fingerprint=SECRET_REASON, reason=SECRET_REASON)
-    with pg_engine.connect() as conn:
-        row = conn.execute(text("SELECT fingerprint || ' ' || reason FROM hermes_repair_events WHERE id = :i"),
-                           {"i": secret}).scalar()
-    assert "sk_live_0123456789abcdef" not in row and "abcdef0123456789abcdef" not in row
-    with pg_engine.begin() as conn:
-        conn.execute(text("DELETE FROM hermes_repair_events WHERE id = :i"), {"i": secret})
 
     events = real.read_since(datetime(2000, 1, 1, tzinfo=timezone.utc))
     assert [e.event for e in events] == ["repair_failed", "long_skip", "cleared"]
     assert len(events[0].reason) == 300 and events[1].skip_until == until and events[1].strikes == 1
-    assert [e.id for e in real.read_clears_after(second)] == [clear]
-    assert real.read_clears_after(clear) == []
+    assert [e.id for e in real.read_clears_since(datetime(2000, 1, 1, tzinfo=timezone.utc))] == [clear]
+    assert real.read_clears_since(datetime.now(timezone.utc) + timedelta(minutes=1)) == []
     with pg_engine.connect() as conn:
         assert conn.execute(text("SELECT DISTINCT release FROM hermes_repair_events")).scalar() == "test-release"
     with pytest.raises(ValueError):
         real.record("other", "s", "S")
+    secret = real.record("repair_failed", "polygon", "polygon", fingerprint=SECRET_REASON, reason=SECRET_REASON)
+    with pg_engine.connect() as conn:
+        row = conn.execute(text("SELECT fingerprint || ' ' || reason FROM hermes_repair_events WHERE id = :i"),
+                           {"i": secret}).scalar()
+    assert FAKE_KEY not in row and FAKE_TOKEN not in row
 
 
 def test_real_types_no_table_means_not_available(pg_engine):
@@ -583,3 +613,85 @@ def test_real_types_a_long_skip_survives_a_restart_on_real_rows(pg_engine, monke
     restarted.cooldowns = OperatorState().cooldowns
     hf.diagnose_and_fix_pulls(engine, False, restarted)
     assert calls == ["TIINGO"] * 4
+
+
+def test_real_types_rows_cannot_be_rewritten_by_any_role_and_grid_may_only_read_and_add(pg_engine):
+    _upgrade(pg_engine)
+    real = store_mod.RepairEventStore(pg_engine)
+    event_id = real.record("cleared", "tiingo", "TIINGO", reason="fixed")
+    for sql in ("UPDATE hermes_repair_events SET reason = 'rewritten' WHERE id = :i",
+                "DELETE FROM hermes_repair_events WHERE id = :i",
+                "TRUNCATE hermes_repair_events"):
+        with pytest.raises(Exception, match="append-only"):
+            with pg_engine.begin() as conn:
+                conn.execute(text(sql), {"i": event_id})
+    with pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT reason FROM hermes_repair_events WHERE id = :i"),
+                            {"i": event_id}).scalar() == "fixed"
+    source = importlib.import_module("migrations.versions.hermes_repair_events_20261128")
+    import inspect
+    body = inspect.getsource(source.upgrade)
+    assert "GRANT SELECT, INSERT ON hermes_repair_events TO grid" in body
+    assert "GRANT USAGE ON SEQUENCE hermes_repair_events_id_seq TO grid" in body
+    assert "GRANT ALL ON hermes_repair_events" not in body
+
+
+def test_real_types_the_tripping_failure_and_its_long_skip_are_stored_together_or_not_at_all(pg_engine):
+    _upgrade(pg_engine)
+    real = store_mod.RepairEventStore(pg_engine)
+    until = datetime.now(timezone.utc) + timedelta(hours=24)
+    with pytest.raises(Exception, match="check constraint"):
+        real.record_many([
+            dict(event="repair_failed", source_key="tiingo", source_name="TIINGO", fingerprint="f", reason="r"),
+            dict(event="long_skip", source_key="tiingo", source_name="TIINGO", fingerprint="f",
+                 reason="same", skip_until=until, strikes=None),          # refused: no strikes
+        ])
+    with pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM hermes_repair_events")).scalar() == 0
+    ids = real.record_many([
+        dict(event="repair_failed", source_key="tiingo", source_name="TIINGO", fingerprint="f", reason="r"),
+        dict(event="long_skip", source_key="tiingo", source_name="TIINGO", fingerprint="f",
+             reason="same", skip_until=until, strikes=1),
+    ])
+    assert len(ids) == 2 and ids[0] < ids[1]
+
+
+def test_real_types_a_clear_that_commits_after_a_later_one_is_still_applied(pg_engine, monkeypatch):
+    """Two operators clear two sources. The first insert gets the lower id but
+    commits after the second; the pass that sees only the second must not
+    skip the first when it commits (an id is not a commit order)."""
+    _upgrade(pg_engine)
+    warnings = _warnings(monkeypatch)
+    state = OperatorState()
+    hf._sync_repair_store(pg_engine, state)                       # restored: nothing yet
+    assert hf._REPAIR_STORE["restored"] is True
+    far = time.monotonic() + 3600
+    hf._DETERMINISTIC_SKIPS.update(tiingo=(far, "held"), polygon=(far, "held"))
+
+    slow = pg_engine.connect()
+    slow_tx = slow.begin()
+    try:                                                          # never leave the open transaction behind
+        slow.execute(text(
+            "INSERT INTO hermes_repair_events (source_key, source_name, event, reason) "
+            "VALUES ('tiingo', 'TIINGO', 'cleared', 'first, slow to commit')"))
+        store_mod.RepairEventStore(pg_engine).record("cleared", "polygon", "polygon", reason="second")
+        with pg_engine.connect() as conn:
+            lower, higher = conn.execute(text(
+                "SELECT min(id), max(id) FROM hermes_repair_events")).one()
+        assert lower == higher                                    # only the committed one is visible
+
+        hf._sync_repair_store(pg_engine, state)
+        assert "polygon" not in hf._DETERMINISTIC_SKIPS and "tiingo" in hf._DETERMINISTIC_SKIPS
+        slow_tx.commit()
+    finally:
+        if slow_tx.is_active:
+            slow_tx.rollback()
+        slow.close()
+    hf._sync_repair_store(pg_engine, state)
+    assert "tiingo" not in hf._DETERMINISTIC_SKIPS, "the lower-id clear that committed later is applied"
+    with pg_engine.connect() as conn:
+        ids = sorted(r[0] for r in conn.execute(text("SELECT id FROM hermes_repair_events")).fetchall())
+    assert ids[0] < ids[1] and ids[0] != higher, "the late commit holds the lower id"
+
+    hf._sync_repair_store(pg_engine, state)
+    assert sum("cleared by an operator" in w for w in warnings) == 2, "each clear applied once"
