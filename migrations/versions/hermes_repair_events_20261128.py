@@ -16,8 +16,10 @@ in memory only.
 
 Order: each writer takes a per-source transaction advisory lock before it
 inserts and numbers its rows ``seq`` = the source's highest ``seq`` + 1 under
-that lock, so for one source ``seq`` is the commit order (a unique index on
-``(source_key, seq)`` refuses a writer that skipped the lock). Wall time is
+that lock, so for one source ``seq`` is the commit order, as long as every
+writer goes through ``RepairEventStore`` (which takes the lock). A unique index
+on ``(source_key, seq)`` refuses two rows with the same number for a source; it
+does not itself prove a writer took the lock. Wall time is
 not used for order: two rows can share a timestamp and a clock can step back.
 ``recorded_at`` (``clock_timestamp()``) only bounds the eight-day window.
 ``occurred_at`` is the instant the live code acted on (a recovery's time,

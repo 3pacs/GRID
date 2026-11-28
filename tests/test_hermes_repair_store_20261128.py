@@ -1177,6 +1177,69 @@ def test_a_pass_applies_each_clear_once_and_then_leaves_it(monkeypatch, table):
     assert table.locks == ["tiingo"], "a consumed clear takes no lock on later passes"
 
 
+class _GrowsWhileRead(dict):
+    """A cooldown table that gains an entry for another source the moment
+    anything iterates it: the interleaving of Codex 6095577140."""
+
+    def __iter__(self):
+        inner = super().__iter__()
+        for n, key in enumerate(inner):
+            yield key
+            if n == 0:
+                self["some_other_source"] = {"consecutive_fails": 1}
+
+
+def test_a_clear_drops_the_cooldown_with_one_pop_while_other_sources_are_recorded():
+    """Codex 6095577140: forget() scanned the table, so an attempt recorded
+    for another source during the scan raised and the cooldown survived.
+    The table is keyed by the canonical name, so forget never scans it."""
+    state = OperatorState()
+    state.cooldowns.record_attempt("Asset_Registries", success=False, error="x")
+    state.cooldowns.record_attempt("Other", success=False, error="y")
+    state.cooldowns._sources = _GrowsWhileRead(state.cooldowns._sources)
+    state.cooldowns.forget("Asset Registries")
+    assert state.cooldowns.get_status("Asset_Registries") is None
+    assert state.cooldowns.get_status("other")["consecutive_fails"] == 1
+    state.cooldowns.forget("Asset Registries")                         # idempotent
+
+
+def test_one_cooldown_entry_per_source_however_it_is_spelled():
+    state = OperatorState()
+    state.cooldowns.record_attempt("Asset Registries", success=False, error="x")
+    state.cooldowns.record_attempt("asset-registries", success=False, error="y")
+    assert state.cooldowns.get_status("Asset_Registries")["consecutive_fails"] == 2
+    assert list(state.cooldowns._sources) == ["asset_registries"]
+    assert state.cooldowns.can_retry("ASSET REGISTRIES") is False
+
+
+def test_clears_and_attempts_on_many_threads_never_raise():
+    state = OperatorState()
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def record():
+        n = 0
+        while not stop.is_set():
+            try:
+                state.cooldowns.record_attempt(f"Source {n % 50}", success=False, error="x")
+                state.cooldowns.skipped_sources()
+            except BaseException as exc:                              # noqa: BLE001 - the assertion
+                errors.append(exc)
+            n += 1
+
+    workers = [threading.Thread(target=record) for _ in range(4)]
+    for w in workers:
+        w.start()
+    try:
+        for n in range(3000):
+            state.cooldowns.forget(f"source-{n % 50}")
+    finally:
+        stop.set()
+        for w in workers:
+            w.join(10)
+    assert errors == []
+
+
 def test_applying_a_clear_twice_changes_nothing_the_second_time(monkeypatch, table):
     hf._sync_repair_store("the engine", OperatorState())
     hf._DETERMINISTIC_SKIPS["tiingo"] = (time.monotonic() + 3600, "held")

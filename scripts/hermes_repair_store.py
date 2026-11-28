@@ -28,6 +28,9 @@ One order, live and replayed. Every write for a source takes that source's
 transaction advisory lock first and numbers its rows with the source's next
 ``seq`` under that lock, so for one source ``seq`` is the order of commits:
 a write that waits on an open clear gets a higher number than the clear.
+That holds for writers that go through this class; the unique index on
+``(source_key, seq)`` refuses a repeated number but does not by itself prove
+that a writer took the lock.
 Wall time is not an order (timestamps can tie, clocks can step back); the
 replay orders each source by ``seq``. A running Hermes applies a
 ``cleared`` event only when its ``seq`` is above the newest one it knows for
