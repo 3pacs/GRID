@@ -1,5 +1,5 @@
 # SPY D2–D4 offline conformance handoff
-Draft only. No admission, protected read, research registration, live wiring, spend or release authority. Signed D0 (#1142 rev 6) controls where this note summarizes it.
+Draft only. No admission, protected read, research registration, live wiring, spend or release authority. The owner-signed D0 revision 6 is on main after #1142; its body controls where this note summarizes it. The admission manifest remains unsigned by the reviewer, and the verifier is disabled. This fixture does not admit a hypothesis.
 
 | Stage | Reuse and next review | Hard gate |
 | --- | --- | --- |

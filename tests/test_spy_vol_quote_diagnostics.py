@@ -105,6 +105,20 @@ class TestQuoteMark(TestCase):
             self.assertEqual(self.check([wide, *self.rows[1:]])["reasons"], {LEGS[0]: "wide_spread"})
 
 
+    def test_clean_newer_quote_supersedes_older_conflict_in_any_order(self):
+        from itertools import permutations
+
+        leg = LEGS[0]
+        old = quote(leg, age=20, known_age=18)
+        conflict = replace(old, ask=Decimal("1.11"))
+        fresh = quote(leg, age=10, known_age=8, ask="1.12")
+        for ordering in permutations((old, conflict, fresh)):
+            with self.subTest(ordering=ordering):
+                result = self.check([*ordering, *self.rows[1:]])
+                self.assertEqual(result["status"], "FOUR_QUOTES_QUALIFIED")
+                self.assertEqual(result["quotes"][0], fresh)
+
+
 class TestCbboMinuteClock(TestCase):
     def setUp(self):
         self.mark = datetime(2022, 11, 11, 19, tzinfo=timezone.utc)  # 14:00 ET
