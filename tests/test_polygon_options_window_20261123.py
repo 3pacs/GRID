@@ -36,13 +36,21 @@ from ingestion.smart_scheduler import _classify_outcome
 from tests.test_puller_write_contract_20261104 import SECRET, FakeEngine, Resp, _bare
 
 REAL_GATE = mod.options_writes_enabled
-TODAY = date.today()
+TODAY = date(2026, 11, 27)  # Test data and the puller share one date across midnight.
 BASE = "https://api.polygon.io/v3/snapshot/options/"
+
+
+class _PinnedOptionsDate(date):
+    @classmethod
+    def today(cls) -> date:
+        return TODAY
+
 
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Gate on, a private hold file, and no hold latched from another test."""
+    """One options date, gate on, and a hold file private to each test."""
+    monkeypatch.setattr(mod, "date", _PinnedOptionsDate)
     monkeypatch.setenv("GRID_POLYGON_HOLD_FILE", str(tmp_path / "polygon-hold.json"))
     monkeypatch.setattr(mod, "_held_until_epoch", 0.0)
     monkeypatch.setattr(mod, "options_writes_enabled", lambda: True)
